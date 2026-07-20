@@ -1,6 +1,6 @@
 {
   "name": "mayhem-contracts",
-  "version": "0.2.0",
+  "version": "0.2.23",
   "private": true,
   "type": "module",
   "description": "Mayhem local Ethereum TAP escrow harness (SAUCE MayhemInferencePool port; pinned ganache/solc/ethers).",

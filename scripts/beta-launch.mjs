@@ -13,6 +13,8 @@ const hex40 = /^[0-9a-fA-F]{40}$/;
 const hex128 = /^[0-9a-fA-F]{128}$/;
 const pubkey64 = /^[0-9a-fA-F]{64}$/;
 const testtracAddress = /^testtrac1[0-9a-z]+$/;
+const isoCountryCode = /^[A-Z]{2}$/;
+const providerPaymentRails = ['fiat', 'tap', 'tnk'];
 const safeCommandText = /^[a-zA-Z0-9._:@/+~,\-\s<>$:"{}[\]]+$/;
 const sha256Evidence = /#sha256:[0-9a-fA-F]{64}(?:$|[#?&])/;
 const httpUrl = /^https?:\/\//;
@@ -798,7 +800,6 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
       'admin_sets_prices',
       'admin_sets_rules',
       'admin_sets_params',
-      'admin_sets_provider_payout_targets',
       'admin_can_ban_providers',
       'providers_set_prices',
       'providers_set_rules',
@@ -807,14 +808,14 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
       'providers_submit_models',
       'providers_create_canonical_rooms',
       'providers_only_join_admin_rooms',
-      'provider_payout_targets_admin_verified',
+      'provider_payout_bindings_permissionless',
+      'provider_payout_bindings_ownership_verified',
       'browser_handoffs_print_copy_paste_url',
     ]);
     requireLiteral(add, manifest.controls.admin_controls_economy, true, 'controls.admin_controls_economy');
     requireLiteral(add, manifest.controls.admin_sets_prices, true, 'controls.admin_sets_prices');
     requireLiteral(add, manifest.controls.admin_sets_rules, true, 'controls.admin_sets_rules');
     requireLiteral(add, manifest.controls.admin_sets_params, true, 'controls.admin_sets_params');
-    requireLiteral(add, manifest.controls.admin_sets_provider_payout_targets, true, 'controls.admin_sets_provider_payout_targets');
     requireLiteral(add, manifest.controls.admin_can_ban_providers, true, 'controls.admin_can_ban_providers');
     requireLiteral(add, manifest.controls.providers_set_prices, false, 'controls.providers_set_prices');
     requireLiteral(add, manifest.controls.providers_set_rules, false, 'controls.providers_set_rules');
@@ -823,7 +824,8 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
     requireLiteral(add, manifest.controls.providers_submit_models, false, 'controls.providers_submit_models');
     requireLiteral(add, manifest.controls.providers_create_canonical_rooms, false, 'controls.providers_create_canonical_rooms');
     requireLiteral(add, manifest.controls.providers_only_join_admin_rooms, true, 'controls.providers_only_join_admin_rooms');
-    requireLiteral(add, manifest.controls.provider_payout_targets_admin_verified, true, 'controls.provider_payout_targets_admin_verified');
+    requireLiteral(add, manifest.controls.provider_payout_bindings_permissionless, true, 'controls.provider_payout_bindings_permissionless');
+    requireLiteral(add, manifest.controls.provider_payout_bindings_ownership_verified, true, 'controls.provider_payout_bindings_ownership_verified');
     requireLiteral(add, manifest.controls.browser_handoffs_print_copy_paste_url, true, 'controls.browser_handoffs_print_copy_paste_url');
   }
 
@@ -1089,32 +1091,29 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
     for (const [index, provider] of manifest.seed_providers.entries()) {
       const prefix = `seed_providers[${index}]`;
       if (!requireObject(add, provider, prefix)) continue;
-      requireOnlyKeys(add, provider, prefix, ['provider_pubkey', 'payouts', 'joins']);
+      requireOnlyKeys(add, provider, prefix, ['provider_pubkey', 'accepted_rails', 'stripe_country', 'joins']);
       requireString(add, provider.provider_pubkey, `${prefix}.provider_pubkey`, pubkey64);
       if (provider.submitted_models !== undefined || provider.created_rooms !== undefined || provider.created_enclaves !== undefined) {
         add('error', `${prefix} must not contain provider-created models, rooms, or enclaves`);
       }
-      if (requireObject(add, provider.payouts, `${prefix}.payouts`)) {
-        const methods = Object.keys(provider.payouts);
-        if (methods.length === 0) add('error', `${prefix}.payouts must not be empty`);
-        for (const [method, payout] of Object.entries(provider.payouts)) {
-          const payoutPrefix = `${prefix}.payouts.${method}`;
-          if (!['tnk', 'tap', 'stripe'].includes(method)) {
-            add('error', `${payoutPrefix} must be tnk, tap, or stripe`);
-            continue;
+      if (requireArray(add, provider.accepted_rails, `${prefix}.accepted_rails`, 1)) {
+        const seenRails = new Set();
+        for (const [railIndex, rail] of provider.accepted_rails.entries()) {
+          const railPrefix = `${prefix}.accepted_rails[${railIndex}]`;
+          requireString(add, rail, railPrefix);
+          if (typeof rail !== 'string' || isPlaceholder(rail)) continue;
+          if (!providerPaymentRails.includes(rail)) {
+            add('error', `${railPrefix} must be fiat, tap, or tnk`);
+          } else if (seenRails.has(rail)) {
+            add('error', `${railPrefix} duplicates another accepted rail`);
           }
-          if (!requireObject(add, payout, payoutPrefix)) continue;
-          requireOnlyKeys(add, payout, payoutPrefix, ['admin_approved', 'addr', 'currency']);
-          requireLiteral(add, payout.admin_approved, true, `${payoutPrefix}.admin_approved`);
-          requireString(add, payout.addr, `${payoutPrefix}.addr`);
-          if (method === 'stripe') {
-            if (!['usd', 'eur'].includes(payout.currency)) {
-              add('error', `${payoutPrefix}.currency must be usd or eur`);
-            }
-          } else if (payout.currency !== undefined) {
-            add('error', `${payoutPrefix}.currency is only valid for stripe`);
-          }
+          seenRails.add(rail);
         }
+      }
+      if (provider.accepted_rails?.includes('fiat')) {
+        requireString(add, provider.stripe_country, `${prefix}.stripe_country`, isoCountryCode);
+      } else if (provider.stripe_country !== undefined) {
+        add('error', `${prefix}.stripe_country requires the fiat rail`);
       }
       if (requireArray(add, provider.joins, `${prefix}.joins`, 1)) {
         for (const [joinIndex, join] of provider.joins.entries()) {
@@ -1180,6 +1179,18 @@ function providerJoinCommand({ home, rpcUrl, enclaveId, rooms }) {
   return `mayhem provider join --home ${sh(home)} --rpc-url ${sh(rpcUrl)} --enclave ${sh(enclaveId)} --rooms ${sh(roomArg)}`;
 }
 
+function providerRailsCommand({ home, rpcUrl, rails }) {
+  return `mayhem provider rails set --home ${sh(home)} --rpc-url ${sh(rpcUrl)} --rails ${sh(commaList(rails))} --submit`;
+}
+
+function providerPayoutCommand({ home, rpcUrl, rail }) {
+  return `mayhem provider payout set --home ${sh(home)} --rpc-url ${sh(rpcUrl)} --rail ${sh(rail)} --submit`;
+}
+
+function providerStripeOnboardCommand({ home, rpcUrl, country }) {
+  return `mayhem provider stripe onboard --home ${sh(home)} --rpc-url ${sh(rpcUrl)} --country ${sh(country)} --no-open`;
+}
+
 function commaList(values) {
   return Array.isArray(values) && values.length > 0 ? values.join(',') : '';
 }
@@ -1236,8 +1247,8 @@ async function buildCommands(manifest) {
   ];
 
   const adminSetupTxs = [];
-  const adminPayoutTxs = [];
   const providerLifecycleCommands = [];
+  const providerPayoutCommands = [];
   adminSetupTxs.push(txCommand({
     op: 'set_payments',
     ver: payments.version,
@@ -1289,28 +1300,35 @@ async function buildCommands(manifest) {
   }
 
   for (const provider of manifest.seed_providers || []) {
-    for (const [method, payout] of Object.entries(provider.payouts || {})) {
-      adminPayoutTxs.push(txCommand({
-        op: 'set_provider_payout',
-        provider: provider.provider_pubkey,
-        payout_addr: payout.addr,
-        payout_method: method,
-        ...(payout.currency ? { payout_currency: payout.currency } : {}),
-      }));
-    }
+    const home = providerHomePlaceholder(provider.provider_pubkey);
+    const rpcUrl = manifest.admin?.rpc_url || '<peer-rpc-url>';
+    providerLifecycleCommands.push(`# provider ${provider.provider_pubkey}: run from this provider wallet; submits free signed Mayhem Feature records`);
     for (const join of provider.joins || []) {
-      providerLifecycleCommands.push(`# provider ${provider.provider_pubkey}: run from this provider wallet; submits free signed Mayhem Feature records`);
       const roomIds = [];
       for (const roomRef of join.rooms || []) {
         const room = roomByLabel.get(roomRef);
         roomIds.push(room?.room_id || `<room_id returned by open_room for ${roomRef}>`);
       }
       providerLifecycleCommands.push(providerJoinCommand({
-        home: providerHomePlaceholder(provider.provider_pubkey),
-        rpcUrl: manifest.admin?.rpc_url || '<peer-rpc-url>',
+        home,
+        rpcUrl,
         enclaveId: join.enclave_id,
         rooms: roomIds,
       }));
+    }
+    const acceptedRails = providerPaymentRails.filter((rail) => provider.accepted_rails?.includes(rail));
+    providerPayoutCommands.push(`# provider ${provider.provider_pubkey}: choose rails and bind verified payout destinations without an admin transaction`);
+    providerPayoutCommands.push(providerRailsCommand({ home, rpcUrl, rails: acceptedRails }));
+    for (const rail of acceptedRails) {
+      if (rail === 'fiat') {
+        providerPayoutCommands.push(providerStripeOnboardCommand({
+          home,
+          rpcUrl,
+          country: provider.stripe_country,
+        }));
+      } else {
+        providerPayoutCommands.push(providerPayoutCommand({ home, rpcUrl, rail }));
+      }
     }
   }
 
@@ -1324,23 +1342,23 @@ async function buildCommands(manifest) {
   return {
     boot,
     adminTxs: adminSetupTxs,
-    providerCommands: providerLifecycleCommands,
-    adminSetupTxs,
-    adminPayoutTxs,
-    providerLifecycleCommands,
-    allTxs: [
-      ...adminSetupTxs,
-      ...adminPayoutTxs,
+    providerCommands: [
+      ...providerLifecycleCommands,
+      ...providerPayoutCommands,
     ],
+    adminSetupTxs,
+    providerLifecycleCommands,
+    providerPayoutCommands,
+    allTxs: [...adminSetupTxs],
     allCommands: [
       ...adminSetupTxs,
       ...providerLifecycleCommands,
-      ...adminPayoutTxs,
+      ...providerPayoutCommands,
     ],
     orderedCommands: [
       { label: 'admin canonical setup commands', commands: adminSetupTxs },
       { label: 'provider lifecycle feature commands', commands: providerLifecycleCommands },
-      { label: 'admin provider payout commands', commands: adminPayoutTxs },
+      { label: 'provider payment-rail and payout commands', commands: providerPayoutCommands },
     ],
     checkoutCommands,
     emergencyBan: txCommand({

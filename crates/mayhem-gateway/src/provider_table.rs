@@ -1,6 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use mayhem_proto::{MoneyAu, ReceiptUsage};
+use mayhem_proto::{
+    AttestationMeasurementLayer, AttestationVerifierProfile, HardwareQuoteKind, MoneyAu,
+    ReceiptUsage,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -65,6 +68,36 @@ pub struct ContractProviderSnapshot {
     pub hardware_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_key: Option<String>,
+    #[serde(default)]
+    pub attestation_policy: RouteAttestationPolicyReadiness,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RouteAttestationPolicyReadiness {
+    pub attestation_tier: u8,
+    pub policy_required: bool,
+    pub locally_ready: bool,
+    #[serde(default)]
+    pub tpm_activation_pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote_kind: Option<HardwareQuoteKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_effective_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluated_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_profile: Option<AttestationVerifierProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_schema_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub required_measurement_layers: BTreeSet<AttestationMeasurementLayer>,
+    pub runtime_binary_hash_evidence_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -139,6 +172,32 @@ pub struct ProviderTableEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BaselineRouteRequirements {
+    pub current_rules_ver: u64,
+    pub requires_transport_peer: bool,
+    pub now_millis: u64,
+    pub max_attestation_head_age_millis: u64,
+    pub heartbeat_ttl_millis: u64,
+    pub saturation_cutoff: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BaselineRouteState {
+    Live,
+    ConsentVersion,
+    CircuitOpen,
+    AttestationPolicyNotReady,
+    HeartbeatMissing,
+    HeartbeatStale,
+    TransportPeerMissing,
+    Draining,
+    Saturated,
+    AtCapacity,
+    AttestationMissing,
+    AttestationStale,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RequestRequirements {
     pub current_rules_ver: u64,
     pub min_reputation: f64,
@@ -182,6 +241,7 @@ pub struct ModalityRequestLoad {
 pub enum IneligibilityReason {
     ConsentVersion,
     Reputation,
+    AttestationPolicy,
     HeartbeatMissing,
     HeartbeatStale,
     TransportPeerMissing,
@@ -245,6 +305,7 @@ pub struct LcgBalancerRng {
 struct LiveHeartbeat {
     heartbeat: ProviderHeartbeat,
     received_at_millis: u64,
+    freshness_at_millis: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -290,6 +351,100 @@ impl ProviderKey {
 impl Default for ProviderTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Default for BaselineRouteRequirements {
+    fn default() -> Self {
+        Self {
+            current_rules_ver: 1,
+            requires_transport_peer: false,
+            now_millis: 0,
+            max_attestation_head_age_millis: DEFAULT_ATTESTATION_HEAD_MAX_AGE_MILLIS,
+            heartbeat_ttl_millis: DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
+            saturation_cutoff: DEFAULT_SATURATION_CUTOFF,
+        }
+    }
+}
+
+impl Default for RouteAttestationPolicyReadiness {
+    fn default() -> Self {
+        Self::not_required(1)
+    }
+}
+
+impl RouteAttestationPolicyReadiness {
+    pub fn not_required(attestation_tier: u8) -> Self {
+        Self {
+            attestation_tier,
+            policy_required: false,
+            locally_ready: true,
+            tpm_activation_pending: false,
+            quote_kind: None,
+            policy_sequence: None,
+            policy_digest: None,
+            policy_effective_epoch: None,
+            evaluated_epoch: None,
+            verifier_profile: None,
+            evidence_schema_version: None,
+            required_measurement_layers: BTreeSet::new(),
+            runtime_binary_hash_evidence_only: true,
+            reason: None,
+        }
+    }
+
+    pub fn unavailable(attestation_tier: u8, reason: impl Into<String>) -> Self {
+        Self {
+            attestation_tier,
+            policy_required: true,
+            locally_ready: false,
+            tpm_activation_pending: false,
+            quote_kind: None,
+            policy_sequence: None,
+            policy_digest: None,
+            policy_effective_epoch: None,
+            evaluated_epoch: None,
+            verifier_profile: None,
+            evidence_schema_version: None,
+            required_measurement_layers: BTreeSet::new(),
+            runtime_binary_hash_evidence_only: true,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
+impl From<&RequestRequirements> for BaselineRouteRequirements {
+    fn from(request: &RequestRequirements) -> Self {
+        Self {
+            current_rules_ver: request.current_rules_ver,
+            requires_transport_peer: request.requires_transport_peer,
+            now_millis: request.now_millis,
+            max_attestation_head_age_millis: request.max_attestation_head_age_millis,
+            heartbeat_ttl_millis: request.heartbeat_ttl_millis,
+            saturation_cutoff: request.saturation_cutoff,
+        }
+    }
+}
+
+impl BaselineRouteState {
+    pub fn is_live(self) -> bool {
+        self == Self::Live
+    }
+
+    fn ineligibility_reason(self) -> Option<IneligibilityReason> {
+        match self {
+            Self::Live => None,
+            Self::ConsentVersion => Some(IneligibilityReason::ConsentVersion),
+            Self::CircuitOpen => Some(IneligibilityReason::CircuitOpen),
+            Self::AttestationPolicyNotReady => Some(IneligibilityReason::AttestationPolicy),
+            Self::HeartbeatMissing => Some(IneligibilityReason::HeartbeatMissing),
+            Self::HeartbeatStale => Some(IneligibilityReason::HeartbeatStale),
+            Self::TransportPeerMissing => Some(IneligibilityReason::TransportPeerMissing),
+            Self::Draining => Some(IneligibilityReason::Draining),
+            Self::Saturated | Self::AtCapacity => Some(IneligibilityReason::Saturated),
+            Self::AttestationMissing => Some(IneligibilityReason::AttestationMissing),
+            Self::AttestationStale => Some(IneligibilityReason::AttestationStale),
+        }
     }
 }
 
@@ -396,18 +551,31 @@ impl ProviderTable {
 
     pub fn upsert_heartbeat(&mut self, heartbeat: ProviderHeartbeat, received_at_millis: u64) {
         let key = ProviderKey::from_heartbeat(&heartbeat);
+        if self
+            .heartbeats
+            .get(&key)
+            .is_some_and(|live| heartbeat.ts < live.heartbeat.ts)
+        {
+            return;
+        }
+        let freshness_at_millis = if heartbeat.sig.is_empty() {
+            received_at_millis
+        } else {
+            heartbeat.ts.min(received_at_millis)
+        };
         self.upsert_attestation_head(
             &heartbeat.provider,
             &heartbeat.enclave_id,
             heartbeat.att.head.clone(),
             heartbeat.att.epoch,
-            received_at_millis,
+            freshness_at_millis,
         );
         self.heartbeats.insert(
             key,
             LiveHeartbeat {
                 heartbeat,
                 received_at_millis,
+                freshness_at_millis,
             },
         );
     }
@@ -420,7 +588,7 @@ impl ProviderTable {
         let key = ProviderKey::from_heartbeat(&heartbeat);
         if self.heartbeats.get(&key).is_some_and(|live| {
             !live.heartbeat.sig.is_empty()
-                && received_at_millis.saturating_sub(live.received_at_millis)
+                && received_at_millis.saturating_sub(live.freshness_at_millis)
                     <= self.heartbeat_ttl_millis
         }) {
             return;
@@ -520,7 +688,7 @@ impl ProviderTable {
         now_millis: u64,
     ) -> Option<ProviderCapacityMismatchEvent> {
         let live = self.heartbeats.get(key)?;
-        if now_millis.saturating_sub(live.received_at_millis) > self.heartbeat_ttl_millis {
+        if now_millis.saturating_sub(live.freshness_at_millis) > self.heartbeat_ttl_millis {
             return None;
         }
         let heartbeat = &live.heartbeat;
@@ -563,10 +731,10 @@ impl ProviderTable {
             .map(|(key, contract)| {
                 let live = self.heartbeats.get(key);
                 let heartbeat_age_millis =
-                    live.map(|live| now_millis.saturating_sub(live.received_at_millis));
+                    live.map(|live| now_millis.saturating_sub(live.freshness_at_millis));
                 let heartbeat = live
                     .filter(|live| {
-                        now_millis.saturating_sub(live.received_at_millis)
+                        now_millis.saturating_sub(live.freshness_at_millis)
                             <= self.heartbeat_ttl_millis
                     })
                     .map(|live| live.heartbeat.clone());
@@ -601,6 +769,12 @@ impl ProviderTable {
         self.heartbeats.len()
     }
 
+    pub fn heartbeat_matches(&self, key: &ProviderKey, ts: u64, nonce: &str) -> bool {
+        self.heartbeats
+            .get(key)
+            .is_some_and(|live| live.heartbeat.ts == ts && live.heartbeat.nonce.as_str() == nonce)
+    }
+
     fn upsert_attestation_head(
         &mut self,
         provider: &str,
@@ -629,6 +803,66 @@ impl ProviderTable {
     }
 }
 
+pub fn baseline_route_state(
+    entry: &ProviderTableEntry,
+    requirements: &BaselineRouteRequirements,
+) -> BaselineRouteState {
+    if entry.contract.consent_ver != requirements.current_rules_ver {
+        return BaselineRouteState::ConsentVersion;
+    }
+    if entry
+        .observed
+        .circuit_open_until_millis
+        .is_some_and(|until| until > requirements.now_millis)
+    {
+        return BaselineRouteState::CircuitOpen;
+    }
+    if entry.contract.attestation_policy.policy_required
+        && !entry.contract.attestation_policy.locally_ready
+    {
+        return BaselineRouteState::AttestationPolicyNotReady;
+    }
+    let Some(heartbeat) = entry.heartbeat.as_ref() else {
+        return if entry
+            .heartbeat_age_millis
+            .is_some_and(|age| age > requirements.heartbeat_ttl_millis)
+        {
+            BaselineRouteState::HeartbeatStale
+        } else {
+            BaselineRouteState::HeartbeatMissing
+        };
+    };
+    if entry
+        .heartbeat_age_millis
+        .is_none_or(|age| age > requirements.heartbeat_ttl_millis)
+    {
+        return BaselineRouteState::HeartbeatStale;
+    }
+    if requirements.requires_transport_peer && heartbeat.transport_peer.is_none() {
+        return BaselineRouteState::TransportPeerMissing;
+    }
+    if !heartbeat.accepting_new {
+        return BaselineRouteState::Draining;
+    }
+    if heartbeat.sat >= requirements.saturation_cutoff {
+        return BaselineRouteState::Saturated;
+    }
+    if heartbeat.slots.active >= heartbeat.slots.max || heartbeat.q.free_slots == 0 {
+        return BaselineRouteState::AtCapacity;
+    }
+    let Some(attestation) = entry.attestation_head.as_ref() else {
+        return BaselineRouteState::AttestationMissing;
+    };
+    if requirements
+        .now_millis
+        .saturating_sub(attestation.observed_at_millis)
+        > requirements.max_attestation_head_age_millis
+    {
+        return BaselineRouteState::AttestationStale;
+    }
+    BaselineRouteState::Live
+}
+
 pub fn evaluate_eligibility(
     entry: &ProviderTableEntry,
     request: &RequestRequirements,
@@ -639,32 +873,15 @@ pub fn evaluate_eligibility(
     if entry.contract.reputation < request.min_reputation {
         return Err(IneligibilityReason::Reputation);
     }
-    if entry
-        .observed
-        .circuit_open_until_millis
-        .is_some_and(|until| until > request.now_millis)
+    if let Some(reason) = baseline_route_state(entry, &BaselineRouteRequirements::from(request))
+        .ineligibility_reason()
     {
-        return Err(IneligibilityReason::CircuitOpen);
+        return Err(reason);
     }
     let heartbeat = entry
         .heartbeat
         .as_ref()
         .ok_or(IneligibilityReason::HeartbeatMissing)?;
-    let heartbeat_age = entry
-        .heartbeat_age_millis
-        .ok_or(IneligibilityReason::HeartbeatMissing)?;
-    if heartbeat_age > request.heartbeat_ttl_millis {
-        return Err(IneligibilityReason::HeartbeatStale);
-    }
-    if request.requires_transport_peer && heartbeat.transport_peer.is_none() {
-        return Err(IneligibilityReason::TransportPeerMissing);
-    }
-    if !heartbeat.accepting_new {
-        return Err(IneligibilityReason::Draining);
-    }
-    if heartbeat.sat >= request.saturation_cutoff {
-        return Err(IneligibilityReason::Saturated);
-    }
     if request.requires_tools && !heartbeat.caps.tools
         || request.requires_json && !heartbeat.caps.json
         || request.requires_vision && !heartbeat.caps.vision
@@ -768,16 +985,6 @@ pub fn evaluate_eligibility(
             return Err(IneligibilityReason::ProbationPriceCap);
         }
     }
-    let attestation = entry
-        .attestation_head
-        .as_ref()
-        .ok_or(IneligibilityReason::AttestationMissing)?;
-    let attestation_age = request
-        .now_millis
-        .saturating_sub(attestation.observed_at_millis);
-    if attestation_age > request.max_attestation_head_age_millis {
-        return Err(IneligibilityReason::AttestationStale);
-    }
     Ok(estimated_price_au)
 }
 
@@ -855,6 +1062,34 @@ pub fn eligible_candidates(
         .collect::<Vec<_>>();
     apply_capacity_group_factors(&mut candidates);
     candidates
+}
+
+/// Select routes for the one-time buyer-side TPM ownership handshake while
+/// preserving every ordinary route gate except the explicit activation-pending
+/// state. The returned entries remain marked not-ready and cannot be used for
+/// inference until activation completes and the normal table is rebuilt.
+pub fn eligible_tpm_activation_candidates(
+    entries: &[ProviderTableEntry],
+    request: &RequestRequirements,
+    weights: &SelectionWeights,
+) -> Vec<SelectionCandidate> {
+    let activation_entries = entries
+        .iter()
+        .filter(|entry| {
+            entry.contract.attestation_policy.policy_required
+                && !entry.contract.attestation_policy.locally_ready
+                && entry.contract.attestation_policy.tpm_activation_pending
+                && entry.contract.attestation_policy.quote_kind
+                    == Some(HardwareQuoteKind::Tpm2QuoteEk)
+        })
+        .cloned()
+        .map(|mut entry| {
+            entry.contract.attestation_policy.locally_ready = true;
+            entry.contract.attestation_policy.tpm_activation_pending = false;
+            entry
+        })
+        .collect::<Vec<_>>();
+    eligible_candidates(&activation_entries, request, weights)
 }
 
 pub fn select_weighted_p2c(
@@ -1224,6 +1459,7 @@ mod tests {
             attestation_head: None,
             hardware_fingerprint: None,
             device_key: None,
+            attestation_policy: RouteAttestationPolicyReadiness::not_required(1),
         }
     }
 
@@ -1247,6 +1483,7 @@ mod tests {
             attestation_head: None,
             hardware_fingerprint: None,
             device_key: None,
+            attestation_policy: RouteAttestationPolicyReadiness::not_required(1),
         }
     }
 
@@ -1725,6 +1962,188 @@ mod tests {
             expired[0].heartbeat_age_millis,
             Some(DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS + 1)
         );
+    }
+
+    #[test]
+    fn provider_table_ages_signed_heartbeats_from_the_signed_timestamp() {
+        let signed_at = 1_000_000;
+        let received_at = signed_at + 30_000;
+        let mut table = ProviderTable::new();
+        table.upsert_contract(contract_record());
+        table.upsert_heartbeat(heartbeat(signed_at, 7, "11"), received_at);
+
+        let live = table.entries(signed_at + DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS);
+        assert!(live[0].heartbeat.is_some());
+        assert_eq!(
+            live[0].heartbeat_age_millis,
+            Some(DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS)
+        );
+
+        let expired = table.entries(signed_at + DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS + 1);
+        assert!(expired[0].heartbeat.is_none());
+        assert_eq!(
+            expired[0].heartbeat_age_millis,
+            Some(DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS + 1)
+        );
+    }
+
+    #[test]
+    fn provider_table_rejects_older_heartbeat_overwrites() {
+        let now = 1_000_000;
+        let mut table = ProviderTable::new();
+        table.upsert_contract(contract_record());
+        table.upsert_heartbeat(heartbeat(now + 100, 8, "33"), now + 100);
+
+        let mut older = heartbeat(now + 50, 9, "44");
+        older.accepting_new = false;
+        table.upsert_heartbeat(older, now + 200);
+
+        let entry = table.entries(now + 200).pop().expect("provider entry");
+        let retained = entry.heartbeat.expect("newest heartbeat remains live");
+        assert_eq!(retained.ts, now + 100);
+        assert!(retained.accepting_new);
+        let attestation = table
+            .attestation_head(&entry.key.provider, &entry.key.enclave_id)
+            .expect("attestation cache");
+        assert_eq!(attestation.epoch, 8);
+        assert_eq!(attestation.head, "33".repeat(32));
+    }
+
+    #[test]
+    fn baseline_route_state_and_eligibility_share_capacity_truth() {
+        let now = 1_000_000;
+        let mut entry = entry_for(1, now, 0.2, 100);
+        entry.heartbeat.as_mut().expect("heartbeat").q.free_slots = 0;
+        let request = eligible_request(now + 1);
+
+        assert_eq!(
+            baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)),
+            BaselineRouteState::AtCapacity
+        );
+        assert_eq!(
+            evaluate_eligibility(&entry, &request),
+            Err(IneligibilityReason::Saturated)
+        );
+    }
+
+    #[test]
+    fn attestation_policy_readiness_is_a_local_hard_route_gate() {
+        let now = 1_000_000;
+        let mut entry = entry_for(1, now, 0.2, 100);
+        entry.contract.attestation_policy =
+            RouteAttestationPolicyReadiness::unavailable(2, "policy digest mismatch");
+        let request = eligible_request(now + 1);
+
+        assert_eq!(
+            baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)),
+            BaselineRouteState::AttestationPolicyNotReady
+        );
+        assert_eq!(
+            evaluate_eligibility(&entry, &request),
+            Err(IneligibilityReason::AttestationPolicy)
+        );
+        assert!(eligible_candidates(&[entry], &request, &SelectionWeights::default()).is_empty());
+    }
+
+    #[test]
+    fn selector_truth_matrix_rejects_every_dynamic_routing_gate() {
+        let now = 1_000_000;
+        let base = entry_for(1, now, 0.2, 100);
+        let request = eligible_request(now + 1);
+        assert!(evaluate_eligibility(&base, &request).is_ok());
+
+        let mut cases = Vec::new();
+
+        let mut stale = base.clone();
+        stale.heartbeat = None;
+        stale.heartbeat_age_millis = Some(request.heartbeat_ttl_millis + 1);
+        cases.push((
+            "freshness",
+            stale,
+            request.clone(),
+            IneligibilityReason::HeartbeatStale,
+        ));
+
+        let mut draining = base.clone();
+        draining
+            .heartbeat
+            .as_mut()
+            .expect("heartbeat")
+            .accepting_new = false;
+        cases.push((
+            "accepting",
+            draining,
+            request.clone(),
+            IneligibilityReason::Draining,
+        ));
+
+        let mut saturated = base.clone();
+        saturated.heartbeat.as_mut().expect("heartbeat").sat = request.saturation_cutoff;
+        cases.push((
+            "saturation",
+            saturated,
+            request.clone(),
+            IneligibilityReason::Saturated,
+        ));
+
+        let mut at_capacity = base.clone();
+        at_capacity
+            .heartbeat
+            .as_mut()
+            .expect("heartbeat")
+            .q
+            .free_slots = 0;
+        cases.push((
+            "capacity",
+            at_capacity,
+            request.clone(),
+            IneligibilityReason::Saturated,
+        ));
+
+        let mut missing_tools = base.clone();
+        missing_tools
+            .heartbeat
+            .as_mut()
+            .expect("heartbeat")
+            .caps
+            .tools = false;
+        cases.push((
+            "capability",
+            missing_tools,
+            request.clone(),
+            IneligibilityReason::Capabilities,
+        ));
+
+        let mut short_context = base.clone();
+        short_context
+            .heartbeat
+            .as_mut()
+            .expect("heartbeat")
+            .caps
+            .ctx = request.min_ctx - 1;
+        cases.push((
+            "context",
+            short_context,
+            request.clone(),
+            IneligibilityReason::Capabilities,
+        ));
+
+        let mut circuit_open = base.clone();
+        circuit_open.observed.circuit_open_until_millis = Some(request.now_millis + 1);
+        cases.push((
+            "circuit breaker",
+            circuit_open,
+            request.clone(),
+            IneligibilityReason::CircuitOpen,
+        ));
+
+        for (gate, entry, requirements, expected) in cases {
+            assert_eq!(
+                evaluate_eligibility(&entry, &requirements),
+                Err(expected),
+                "{gate} must agree with selector truth"
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod attestation_policy;
 pub mod audit;
 pub mod failover;
 mod job_store;
@@ -7,6 +8,7 @@ pub mod openai;
 pub mod pricing;
 pub mod provider_table;
 pub mod reputation;
+pub use attestation_policy::*;
 pub use audit::*;
 pub use failover::*;
 pub use pricing::*;
@@ -18,19 +20,23 @@ use std::{
     io::{Read, Write},
     path::PathBuf,
     process::{Command, Stdio},
-    time::Duration,
+    sync::mpsc::{self, RecvTimeoutError},
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use jsonwebtoken::{
     decode, decode_header,
     jwk::{JwkSet, KeyAlgorithm},
-    Algorithm, DecodingKey, Validation,
+    Algorithm, DecodingKey, Header, Validation,
 };
+use mayhem_attestation::{verify_tpm_hardware_quote, TpmVerificationMaterials};
 use mayhem_proto::{
     attestation_report_head, attestation_signing_bytes, catalog_enclave_id, hardware_quote_binding,
-    AttestationReport, AttestationSigner, CatalogEnclaveIdentity, HardwareQuote, HardwareQuoteKind,
-    MoneyAu, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    AttestationMeasurementLayer, AttestationReport, AttestationSigner, CatalogEnclaveIdentity,
+    HardwareQuote, HardwareQuoteKind, MoneyAu, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
+    CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -52,6 +58,8 @@ pub const MAX_HARDWARE_QUOTE_ENDORSEMENTS_BYTES: usize = 256 * 1024;
 pub const MAX_HARDWARE_QUOTE_METADATA_BYTES: usize = 256 * 1024;
 pub const MAX_HARDWARE_QUOTE_METADATA_DEPTH: usize = 32;
 pub const MAX_HARDWARE_QUOTE_METADATA_NODES: usize = 16_384;
+pub const MAX_HARDWARE_QUOTE_VERIFIER_OUTPUT_BYTES: usize = 256 * 1024;
+pub const HARDWARE_QUOTE_VERIFIER_PIPE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_NVIDIA_EAT_DEPTH: usize = 32;
 pub const MAX_NVIDIA_EAT_NODES: usize = 16_384;
 pub const MAX_NVIDIA_EAT_TOKENS: usize = 64;
@@ -117,6 +125,10 @@ pub enum GatewayError {
     HardwareQuoteTrustRootMissing { kind: String },
     #[error("hardware quote kind {kind} is invalid: {reason}")]
     HardwareQuoteInvalid { kind: String, reason: String },
+    #[error("hardware quote kind {kind} requires an exact active admin attestation policy")]
+    HardwareQuotePolicyRequired { kind: String },
+    #[error("provider-supplied hardware quote trust material is forbidden for {kind}")]
+    ProviderTrustMaterialRejected { kind: String },
     #[error("heartbeat JSON error: {0}")]
     HeartbeatJson(String),
     #[error("heartbeat must have t=\"hb\" and v={expected_version}")]
@@ -176,6 +188,7 @@ pub struct AttestationVerificationRequest<'a> {
     pub trusted_nvidia_nras_jwks: Option<&'a Value>,
     pub trusted_nvidia_offline_jwks: Option<&'a Value>,
     pub hardware_quote_verifier_command: Option<&'a HardwareQuoteVerifierCommand>,
+    pub attestation_policy: Option<&'a AttestationPolicyVerificationContext<'a>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,6 +200,7 @@ pub struct VerifiedAttestation {
     pub boot_epoch: u64,
     pub report_ts: u64,
     pub att_tier: u8,
+    pub runtime_binary_hash: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -332,6 +346,7 @@ impl<'a> AttestationVerificationRequest<'a> {
             trusted_nvidia_nras_jwks: None,
             trusted_nvidia_offline_jwks: None,
             hardware_quote_verifier_command: None,
+            attestation_policy: None,
         }
     }
 }
@@ -548,6 +563,7 @@ pub fn verify_tier1_attestation(
         boot_epoch: report.boot_epoch,
         report_ts: report.report_ts,
         att_tier: report.att_tier,
+        runtime_binary_hash: report.binary_hash.clone(),
     })
 }
 
@@ -589,53 +605,180 @@ fn verify_hardware_quote(request: &AttestationVerificationRequest<'_>) -> Result
         });
     }
     let kind = hardware_quote_kind_name(&quote.kind);
-    if quote.kind.attestation_tier() >= 3 && request.hardware_quote_verifier_command.is_none() {
-        return Err(hardware_quote_invalid(
-            kind,
-            "Tier-3 confidential compute requires an admin hardware quote verifier command that checks GPU/CPU roots and golden launch measurements",
-        ));
-    }
-    if matches!(quote.kind, HardwareQuoteKind::Tpm2QuoteEk)
-        && request.hardware_quote_verifier_command.is_none()
+    if request.trusted_apple_app_attest_jwks.is_some()
+        || request.trusted_nvidia_gb10_device_jwks.is_some()
+        || request.trusted_nvidia_nras_jwks.is_some()
+        || request.trusted_nvidia_offline_jwks.is_some()
+        || quote_metadata_contains_trust_material(&quote.metadata)
     {
-        return Err(hardware_quote_invalid(
-            kind,
-            "TPM 2.0 EK quotes require an admin hardware quote verifier command that validates the EK certificate chain, TPM quote signature, nonce binding, and EK device key",
-        ));
+        return Err(GatewayError::ProviderTrustMaterialRejected {
+            kind: kind.to_owned(),
+        });
     }
-    if let Some(verifier) = request.hardware_quote_verifier_command {
-        return verify_hardware_quote_with_command(request, quote, &expected, verifier);
-    }
+    let context =
+        request
+            .attestation_policy
+            .ok_or_else(|| GatewayError::HardwareQuotePolicyRequired {
+                kind: kind.to_owned(),
+            })?;
+    let managed_kind = matches!(
+        quote.kind,
+        HardwareQuoteKind::AmdSevSnpVcek
+            | HardwareQuoteKind::IntelTdxDcap
+            | HardwareQuoteKind::NvidiaNrasJwt
+            | HardwareQuoteKind::NvidiaNvtrustOfflineJwt
+    );
+    let authenticated_managed = if managed_kind {
+        request
+            .hardware_quote_verifier_command
+            .map(|verifier| {
+                attestation_policy::authenticate_managed_verifier(context, quote.kind, verifier)
+                    .map_err(|reason| hardware_quote_invalid(kind, reason))
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let resolved = attestation_policy::resolve_attestation_policy(
+        context,
+        quote.kind,
+        &request.report.nonce_u,
+        &request.report.enclave_id,
+        &expected,
+        authenticated_managed.as_ref(),
+    )
+    .map_err(|reason| hardware_quote_invalid(kind, reason))?;
+    let evidence_nonce = hex::encode(
+        resolved
+            .evidence_binding
+            .digest()
+            .map_err(|err| hardware_quote_invalid(kind, err.to_string()))?,
+    );
+
     match quote.kind {
-        HardwareQuoteKind::AppleAppAttestJwt => verify_apple_app_attest_quote(
-            &quote.evidence,
-            request.trusted_apple_app_attest_jwks,
-            &expected,
-            request.report,
-        ),
-        HardwareQuoteKind::AmdSevSnpVcek => Err(GatewayError::HardwareQuoteUnsupported {
-            kind: "amd_sev_snp_vcek".to_owned(),
-        }),
-        HardwareQuoteKind::IntelTdxDcap => Err(GatewayError::HardwareQuoteUnsupported {
-            kind: "intel_tdx_dcap".to_owned(),
-        }),
-        HardwareQuoteKind::NvidiaGb10DeviceJwt => verify_nvidia_gb10_device_quote(
-            &quote.evidence,
-            request.trusted_nvidia_gb10_device_jwks,
-            &expected,
-            request.report,
-        ),
-        HardwareQuoteKind::NvidiaNrasJwt => {
-            verify_nvidia_nras_quote(&quote.evidence, request.trusted_nvidia_nras_jwks, &expected)
+        HardwareQuoteKind::AppleAppAttestJwt => {
+            let jwks = attestation_policy::policy_jwks(&resolved, context.collateral)
+                .map_err(|reason| hardware_quote_invalid(kind, reason))?;
+            verify_apple_app_attest_quote(
+                &quote.evidence,
+                Some(&jwks),
+                &evidence_nonce,
+                request.report,
+            )
         }
-        HardwareQuoteKind::NvidiaNvtrustOfflineJwt => verify_nvidia_nvtrust_offline_quote(
-            &quote.evidence,
-            request.trusted_nvidia_offline_jwks,
-            &expected,
-        ),
-        HardwareQuoteKind::Tpm2QuoteEk => Err(GatewayError::HardwareQuoteUnsupported {
-            kind: "tpm2_quote_ek".to_owned(),
-        }),
+        HardwareQuoteKind::AmdSevSnpVcek | HardwareQuoteKind::IntelTdxDcap => {
+            let verifier = request.hardware_quote_verifier_command.ok_or_else(|| {
+                GatewayError::HardwareQuoteUnsupported {
+                    kind: kind.to_owned(),
+                }
+            })?;
+            verify_hardware_quote_with_command(
+                request,
+                quote,
+                &evidence_nonce,
+                verifier,
+                &resolved,
+                authenticated_managed
+                    .as_ref()
+                    .expect("managed dispatch was authenticated"),
+            )
+        }
+        HardwareQuoteKind::NvidiaGb10DeviceJwt => {
+            let jwks = attestation_policy::policy_jwks(&resolved, context.collateral)
+                .map_err(|reason| hardware_quote_invalid(kind, reason))?;
+            verify_nvidia_gb10_device_quote(
+                &quote.evidence,
+                Some(&jwks),
+                &evidence_nonce,
+                request.report,
+            )
+        }
+        HardwareQuoteKind::NvidiaNrasJwt => {
+            let jwks = attestation_policy::policy_jwks(&resolved, context.collateral)
+                .map_err(|reason| hardware_quote_invalid(kind, reason))?;
+            verify_nvidia_nras_quote(&quote.evidence, Some(&jwks), &expected)?;
+            let verifier = request.hardware_quote_verifier_command.ok_or_else(|| {
+                GatewayError::HardwareQuoteUnsupported {
+                    kind: kind.to_owned(),
+                }
+            })?;
+            verify_hardware_quote_with_command(
+                request,
+                quote,
+                &evidence_nonce,
+                verifier,
+                &resolved,
+                authenticated_managed
+                    .as_ref()
+                    .expect("managed dispatch was authenticated"),
+            )
+        }
+        HardwareQuoteKind::NvidiaNvtrustOfflineJwt => {
+            let jwks = attestation_policy::policy_jwks(&resolved, context.collateral)
+                .map_err(|reason| hardware_quote_invalid(kind, reason))?;
+            verify_nvidia_nvtrust_offline_quote(&quote.evidence, Some(&jwks), &expected)?;
+            let verifier = request.hardware_quote_verifier_command.ok_or_else(|| {
+                GatewayError::HardwareQuoteUnsupported {
+                    kind: kind.to_owned(),
+                }
+            })?;
+            verify_hardware_quote_with_command(
+                request,
+                quote,
+                &evidence_nonce,
+                verifier,
+                &resolved,
+                authenticated_managed
+                    .as_ref()
+                    .expect("managed dispatch was authenticated"),
+            )
+        }
+        HardwareQuoteKind::Tpm2QuoteEk => {
+            let activated = context.activated_tpm_identity.ok_or_else(|| {
+                hardware_quote_invalid(
+                    kind,
+                    "native TPM verification requires a completed gateway ActivateCredential identity",
+                )
+            })?;
+            let materials = TpmVerificationMaterials::from_policy(
+                resolved.policy,
+                context.collateral,
+                request.now_ts,
+            )
+            .map_err(|err| hardware_quote_invalid(kind, err.to_string()))?;
+            verify_tpm_hardware_quote(
+                quote,
+                &resolved.evidence_binding,
+                activated,
+                &materials,
+                request.now_ts,
+            )
+            .map_err(|err| hardware_quote_invalid(kind, err.to_string()))?;
+            Ok(())
+        }
+    }
+}
+
+fn quote_metadata_contains_trust_material(metadata: &Value) -> bool {
+    const FORBIDDEN: [&str; 8] = [
+        "jku",
+        "jwk",
+        "jwks",
+        "x5u",
+        "trust_root",
+        "trust_roots",
+        "policy",
+        "verifier",
+    ];
+    match metadata {
+        Value::Array(values) => values.iter().any(quote_metadata_contains_trust_material),
+        Value::Object(object) => {
+            object
+                .keys()
+                .any(|field| FORBIDDEN.contains(&field.as_str()))
+                || object.values().any(quote_metadata_contains_trust_material)
+        }
+        _ => false,
     }
 }
 
@@ -812,8 +955,6 @@ struct HardwareQuoteVerifierCommandOutput {
     #[serde(default)]
     gpu_vbios: Option<String>,
     #[serde(default)]
-    device_key: Option<String>,
-    #[serde(default)]
     alert: Value,
 }
 
@@ -822,6 +963,8 @@ fn verify_hardware_quote_with_command(
     quote: &HardwareQuote,
     expected_binding: &str,
     verifier: &HardwareQuoteVerifierCommand,
+    resolved: &attestation_policy::ResolvedAttestationPolicy<'_>,
+    authenticated: &attestation_policy::AuthenticatedManagedVerifier,
 ) -> Result<()> {
     const KIND: &str = "external_verifier";
     if verifier.timeout.is_zero() {
@@ -832,9 +975,34 @@ fn verify_hardware_quote_with_command(
     }
     let kind = hardware_quote_kind_name(&quote.kind);
     let golden_measurements = golden_tier3_measurements(&request.contract.launch_measurements);
+    let policy_measurements = attestation_policy::policy_measurement_json(
+        resolved,
+        request
+            .attestation_policy
+            .expect("managed verification requires policy context")
+            .collateral,
+    )
+    .map_err(|reason| hardware_quote_invalid(kind, reason))?;
     let declared_platform = if quote.kind.attestation_tier() >= 3 {
-        let platform = tier3_quote_platform_id(kind, quote)?;
+        let platform = resolved
+            .evidence_binding
+            .platform
+            .as_deref()
+            .ok_or_else(|| hardware_quote_invalid(kind, "admin policy binding has no platform"))?;
         require_tier3_workload_measurements(kind, &golden_measurements)?;
+        let policy_workload = policy_measurements
+            .get(&AttestationMeasurementLayer::Workload)
+            .map(golden_tier3_measurements)
+            .unwrap_or_default();
+        require_tier3_workload_measurements(kind, &policy_workload)?;
+        if golden_measurements.get(TIER3_WORKLOAD_LAYER)
+            != policy_workload.get(TIER3_WORKLOAD_LAYER)
+        {
+            return Err(hardware_quote_invalid(
+                kind,
+                "contract workload measurements do not match the exact active policy binding",
+            ));
+        }
         Some(platform.to_owned())
     } else {
         None
@@ -844,6 +1012,28 @@ fn verify_hardware_quote_with_command(
         "kind": kind,
         "expected_binding": expected_binding,
         "declared_platform": declared_platform.as_deref(),
+        "evidence_binding": {
+            "kind": resolved.evidence_binding.kind.as_str(),
+            "evidence_schema_version": resolved.evidence_binding.evidence_schema_version,
+            "policy_sequence": resolved.evidence_binding.policy_sequence,
+            "policy_digest": &resolved.evidence_binding.policy_digest,
+            "platform": &resolved.evidence_binding.platform,
+            "nonce": &resolved.evidence_binding.nonce,
+            "enclave_id": &resolved.evidence_binding.enclave_id,
+            "device_id": &resolved.evidence_binding.device_id,
+            "quote_binding": &resolved.evidence_binding.quote_binding,
+        },
+        "admin_policy": {
+            "digest": resolved.policy.digest(),
+            "record": resolved.policy.policy(),
+        },
+        "admin_enclave_binding": &resolved.enclave_binding,
+        "policy_measurement_collateral": &policy_measurements,
+        "managed_verifier": {
+            "id": &authenticated.verifier_id,
+            "version": authenticated.capabilities.version,
+            "executable_sha256": &authenticated.executable_sha256,
+        },
         "golden_measurement_layers": &golden_measurements,
         "quote": quote,
         "report": request.report,
@@ -866,6 +1056,7 @@ fn verify_hardware_quote_with_command(
     })?;
     input.push(b'\n');
     let mut command = Command::new(&verifier.command);
+    configure_hardware_quote_verifier_runtime(&mut command);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -894,70 +1085,74 @@ fn verify_hardware_quote_with_command(
             ),
         )
     })?;
-    let write_result = child
+    let mut stdin = child
         .stdin
-        .as_mut()
-        .ok_or_else(|| hardware_quote_invalid(KIND, "admin verifier stdin was not available"))
-        .and_then(|stdin| {
-            stdin.write_all(&input).map_err(|err| {
-                hardware_quote_invalid(KIND, format!("admin verifier stdin write failed: {err}"))
-            })
-        });
-    drop(child.stdin.take());
-    if let Err(err) = write_result {
-        terminate_hardware_quote_verifier_process_tree(child.id());
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(err);
-    }
-    let status = match child.wait_timeout(verifier.timeout) {
-        Ok(Some(status)) => status,
+        .take()
+        .ok_or_else(|| hardware_quote_invalid(KIND, "admin verifier stdin was not available"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| hardware_quote_invalid(KIND, "admin verifier stdout was not available"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| hardware_quote_invalid(KIND, "admin verifier stderr was not available"))?;
+    let input_writer = spawn_verifier_worker(move || {
+        stdin.write_all(&input)?;
+        drop(stdin);
+        Ok::<(), std::io::Error>(())
+    });
+    let stdout_reader = spawn_bounded_verifier_reader(stdout);
+    let stderr_reader = spawn_bounded_verifier_reader(stderr);
+
+    let wait_error = match child.wait_timeout(verifier.timeout) {
+        Ok(Some(status)) => {
+            terminate_hardware_quote_verifier_process_tree(child.id());
+            (!status.success()).then(|| format!("admin verifier exited with {status}"))
+        }
         Ok(None) => {
             terminate_hardware_quote_verifier_process_tree(child.id());
             let _ = child.kill();
             let _ = child.wait();
-            return Err(hardware_quote_invalid(
-                KIND,
-                format!(
-                    "admin verifier {} timed out after {}s",
-                    verifier.command.display(),
-                    verifier.timeout.as_secs()
-                ),
-            ));
+            Some(format!(
+                "admin verifier {} timed out after {}s",
+                verifier.command.display(),
+                verifier.timeout.as_secs()
+            ))
         }
         Err(err) => {
             terminate_hardware_quote_verifier_process_tree(child.id());
             let _ = child.kill();
             let _ = child.wait();
-            return Err(hardware_quote_invalid(
-                KIND,
-                format!("admin verifier wait failed: {err}"),
-            ));
+            Some(format!("admin verifier wait failed: {err}"))
         }
     };
-    let mut stdout = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        pipe.read_to_string(&mut stdout).map_err(|err| {
-            hardware_quote_invalid(KIND, format!("admin verifier stdout read failed: {err}"))
-        })?;
-    }
-    let mut stderr = String::new();
-    if let Some(mut pipe) = child.stderr.take() {
-        pipe.read_to_string(&mut stderr).map_err(|err| {
-            hardware_quote_invalid(KIND, format!("admin verifier stderr read failed: {err}"))
-        })?;
-    }
-    if !status.success() {
+    let pipe_deadline = Instant::now() + HARDWARE_QUOTE_VERIFIER_PIPE_SHUTDOWN_TIMEOUT;
+    let input_result = finish_verifier_worker(input_writer, "stdin writer", pipe_deadline)?;
+    let stdout = finish_bounded_verifier_reader(stdout_reader, "stdout", pipe_deadline)?;
+    let stderr = finish_bounded_verifier_reader(stderr_reader, "stderr", pipe_deadline)?;
+    if let Some(wait_error) = wait_error {
         return Err(hardware_quote_invalid(
             kind,
             format!(
-                "admin verifier exited with {status}; stderr: {}",
-                short_verifier_stream(&stderr)
+                "{wait_error}; stderr: {}",
+                short_verifier_stream(&stderr.text)
             ),
         ));
     }
-    let verdict: HardwareQuoteVerifierCommandOutput =
-        serde_json::from_str(stdout.trim()).map_err(|err| {
+    input_result.map_err(|err| {
+        hardware_quote_invalid(KIND, format!("admin verifier stdin write failed: {err}"))
+    })?;
+    if stdout.exceeded || stderr.exceeded {
+        return Err(hardware_quote_invalid(
+            kind,
+            format!(
+                "admin verifier output exceeded {MAX_HARDWARE_QUOTE_VERIFIER_OUTPUT_BYTES} bytes"
+            ),
+        ));
+    }
+    let verdict: HardwareQuoteVerifierCommandOutput = serde_json::from_str(stdout.text.trim())
+        .map_err(|err| {
             hardware_quote_invalid(
                 kind,
                 format!("admin verifier stdout was not verdict JSON: {err}"),
@@ -1011,9 +1206,6 @@ fn verify_hardware_quote_with_command(
             ),
         ));
     }
-    if matches!(quote.kind, HardwareQuoteKind::Tpm2QuoteEk) {
-        verify_tpm2_verdict_device_key(kind, quote, &verdict)?;
-    }
     if quote.kind.attestation_tier() >= 3 {
         verify_verdict_matches_golden_measurement(
             kind,
@@ -1023,6 +1215,37 @@ fn verify_hardware_quote_with_command(
         )?;
     }
     Ok(())
+}
+
+fn configure_hardware_quote_verifier_runtime(command: &mut Command) {
+    command.env_clear();
+    #[cfg(unix)]
+    {
+        command
+            .current_dir("/")
+            .env("PATH", "/usr/bin:/bin")
+            .env("LANG", "C")
+            .env("LC_ALL", "C");
+    }
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var_os("SystemRoot")
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+        let system_root_path = PathBuf::from(&system_root);
+        let system32 = system_root_path.join("System32");
+        command
+            .current_dir(&system_root_path)
+            .env("SystemRoot", &system_root)
+            .env("WINDIR", &system_root)
+            .env("COMSPEC", system32.join("cmd.exe"))
+            .env("PATH", &system32)
+            .env("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        command.current_dir("/");
+    }
 }
 
 fn terminate_hardware_quote_verifier_process_tree(pid: u32) {
@@ -1048,28 +1271,101 @@ fn terminate_hardware_quote_verifier_process_tree(pid: u32) {
     let _ = pid;
 }
 
-fn tier3_quote_platform_id<'a>(kind: &'static str, quote: &'a HardwareQuote) -> Result<&'a str> {
-    let platform = quote
-        .metadata
-        .get("platform_id")
-        .or_else(|| quote.metadata.get("platform"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            hardware_quote_invalid(kind, "Tier-3 quote metadata must carry platform_id")
-        })?;
-    if !platform
-        .as_bytes()
-        .iter()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
-    {
-        return Err(hardware_quote_invalid(
-            kind,
-            "Tier-3 quote metadata platform_id is not a safe label",
-        ));
-    }
-    Ok(platform)
+struct BoundedVerifierCapture {
+    text: String,
+    exceeded: bool,
+}
+
+struct VerifierWorker<T> {
+    result: mpsc::Receiver<T>,
+    thread: JoinHandle<()>,
+}
+
+fn spawn_verifier_worker<T, F>(worker: F) -> VerifierWorker<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (sender, result) = mpsc::sync_channel(1);
+    let thread = std::thread::spawn(move || {
+        let _ = sender.send(worker());
+    });
+    VerifierWorker { result, thread }
+}
+
+fn finish_verifier_worker<T>(
+    worker: VerifierWorker<T>,
+    name: &'static str,
+    deadline: Instant,
+) -> Result<T> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let result = match worker.result.recv_timeout(remaining) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => {
+            return Err(hardware_quote_invalid(
+                "external_verifier",
+                format!(
+                    "admin verifier {name} did not close within {}s after termination",
+                    HARDWARE_QUOTE_VERIFIER_PIPE_SHUTDOWN_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            let _ = worker.thread.join();
+            return Err(hardware_quote_invalid(
+                "external_verifier",
+                format!("admin verifier {name} panicked"),
+            ));
+        }
+    };
+    worker.thread.join().map_err(|_| {
+        hardware_quote_invalid(
+            "external_verifier",
+            format!("admin verifier {name} panicked"),
+        )
+    })?;
+    Ok(result)
+}
+
+fn spawn_bounded_verifier_reader<R>(
+    reader: R,
+) -> VerifierWorker<std::io::Result<BoundedVerifierCapture>>
+where
+    R: Read + Send + 'static,
+{
+    spawn_verifier_worker(move || {
+        let mut reader = reader;
+        let mut retained = Vec::with_capacity(MAX_HARDWARE_QUOTE_VERIFIER_OUTPUT_BYTES.min(8192));
+        let mut exceeded = false;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let remaining = MAX_HARDWARE_QUOTE_VERIFIER_OUTPUT_BYTES.saturating_sub(retained.len());
+            let keep = remaining.min(read);
+            retained.extend_from_slice(&buffer[..keep]);
+            exceeded |= keep < read;
+        }
+        Ok(BoundedVerifierCapture {
+            text: String::from_utf8_lossy(&retained).into_owned(),
+            exceeded,
+        })
+    })
+}
+
+fn finish_bounded_verifier_reader(
+    reader: VerifierWorker<std::io::Result<BoundedVerifierCapture>>,
+    stream: &'static str,
+    deadline: Instant,
+) -> Result<BoundedVerifierCapture> {
+    finish_verifier_worker(reader, stream, deadline)?.map_err(|err| {
+        hardware_quote_invalid(
+            "external_verifier",
+            format!("admin verifier {stream} read failed: {err}"),
+        )
+    })
 }
 
 fn golden_tier3_measurements(value: &Value) -> GoldenTier3Measurements {
@@ -1620,10 +1916,6 @@ fn verdict_roots_for_error(roots: &[String]) -> Vec<&str> {
     roots.iter().map(String::as_str).take(8).collect()
 }
 
-fn is_hex_len(value: &str, len: usize) -> bool {
-    value.len() == len && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
 fn short_verifier_stream(stream: &str) -> String {
     let stream = stream.trim();
     if stream.len() <= 512 {
@@ -1714,6 +2006,7 @@ fn decode_vendor_identity_jwt(
     let jwks = parse_vendor_jwks(trusted_jwks, kind)?;
     let header = decode_header(token)
         .map_err(|err| hardware_quote_invalid(kind, format!("JWT header decode failed: {err}")))?;
+    reject_provider_jwt_trust_material(&header, kind)?;
     if header.alg != Algorithm::ES384 {
         return Err(hardware_quote_invalid(
             kind,
@@ -1761,6 +2054,17 @@ fn parse_vendor_jwks(value: &Value, kind: &'static str) -> Result<JwkSet> {
         kind: kind.to_owned(),
         reason: format!("trusted JWKS is invalid: {err}"),
     })
+}
+
+fn reject_provider_jwt_trust_material(header: &Header, kind: &'static str) -> Result<()> {
+    if header.jku.is_some() || header.jwk.is_some() || header.x5u.is_some() || header.x5c.is_some()
+    {
+        Err(GatewayError::ProviderTrustMaterialRejected {
+            kind: kind.to_owned(),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn require_claim_matches_for_kind(
@@ -1842,62 +2146,6 @@ fn require_gb10_device_model_claim(claims: &Value) -> Result<()> {
             "NVIDIA device evidence is not for GB10/DGX Spark hardware",
         ))
     }
-}
-
-fn verify_tpm2_verdict_device_key(
-    kind: &'static str,
-    quote: &HardwareQuote,
-    verdict: &HardwareQuoteVerifierCommandOutput,
-) -> Result<()> {
-    let verifier_device_key = verdict
-        .device_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            hardware_quote_invalid(
-                kind,
-                "admin verifier must return the TPM EK device_key for ban enforcement",
-            )
-        })?;
-    if !is_hex_len(verifier_device_key, 64) {
-        return Err(hardware_quote_invalid(
-            kind,
-            "admin verifier returned a TPM EK device_key that is not a 32-byte hex digest",
-        ));
-    }
-    let quote_device_key =
-        hardware_quote_metadata_device_key(&quote.metadata).ok_or_else(|| {
-            hardware_quote_invalid(
-                kind,
-                "TPM quote metadata must carry the EK device_key submitted to the contract",
-            )
-        })?;
-    if quote_device_key != verifier_device_key {
-        return Err(hardware_quote_invalid(
-            kind,
-            "TPM EK device_key in quote metadata does not match the verifier-confirmed EK",
-        ));
-    }
-    Ok(())
-}
-
-fn hardware_quote_metadata_device_key(metadata: &Value) -> Option<&str> {
-    metadata
-        .get("device_key")
-        .or_else(|| metadata.get("ek_fingerprint"))
-        .or_else(|| metadata.get("tpm_ek_sha256"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            metadata
-                .get("tpm")
-                .and_then(|tpm| {
-                    tpm.get("device_key")
-                        .or_else(|| tpm.get("ek_fingerprint"))
-                        .or_else(|| tpm.get("ek_sha256"))
-                })
-                .and_then(Value::as_str)
-        })
 }
 
 fn verify_nvidia_nras_quote(
@@ -2152,6 +2400,7 @@ fn decode_nvidia_nras_jwt(token: &str, jwks: &JwkSet) -> Result<Value> {
         kind: "nvidia_nras_jwt".to_owned(),
         reason: format!("JWT header decode failed: {err}"),
     })?;
+    reject_provider_jwt_trust_material(&header, "nvidia_nras_jwt")?;
     if header.alg != Algorithm::ES384 {
         return Err(nvidia_quote_invalid("NVIDIA NRAS JWT must use ES384"));
     }
@@ -2197,6 +2446,7 @@ fn decode_vendor_identity_jwt_with_jwks(
 ) -> Result<Value> {
     let header = decode_header(token)
         .map_err(|err| hardware_quote_invalid(kind, format!("JWT header decode failed: {err}")))?;
+    reject_provider_jwt_trust_material(&header, kind)?;
     if header.alg != Algorithm::ES384 {
         return Err(hardware_quote_invalid(
             kind,

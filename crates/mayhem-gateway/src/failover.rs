@@ -15,6 +15,18 @@ pub const DEFAULT_OPEN_TIMEOUT_MILLIS: u64 = ADMIN_RELAY_CONNECT_BUDGET_MILLIS
 pub const DEFAULT_MAX_OPEN_ATTEMPTS: u8 = 4;
 pub const DEFAULT_PROVIDER_COOLOFF_MILLIS: u64 = 30_000;
 
+pub fn route_wait_millis(
+    generic_max_wait_millis: u64,
+    now_millis: u64,
+    earliest_route_cooloff_until_millis: Option<u64>,
+) -> u64 {
+    let known_cooloff_remaining = earliest_route_cooloff_until_millis
+        .filter(|until_millis| *until_millis > now_millis)
+        .map(|until_millis| until_millis - now_millis)
+        .unwrap_or(0);
+    generic_max_wait_millis.max(known_cooloff_remaining)
+}
+
 pub fn effective_context_floor(
     user_min_ctx: Option<u32>,
     conversation_tokens: u64,
@@ -505,6 +517,25 @@ fn usage_delta(previous: &ReceiptUsage, current: &ReceiptUsage) -> ReceiptUsage 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sole_known_cooloff_extends_generic_route_wait_to_exact_remainder() {
+        let now_millis = 1_000_000;
+
+        assert_eq!(
+            route_wait_millis(10_000, now_millis, Some(now_millis + 30_000)),
+            30_000
+        );
+        assert_eq!(
+            route_wait_millis(10_000, now_millis, Some(now_millis + 5_000)),
+            10_000
+        );
+        assert_eq!(
+            route_wait_millis(10_000, now_millis, Some(now_millis)),
+            10_000
+        );
+        assert_eq!(route_wait_millis(10_000, now_millis, None), 10_000);
+    }
 
     fn provider(idx: u8) -> ProviderKey {
         ProviderKey::new(

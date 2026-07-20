@@ -5,37 +5,42 @@ use axum::{
 };
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
+use mayhem_attestation::ValidatedAttestationPolicy;
 use mayhem_gateway::openai::{
     openai_router, validate_loopback_dashboard_bind, ArtifactGenerationOutput,
     ArtifactGenerationRequest, AudioSpeechOutput, AudioSpeechRequest, AudioTranscriptionOutput,
     AudioTranscriptionRequest, ChatCompletionRequest, ChatMessage, ChatOutput, EmbeddingOutput,
     EmbeddingRequest, GatewayArtifactGenerationFuture, GatewayArtifactGenerationResult,
-    GatewayArtifactOutput, GatewayAudioSpeechFuture, GatewayAudioSpeechResult,
-    GatewayAudioTranscriptionFuture, GatewayAudioTranscriptionResult, GatewayCanaryModelConfig,
-    GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry, GatewayEmbeddingFuture,
-    GatewayEmbeddingResult, GatewayImageGenerationFuture, GatewayImageGenerationResult,
-    GatewayMarketInfo, GatewayModel, GatewayRouteCandidate, GatewaySessionBackend,
-    GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult,
-    GatewaySpecialityCalibration, GatewayState, ImageGenerationOutput, ImageGenerationRequest,
-    MayhemModelInfo, ModelCaps, PriceRefAu, ProviderSignedReceipt, SamplingProfile,
-    ShapeAdapterInfo, ToolCallOutput, Usage,
+    GatewayArtifactOutput, GatewayAttestationAuthority, GatewayAttestationCollateral,
+    GatewayAudioSpeechFuture, GatewayAudioSpeechResult, GatewayAudioTranscriptionFuture,
+    GatewayAudioTranscriptionResult, GatewayCanaryModelConfig, GatewayCanaryProbePolicy,
+    GatewayCanaryPrompt, GatewayCanaryRegistry, GatewayEmbeddingFuture, GatewayEmbeddingResult,
+    GatewayImageGenerationFuture, GatewayImageGenerationResult, GatewayMarketInfo, GatewayModel,
+    GatewayRouteCandidate, GatewaySessionBackend, GatewaySessionError, GatewaySessionFuture,
+    GatewaySessionInvocation, GatewaySessionResult, GatewaySpecialityCalibration, GatewayState,
+    ImageGenerationOutput, ImageGenerationRequest, MayhemModelInfo, ModelCaps, PriceRefAu,
+    ProviderKybInfo, ProviderSignedReceipt, SamplingProfile, ShapeAdapterInfo, ToolCallOutput,
+    Usage,
 };
 use mayhem_gateway::{
     aggregate_canary_fingerprints, audio_fingerprint, image_average_hash_hex, normalize_rate_map,
     priced_usage_au, text_generation_rate_map, token_fingerprint, HeartbeatAttestation,
-    HeartbeatCaps, HeartbeatModalityCapacity, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots,
-    ProviderHeartbeat, ReputationEventKind, HEARTBEAT_SCHEMA_VERSION,
+    HeartbeatCaps, HeartbeatModalityCapacity, HeartbeatPerf, HeartbeatQueue, HeartbeatReceiver,
+    HeartbeatSlots, ProviderHeartbeat, ProviderKey, ReputationEventKind, HEARTBEAT_SCHEMA_VERSION,
 };
 use mayhem_proto::{
     catalog_enclave_id, endpoint_request_fingerprint, receipt_signing_bytes,
+    AdminAttestationPolicy, AdminEnclaveAttestationBinding, AttestationQuoteKindPolicy,
+    AttestationTrustDataKind, AttestationTrustDataRef, AttestationVerifierProfile,
     CatalogEnclaveIdentity, EndpointAttributeSpec, EndpointSpecialityMapping,
-    EndpointSpecialityTarget, EndpointValueType, ModelSpecialityDescriptor, ModelSpecialityLevel,
-    ReceiptBody, ReceiptUsage, TranscriptionResult, TranscriptionTimestamp, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION, TRANSCRIPTION_RESULT_SCHEMA_VERSION,
-    USAGE_AUDIO_SECOND, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP,
-    USAGE_VIDEO_SECOND,
+    EndpointSpecialityTarget, EndpointValueType, HardwareQuoteKind, ModelSpecialityDescriptor,
+    ModelSpecialityLevel, ReceiptBody, ReceiptUsage, TranscriptionResult, TranscriptionTimestamp,
+    ATTESTATION_POLICY_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    SESSION_RECEIPT_SCHEMA_VERSION, TRANSCRIPTION_RESULT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
+    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -1372,6 +1377,156 @@ fn current_test_millis() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
+const AV3_APPLE_JWKS: &[u8] = br#"{"keys":[]}"#;
+
+fn av3_verifier_profile(kind: HardwareQuoteKind) -> AttestationVerifierProfile {
+    match kind {
+        HardwareQuoteKind::AppleAppAttestJwt => AttestationVerifierProfile::AppleAppAttestNativeV1,
+        HardwareQuoteKind::AmdSevSnpVcek => AttestationVerifierProfile::AmdSevSnpVcekV1,
+        HardwareQuoteKind::IntelTdxDcap => AttestationVerifierProfile::IntelTdxDcapV1,
+        HardwareQuoteKind::NvidiaGb10DeviceJwt => AttestationVerifierProfile::NvidiaGb10DeviceV1,
+        HardwareQuoteKind::NvidiaNrasJwt => AttestationVerifierProfile::NvidiaNrasCompositeV1,
+        HardwareQuoteKind::NvidiaNvtrustOfflineJwt => {
+            AttestationVerifierProfile::NvidiaNvtrustOfflineCompositeV1
+        }
+        HardwareQuoteKind::Tpm2QuoteEk => AttestationVerifierProfile::Tpm2EkActivateCredentialV1,
+    }
+}
+
+fn av3_apple_authority(
+    candidate: &GatewayRouteCandidate,
+    policy_epoch: u64,
+    expires_epoch: Option<u64>,
+) -> (GatewayAttestationAuthority, String) {
+    let jwks_digest = hex::encode(Sha256::digest(AV3_APPLE_JWKS));
+    let policy = AdminAttestationPolicy {
+        schema_version: ATTESTATION_POLICY_SCHEMA_VERSION,
+        sequence: 1,
+        previous_policy_digest: None,
+        issued_epoch: 1,
+        effective_epoch: 1,
+        expires_epoch,
+        min_verifier_version: 3,
+        emergency_disabled_quote_kinds: BTreeSet::new(),
+        origin_pins: Vec::new(),
+        trust_data: vec![AttestationTrustDataRef {
+            id: "apple-jwks".to_owned(),
+            kind: AttestationTrustDataKind::VerificationKey,
+            sha256: jwks_digest,
+            media_type: "application/jwk-set+json".to_owned(),
+            max_bytes: 4_096,
+            valid_from_epoch: Some(1),
+            valid_until_epoch: None,
+            source: None,
+        }],
+        quote_kinds: HardwareQuoteKind::ALL
+            .into_iter()
+            .map(|kind| AttestationQuoteKindPolicy {
+                kind,
+                enabled: kind == HardwareQuoteKind::AppleAppAttestJwt,
+                verifier_profile: av3_verifier_profile(kind),
+                evidence_schema_version: 1,
+                required_trust_data: if kind == HardwareQuoteKind::AppleAppAttestJwt {
+                    BTreeSet::from(["apple-jwks".to_owned()])
+                } else {
+                    BTreeSet::new()
+                },
+                measurement_trust_data: BTreeSet::new(),
+                platforms: BTreeSet::new(),
+                required_measurement_layers: BTreeSet::new(),
+            })
+            .collect(),
+    };
+    let validated = ValidatedAttestationPolicy::validate(policy.clone())
+        .expect("valid AV.3 Apple policy fixture");
+    let digest = validated.digest().to_owned();
+    let collateral_reference = policy.trust_data[0].clone();
+    (
+        GatewayAttestationAuthority::from_catalog_records(
+            Some(vec![policy]),
+            vec![AdminEnclaveAttestationBinding {
+                enclave_id: candidate.enclave_id.clone(),
+                kind: HardwareQuoteKind::AppleAppAttestJwt,
+                platform: None,
+                measurement_trust_data: BTreeMap::new(),
+            }],
+            [GatewayAttestationCollateral {
+                reference: collateral_reference,
+                bytes: AV3_APPLE_JWKS.to_vec(),
+                observed_epoch: 1,
+            }],
+            policy_epoch,
+        )
+        .expect("construct AV.3 authority from signed catalog records"),
+        digest,
+    )
+}
+
+fn av3_route_key(candidate: &GatewayRouteCandidate) -> ProviderKey {
+    ProviderKey::new(
+        candidate.provider.clone(),
+        candidate.enclave_id.clone(),
+        candidate.room_id.clone(),
+    )
+}
+
+fn av3_signing_key(seed: u8) -> SigningKey {
+    SigningKey::from_bytes(&[seed; 32])
+}
+
+fn av3_provider(signing_key: &SigningKey) -> String {
+    hex::encode(signing_key.verifying_key().to_bytes())
+}
+
+fn av3_signed_advertisement_heartbeat(
+    model: &GatewayModel,
+    candidate: &GatewayRouteCandidate,
+    signing_key: &SigningKey,
+    kind: HardwareQuoteKind,
+    declared_platform: Option<&str>,
+) -> (Value, ProviderHeartbeat, u64) {
+    assert_eq!(candidate.provider, av3_provider(signing_key));
+    let mut heartbeat = test_provider_heartbeat(model, candidate, 0.0, 0, 8, Some(50.0), 150);
+    heartbeat.ts = current_test_millis();
+    heartbeat.nonce = hex::encode(Sha256::digest(format!(
+        "{}:{}:{}:{}",
+        heartbeat.provider,
+        heartbeat.room_id,
+        heartbeat.ts,
+        kind.as_str()
+    )));
+    heartbeat.sig.clear();
+    let mut raw = serde_json::to_value(&heartbeat).expect("serialize AV.3 heartbeat");
+    raw["att"]["quote_kind"] = serde_json::to_value(kind).expect("serialize quote kind");
+    if let Some(platform) = declared_platform {
+        raw["att"]["declared_platform"] = json!(platform);
+    }
+    let signature = signing_key.sign(
+        &mayhem_gateway::heartbeat_signing_payload(&raw).expect("AV.3 heartbeat signing payload"),
+    );
+    raw["sig"] = json!(hex::encode(signature.to_bytes()));
+    let mut receiver = HeartbeatReceiver::with_limits(60_000, 5_000);
+    let heartbeat = receiver
+        .receive(&raw, heartbeat.ts)
+        .expect("signed AV.3 heartbeat");
+    let received_at = heartbeat.ts;
+    (raw, heartbeat, received_at)
+}
+
+fn av3_ingest_advertisement(
+    state: &GatewayState,
+    model: &GatewayModel,
+    candidate: &GatewayRouteCandidate,
+    signing_key: &SigningKey,
+    kind: HardwareQuoteKind,
+) {
+    let (raw, heartbeat, received_at) =
+        av3_signed_advertisement_heartbeat(model, candidate, signing_key, kind, None);
+    state
+        .ingest_authenticated_provider_heartbeat(&raw, heartbeat, received_at)
+        .expect("ingest signed AV.3 heartbeat");
+}
+
 async fn json_request(app: Router, method: Method, uri: &str, body: Value) -> (StatusCode, Value) {
     json_request_with_headers(app, method, uri, body, &[]).await
 }
@@ -1540,11 +1695,330 @@ async fn models_endpoint_returns_openai_list_shape_with_mayhem_extension() {
         rate_units,
         vec!["input_token", "cached_input_token", "output_token"]
     );
-    assert_eq!(body["data"][0]["mayhem"]["caps"]["tools"], true);
+    assert_eq!(body["data"][0]["mayhem"]["caps"]["tools"], false);
+    assert_eq!(body["data"][0]["mayhem"]["caps"]["ctx"], 0);
+    assert_eq!(body["data"][0]["mayhem"]["registered_caps"]["tools"], true);
     assert_eq!(
         body["data"][0]["mayhem"]["adapter"]["tool_call_strategy"],
         "qwen_function_xml"
     );
+}
+
+#[tokio::test]
+async fn av3_missing_policy_filters_tier2_and_routes_tier1_fallback() {
+    let tier2_signing_key = av3_signing_key(21);
+    let tier2_provider = av3_provider(&tier2_signing_key);
+    let tier1_provider = "22".repeat(32);
+    let mut model =
+        routed_test_model_with_providers(&[tier2_provider.clone(), tier1_provider.clone()]);
+    model.mayhem.route_candidates[0].att_tier = 2;
+    model.mayhem.route_candidates[0].device_key = Some("31".repeat(32));
+    model.mayhem.attestation_tiers = BTreeMap::from([("T1".to_owned(), 1), ("T2".to_owned(), 1)]);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(Arc::new(
+        RetryThenDirectSessionBackend {
+            retry_provider: "ff".repeat(32),
+            calls: calls.clone(),
+        },
+    ));
+    av3_ingest_advertisement(
+        &state,
+        &model,
+        &model.mayhem.route_candidates[0],
+        &tier2_signing_key,
+        HardwareQuoteKind::AppleAppAttestJwt,
+    );
+    let app = openai_router(state.clone());
+
+    let (status, body) = json_request(app.clone(), Method::GET, "/v1/models", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    let mayhem = &body["data"][0]["mayhem"];
+    assert_eq!(mayhem["route_count"], 1);
+    let tier2 = &mayhem["registered_route_candidates"][0]["attestation_verification"];
+    assert_eq!(tier2["attestation_tier"], 2);
+    assert_eq!(tier2["policy_required"], true);
+    assert_eq!(tier2["locally_ready"], false);
+    assert!(tier2["reason"]
+        .as_str()
+        .expect("missing-policy reason")
+        .contains("authority is not configured"));
+    assert_eq!(
+        mayhem["registered_route_candidates"][0]["dispatch_eligible"],
+        false
+    );
+    let tier1 = &mayhem["route_candidates"][0]["attestation_verification"];
+    assert_eq!(tier1["policy_required"], false);
+    assert_eq!(tier1["locally_ready"], true);
+
+    let (status, _) = json_request(
+        app,
+        Method::POST,
+        "/v1/chat/completions",
+        json!({
+            "model": "mayhem/routed-test",
+            "messages": [{"role": "user", "content": "Use the eligible route."}]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        calls.lock().expect("route calls").clone(),
+        vec![tier1_provider.clone()]
+    );
+    assert_eq!(state.receipts()[0].receipt.body.provider, tier1_provider);
+}
+
+#[tokio::test]
+async fn av3_stale_substituted_and_quote_mismatched_policy_routes_are_filtered() {
+    let signing_key = av3_signing_key(31);
+    let mut model = routed_test_model();
+    model.mayhem.route_candidates[0].provider = av3_provider(&signing_key);
+    model.mayhem.route_candidates[0].att_tier = 2;
+    model.mayhem.route_candidates[0].device_key = Some("32".repeat(32));
+    model.mayhem.attestation_tiers = BTreeMap::from([("T2".to_owned(), 1)]);
+    let candidate = model.mayhem.route_candidates[0].clone();
+
+    let (stale_authority, _) = av3_apple_authority(&candidate, 2, Some(2));
+    let stale_state = test_gateway_state_from_models(vec![model.clone()])
+        .with_attestation_authority(stale_authority);
+    av3_ingest_advertisement(
+        &stale_state,
+        &model,
+        &candidate,
+        &signing_key,
+        HardwareQuoteKind::AppleAppAttestJwt,
+    );
+    let (status, stale) = json_request(
+        openai_router(stale_state),
+        Method::GET,
+        "/v1/models",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stale["data"][0]["mayhem"]["route_count"], 0);
+    assert!(stale["data"][0]["mayhem"]["registered_route_candidates"][0]
+        ["attestation_verification"]["reason"]
+        .as_str()
+        .expect("stale-policy reason")
+        .contains("PolicyExpired"));
+
+    let substituted_signing_key = av3_signing_key(32);
+    let mut substituted_candidate = candidate.clone();
+    substituted_candidate.provider = av3_provider(&substituted_signing_key);
+    let (substituted_authority, _) = av3_apple_authority(&candidate, 1, None);
+    let substituted_state = test_gateway_state_from_models(vec![model.clone()])
+        .with_attestation_authority(substituted_authority);
+    av3_ingest_advertisement(
+        &substituted_state,
+        &model,
+        &substituted_candidate,
+        &substituted_signing_key,
+        HardwareQuoteKind::AppleAppAttestJwt,
+    );
+    let (status, substituted) = json_request(
+        openai_router(substituted_state),
+        Method::GET,
+        "/v1/models",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(substituted["data"][0]["mayhem"]["route_count"], 0);
+    assert!(
+        substituted["data"][0]["mayhem"]["registered_route_candidates"][0]
+            ["attestation_verification"]["reason"]
+            .as_str()
+            .expect("substituted-route reason")
+            .contains("no signed heartbeat quote-kind advertisement")
+    );
+
+    let (mismatched_authority, _) = av3_apple_authority(&candidate, 1, None);
+    let mismatched_state = test_gateway_state_from_models(vec![model.clone()])
+        .with_attestation_authority(mismatched_authority);
+    av3_ingest_advertisement(
+        &mismatched_state,
+        &model,
+        &candidate,
+        &signing_key,
+        HardwareQuoteKind::NvidiaNrasJwt,
+    );
+    let (status, mismatched) = json_request(
+        openai_router(mismatched_state),
+        Method::GET,
+        "/v1/models",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mismatched["data"][0]["mayhem"]["route_count"], 0);
+    assert!(
+        mismatched["data"][0]["mayhem"]["registered_route_candidates"][0]
+            ["attestation_verification"]["reason"]
+            .as_str()
+            .expect("quote-kind mismatch reason")
+            .contains("proves Tier 3, not route Tier 2")
+    );
+}
+
+#[tokio::test]
+async fn av3_heartbeat_quote_kind_and_platform_are_signature_bound() {
+    let signing_key = av3_signing_key(34);
+    let provider = av3_provider(&signing_key);
+    let mut model = routed_test_model_with_providers(&[provider]);
+    let candidate = &mut model.mayhem.route_candidates[0];
+    candidate.att_tier = 2;
+    candidate.device_key = Some("34".repeat(32));
+    let candidate = candidate.clone();
+    let (authority, _) = av3_apple_authority(&candidate, 1, None);
+    let state =
+        test_gateway_state_from_models(vec![model.clone()]).with_attestation_authority(authority);
+    let (raw, heartbeat, received_at) = av3_signed_advertisement_heartbeat(
+        &model,
+        &candidate,
+        &signing_key,
+        HardwareQuoteKind::AppleAppAttestJwt,
+        None,
+    );
+
+    let mut kind_tamper = raw.clone();
+    kind_tamper["att"]["quote_kind"] = json!("nvidia_nras_jwt");
+    let error = state
+        .ingest_authenticated_provider_heartbeat(&kind_tamper, heartbeat.clone(), received_at)
+        .expect_err("tampered quote kind must fail");
+    assert!(error.contains("signature failed"));
+
+    let mut platform_tamper = raw.clone();
+    platform_tamper["att"]["declared_platform"] = json!("windows-11-tpm2");
+    let error = state
+        .ingest_authenticated_provider_heartbeat(&platform_tamper, heartbeat.clone(), received_at)
+        .expect_err("tampered platform must fail");
+    assert!(error.contains("signature failed"));
+
+    state
+        .ingest_authenticated_provider_heartbeat(&raw, heartbeat, received_at)
+        .expect("untampered signed advertisement");
+    let (status, body) =
+        json_request(openai_router(state), Method::GET, "/v1/models", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["mayhem"]["route_count"], 1);
+    assert_eq!(
+        body["data"][0]["mayhem"]["route_candidates"][0]["attestation_verification"]["quote_kind"],
+        "apple_app_attest_jwt"
+    );
+}
+
+#[tokio::test]
+async fn av3_ready_source_built_route_and_dashboard_report_local_policy_truth() {
+    let signing_key = av3_signing_key(33);
+    let provider = av3_provider(&signing_key);
+    let mut model = routed_test_model_with_providers(std::slice::from_ref(&provider));
+    let candidate = &mut model.mayhem.route_candidates[0];
+    candidate.att_tier = 2;
+    candidate.device_key = Some("33".repeat(32));
+    candidate.binary_hash = "de".repeat(32);
+    candidate.approved_binary_hashes = BTreeSet::from(["ad".repeat(32)]);
+    model.mayhem.attestation_tiers = BTreeMap::from([("T2".to_owned(), 1)]);
+    let route_key = av3_route_key(candidate);
+    let (authority, policy_digest) = av3_apple_authority(candidate, 1, None);
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let state = test_gateway_state_from_models(vec![model.clone()])
+        .with_attestation_authority(authority)
+        .with_session_backend(Arc::new(RetryThenDirectSessionBackend {
+            retry_provider: "ff".repeat(32),
+            calls: calls.clone(),
+        }));
+    av3_ingest_advertisement(
+        &state,
+        &model,
+        &model.mayhem.route_candidates[0],
+        &signing_key,
+        HardwareQuoteKind::AppleAppAttestJwt,
+    );
+    let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
+    let token_query = dashboard_url
+        .strip_prefix("http://127.0.0.1:11435/mayhem/dashboard?")
+        .expect("dashboard token query");
+    let evidence_path = format!(
+        "/mayhem/dashboard/evidence?{token_query}&kind=route&provider={}&enclave={}&room={}",
+        route_key.provider, route_key.enclave_id, route_key.room_id
+    );
+    let app = openai_router(state.clone());
+
+    let (status, body) = json_request(app.clone(), Method::GET, "/v1/models", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    let mayhem = &body["data"][0]["mayhem"];
+    assert_eq!(mayhem["route_count"], 1);
+    assert_eq!(
+        mayhem["attestation_verification"]["policy_required_routes"],
+        1
+    );
+    assert_eq!(
+        mayhem["attestation_verification"]["locally_ready_routes"],
+        1
+    );
+    assert_eq!(
+        mayhem["attestation_verification"]["runtime_binary_hash_role"],
+        "evidence_only"
+    );
+    let readiness = &mayhem["route_candidates"][0]["attestation_verification"];
+    assert_eq!(readiness["attestation_tier"], 2);
+    assert_eq!(readiness["quote_kind"], "apple_app_attest_jwt");
+    assert_eq!(readiness["policy_sequence"], 1);
+    assert_eq!(readiness["policy_digest"], policy_digest);
+    assert_eq!(readiness["policy_effective_epoch"], 1);
+    assert_eq!(readiness["evaluated_epoch"], 1);
+    assert_eq!(readiness["verifier_profile"], "apple_app_attest_native_v1");
+    assert_eq!(readiness["evidence_schema_version"], 1);
+    assert_eq!(readiness["locally_ready"], true);
+    assert_eq!(readiness["runtime_binary_hash_evidence_only"], true);
+    assert_eq!(
+        mayhem["route_candidates"][0]["binary_hash"],
+        "de".repeat(32)
+    );
+    assert_eq!(
+        mayhem["route_candidates"][0]["approved_binary_hashes"],
+        json!(["ad".repeat(32)])
+    );
+
+    let (status, _) = json_request_with_headers(
+        app.clone(),
+        Method::POST,
+        "/v1/chat/completions",
+        json!({
+            "model": "mayhem/routed-test",
+            "messages": [{"role": "user", "content": "Use source-built runtime evidence."}]
+        }),
+        &[("X-Mayhem-Min-Att-Tier", "2")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        calls.lock().expect("route calls").clone(),
+        vec![provider.clone()]
+    );
+
+    let (status, _, evidence_bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        &evidence_path,
+        None,
+        &[("host", "127.0.0.1:11435"), ("accept", "application/json")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let evidence: Value = serde_json::from_slice(&evidence_bytes).expect("route evidence JSON");
+    let local = &evidence["raw"]["local_attestation_verification"];
+    assert_eq!(local["attestation_tier"], 2);
+    assert_eq!(local["quote_kind"], "apple_app_attest_jwt");
+    assert_eq!(local["policy_digest"], policy_digest);
+    assert_eq!(local["locally_ready"], true);
+    assert_eq!(local["runtime_binary_hash_evidence_only"], true);
+    assert!(evidence["facts"]
+        .as_array()
+        .expect("evidence facts")
+        .iter()
+        .any(|fact| fact["label"] == "Local verification" && fact["value"] == "Ready"));
 }
 
 #[tokio::test]
@@ -1578,10 +2052,14 @@ async fn models_endpoint_lists_empty_canonical_market_without_routing_or_billing
     let (status, body) = json_request(app.clone(), Method::GET, "/v1/models", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"].as_array().map(Vec::len), Some(1));
-    assert_eq!(body["data"][0]["mayhem"]["markets"][0]["att_tier"], 2);
-    assert_eq!(body["data"][0]["mayhem"]["markets"][0]["route_count"], 0);
+    assert!(body["data"][0]["mayhem"]["markets"]
+        .as_array()
+        .is_some_and(Vec::is_empty));
+    let registered_market = &body["data"][0]["mayhem"]["registered_markets"][0];
+    assert_eq!(registered_market["att_tier"], 2);
+    assert_eq!(registered_market["route_count"], 0);
     assert_eq!(
-        body["data"][0]["mayhem"]["markets"][0]["availability"],
+        registered_market["availability"],
         "no_eligible_provider_yet"
     );
     assert!(body["data"][0]["mayhem"]["route_candidates"]
@@ -1599,6 +2077,355 @@ async fn models_endpoint_lists_empty_canonical_market_without_routing_or_billing
         .expect("error message")
         .contains("no provider available"));
     assert!(state.receipts().is_empty());
+}
+
+#[tokio::test]
+async fn models_endpoint_keeps_zero_live_tier3_registration_out_of_confidential_fields() {
+    let mut model = routed_test_model();
+    model.mayhem.route_candidates[0].att_tier = 3;
+    let candidate = model.mayhem.route_candidates[0].clone();
+    model.mayhem.attestation_tiers = BTreeMap::from([("T3".to_owned(), 1)]);
+    model.mayhem.attestation_tier_labels = BTreeMap::from([(
+        "T3".to_owned(),
+        "Tier 3 - hardware confidential compute; prompt-confidential when supported".to_owned(),
+    )]);
+    model.mayhem.markets = vec![GatewayMarketInfo {
+        enclave_id: candidate.enclave_id.clone(),
+        att_tier: 3,
+        quant: candidate.quant.clone(),
+        ctx_bracket: Some("le8k".to_owned()),
+        room_ids: vec![candidate.room_id.clone()],
+        providers_online: 1,
+        route_count: 1,
+        availability: "routable".to_owned(),
+        price_ref_au: model.mayhem.price_ref_au.clone(),
+    }];
+    let now = current_test_millis();
+    let mut stale_heartbeat = test_provider_heartbeat(
+        &model,
+        &model.mayhem.route_candidates[0],
+        0.0,
+        0,
+        8,
+        None,
+        150,
+    );
+    stale_heartbeat.caps.ctx = 65_536;
+    let heartbeat_ttl_millis = 60_000;
+    let state = GatewayState::from_models(vec![model])
+        .with_provider_heartbeat_ttl_millis(heartbeat_ttl_millis);
+    state.ingest_provider_heartbeat(
+        stale_heartbeat,
+        now.saturating_sub(heartbeat_ttl_millis + 1),
+    );
+
+    let (status, body) =
+        json_request(openai_router(state), Method::GET, "/v1/models", Value::Null).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let mayhem = &body["data"][0]["mayhem"];
+    assert_eq!(mayhem["registered_provider_count"], 1);
+    assert_eq!(mayhem["registered_route_count"], 1);
+    assert_eq!(mayhem["providers_online"], 0);
+    assert_eq!(mayhem["route_count"], 0);
+    assert!(mayhem["attestation_tiers"]
+        .as_object()
+        .is_some_and(|tiers| tiers.is_empty()));
+    assert_eq!(mayhem["registered_attestation_tiers"]["T3"], 1);
+    assert_eq!(mayhem["prompt_confidential"], false);
+    assert_eq!(mayhem["registered_prompt_confidential"], true);
+    assert_eq!(mayhem["caps"]["tools"], false);
+    assert_eq!(mayhem["caps"]["json"], false);
+    assert_eq!(mayhem["caps"]["ctx"], 0);
+    assert_eq!(mayhem["registered_caps"]["tools"], true);
+    assert_eq!(mayhem["registered_caps"]["json"], true);
+    assert_eq!(mayhem["registered_caps"]["ctx"], 8_192);
+    assert!(mayhem["route_candidates"]
+        .as_array()
+        .is_some_and(Vec::is_empty));
+    assert_eq!(
+        mayhem["registered_route_candidates"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        mayhem["registered_route_candidates"][0]["dispatch_eligible"],
+        false
+    );
+    assert!(mayhem["markets"].as_array().is_some_and(Vec::is_empty));
+    assert_eq!(
+        mayhem["registered_markets"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(mayhem["registered_markets"][0]["att_tier"], 3);
+    assert_eq!(mayhem["registered_markets"][0]["registered_route_count"], 1);
+    assert_eq!(mayhem["registered_markets"][0]["route_count"], 0);
+}
+
+#[tokio::test]
+async fn models_endpoint_derives_modality_and_speciality_only_from_fresh_live_routes() {
+    let providers = ["41".repeat(32), "42".repeat(32)];
+    let mut model = routed_test_model_with_specialities(&providers);
+    model.mayhem.providers_online = 2;
+    model.mayhem.rooms = 2;
+    model.mayhem.caps.image = true;
+    model.mayhem.caps.output_modalities = vec!["text".to_owned(), "image".to_owned()];
+    model.mayhem.adapter.modality_set = vec!["text".to_owned(), "image".to_owned()];
+    model.mayhem.adapter.endpoint_families.push(
+        mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+        )
+        .expect("image generation endpoint contract"),
+    );
+    model.mayhem.route_candidates[0].served_specialities.clear();
+    model.mayhem.route_candidates[1].quant = "fp16".to_owned();
+    model.mayhem.route_candidates[1].served_modalities = vec!["image".to_owned()];
+    let stale_kyb = ProviderKybInfo {
+        provider: model.mayhem.route_candidates[1].provider.clone(),
+        legal_name: "Stale Image Provider GmbH".to_owned(),
+        jurisdiction: "DE".to_owned(),
+        proof_hash: "ab".repeat(32),
+        kyb_ref: "kyb:stale-image".to_owned(),
+    };
+    model.mayhem.route_candidates[1].kyb = Some(stale_kyb.clone());
+    let stale_candidate = model.mayhem.route_candidates[1].clone();
+    model.mayhem.quant_buckets = BTreeMap::from([("int4".to_owned(), 1), ("fp16".to_owned(), 1)]);
+    model.mayhem.kyb_identities = vec![stale_kyb];
+    model.mayhem.markets = vec![GatewayMarketInfo {
+        enclave_id: stale_candidate.enclave_id.clone(),
+        att_tier: stale_candidate.att_tier,
+        quant: stale_candidate.quant.clone(),
+        ctx_bracket: Some("le8k".to_owned()),
+        room_ids: vec![stale_candidate.room_id.clone()],
+        providers_online: 1,
+        route_count: 1,
+        availability: "routable".to_owned(),
+        price_ref_au: model.mayhem.price_ref_au.clone(),
+    }];
+    let now = current_test_millis();
+    let mut fresh_heartbeat = test_provider_heartbeat(
+        &model,
+        &model.mayhem.route_candidates[0],
+        0.0,
+        0,
+        8,
+        None,
+        150,
+    );
+    fresh_heartbeat.caps.tools = false;
+    fresh_heartbeat.caps.json = true;
+    fresh_heartbeat.caps.ctx = 4_096;
+    let mut catalog_capped_heartbeat = fresh_heartbeat.clone();
+    catalog_capped_heartbeat.caps.ctx = 16_384;
+    catalog_capped_heartbeat.ts = catalog_capped_heartbeat.ts.saturating_add(1);
+    catalog_capped_heartbeat.nonce = "catalog-capped-live-context".to_owned();
+    let mut stale_heartbeat = test_provider_heartbeat(
+        &model,
+        &model.mayhem.route_candidates[1],
+        0.0,
+        0,
+        8,
+        None,
+        150,
+    );
+    stale_heartbeat.caps.tools = true;
+    stale_heartbeat.caps.json = true;
+    stale_heartbeat.caps.ctx = 32_768;
+    let heartbeat_ttl_millis = 60_000;
+    let state = GatewayState::from_models(vec![model])
+        .with_provider_heartbeat_ttl_millis(heartbeat_ttl_millis);
+    state.ingest_provider_heartbeat(fresh_heartbeat, now);
+    state.ingest_provider_heartbeat(
+        stale_heartbeat,
+        now.saturating_sub(heartbeat_ttl_millis + 1),
+    );
+    let app = openai_router(state.clone());
+
+    let (status, body) = json_request(app.clone(), Method::GET, "/v1/models", Value::Null).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let mayhem = &body["data"][0]["mayhem"];
+    assert_eq!(mayhem["registered_provider_count"], 2);
+    assert_eq!(mayhem["registered_route_count"], 2);
+    assert_eq!(mayhem["providers_online"], 1);
+    assert_eq!(mayhem["route_count"], 1);
+    assert_eq!(mayhem["quant_buckets"], json!({ "int4": 1 }));
+    assert_eq!(mayhem["registered_quant_buckets"]["fp16"], 1);
+    assert!(mayhem["kyb_identities"]
+        .as_array()
+        .is_some_and(Vec::is_empty));
+    assert_eq!(
+        mayhem["registered_kyb_identities"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(mayhem["caps"]["tools"], false);
+    assert_eq!(mayhem["caps"]["json"], true);
+    assert_eq!(mayhem["caps"]["ctx"], 4_096);
+    assert_eq!(mayhem["caps"]["image"], false);
+    assert_eq!(mayhem["caps"]["output_modalities"], json!(["text"]));
+    assert_eq!(mayhem["registered_caps"]["tools"], true);
+    assert_eq!(mayhem["registered_caps"]["json"], true);
+    assert_eq!(mayhem["registered_caps"]["ctx"], 8_192);
+    assert_eq!(mayhem["registered_caps"]["image"], true);
+    assert_eq!(
+        mayhem["registered_caps"]["output_modalities"],
+        json!(["text", "image"])
+    );
+    assert_eq!(mayhem["modality_availability"]["text"]["available"], true);
+    assert_eq!(mayhem["modality_availability"]["image"]["available"], false);
+    assert_eq!(
+        mayhem["modality_availability"]["image"]["live_route_count"],
+        0
+    );
+    assert_eq!(
+        mayhem["modality_availability"]["image"]["registered_route_count"],
+        1
+    );
+    assert_eq!(mayhem["route_candidates"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        mayhem["route_candidates"][0]["served_modalities"],
+        json!(["text"])
+    );
+    assert_eq!(
+        mayhem["registered_route_candidates"][1]["served_modalities"],
+        json!(["image"])
+    );
+    assert_eq!(
+        mayhem["registered_route_candidates"][1]["dispatch_eligible"],
+        false
+    );
+    let high = &mayhem["speciality_availability"]["reasoning_effort"]["levels"]["high"];
+    assert_eq!(high["available"], false);
+    assert_eq!(high["live_provider_count"], 0);
+    assert_eq!(high["canonical_provider_count"], 1);
+    assert!(mayhem["markets"].as_array().is_some_and(Vec::is_empty));
+    assert_eq!(mayhem["registered_markets"][0]["registered_route_count"], 1);
+    assert_eq!(mayhem["registered_markets"][0]["route_count"], 0);
+
+    state.ingest_provider_heartbeat(catalog_capped_heartbeat, now.saturating_add(1));
+    let (status, body) = json_request(app, Method::GET, "/v1/models", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["mayhem"]["caps"]["ctx"], 8_192);
+    assert_eq!(body["data"][0]["mayhem"]["registered_caps"]["ctx"], 8_192);
+}
+
+#[tokio::test]
+async fn models_api_and_market_dashboard_share_selector_live_counts() {
+    let providers = [
+        "31".repeat(32),
+        "32".repeat(32),
+        "33".repeat(32),
+        "34".repeat(32),
+        "35".repeat(32),
+        "36".repeat(32),
+    ];
+    let mut model = routed_test_model_with_providers(&providers);
+    model.mayhem.route_candidates[1].quant = "fp16".to_owned();
+    model.mayhem.route_candidates[2].att_tier = 2;
+    model.mayhem.route_candidates[4].accepted_rails = vec!["tap".to_owned()];
+    let enclave_id = model.mayhem.route_candidates[0].enclave_id.clone();
+    let room_ids = model
+        .mayhem
+        .route_candidates
+        .iter()
+        .map(|candidate| candidate.room_id.clone())
+        .collect::<Vec<_>>();
+    model.mayhem.markets = vec![GatewayMarketInfo {
+        enclave_id,
+        att_tier: 1,
+        quant: "int4".to_owned(),
+        ctx_bracket: Some("le8k".to_owned()),
+        room_ids,
+        providers_online: 6,
+        route_count: 6,
+        availability: "routable".to_owned(),
+        price_ref_au: model.mayhem.price_ref_au.clone(),
+    }];
+    let mut heartbeats = model
+        .mayhem
+        .route_candidates
+        .iter()
+        .map(|candidate| test_provider_heartbeat(&model, candidate, 0.2, 0, 4, Some(50.0), 150))
+        .collect::<Vec<_>>();
+    heartbeats[3].caps.ctx = 16_384;
+    heartbeats[5].caps.served_modalities.clear();
+    let heartbeat = heartbeats[0].clone();
+    let state = GatewayState::from_models(vec![model]).with_provider_heartbeats(heartbeats);
+    let dashboard_url = state.dashboard_url("http://127.0.0.1:11435");
+    let market_path = dashboard_url
+        .replacen(
+            "/mayhem/dashboard?",
+            "/mayhem/dashboard/network/markets?",
+            1,
+        )
+        .strip_prefix("http://127.0.0.1:11435")
+        .expect("dashboard URL is rooted at gateway")
+        .to_owned();
+    let app = openai_router(state.clone());
+
+    let (status, body) = json_request(app.clone(), Method::GET, "/v1/models", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    let mayhem = &body["data"][0]["mayhem"];
+    assert_eq!(mayhem["registered_provider_count"], 6);
+    assert_eq!(mayhem["registered_route_count"], 6);
+    assert_eq!(mayhem["providers_online"], 3);
+    assert_eq!(mayhem["route_count"], 3);
+    let market = &mayhem["markets"][0];
+    assert_eq!(market["registered_provider_count"], 6);
+    assert_eq!(market["registered_route_count"], 6);
+    assert_eq!(market["providers_online"], 1);
+    assert_eq!(market["route_count"], 1);
+    assert_eq!(market["availability"], "routable");
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app.clone(),
+        Method::GET,
+        &market_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let dashboard = String::from_utf8(bytes).expect("market dashboard HTML");
+    assert!(dashboard.contains(
+        r#"data-live-route-count="1" data-live-provider-count="1" data-registered-route-count="6" data-registered-provider-count="6""#
+    ));
+
+    let mut draining = heartbeat;
+    draining.accepting_new = false;
+    draining.ts = draining.ts.saturating_add(1);
+    draining.nonce = "draining-market-count".to_owned();
+    state.ingest_provider_heartbeat(draining.clone(), draining.ts);
+
+    let (status, body) = json_request(app.clone(), Method::GET, "/v1/models", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    let mayhem = &body["data"][0]["mayhem"];
+    assert_eq!(mayhem["registered_provider_count"], 6);
+    assert_eq!(mayhem["providers_online"], 2);
+    assert_eq!(mayhem["route_count"], 2);
+    assert!(mayhem["markets"].as_array().is_some_and(Vec::is_empty));
+    let market = &mayhem["registered_markets"][0];
+    assert_eq!(market["registered_provider_count"], 6);
+    assert_eq!(market["registered_route_count"], 6);
+    assert_eq!(market["providers_online"], 0);
+    assert_eq!(market["route_count"], 0);
+    assert_eq!(market["availability"], "no_eligible_provider_yet");
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app,
+        Method::GET,
+        &market_path,
+        None,
+        &[("host", "127.0.0.1:11435")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let dashboard = String::from_utf8(bytes).expect("market dashboard HTML");
+    assert!(dashboard.contains(
+        r#"data-live-route-count="0" data-live-provider-count="0" data-registered-route-count="6" data-registered-provider-count="6""#
+    ));
+    assert!(dashboard.contains("no_eligible_provider_yet"));
 }
 
 #[tokio::test]
@@ -1808,7 +2635,7 @@ async fn models_endpoint_and_progressive_evidence_expose_speciality_cost_and_ava
 }
 
 #[tokio::test]
-async fn models_endpoint_surfaces_tier2_attestation_counts_from_catalog() {
+async fn models_endpoint_preserves_catalog_tier_counts_as_registered_evidence() {
     let embedding_contract =
         mayhem_proto::endpoint_family_contract_template(mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS)
             .unwrap();
@@ -1842,12 +2669,23 @@ async fn models_endpoint_surfaces_tier2_attestation_counts_from_catalog() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"][0]["id"], "mayhem/tier2-model");
     assert_eq!(body["data"][0]["mayhem"]["model_class"], "embedding");
-    assert_eq!(body["data"][0]["mayhem"]["attestation_tiers"]["T1"], 1);
-    assert_eq!(body["data"][0]["mayhem"]["attestation_tiers"]["T2"], 2);
-    assert!(body["data"][0]["mayhem"]["attestation_tier_labels"]["T2"]
-        .as_str()
-        .expect("tier 2 label")
-        .contains("TPM EK / Apple App Attest / NVIDIA GB10"));
+    assert!(body["data"][0]["mayhem"]["attestation_tiers"]
+        .as_object()
+        .is_some_and(|tiers| tiers.is_empty()));
+    assert_eq!(
+        body["data"][0]["mayhem"]["registered_attestation_tiers"]["T1"],
+        1
+    );
+    assert_eq!(
+        body["data"][0]["mayhem"]["registered_attestation_tiers"]["T2"],
+        2
+    );
+    assert!(
+        body["data"][0]["mayhem"]["registered_attestation_tier_labels"]["T2"]
+            .as_str()
+            .expect("tier 2 label")
+            .contains("TPM EK / Apple App Attest / NVIDIA GB10")
+    );
 }
 
 #[tokio::test]
@@ -4535,8 +5373,8 @@ async fn chat_completion_min_att_tier_filters_route_candidates() {
     let mut model =
         routed_test_model_with_providers(&[first_provider.clone(), second_provider.clone()]);
     model.mayhem.route_candidates[0].att_tier = 1;
-    model.mayhem.route_candidates[1].att_tier = 3;
-    model.mayhem.attestation_tiers = BTreeMap::from([("T1".to_owned(), 1), ("T3".to_owned(), 1)]);
+    model.mayhem.route_candidates[1].att_tier = 4;
+    model.mayhem.attestation_tiers = BTreeMap::from([("T1".to_owned(), 1), ("T4".to_owned(), 1)]);
     let calls = Arc::new(Mutex::new(Vec::new()));
     let state = test_gateway_state_from_models(vec![model]).with_session_backend(Arc::new(
         RetryThenDirectSessionBackend {
@@ -4547,7 +5385,7 @@ async fn chat_completion_min_att_tier_filters_route_candidates() {
     let app = openai_router(state.clone());
     let request = json!({
         "model": "mayhem/routed-test",
-        "messages": [{ "role": "user", "content": "Use Tier 3 only." }]
+        "messages": [{ "role": "user", "content": "Use Tier 3 or higher." }]
     });
 
     let (status, body) = json_request_with_headers(
@@ -4575,7 +5413,8 @@ async fn chat_completion_min_att_tier_filters_route_candidates() {
 #[tokio::test]
 async fn chat_completion_min_att_tier_two_routes_and_bills_tier2_market_price() {
     let tier1_provider = "55".repeat(32);
-    let tier2_provider = "66".repeat(32);
+    let tier2_signing_key = av3_signing_key(66);
+    let tier2_provider = av3_provider(&tier2_signing_key);
     let tier2_enclave = "77".repeat(32);
     let mut model =
         routed_test_model_with_providers(&[tier1_provider.clone(), tier2_provider.clone()]);
@@ -4593,6 +5432,7 @@ async fn chat_completion_min_att_tier_two_routes_and_bills_tier2_market_price() 
     });
     model.mayhem.route_candidates[1].att_tier = 2;
     model.mayhem.route_candidates[1].enclave_id = tier2_enclave.clone();
+    model.mayhem.route_candidates[1].device_key = Some("78".repeat(32));
     model.mayhem.route_candidates[1].price_ver = 22;
     model.mayhem.route_candidates[1].price_ref_au = Some(PriceRefAu {
         denom: "au_usd".to_owned(),
@@ -4608,12 +5448,20 @@ async fn chat_completion_min_att_tier_two_routes_and_bills_tier2_market_price() 
         history: Vec::new(),
     });
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let state = test_gateway_state_from_models(vec![model]).with_session_backend(Arc::new(
-        RetryThenDirectSessionBackend {
+    let (authority, _) = av3_apple_authority(&model.mayhem.route_candidates[1], 1, None);
+    let state = test_gateway_state_from_models(vec![model.clone()])
+        .with_attestation_authority(authority)
+        .with_session_backend(Arc::new(RetryThenDirectSessionBackend {
             retry_provider: "ff".repeat(32),
             calls: calls.clone(),
-        },
-    ));
+        }));
+    av3_ingest_advertisement(
+        &state,
+        &model,
+        &model.mayhem.route_candidates[1],
+        &tier2_signing_key,
+        HardwareQuoteKind::AppleAppAttestJwt,
+    );
     let app = openai_router(state.clone());
     let request = json!({
         "model": "mayhem/routed-test",
@@ -6223,7 +7071,7 @@ fn test_provider_heartbeat(
             epoch: 3,
             head: candidate.binary_hash.clone(),
         },
-        ts: 1_782_950_400,
+        ts: current_test_millis(),
         nonce: format!("network-dashboard-test-{}", candidate.room_id),
         sig: "11".repeat(64),
     }

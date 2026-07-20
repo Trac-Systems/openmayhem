@@ -12,6 +12,7 @@ import {
   spendReservationMessage,
   spendVoucherMessage,
   tapAccountBindingMessage,
+  targetedSpendReservationMessage,
 } from '../../contract/contract.js';
 
 export const ZERO_HEX = '0'.repeat(64);
@@ -119,16 +120,23 @@ export async function epochApplyFeatureKey(contract, value) {
 }
 
 export async function executeEpochApplyFeature(contract, storage, value, sender) {
-  contract._mayhemLastFeatureResult = undefined;
-  const result = await executeFeature(
-    contract,
-    storage,
-    'mayhem_feature',
-    await epochApplyFeatureKey(contract, value),
-    value,
-    sender
-  );
-  return result ?? contract._mayhemLastFeatureResult;
+  const previousStorage = contract.storage;
+  const previousAddress = contract.address;
+  const previousValue = contract.value;
+  const previousTx = contract.tx;
+  contract.storage = storage;
+  contract.address = sender;
+  contract.value = value;
+  contract.tx = await epochApplyFeatureKey(contract, value);
+  try {
+    // Legacy-shaped vectors exercise the accounting core used by apply_targeted_epoch.
+    return await contract.targetedEpochApply(value, [], []);
+  } finally {
+    contract.storage = previousStorage;
+    contract.address = previousAddress;
+    contract.value = previousValue;
+    contract.tx = previousTx;
+  }
 }
 
 export async function depositFeatureKey(contract, value) {
@@ -238,7 +246,9 @@ export async function spendReservationFeatureKey(contract, value, storage = null
   const previousStorage = contract.storage;
   if (storage) contract.storage = storage;
   try {
-    const key = await contract.spendReservationFeatureKey(value);
+    const key = value.op === 'spend_reserve_targeted'
+      ? await contract.targetedSpendReservationFeatureKey(value)
+      : await contract.spendReservationFeatureKey(value);
     if (key instanceof Error) throw key;
     return key;
   } finally {
@@ -379,6 +389,9 @@ export const signSpendVoucher = (wallet, body, signingVersion) =>
 
 export const signSpendReservation = (wallet, value) =>
   b4a.toString(wallet.sign(b4a.from(spendReservationMessage(value))), 'hex');
+
+export const signTargetedSpendReservation = (wallet, value) =>
+  b4a.toString(wallet.sign(b4a.from(targetedSpendReservationMessage(value))), 'hex');
 
 export const signProviderLifecycleIntent = (wallet, intent, signingVersion) =>
   b4a.toString(wallet.sign(b4a.from(providerLifecycleIntentMessage(intent, signingVersion))), 'hex');

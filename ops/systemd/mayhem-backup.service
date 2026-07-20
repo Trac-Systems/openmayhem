@@ -5,17 +5,25 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-User=mayhem
-Group=mayhem
-WorkingDirectory=/opt/mayhem/source
+User=root
+Group=root
+WorkingDirectory=/opt/mayhem
 EnvironmentFile=/opt/mayhem/.mayhem-local/secrets/GO-LIVE/mayhem-systemd.env
 UMask=0077
-ExecStartPre=+/usr/bin/systemctl stop mayhem-paygate.service mayhem-tap-rate.service mayhem-tnk-rate.service mayhem-tap-deposit.service mayhem-tnk-deposit.service mayhem-tap-settlement.service mayhem-stack.service
-ExecStart=/opt/mayhem/source/scripts/ops/backup-mainnet.sh
-ExecStopPost=+/usr/bin/systemctl start mayhem-stack.service mayhem-paygate.service mayhem-tap-rate.service mayhem-tnk-rate.service mayhem-tap-deposit.service mayhem-tnk-deposit.service mayhem-tap-settlement.service
+ExecStart=/opt/mayhem/libexec/backup-mainnet.sh
 TimeoutStartSec=infinity
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX
+ReadOnlyPaths=/opt/mayhem/.mayhem-local /etc/systemd/system
+ReadWritePaths=/opt/mayhem/backups
 
 [Install]
 WantedBy=multi-user.target

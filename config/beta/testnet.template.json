@@ -36,7 +36,6 @@
     "admin_sets_prices": true,
     "admin_sets_rules": true,
     "admin_sets_params": true,
-    "admin_sets_provider_payout_targets": true,
     "admin_can_ban_providers": true,
     "providers_set_prices": false,
     "providers_set_rules": false,
@@ -45,7 +44,8 @@
     "providers_submit_models": false,
     "providers_create_canonical_rooms": false,
     "providers_only_join_admin_rooms": true,
-    "provider_payout_targets_admin_verified": true,
+    "provider_payout_bindings_permissionless": true,
+    "provider_payout_bindings_ownership_verified": true,
     "browser_handoffs_print_copy_paste_url": true
   },
   "admin": {
@@ -162,12 +162,8 @@
   "seed_providers": [
     {
       "provider_pubkey": "<seed-provider-public-key-64-hex>",
-      "payouts": {
-        "tnk": {
-          "admin_approved": true,
-          "addr": "<testtrac1-admin-approved-payout-target>"
-        }
-      },
+      "accepted_rails": ["fiat", "tap", "tnk"],
+      "stripe_country": "<ISO-2-provider-country>",
       "joins": [
         {
           "enclave_id": "<derived-catalog-enclave-id-64-hex>",

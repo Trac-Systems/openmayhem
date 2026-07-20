@@ -70,3 +70,46 @@ export function signedTapReceipt({
   if (epoch !== undefined) entry.epoch = epoch;
   return entry;
 }
+
+export function targetedTapBindingsFor(bundle, providerAccounts, revisions = {}) {
+  const bindings = {};
+  const billingTotals = new Map();
+  const entries = [...(bundle.receipts ?? [])].sort((left, right) => {
+    const a = left.receipt?.body ?? left.body ?? left;
+    const b = right.receipt?.body ?? right.body ?? right;
+    return String(a.billing_id).localeCompare(String(b.billing_id)) ||
+      Number(a.billing_attempt) - Number(b.billing_attempt) ||
+      Number(a.seq) - Number(b.seq);
+  });
+
+  for (const entry of entries) {
+    const body = entry.receipt?.body ?? entry.body ?? entry;
+    const epoch = entry.receipt_epoch ?? entry.epoch ??
+      body.receipt_epoch ?? body.epoch ?? bundle.epoch;
+    const key = `${epoch}/${body.user.toLowerCase()}/${body.session_id}`;
+    const currentAu = BigInt(body.au_owed_cum);
+    const previousAu = billingTotals.get(body.billing_id) ??
+      BigInt(body.billing_prior_au_owed_cum);
+    const deltaAu = currentAu - previousAu;
+    billingTotals.set(body.billing_id, currentAu);
+    const existing = bindings[key];
+    const account = providerAccounts[body.provider];
+    if (!account) {
+      throw new Error(`missing TAP payout account for provider ${body.provider}`);
+    }
+    bindings[key] = {
+      epoch,
+      session_id: body.session_id,
+      user: body.user,
+      provider: body.provider,
+      payout_revision: revisions[body.provider] ?? '11'.repeat(32),
+      account,
+      chain_id: 61_000,
+      context_revision: '22'.repeat(32),
+      payment_config_version: 1,
+      au: ((existing ? BigInt(existing.au) : 0n) + deltaAu).toString(),
+    };
+  }
+
+  return bindings;
+}

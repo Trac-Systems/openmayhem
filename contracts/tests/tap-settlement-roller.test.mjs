@@ -23,7 +23,7 @@ import {
   auToTapWei,
   providerShareWei,
   receiptMessage,
-  resolveProviderAccountsFromLedger,
+  resolveTargetedTapPayoutsFromLedger,
   resolveTapSettlementRate,
   resolveTapSettlementEpochPolicy,
   rollTapSettlement,
@@ -69,50 +69,140 @@ function runNode(args, options = {}) {
 
 const receipt = signedTapReceipt;
 
-test('TAP settlement resolves provider claim addresses only from current admin ledger state', async () => {
+function targetedBindingsFor(bundle, providerAccounts, revisions = {}) {
+  const bindings = {};
+  const billingTotals = new Map();
+  const entries = [...(bundle.receipts ?? [])].sort((left, right) => {
+    const a = left.receipt?.body ?? left.body ?? left;
+    const b = right.receipt?.body ?? right.body ?? right;
+    return String(a.billing_id).localeCompare(String(b.billing_id)) ||
+      Number(a.billing_attempt) - Number(b.billing_attempt) ||
+      Number(a.seq) - Number(b.seq);
+  });
+  for (const entry of entries) {
+    const body = entry.receipt?.body ?? entry.body ?? entry;
+    const epoch = entry.receipt_epoch ?? body.receipt_epoch ?? body.epoch ?? bundle.epoch;
+    const key = `${epoch}/${body.user.toLowerCase()}/${body.session_id}`;
+    const currentAu = BigInt(body.au_owed_cum);
+    const previousAu = billingTotals.get(body.billing_id) ??
+      BigInt(body.billing_prior_au_owed_cum);
+    const au = currentAu - previousAu;
+    billingTotals.set(body.billing_id, currentAu);
+    const existing = bindings[key];
+    bindings[key] = {
+      epoch,
+      session_id: body.session_id,
+      user: body.user,
+      provider: body.provider,
+      payout_revision: revisions[body.provider] ?? '11'.repeat(32),
+      account: providerAccounts[body.provider],
+      chain_id: 61_000,
+      context_revision: '22'.repeat(32),
+      payment_config_version: 1,
+      au: ((existing ? BigInt(existing.au) : 0n) + au).toString(),
+    };
+  }
+  return bindings;
+}
+
+test('targeted TAP roots preserve each session payout revision across rotation', async () => {
   const providerId = makeReceiptIdentity();
-  const providerAccount = ethers.Wallet.createRandom().address;
-  const admin = 'aa'.repeat(32);
-  const bundle = {
-    epoch: 1,
-    receipts: [receipt({ session: 'ledger-payout', provider: providerId, au: usdAu(1) })],
+  const oldAccount = ethers.Wallet.createRandom().address.toLowerCase();
+  const newAccount = ethers.Wallet.createRandom().address.toLowerCase();
+  const oldRevision = '11'.repeat(32);
+  const newRevision = '22'.repeat(32);
+  const oldReceipt = {
+    ...receipt({ session: 'targeted-old', provider: providerId, au: usdAu(1) }),
+    receipt_epoch: 1,
   };
-  const state = new Map([
-    ['admin', admin],
-    [`prov/${providerId.publicKeyHex}`, {
-      status: 'active',
-      payouts: {
-        tap: {
-          method: 'tap',
-          addr: providerAccount,
-          set_by: admin,
-          set_by_role: 'admin',
-        },
-      },
-    }],
-  ]);
+  const newReceipt = {
+    ...receipt({ session: 'targeted-new', provider: providerId, au: usdAu(1) }),
+    receipt_epoch: 2,
+  };
+  const state = new Map();
+  for (const [entry, epoch, revision, account] of [
+    [oldReceipt, 1, oldRevision, oldAccount],
+    [newReceipt, 2, newRevision, newAccount],
+  ]) {
+    const body = entry.receipt.body;
+    state.set(`payout/allocation/${epoch}/${body.session_id}`, {
+      type: 'provider_payout_session_allocation',
+      epoch,
+      page: 0,
+      session_id: body.session_id,
+      user: body.user,
+      rail: 'tap',
+      provider: body.provider,
+      payout_revision: revision,
+      au: usdAu(1),
+      feature_key: `epoch/targeted/${epoch}/${'aa'.repeat(32)}`,
+    });
+    state.set(`payout/binding/tap/${body.provider}/${revision}`, {
+      verified: true,
+      provider: body.provider,
+      rail: 'tap',
+      revision,
+      target: account,
+      chain_id: 61_000,
+      activation_epoch: epoch,
+      context_revision: '33'.repeat(32),
+      payment_config_version: 7,
+    });
+    state.set(`payout/liability/tap/${body.provider}/${revision}`, {
+      provider: body.provider,
+      rail: 'tap',
+      revision,
+      target: account,
+      currency: null,
+      chain_id: 61_000,
+    });
+  }
   const fetchImpl = async (url) => ({
     ok: true,
     json: async () => ({ value: state.get(new URL(url).searchParams.get('key')) ?? null }),
   });
-
+  const bundle = { receipts: [oldReceipt, newReceipt] };
+  const targeted = await resolveTargetedTapPayoutsFromLedger({
+    bundle,
+    peerRpcUrl: 'http://127.0.0.1:49223/v1',
+    fetchImpl,
+  });
+  const settlement = buildTapSettlement({
+    bundle,
+    targetedSessionBindings: targeted.sessionBindings,
+    tapUsdAu: TAP_USD_AU,
+    ledgerFeeBps: 1500,
+    settleThroughEpoch: 8,
+    challengeEpochs: 6,
+  });
+  const claim = providerShareWei(auToTapWei(usdAu(1), TAP_USD_AU));
   assert.deepEqual(
-    await resolveProviderAccountsFromLedger({
-      bundle,
-      peerRpcUrl: 'http://127.0.0.1:49223/v1',
-      fetchImpl,
-    }),
-    { [providerId.publicKeyHex]: providerAccount.toLowerCase() }
+    settlement.providers,
+    [oldAccount, newAccount]
+      .sort()
+      .map((account) => ({ account, cumulative_wei: claim.toString() }))
+  );
+  assert.deepEqual(
+    settlement.payout_bindings.map((binding) => binding.payout_revision),
+    [oldRevision, newRevision]
   );
 
-  state.get(`prov/${providerId.publicKeyHex}`).payouts.tap.set_by = 'bb'.repeat(32);
-  await assert.rejects(
-    resolveProviderAccountsFromLedger({
+  state.get(`payout/allocation/1/${oldReceipt.receipt.body.session_id}`).au = usdAu(2);
+  const substituted = await resolveTargetedTapPayoutsFromLedger({
+    bundle,
+    peerRpcUrl: 'http://127.0.0.1:49223/v1',
+    fetchImpl,
+  });
+  assert.throws(
+    () => buildTapSettlement({
       bundle,
-      peerRpcUrl: 'http://127.0.0.1:49223/v1',
-      fetchImpl,
+      targetedSessionBindings: substituted.sessionBindings,
+      tapUsdAu: TAP_USD_AU,
+      ledgerFeeBps: 1500,
+      settleThroughEpoch: 8,
+      challengeEpochs: 6,
     }),
-    /current admin/
+    /does not equal targeted session allocation/
   );
 });
 
@@ -267,7 +357,7 @@ test('TAP settlement roller posts root and provider proof verifies independently
   };
   const rolled = await rollTapSettlement({
     bundle,
-    providerAccounts,
+    targetedSessionBindings: targetedBindingsFor(bundle, providerAccounts),
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     settleThroughEpoch: 7,
@@ -347,7 +437,9 @@ test('TAP settlement roller includes buyer refund leaves in the claim root', asy
   };
   const rolled = await rollTapSettlement({
     bundle,
-    providerAccounts: { [providerId.publicKeyHex]: providerAccount },
+    targetedSessionBindings: targetedBindingsFor(bundle, {
+      [providerId.publicKeyHex]: providerAccount,
+    }),
     buyerAccounts: { [userId.publicKeyHex]: buyerAccount },
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
@@ -392,7 +484,7 @@ test('TAP settlement roller includes buyer refund leaves in the claim root', asy
   assert.equal(await token.balanceOf(buyerAccount), buyerRefund);
 });
 
-test('TAP settlement roller uses provider account mapping and skips repeated roots', async () => {
+test('TAP settlement roller requires targeted bindings and skips repeated roots', async () => {
   const ganache = Ganache.provider({
     logging: { quiet: true },
     chain: { chainId: 61_000 },
@@ -415,12 +507,14 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
   };
   assert.throws(
     () => buildTapSettlement({ bundle, tapUsdAu: TAP_USD_AU, ledgerFeeBps: 1500, settleThroughEpoch: 7 }),
-    /Missing TAP claim address/
+    /targeted TAP session bindings are required/
   );
   assert.throws(
     () => buildTapSettlement({
       bundle,
-      providerAccounts: { [providerId.publicKeyHex]: '0x1111111111111111111111111111111111111111' },
+      targetedSessionBindings: targetedBindingsFor(bundle, {
+        [providerId.publicKeyHex]: '0x1111111111111111111111111111111111111111',
+      }),
       tapUsdAu: TAP_USD_AU,
       ledgerFeeBps: 1500,
       settleThroughEpoch: 1,
@@ -431,7 +525,9 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
   assert.throws(
     () => buildTapSettlement({
       bundle,
-      providerAccounts: { [providerId.publicKeyHex]: '0x1111111111111111111111111111111111111111' },
+      targetedSessionBindings: targetedBindingsFor(bundle, {
+        [providerId.publicKeyHex]: '0x1111111111111111111111111111111111111111',
+      }),
       tapUsdAu: TAP_USD_AU,
       ledgerFeeBps: 1200,
       settleThroughEpoch: 7,
@@ -442,7 +538,7 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
   const providerAccounts = { [providerId.publicKeyHex]: await providerA.getAddress() };
   const first = await rollTapSettlement({
     bundle,
-    providerAccounts,
+    targetedSessionBindings: targetedBindingsFor(bundle, providerAccounts),
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     settleThroughEpoch: 7,
@@ -456,7 +552,7 @@ test('TAP settlement roller uses provider account mapping and skips repeated roo
 
   const replay = await rollTapSettlement({
     bundle,
-    providerAccounts,
+    targetedSessionBindings: targetedBindingsFor(bundle, providerAccounts),
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     settleThroughEpoch: 7,
@@ -524,10 +620,11 @@ test('TAP settlement nets one logical bill across provider redispatch attempts',
     [providerA.publicKeyHex]: accountA,
     [providerB.publicKeyHex]: accountB,
   };
+  const bundle = { epoch: 1, receipts: [second, first] };
 
   const settlement = buildTapSettlement({
-    bundle: { epoch: 1, receipts: [second, first] },
-    providerAccounts,
+    bundle,
+    targetedSessionBindings: targetedBindingsFor(bundle, providerAccounts),
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     settleThroughEpoch: 7,
@@ -556,23 +653,29 @@ test('TAP settlement nets one logical bill across provider redispatch attempts',
     user.privateKey
   ).toString('hex');
   assert.throws(
-    () => buildTapSettlement({
-      bundle: { epoch: 1, receipts: [first, wrongAmount] },
-      providerAccounts,
-      tapUsdAu: TAP_USD_AU,
-      ledgerFeeBps: 1500,
-      settleThroughEpoch: 7,
-    }),
+    () => {
+      const invalidBundle = { epoch: 1, receipts: [first, wrongAmount] };
+      return buildTapSettlement({
+        bundle: invalidBundle,
+        targetedSessionBindings: targetedBindingsFor(invalidBundle, providerAccounts),
+        tapUsdAu: TAP_USD_AU,
+        ledgerFeeBps: 1500,
+        settleThroughEpoch: 7,
+      });
+    },
     /redispatch baseline does not match prior logical settlement/
   );
   assert.throws(
-    () => buildTapSettlement({
-      bundle: { epoch: 1, receipts: [second] },
-      providerAccounts,
-      tapUsdAu: TAP_USD_AU,
-      ledgerFeeBps: 1500,
-      settleThroughEpoch: 7,
-    }),
+    () => {
+      const invalidBundle = { epoch: 1, receipts: [second] };
+      return buildTapSettlement({
+        bundle: invalidBundle,
+        targetedSessionBindings: targetedBindingsFor(invalidBundle, providerAccounts),
+        tapUsdAu: TAP_USD_AU,
+        ledgerFeeBps: 1500,
+        settleThroughEpoch: 7,
+      });
+    },
     /logical billing baseline has no prior signed receipt/
   );
 });
@@ -601,7 +704,7 @@ test('TAP settlement roller resumes fee and burn after an exact root-only partia
   };
   const settlement = buildTapSettlement({
     bundle,
-    providerAccounts,
+    targetedSessionBindings: targetedBindingsFor(bundle, providerAccounts),
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     settleThroughEpoch: 7,
@@ -625,7 +728,7 @@ test('TAP settlement roller resumes fee and burn after an exact root-only partia
 
   const resumed = await rollTapSettlement({
     bundle,
-    providerAccounts,
+    targetedSessionBindings: targetedBindingsFor(bundle, providerAccounts),
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     settleThroughEpoch: 7,
@@ -652,23 +755,26 @@ test('TAP settlement roller refuses unsigned multi-provider split controls', () 
   const providerId = makeReceiptIdentity();
   const a = '0x1111111111111111111111111111111111111111';
   const b = '0x2222222222222222222222222222222222222222';
+  const bundle = {
+    epoch: 1,
+    receipts: [receipt({
+      session: 's1',
+      provider: providerId,
+      au: usdAu(4),
+      extraBody: {
+        provider_refs: ['pa', 'pb'],
+        contribution_weights_bps: [2_500, 7_500],
+      },
+    })],
+  };
   assert.throws(
     () => buildTapSettlement({
       tapUsdAu: TAP_USD_AU,
       ledgerFeeBps: 1500,
-      bundle: {
-        epoch: 1,
-        receipts: [receipt({
-          session: 's1',
-          provider: providerId,
-          au: usdAu(4),
-          extraBody: {
-            provider_refs: ['pa', 'pb'],
-            contribution_weights_bps: [2_500, 7_500],
-          },
-        })],
-      },
-      providerAccounts: { [providerId.publicKeyHex]: a, pa: a, pb: b },
+      bundle,
+      targetedSessionBindings: targetedBindingsFor(bundle, {
+        [providerId.publicKeyHex]: a,
+      }),
       settleThroughEpoch: 7,
     }),
     /multi-provider TAP receipts require a signed contribution schema/
@@ -679,19 +785,22 @@ test('TAP settlement roller rejects unsigned and tampered receipts before root c
   const providerId = makeReceiptIdentity();
   const account = '0x1111111111111111111111111111111111111111';
   const signed = receipt({ session: 's1', provider: providerId, au: usdAu(2) });
+  const unsignedBundle = {
+    epoch: 1,
+    receipts: [{
+      receipt: {
+        body: signed.receipt.body,
+      },
+    }],
+  };
   assert.throws(
     () => buildTapSettlement({
       tapUsdAu: TAP_USD_AU,
       ledgerFeeBps: 1500,
-      bundle: {
-        epoch: 1,
-        receipts: [{
-          receipt: {
-            body: signed.receipt.body,
-          },
-        }],
-      },
-      providerAccounts: { [providerId.publicKeyHex]: account },
+      bundle: unsignedBundle,
+      targetedSessionBindings: targetedBindingsFor(unsignedBundle, {
+        [providerId.publicKeyHex]: account,
+      }),
       settleThroughEpoch: 7,
     }),
     /Invalid enclave receipt signature/
@@ -699,12 +808,15 @@ test('TAP settlement roller rejects unsigned and tampered receipts before root c
 
   const tampered = structuredClone(signed);
   tampered.receipt.body.au_owed_cum = usdAu(3);
+  const tamperedBundle = { epoch: 1, receipts: [tampered] };
   assert.throws(
     () => buildTapSettlement({
       tapUsdAu: TAP_USD_AU,
       ledgerFeeBps: 1500,
-      bundle: { epoch: 1, receipts: [tampered] },
-      providerAccounts: { [providerId.publicKeyHex]: account },
+      bundle: tamperedBundle,
+      targetedSessionBindings: targetedBindingsFor(tamperedBundle, {
+        [providerId.publicKeyHex]: account,
+      }),
       settleThroughEpoch: 7,
     }),
     /Invalid enclave receipt signature/
@@ -907,10 +1019,13 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
   t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
   const bundlePath = path.join(tmp, 'bundle.json');
   const providerId = makeReceiptIdentity();
-  fs.writeFileSync(bundlePath, JSON.stringify({
+  const bundle = {
     epoch: 1,
     receipts: [receipt({ session: 'cli-s1', provider: providerId, au: usdAu(1) })],
-  }, null, 2));
+  };
+  fs.writeFileSync(bundlePath, JSON.stringify(bundle, null, 2));
+  const body = bundle.receipts[0].receipt.body;
+  const payoutRevision = '44'.repeat(32);
   const admin = 'aa'.repeat(32);
   const ledgerState = new Map([
     ['admin', admin],
@@ -936,16 +1051,36 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
       posted_by: admin,
       posted_by_role: 'admin',
     }],
-    [`prov/${providerId.publicKeyHex}`, {
-      status: 'active',
-      payouts: {
-        tap: {
-          method: 'tap',
-          addr: providerSigner.address,
-          set_by: admin,
-          set_by_role: 'admin',
-        },
-      },
+    [`payout/allocation/1/${body.session_id}`, {
+      type: 'provider_payout_session_allocation',
+      epoch: 1,
+      page: 0,
+      session_id: body.session_id,
+      user: body.user,
+      rail: 'tap',
+      provider: body.provider,
+      payout_revision: payoutRevision,
+      au: usdAu(1),
+      feature_key: `epoch/targeted/1/${'55'.repeat(32)}`,
+    }],
+    [`payout/binding/tap/${body.provider}/${payoutRevision}`, {
+      verified: true,
+      provider: body.provider,
+      rail: 'tap',
+      revision: payoutRevision,
+      target: providerSigner.address.toLowerCase(),
+      chain_id: 61_000,
+      activation_epoch: 1,
+      context_revision: '66'.repeat(32),
+      payment_config_version: 1,
+    }],
+    [`payout/liability/tap/${body.provider}/${payoutRevision}`, {
+      provider: body.provider,
+      rail: 'tap',
+      revision: payoutRevision,
+      target: providerSigner.address.toLowerCase(),
+      currency: null,
+      chain_id: 61_000,
     }],
   ]);
   const ledgerServer = http.createServer((request, response) => {

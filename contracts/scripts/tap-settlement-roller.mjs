@@ -517,22 +517,45 @@ function receiptDeltaAu(entry, body, billingStates) {
   return current - previous;
 }
 
-function providerAccountFor(providerId, entry, body, providerAccounts) {
+function rejectReceiptPayoutAddress(entry, body) {
   const direct = entry.provider_tap_address
     ?? entry.tap_address
     ?? body.provider_tap_address
     ?? body.tap_address;
   if (direct) {
-    throw new Error('provider TAP address must come from operator provider-account map');
+    throw new Error('provider TAP address must come from an immutable targeted payout binding');
   }
-  const mapped = providerAccounts?.[providerId] ?? providerAccounts?.[providerId.toLowerCase()];
-  if (mapped) {
-    return normalizeAddress(mapped, `provider account for ${providerId}`);
-  }
-  throw new Error(`Missing TAP claim address for provider ${providerId}`);
 }
 
-function receiptProviders(entry, body, providerAccounts) {
+export function targetedTapSessionBindingKey({ epoch, user, sessionId } = {}) {
+  const safeEpoch = parsePositiveInt(epoch, 'targeted TAP allocation epoch');
+  if (!isHexBytes(user, 32)) throw new Error('targeted TAP allocation user must be 32 bytes of hex');
+  if (typeof sessionId !== 'string' || sessionId.length === 0 || sessionId.length > 256) {
+    throw new Error('targeted TAP allocation session id is invalid');
+  }
+  return `${safeEpoch}/${user.toLowerCase()}/${sessionId}`;
+}
+
+function targetedBindingForReceipt(entry, body, bundleEpoch, targetedSessionBindings) {
+  const epoch = entryEpoch(entry, body, bundleEpoch);
+  const key = targetedTapSessionBindingKey({
+    epoch,
+    user: body.user,
+    sessionId: body.session_id,
+  });
+  const binding = targetedSessionBindings[key];
+  if (!isObject(binding)) {
+    throw new Error(`Missing targeted TAP payout allocation for session ${body.session_id}`);
+  }
+  if (binding.provider !== body.provider ||
+      !isHexBytes(binding.payout_revision, 32)) {
+    throw new Error('targeted TAP payout allocation does not match receipt provider');
+  }
+  safeAu(binding.au, 'targeted TAP allocation au');
+  return { key, ...binding };
+}
+
+function receiptProviders(entry, body, targetedBinding) {
   const refs = entry.provider_refs ?? body.provider_refs;
   if (refs !== undefined) {
     throw new Error('multi-provider TAP receipts require a signed contribution schema');
@@ -545,9 +568,14 @@ function receiptProviders(entry, body, providerAccounts) {
     throw new Error('receipt provider is required');
   }
   if (!isHexBytes(providerId, 32)) throw new Error('receipt provider must be a 32-byte public key');
+  rejectReceiptPayoutAddress(entry, body);
   return [{
     provider_id: providerId,
-    account: providerAccountFor(providerId, entry, body, providerAccounts),
+    account: normalizeAddress(
+      targetedBinding.account,
+      `targeted provider account for ${providerId}`
+    ),
+    payout_revision: targetedBinding.payout_revision,
     weight_bps: 10_000,
   }];
 }
@@ -783,7 +811,6 @@ function applyBuyerRefunds(perBuyerRefund, inputBundle, buyerAccounts, rate) {
 export function buildTapSettlement({
   bundle,
   receipts,
-  providerAccounts = {},
   buyerAccounts = {},
   tapUsdAu,
   ledgerFeeBps,
@@ -791,9 +818,13 @@ export function buildTapSettlement({
   settleThroughEpoch = null,
   challengeEpochs = null,
   holdbackEpochs = 0,
+  targetedSessionBindings,
 } = {}) {
   const inputBundle = receipts ? { receipts } : bundle;
   const input = receipts ?? normalizedReceipts(bundle);
+  if (!isObject(targetedSessionBindings)) {
+    throw new Error('confirmed targeted TAP session bindings are required');
+  }
   const rate = safeAu(tapUsdAu, 'tap_usd_au').toString();
   const feeBps = tapLedgerFeeBps(inputBundle, ledgerFeeBps);
   const policy = releasePolicy({
@@ -810,6 +841,8 @@ export function buildTapSettlement({
   let heldReceiptCount = 0;
   let spentAu = 0n;
   let heldAu = 0n;
+  const targetedAllocatedAu = new Map();
+  const targetedBindingsUsed = new Map();
 
   const sorted = input
     .map(receiptEnvelope)
@@ -829,17 +862,38 @@ export function buildTapSettlement({
       heldAu += deltaAu;
       continue;
     }
+    const targetedBinding = targetedBindingForReceipt(
+      entry,
+      body,
+      bundleEpoch,
+      targetedSessionBindings
+    );
+    const nextAllocated = (targetedAllocatedAu.get(targetedBinding.key) ?? 0n) + deltaAu;
+    const expectedAllocated = safeAu(
+      targetedBinding.au,
+      'targeted TAP allocation au'
+    );
+    if (nextAllocated > expectedAllocated) {
+      throw new Error('TAP receipt amount exceeds targeted session allocation');
+    }
+    targetedAllocatedAu.set(targetedBinding.key, nextAllocated);
+    targetedBindingsUsed.set(targetedBinding.key, targetedBinding);
     const spentWei = auToTapWei(deltaAu, rate);
     if (spentWei <= 0n) throw new Error('receipt converts to zero TAP wei');
     receiptCount += 1;
     spentAu += deltaAu;
     cumulativeSpentWei += spentWei;
-    const providers = receiptProviders(entry, body, providerAccounts);
+    const providers = receiptProviders(entry, body, targetedBinding);
     let weightTotal = 0;
     for (const provider of providers) weightTotal += provider.weight_bps;
     if (weightTotal !== 10_000) throw new Error('provider weights must sum to 10000 bps');
     for (const provider of providers) {
       addWei(perProvider, provider.account, providerShareWei(spentWei, provider.weight_bps));
+    }
+  }
+  for (const [key, binding] of targetedBindingsUsed) {
+    if (targetedAllocatedAu.get(key) !== safeAu(binding.au, 'targeted TAP allocation au')) {
+      throw new Error('TAP receipt amount does not equal targeted session allocation');
     }
   }
 
@@ -883,6 +937,13 @@ export function buildTapSettlement({
       entries: [],
       providers: [],
       refunds: [],
+      payout_bindings: Array.from(targetedBindingsUsed.values())
+        .map(({ key: _key, ...binding }) => binding)
+        .sort((left, right) => (
+          left.epoch - right.epoch ||
+          left.provider.localeCompare(right.provider) ||
+          left.session_id.localeCompare(right.session_id)
+        )),
       release_policy: policy,
     };
   }
@@ -921,6 +982,13 @@ export function buildTapSettlement({
     entries: entries.map((entry) => ({ account: entry.account, cumulative_wei: entry.amount.toString() })),
     providers: providers.map((entry) => ({ account: entry.account, cumulative_wei: entry.amount.toString() })),
     refunds: refunds.map((entry) => ({ account: entry.account, cumulative_wei: entry.amount.toString() })),
+    payout_bindings: Array.from(targetedBindingsUsed.values())
+      .map(({ key: _key, ...binding }) => binding)
+      .sort((left, right) => (
+        left.epoch - right.epoch ||
+        left.provider.localeCompare(right.provider) ||
+        left.session_id.localeCompare(right.session_id)
+      )),
     proofs,
     release_policy: policy,
     dist,
@@ -1202,7 +1270,7 @@ async function poolTimestamp(pool, blockTag = 'latest') {
 export async function rollTapSettlement({
   bundle,
   receipts,
-  providerAccounts,
+  targetedSessionBindings,
   buyerAccounts,
   tapUsdAu,
   ledgerFeeBps,
@@ -1220,7 +1288,6 @@ export async function rollTapSettlement({
   const settlement = buildTapSettlement({
     bundle,
     receipts,
-    providerAccounts,
     buyerAccounts,
     tapUsdAu,
     ledgerFeeBps,
@@ -1228,6 +1295,7 @@ export async function rollTapSettlement({
     settleThroughEpoch,
     challengeEpochs,
     holdbackEpochs,
+    targetedSessionBindings,
   });
   if (!settlement.root) return settlement;
 
@@ -1688,37 +1756,96 @@ async function readContractStateValue(rpcUrl, key, {
   return body?.value ?? null;
 }
 
-export async function resolveProviderAccountsFromLedger({ bundle, peerRpcUrl, fetchImpl } = {}) {
-  const admin = String(await readContractStateValue(peerRpcUrl, 'admin', { fetchImpl }) ?? '')
-    .trim()
-    .toLowerCase();
-  if (!isHexBytes(admin, 32)) throw new Error('ledger admin key is missing or invalid');
-
-  const providerIds = new Set();
+export async function resolveTargetedTapPayoutsFromLedger({
+  bundle,
+  peerRpcUrl,
+  fetchImpl,
+} = {}) {
+  const bundleEpoch = bundle?.epoch ?? bundle?.receipt_epoch ?? bundle?.settlement_epoch;
+  const sessionBindings = {};
+  const accounts = {};
   for (const entry of normalizedReceipts(bundle)) {
     const { body, envelope } = receiptEnvelope(entry);
     verifyReceiptEnvelope(envelope);
-    const provider = String(body.provider ?? '').trim().toLowerCase();
-    if (!isHexBytes(provider, 32)) throw new Error('receipt provider must be a 32-byte public key');
-    providerIds.add(provider);
+    const epoch = parsePositiveInt(
+      entryEpoch(entry, body, bundleEpoch),
+      'targeted TAP receipt epoch'
+    );
+    const key = targetedTapSessionBindingKey({
+      epoch,
+      user: body.user,
+      sessionId: body.session_id,
+    });
+    const allocation = await readContractStateValue(
+      peerRpcUrl,
+      `payout/allocation/${epoch}/${body.session_id}`,
+      { confirmed: true, fetchImpl }
+    );
+    if (!allocation ||
+        allocation.type !== 'provider_payout_session_allocation' ||
+        allocation.epoch !== epoch ||
+        allocation.session_id !== body.session_id ||
+        allocation.user !== body.user ||
+        allocation.rail !== 'tap' ||
+        allocation.provider !== body.provider ||
+        !isHexBytes(allocation.payout_revision, 32) ||
+        !String(allocation.feature_key ?? '').startsWith(`epoch/targeted/${epoch}/`)) {
+      throw new Error(`confirmed targeted TAP allocation is missing for session ${body.session_id}`);
+    }
+    const allocationAu = safeAu(allocation.au, 'targeted TAP allocation au').toString();
+    const revision = allocation.payout_revision.toLowerCase();
+    const binding = await readContractStateValue(
+      peerRpcUrl,
+      `payout/binding/tap/${body.provider}/${revision}`,
+      { confirmed: true, fetchImpl }
+    );
+    if (!binding ||
+        binding.verified !== true ||
+        binding.provider !== body.provider ||
+        binding.rail !== 'tap' ||
+        binding.revision !== revision ||
+        binding.activation_epoch > epoch ||
+        !Number.isSafeInteger(binding.chain_id) ||
+        binding.chain_id < 1) {
+      throw new Error(`verified targeted TAP binding is missing for session ${body.session_id}`);
+    }
+    const liability = await readContractStateValue(
+      peerRpcUrl,
+      `payout/liability/tap/${body.provider}/${revision}`,
+      { confirmed: true, fetchImpl }
+    );
+    if (!liability ||
+        liability.provider !== body.provider ||
+        liability.rail !== 'tap' ||
+        liability.revision !== revision ||
+        liability.target !== binding.target ||
+        liability.chain_id !== binding.chain_id) {
+      throw new Error(`targeted TAP liability is missing for session ${body.session_id}`);
+    }
+    const resolved = {
+      epoch,
+      session_id: body.session_id,
+      user: body.user,
+      provider: body.provider,
+      payout_revision: revision,
+      account: normalizeAddress(
+        binding.target,
+        `targeted TAP account for ${body.provider}`
+      ),
+      chain_id: binding.chain_id,
+      context_revision: binding.context_revision,
+      payment_config_version: binding.payment_config_version,
+      au: allocationAu,
+    };
+    if (sessionBindings[key] &&
+        stableJson(sessionBindings[key]) !== stableJson(resolved)) {
+      throw new Error(`conflicting targeted TAP allocation for session ${body.session_id}`);
+    }
+    sessionBindings[key] = resolved;
+    const providerRevision = `${body.provider}/${revision}`;
+    accounts[providerRevision] = resolved.account;
   }
-
-  const accounts = {};
-  for (const provider of [...providerIds].sort()) {
-    const record = await readContractStateValue(peerRpcUrl, `prov/${provider}`, { fetchImpl });
-    if (!record || record.status !== 'active') {
-      throw new Error(`active provider record is missing for ${provider}`);
-    }
-    const payout = record.payouts?.tap;
-    if (!payout || payout.method !== 'tap') {
-      throw new Error(`admin-set TAP payout target is missing for provider ${provider}`);
-    }
-    if (String(payout.set_by ?? '').toLowerCase() !== admin || payout.set_by_role !== 'admin') {
-      throw new Error(`TAP payout target was not set by the current admin for provider ${provider}`);
-    }
-    accounts[provider] = normalizeAddress(payout.addr, `provider account for ${provider}`);
-  }
-  return accounts;
+  return { accounts, sessionBindings };
 }
 
 async function resolveActiveEpochParam({ peerRpcUrl, key, fallback, fetchImpl } = {}) {
@@ -1985,7 +2112,7 @@ async function main() {
   if (!bundlePath) throw new Error('Missing --bundle/--receipts-file.');
   const bundle = readJson(path.resolve(bundlePath), 'receipt bundle');
   if (args['provider-accounts'] !== undefined) {
-    throw new Error('--provider-accounts is not supported; set the TAP payout target with mayhem admin set-provider-payout');
+    throw new Error('--provider-accounts is not supported.');
   }
   for (const key of ['settle-through-epoch', 'challenge-epochs', 'holdback-epochs']) {
     if (args[key] !== undefined) {
@@ -2003,7 +2130,10 @@ async function main() {
   const poolAddress = args.pool || process.env.MAYHEM_TAP_POOL_ADDRESS;
   const operatorAddress = args['operator-address'] || process.env.MAYHEM_TAP_OPERATOR_ADDRESS;
   if (!poolAddress) throw new Error('Missing --pool or MAYHEM_TAP_POOL_ADDRESS.');
-  const providerAccounts = await resolveProviderAccountsFromLedger({ bundle, peerRpcUrl });
+  const targetedPayouts = await resolveTargetedTapPayoutsFromLedger({
+    bundle,
+    peerRpcUrl,
+  });
   const epochPolicy = await resolveTapSettlementEpochPolicy({
     peerRpcUrl,
   });
@@ -2018,6 +2148,11 @@ async function main() {
   }
   const tapUsdAu = tapRateLock.tap_usd_au;
   const ledgerFeeBps = args['ledger-fee-bps'];
+  for (const binding of Object.values(targetedPayouts.sessionBindings)) {
+    if (binding.chain_id !== tapRateLock.chain_id) {
+      throw new Error('Targeted TAP binding chain does not match the settlement pool');
+    }
+  }
 
   const confirm = boolArg(args.confirm, false);
   const json = boolArg(args.json, false);
@@ -2051,7 +2186,7 @@ async function main() {
 
   const report = await rollTapSettlement({
     bundle,
-    providerAccounts,
+    targetedSessionBindings: targetedPayouts.sessionBindings,
     buyerAccounts,
     prior,
     tapUsdAu,

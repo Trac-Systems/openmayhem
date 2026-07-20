@@ -128,15 +128,6 @@ const buildAdminOnlyAttempts = (provider, roomId) => [
     },
   ],
   [
-    'setProviderPayout',
-    {
-      op: 'set_provider_payout',
-      provider: provider.publicKey,
-      payout_addr: 'provider-picked-target',
-      payout_method: 'tnk',
-    },
-  ],
-  [
     'banProvider',
     {
       op: 'ban_provider',
@@ -340,6 +331,16 @@ test('MayhemContract replicated source avoids locale and env-dependent admission
   assert.doesNotMatch(contractSource, /localeCompare/);
   assert.doesNotMatch(contractSource, /MAYHEM_TX_MAX_BYTES/);
   assert.match(protocolSource, /MAYHEM_TX_MAX_BYTES/);
+  assert.doesNotMatch(protocolSource, /set_provider_payout|setProviderPayout/);
+  assert.match(protocolSource, /bind_provider_payout/);
+  assert.match(protocolSource, /spend_reserve_targeted/);
+  assert.match(protocolSource, /apply_targeted_epoch/);
+  assert.doesNotMatch(
+    contractSource,
+    /requireAdminSetPayoutTarget|applyTnkSettlementFeature|applyFiatSettlementFeature/
+  );
+  assert.doesNotMatch(contractSource, /(?:^|[^a-z_])tnk_settlement(?:[^a-z_]|$)/m);
+  assert.doesNotMatch(contractSource, /(?:^|[^a-z_])fiat_settlement(?:[^a-z_]|$)/m);
 });
 
 test('MayhemContract rejects admin ops before genesis admin is present', async () => {
@@ -384,6 +385,34 @@ test('MayhemContract rejects admin ops before genesis admin is present', async (
     const result = await executeRateFeature(contract, storage, value, outsider.publicKey);
     assert.match(result.message, /admin required/i, `${value.op} feature should require genesis admin`);
     assert.equal(storage.snapshotBytes(), before, `${value.op} feature must not mutate before genesis admin`);
+  }
+});
+
+test('removed admin payout mutation is not part of the contract surface', async () => {
+  const { admin, provider, storage, contract } = await setupSecuritySurface();
+  assert.equal(typeof contract.setProviderPayout, 'undefined');
+  assert.equal(contract.schemas?.has?.('setProviderPayout') ?? false, false);
+  assert.equal(typeof contract.tnkSettlement, 'undefined');
+  assert.equal(typeof contract.fiatSettlement, 'undefined');
+  assert.equal(typeof contract.requireAdminSetPayoutTarget, 'undefined');
+
+  for (const [type, value] of [
+    [
+      'setProviderPayout',
+      {
+        op: 'set_provider_payout',
+        provider: provider.publicKey,
+        payout_addr: 'provider-picked-target',
+        payout_method: 'tnk',
+      },
+    ],
+    ['tnkSettlement', { op: 'tnk_settlement' }],
+    ['fiatSettlement', { op: 'fiat_settlement' }],
+  ]) {
+    const before = storage.snapshotBytes();
+    const result = await execute(contract, storage, type, value, admin.publicKey, 6);
+    assert.match(result.message, /unknown contract operation type/i);
+    assert.equal(storage.snapshotBytes(), before);
   }
 });
 
@@ -471,7 +500,7 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
 
   const providerRecord = await storage.get(`prov/${provider.publicKey}`);
   assert.equal(providerRecord.value.status, 'active');
-  assert.deepEqual(providerRecord.value.payouts, {});
+  assert.equal(Object.hasOwn(providerRecord.value, 'payouts'), false);
   assert.equal((await storage.get(`enclave/${enclaveId}`)).value.created_by, admin.publicKey);
   assert.equal((await storage.get(`enclave/${enclaveId}`)).value.created_by_role, 'admin');
   assert.equal((await storage.get(`room/${roomId}`)).value.creator, admin.publicKey);

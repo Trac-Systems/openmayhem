@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { Duplex } from 'node:stream';
 import test from 'node:test';
 import b4a from 'b4a';
+import NoiseSecretStream from '../node_modules/@hyperswarm/secret-stream/index.js';
+import DirectSession from '../features/direct-session/index.js';
 import InferenceRelay, {
   BoundedPairingMap,
   normalizeRelayKeys,
@@ -69,6 +72,380 @@ const mockPeer = (swarm = new MockSwarm()) => ({
   swarm,
   directSession: { sessions: new Map() },
 });
+
+const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
+
+const streamBytes = (stream) => (
+  Math.max(0, Number(stream?.bytesReceived) || 0)
+  + Math.max(0, Number(stream?.bytesTransmitted) || 0)
+);
+
+const memoryDuplexPair = () => {
+  const writes = { left: [], right: [] };
+  let left = null;
+  let right = null;
+  left = new Duplex({
+    read() {},
+    write(chunk, _encoding, callback) {
+      const data = Buffer.from(chunk);
+      writes.left.push(data.byteLength);
+      right.push(data);
+      callback();
+    },
+  });
+  right = new Duplex({
+    read() {},
+    write(chunk, _encoding, callback) {
+      const data = Buffer.from(chunk);
+      writes.right.push(data.byteLength);
+      left.push(data);
+      callback();
+    },
+  });
+  return { left, right, writes };
+};
+
+const authenticatedDuplexPair = async (rawPair, leftKeyPair, rightKeyPair) => {
+  const rawLeft = rawPair.left;
+  const rawRight = rawPair.right;
+  const left = new NoiseSecretStream(true, rawLeft, { keyPair: leftKeyPair });
+  const right = new NoiseSecretStream(false, rawRight, { keyPair: rightKeyPair });
+  left.on('error', () => {});
+  right.on('error', () => {});
+  const [leftOpened, rightOpened] = await Promise.all([left.opened, right.opened]);
+  assert.equal(leftOpened, true);
+  assert.equal(rightOpened, true);
+  assert.deepEqual(left.remotePublicKey, rightKeyPair.publicKey);
+  assert.deepEqual(right.remotePublicKey, leftKeyPair.publicKey);
+  assert.ok(left.handshakeHash.byteLength > 0);
+  assert.deepEqual(left.handshakeHash, right.handshakeHash);
+  return {
+    ...rawPair,
+    left,
+    right,
+    rawLeft,
+    rawRight,
+  };
+};
+
+const boundedRelayDuplexPair = (relay) => {
+  let nextStreamId = 1;
+  relay.peer.swarm.dht.createRawStream = () => {
+    const stream = new EventEmitter();
+    stream.id = nextStreamId++;
+    stream.bytesReceived = 0;
+    stream.bytesTransmitted = 0;
+    stream.destroyed = false;
+    stream.destroy = (error = null) => {
+      if (stream.destroyed) return;
+      stream.destroyed = true;
+      stream.error = error;
+      if (error) stream.emit('error', error);
+      stream.emit('close');
+    };
+    return stream;
+  };
+
+  const legs = [
+    relay._createBoundedStream({ side: 'left' }),
+    relay._createBoundedStream({ side: 'right' }),
+  ];
+  const writes = { left: [], right: [] };
+  let left = null;
+  let right = null;
+  let closing = false;
+
+  const closeConnections = (error) => {
+    if (closing) return;
+    closing = true;
+    if (!left.destroyed) left.destroy(error || undefined);
+    if (!right.destroyed) right.destroy(error || undefined);
+  };
+  for (const leg of legs) {
+    leg.on('close', () => closeConnections(leg.error));
+  }
+
+  const forward = (source, destination, peer, side, chunk, callback) => {
+    if (source.destroyed || destination.destroyed || peer.destroyed) {
+      callback(source.error || destination.error || new Error('Relay link is closed.'));
+      return;
+    }
+    const data = Buffer.from(chunk);
+    source.bytesReceived += data.byteLength;
+    destination.bytesTransmitted += data.byteLength;
+    writes[side].push(data.byteLength);
+    peer.push(data);
+    callback();
+  };
+
+  left = new Duplex({
+    read() {},
+    write(chunk, _encoding, callback) {
+      forward(legs[0], legs[1], right, 'left', chunk, callback);
+    },
+  });
+  right = new Duplex({
+    read() {},
+    write(chunk, _encoding, callback) {
+      forward(legs[1], legs[0], left, 'right', chunk, callback);
+    },
+  });
+  left.on('error', () => {});
+  right.on('error', () => {});
+
+  return {
+    left,
+    right,
+    legs,
+    writes,
+  };
+};
+
+const payloadFrames = (requestId, mode, startIndex) => {
+  const payloads = [
+    { modelClass: 'text', contentType: 'text/plain', byte: '74' },
+    { modelClass: 'image', contentType: 'image/png', byte: '89' },
+    { modelClass: 'audio', contentType: 'audio/wav', byte: '52' },
+    { modelClass: 'video', contentType: 'video/mp4', byte: '00' },
+    { modelClass: 'embedding', contentType: 'application/json', byte: '65' },
+  ];
+  let index = startIndex;
+  return payloads.flatMap(({ modelClass, contentType, byte }, payloadIndex) => (
+    [0, 1].map((part) => {
+      const frameIndex = index++;
+      if (modelClass === 'text') {
+        return {
+          t: 's.delta',
+          rid: requestId,
+          i: frameIndex,
+          d: `${mode}-text-${part}-`.repeat(12),
+          model_class: modelClass,
+          wire_mode: mode,
+          wire_part: part,
+          fin: null,
+        };
+      }
+      if (modelClass === 'embedding') {
+        return {
+          t: 's.delta_chunk',
+          v: 1,
+          rid: requestId,
+          i: frameIndex,
+          field: 'embeddings',
+          payload_id: byte.repeat(32),
+          chunk: {
+            index: part,
+            count: 2,
+            values: Array.from(
+              { length: 24 },
+              (_, valueIndex) => (payloadIndex + part + valueIndex) / 100
+            ),
+          },
+          model_class: modelClass,
+          wire_mode: mode,
+          wire_part: part,
+        };
+      }
+      return {
+        t: 's.delta',
+        rid: requestId,
+        i: frameIndex,
+        d: '',
+        model_class: modelClass,
+        wire_mode: mode,
+        wire_part: part,
+        artifact: {
+          id: `${mode}-${modelClass}`,
+          content_type: contentType,
+          encoding: 'hex',
+          offset: part * 96,
+          len: 96,
+          total_len: 192,
+          blake3: byte.repeat(32),
+          data: byte.repeat(96),
+          final: part === 1,
+        },
+        fin: null,
+      };
+    })
+  ));
+};
+
+const sendFrames = async (directSession, record, frames, coalesced) => {
+  if (!coalesced) {
+    for (const frame of frames) {
+      await directSession.send(record.remote, record.sessionId, frame);
+      await nextTurn();
+    }
+    return;
+  }
+  const mux = record.connection.userData;
+  mux.cork();
+  try {
+    for (const frame of frames) {
+      directSession._validateFrame(frame);
+      assert.equal(record.message.send(frame), true);
+    }
+  } finally {
+    mux.uncork();
+  }
+  await nextTurn();
+};
+
+const relayedSessionHarness = async ({
+  relayConfig = {},
+  buyerConfig = {},
+  providerConfig = {},
+} = {}) => {
+  const buyerKeyPair = NoiseSecretStream.keyPair(b4a.alloc(32, 0x66));
+  const providerKeyPair = NoiseSecretStream.keyPair(b4a.alloc(32, 0x77));
+  const buyerKey = b4a.toString(buyerKeyPair.publicKey, 'hex');
+  const providerKey = b4a.toString(providerKeyPair.publicKey, 'hex');
+  const relaySwarm = new MockSwarm();
+  const boundedRelay = new InferenceRelay(mockPeer(relaySwarm), {
+    maxBytesPerLink: 16 * 1024 * 1024,
+    rateBytesPerSecond: 16 * 1024 * 1024,
+    rateBurstBytes: 16 * 1024 * 1024,
+    ...relayConfig,
+  });
+  const relayPair = await authenticatedDuplexPair(
+    boundedRelayDuplexPair(boundedRelay),
+    buyerKeyPair,
+    providerKeyPair
+  );
+
+  const buyerSwarm = {
+    connections: new Set([relayPair.left]),
+    peers: new Map(),
+    joinPeer() {},
+    leavePeer() {},
+  };
+  const providerSwarm = {
+    connections: new Set([relayPair.right]),
+    peers: new Map(),
+    joinPeer() {},
+    leavePeer() {},
+  };
+  const buyerPeer = {
+    wallet: { publicKey: buyerKey },
+    swarm: buyerSwarm,
+    directSession: null,
+  };
+  const providerPeer = {
+    wallet: { publicKey: providerKey },
+    swarm: providerSwarm,
+    directSession: null,
+  };
+  const buyerRoutes = new InferenceRelay(buyerPeer, { relays: [relayA] });
+  const providerRoutes = new InferenceRelay(providerPeer, { relays: [relayA] });
+  buyerRoutes._handleConnection(relayPair.left, {
+    inferenceRelay: true,
+    relay: relayA,
+  });
+  providerRoutes._handleConnection(relayPair.right, {
+    inferenceRelay: true,
+    relay: relayA,
+  });
+
+  const buyerFrames = [];
+  const buyerCloses = [];
+  const providerFrames = [];
+  const providerCloses = [];
+  const commonConfig = {
+    maxFrameBytes: 4096,
+    maxStringBytes: 4096,
+    rateBytesPerSecond: 0,
+    rateBurstBytes: 4096,
+    receiveBatchHeadroomBytes: 64 * 1024,
+  };
+  const buyer = new DirectSession(buyerPeer, {
+    ...commonConfig,
+    ...buyerConfig,
+    transportInfo: (connection, key) => buyerRoutes.connectionTransport(connection, key),
+    onFrame: (event) => buyerFrames.push(event),
+    onClose: (event) => buyerCloses.push(event),
+  });
+  const provider = new DirectSession(providerPeer, {
+    ...commonConfig,
+    ...providerConfig,
+    transportInfo: (connection, key) => providerRoutes.connectionTransport(connection, key),
+    onFrame: (event) => providerFrames.push(event),
+    onClose: (event) => providerCloses.push(event),
+  });
+  buyerPeer.directSession = buyer;
+  providerPeer.directSession = provider;
+  buyer._prepareConnection(relayPair.left);
+  provider._prepareConnection(relayPair.right);
+
+  const connections = [
+    { feature: buyer, connection: relayPair.left },
+    { feature: provider, connection: relayPair.right },
+  ];
+
+  const open = async (sessionId) => {
+    await buyer.open(providerKey, sessionId);
+    await nextTurn();
+    const buyerRecord = buyer.sessions.get(`${providerKey}:${sessionId}`);
+    const providerRecord = provider.sessions.get(`${buyerKey}:${sessionId}`);
+    assert.ok(buyerRecord, `buyer session ${sessionId}`);
+    assert.ok(providerRecord, `provider session ${sessionId}`);
+    return { buyerRecord, providerRecord };
+  };
+
+  const replaceWithDirect = async (sessionId) => {
+    const directPair = await authenticatedDuplexPair(
+      memoryDuplexPair(),
+      buyerKeyPair,
+      providerKeyPair
+    );
+    buyerSwarm.connections.add(directPair.left);
+    providerSwarm.connections.add(directPair.right);
+    buyerRoutes._handleConnection(directPair.left, null);
+    providerRoutes._handleConnection(directPair.right, null);
+    buyer._prepareConnection(directPair.left);
+    provider._prepareConnection(directPair.right);
+    connections.push(
+      { feature: buyer, connection: directPair.left },
+      { feature: provider, connection: directPair.right }
+    );
+
+    const buyerRecord = buyer._ensureSession(directPair.left, sessionId);
+    await buyerRecord.channel.fullyOpened();
+    await nextTurn();
+    const providerRecord = provider.sessions.get(`${buyerKey}:${sessionId}`);
+    assert.ok(providerRecord, `replacement provider session ${sessionId}`);
+    assert.equal(providerRecord.connection, directPair.right);
+    return { buyerRecord, providerRecord, directPair };
+  };
+
+  const cleanup = () => {
+    for (const { feature, connection } of connections) {
+      feature._dropHealthConnection(connection);
+      if (!connection.destroyed) connection.destroy();
+    }
+    for (const leg of relayPair.legs) {
+      if (!leg.destroyed) leg.destroy();
+    }
+  };
+
+  return {
+    boundedRelay,
+    buyer,
+    buyerCloses,
+    buyerFrames,
+    buyerKey,
+    buyerRoutes,
+    cleanup,
+    open,
+    provider,
+    providerCloses,
+    providerFrames,
+    providerKey,
+    providerRoutes,
+    relayPair,
+    replaceWithDirect,
+  };
+};
 
 test('relay keys are canonical, unique, and never include the local peer', () => {
   assert.deepEqual(
@@ -295,6 +672,436 @@ test('relay stream byte cap destroys only the offending link', () => {
   assert.match(first.error.message, /byte limit/);
   assert.equal(second.destroyed, false);
   assert.equal(relay.stats().counters.links_byte_limited, 1);
+});
+
+test('relay stream rate budget accepts a bounded burst after refill', (t) => {
+  let now = 10_000;
+  t.mock.method(Date, 'now', () => now);
+  const swarm = new MockSwarm();
+  swarm.dht.createRawStream = () => {
+    const stream = new EventEmitter();
+    stream.bytesReceived = 0;
+    stream.bytesTransmitted = 0;
+    stream.destroyed = false;
+    stream.destroy = (error) => {
+      stream.destroyed = true;
+      stream.error = error;
+      stream.emit('close');
+    };
+    return stream;
+  };
+  const relay = new InferenceRelay(mockPeer(swarm), {
+    maxBytesPerLink: 10_000,
+    rateBytesPerSecond: 100,
+    rateBurstBytes: 200,
+  });
+  const stream = relay._createBoundedStream({});
+
+  stream.bytesReceived = 200;
+  relay._sweep();
+  assert.equal(stream.destroyed, false);
+
+  now += 2_000;
+  stream.bytesReceived += 200;
+  relay._sweep();
+
+  assert.equal(stream.destroyed, false);
+  assert.equal(relay.stats().counters.links_rate_limited, 0);
+  assert.equal(relay.stats().counters.bytes_observed, 400);
+});
+
+test('relay stream rate budget closes only sustained over-budget traffic', (t) => {
+  let now = 20_000;
+  t.mock.method(Date, 'now', () => now);
+  const swarm = new MockSwarm();
+  swarm.dht.createRawStream = () => {
+    const stream = new EventEmitter();
+    stream.bytesReceived = 0;
+    stream.bytesTransmitted = 0;
+    stream.destroyed = false;
+    stream.destroy = (error) => {
+      stream.destroyed = true;
+      stream.error = error;
+      stream.emit('close');
+    };
+    return stream;
+  };
+  const relay = new InferenceRelay(mockPeer(swarm), {
+    maxBytesPerLink: 10_000,
+    rateBytesPerSecond: 100,
+    rateBurstBytes: 200,
+  });
+  const offender = relay._createBoundedStream({});
+  const healthy = relay._createBoundedStream({});
+
+  offender.bytesReceived = 200;
+  healthy.bytesReceived = 100;
+  relay._sweep();
+  now += 1_000;
+  offender.bytesReceived += 101;
+  healthy.bytesReceived += 100;
+  relay._sweep();
+
+  assert.equal(offender.destroyed, true);
+  assert.match(offender.error.message, /rate limit/);
+  assert.equal(healthy.destroyed, false);
+  assert.equal(relay.stats().counters.links_rate_limited, 1);
+});
+
+test('bounded relay carries authenticated payload classes across relay-to-direct without replay', async () => {
+  const harness = await relayedSessionHarness();
+  const matrixSessionId = '88'.repeat(32);
+  const requestId = 'relay-boundary-request';
+
+  try {
+    const relayed = await harness.open(matrixSessionId);
+    assert.deepEqual(harness.buyer._sessionInfo(relayed.buyerRecord), {
+      session_id: matrixSessionId,
+      channel: `mx/s/${matrixSessionId}`,
+      protocol: 'mx/s',
+      remote: harness.providerKey,
+      direct: false,
+      relayed: true,
+      relay: relayA,
+      opened: true,
+    });
+    assert.equal(relayed.providerRecord.remote, harness.buyerKey);
+
+    let nextIndex = 0;
+    const expectedFrames = [];
+    const relayFragmented = payloadFrames(requestId, 'relay-fragmented', nextIndex);
+    nextIndex += relayFragmented.length;
+    const fragmentedWritesBefore = harness.relayPair.writes.right.length;
+    await sendFrames(harness.provider, relayed.providerRecord, relayFragmented, false);
+    expectedFrames.push(...relayFragmented);
+    assert.ok(
+      harness.relayPair.writes.right.length - fragmentedWritesBefore
+        >= relayFragmented.length
+    );
+
+    const relayCoalesced = payloadFrames(requestId, 'relay-coalesced', nextIndex);
+    nextIndex += relayCoalesced.length;
+    const coalescedWritesBefore = harness.relayPair.writes.right.length;
+    await sendFrames(harness.provider, relayed.providerRecord, relayCoalesced, true);
+    expectedFrames.push(...relayCoalesced);
+    assert.equal(harness.relayPair.writes.right.length - coalescedWritesBefore, 1);
+
+    const partialReceipt = {
+      t: 's.receipt',
+      v: 1,
+      session_id: matrixSessionId,
+      seq: 1,
+      receipt: {
+        body: {
+          session_id: matrixSessionId,
+          seq: 1,
+          final_receipt: false,
+        },
+      },
+    };
+    await harness.provider.send(
+      harness.buyerKey,
+      matrixSessionId,
+      partialReceipt
+    );
+    await nextTurn();
+    expectedFrames.push(partialReceipt);
+    const partialReceiptAck = {
+      t: 's.receipt_ack',
+      v: 1,
+      session_id: matrixSessionId,
+      seq: 1,
+      user_sig: 'a1'.repeat(64),
+    };
+    await harness.buyer.send(
+      harness.providerKey,
+      matrixSessionId,
+      partialReceiptAck
+    );
+    await nextTurn();
+
+    harness.boundedRelay._sweep();
+    const relayBytesAtBoundary = harness.boundedRelay.stats().counters.bytes_observed;
+    assert.ok(
+      relayBytesAtBoundary
+        > relayFragmented.reduce(
+          (total, frame) => total + harness.buyer._frameBytes(frame),
+          0
+        )
+    );
+    assert.equal(harness.relayPair.legs.every((leg) => !leg.destroyed), true);
+
+    const direct = await harness.replaceWithDirect(matrixSessionId);
+    assert.equal(relayed.buyerRecord.closed, true);
+    assert.equal(relayed.providerRecord.closed, true);
+    assert.equal(relayed.buyerRecord.channel.closed, true);
+    assert.equal(relayed.providerRecord.channel.closed, true);
+    assert.deepEqual(harness.buyer._sessionInfo(direct.buyerRecord), {
+      session_id: matrixSessionId,
+      channel: `mx/s/${matrixSessionId}`,
+      protocol: 'mx/s',
+      remote: harness.providerKey,
+      direct: true,
+      relayed: false,
+      relay: null,
+      opened: true,
+    });
+    harness.boundedRelay._sweep();
+    const relayBytesAfterRelease = harness.boundedRelay.stats().counters.bytes_observed;
+    assert.ok(relayBytesAfterRelease >= relayBytesAtBoundary);
+
+    const directFragmented = payloadFrames(requestId, 'direct-fragmented', nextIndex);
+    nextIndex += directFragmented.length;
+    const directFragmentedWritesBefore = direct.directPair.writes.right.length;
+    await sendFrames(harness.provider, direct.providerRecord, directFragmented, false);
+    expectedFrames.push(...directFragmented);
+    assert.ok(
+      direct.directPair.writes.right.length - directFragmentedWritesBefore
+        >= directFragmented.length
+    );
+
+    const directCoalesced = payloadFrames(requestId, 'direct-coalesced', nextIndex);
+    nextIndex += directCoalesced.length;
+    const finalDelta = {
+      t: 's.delta',
+      rid: requestId,
+      i: nextIndex++,
+      d: '',
+      fin: 'stop',
+      model_class: 'text',
+    };
+    const directCoalescedBatch = [...directCoalesced, finalDelta];
+    const directCoalescedWritesBefore = direct.directPair.writes.right.length;
+    await sendFrames(
+      harness.provider,
+      direct.providerRecord,
+      directCoalescedBatch,
+      true
+    );
+    expectedFrames.push(...directCoalescedBatch);
+    assert.equal(
+      direct.directPair.writes.right.length - directCoalescedWritesBefore,
+      1
+    );
+
+    const finalReceipt = {
+      t: 's.receipt',
+      v: 1,
+      session_id: matrixSessionId,
+      seq: 2,
+      receipt: {
+        body: {
+          session_id: matrixSessionId,
+          seq: 2,
+          final_receipt: true,
+        },
+      },
+    };
+    await harness.provider.send(harness.buyerKey, matrixSessionId, finalReceipt);
+    await nextTurn();
+    expectedFrames.push(finalReceipt);
+    const finalReceiptAck = {
+      t: 's.receipt_ack',
+      v: 1,
+      session_id: matrixSessionId,
+      seq: 2,
+      user_sig: 'a2'.repeat(64),
+    };
+    await harness.buyer.send(
+      harness.providerKey,
+      matrixSessionId,
+      finalReceiptAck
+    );
+    await nextTurn();
+
+    harness.boundedRelay._sweep();
+    assert.equal(
+      harness.boundedRelay.stats().counters.bytes_observed,
+      relayBytesAfterRelease,
+      'direct traffic must not accrue relay bytes'
+    );
+    assert.deepEqual(
+      harness.buyerFrames.map(({ frame }) => frame),
+      expectedFrames
+    );
+    const deltaIndices = harness.buyerFrames
+      .map(({ frame }) => frame)
+      .filter((frame) => Number.isSafeInteger(frame.i))
+      .map((frame) => frame.i);
+    assert.deepEqual(
+      deltaIndices,
+      Array.from({ length: nextIndex }, (_, index) => index),
+      'replacement must neither reorder nor replay provider deltas'
+    );
+    assert.equal(new Set(deltaIndices).size, deltaIndices.length);
+
+    const receipts = harness.buyerFrames
+      .map(({ frame }) => frame)
+      .filter((frame) => frame.t === 's.receipt');
+    assert.equal(receipts.length, 2);
+    assert.equal(
+      receipts.filter((frame) => frame.receipt.body.final_receipt === true).length,
+      1
+    );
+    assert.deepEqual(
+      harness.providerFrames.map(({ frame }) => frame),
+      [partialReceiptAck, finalReceiptAck]
+    );
+    assert.equal(harness.providerFrames[0].relayed, true);
+    assert.equal(harness.providerFrames[1].direct, true);
+    assert.equal(
+      harness.providerFrames.filter(({ frame }) => frame.seq === 2).length,
+      1
+    );
+    assert.equal(
+      harness.buyerFrames
+        .slice(0, relayFragmented.length + relayCoalesced.length + 1)
+        .every((event) => event.relayed && !event.direct && event.relay === relayA),
+      true
+    );
+    assert.equal(
+      harness.buyerFrames
+        .slice(relayFragmented.length + relayCoalesced.length + 1)
+        .every((event) => event.direct && !event.relayed && event.relay === null),
+      true
+    );
+    assert.equal(harness.boundedRelay.stats().counters.links_byte_limited, 0);
+    assert.equal(harness.boundedRelay.stats().counters.links_rate_limited, 0);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('bounded relay aggregate and rate limits observe actual DirectSession frames', async (t) => {
+  await t.test('aggregate bytes', async () => {
+    const harness = await relayedSessionHarness();
+    const aggregateSessionId = '89'.repeat(32);
+    try {
+      const { providerRecord } = await harness.open(aggregateSessionId);
+      harness.boundedRelay._sweep();
+      harness.boundedRelay.maxBytesPerLink = Math.max(
+        ...harness.relayPair.legs.map((leg) => streamBytes(leg))
+      );
+      const frame = {
+        t: 's.delta',
+        rid: 'aggregate-limit',
+        i: 0,
+        d: 'aggregate-limit-frame'.repeat(32),
+      };
+
+      await sendFrames(harness.provider, providerRecord, [frame], false);
+      assert.deepEqual(harness.buyerFrames.map((event) => event.frame), [frame]);
+      harness.boundedRelay._sweep();
+
+      assert.equal(harness.boundedRelay.stats().counters.links_byte_limited, 2);
+      assert.equal(harness.boundedRelay.stats().counters.links_rate_limited, 0);
+      assert.equal(harness.relayPair.legs.every((leg) => leg.destroyed), true);
+      assert.ok(
+        harness.boundedRelay.stats().counters.bytes_observed
+          >= harness.buyer._frameBytes(frame)
+      );
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  await t.test('rate bytes', async () => {
+    const harness = await relayedSessionHarness();
+    const rateSessionId = '8a'.repeat(32);
+    try {
+      const { providerRecord } = await harness.open(rateSessionId);
+      harness.boundedRelay._sweep();
+      harness.boundedRelay.rateBytesPerSecond = 1;
+      harness.boundedRelay.rateBurstBytes = 1;
+      for (const state of harness.boundedRelay.streams.values()) {
+        state.tokens = 1;
+        state.last_checked_at = Date.now() + 60_000;
+      }
+      const frame = {
+        t: 's.delta',
+        rid: 'rate-limit',
+        i: 0,
+        d: 'rate-limit-frame'.repeat(32),
+      };
+
+      await sendFrames(harness.provider, providerRecord, [frame], false);
+      assert.deepEqual(harness.buyerFrames.map((event) => event.frame), [frame]);
+      harness.boundedRelay._sweep();
+
+      assert.equal(harness.boundedRelay.stats().counters.links_rate_limited, 2);
+      assert.equal(harness.boundedRelay.stats().counters.links_byte_limited, 0);
+      assert.equal(harness.relayPair.legs.every((leg) => leg.destroyed), true);
+    } finally {
+      harness.cleanup();
+    }
+  });
+});
+
+test('buyer-local receive limiting does not penalize the provider relay link', async () => {
+  const harness = await relayedSessionHarness({
+    buyerConfig: {
+      rateBytesPerSecond: 1,
+      rateBurstBytes: 4096,
+      receiveBatchHeadroomBytes: 8192,
+    },
+  });
+  const limitedSessionId = '8b'.repeat(32);
+  const healthySessionId = '8c'.repeat(32);
+
+  try {
+    const limited = await harness.open(limitedSessionId);
+    const healthy = await harness.open(healthySessionId);
+    limited.buyerRecord.receiveLimiter.tokens = 0;
+    limited.buyerRecord.receiveLimiter.lastRefill = Date.now() + 60_000;
+    const rejectedLocally = {
+      t: 's.delta',
+      rid: 'buyer-local-limit',
+      i: 0,
+      d: 'buyer-local-overflow',
+    };
+    const healthyFrame = {
+      t: 's.delta',
+      rid: 'provider-still-healthy',
+      i: 0,
+      d: 'provider connection remains usable',
+    };
+
+    await harness.provider.send(
+      harness.buyerKey,
+      limitedSessionId,
+      rejectedLocally
+    );
+    await nextTurn();
+    assert.equal(limited.buyerRecord.closed, true);
+    assert.equal(
+      harness.buyerCloses.some(
+        (event) => event.session_id === limitedSessionId
+          && event.locally_initiated === true
+          && /receive rate/.test(event.reason)
+      ),
+      true
+    );
+
+    await harness.provider.send(
+      harness.buyerKey,
+      healthySessionId,
+      healthyFrame
+    );
+    await nextTurn();
+    harness.boundedRelay._sweep();
+
+    assert.deepEqual(
+      harness.buyerFrames.map(({ session_id, frame }) => ({ session_id, frame })),
+      [{ session_id: healthySessionId, frame: healthyFrame }]
+    );
+    assert.equal(healthy.buyerRecord.closed, false);
+    assert.equal(healthy.providerRecord.closed, false);
+    assert.equal(harness.relayPair.legs.every((leg) => !leg.destroyed), true);
+    assert.equal(harness.boundedRelay.stats().counters.links_rate_limited, 0);
+    assert.equal(harness.boundedRelay.stats().counters.links_byte_limited, 0);
+  } finally {
+    harness.cleanup();
+  }
 });
 
 test('idle cleanup closes only inactive relay control sessions', () => {

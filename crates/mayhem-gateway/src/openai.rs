@@ -27,9 +27,10 @@ use crate::{
         DEFAULT_CANARY_MATCH_MIN_BPS, MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS,
     },
     failover::{
-        effective_context_floor, midstream_stalled_after, x_mayhem_hedge_requested, FailoverPolicy,
-        RedispatchMode, SessionFailoverState, SessionPriceAu, DEFAULT_MAX_OPEN_ATTEMPTS,
-        DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_COOLOFF_MILLIS,
+        effective_context_floor, midstream_stalled_after, route_wait_millis,
+        x_mayhem_hedge_requested, FailoverPolicy, RedispatchMode, SessionFailoverState,
+        SessionPriceAu, DEFAULT_MAX_OPEN_ATTEMPTS, DEFAULT_OPEN_TIMEOUT_MILLIS,
+        DEFAULT_PROVIDER_COOLOFF_MILLIS,
     },
     job_store::{
         gateway_job_id, BeginGatewayJob, GatewayJobArtifact, GatewayJobListEntry, GatewayJobLookup,
@@ -41,17 +42,19 @@ use crate::{
         RateMapEntry,
     },
     provider_table::{
+        baseline_route_state, BaselineRouteRequirements, BaselineRouteState,
         ContractProviderSnapshot, LcgBalancerRng, ModalityRequestLoad,
         ProviderCapacityMismatchEvent, ProviderObservationSample, ProviderTable,
-        ProviderTableEntry, ProviderUnderdeliveryEvent, RequestRequirements, SelectionWeights,
-        DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR, DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S,
-        DEFAULT_IMAGE_FLOOR_IMAGES_PER_S, DEFAULT_LLM_GENERATION_FLOOR_TOK_S,
-        DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
+        ProviderTableEntry, ProviderUnderdeliveryEvent, RequestRequirements,
+        RouteAttestationPolicyReadiness, SelectionWeights, DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR,
+        DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S, DEFAULT_IMAGE_FLOOR_IMAGES_PER_S,
+        DEFAULT_LLM_GENERATION_FLOOR_TOK_S, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
     },
-    verify_tier1_attestation, AttestationVerificationRequest, EnclaveContractRecord,
-    HardwareQuoteVerifierCommand, HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf,
-    HeartbeatQueue, HeartbeatSlots, ProviderHeartbeat, ProviderKey, ProviderProbation,
-    ReputationEventKind,
+    verify_tier1_attestation, AttestationPolicyVerificationContext, AttestationVerificationRequest,
+    EnclaveContractRecord, HardwareQuoteVerifierCommand, HeartbeatAttestation, HeartbeatCaps,
+    HeartbeatPerf, HeartbeatQueue, HeartbeatSlots, ProviderHeartbeat, ProviderKey,
+    ProviderProbation, ReputationEventKind, VerifiedAttestation,
+    GATEWAY_ATTESTATION_VERIFIER_VERSION,
 };
 use axum::{
     body::{Body, Bytes},
@@ -73,6 +76,11 @@ use base64::{
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use futures_util::{stream, Stream};
 use image::ImageReader;
+use mayhem_attestation::{
+    issue_tpm_activate_credential_challenge, ActivatedTpmIdentity, AttestationPolicyChain,
+    AttestationReadiness, CollateralInventory, VerifierCapabilities,
+    DEFAULT_TPM_CHALLENGE_TTL_SECS,
+};
 use mayhem_bridge::{sc_bridge_session_transport, BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
     artifact_generation_inline_audio_load, ctx_bracket_for_tokens_in_schedule,
@@ -80,17 +88,22 @@ use mayhem_proto::{
     payload_chunk_manifest, receipt_signing_bytes, session_accept_signing_bytes,
     session_frame_head, spend_voucher_signing_bytes, stable_json_bytes,
     validate_transcription_result, validated_audio_metadata, validated_wav_audio_metadata,
-    AttestationReport, CheckpointPolicy, CtxBracketSchedule, EndpointFamilyContract,
-    EndpointValueType, ModelSpecialityDescriptor, MoneyAu, PayloadChunk, PayloadChunkCollector,
-    PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
-    SpendVoucherBody, TranscriptionResult, TranscriptionResultLimits, ValidatedAudioFormat,
-    VisibleToolCall, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    AdminAttestationPolicy, AdminEnclaveAttestationBinding, AttestationReport,
+    AttestationTrustDataRef, AttestationVerifierProfile, CheckpointPolicy, CtxBracketSchedule,
+    EndpointFamilyContract, EndpointValueType, HardwareQuoteKind, HardwareQuoteRouteAdvertisement,
+    HardwareQuoteRoutePolicyBinding, ModelSpecialityDescriptor, MoneyAu, PayloadChunk,
+    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SessionReceipt, SpendVoucher, SpendVoucherBody, TpmActivateCredentialChallengeFrame,
+    TpmActivateCredentialHello, TpmActivateCredentialResponseFrame, TranscriptionResult,
+    TranscriptionResultLimits, ValidatedAudioFormat, VisibleToolCall, ATTESTATION_ALG,
+    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
     MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
-    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME,
-    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP,
-    USAGE_VIDEO_SECOND,
+    SESSION_RECEIPT_SCHEMA_VERSION, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
+    TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION, TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE,
+    USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
+    USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 #[cfg(test)]
 use mayhem_proto::{chunk_json_payload, visible_output_units};
@@ -211,13 +224,14 @@ const CONTEXT_NEEDLE_MAX_TOKENS: u32 = 16;
 const CONTEXT_NEEDLE_FILLER_WORDS_PER_LINE: usize = 32;
 const DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS: u64 = 1_000;
 const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
+const TPM_ACTIVATION_CACHE_TTL_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 const DASHBOARD_SESSION_TTL_SECONDS: u64 = 15 * 60;
 const DASHBOARD_COOKIE_NAME: &str = "mayhem_dashboard";
 const DASHBOARD_PROVIDER_PROGRESS_ONLY_TTL_MS: u64 = 5 * 60 * 1000;
 const DASHBOARD_CSP: &str = "default-src 'self'; connect-src 'self' http://127.0.0.1:*; img-src 'self' data:; font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'";
 #[derive(Clone, Debug)]
 pub struct GatewayState {
-    models: Arc<Mutex<Arc<Vec<GatewayModel>>>>,
+    catalog_runtime: Arc<Mutex<GatewayCatalogRuntime>>,
     receipts: Arc<Mutex<Vec<StoredReceipt>>>,
     dashboard_history_path: Arc<Option<PathBuf>>,
     dashboard_history_write: Arc<Mutex<()>>,
@@ -231,7 +245,10 @@ pub struct GatewayState {
     payment_directory: Arc<Mutex<Option<Value>>>,
     session_backend: Arc<dyn GatewaySessionBackend>,
     hardware_quote_trust: Arc<HardwareQuoteTrust>,
-    canaries: Arc<GatewayCanaryRegistry>,
+    heartbeat_attestation_advertisements:
+        Arc<Mutex<BTreeMap<ProviderKey, LiveHeartbeatAttestationAdvertisement>>>,
+    tpm_activation_cache: Arc<Mutex<BTreeMap<ProviderKey, GatewayTpmActivationCacheEntry>>>,
+    tpm_activation_inflight: Arc<Mutex<BTreeSet<ProviderKey>>>,
     canary_policy: GatewayCanaryProbePolicy,
     canary_scheduler: Arc<Mutex<GatewayCanaryScheduler>>,
     dashboard_session: Arc<DashboardSession>,
@@ -256,6 +273,13 @@ pub struct GatewayState {
     default_min_ctx: Option<u32>,
     dev_session_shim: bool,
     media_limits: Arc<GatewayMediaLimits>,
+}
+
+#[derive(Clone, Debug)]
+struct GatewayCatalogRuntime {
+    models: Arc<Vec<GatewayModel>>,
+    canaries: Arc<GatewayCanaryRegistry>,
+    attestation_authority: Option<Arc<GatewayAttestationAuthority>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1725,11 +1749,128 @@ struct ReceiptConfig {
 
 #[derive(Clone, Debug, Default)]
 struct HardwareQuoteTrust {
-    apple_app_attest_jwks: Option<Value>,
-    nvidia_gb10_device_jwks: Option<Value>,
-    nvidia_nras_jwks: Option<Value>,
-    nvidia_offline_jwks: Option<Value>,
     verifier_command: Option<HardwareQuoteVerifierCommand>,
+}
+
+#[derive(Clone, Debug)]
+/// Gateway-local attestation authority assembled only from authenticated
+/// canonical ledger state and locally validated collateral.
+pub struct GatewayAttestationAuthority {
+    policy_chain: Arc<AttestationPolicyChain>,
+    collateral: Arc<CollateralInventory>,
+    policy_epoch: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayAttestationCollateral {
+    pub reference: AttestationTrustDataRef,
+    pub bytes: Vec<u8>,
+    pub observed_epoch: u64,
+}
+
+impl GatewayAttestationAuthority {
+    /// Build the policy authority at the canonical ledger epoch used for route
+    /// and session decisions. Provider quote payloads must never populate it.
+    pub fn new(
+        policy_chain: AttestationPolicyChain,
+        collateral: CollateralInventory,
+        policy_epoch: u64,
+    ) -> Self {
+        Self {
+            policy_chain: Arc::new(policy_chain),
+            collateral: Arc::new(collateral),
+            policy_epoch,
+        }
+    }
+
+    /// Construct an authority directly from fields carried by verified signed
+    /// catalog bytes. Every collateral record must be an exact policy
+    /// reference and is digest/size checked before becoming locally trusted.
+    pub fn from_catalog_records(
+        policies: Option<Vec<AdminAttestationPolicy>>,
+        enclave_bindings: Vec<AdminEnclaveAttestationBinding>,
+        collateral: impl IntoIterator<Item = GatewayAttestationCollateral>,
+        policy_epoch: u64,
+    ) -> Result<Self, String> {
+        let policy_references = policies
+            .as_ref()
+            .into_iter()
+            .flat_map(|policies| policies.iter())
+            .flat_map(|policy| policy.trust_data.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let policy_chain = AttestationPolicyChain::from_catalog_records(policies, enclave_bindings)
+            .map_err(|err| format!("signed catalog attestation policy is invalid: {err}"))?;
+        let mut inventory = CollateralInventory::new();
+        for item in collateral {
+            if !policy_references
+                .iter()
+                .any(|reference| reference == &item.reference)
+            {
+                return Err(format!(
+                    "attestation collateral {} is not an exact signed-catalog policy reference",
+                    item.reference.id
+                ));
+            }
+            inventory
+                .insert_reference(&item.reference, item.bytes, item.observed_epoch)
+                .map_err(|err| {
+                    format!(
+                        "attestation collateral {} failed validation: {err}",
+                        item.reference.id
+                    )
+                })?;
+        }
+        Ok(Self::new(policy_chain, inventory, policy_epoch))
+    }
+
+    pub fn policy_epoch(&self) -> u64 {
+        self.policy_epoch
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LiveHeartbeatAttestationAdvertisement {
+    advertisement: HardwareQuoteRouteAdvertisement,
+    tpm_activation_hello: Option<TpmActivateCredentialHello>,
+    heartbeat_epoch: u64,
+    heartbeat_head: String,
+    heartbeat_ts: u64,
+    transport_peer: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct GatewayTpmActivationCacheEntry {
+    identity: ActivatedTpmIdentity,
+    policy_sequence: u64,
+    policy_digest: String,
+    device_id: String,
+    heartbeat_epoch: u64,
+    heartbeat_head: String,
+    transport_peer: String,
+    hello_digest: String,
+    expires_at_millis: u64,
+}
+
+struct GatewayTpmActivationAttemptGuard {
+    inflight: Arc<Mutex<BTreeSet<ProviderKey>>>,
+    key: ProviderKey,
+}
+
+impl Drop for GatewayTpmActivationAttemptGuard {
+    fn drop(&mut self) {
+        self.inflight
+            .lock_recover("TPM activation in-flight set")
+            .remove(&self.key);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GatewayResolvedRouteAttestation {
+    readiness: RouteAttestationPolicyReadiness,
+    authority: Arc<GatewayAttestationAuthority>,
+    route_binding: HardwareQuoteRoutePolicyBinding,
+    activated_tpm_identity: Option<ActivatedTpmIdentity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2266,6 +2407,9 @@ pub type GatewayArtifactGenerationFuture<'a> = Pin<
 pub type GatewayHedgeProbeFuture<'a> =
     Pin<Box<dyn Future<Output = Result<GatewayHedgeProbeResult, GatewaySessionError>> + Send + 'a>>;
 
+pub type GatewayTpmActivationFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ActivatedTpmIdentity, GatewaySessionError>> + Send + 'a>>;
+
 pub trait GatewaySessionBackend: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &str;
     fn bridge_stream_config(&self) -> Option<ScBridgeGatewaySessionConfig> {
@@ -2282,6 +2426,18 @@ pub trait GatewaySessionBackend: Send + Sync + std::fmt::Debug {
                 provider: invocation.provider_pubkey.clone().unwrap_or_default(),
                 ttft_ms: 0,
             })
+        })
+    }
+
+    fn activate_tpm<'a>(
+        &'a self,
+        _invocation: &'a GatewayTpmActivationInvocation,
+    ) -> GatewayTpmActivationFuture<'a> {
+        Box::pin(async move {
+            Err(GatewaySessionError::new(format!(
+                "{} backend does not support TPM activation",
+                self.name()
+            )))
         })
     }
 
@@ -2712,6 +2868,7 @@ pub struct GatewaySessionInvocation {
     pub hedge: GatewayHedgeInvocation,
     pub failover: GatewayFailoverInvocation,
     pub access_token: Option<GatewayTokenAttribution>,
+    verified_attestation_evidence: Arc<Mutex<Option<VerifiedAttestation>>>,
     client_cancellation: Option<GatewayRequestCancellation>,
     job: Option<GatewayJobHandle>,
     receipt_recorder: GatewayReceiptRecorder,
@@ -2725,6 +2882,15 @@ pub struct GatewayHedgeProbeInvocation {
     pub provider_pubkey: Option<String>,
     pub transport_peer: Option<String>,
     pub failover: GatewayFailoverInvocation,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayTpmActivationInvocation {
+    pub provider_pubkey: String,
+    pub transport_peer: String,
+    pub enclave_id: String,
+    pub room_id: String,
+    pub hello: TpmActivateCredentialHello,
 }
 
 impl GatewayHedgeProbeInvocation {
@@ -2745,6 +2911,32 @@ impl GatewayHedgeProbeInvocation {
 }
 
 impl GatewaySessionInvocation {
+    fn retain_verified_attestation(&self, verified: VerifiedAttestation) {
+        *self
+            .verified_attestation_evidence
+            .lock_recover("verified session attestation evidence") = Some(verified);
+    }
+
+    fn attestation_policy_binding(&self) -> Option<&HardwareQuoteRoutePolicyBinding> {
+        self.attestation
+            .as_ref()
+            .and_then(|attestation| attestation.policy.as_ref())
+            .map(|policy| &policy.route_binding)
+    }
+
+    fn runtime_binary_hash_evidence(&self) -> String {
+        self.verified_attestation_evidence
+            .lock_recover("verified session attestation evidence")
+            .as_ref()
+            .map(|verified| verified.runtime_binary_hash.clone())
+            .or_else(|| {
+                self.attestation
+                    .as_ref()
+                    .map(|attestation| attestation.contract.binary_hash.clone())
+            })
+            .unwrap_or_default()
+    }
+
     fn provider_pubkey_required(&self) -> Result<&str, GatewaySessionError> {
         self.provider_pubkey
             .as_deref()
@@ -2788,16 +2980,21 @@ pub struct GatewayHedgeProbeResult {
 #[derive(Clone, Debug)]
 pub struct GatewaySessionAttestation {
     pub contract: EnclaveContractRecord,
-    pub trusted_apple_app_attest_jwks: Option<Value>,
-    pub trusted_nvidia_gb10_device_jwks: Option<Value>,
-    pub trusted_nvidia_nras_jwks: Option<Value>,
-    pub trusted_nvidia_offline_jwks: Option<Value>,
+    policy: Option<GatewaySessionAttestationPolicy>,
     pub hardware_quote_verifier_command: Option<HardwareQuoteVerifierCommand>,
+}
+
+#[derive(Clone, Debug)]
+struct GatewaySessionAttestationPolicy {
+    authority: Arc<GatewayAttestationAuthority>,
+    route_binding: HardwareQuoteRoutePolicyBinding,
+    activated_tpm_identity: Option<ActivatedTpmIdentity>,
 }
 
 #[derive(Clone, Debug)]
 pub struct GatewaySessionError {
     pub message: String,
+    pub failure_class: GatewaySessionFailureClass,
     pub retryable: bool,
     pub before_first_output: bool,
     pub transport_closed: bool,
@@ -2806,6 +3003,12 @@ pub struct GatewaySessionError {
     pub clean_refusal_code: Option<String>,
     pub partial: Option<Box<GatewaySessionPartial>>,
     pub interrupted: Option<Box<GatewaySessionInterrupted>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatewaySessionFailureClass {
+    ProviderFault,
+    BuyerLocal,
 }
 
 #[derive(Debug)]
@@ -3013,13 +3216,24 @@ impl GatewayState {
         let receipt_config = ReceiptConfig::default();
         let ledger_balance_au = receipt_config.balance_au;
         let retention_limits = GatewayRetentionLimits::default();
-        let provider_table = provider_table_from_models(&models, receipt_config.rules_ver);
+        let provider_table = provider_table_from_models(
+            &models,
+            receipt_config.rules_ver,
+            None,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+        );
         let media_limits = GatewayMediaLimits::from_env().unwrap_or_else(|err| {
             eprintln!("Invalid gateway media limit during state construction: {err}");
             GatewayMediaLimits::default()
         });
         Self {
-            models: Arc::new(Mutex::new(Arc::new(models))),
+            catalog_runtime: Arc::new(Mutex::new(GatewayCatalogRuntime {
+                models: Arc::new(models),
+                canaries: Arc::new(canaries),
+                attestation_authority: None,
+            })),
             receipts: Arc::new(Mutex::new(Vec::new())),
             dashboard_history_path: Arc::new(None),
             dashboard_history_write: Arc::new(Mutex::new(())),
@@ -3041,7 +3255,9 @@ impl GatewayState {
             payment_directory: Arc::new(Mutex::new(None)),
             session_backend: Arc::new(NoProviderSessionBackend),
             hardware_quote_trust: Arc::new(HardwareQuoteTrust::default()),
-            canaries: Arc::new(canaries),
+            heartbeat_attestation_advertisements: Arc::new(Mutex::new(BTreeMap::new())),
+            tpm_activation_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            tpm_activation_inflight: Arc::new(Mutex::new(BTreeSet::new())),
             canary_policy: GatewayCanaryProbePolicy::default(),
             canary_scheduler: Arc::new(Mutex::new(GatewayCanaryScheduler::default())),
             dashboard_session: Arc::new(DashboardSession::new()),
@@ -3243,7 +3459,10 @@ impl GatewayState {
     }
 
     pub fn models_snapshot(&self) -> Arc<Vec<GatewayModel>> {
-        self.models.lock_recover("gateway model catalog").clone()
+        self.catalog_runtime
+            .lock_recover("gateway catalog runtime")
+            .models
+            .clone()
     }
 
     /// Swap the model catalog at runtime (contract catalog refresh). Keeps
@@ -3251,23 +3470,73 @@ impl GatewayState {
     /// of the provider table are rebuilt, so enclave/binary approvals and
     /// price changes take effect without a gateway restart.
     pub fn replace_model_catalog(&self, models: Vec<GatewayModel>) {
+        let (canaries, authority) = {
+            let runtime = self.catalog_runtime.lock_recover("gateway catalog runtime");
+            (
+                (*runtime.canaries).clone(),
+                runtime.attestation_authority.as_deref().cloned(),
+            )
+        };
+        self.replace_authenticated_catalog(models, canaries, authority);
+    }
+
+    pub fn replace_authenticated_catalog(
+        &self,
+        models: Vec<GatewayModel>,
+        canaries: GatewayCanaryRegistry,
+        authority: Option<GatewayAttestationAuthority>,
+    ) {
         let models = sanitize_gateway_models(models);
+        let authority = authority.map(Arc::new);
+        let valid_route_keys = models
+            .iter()
+            .flat_map(|model| model.mayhem.route_candidates.iter().map(route_key))
+            .collect::<BTreeSet<_>>();
+        let heartbeat_advertisements = {
+            let mut advertisements = self
+                .heartbeat_attestation_advertisements
+                .lock_recover("heartbeat attestation advertisements");
+            advertisements.retain(|key, _| valid_route_keys.contains(key));
+            advertisements.clone()
+        };
+        self.tpm_activation_cache
+            .lock_recover("TPM activation cache")
+            .clear();
         let snapshots = models
             .iter()
             .flat_map(|model| {
                 model.mayhem.route_candidates.iter().map(|candidate| {
-                    contract_snapshot_for_route(model, candidate, self.receipt_config.rules_ver)
+                    contract_snapshot_for_route(
+                        model,
+                        candidate,
+                        self.receipt_config.rules_ver,
+                        authority.as_ref(),
+                        &heartbeat_advertisements,
+                        &BTreeMap::new(),
+                        self.hardware_quote_trust.verifier_command.as_ref(),
+                    )
                 })
             })
             .collect::<Vec<_>>();
-        self.provider_table
-            .lock_recover("provider table")
-            .replace_contract_snapshot(snapshots);
-        *self.models.lock_recover("gateway model catalog") = Arc::new(models);
+        let mut runtime = self.catalog_runtime.lock_recover("gateway catalog runtime");
+        let mut provider_table = self.provider_table.lock_recover("provider table");
+        provider_table.replace_contract_snapshot(snapshots);
+        *runtime = GatewayCatalogRuntime {
+            models: Arc::new(models),
+            canaries: Arc::new(canaries),
+            attestation_authority: authority,
+        };
+        drop(provider_table);
+        drop(runtime);
+        *self
+            .canary_scheduler
+            .lock_recover("gateway canary scheduler") = GatewayCanaryScheduler::default();
     }
 
     pub fn with_canary_registry(mut self, registry: GatewayCanaryRegistry) -> Self {
-        self.canaries = Arc::new(registry);
+        self.catalog_runtime
+            .lock_recover("gateway catalog runtime")
+            .canaries = Arc::new(registry);
         self.canary_scheduler = Arc::new(Mutex::new(GatewayCanaryScheduler::default()));
         self
     }
@@ -3343,10 +3612,79 @@ impl GatewayState {
         self
     }
 
+    fn baseline_route_requirements(&self, now_millis: u64) -> BaselineRouteRequirements {
+        BaselineRouteRequirements {
+            current_rules_ver: self.receipt_config.rules_ver,
+            requires_transport_peer: !self.dev_session_shim,
+            now_millis,
+            heartbeat_ttl_millis: self.provider_heartbeat_ttl_millis,
+            ..BaselineRouteRequirements::default()
+        }
+    }
+
     pub fn ingest_provider_heartbeat(&self, heartbeat: ProviderHeartbeat, received_at_millis: u64) {
-        self.provider_table
-            .lock_recover("provider table")
-            .upsert_heartbeat(heartbeat, received_at_millis);
+        let key = ProviderKey::from_heartbeat(&heartbeat);
+        let heartbeat_ts = heartbeat.ts;
+        let heartbeat_nonce = heartbeat.nonce.clone();
+        let accepted = {
+            let mut table = self.provider_table.lock_recover("provider table");
+            table.upsert_heartbeat(heartbeat.clone(), received_at_millis);
+            table.heartbeat_matches(&key, heartbeat_ts, &heartbeat_nonce)
+        };
+        if accepted && self.update_heartbeat_attestation_advertisement(&heartbeat, None) {
+            self.rebuild_provider_contract_snapshot();
+        }
+    }
+
+    /// Retain the quote-kind/platform hint from the exact raw heartbeat after
+    /// independently checking its provider signature. Policy, collateral,
+    /// verifier metadata, and enclave bindings never come from this payload.
+    pub fn ingest_authenticated_provider_heartbeat(
+        &self,
+        signed_raw: &Value,
+        heartbeat: ProviderHeartbeat,
+        received_at_millis: u64,
+    ) -> Result<(), String> {
+        let advertisement = signed_heartbeat_attestation_advertisement(signed_raw, &heartbeat)?;
+        let key = ProviderKey::from_heartbeat(&heartbeat);
+        let heartbeat_ts = heartbeat.ts;
+        let heartbeat_nonce = heartbeat.nonce.clone();
+        let accepted = {
+            let mut table = self.provider_table.lock_recover("provider table");
+            table.upsert_heartbeat(heartbeat.clone(), received_at_millis);
+            table.heartbeat_matches(&key, heartbeat_ts, &heartbeat_nonce)
+        };
+        if accepted && self.update_heartbeat_attestation_advertisement(&heartbeat, advertisement) {
+            self.rebuild_provider_contract_snapshot();
+        }
+        Ok(())
+    }
+
+    fn update_heartbeat_attestation_advertisement(
+        &self,
+        heartbeat: &ProviderHeartbeat,
+        advertisement: Option<LiveHeartbeatAttestationAdvertisement>,
+    ) -> bool {
+        let key = ProviderKey::from_heartbeat(heartbeat);
+        let mut advertisements = self
+            .heartbeat_attestation_advertisements
+            .lock_recover("heartbeat attestation advertisements");
+        if advertisements
+            .get(&key)
+            .is_some_and(|current| heartbeat.ts < current.heartbeat_ts)
+        {
+            return false;
+        }
+        match advertisement {
+            Some(advertisement) => {
+                let changed = advertisements
+                    .get(&key)
+                    .is_none_or(|current| current != &advertisement);
+                advertisements.insert(key, advertisement);
+                changed
+            }
+            None => advertisements.remove(&key).is_some(),
+        }
     }
 
     pub fn with_access_control(mut self, access_control: GatewayAccessControl) -> Self {
@@ -3481,34 +3819,6 @@ impl GatewayState {
         self.dashboard_session.expires_in()
     }
 
-    pub fn with_apple_app_attest_jwks(mut self, jwks: Value) -> Self {
-        let mut trust = (*self.hardware_quote_trust).clone();
-        trust.apple_app_attest_jwks = Some(jwks);
-        self.hardware_quote_trust = Arc::new(trust);
-        self
-    }
-
-    pub fn with_nvidia_gb10_device_jwks(mut self, jwks: Value) -> Self {
-        let mut trust = (*self.hardware_quote_trust).clone();
-        trust.nvidia_gb10_device_jwks = Some(jwks);
-        self.hardware_quote_trust = Arc::new(trust);
-        self
-    }
-
-    pub fn with_nvidia_nras_jwks(mut self, jwks: Value) -> Self {
-        let mut trust = (*self.hardware_quote_trust).clone();
-        trust.nvidia_nras_jwks = Some(jwks);
-        self.hardware_quote_trust = Arc::new(trust);
-        self
-    }
-
-    pub fn with_nvidia_offline_jwks(mut self, jwks: Value) -> Self {
-        let mut trust = (*self.hardware_quote_trust).clone();
-        trust.nvidia_offline_jwks = Some(jwks);
-        self.hardware_quote_trust = Arc::new(trust);
-        self
-    }
-
     pub fn with_hardware_quote_verifier_command(
         mut self,
         verifier: HardwareQuoteVerifierCommand,
@@ -3516,7 +3826,62 @@ impl GatewayState {
         let mut trust = (*self.hardware_quote_trust).clone();
         trust.verifier_command = Some(verifier);
         self.hardware_quote_trust = Arc::new(trust);
+        self.rebuild_provider_contract_snapshot();
         self
+    }
+
+    pub fn with_attestation_authority(self, authority: GatewayAttestationAuthority) -> Self {
+        self.catalog_runtime
+            .lock_recover("gateway catalog runtime")
+            .attestation_authority = Some(Arc::new(authority));
+        self.rebuild_provider_contract_snapshot();
+        self
+    }
+
+    pub fn update_attestation_authority(&self, authority: GatewayAttestationAuthority) {
+        self.catalog_runtime
+            .lock_recover("gateway catalog runtime")
+            .attestation_authority = Some(Arc::new(authority));
+        self.rebuild_provider_contract_snapshot();
+    }
+
+    fn attestation_authority_snapshot(&self) -> Option<Arc<GatewayAttestationAuthority>> {
+        self.catalog_runtime
+            .lock_recover("gateway catalog runtime")
+            .attestation_authority
+            .clone()
+    }
+
+    fn rebuild_provider_contract_snapshot(&self) {
+        let models = self.models_snapshot();
+        let authority = self.attestation_authority_snapshot();
+        let heartbeat_advertisements = self
+            .heartbeat_attestation_advertisements
+            .lock_recover("heartbeat attestation advertisements")
+            .clone();
+        let tpm_activation_cache = self
+            .tpm_activation_cache
+            .lock_recover("TPM activation cache")
+            .clone();
+        let snapshots = models
+            .iter()
+            .flat_map(|model| {
+                model.mayhem.route_candidates.iter().map(|candidate| {
+                    contract_snapshot_for_route(
+                        model,
+                        candidate,
+                        self.receipt_config.rules_ver,
+                        authority.as_ref(),
+                        &heartbeat_advertisements,
+                        &tpm_activation_cache,
+                        self.hardware_quote_trust.verifier_command.as_ref(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        self.provider_table
+            .lock_recover("provider table")
+            .replace_contract_snapshot(snapshots);
     }
 
     pub fn receipts(&self) -> Vec<StoredReceipt> {
@@ -3897,26 +4262,859 @@ pub fn validate_loopback_dashboard_bind(bind: SocketAddr) -> std::io::Result<()>
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GatewayMarketRouteSummary {
+    registered_route_count: u32,
+    registered_provider_count: u32,
+    route_count: u32,
+    providers_online: u32,
+}
+
+impl GatewayMarketRouteSummary {
+    fn availability(self) -> &'static str {
+        if self.route_count > 0 {
+            "routable"
+        } else {
+            "no_eligible_provider_yet"
+        }
+    }
+}
+
+fn gateway_live_route_keys(
+    state: &GatewayState,
+    models: &[GatewayModel],
+    entries: &[ProviderTableEntry],
+    now_millis: u64,
+) -> BTreeSet<ProviderKey> {
+    models
+        .iter()
+        .flat_map(|model| gateway_model_live_route_keys(state, model, entries, now_millis))
+        .collect()
+}
+
+fn gateway_model_live_route_keys(
+    state: &GatewayState,
+    model: &GatewayModel,
+    entries: &[ProviderTableEntry],
+    now_millis: u64,
+) -> BTreeSet<ProviderKey> {
+    let entries_by_key = entries
+        .iter()
+        .map(|entry| (&entry.key, entry))
+        .collect::<BTreeMap<_, _>>();
+    model
+        .mayhem
+        .route_candidates
+        .iter()
+        .filter_map(|candidate| {
+            let key = route_key(candidate);
+            let entry = entries_by_key.get(&key)?;
+            gateway_reporting_requirements_for_route(state, model, candidate, now_millis)
+                .into_iter()
+                .any(|requirements| {
+                    selector_route_is_eligible(
+                        state,
+                        candidate,
+                        entry,
+                        None,
+                        None,
+                        &requirements,
+                        now_millis,
+                    )
+                })
+                .then_some(key)
+        })
+        .collect()
+}
+
+fn gateway_reporting_requirements_for_route(
+    state: &GatewayState,
+    model: &GatewayModel,
+    candidate: &GatewayRouteCandidate,
+    now_millis: u64,
+) -> Vec<RequestRequirements> {
+    gateway_reporting_modality_shapes(model, candidate)
+        .into_iter()
+        .map(|modalities| {
+            let is_text_generation = modalities.as_slice() == ["text"];
+            let input_tokens = u64::from(
+                is_text_generation || modalities.iter().any(|modality| modality == "embedding"),
+            );
+            let output_tokens = if is_text_generation {
+                DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS
+            } else {
+                0
+            };
+            let modality_load = modalities
+                .iter()
+                .filter(|modality| modality.as_str() != "text")
+                .map(|modality| {
+                    (
+                        modality.clone(),
+                        ModalityRequestLoad {
+                            item_count: 1,
+                            max_item_bytes: 1,
+                            max_item_units: 1,
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let usage = if is_text_generation {
+                ReceiptUsage::text(input_tokens, output_tokens)
+            } else if modalities.iter().any(|modality| modality == "embedding") {
+                ReceiptUsage::text(1, 0)
+            } else {
+                let mut units = BTreeMap::new();
+                for modality in &modalities {
+                    match modality.as_str() {
+                        "text" => {}
+                        "image" => {
+                            units.insert(USAGE_IMAGE.to_owned(), 1);
+                            units.insert(USAGE_STEP.to_owned(), 1);
+                        }
+                        "audio" => {
+                            units.insert(USAGE_AUDIO_SECOND.to_owned(), 1);
+                        }
+                        "video" => {
+                            units.insert(USAGE_VIDEO_SECOND.to_owned(), 1);
+                            units.insert(USAGE_FRAME.to_owned(), 1);
+                        }
+                        modality => {
+                            units.insert(modality.to_owned(), 1);
+                        }
+                    }
+                }
+                ReceiptUsage::new(units)
+            };
+            RequestRequirements {
+                current_rules_ver: state.receipt_config.rules_ver,
+                requires_transport_peer: !state.dev_session_shim,
+                required_modalities: modalities,
+                modality_load,
+                min_ctx: if is_text_generation {
+                    u32::try_from(input_tokens.saturating_add(DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS))
+                        .unwrap_or(u32::MAX)
+                } else {
+                    1
+                },
+                input_tokens,
+                output_tokens,
+                usage,
+                now_millis,
+                heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
+                ..RequestRequirements::default()
+            }
+        })
+        .collect()
+}
+
+fn gateway_reporting_modality_shapes(
+    model: &GatewayModel,
+    candidate: &GatewayRouteCandidate,
+) -> BTreeSet<Vec<String>> {
+    let mut recognized_endpoint = false;
+    let mut shapes = BTreeSet::new();
+    for contract in &model.mayhem.adapter.endpoint_families {
+        let modalities = match contract.family.as_str() {
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+            | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+            | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+            | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT => vec!["text".to_owned()],
+            mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS
+            | mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION => vec!["embedding".to_owned()],
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE => vec!["image".to_owned()],
+            mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS
+            | mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => {
+                vec!["audio".to_owned(), "text".to_owned()]
+            }
+            mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH
+            | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+            | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => vec!["audio".to_owned()],
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO => {
+                vec!["video".to_owned()]
+            }
+            _ => continue,
+        };
+        recognized_endpoint = true;
+        if modalities
+            .iter()
+            .all(|modality| candidate.served_modalities.contains(modality))
+        {
+            shapes.insert(modalities);
+        }
+    }
+    if !recognized_endpoint {
+        shapes.extend(
+            candidate
+                .served_modalities
+                .iter()
+                .cloned()
+                .map(|modality| vec![modality]),
+        );
+    }
+    shapes
+}
+
+#[derive(Clone, Copy)]
+struct GatewayLiveRoute<'a> {
+    candidate: &'a GatewayRouteCandidate,
+    entry: &'a ProviderTableEntry,
+}
+
+fn gateway_model_live_routes<'a>(
+    model: &'a GatewayModel,
+    entries: &'a [ProviderTableEntry],
+    live_route_keys: &BTreeSet<ProviderKey>,
+) -> Vec<GatewayLiveRoute<'a>> {
+    model
+        .mayhem
+        .route_candidates
+        .iter()
+        .filter_map(|candidate| {
+            live_route_keys
+                .contains(&route_key(candidate))
+                .then(|| {
+                    dashboard_entry_for_route(entries, candidate)
+                        .map(|entry| GatewayLiveRoute { candidate, entry })
+                })
+                .flatten()
+        })
+        .collect()
+}
+
+fn gateway_live_route_modalities(route: GatewayLiveRoute<'_>) -> Vec<String> {
+    let Some(heartbeat) = route.entry.heartbeat.as_ref() else {
+        return Vec::new();
+    };
+    route
+        .candidate
+        .served_modalities
+        .iter()
+        .filter(|modality| heartbeat.caps.served_modalities.contains(modality))
+        .cloned()
+        .collect()
+}
+
+fn gateway_live_route_specialities(route: GatewayLiveRoute<'_>) -> BTreeMap<String, Vec<String>> {
+    let Some(heartbeat) = route.entry.heartbeat.as_ref() else {
+        return BTreeMap::new();
+    };
+    route
+        .candidate
+        .served_specialities
+        .iter()
+        .filter_map(|(speciality, levels)| {
+            let live_levels = heartbeat
+                .caps
+                .served_specialities
+                .get(speciality)
+                .map(|heartbeat_levels| {
+                    levels
+                        .iter()
+                        .filter(|level| heartbeat_levels.contains(level))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            (!live_levels.is_empty()).then(|| (speciality.clone(), live_levels))
+        })
+        .collect()
+}
+
+fn gateway_route_attestation_readiness(
+    candidate: &GatewayRouteCandidate,
+    entries: &[ProviderTableEntry],
+) -> RouteAttestationPolicyReadiness {
+    dashboard_entry_for_route(entries, candidate)
+        .map(|entry| entry.contract.attestation_policy.clone())
+        .unwrap_or_else(|| {
+            if matches!(candidate.att_tier, 2 | 3) {
+                RouteAttestationPolicyReadiness::unavailable(
+                    candidate.att_tier,
+                    "route has no local provider-table policy snapshot",
+                )
+            } else {
+                RouteAttestationPolicyReadiness::not_required(candidate.att_tier)
+            }
+        })
+}
+
+fn gateway_registered_route_value(
+    candidate: &GatewayRouteCandidate,
+    entries: &[ProviderTableEntry],
+    dispatch_eligible: bool,
+) -> Value {
+    let mut value = serde_json::to_value(candidate).unwrap_or(Value::Null);
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    let readiness = gateway_route_attestation_readiness(candidate, entries);
+    object.insert("dispatch_eligible".to_owned(), json!(dispatch_eligible));
+    object.insert(
+        "attestation_verification".to_owned(),
+        serde_json::to_value(readiness).unwrap_or_else(|_| {
+            json!({
+                "attestation_tier": candidate.att_tier,
+                "policy_required": matches!(candidate.att_tier, 2 | 3),
+                "locally_ready": false,
+                "runtime_binary_hash_evidence_only": true,
+                "reason": "local attestation readiness could not be encoded",
+            })
+        }),
+    );
+    value
+}
+
+fn gateway_live_route_value(route: GatewayLiveRoute<'_>, entries: &[ProviderTableEntry]) -> Value {
+    let mut value = gateway_registered_route_value(route.candidate, entries, true);
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    let Some(heartbeat) = route.entry.heartbeat.as_ref() else {
+        return value;
+    };
+    let served_modalities = gateway_live_route_modalities(route);
+    let served_specialities = gateway_live_route_specialities(route);
+    object.insert(
+        "served_modalities".to_owned(),
+        json!(served_modalities.clone()),
+    );
+    object.insert(
+        "served_specialities".to_owned(),
+        json!(served_specialities.clone()),
+    );
+    object.insert("served_ctx".to_owned(), json!(heartbeat.caps.ctx));
+    let mut caps = route
+        .candidate
+        .caps
+        .as_object()
+        .cloned()
+        .unwrap_or_default();
+    caps.insert("tools".to_owned(), json!(heartbeat.caps.tools));
+    caps.insert("json".to_owned(), json!(heartbeat.caps.json));
+    caps.insert("ctx".to_owned(), json!(heartbeat.caps.ctx));
+    caps.insert("vision".to_owned(), json!(heartbeat.caps.vision));
+    caps.insert("served_modalities".to_owned(), json!(served_modalities));
+    caps.insert("served_specialities".to_owned(), json!(served_specialities));
+    caps.insert(
+        "modality_capacity".to_owned(),
+        serde_json::to_value(&heartbeat.caps.modality_capacity).unwrap_or_else(|_| json!({})),
+    );
+    object.insert("caps".to_owned(), Value::Object(caps));
+    value
+}
+
+fn gateway_live_provider_count(live_routes: &[GatewayLiveRoute<'_>]) -> u32 {
+    let providers = live_routes
+        .iter()
+        .map(|route| route.candidate.provider.as_str())
+        .collect::<BTreeSet<_>>();
+    u32::try_from(providers.len()).unwrap_or(u32::MAX)
+}
+
+fn gateway_live_room_count(live_routes: &[GatewayLiveRoute<'_>]) -> u32 {
+    let rooms = live_routes
+        .iter()
+        .map(|route| route.candidate.room_id.as_str())
+        .collect::<BTreeSet<_>>();
+    u32::try_from(rooms.len()).unwrap_or(u32::MAX)
+}
+
+fn gateway_live_attestation_tiers(live_routes: &[GatewayLiveRoute<'_>]) -> BTreeMap<String, u32> {
+    let mut providers_by_tier = BTreeMap::<String, BTreeSet<String>>::new();
+    for route in live_routes {
+        providers_by_tier
+            .entry(format!("T{}", route.candidate.att_tier))
+            .or_default()
+            .insert(route.candidate.provider.clone());
+    }
+    providers_by_tier
+        .into_iter()
+        .map(|(tier, providers)| (tier, u32::try_from(providers.len()).unwrap_or(u32::MAX)))
+        .collect()
+}
+
+fn gateway_live_attestation_tier_labels(
+    model: &GatewayModel,
+    attestation_tiers: &BTreeMap<String, u32>,
+) -> BTreeMap<String, String> {
+    let mut labels = attestation_tier_labels_for_counts(attestation_tiers);
+    for tier in attestation_tiers.keys() {
+        if let Some(label) = model.mayhem.attestation_tier_labels.get(tier) {
+            labels.insert(tier.clone(), label.clone());
+        }
+    }
+    labels
+}
+
+fn gateway_live_quant_buckets(live_routes: &[GatewayLiveRoute<'_>]) -> BTreeMap<String, u32> {
+    let mut providers_by_quant = BTreeMap::<String, BTreeSet<String>>::new();
+    for route in live_routes {
+        let quant = normalize_quant_bucket(&route.candidate.quant)
+            .unwrap_or_else(|_| route.candidate.quant.clone());
+        providers_by_quant
+            .entry(quant)
+            .or_default()
+            .insert(route.candidate.provider.clone());
+    }
+    providers_by_quant
+        .into_iter()
+        .map(|(quant, providers)| (quant, u32::try_from(providers.len()).unwrap_or(u32::MAX)))
+        .collect()
+}
+
+fn gateway_live_kyb_identities(
+    model: &GatewayModel,
+    live_routes: &[GatewayLiveRoute<'_>],
+) -> Vec<ProviderKybInfo> {
+    let mut identities = BTreeMap::new();
+    for route in live_routes {
+        let identity = route.candidate.kyb.as_ref().or_else(|| {
+            model
+                .mayhem
+                .kyb_identities
+                .iter()
+                .find(|identity| identity.provider == route.candidate.provider)
+        });
+        if let Some(identity) = identity {
+            identities
+                .entry(identity.provider.clone())
+                .or_insert_with(|| identity.clone());
+        }
+    }
+    identities.into_values().collect()
+}
+
+fn gateway_live_model_caps(
+    model: &GatewayModel,
+    live_routes: &[GatewayLiveRoute<'_>],
+) -> ModelCaps {
+    let mut caps = model.mayhem.caps.clone();
+    let live_modalities = live_routes
+        .iter()
+        .flat_map(|route| gateway_live_route_modalities(*route))
+        .collect::<BTreeSet<_>>();
+    caps.tools = model.mayhem.caps.tools
+        && live_routes.iter().any(|route| {
+            route
+                .entry
+                .heartbeat
+                .as_ref()
+                .is_some_and(|heartbeat| heartbeat.caps.tools)
+        });
+    caps.json = model.mayhem.caps.json
+        && live_routes.iter().any(|route| {
+            route
+                .entry
+                .heartbeat
+                .as_ref()
+                .is_some_and(|heartbeat| heartbeat.caps.json)
+        });
+    caps.ctx = live_routes
+        .iter()
+        .filter_map(|route| {
+            route
+                .entry
+                .heartbeat
+                .as_ref()
+                .map(|heartbeat| heartbeat.caps.ctx)
+        })
+        .max()
+        .unwrap_or(0)
+        .min(model.mayhem.caps.ctx);
+    caps.vision = model.mayhem.caps.vision
+        && live_routes.iter().any(|route| {
+            route
+                .entry
+                .heartbeat
+                .as_ref()
+                .is_some_and(|heartbeat| heartbeat.caps.vision)
+                && gateway_live_route_modalities(*route)
+                    .iter()
+                    .any(|modality| modality == "image")
+        });
+    caps.image = model.mayhem.caps.image && live_modalities.contains("image");
+    caps.video = model.mayhem.caps.video && live_modalities.contains("video");
+    caps.audio = model.mayhem.caps.audio && live_modalities.contains("audio");
+    if !caps.image {
+        caps.max_image_width = None;
+        caps.max_image_height = None;
+        caps.max_image_steps = None;
+    }
+    caps.output_modalities
+        .retain(|modality| live_modalities.contains(modality));
+    if caps
+        .output_modality
+        .as_ref()
+        .is_some_and(|modality| !live_modalities.contains(modality))
+    {
+        caps.output_modality = None;
+    }
+    caps
+}
+
+#[derive(Default)]
+struct GatewayModalityRouteSummary {
+    registered_routes: u32,
+    registered_providers: BTreeSet<String>,
+    live_routes: u32,
+    live_providers: BTreeSet<String>,
+}
+
+fn gateway_modality_availability(
+    model: &GatewayModel,
+    live_routes: &[GatewayLiveRoute<'_>],
+) -> Value {
+    let mut summaries = BTreeMap::<String, GatewayModalityRouteSummary>::new();
+    for modality in &model.mayhem.adapter.modality_set {
+        summaries.entry(modality.clone()).or_default();
+    }
+    for candidate in &model.mayhem.route_candidates {
+        for modality in candidate
+            .served_modalities
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+        {
+            let summary = summaries.entry(modality).or_default();
+            summary.registered_routes = summary.registered_routes.saturating_add(1);
+            summary
+                .registered_providers
+                .insert(candidate.provider.clone());
+        }
+    }
+    for route in live_routes {
+        for modality in gateway_live_route_modalities(*route)
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+        {
+            let summary = summaries.entry(modality).or_default();
+            summary.live_routes = summary.live_routes.saturating_add(1);
+            summary
+                .live_providers
+                .insert(route.candidate.provider.clone());
+        }
+    }
+    Value::Object(
+        summaries
+            .into_iter()
+            .map(|(modality, summary)| {
+                (
+                    modality,
+                    json!({
+                        "available": summary.live_routes > 0,
+                        "live_route_count": summary.live_routes,
+                        "live_provider_count": summary.live_providers.len(),
+                        "registered_route_count": summary.registered_routes,
+                        "registered_provider_count": summary.registered_providers.len(),
+                    }),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn gateway_route_belongs_to_market(
+    model: &GatewayModel,
+    candidate: &GatewayRouteCandidate,
+    entry: &ProviderTableEntry,
+    market: &GatewayMarketInfo,
+    rail: &str,
+    ctx_bracket_schedule: &CtxBracketSchedule,
+    at_seconds: u64,
+) -> bool {
+    if candidate.enclave_id != market.enclave_id
+        || !market.room_ids.contains(&candidate.room_id)
+        || candidate.att_tier != market.att_tier
+        || !candidate.quant.eq_ignore_ascii_case(&market.quant)
+        || !candidate
+            .accepted_rails
+            .iter()
+            .any(|candidate_rail| candidate_rail == rail)
+    {
+        return false;
+    }
+    let candidate_ctx_bracket = if model.mayhem.model_class == DEFAULT_MODEL_CLASS {
+        let Some(served_ctx) = entry
+            .heartbeat
+            .as_ref()
+            .map(|heartbeat| heartbeat.caps.ctx)
+            .filter(|ctx| *ctx > 0)
+        else {
+            return false;
+        };
+        let Some((ctx_bracket, _)) =
+            ctx_bracket_for_tokens_in_schedule(served_ctx, ctx_bracket_schedule, at_seconds)
+        else {
+            return false;
+        };
+        Some(ctx_bracket)
+    } else {
+        None
+    };
+    candidate_ctx_bracket.as_deref() == market.ctx_bracket.as_deref()
+}
+
+fn gateway_market_route_summary(
+    model: &GatewayModel,
+    market: &GatewayMarketInfo,
+    entries: &[ProviderTableEntry],
+    live_route_keys: &BTreeSet<ProviderKey>,
+    rail: &str,
+    ctx_bracket_schedule: &CtxBracketSchedule,
+    at_seconds: u64,
+) -> GatewayMarketRouteSummary {
+    let live_routes = model
+        .mayhem
+        .route_candidates
+        .iter()
+        .filter(|candidate| {
+            let Some(entry) = dashboard_entry_for_route(entries, candidate) else {
+                return false;
+            };
+            gateway_route_belongs_to_market(
+                model,
+                candidate,
+                entry,
+                market,
+                rail,
+                ctx_bracket_schedule,
+                at_seconds,
+            ) && live_route_keys.contains(&route_key(candidate))
+        })
+        .collect::<Vec<_>>();
+    let live_providers = live_routes
+        .iter()
+        .map(|candidate| candidate.provider.as_str())
+        .collect::<BTreeSet<_>>();
+    GatewayMarketRouteSummary {
+        registered_route_count: market.route_count,
+        registered_provider_count: market.providers_online,
+        route_count: u32::try_from(live_routes.len()).unwrap_or(u32::MAX),
+        providers_online: u32::try_from(live_providers.len()).unwrap_or(u32::MAX),
+    }
+}
+
+fn gateway_model_info_value(
+    state: &GatewayState,
+    model: &GatewayModel,
+    entries: &[ProviderTableEntry],
+    live_route_keys: &BTreeSet<ProviderKey>,
+    now_millis: u64,
+) -> Value {
+    let mut mayhem = serde_json::to_value(&model.mayhem).unwrap_or(Value::Null);
+    let Some(object) = mayhem.as_object_mut() else {
+        return mayhem;
+    };
+    let live_routes = gateway_model_live_routes(model, entries, live_route_keys);
+    let live_attestation_tiers = gateway_live_attestation_tiers(&live_routes);
+    let live_attestation_tier_labels =
+        gateway_live_attestation_tier_labels(model, &live_attestation_tiers);
+    let live_quant_buckets = gateway_live_quant_buckets(&live_routes);
+    let live_kyb_identities = gateway_live_kyb_identities(model, &live_routes);
+    let live_caps = gateway_live_model_caps(model, &live_routes);
+    let live_route_values = live_routes
+        .iter()
+        .map(|route| gateway_live_route_value(*route, entries))
+        .collect::<Vec<_>>();
+    let registered_route_values = model
+        .mayhem
+        .route_candidates
+        .iter()
+        .map(|candidate| {
+            gateway_registered_route_value(
+                candidate,
+                entries,
+                live_route_keys.contains(&route_key(candidate)),
+            )
+        })
+        .collect::<Vec<_>>();
+    object.insert(
+        "registered_provider_count".to_owned(),
+        json!(model.mayhem.providers_online),
+    );
+    object.insert(
+        "registered_route_count".to_owned(),
+        json!(u32::try_from(model.mayhem.route_candidates.len()).unwrap_or(u32::MAX)),
+    );
+    object.insert("registered_rooms".to_owned(), json!(model.mayhem.rooms));
+    object.insert(
+        "registered_attestation_tiers".to_owned(),
+        json!(model.mayhem.attestation_tiers),
+    );
+    object.insert(
+        "registered_attestation_tier_labels".to_owned(),
+        json!(model.mayhem.attestation_tier_labels),
+    );
+    object.insert(
+        "registered_quant_buckets".to_owned(),
+        json!(model.mayhem.quant_buckets),
+    );
+    object.insert(
+        "registered_kyb_identities".to_owned(),
+        json!(model.mayhem.kyb_identities),
+    );
+    object.insert(
+        "registered_caps".to_owned(),
+        serde_json::to_value(&model.mayhem.caps).unwrap_or_else(|_| json!({})),
+    );
+    object.insert(
+        "registered_route_candidates".to_owned(),
+        Value::Array(registered_route_values),
+    );
+    object.insert(
+        "providers_online".to_owned(),
+        json!(gateway_live_provider_count(&live_routes)),
+    );
+    object.insert(
+        "route_count".to_owned(),
+        json!(u32::try_from(live_routes.len()).unwrap_or(u32::MAX)),
+    );
+    object.insert(
+        "rooms".to_owned(),
+        json!(gateway_live_room_count(&live_routes)),
+    );
+    object.insert(
+        "attestation_tiers".to_owned(),
+        json!(live_attestation_tiers),
+    );
+    object.insert(
+        "attestation_tier_labels".to_owned(),
+        json!(live_attestation_tier_labels),
+    );
+    object.insert("quant_buckets".to_owned(), json!(live_quant_buckets));
+    object.insert("kyb_identities".to_owned(), json!(live_kyb_identities));
+    object.insert(
+        "prompt_confidential".to_owned(),
+        json!(live_attestation_tiers.get("T3").copied().unwrap_or(0) > 0),
+    );
+    object.insert(
+        "registered_prompt_confidential".to_owned(),
+        json!(
+            model
+                .mayhem
+                .attestation_tiers
+                .get("T3")
+                .copied()
+                .unwrap_or(0)
+                > 0
+        ),
+    );
+    object.insert(
+        "caps".to_owned(),
+        serde_json::to_value(live_caps).unwrap_or_else(|_| json!({})),
+    );
+    object.insert(
+        "modality_availability".to_owned(),
+        gateway_modality_availability(model, &live_routes),
+    );
+    object.insert(
+        "route_candidates".to_owned(),
+        Value::Array(live_route_values),
+    );
+    object.insert(
+        "speciality_availability".to_owned(),
+        serde_json::to_value(gateway_speciality_availability(
+            model,
+            entries,
+            live_route_keys,
+        ))
+        .unwrap_or_else(|_| json!({})),
+    );
+    let registered_policy_routes = model
+        .mayhem
+        .route_candidates
+        .iter()
+        .map(|candidate| gateway_route_attestation_readiness(candidate, entries))
+        .filter(|readiness| readiness.policy_required)
+        .collect::<Vec<_>>();
+    let live_policy_routes = live_routes
+        .iter()
+        .map(|route| gateway_route_attestation_readiness(route.candidate, entries))
+        .filter(|readiness| readiness.policy_required)
+        .collect::<Vec<_>>();
+    object.insert(
+        "attestation_verification".to_owned(),
+        json!({
+            "policy_required_routes": live_policy_routes.len(),
+            "locally_ready_routes": live_policy_routes
+                .iter()
+                .filter(|readiness| readiness.locally_ready)
+                .count(),
+            "registered_policy_required_routes": registered_policy_routes.len(),
+            "registered_locally_ready_routes": registered_policy_routes
+                .iter()
+                .filter(|readiness| readiness.locally_ready)
+                .count(),
+            "runtime_binary_hash_role": "evidence_only",
+        }),
+    );
+    let mut registered_markets = Vec::new();
+    let mut live_markets = Vec::new();
+    for market in &model.mayhem.markets {
+        let summary = gateway_market_route_summary(
+            model,
+            market,
+            entries,
+            live_route_keys,
+            &state.receipt_config.rail,
+            &state.ctx_bracket_schedule,
+            now_millis / 1_000,
+        );
+        let mut value = serde_json::to_value(market).unwrap_or(Value::Null);
+        if let Some(market_object) = value.as_object_mut() {
+            market_object.insert(
+                "registered_route_count".to_owned(),
+                json!(summary.registered_route_count),
+            );
+            market_object.insert(
+                "registered_provider_count".to_owned(),
+                json!(summary.registered_provider_count),
+            );
+            market_object.insert("route_count".to_owned(), json!(summary.route_count));
+            market_object.insert(
+                "providers_online".to_owned(),
+                json!(summary.providers_online),
+            );
+            market_object.insert("availability".to_owned(), json!(summary.availability()));
+            market_object.insert(
+                "dispatch_eligible".to_owned(),
+                json!(summary.route_count > 0),
+            );
+        }
+        registered_markets.push(value.clone());
+        if summary.route_count > 0 {
+            live_markets.push(value);
+        }
+    }
+    object.insert(
+        "registered_markets".to_owned(),
+        Value::Array(registered_markets),
+    );
+    object.insert("markets".to_owned(), Value::Array(live_markets));
+    mayhem
+}
+
 async fn list_models(State(state): State<SharedState>, headers: HeaderMap) -> Response {
     if let Err(err) = state.authorize_gateway_request(&headers, None) {
         return err.into_response();
     }
+    let now_millis = now_millis_u64();
     let entries = {
         let table = state.provider_table.lock_recover("provider table");
-        table.entries(now_millis_u64())
+        table.entries(now_millis)
     };
-    let data = state
-        .models_snapshot()
+    let models = state.models_snapshot();
+    let data = models
         .iter()
         .map(|model| {
-            let mut mayhem = serde_json::to_value(&model.mayhem).unwrap_or(Value::Null);
-            if let Some(object) = mayhem.as_object_mut() {
-                object.insert(
-                    "speciality_availability".to_owned(),
-                    serde_json::to_value(gateway_speciality_availability(model, &entries))
-                        .unwrap_or_else(|_| json!({})),
-                );
-            }
+            let live_route_keys =
+                gateway_model_live_route_keys(&state, model, &entries, now_millis);
+            let mayhem =
+                gateway_model_info_value(&state, model, &entries, &live_route_keys, now_millis);
             json!({
                 "id": model.id,
                 "object": "model",
@@ -3932,6 +5130,7 @@ async fn list_models(State(state): State<SharedState>, headers: HeaderMap) -> Re
 fn gateway_speciality_availability(
     model: &GatewayModel,
     entries: &[ProviderTableEntry],
+    live_route_keys: &BTreeSet<ProviderKey>,
 ) -> BTreeMap<String, GatewaySpecialityAvailability> {
     model
         .mayhem
@@ -3964,6 +5163,7 @@ fn gateway_speciality_availability(
                                 .served_specialities
                                 .get(&descriptor.name)
                                 .is_some_and(|levels| levels.contains(&level.name))
+                                && live_route_keys.contains(&route_key(candidate))
                                 && dashboard_entry_for_route(entries, candidate)
                                     .and_then(|entry| entry.heartbeat.as_ref())
                                     .is_some_and(|heartbeat| {
@@ -8422,6 +9622,7 @@ impl Default for GatewayRequestOptions {
 #[derive(Clone, Debug)]
 struct ValidatedDirectSessionAccept {
     enclave_pubkey: String,
+    verified_attestation: Option<VerifiedAttestation>,
 }
 
 #[derive(Clone, Debug)]
@@ -8971,11 +10172,26 @@ fn gateway_canary_prompts(doc: CanarySetDocument) -> Vec<GatewayCanaryPrompt> {
         .collect()
 }
 
-fn provider_table_from_models(models: &[GatewayModel], rules_ver: u64) -> ProviderTable {
+fn provider_table_from_models(
+    models: &[GatewayModel],
+    rules_ver: u64,
+    authority: Option<&Arc<GatewayAttestationAuthority>>,
+    heartbeat_advertisements: &BTreeMap<ProviderKey, LiveHeartbeatAttestationAdvertisement>,
+    tpm_activation_cache: &BTreeMap<ProviderKey, GatewayTpmActivationCacheEntry>,
+    verifier_command: Option<&HardwareQuoteVerifierCommand>,
+) -> ProviderTable {
     let mut table = ProviderTable::new();
     for model in models {
         for candidate in &model.mayhem.route_candidates {
-            table.upsert_contract(contract_snapshot_for_route(model, candidate, rules_ver));
+            table.upsert_contract(contract_snapshot_for_route(
+                model,
+                candidate,
+                rules_ver,
+                authority,
+                heartbeat_advertisements,
+                tpm_activation_cache,
+                verifier_command,
+            ));
         }
     }
     table
@@ -8998,8 +10214,32 @@ fn contract_snapshot_for_route(
     model: &GatewayModel,
     candidate: &GatewayRouteCandidate,
     rules_ver: u64,
+    authority: Option<&Arc<GatewayAttestationAuthority>>,
+    heartbeat_advertisements: &BTreeMap<ProviderKey, LiveHeartbeatAttestationAdvertisement>,
+    tpm_activation_cache: &BTreeMap<ProviderKey, GatewayTpmActivationCacheEntry>,
+    verifier_command: Option<&HardwareQuoteVerifierCommand>,
 ) -> ContractProviderSnapshot {
     let price = route_price_ref_au(model, Some(candidate));
+    let route_key = route_key(candidate);
+    let live_advertisement = heartbeat_advertisements.get(&route_key);
+    let attestation_policy = route_attestation_policy_resolution(
+        candidate,
+        live_advertisement,
+        authority,
+        tpm_activation_cache,
+        verifier_command,
+        now_millis_u64(),
+    )
+    .map_or_else(
+        |readiness| readiness,
+        |resolved| {
+            resolved
+                .map(|resolved| resolved.readiness)
+                .unwrap_or_else(|| {
+                    RouteAttestationPolicyReadiness::not_required(candidate.att_tier)
+                })
+        },
+    );
     ContractProviderSnapshot {
         provider: candidate.provider.clone(),
         provider_status: Some("active".to_owned()),
@@ -9018,7 +10258,336 @@ fn contract_snapshot_for_route(
         attestation_head: Some(candidate.binary_hash.clone()),
         hardware_fingerprint: candidate.hardware_fingerprint.clone(),
         device_key: candidate.device_key.clone(),
+        attestation_policy,
     }
+}
+
+fn signed_heartbeat_attestation_advertisement(
+    signed_raw: &Value,
+    heartbeat: &ProviderHeartbeat,
+) -> Result<Option<LiveHeartbeatAttestationAdvertisement>, String> {
+    let decoded: ProviderHeartbeat = serde_json::from_value(signed_raw.clone())
+        .map_err(|err| format!("signed provider heartbeat is invalid: {err}"))?;
+    if &decoded != heartbeat {
+        return Err(
+            "signed provider heartbeat does not match the validated heartbeat record".to_owned(),
+        );
+    }
+
+    let provider_bytes: [u8; 32] = hex::decode(&heartbeat.provider)
+        .map_err(|err| format!("provider heartbeat key is invalid: {err}"))?
+        .try_into()
+        .map_err(|_| "provider heartbeat key must be 32 bytes".to_owned())?;
+    let provider_key = VerifyingKey::from_bytes(&provider_bytes)
+        .map_err(|err| format!("provider heartbeat key is invalid: {err}"))?;
+    let signature_bytes = hex::decode(&heartbeat.sig)
+        .map_err(|err| format!("provider heartbeat signature is invalid: {err}"))?;
+    let signature = Signature::from_slice(&signature_bytes)
+        .map_err(|err| format!("provider heartbeat signature is invalid: {err}"))?;
+    let signing_payload = crate::heartbeat_signing_payload(signed_raw)
+        .map_err(|err| format!("provider heartbeat signing payload is invalid: {err}"))?;
+    provider_key
+        .verify_strict(&signing_payload, &signature)
+        .map_err(|err| format!("provider heartbeat signature failed: {err}"))?;
+
+    let attestation = signed_raw
+        .get("att")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "signed provider heartbeat att must be an object".to_owned())?;
+    if let Some(unknown) = attestation.keys().find(|field| {
+        !matches!(
+            field.as_str(),
+            "epoch" | "head" | "quote_kind" | "declared_platform" | "tpm_activation_hello"
+        )
+    }) {
+        return Err(format!(
+            "signed provider heartbeat att contains unsupported field {unknown}"
+        ));
+    }
+    let quote_kind = match attestation.get("quote_kind") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            serde_json::from_value::<HardwareQuoteKind>(value.clone())
+                .map_err(|err| format!("signed provider heartbeat quote_kind is invalid: {err}"))?,
+        ),
+    };
+    let declared_platform = match attestation.get("declared_platform") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(platform)) if valid_attestation_platform_hint(platform) => {
+            Some(platform.clone())
+        }
+        Some(Value::String(_)) => {
+            return Err("signed provider heartbeat declared_platform is invalid".to_owned())
+        }
+        Some(_) => {
+            return Err("signed provider heartbeat declared_platform must be a string".to_owned())
+        }
+    };
+    let tpm_activation_hello = match attestation.get("tpm_activation_hello") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            serde_json::from_value::<TpmActivateCredentialHello>(value.clone()).map_err(|err| {
+                format!("signed provider heartbeat TPM activation hello is invalid: {err}")
+            })?,
+        ),
+    };
+    let Some(kind) = quote_kind else {
+        if declared_platform.is_some() || tpm_activation_hello.is_some() {
+            return Err(
+                "signed provider heartbeat attestation details require quote_kind".to_owned(),
+            );
+        }
+        return Ok(None);
+    };
+    if tpm_activation_hello.is_some() && kind != HardwareQuoteKind::Tpm2QuoteEk {
+        return Err(
+            "signed provider heartbeat TPM activation hello requires tpm2_quote_ek".to_owned(),
+        );
+    }
+    Ok(Some(LiveHeartbeatAttestationAdvertisement {
+        advertisement: HardwareQuoteRouteAdvertisement {
+            kind,
+            declared_platform,
+        },
+        tpm_activation_hello,
+        heartbeat_epoch: heartbeat.att.epoch,
+        heartbeat_head: heartbeat.att.head.clone(),
+        heartbeat_ts: heartbeat.ts,
+        transport_peer: heartbeat.transport_peer.clone(),
+    }))
+}
+
+fn valid_attestation_platform_hint(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+        })
+}
+
+fn route_attestation_policy_resolution(
+    candidate: &GatewayRouteCandidate,
+    live_advertisement: Option<&LiveHeartbeatAttestationAdvertisement>,
+    authority: Option<&Arc<GatewayAttestationAuthority>>,
+    tpm_activation_cache: &BTreeMap<ProviderKey, GatewayTpmActivationCacheEntry>,
+    verifier_command: Option<&HardwareQuoteVerifierCommand>,
+    now_millis: u64,
+) -> Result<Option<GatewayResolvedRouteAttestation>, RouteAttestationPolicyReadiness> {
+    if !matches!(candidate.att_tier, 2 | 3) {
+        return Ok(None);
+    }
+
+    let mut status = RouteAttestationPolicyReadiness::unavailable(
+        candidate.att_tier,
+        "authenticated attestation authority is not configured",
+    );
+    let Some(authority) = authority.cloned() else {
+        return Err(status);
+    };
+    status.evaluated_epoch = Some(authority.policy_epoch);
+
+    let key = route_key(candidate);
+    let Some(live_advertisement) = live_advertisement else {
+        status.reason = Some("route has no signed heartbeat quote-kind advertisement".to_owned());
+        return Err(status);
+    };
+    let advertisement = &live_advertisement.advertisement;
+    status.quote_kind = Some(advertisement.kind);
+    if advertisement.kind.attestation_tier() != candidate.att_tier {
+        status.reason = Some(format!(
+            "quote kind {} proves Tier {}, not route Tier {}",
+            advertisement.kind.as_str(),
+            advertisement.kind.attestation_tier(),
+            candidate.att_tier
+        ));
+        return Err(status);
+    }
+
+    let Some(device_id) = candidate
+        .device_key
+        .as_deref()
+        .filter(|device_id| is_hex_len(device_id, 64))
+    else {
+        status.reason = Some("route has no canonical 32-byte device identity".to_owned());
+        return Err(status);
+    };
+    let Some(policy) = authority.policy_chain.active_at(authority.policy_epoch) else {
+        status.reason =
+            Some("no admin attestation policy is active at the ledger epoch".to_owned());
+        return Err(status);
+    };
+    status.policy_sequence = Some(policy.policy().sequence);
+    status.policy_digest = Some(policy.digest().to_owned());
+    status.policy_effective_epoch = Some(policy.policy().effective_epoch);
+    let Some(kind_policy) = policy.quote_kind(advertisement.kind) else {
+        status.reason = Some("active policy has no exact quote-kind entry".to_owned());
+        return Err(status);
+    };
+    status.verifier_profile = Some(kind_policy.verifier_profile);
+    status.evidence_schema_version = Some(kind_policy.evidence_schema_version);
+    status.required_measurement_layers = kind_policy.required_measurement_layers.clone();
+
+    let provisional_binding = HardwareQuoteRoutePolicyBinding {
+        enclave_id: candidate.enclave_id.clone(),
+        device_id: device_id.to_owned(),
+        kind: advertisement.kind,
+        evidence_schema_version: kind_policy.evidence_schema_version,
+        policy_sequence: policy.policy().sequence,
+        policy_digest: policy.digest().to_owned(),
+        platform: advertisement.declared_platform.clone(),
+    };
+    let provisional_context = AttestationPolicyVerificationContext::new(
+        &authority.policy_chain,
+        &authority.collateral,
+        &provisional_binding,
+        authority.policy_epoch,
+        device_id,
+    );
+
+    let mut capabilities = native_gateway_attestation_capabilities();
+    if managed_quote_kind(advertisement.kind) {
+        let Some(command) = verifier_command else {
+            status.reason = Some(format!(
+                "policy-authenticated {} verifier is not installed",
+                advertisement.kind.as_str()
+            ));
+            return Err(status);
+        };
+        let managed = match crate::attestation_policy::authenticate_managed_verifier(
+            &provisional_context,
+            advertisement.kind,
+            command,
+        ) {
+            Ok(managed) => managed,
+            Err(reason) => {
+                status.reason = Some(reason);
+                return Err(status);
+            }
+        };
+        capabilities.version = capabilities.version.max(managed.capabilities.version);
+        capabilities.profiles.extend(managed.capabilities.profiles);
+    }
+
+    let readiness = AttestationReadiness::evaluate(
+        &authority.policy_chain,
+        &authority.collateral,
+        &capabilities,
+        authority.policy_epoch,
+    );
+    let route_binding = match readiness.bind_route(&candidate.enclave_id, device_id, advertisement)
+    {
+        Ok(binding) => binding,
+        Err(error) => {
+            status.reason = Some(error.to_string());
+            return Err(status);
+        }
+    };
+    let enclave_binding = match readiness.enclave_binding(&route_binding) {
+        Ok(binding) => binding,
+        Err(error) => {
+            status.reason = Some(error.to_string());
+            return Err(status);
+        }
+    };
+    let actual_layers = enclave_binding
+        .measurement_trust_data
+        .keys()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if actual_layers != kind_policy.required_measurement_layers {
+        status.reason =
+            Some("enclave binding does not carry every policy-required layer".to_owned());
+        return Err(status);
+    }
+
+    let activated_tpm_identity = if advertisement.kind == HardwareQuoteKind::Tpm2QuoteEk {
+        let Some(hello) = live_advertisement.tpm_activation_hello.as_ref() else {
+            status.reason = Some("route has no signed TPM ActivateCredential hello".to_owned());
+            return Err(status);
+        };
+        let hello_digest = match tpm_activation_hello_digest(hello) {
+            Ok(digest) => digest,
+            Err(reason) => {
+                status.reason = Some(reason);
+                return Err(status);
+            }
+        };
+        let transport_peer = live_advertisement
+            .transport_peer
+            .as_deref()
+            .filter(|peer| is_hex_len(peer, 64));
+        let identity = tpm_activation_cache.get(&key).filter(|entry| {
+            entry.expires_at_millis > now_millis
+                && entry.policy_sequence == route_binding.policy_sequence
+                && entry.policy_digest == route_binding.policy_digest
+                && entry.device_id == route_binding.device_id
+                && entry.heartbeat_epoch == live_advertisement.heartbeat_epoch
+                && entry.heartbeat_head == live_advertisement.heartbeat_head
+                && transport_peer == Some(entry.transport_peer.as_str())
+                && entry.hello_digest == hello_digest
+        });
+        let Some(identity) = identity.map(|entry| entry.identity.clone()) else {
+            status.tpm_activation_pending = transport_peer.is_some();
+            status.reason = Some(if transport_peer.is_some() {
+                "gateway has not completed TPM ActivateCredential for this signed route state"
+                    .to_owned()
+            } else {
+                "route has no valid signed transport peer for TPM activation".to_owned()
+            });
+            return Err(status);
+        };
+        Some(identity)
+    } else {
+        None
+    };
+
+    status.locally_ready = true;
+    status.reason = None;
+    Ok(Some(GatewayResolvedRouteAttestation {
+        readiness: status,
+        authority,
+        route_binding,
+        activated_tpm_identity,
+    }))
+}
+
+fn tpm_activation_hello_digest(hello: &TpmActivateCredentialHello) -> Result<String, String> {
+    serde_json::to_value(hello)
+        .and_then(|value| stable_json_bytes(&value))
+        .map(|bytes| blake3_hex(&bytes))
+        .map_err(|err| format!("signed TPM activation hello is not canonical JSON: {err}"))
+}
+
+fn native_gateway_attestation_capabilities() -> VerifierCapabilities {
+    VerifierCapabilities::with_evidence_schemas(
+        GATEWAY_ATTESTATION_VERIFIER_VERSION,
+        BTreeMap::from([
+            (
+                AttestationVerifierProfile::AppleAppAttestNativeV1,
+                BTreeSet::from([1]),
+            ),
+            (
+                AttestationVerifierProfile::NvidiaGb10DeviceV1,
+                BTreeSet::from([1]),
+            ),
+            (
+                AttestationVerifierProfile::Tpm2EkActivateCredentialV1,
+                BTreeSet::from([1]),
+            ),
+        ]),
+    )
+}
+
+fn managed_quote_kind(kind: HardwareQuoteKind) -> bool {
+    matches!(
+        kind,
+        HardwareQuoteKind::AmdSevSnpVcek
+            | HardwareQuoteKind::IntelTdxDcap
+            | HardwareQuoteKind::NvidiaNrasJwt
+            | HardwareQuoteKind::NvidiaNvtrustOfflineJwt
+    )
 }
 
 fn heartbeat_for_route(
@@ -9042,7 +10611,7 @@ fn heartbeat_for_route(
             max: 1,
         },
         q: HeartbeatQueue {
-            free_slots: 0,
+            free_slots: 1,
             engine_backlog: 0,
             est_wait_ms: 0,
         },
@@ -9060,7 +10629,7 @@ fn heartbeat_for_route(
             epoch: 1,
             head: candidate.binary_hash.clone(),
         },
-        ts: now_millis / 1000,
+        ts: now_millis,
         nonce: blake3_hex(
             format!(
                 "route:{}:{}:{}:{now_millis}",
@@ -9266,6 +10835,7 @@ impl GatewaySessionError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: false,
             before_first_output: false,
             transport_closed: false,
@@ -9280,6 +10850,7 @@ impl GatewaySessionError {
     pub fn retryable(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
             before_first_output: false,
             transport_closed: false,
@@ -9294,6 +10865,7 @@ impl GatewaySessionError {
     pub fn retryable_before_output(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
             before_first_output: true,
             transport_closed: false,
@@ -9308,6 +10880,7 @@ impl GatewaySessionError {
     pub fn transport_closed(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
             before_first_output: false,
             transport_closed: true,
@@ -9322,6 +10895,7 @@ impl GatewaySessionError {
     fn wait_elapsed(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
             before_first_output: false,
             transport_closed: false,
@@ -9340,6 +10914,7 @@ impl GatewaySessionError {
     pub fn clean_refusal_with_code(message: impl Into<String>, code: Option<&str>) -> Self {
         Self {
             message: message.into(),
+            failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
             before_first_output: false,
             transport_closed: false,
@@ -9354,6 +10929,7 @@ impl GatewaySessionError {
     pub fn retryable_partial(message: impl Into<String>, partial: GatewaySessionPartial) -> Self {
         Self {
             message: message.into(),
+            failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
             before_first_output: false,
             transport_closed: false,
@@ -9371,6 +10947,7 @@ impl GatewaySessionError {
     ) -> Self {
         Self {
             message: message.into(),
+            failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
             before_first_output: false,
             transport_closed: false,
@@ -9382,6 +10959,18 @@ impl GatewaySessionError {
         }
     }
 
+    fn buyer_local(message: impl Into<String>) -> Self {
+        let mut error = Self::new(message);
+        error.failure_class = GatewaySessionFailureClass::BuyerLocal;
+        error
+    }
+
+    fn buyer_local_transport_closed(message: impl Into<String>) -> Self {
+        let mut error = Self::transport_closed(message);
+        error.failure_class = GatewaySessionFailureClass::BuyerLocal;
+        error
+    }
+
     pub fn into_retryable(mut self) -> Self {
         self.retryable = true;
         self
@@ -9390,6 +10979,12 @@ impl GatewaySessionError {
     fn into_retryable_before_output(mut self) -> Self {
         self.retryable = true;
         self.before_first_output = true;
+        self
+    }
+
+    fn into_retryable_partial(mut self, partial: GatewaySessionPartial) -> Self {
+        self.retryable = true;
+        self.partial = Some(Box::new(partial));
         self
     }
 }
@@ -9725,7 +11320,10 @@ fn parse_x_mayhem_hedge(headers: &HeaderMap) -> Result<bool, ApiError> {
 
 impl From<BridgeError> for GatewaySessionError {
     fn from(error: BridgeError) -> Self {
-        Self::new(error.to_string())
+        match error {
+            error @ BridgeError::ResourceLimit(_) => Self::buyer_local(error.to_string()),
+            error => Self::new(error.to_string()),
+        }
     }
 }
 
@@ -9821,6 +11419,13 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
         Box::pin(async move { self.hedge_probe_over_bridge(invocation).await })
     }
 
+    fn activate_tpm<'a>(
+        &'a self,
+        invocation: &'a GatewayTpmActivationInvocation,
+    ) -> GatewayTpmActivationFuture<'a> {
+        Box::pin(async move { self.activate_tpm_over_bridge(invocation).await })
+    }
+
     fn run_chat<'a>(
         &'a self,
         model: &'a GatewayModel,
@@ -9892,6 +11497,127 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
 }
 
 impl ScBridgeGatewaySessionBackend {
+    async fn activate_tpm_over_bridge(
+        &self,
+        invocation: &GatewayTpmActivationInvocation,
+    ) -> Result<ActivatedTpmIdentity, GatewaySessionError> {
+        let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
+            &self.config.url,
+            self.config.token.clone(),
+        )?)
+        .await?;
+        bridge
+            .peer_connect(&invocation.transport_peer, self.config.open_timeout)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "connecting provider {} transport peer {} for TPM activation failed: {err}",
+                    invocation.provider_pubkey, invocation.transport_peer
+                ))
+            })?;
+
+        let issued_at = now_secs();
+        let (challenge, pending) =
+            issue_tpm_activate_credential_challenge(&invocation.hello, issued_at).map_err(
+                |err| {
+                    GatewaySessionError::new(format!(
+                        "signed TPM activation hello from provider {} is invalid: {err}",
+                        invocation.provider_pubkey
+                    ))
+                },
+            )?;
+        let session_id = challenge.challenge_id.clone();
+        bridge.session_subscribe([session_id.as_str()]).await?;
+        let opened = bridge
+            .session_open(&invocation.transport_peer, &session_id)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "opening TPM activation session {} to provider {} failed: {err}",
+                    session_id, invocation.provider_pubkey
+                ))
+            })?;
+        if !sc_bridge_session_transport_valid(&opened) {
+            return Err(GatewaySessionError::retryable(format!(
+                "TPM activation session {} did not open an authenticated direct-or-relayed channel",
+                session_id
+            )));
+        }
+
+        let frame = TpmActivateCredentialChallengeFrame {
+            frame_type: TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE.to_owned(),
+            version: TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
+            session_id: session_id.clone(),
+            provider: invocation.provider_pubkey.clone(),
+            enclave_id: invocation.enclave_id.clone(),
+            room_id: invocation.room_id.clone(),
+            challenge,
+        };
+        bridge
+            .session_send(&invocation.transport_peer, &session_id, &frame)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending TPM activation challenge {} to provider {} failed: {err}",
+                    session_id, invocation.provider_pubkey
+                ))
+            })?;
+
+        let wait = Duration::from_secs(DEFAULT_TPM_CHALLENGE_TTL_SECS);
+        let event = bridge
+            .next_session_frame_for(&session_id, Some(wait))
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "waiting for TPM activation response {} from provider {} failed: {err}",
+                    session_id, invocation.provider_pubkey
+                ))
+            })?;
+        let response_frame: TpmActivateCredentialResponseFrame = serde_json::from_value(
+            event
+                .get("frame")
+                .cloned()
+                .ok_or_else(|| GatewaySessionError::new("TPM activation event has no frame"))?,
+        )
+        .map_err(|err| {
+            GatewaySessionError::new(format!(
+                "provider {} returned an invalid TPM activation response: {err}",
+                invocation.provider_pubkey
+            ))
+        })?;
+        let remote = event
+            .get("remote")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if remote != invocation.transport_peer
+            || response_frame.frame_type != TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE
+            || response_frame.version != TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION
+            || response_frame.session_id != session_id
+            || response_frame.provider != invocation.provider_pubkey
+            || response_frame.enclave_id != invocation.enclave_id
+            || response_frame.room_id != invocation.room_id
+        {
+            let _ = bridge
+                .session_close(&invocation.transport_peer, &session_id)
+                .await;
+            return Err(GatewaySessionError::new(
+                "TPM activation response does not match the authenticated route",
+            ));
+        }
+        let completed = pending
+            .complete(&response_frame.response, now_secs())
+            .map_err(|err| {
+                GatewaySessionError::new(format!(
+                    "provider {} failed TPM ActivateCredential: {err}",
+                    invocation.provider_pubkey
+                ))
+            });
+        let _ = bridge
+            .session_close(&invocation.transport_peer, &session_id)
+            .await;
+        completed
+    }
+
     async fn hedge_probe_over_bridge(
         &self,
         invocation: &GatewayHedgeProbeInvocation,
@@ -10003,6 +11729,7 @@ impl ScBridgeGatewaySessionBackend {
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
+            "attestation_policy_binding": invocation.attestation_policy_binding(),
             "ts": now,
             "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
             "sig": invocation.spend_voucher.user_sig.clone(),
@@ -10227,6 +11954,7 @@ impl ScBridgeGatewaySessionBackend {
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
+            "attestation_policy_binding": invocation.attestation_policy_binding(),
             "ts": now,
             "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
             "sig": invocation.spend_voucher.user_sig.clone(),
@@ -10406,6 +12134,7 @@ impl ScBridgeGatewaySessionBackend {
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
+            "attestation_policy_binding": invocation.attestation_policy_binding(),
             "ts": now,
             "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
             "sig": invocation.spend_voucher.user_sig.clone(),
@@ -10585,6 +12314,7 @@ impl ScBridgeGatewaySessionBackend {
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
+            "attestation_policy_binding": invocation.attestation_policy_binding(),
             "ts": now,
             "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
             "sig": invocation.spend_voucher.user_sig.clone(),
@@ -10754,6 +12484,7 @@ impl ScBridgeGatewaySessionBackend {
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
+            "attestation_policy_binding": invocation.attestation_policy_binding(),
             "ts": now,
             "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
             "sig": invocation.spend_voucher.user_sig.clone(),
@@ -10923,6 +12654,7 @@ impl ScBridgeGatewaySessionBackend {
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
+            "attestation_policy_binding": invocation.attestation_policy_binding(),
             "ts": now,
             "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
             "sig": invocation.spend_voucher.user_sig.clone(),
@@ -11100,10 +12832,23 @@ fn validate_direct_session_accept(
         .get("sig")
         .and_then(Value::as_str)
         .ok_or_else(|| fail("provider accept missing sig".to_owned()))?;
-    if let Some(provider) = invocation.provider_pubkey.as_deref() {
+    let verified_attestation = if let Some(provider) = invocation.provider_pubkey.as_deref() {
         let attestation = invocation.attestation.as_ref().ok_or_else(|| {
             fail("provider accept missing admin enclave attestation metadata".to_owned())
         })?;
+        let policy_context = attestation.policy.as_ref().map(|policy| {
+            let context = AttestationPolicyVerificationContext::new(
+                &policy.authority.policy_chain,
+                &policy.authority.collateral,
+                &policy.route_binding,
+                policy.authority.policy_epoch,
+                &policy.route_binding.device_id,
+            );
+            match policy.activated_tpm_identity.as_ref() {
+                Some(identity) => context.with_activated_tpm_identity(identity),
+                None => context,
+            }
+        });
         let mut request = AttestationVerificationRequest::new(
             &report,
             &attestation.contract,
@@ -11111,22 +12856,23 @@ fn validate_direct_session_accept(
             provider,
             now_ts,
         );
-        request.trusted_apple_app_attest_jwks = attestation.trusted_apple_app_attest_jwks.as_ref();
-        request.trusted_nvidia_gb10_device_jwks =
-            attestation.trusted_nvidia_gb10_device_jwks.as_ref();
-        request.trusted_nvidia_nras_jwks = attestation.trusted_nvidia_nras_jwks.as_ref();
-        request.trusted_nvidia_offline_jwks = attestation.trusted_nvidia_offline_jwks.as_ref();
+        request.attestation_policy = policy_context.as_ref();
         request.hardware_quote_verifier_command =
             attestation.hardware_quote_verifier_command.as_ref();
-        verify_tier1_attestation(&request).map_err(|err| {
+        let verified = verify_tier1_attestation(&request).map_err(|err| {
             fail(format!(
                 "provider accept attestation verification failed: {err}"
             ))
         })?;
         verify_direct_session_accept_signature(frame, provider, top_sig)?;
-    }
+        invocation.retain_verified_attestation(verified.clone());
+        Some(verified)
+    } else {
+        None
+    };
     Ok(ValidatedDirectSessionAccept {
         enclave_pubkey: report.enclave_pubkey,
+        verified_attestation,
     })
 }
 
@@ -11212,6 +12958,24 @@ fn decode_hex_array<const N: usize>(
     })
 }
 
+fn direct_session_transport_closed_error(
+    expected_types: &[&str],
+    session_id: &str,
+    reason: &str,
+) -> GatewaySessionError {
+    let message = format!(
+        "direct transport closed while waiting for {} on session {}: {}",
+        expected_types.join("|"),
+        session_id,
+        reason
+    );
+    if reason.starts_with("Session ") && reason.contains(" exceeded its receive rate.") {
+        GatewaySessionError::buyer_local_transport_closed(message)
+    } else {
+        GatewaySessionError::transport_closed(message)
+    }
+}
+
 async fn next_session_frame(
     bridge: &mut ScBridgeClient,
     session_id: &str,
@@ -11271,12 +13035,11 @@ async fn next_session_frame_with_optional_wait(
                         .get("reason")
                         .and_then(Value::as_str)
                         .unwrap_or("direct transport closed");
-                    return Err(GatewaySessionError::transport_closed(format!(
-                        "direct transport closed while waiting for {} on session {}: {}",
-                        expected_types.join("|"),
+                    return Err(direct_session_transport_closed_error(
+                        expected_types,
                         session_id,
-                        reason
-                    )));
+                        reason,
+                    ));
                 }
                 let frame = event.get("frame").cloned().unwrap_or(Value::Null);
                 if !frame.is_object() {
@@ -13744,7 +15507,7 @@ fn retryable_interrupted_direct_session_error(
         now_millis,
         reason,
     ) {
-        return GatewaySessionError::retryable_partial(err.message, partial);
+        return err.into_retryable_partial(partial);
     }
     if watchdog.first_delta_at_millis.is_none() && !receipt_seen {
         return err.into_retryable_before_output();
@@ -15212,7 +16975,7 @@ async fn run_embedding_with_route_retry(
         state,
         model,
         &options,
-        &requirements.required_modalities,
+        &requirements,
         eligible_routes,
         || ordered_route_candidates_for_embedding_with_options(state, model, inputs, &options),
     )
@@ -15286,13 +17049,13 @@ async fn run_embedding_with_route_retry(
                 return Err(ApiError::client_closed_request(err.message));
             }
             Err(err) if err.retryable => {
-                record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
-                record_route_failure_attempt(state, route, attempt_started.elapsed());
+                record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 return Err(ApiError::bad_gateway(err.message, Some("model")));
             }
         }
@@ -15330,7 +17093,7 @@ async fn run_image_generation_with_route_retry(
         state,
         model,
         &options,
-        &requirements.required_modalities,
+        &requirements,
         eligible_routes,
         || {
             ordered_route_candidates_for_image_generation_with_options(
@@ -15416,13 +17179,13 @@ async fn run_image_generation_with_route_retry(
                 return Err(ApiError::client_closed_request(err.message));
             }
             Err(err) if err.retryable => {
-                record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
-                record_route_failure_attempt(state, route, attempt_started.elapsed());
+                record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 return Err(ApiError::bad_gateway(err.message, Some("model")));
             }
         }
@@ -15460,7 +17223,7 @@ async fn run_audio_speech_with_route_retry(
         state,
         model,
         &options,
-        &requirements.required_modalities,
+        &requirements,
         eligible_routes,
         || ordered_route_candidates_for_audio_speech_with_options(state, model, request, &options),
     )
@@ -15542,13 +17305,13 @@ async fn run_audio_speech_with_route_retry(
                 return Err(ApiError::client_closed_request(err.message));
             }
             Err(err) if err.retryable => {
-                record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
-                record_route_failure_attempt(state, route, attempt_started.elapsed());
+                record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 return Err(ApiError::bad_gateway(err.message, Some("model")));
             }
         }
@@ -15586,7 +17349,7 @@ async fn run_audio_transcription_with_route_retry(
         state,
         model,
         &options,
-        &requirements.required_modalities,
+        &requirements,
         eligible_routes,
         || {
             ordered_route_candidates_for_audio_transcription_with_options(
@@ -15672,13 +17435,13 @@ async fn run_audio_transcription_with_route_retry(
                 return Err(ApiError::client_closed_request(err.message));
             }
             Err(err) if err.retryable => {
-                record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
-                record_route_failure_attempt(state, route, attempt_started.elapsed());
+                record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 return Err(ApiError::bad_gateway(err.message, Some("model")));
             }
         }
@@ -15724,7 +17487,7 @@ async fn run_artifact_generation_with_route_retry(
         state,
         model,
         &options,
-        &requirements.required_modalities,
+        &requirements,
         eligible_routes,
         || {
             ordered_route_candidates_for_artifact_generation_with_options(
@@ -15809,13 +17572,13 @@ async fn run_artifact_generation_with_route_retry(
                 return Err(ApiError::client_closed_request(err.message));
             }
             Err(err) if err.retryable => {
-                record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
-                record_route_failure_attempt(state, route, attempt_started.elapsed());
+                record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 return Err(ApiError::bad_gateway(err.message, Some("model")));
             }
         }
@@ -16073,11 +17836,16 @@ struct RouteWaitOutcome<'a> {
     waited: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KnownRouteCooloff {
+    until_millis: u64,
+}
+
 async fn wait_for_eligible_routes<'a, F>(
     state: &GatewayState,
     model: &'a GatewayModel,
     options: &GatewayRequestOptions,
-    required_modalities: &[String],
+    requirements: &RequestRequirements,
     routes: Vec<&'a GatewayRouteCandidate>,
     refresh: F,
 ) -> RouteWaitOutcome<'a>
@@ -16088,7 +17856,7 @@ where
         state,
         model,
         options,
-        required_modalities,
+        requirements,
         routes,
         refresh,
         Duration::from_millis(ROUTE_WAIT_POLL_MS),
@@ -16100,7 +17868,7 @@ async fn wait_for_eligible_routes_with_poll<'a, F>(
     state: &GatewayState,
     model: &'a GatewayModel,
     options: &GatewayRequestOptions,
-    required_modalities: &[String],
+    requirements: &RequestRequirements,
     mut routes: Vec<&'a GatewayRouteCandidate>,
     mut refresh: F,
     poll_interval: Duration,
@@ -16108,17 +17876,57 @@ async fn wait_for_eligible_routes_with_poll<'a, F>(
 where
     F: FnMut() -> Vec<&'a GatewayRouteCandidate>,
 {
-    if model.mayhem.route_candidates.is_empty()
-        || !routes.is_empty()
-        || options.max_wait_ms == 0
-        || !route_static_filters_have_candidates(state, model, options, required_modalities)
+    if options.max_wait_ms == 0 {
+        return RouteWaitOutcome {
+            routes,
+            waited: false,
+        };
+    }
+    if routes.is_empty()
+        && !route_static_filters_have_candidates(
+            state,
+            model,
+            options,
+            &requirements.required_modalities,
+        )
     {
         return RouteWaitOutcome {
             routes,
             waited: false,
         };
     }
-    let max_wait = Duration::from_millis(options.max_wait_ms.min(MAX_ROUTE_MAX_WAIT_MS));
+    if routes.is_empty() {
+        activate_one_pending_tpm_route(state, model, options, requirements).await;
+        routes = refresh();
+    }
+    let now_millis = now_millis_u64();
+    let known_cooloff =
+        earliest_otherwise_eligible_route_cooloff(state, model, options, requirements, now_millis);
+    if model.mayhem.route_candidates.is_empty()
+        || !routes.is_empty()
+        || (!route_static_filters_have_candidates(
+            state,
+            model,
+            options,
+            &requirements.required_modalities,
+        ) && known_cooloff.is_none())
+    {
+        return RouteWaitOutcome {
+            routes,
+            waited: false,
+        };
+    }
+    let max_wait = Duration::from_millis(route_wait_millis(
+        options.max_wait_ms.min(MAX_ROUTE_MAX_WAIT_MS),
+        now_millis,
+        known_cooloff.as_ref().map(|cooloff| cooloff.until_millis),
+    ));
+    if max_wait.is_zero() {
+        return RouteWaitOutcome {
+            routes,
+            waited: false,
+        };
+    }
     let started = Instant::now();
     let mut waited = false;
     while started.elapsed() < max_wait {
@@ -16131,7 +17939,197 @@ where
             break;
         }
     }
+    if routes.is_empty() {
+        routes = refresh();
+    }
     RouteWaitOutcome { routes, waited }
+}
+
+async fn activate_one_pending_tpm_route(
+    state: &GatewayState,
+    model: &GatewayModel,
+    options: &GatewayRequestOptions,
+    requirements: &RequestRequirements,
+) {
+    let now_millis = now_millis_u64();
+    state.refresh_provider_table_routes(model);
+    let entries = state
+        .provider_table
+        .lock_recover("provider table")
+        .entries(now_millis);
+    let preferred = state.preferred_provider_order(model, options);
+    let route_by_key = model
+        .mayhem
+        .route_candidates
+        .iter()
+        .filter(|candidate| {
+            route_matches_selector_filters(
+                candidate,
+                options.min_att_tier,
+                options.quant.as_deref(),
+                &state.receipt_config.rail,
+            ) && !state.route_provider_in_cooloff(candidate, now_millis)
+                && preferred.as_ref().map_or(true, |providers| {
+                    providers
+                        .iter()
+                        .any(|provider| candidate.provider.eq_ignore_ascii_case(provider))
+                })
+        })
+        .map(|candidate| (route_key(candidate), candidate))
+        .collect::<BTreeMap<_, _>>();
+    if route_by_key.is_empty() {
+        return;
+    }
+    let entries_by_key = entries
+        .iter()
+        .map(|entry| (entry.key.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut current_requirements = requirements.clone();
+    current_requirements.now_millis = now_millis;
+    let filtered_entries = entries
+        .iter()
+        .filter(|entry| route_by_key.contains_key(&entry.key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut pending = crate::provider_table::eligible_tpm_activation_candidates(
+        &filtered_entries,
+        &current_requirements,
+        &SelectionWeights::default(),
+    );
+    pending.sort_by(|left, right| right.weight.total_cmp(&left.weight));
+
+    for selection in pending {
+        let key = selection.entry.key;
+        let Some(route) = route_by_key.get(&key).copied() else {
+            continue;
+        };
+        let Some(readiness) = entries_by_key
+            .get(&key)
+            .map(|entry| &entry.contract.attestation_policy)
+        else {
+            continue;
+        };
+        let live = state
+            .heartbeat_attestation_advertisements
+            .lock_recover("heartbeat attestation advertisements")
+            .get(&key)
+            .cloned();
+        let Some(live) = live else {
+            continue;
+        };
+        let (Some(hello), Some(transport_peer)) = (
+            live.tpm_activation_hello.clone(),
+            live.transport_peer
+                .clone()
+                .filter(|peer| is_hex_len(peer, 64)),
+        ) else {
+            continue;
+        };
+        let Some(_attempt) = state.begin_tpm_activation(key.clone()) else {
+            continue;
+        };
+        let invocation = GatewayTpmActivationInvocation {
+            provider_pubkey: route.provider.clone(),
+            transport_peer,
+            enclave_id: route.enclave_id.clone(),
+            room_id: route.room_id.clone(),
+            hello,
+        };
+        match state.session_backend.activate_tpm(&invocation).await {
+            Ok(identity) => {
+                if let Err(reason) = state.cache_tpm_activation(
+                    key,
+                    readiness,
+                    route,
+                    &live,
+                    identity,
+                    now_millis_u64(),
+                ) {
+                    eprintln!(
+                        "Mayhem gateway discarded TPM activation for provider {}: {reason}",
+                        route.provider
+                    );
+                    continue;
+                }
+                state.refresh_provider_table_routes(model);
+                return;
+            }
+            Err(error) => {
+                eprintln!(
+                    "Mayhem gateway TPM activation for provider {} failed before spend: {}",
+                    route.provider, error.message
+                );
+            }
+        }
+    }
+}
+
+fn earliest_otherwise_eligible_route_cooloff(
+    state: &GatewayState,
+    model: &GatewayModel,
+    options: &GatewayRequestOptions,
+    requirements: &RequestRequirements,
+    now_millis: u64,
+) -> Option<KnownRouteCooloff> {
+    let preferred = state.preferred_provider_order(model, options);
+    let routes = eligible_route_candidates(
+        model,
+        options.min_att_tier,
+        options.quant.as_deref(),
+        &state.receipt_config.rail,
+    )
+    .into_iter()
+    .filter(|candidate| {
+        preferred.as_ref().map_or(true, |providers| {
+            providers
+                .iter()
+                .any(|provider| candidate.provider.eq_ignore_ascii_case(provider))
+        })
+    })
+    .collect::<Vec<_>>();
+    if routes.is_empty() {
+        return None;
+    }
+
+    state.refresh_provider_table_routes(model);
+    let route_by_key = routes
+        .into_iter()
+        .map(|candidate| (route_key(candidate), candidate))
+        .collect::<BTreeMap<_, _>>();
+    let entries = state
+        .provider_table
+        .lock_recover("provider table")
+        .entries(now_millis)
+        .into_iter()
+        .filter(|entry| route_by_key.contains_key(&entry.key))
+        .collect::<Vec<_>>();
+    let mut current_requirements = requirements.clone();
+    current_requirements.now_millis = now_millis;
+    let eligible_keys = crate::provider_table::eligible_candidates(
+        &entries,
+        &current_requirements,
+        &SelectionWeights::default(),
+    )
+    .into_iter()
+    .map(|candidate| candidate.entry.key)
+    .collect::<Vec<_>>();
+    if eligible_keys.is_empty() {
+        return None;
+    }
+    let cooloffs = state.provider_cooloffs.lock_recover("provider cooloff map");
+    let until_millis = eligible_keys
+        .iter()
+        .map(|key| cooloffs.get(key).copied())
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .filter(|until_millis| *until_millis > now_millis)
+        .min()?;
+    let every_route_is_cooling = eligible_keys.iter().all(|key| {
+        cooloffs
+            .get(key)
+            .is_some_and(|until_millis| *until_millis > now_millis)
+    });
+    every_route_is_cooling.then_some(KnownRouteCooloff { until_millis })
 }
 
 fn route_static_filters_have_candidates(
@@ -16521,6 +18519,7 @@ struct LiveDirectChatSession {
     transport_peer: String,
     request_id: String,
     enclave_pubkey: String,
+    _verified_attestation: Option<VerifiedAttestation>,
     id: String,
     created: u64,
     include_usage: bool,
@@ -16572,7 +18571,7 @@ async fn prepare_live_direct_chat_session(
         &state,
         &model,
         &options,
-        &requirements.required_modalities,
+        &requirements,
         eligible_route_refs,
         || ordered_route_candidates_for_request_with_options(&state, &model, &request, &options),
     )
@@ -16630,7 +18629,14 @@ async fn prepare_live_direct_chat_session(
         let invocation = invocation.with_hedge_probe_outcome(&hedge_probe);
         let attempt_started = Instant::now();
         match open_live_direct_chat_session(&config, &model, &request, &invocation).await {
-            Ok((bridge, provider, transport_peer, request_id, enclave_pubkey)) => {
+            Ok((
+                bridge,
+                provider,
+                transport_peer,
+                request_id,
+                enclave_pubkey,
+                verified_attestation,
+            )) => {
                 let include_usage = request
                     .stream_options
                     .as_ref()
@@ -16648,6 +18654,7 @@ async fn prepare_live_direct_chat_session(
                     transport_peer,
                     request_id,
                     enclave_pubkey,
+                    _verified_attestation: verified_attestation,
                     id,
                     created,
                     include_usage,
@@ -16656,14 +18663,14 @@ async fn prepare_live_direct_chat_session(
                 });
             }
             Err(err) if err.retryable => {
-                record_retryable_route_attempt(&state, route, attempt_started.elapsed(), &err);
+                record_route_attempt_error(&state, route, attempt_started.elapsed(), &err);
                 if let Some(refusal) = terminal_balance_refusal(&err) {
                     return Err(refusal);
                 }
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
-                record_route_failure_attempt(&state, route, attempt_started.elapsed());
+                record_route_attempt_error(&state, route, attempt_started.elapsed(), &err);
                 return Err(ApiError::bad_gateway(err.message, Some("model")));
             }
         }
@@ -16683,7 +18690,17 @@ async fn open_live_direct_chat_session(
     model: &GatewayModel,
     request: &ChatCompletionRequest,
     invocation: &GatewaySessionInvocation,
-) -> Result<(ScBridgeClient, String, String, String, String), GatewaySessionError> {
+) -> Result<
+    (
+        ScBridgeClient,
+        String,
+        String,
+        String,
+        String,
+        Option<VerifiedAttestation>,
+    ),
+    GatewaySessionError,
+> {
     let provider = invocation.provider_pubkey_required()?;
     let direct_peer = invocation.direct_peer()?;
     let mut bridge =
@@ -16738,6 +18755,7 @@ async fn open_live_direct_chat_session(
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
+            "attestation_policy_binding": invocation.attestation_policy_binding(),
             "ts": now,
             "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
             "sig": invocation.spend_voucher.user_sig.clone(),
@@ -16782,10 +18800,14 @@ async fn open_live_direct_chat_session(
             byte_limit,
         )
         .await?;
-        Ok::<_, GatewaySessionError>((request_id, accept_info.enclave_pubkey))
+        Ok::<_, GatewaySessionError>((
+            request_id,
+            accept_info.enclave_pubkey,
+            accept_info.verified_attestation,
+        ))
     }
     .await;
-    let (request_id, enclave_pubkey) = match open_result {
+    let (request_id, enclave_pubkey, verified_attestation) = match open_result {
         Ok(opened) => opened,
         Err(err) => {
             let _ = close_direct_session_channel(
@@ -16804,6 +18826,7 @@ async fn open_live_direct_chat_session(
         direct_peer.to_owned(),
         request_id,
         enclave_pubkey,
+        verified_attestation,
     ))
 }
 
@@ -17027,17 +19050,18 @@ async fn run_live_direct_chat_sse(
                 Err(err) => {
                     if !attempt_recorded {
                         if err.retryable {
-                            record_retryable_route_attempt(
+                            record_route_attempt_error(
                                 &session.state,
                                 session.route.as_ref(),
                                 session.attempt_started.elapsed(),
                                 &err,
                             );
                         } else {
-                            record_route_failure_attempt(
+                            record_route_attempt_error(
                                 &session.state,
                                 session.route.as_ref(),
                                 session.attempt_started.elapsed(),
+                                &err,
                             );
                         }
                     }
@@ -17244,7 +19268,7 @@ async fn recover_live_direct_chat_after_retryable(
     if partial.is_none() && !err.before_first_output {
         return Err(GatewaySessionError::new(err.message));
     }
-    record_retryable_route_attempt(
+    record_route_attempt_error(
         &session.state,
         session.route.as_ref(),
         session.attempt_started.elapsed(),
@@ -18226,7 +20250,7 @@ async fn run_chat_with_route_retry(
         state,
         model,
         &options,
-        &initial_requirements.required_modalities,
+        &initial_requirements,
         eligible_routes,
         || ordered_route_candidates_for_request_with_options(state, model, request, &options),
     )
@@ -18379,7 +20403,7 @@ async fn run_chat_with_route_retry(
                 return Err(ApiError::client_closed_request(err.message));
             }
             Err(err) if err.retryable => {
-                record_retryable_route_attempt(state, route, attempt_started.elapsed(), &err);
+                record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 if let Some(refusal) = terminal_balance_refusal(&err) {
                     return Err(refusal);
                 }
@@ -18409,7 +20433,7 @@ async fn run_chat_with_route_retry(
                 last_retryable_error = Some(err.message);
             }
             Err(err) => {
-                record_route_failure_attempt(state, route, attempt_started.elapsed());
+                record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 return Err(ApiError::bad_gateway(err.message, Some("model")));
             }
         }
@@ -18665,15 +20689,6 @@ fn ordered_route_candidates_for_request_with_max_price_seed<'a>(
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
-    let eligible_routes =
-        eligible_route_candidates(model, min_att_tier, quant, &state.receipt_config.rail)
-            .into_iter()
-            .filter(|route| !state.route_provider_in_cooloff(route, now_millis))
-            .collect::<Vec<_>>();
-    if eligible_routes.is_empty() {
-        return eligible_routes;
-    }
-
     state.refresh_provider_table_routes(model);
     let requirements = request_requirements_for_chat(
         state,
@@ -18684,35 +20699,37 @@ fn ordered_route_candidates_for_request_with_max_price_seed<'a>(
         min_ctx,
         min_throughput,
     );
+    let entries = {
+        let table = state.provider_table.lock_recover("provider table");
+        table.entries(now_millis)
+    };
+    let eligible_keys = selector_eligible_route_keys(
+        state,
+        model,
+        &entries,
+        min_att_tier,
+        quant,
+        &requirements,
+        now_millis,
+    );
+    let eligible_routes = model
+        .mayhem
+        .route_candidates
+        .iter()
+        .filter(|candidate| eligible_keys.contains(&route_key(candidate)))
+        .collect::<Vec<_>>();
+    if eligible_routes.is_empty() {
+        return eligible_routes;
+    }
     let route_by_key = eligible_routes
         .iter()
         .map(|candidate| (route_key(candidate), *candidate))
         .collect::<BTreeMap<_, _>>();
-    let mut remaining_entries = {
-        let table = state.provider_table.lock_recover("provider table");
-        table
-            .entries(now_millis)
-            .into_iter()
-            .filter(|entry| route_by_key.contains_key(&entry.key))
-            .collect::<Vec<_>>()
-    };
-    let weights = SelectionWeights::default();
-    let table_entry_keys = remaining_entries
-        .iter()
-        .map(|entry| entry.key.clone())
-        .collect::<BTreeSet<_>>();
-    let table_eligible_keys =
-        crate::provider_table::eligible_candidates(&remaining_entries, &requirements, &weights)
-            .into_iter()
-            .map(|candidate| candidate.entry.key)
-            .collect::<BTreeSet<_>>();
-    let eligible_routes = eligible_routes
+    let mut remaining_entries = entries
         .into_iter()
-        .filter(|candidate| {
-            let key = route_key(candidate);
-            table_entry_keys.contains(&key) && table_eligible_keys.contains(&key)
-        })
+        .filter(|entry| eligible_keys.contains(&entry.key))
         .collect::<Vec<_>>();
+    let weights = SelectionWeights::default();
     if eligible_routes.len() <= 1 {
         return eligible_routes;
     }
@@ -18739,9 +20756,6 @@ fn ordered_route_candidates_for_request_with_max_price_seed<'a>(
 
     for candidate in eligible_routes {
         let key = route_key(candidate);
-        if table_entry_keys.contains(&key) && !table_eligible_keys.contains(&key) {
-            continue;
-        }
         if selected_keys.insert(key) {
             ordered.push(candidate);
         }
@@ -18760,15 +20774,6 @@ fn ordered_route_candidates_for_embedding_with_max_price_seed<'a>(
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
-    let eligible_routes =
-        eligible_route_candidates(model, min_att_tier, quant, &state.receipt_config.rail)
-            .into_iter()
-            .filter(|route| !state.route_provider_in_cooloff(route, now_millis))
-            .collect::<Vec<_>>();
-    if eligible_routes.is_empty() {
-        return eligible_routes;
-    }
-
     state.refresh_provider_table_routes(model);
     let requirements = request_requirements_for_embedding(
         state,
@@ -18778,35 +20783,37 @@ fn ordered_route_candidates_for_embedding_with_max_price_seed<'a>(
         max_price_au,
         min_throughput,
     );
+    let entries = {
+        let table = state.provider_table.lock_recover("provider table");
+        table.entries(now_millis)
+    };
+    let eligible_keys = selector_eligible_route_keys(
+        state,
+        model,
+        &entries,
+        min_att_tier,
+        quant,
+        &requirements,
+        now_millis,
+    );
+    let eligible_routes = model
+        .mayhem
+        .route_candidates
+        .iter()
+        .filter(|candidate| eligible_keys.contains(&route_key(candidate)))
+        .collect::<Vec<_>>();
+    if eligible_routes.is_empty() {
+        return eligible_routes;
+    }
     let route_by_key = eligible_routes
         .iter()
         .map(|candidate| (route_key(candidate), *candidate))
         .collect::<BTreeMap<_, _>>();
-    let mut remaining_entries = {
-        let table = state.provider_table.lock_recover("provider table");
-        table
-            .entries(now_millis)
-            .into_iter()
-            .filter(|entry| route_by_key.contains_key(&entry.key))
-            .collect::<Vec<_>>()
-    };
-    let weights = SelectionWeights::default();
-    let table_entry_keys = remaining_entries
-        .iter()
-        .map(|entry| entry.key.clone())
-        .collect::<BTreeSet<_>>();
-    let table_eligible_keys =
-        crate::provider_table::eligible_candidates(&remaining_entries, &requirements, &weights)
-            .into_iter()
-            .map(|candidate| candidate.entry.key)
-            .collect::<BTreeSet<_>>();
-    let eligible_routes = eligible_routes
+    let mut remaining_entries = entries
         .into_iter()
-        .filter(|candidate| {
-            let key = route_key(candidate);
-            table_entry_keys.contains(&key) && table_eligible_keys.contains(&key)
-        })
+        .filter(|entry| eligible_keys.contains(&entry.key))
         .collect::<Vec<_>>();
+    let weights = SelectionWeights::default();
     if eligible_routes.len() <= 1 {
         return eligible_routes;
     }
@@ -18833,9 +20840,6 @@ fn ordered_route_candidates_for_embedding_with_max_price_seed<'a>(
 
     for candidate in eligible_routes {
         let key = route_key(candidate);
-        if table_entry_keys.contains(&key) && !table_eligible_keys.contains(&key) {
-            continue;
-        }
         if selected_keys.insert(key) {
             ordered.push(candidate);
         }
@@ -18854,15 +20858,6 @@ fn ordered_route_candidates_for_image_generation_with_max_price_seed<'a>(
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
-    let eligible_routes =
-        eligible_route_candidates(model, min_att_tier, quant, &state.receipt_config.rail)
-            .into_iter()
-            .filter(|route| !state.route_provider_in_cooloff(route, now_millis))
-            .collect::<Vec<_>>();
-    if eligible_routes.is_empty() {
-        return eligible_routes;
-    }
-
     state.refresh_provider_table_routes(model);
     let requirements = request_requirements_for_image_generation(
         state,
@@ -18872,35 +20867,37 @@ fn ordered_route_candidates_for_image_generation_with_max_price_seed<'a>(
         max_price_au,
         min_throughput,
     );
+    let entries = {
+        let table = state.provider_table.lock_recover("provider table");
+        table.entries(now_millis)
+    };
+    let eligible_keys = selector_eligible_route_keys(
+        state,
+        model,
+        &entries,
+        min_att_tier,
+        quant,
+        &requirements,
+        now_millis,
+    );
+    let eligible_routes = model
+        .mayhem
+        .route_candidates
+        .iter()
+        .filter(|candidate| eligible_keys.contains(&route_key(candidate)))
+        .collect::<Vec<_>>();
+    if eligible_routes.is_empty() {
+        return eligible_routes;
+    }
     let route_by_key = eligible_routes
         .iter()
         .map(|candidate| (route_key(candidate), *candidate))
         .collect::<BTreeMap<_, _>>();
-    let mut remaining_entries = {
-        let table = state.provider_table.lock_recover("provider table");
-        table
-            .entries(now_millis)
-            .into_iter()
-            .filter(|entry| route_by_key.contains_key(&entry.key))
-            .collect::<Vec<_>>()
-    };
-    let weights = SelectionWeights::default();
-    let table_entry_keys = remaining_entries
-        .iter()
-        .map(|entry| entry.key.clone())
-        .collect::<BTreeSet<_>>();
-    let table_eligible_keys =
-        crate::provider_table::eligible_candidates(&remaining_entries, &requirements, &weights)
-            .into_iter()
-            .map(|candidate| candidate.entry.key)
-            .collect::<BTreeSet<_>>();
-    let eligible_routes = eligible_routes
+    let mut remaining_entries = entries
         .into_iter()
-        .filter(|candidate| {
-            let key = route_key(candidate);
-            table_entry_keys.contains(&key) && table_eligible_keys.contains(&key)
-        })
+        .filter(|entry| eligible_keys.contains(&entry.key))
         .collect::<Vec<_>>();
+    let weights = SelectionWeights::default();
     if eligible_routes.len() <= 1 {
         return eligible_routes;
     }
@@ -18927,9 +20924,6 @@ fn ordered_route_candidates_for_image_generation_with_max_price_seed<'a>(
 
     for candidate in eligible_routes {
         let key = route_key(candidate);
-        if table_entry_keys.contains(&key) && !table_eligible_keys.contains(&key) {
-            continue;
-        }
         if selected_keys.insert(key) {
             ordered.push(candidate);
         }
@@ -18946,45 +20940,38 @@ fn ordered_route_candidates_for_requirements_with_seed<'a>(
     requirements: RequestRequirements,
     now_millis: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
-    let eligible_routes =
-        eligible_route_candidates(model, min_att_tier, quant, &state.receipt_config.rail)
-            .into_iter()
-            .filter(|route| !state.route_provider_in_cooloff(route, now_millis))
-            .collect::<Vec<_>>();
+    state.refresh_provider_table_routes(model);
+    let entries = {
+        let table = state.provider_table.lock_recover("provider table");
+        table.entries(now_millis)
+    };
+    let eligible_keys = selector_eligible_route_keys(
+        state,
+        model,
+        &entries,
+        min_att_tier,
+        quant,
+        &requirements,
+        now_millis,
+    );
+    let eligible_routes = model
+        .mayhem
+        .route_candidates
+        .iter()
+        .filter(|candidate| eligible_keys.contains(&route_key(candidate)))
+        .collect::<Vec<_>>();
     if eligible_routes.is_empty() {
         return eligible_routes;
     }
-
-    state.refresh_provider_table_routes(model);
     let route_by_key = eligible_routes
         .iter()
         .map(|candidate| (route_key(candidate), *candidate))
         .collect::<BTreeMap<_, _>>();
-    let mut remaining_entries = {
-        let table = state.provider_table.lock_recover("provider table");
-        table
-            .entries(now_millis)
-            .into_iter()
-            .filter(|entry| route_by_key.contains_key(&entry.key))
-            .collect::<Vec<_>>()
-    };
-    let weights = SelectionWeights::default();
-    let table_entry_keys = remaining_entries
-        .iter()
-        .map(|entry| entry.key.clone())
-        .collect::<BTreeSet<_>>();
-    let table_eligible_keys =
-        crate::provider_table::eligible_candidates(&remaining_entries, &requirements, &weights)
-            .into_iter()
-            .map(|candidate| candidate.entry.key)
-            .collect::<BTreeSet<_>>();
-    let eligible_routes = eligible_routes
+    let mut remaining_entries = entries
         .into_iter()
-        .filter(|candidate| {
-            let key = route_key(candidate);
-            table_entry_keys.contains(&key) && table_eligible_keys.contains(&key)
-        })
+        .filter(|entry| eligible_keys.contains(&entry.key))
         .collect::<Vec<_>>();
+    let weights = SelectionWeights::default();
     if eligible_routes.len() <= 1 {
         return eligible_routes;
     }
@@ -19009,9 +20996,6 @@ fn ordered_route_candidates_for_requirements_with_seed<'a>(
     }
     for candidate in eligible_routes {
         let key = route_key(candidate);
-        if table_entry_keys.contains(&key) && !table_eligible_keys.contains(&key) {
-            continue;
-        }
         if selected_keys.insert(key) {
             ordered.push(candidate);
         }
@@ -19020,6 +21004,70 @@ fn ordered_route_candidates_for_requirements_with_seed<'a>(
 }
 
 impl GatewayState {
+    fn begin_tpm_activation(&self, key: ProviderKey) -> Option<GatewayTpmActivationAttemptGuard> {
+        let mut inflight = self
+            .tpm_activation_inflight
+            .lock_recover("TPM activation in-flight set");
+        if !inflight.insert(key.clone()) {
+            return None;
+        }
+        drop(inflight);
+        Some(GatewayTpmActivationAttemptGuard {
+            inflight: Arc::clone(&self.tpm_activation_inflight),
+            key,
+        })
+    }
+
+    fn cache_tpm_activation(
+        &self,
+        key: ProviderKey,
+        readiness: &RouteAttestationPolicyReadiness,
+        candidate: &GatewayRouteCandidate,
+        live: &LiveHeartbeatAttestationAdvertisement,
+        identity: ActivatedTpmIdentity,
+        now_millis: u64,
+    ) -> Result<(), String> {
+        let policy_sequence = readiness
+            .policy_sequence
+            .ok_or_else(|| "TPM activation route has no policy sequence".to_owned())?;
+        let policy_digest = readiness
+            .policy_digest
+            .clone()
+            .ok_or_else(|| "TPM activation route has no policy digest".to_owned())?;
+        let device_id = candidate
+            .device_key
+            .clone()
+            .filter(|value| is_hex_len(value, 64))
+            .ok_or_else(|| "TPM activation route has no canonical device identity".to_owned())?;
+        let transport_peer = live
+            .transport_peer
+            .clone()
+            .filter(|value| is_hex_len(value, 64))
+            .ok_or_else(|| "TPM activation route has no signed transport peer".to_owned())?;
+        let hello = live
+            .tpm_activation_hello
+            .as_ref()
+            .ok_or_else(|| "TPM activation route has no signed hello".to_owned())?;
+        let hello_digest = tpm_activation_hello_digest(hello)?;
+        self.tpm_activation_cache
+            .lock_recover("TPM activation cache")
+            .insert(
+                key,
+                GatewayTpmActivationCacheEntry {
+                    identity,
+                    policy_sequence,
+                    policy_digest,
+                    device_id,
+                    heartbeat_epoch: live.heartbeat_epoch,
+                    heartbeat_head: live.heartbeat_head.clone(),
+                    transport_peer,
+                    hello_digest,
+                    expires_at_millis: now_millis.saturating_add(TPM_ACTIVATION_CACHE_TTL_MILLIS),
+                },
+            );
+        Ok(())
+    }
+
     fn try_acquire_modality_admission(
         &self,
         route: Option<&GatewayRouteCandidate>,
@@ -19101,12 +21149,25 @@ impl GatewayState {
 
     fn refresh_provider_table_routes(&self, model: &GatewayModel) {
         let now = now_millis_u64();
+        let authority = self.attestation_authority_snapshot();
+        let heartbeat_advertisements = self
+            .heartbeat_attestation_advertisements
+            .lock_recover("heartbeat attestation advertisements")
+            .clone();
+        let tpm_activation_cache = self
+            .tpm_activation_cache
+            .lock_recover("TPM activation cache")
+            .clone();
         let mut table = self.provider_table.lock_recover("provider table");
         for candidate in &model.mayhem.route_candidates {
             table.upsert_contract(contract_snapshot_for_route(
                 model,
                 candidate,
                 self.receipt_config.rules_ver,
+                authority.as_ref(),
+                &heartbeat_advertisements,
+                &tpm_activation_cache,
+                self.hardware_quote_trust.verifier_command.as_ref(),
             ));
             if self.dev_session_shim {
                 table.upsert_fallback_heartbeat(heartbeat_for_route(model, candidate, now), now);
@@ -19544,7 +21605,10 @@ fn request_requirements_for_image_generation(
                 max_item_units: u64::from(width).saturating_mul(u64::from(height)),
             },
         )]),
-        min_ctx: input_tokens.min(u64::from(u32::MAX)) as u32,
+        // Artifact endpoints bound prompt size through their calibrated endpoint
+        // contract. Provider `ctx` is a text-generation capacity and is only a
+        // sentinel for image, audio, music, and video routes.
+        min_ctx: 1,
         input_tokens,
         output_tokens: 0,
         usage: image_generation_usage_for_request(request),
@@ -19581,7 +21645,10 @@ fn request_requirements_for_audio_speech(
                 max_item_units: estimated_seconds,
             },
         )]),
-        min_ctx: input_tokens.min(u64::from(u32::MAX)) as u32,
+        // Artifact endpoints bound prompt size through their calibrated endpoint
+        // contract. Provider `ctx` is a text-generation capacity and is only a
+        // sentinel for image, audio, music, and video routes.
+        min_ctx: 1,
         input_tokens,
         output_tokens: 0,
         usage: audio_speech_usage_for_request(request),
@@ -19665,7 +21732,10 @@ fn request_requirements_for_artifact_generation(
                 max_item_units,
             },
         )]),
-        min_ctx: input_tokens.min(u64::from(u32::MAX)) as u32,
+        // Artifact endpoints bound prompt size through their calibrated endpoint
+        // contract. Provider `ctx` is a text-generation capacity and is only a
+        // sentinel for image, audio, music, and video routes.
+        min_ctx: 1,
         input_tokens,
         output_tokens: 0,
         usage: artifact_generation_usage_for_request(request),
@@ -19893,12 +21963,15 @@ fn record_route_failure_attempt(
     record_route_observation(state, route, observation_sample_from_error(elapsed));
 }
 
-fn record_retryable_route_attempt(
+fn record_route_attempt_error(
     state: &GatewayState,
     route: Option<&GatewayRouteCandidate>,
     elapsed: Duration,
     err: &GatewaySessionError,
 ) {
+    if err.failure_class == GatewaySessionFailureClass::BuyerLocal {
+        return;
+    }
     if err.clean_refusal
         && err
             .clean_refusal_code
@@ -20170,17 +22243,74 @@ fn eligible_route_candidates<'a>(
         .mayhem
         .route_candidates
         .iter()
-        .filter(|candidate| {
-            candidate
-                .accepted_rails
-                .iter()
-                .any(|candidate_rail| candidate_rail == rail)
-                && min_att_tier
-                    .map(|min_tier| candidate.att_tier >= min_tier)
-                    .unwrap_or(true)
-                && quant
-                    .map(|quant| candidate.quant.eq_ignore_ascii_case(quant))
-                    .unwrap_or(true)
+        .filter(|candidate| route_matches_selector_filters(candidate, min_att_tier, quant, rail))
+        .collect()
+}
+
+fn route_matches_selector_filters(
+    candidate: &GatewayRouteCandidate,
+    min_att_tier: Option<u8>,
+    quant: Option<&str>,
+    rail: &str,
+) -> bool {
+    candidate
+        .accepted_rails
+        .iter()
+        .any(|candidate_rail| candidate_rail == rail)
+        && min_att_tier
+            .map(|min_tier| candidate.att_tier >= min_tier)
+            .unwrap_or(true)
+        && quant
+            .map(|quant| candidate.quant.eq_ignore_ascii_case(quant))
+            .unwrap_or(true)
+}
+
+fn selector_route_is_eligible(
+    state: &GatewayState,
+    candidate: &GatewayRouteCandidate,
+    entry: &ProviderTableEntry,
+    min_att_tier: Option<u8>,
+    quant: Option<&str>,
+    requirements: &RequestRequirements,
+    now_millis: u64,
+) -> bool {
+    route_matches_selector_filters(candidate, min_att_tier, quant, &state.receipt_config.rail)
+        && !state.route_provider_in_cooloff(candidate, now_millis)
+        && crate::provider_table::evaluate_eligibility(entry, requirements).is_ok()
+}
+
+fn selector_eligible_route_keys(
+    state: &GatewayState,
+    model: &GatewayModel,
+    entries: &[ProviderTableEntry],
+    min_att_tier: Option<u8>,
+    quant: Option<&str>,
+    requirements: &RequestRequirements,
+    now_millis: u64,
+) -> BTreeSet<ProviderKey> {
+    let entries_by_key = entries
+        .iter()
+        .map(|entry| (&entry.key, entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut requirements = requirements.clone();
+    requirements.now_millis = now_millis;
+    model
+        .mayhem
+        .route_candidates
+        .iter()
+        .filter_map(|candidate| {
+            let key = route_key(candidate);
+            let entry = entries_by_key.get(&key)?;
+            selector_route_is_eligible(
+                state,
+                candidate,
+                entry,
+                min_att_tier,
+                quant,
+                &requirements,
+                now_millis,
+            )
+            .then_some(key)
         })
         .collect()
 }
@@ -21992,7 +24122,12 @@ impl GatewayState {
         model: &GatewayModel,
         invocation: &GatewaySessionInvocation,
     ) {
-        let Some(config) = self.canaries.models.get(&model.id).cloned() else {
+        let canaries = self
+            .catalog_runtime
+            .lock_recover("gateway catalog runtime")
+            .canaries
+            .clone();
+        let Some(config) = canaries.models.get(&model.id).cloned() else {
             return;
         };
         if config.prompts.is_empty() {
@@ -22144,11 +24279,7 @@ impl GatewayState {
             .provider_pubkey
             .clone()
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
-        let binary_hash = served_invocation
-            .attestation
-            .as_ref()
-            .map(|attestation| attestation.contract.binary_hash.clone())
-            .unwrap_or_default();
+        let binary_hash = served_invocation.runtime_binary_hash_evidence();
         let expected_fingerprint = stable_value_hash(&json!({
             "domain": "mayhem-context-needle-expected-v1",
             "answer": spec.answer.clone(),
@@ -22376,11 +24507,7 @@ impl GatewayState {
             .provider_pubkey
             .clone()
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
-        let binary_hash = served_invocation
-            .attestation
-            .as_ref()
-            .map(|attestation| attestation.contract.binary_hash.clone())
-            .unwrap_or_default();
+        let binary_hash = served_invocation.runtime_binary_hash_evidence();
         let evidence = json!({
             "schema_version": 1,
             "kind": "mayhem-automatic-canary-probe-evidence",
@@ -22736,11 +24863,7 @@ impl GatewayState {
             .provider_pubkey
             .clone()
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
-        let binary_hash = served_invocation
-            .attestation
-            .as_ref()
-            .map(|attestation| attestation.contract.binary_hash.clone())
-            .unwrap_or_default();
+        let binary_hash = served_invocation.runtime_binary_hash_evidence();
         let evidence = json!({
             "schema_version": 1,
             "kind": "mayhem-automatic-speciality-canary-probe-evidence",
@@ -22924,11 +25047,7 @@ impl GatewayState {
             .provider_pubkey
             .clone()
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
-        let binary_hash = served_invocation
-            .attestation
-            .as_ref()
-            .map(|attestation| attestation.contract.binary_hash.clone())
-            .unwrap_or_default();
+        let binary_hash = served_invocation.runtime_binary_hash_evidence();
         let evidence = json!({
             "schema_version": 1,
             "kind": "mayhem-automatic-image-canary-probe-evidence",
@@ -23437,11 +25556,7 @@ impl GatewayState {
             .provider_pubkey
             .clone()
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
-        let binary_hash = served_invocation
-            .attestation
-            .as_ref()
-            .map(|attestation| attestation.contract.binary_hash.clone())
-            .unwrap_or_default();
+        let binary_hash = served_invocation.runtime_binary_hash_evidence();
         evidence["model"] = json!(model.id);
         evidence["provider"] = json!(provider);
         evidence["enclave_id"] = json!(served_invocation.enclave_id);
@@ -23509,6 +25624,67 @@ impl GatewayState {
         }
     }
 
+    fn session_attestation_for_route(
+        &self,
+        model: &GatewayModel,
+        candidate: &GatewayRouteCandidate,
+    ) -> Result<GatewaySessionAttestation, ApiError> {
+        let authority = self.attestation_authority_snapshot();
+        let live_advertisement = self
+            .heartbeat_attestation_advertisements
+            .lock_recover("heartbeat attestation advertisements")
+            .get(&route_key(candidate))
+            .cloned();
+        let tpm_activation_cache = self
+            .tpm_activation_cache
+            .lock_recover("TPM activation cache")
+            .clone();
+        let resolved = route_attestation_policy_resolution(
+            candidate,
+            live_advertisement.as_ref(),
+            authority.as_ref(),
+            &tpm_activation_cache,
+            self.hardware_quote_trust.verifier_command.as_ref(),
+            now_millis_u64(),
+        )
+        .map_err(|readiness| {
+            ApiError::service_unavailable(
+                format!(
+                    "route {} cannot verify Tier {} locally: {}",
+                    candidate.provider,
+                    candidate.att_tier,
+                    readiness
+                        .reason
+                        .as_deref()
+                        .unwrap_or("authenticated policy is not ready")
+                ),
+                Some("model"),
+            )
+        })?;
+        let policy = resolved.map(|resolved| GatewaySessionAttestationPolicy {
+            authority: resolved.authority,
+            route_binding: resolved.route_binding,
+            activated_tpm_identity: resolved.activated_tpm_identity,
+        });
+        Ok(GatewaySessionAttestation {
+            contract: EnclaveContractRecord {
+                enclave_id: candidate.enclave_id.clone(),
+                admin_pubkey: candidate.admin_pubkey.clone(),
+                model_id: model.id.clone(),
+                model_class: model.mayhem.model_class.clone(),
+                artifact_root: candidate.artifact_root.clone(),
+                artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
+                manifest_hash: candidate.manifest_hash.clone(),
+                binary_hash: candidate.binary_hash.clone(),
+                launch_measurements: candidate.launch_measurements.clone(),
+                att_tier: candidate.att_tier,
+                caps: candidate.caps.clone(),
+            },
+            policy,
+            hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
+        })
+    }
+
     fn prepare_chat_invocation_for_route(
         &self,
         model: &GatewayModel,
@@ -23530,29 +25706,9 @@ impl GatewayState {
         let price = route_price_ref_au(model, route);
         let price_ver = price.ver;
         let locked_rate_map = session_locked_rate_map(price);
-        let attestation = route.map(|candidate| GatewaySessionAttestation {
-            contract: EnclaveContractRecord {
-                enclave_id: candidate.enclave_id.clone(),
-                admin_pubkey: candidate.admin_pubkey.clone(),
-                model_id: model.id.clone(),
-                model_class: model.mayhem.model_class.clone(),
-                artifact_root: candidate.artifact_root.clone(),
-                artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
-                manifest_hash: candidate.manifest_hash.clone(),
-                binary_hash: candidate.binary_hash.clone(),
-                launch_measurements: candidate.launch_measurements.clone(),
-                att_tier: candidate.att_tier,
-                caps: candidate.caps.clone(),
-            },
-            trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
-            trusted_nvidia_gb10_device_jwks: self
-                .hardware_quote_trust
-                .nvidia_gb10_device_jwks
-                .clone(),
-            trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
-            trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
-            hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
-        });
+        let attestation = route
+            .map(|candidate| self.session_attestation_for_route(model, candidate))
+            .transpose()?;
         let served_ctx = self.served_ctx_for_route(model, route);
         let max_spend_au = estimate_max_spend_au(price, request, served_ctx, &billing);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
@@ -23606,6 +25762,7 @@ impl GatewayState {
             hedge: hedge_invocation_for_model(model, options, failover),
             failover,
             access_token: options.access_token.clone(),
+            verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
             receipt_recorder: GatewayReceiptRecorder {
@@ -23666,29 +25823,9 @@ impl GatewayState {
         let price = route_price_ref_au(model, route);
         let price_ver = price.ver;
         let locked_rate_map = session_locked_rate_map(price);
-        let attestation = route.map(|candidate| GatewaySessionAttestation {
-            contract: EnclaveContractRecord {
-                enclave_id: candidate.enclave_id.clone(),
-                admin_pubkey: candidate.admin_pubkey.clone(),
-                model_id: model.id.clone(),
-                model_class: model.mayhem.model_class.clone(),
-                artifact_root: candidate.artifact_root.clone(),
-                artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
-                manifest_hash: candidate.manifest_hash.clone(),
-                binary_hash: candidate.binary_hash.clone(),
-                launch_measurements: candidate.launch_measurements.clone(),
-                att_tier: candidate.att_tier,
-                caps: candidate.caps.clone(),
-            },
-            trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
-            trusted_nvidia_gb10_device_jwks: self
-                .hardware_quote_trust
-                .nvidia_gb10_device_jwks
-                .clone(),
-            trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
-            trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
-            hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
-        });
+        let attestation = route
+            .map(|candidate| self.session_attestation_for_route(model, candidate))
+            .transpose()?;
         let max_spend_au = estimate_embedding_max_spend_au(price, inputs);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
         let spend_reservation =
@@ -23741,6 +25878,7 @@ impl GatewayState {
             hedge: GatewayHedgeInvocation::default(),
             failover,
             access_token: options.access_token.clone(),
+            verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
             receipt_recorder: GatewayReceiptRecorder {
@@ -23776,29 +25914,9 @@ impl GatewayState {
         let price = route_price_ref_au(model, route);
         let price_ver = price.ver;
         let locked_rate_map = session_locked_rate_map(price);
-        let attestation = route.map(|candidate| GatewaySessionAttestation {
-            contract: EnclaveContractRecord {
-                enclave_id: candidate.enclave_id.clone(),
-                admin_pubkey: candidate.admin_pubkey.clone(),
-                model_id: model.id.clone(),
-                model_class: model.mayhem.model_class.clone(),
-                artifact_root: candidate.artifact_root.clone(),
-                artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
-                manifest_hash: candidate.manifest_hash.clone(),
-                binary_hash: candidate.binary_hash.clone(),
-                launch_measurements: candidate.launch_measurements.clone(),
-                att_tier: candidate.att_tier,
-                caps: candidate.caps.clone(),
-            },
-            trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
-            trusted_nvidia_gb10_device_jwks: self
-                .hardware_quote_trust
-                .nvidia_gb10_device_jwks
-                .clone(),
-            trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
-            trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
-            hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
-        });
+        let attestation = route
+            .map(|candidate| self.session_attestation_for_route(model, candidate))
+            .transpose()?;
         let max_spend_au = estimate_image_generation_max_spend_au(price, request);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
         let spend_reservation =
@@ -23851,6 +25969,7 @@ impl GatewayState {
             hedge: GatewayHedgeInvocation::default(),
             failover,
             access_token: options.access_token.clone(),
+            verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
             receipt_recorder: GatewayReceiptRecorder {
@@ -23886,29 +26005,9 @@ impl GatewayState {
         let price = route_price_ref_au(model, route);
         let price_ver = price.ver;
         let locked_rate_map = session_locked_rate_map(price);
-        let attestation = route.map(|candidate| GatewaySessionAttestation {
-            contract: EnclaveContractRecord {
-                enclave_id: candidate.enclave_id.clone(),
-                admin_pubkey: candidate.admin_pubkey.clone(),
-                model_id: model.id.clone(),
-                model_class: model.mayhem.model_class.clone(),
-                artifact_root: candidate.artifact_root.clone(),
-                artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
-                manifest_hash: candidate.manifest_hash.clone(),
-                binary_hash: candidate.binary_hash.clone(),
-                launch_measurements: candidate.launch_measurements.clone(),
-                att_tier: candidate.att_tier,
-                caps: candidate.caps.clone(),
-            },
-            trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
-            trusted_nvidia_gb10_device_jwks: self
-                .hardware_quote_trust
-                .nvidia_gb10_device_jwks
-                .clone(),
-            trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
-            trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
-            hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
-        });
+        let attestation = route
+            .map(|candidate| self.session_attestation_for_route(model, candidate))
+            .transpose()?;
         let max_spend_au = estimate_audio_speech_max_spend_au(price, request);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
         let spend_reservation =
@@ -23961,6 +26060,7 @@ impl GatewayState {
             hedge: GatewayHedgeInvocation::default(),
             failover,
             access_token: options.access_token.clone(),
+            verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
             receipt_recorder: GatewayReceiptRecorder {
@@ -23996,29 +26096,9 @@ impl GatewayState {
         let price = route_price_ref_au(model, route);
         let price_ver = price.ver;
         let locked_rate_map = session_locked_rate_map(price);
-        let attestation = route.map(|candidate| GatewaySessionAttestation {
-            contract: EnclaveContractRecord {
-                enclave_id: candidate.enclave_id.clone(),
-                admin_pubkey: candidate.admin_pubkey.clone(),
-                model_id: model.id.clone(),
-                model_class: model.mayhem.model_class.clone(),
-                artifact_root: candidate.artifact_root.clone(),
-                artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
-                manifest_hash: candidate.manifest_hash.clone(),
-                binary_hash: candidate.binary_hash.clone(),
-                launch_measurements: candidate.launch_measurements.clone(),
-                att_tier: candidate.att_tier,
-                caps: candidate.caps.clone(),
-            },
-            trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
-            trusted_nvidia_gb10_device_jwks: self
-                .hardware_quote_trust
-                .nvidia_gb10_device_jwks
-                .clone(),
-            trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
-            trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
-            hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
-        });
+        let attestation = route
+            .map(|candidate| self.session_attestation_for_route(model, candidate))
+            .transpose()?;
         let max_spend_au = estimate_audio_transcription_max_spend_au(price, request);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
         let spend_reservation =
@@ -24071,6 +26151,7 @@ impl GatewayState {
             hedge: GatewayHedgeInvocation::default(),
             failover,
             access_token: options.access_token.clone(),
+            verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
             receipt_recorder: GatewayReceiptRecorder {
@@ -24110,29 +26191,9 @@ impl GatewayState {
         let price = route_price_ref_au(model, route);
         let price_ver = price.ver;
         let locked_rate_map = session_locked_rate_map(price);
-        let attestation = route.map(|candidate| GatewaySessionAttestation {
-            contract: EnclaveContractRecord {
-                enclave_id: candidate.enclave_id.clone(),
-                admin_pubkey: candidate.admin_pubkey.clone(),
-                model_id: model.id.clone(),
-                model_class: model.mayhem.model_class.clone(),
-                artifact_root: candidate.artifact_root.clone(),
-                artifact_sidecar_roots: candidate.artifact_sidecar_roots.clone(),
-                manifest_hash: candidate.manifest_hash.clone(),
-                binary_hash: candidate.binary_hash.clone(),
-                launch_measurements: candidate.launch_measurements.clone(),
-                att_tier: candidate.att_tier,
-                caps: candidate.caps.clone(),
-            },
-            trusted_apple_app_attest_jwks: self.hardware_quote_trust.apple_app_attest_jwks.clone(),
-            trusted_nvidia_gb10_device_jwks: self
-                .hardware_quote_trust
-                .nvidia_gb10_device_jwks
-                .clone(),
-            trusted_nvidia_nras_jwks: self.hardware_quote_trust.nvidia_nras_jwks.clone(),
-            trusted_nvidia_offline_jwks: self.hardware_quote_trust.nvidia_offline_jwks.clone(),
-            hardware_quote_verifier_command: self.hardware_quote_trust.verifier_command.clone(),
-        });
+        let attestation = route
+            .map(|candidate| self.session_attestation_for_route(model, candidate))
+            .transpose()?;
         let max_spend_au = estimate_artifact_generation_max_spend_au(price, request);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
         let spend_reservation =
@@ -24185,6 +26246,7 @@ impl GatewayState {
             hedge: GatewayHedgeInvocation::default(),
             failover,
             access_token: options.access_token.clone(),
+            verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
             receipt_recorder: GatewayReceiptRecorder {
@@ -25528,11 +27590,7 @@ fn failed_canary_runtime_probe(
         .provider_pubkey
         .clone()
         .unwrap_or_else(|| "local-provider".to_owned());
-    let binary_hash = invocation
-        .attestation
-        .as_ref()
-        .map(|attestation| attestation.contract.binary_hash.clone())
-        .unwrap_or_default();
+    let binary_hash = invocation.runtime_binary_hash_evidence();
     let evidence = json!({
         "schema_version": 1,
         "kind": "mayhem-automatic-canary-probe-runtime-failure",
@@ -25613,11 +27671,7 @@ fn failed_context_needle_runtime_probe(
         .provider_pubkey
         .clone()
         .unwrap_or_else(|| "local-provider".to_owned());
-    let binary_hash = invocation
-        .attestation
-        .as_ref()
-        .map(|attestation| attestation.contract.binary_hash.clone())
-        .unwrap_or_default();
+    let binary_hash = invocation.runtime_binary_hash_evidence();
     let expected_fingerprint = stable_value_hash(&json!({
         "domain": "mayhem-context-needle-expected-v1",
         "answer": spec.answer.clone(),
@@ -29033,14 +31087,17 @@ mod tests {
             max_wait_ms: 40,
             ..GatewayRequestOptions::default()
         };
-        let required_modalities = vec!["text".to_owned()];
+        let requirements = RequestRequirements {
+            required_modalities: vec!["text".to_owned()],
+            ..RequestRequirements::default()
+        };
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls_for_refresh = calls.clone();
         let outcome = wait_for_eligible_routes_with_poll(
             &state,
             &model,
             &options,
-            &required_modalities,
+            &requirements,
             Vec::new(),
             || {
                 if calls_for_refresh.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
@@ -29059,27 +31116,39 @@ mod tests {
             max_wait_ms: 0,
             ..GatewayRequestOptions::default()
         };
+        let instant_refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refresh_count = instant_refreshes.clone();
         let outcome = wait_for_eligible_routes_with_poll(
             &state,
             &model,
             &instant,
-            &required_modalities,
+            &requirements,
             Vec::new(),
-            || vec![&model.mayhem.route_candidates[0]],
+            || {
+                refresh_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                vec![&model.mayhem.route_candidates[0]]
+            },
             Duration::from_millis(1),
         )
         .await;
         assert!(!outcome.waited);
         assert!(outcome.routes.is_empty());
+        assert_eq!(
+            instant_refreshes.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
 
-        let media_modalities = vec!["text".to_owned(), "image".to_owned()];
+        let media_requirements = RequestRequirements {
+            required_modalities: vec!["text".to_owned(), "image".to_owned()],
+            ..RequestRequirements::default()
+        };
         let incompatible_refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let refresh_count = incompatible_refreshes.clone();
         let outcome = wait_for_eligible_routes_with_poll(
             &state,
             &model,
             &options,
-            &media_modalities,
+            &media_requirements,
             Vec::new(),
             || {
                 refresh_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -29093,13 +31162,118 @@ mod tests {
             incompatible_refreshes.load(std::sync::atomic::Ordering::SeqCst),
             0
         );
-        let error = no_eligible_route_error(&state, &model, &options, &media_modalities);
+        let error = no_eligible_route_error(
+            &state,
+            &model,
+            &options,
+            &media_requirements.required_modalities,
+        );
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.message.contains("image"));
 
         let error = route_wait_expired_error(&options);
         assert!(error.message.contains("no eligible provider"));
         assert!(!error.message.contains("capacity"));
+    }
+
+    #[tokio::test]
+    async fn sole_known_route_cooloff_outlives_generic_wait_then_retries() {
+        let model = test_routed_model(1);
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(SuccessBackend {
+                providers: providers.clone(),
+            }),
+        );
+        let route = &model.mayhem.route_candidates[0];
+        let now_millis = now_millis_u64();
+        state
+            .provider_cooloffs
+            .lock_recover("provider cooloff map")
+            .insert(route_key(route), now_millis + 30);
+        let options = GatewayRequestOptions {
+            max_wait_ms: 10,
+            ..GatewayRequestOptions::default()
+        };
+        let started = Instant::now();
+
+        let run = run_chat_with_route_retry(&state, &model, &test_chat_request(&model.id), options)
+            .await
+            .expect("the sole route should be retried after its known cooldown");
+
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert_eq!(run.result.output.content.as_deref(), Some("ok"));
+        assert_eq!(providers.lock().expect("providers lock").len(), 1);
+        assert!(!state.route_provider_in_cooloff(route, now_millis_u64()));
+    }
+
+    #[tokio::test]
+    async fn all_known_route_cooloffs_wait_for_the_earliest_recovery() {
+        let model = test_routed_model(2);
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(SuccessBackend {
+                providers: providers.clone(),
+            }),
+        );
+        let now_millis = now_millis_u64();
+        {
+            let mut cooloffs = state.provider_cooloffs.lock_recover("provider cooloff map");
+            cooloffs.insert(
+                route_key(&model.mayhem.route_candidates[0]),
+                now_millis + 30,
+            );
+            cooloffs.insert(
+                route_key(&model.mayhem.route_candidates[1]),
+                now_millis + 500,
+            );
+        }
+        let options = GatewayRequestOptions {
+            max_wait_ms: 10,
+            ..GatewayRequestOptions::default()
+        };
+        let started = Instant::now();
+
+        let run = run_chat_with_route_retry(&state, &model, &test_chat_request(&model.id), options)
+            .await
+            .expect("the earliest recovering route should be retried");
+
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(started.elapsed() < Duration::from_millis(300));
+        assert_eq!(run.result.output.content.as_deref(), Some("ok"));
+        assert_eq!(providers.lock().expect("providers lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn one_available_route_never_waits_for_another_routes_cooloff() {
+        let model = test_routed_model(2);
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(SuccessBackend {
+                providers: providers.clone(),
+            }),
+        );
+        let now_millis = now_millis_u64();
+        state
+            .provider_cooloffs
+            .lock_recover("provider cooloff map")
+            .insert(
+                route_key(&model.mayhem.route_candidates[0]),
+                now_millis + 200,
+            );
+        let options = GatewayRequestOptions {
+            max_wait_ms: 10,
+            ..GatewayRequestOptions::default()
+        };
+        let started = Instant::now();
+
+        let run = run_chat_with_route_retry(&state, &model, &test_chat_request(&model.id), options)
+            .await
+            .expect("the route outside cooloff should run immediately");
+
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(run.result.output.content.as_deref(), Some("ok"));
+        assert_eq!(providers.lock().expect("providers lock").len(), 1);
     }
 
     #[test]
@@ -29211,6 +31385,48 @@ mod tests {
         let mut wrong_sig = frame;
         wrong_sig["sig"] = json!("ee".repeat(64));
         assert_accept_err(&wrong_sig, &invocation, "signature");
+    }
+
+    #[test]
+    fn direct_session_retains_runtime_binary_hash_as_evidence_without_approval() {
+        let invocation = test_invocation();
+        let runtime_binary_hash = "ef".repeat(32);
+        let mut frame = test_accept_frame(&invocation);
+        frame["att_report"] =
+            test_attestation_report_with_mutation(&invocation, test_att_nonce(), |report| {
+                report.binary_hash = runtime_binary_hash.clone()
+            });
+        sign_accept_frame(&mut frame);
+
+        let accepted = validate_direct_session_accept(
+            &frame,
+            &invocation,
+            test_open_head().as_str(),
+            test_att_nonce().as_str(),
+            test_now_ts(),
+        )
+        .expect("source-built runtime remains admissible");
+
+        assert_eq!(
+            accepted
+                .verified_attestation
+                .expect("verified runtime evidence")
+                .runtime_binary_hash,
+            runtime_binary_hash
+        );
+        assert_eq!(
+            invocation.runtime_binary_hash_evidence(),
+            runtime_binary_hash
+        );
+        assert_ne!(
+            invocation.runtime_binary_hash_evidence(),
+            invocation
+                .attestation
+                .as_ref()
+                .expect("catalog attestation")
+                .contract
+                .binary_hash
+        );
     }
 
     #[test]
@@ -29848,15 +32064,13 @@ mod tests {
             },
             attestation: Some(GatewaySessionAttestation {
                 contract,
-                trusted_apple_app_attest_jwks: None,
-                trusted_nvidia_gb10_device_jwks: None,
-                trusted_nvidia_nras_jwks: None,
-                trusted_nvidia_offline_jwks: None,
+                policy: None,
                 hardware_quote_verifier_command: None,
             }),
             hedge: GatewayHedgeInvocation::default(),
             failover: GatewayFailoverInvocation::default(),
             access_token: None,
+            verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: None,
             job: None,
             receipt_recorder: GatewayReceiptRecorder {
@@ -30923,6 +33137,33 @@ mod tests {
         providers: Arc<Mutex<Vec<String>>>,
     }
 
+    #[derive(Debug)]
+    struct BuyerLocalLimiterFailureBackend;
+
+    impl GatewaySessionBackend for BuyerLocalLimiterFailureBackend {
+        fn name(&self) -> &str {
+            "test-buyer-local-limiter-failure"
+        }
+
+        fn run_chat<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            _request: &'a ChatCompletionRequest,
+            invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            Box::pin(async move {
+                Err(direct_session_transport_closed_error(
+                    &["s.delta", "s.receipt"],
+                    &invocation.session_id,
+                    &format!(
+                        "Session {} exceeded its receive rate.",
+                        invocation.session_id
+                    ),
+                ))
+            })
+        }
+    }
+
     impl GatewaySessionBackend for AcceptThenCloseThenSuccessBackend {
         fn name(&self) -> &str {
             "test-accept-close-then-success"
@@ -31408,6 +33649,10 @@ mod tests {
             &anchored_model,
             &anchored_model.mayhem.route_candidates[0],
             3,
+            None,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
         );
         assert!((snapshot.reputation - 0.31).abs() < f64::EPSILON);
     }
@@ -31940,7 +34185,7 @@ mod tests {
             derivation: None,
             history: Vec::new(),
         });
-        model.mayhem.route_candidates[1].att_tier = 3;
+        model.mayhem.route_candidates[1].att_tier = 4;
         model.mayhem.route_candidates[1].quant = "fp16".to_owned();
         model.mayhem.route_candidates[1].price_ref_au = Some(PriceRefAu {
             denom: "au_usd".to_owned(),
@@ -31967,10 +34212,18 @@ mod tests {
         );
         assert_eq!(selected.len(), 1);
         let route = selected[0];
-        assert_eq!(route.att_tier, 3);
+        assert_eq!(route.att_tier, 4);
         assert_eq!(route.quant, "fp16");
 
-        let snapshot = contract_snapshot_for_route(&model, route, state.receipt_config.rules_ver);
+        let snapshot = contract_snapshot_for_route(
+            &model,
+            route,
+            state.receipt_config.rules_ver,
+            None,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+        );
         assert_eq!(snapshot.price_ver, 9);
         let expected_rate_map = normalize_rate_map(text_generation_rate_map(90, 180));
         assert_eq!(
@@ -31994,7 +34247,7 @@ mod tests {
                     ..GatewayRequestOptions::default()
                 },
             )
-            .expect("tier-3 route price clears max bid");
+            .expect("higher-tier route price clears max bid");
         assert_eq!(invocation.enclave_id, route.enclave_id);
         assert_eq!(invocation.price_ver, 9);
         assert_eq!(
@@ -32013,7 +34266,7 @@ mod tests {
         let mut heartbeat = heartbeat_for_route(&model, route, now_millis_u64());
         heartbeat.transport_peer = Some(transport_peer.clone());
         heartbeat.sig = "aa".repeat(64);
-        let state = test_gateway_state_from_models(vec![model.clone()])
+        let state = GatewayState::from_models(vec![model.clone()])
             .with_receipt_balance_au(10_000)
             .with_provider_heartbeats(vec![heartbeat]);
 
@@ -32071,6 +34324,163 @@ mod tests {
             0xfeed,
         );
         assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn selector_truth_matrix_keeps_reporting_and_dispatch_on_one_eligibility_path() {
+        #[derive(Clone, Copy, Debug)]
+        enum Gate {
+            Eligible,
+            Rail,
+            Tier,
+            Quant,
+            Capability,
+            Context,
+            Accepting,
+            Saturation,
+            Capacity,
+            Freshness,
+            CircuitBreaker,
+            Cooloff,
+        }
+
+        for (gate, expected) in [
+            (Gate::Eligible, true),
+            (Gate::Rail, false),
+            (Gate::Tier, false),
+            (Gate::Quant, false),
+            (Gate::Capability, false),
+            (Gate::Context, false),
+            (Gate::Accepting, false),
+            (Gate::Saturation, false),
+            (Gate::Capacity, false),
+            (Gate::Freshness, false),
+            (Gate::CircuitBreaker, false),
+            (Gate::Cooloff, false),
+        ] {
+            let mut model = test_routed_model(1);
+            if matches!(gate, Gate::Rail) {
+                model.mayhem.route_candidates[0].accepted_rails = vec!["tap".to_owned()];
+            }
+            model.mayhem.route_candidates[0].quant = "int4".to_owned();
+            let now = now_millis_u64();
+            let mut heartbeat = heartbeat_for_route(&model, &model.mayhem.route_candidates[0], now);
+            heartbeat.sig = "aa".repeat(64);
+            match gate {
+                Gate::Capability => heartbeat.caps.served_modalities.clear(),
+                Gate::Context => heartbeat.caps.ctx = 1_024,
+                Gate::Accepting => heartbeat.accepting_new = false,
+                Gate::Saturation => {
+                    heartbeat.sat = crate::provider_table::DEFAULT_SATURATION_CUTOFF;
+                }
+                Gate::Capacity => heartbeat.q.free_slots = 0,
+                Gate::Freshness => {
+                    heartbeat.ts = now
+                        .saturating_sub(DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS)
+                        .saturating_sub(1);
+                }
+                _ => {}
+            }
+            let state = GatewayState::from_models(vec![model.clone()])
+                .with_provider_heartbeats(vec![heartbeat]);
+            let route = &model.mayhem.route_candidates[0];
+            if matches!(gate, Gate::CircuitBreaker) {
+                let key = route_key(route);
+                let mut table = state.provider_table.lock_recover("provider table");
+                for offset in
+                    0..crate::provider_table::DEFAULT_ERROR_CIRCUIT_BREAKER_CONSECUTIVE_FAILURES
+                {
+                    table.record_observation_at(
+                        &key,
+                        ProviderObservationSample {
+                            ttft_ms: 5_000,
+                            tok_s: None,
+                            error: true,
+                        },
+                        now + u64::from(offset),
+                    );
+                }
+            }
+            if matches!(gate, Gate::Cooloff) {
+                state.cool_route_provider(route, now);
+            }
+
+            let min_att_tier = matches!(gate, Gate::Tier).then_some(3);
+            let quant = matches!(gate, Gate::Quant).then_some("fp16");
+            let request = test_chat_request(&model.id);
+            let requirements =
+                request_requirements_for_chat(&state, &model, &request, now, None, None, None);
+            let entries = state
+                .provider_table
+                .lock_recover("provider table")
+                .entries(now);
+            let reporting_keys = selector_eligible_route_keys(
+                &state,
+                &model,
+                &entries,
+                min_att_tier,
+                quant,
+                &requirements,
+                now,
+            );
+            let dispatched_keys = ordered_route_candidates_for_request_with_max_price_seed(
+                &state,
+                &model,
+                &request,
+                min_att_tier,
+                None,
+                None,
+                quant,
+                None,
+                0xfeed,
+            )
+            .into_iter()
+            .map(route_key)
+            .collect::<BTreeSet<_>>();
+
+            assert_eq!(
+                reporting_keys, dispatched_keys,
+                "{gate:?} reporting must equal dispatch selector truth"
+            );
+            let live_route_keys = gateway_model_live_route_keys(&state, &model, &entries, now);
+            if min_att_tier.is_none() && quant.is_none() {
+                assert_eq!(
+                    live_route_keys, dispatched_keys,
+                    "{gate:?} model live counts must equal dispatch selector truth"
+                );
+            }
+            let market = GatewayMarketInfo {
+                enclave_id: route.enclave_id.clone(),
+                att_tier: min_att_tier.unwrap_or(route.att_tier),
+                quant: quant.unwrap_or(&route.quant).to_owned(),
+                ctx_bracket: Some("le8k".to_owned()),
+                room_ids: vec![route.room_id.clone()],
+                providers_online: 1,
+                route_count: 1,
+                availability: "routable".to_owned(),
+                price_ref_au: model.mayhem.price_ref_au.clone(),
+            };
+            let market_summary = gateway_market_route_summary(
+                &model,
+                &market,
+                &entries,
+                &live_route_keys,
+                &state.receipt_config.rail,
+                &state.ctx_bracket_schedule,
+                now / 1_000,
+            );
+            assert_eq!(
+                usize::try_from(market_summary.route_count).unwrap(),
+                dispatched_keys.len(),
+                "{gate:?} market reporting must equal dispatch selector truth"
+            );
+            assert_eq!(
+                usize::try_from(market_summary.providers_online).unwrap(),
+                dispatched_keys.len(),
+                "{gate:?} market provider counts must equal dispatch selector truth"
+            );
+            assert_eq!(!reporting_keys.is_empty(), expected, "{gate:?} eligibility");
+        }
     }
 
     #[test]
@@ -32139,7 +34549,7 @@ mod tests {
         let mut large = heartbeat_for_route(&model, &model.mayhem.route_candidates[1], now);
         large.att.epoch = 1;
         large.sig = "bb".repeat(64);
-        let state = test_gateway_state_from_models(vec![model.clone()])
+        let state = GatewayState::from_models(vec![model.clone()])
             .with_provider_heartbeats(vec![small, large]);
         let request = test_chat_request(&model.id);
         let options = GatewayRequestOptions {
@@ -32444,6 +34854,49 @@ mod tests {
         assert_eq!(failed_entry.observed.samples, 1);
         assert_eq!(failed_entry.observed.consecutive_failures, 1);
         assert!(state.receipts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn buyer_local_limiter_failure_spends_zero_and_does_not_penalize_provider() {
+        let model = test_routed_model(1);
+        let initial_balance = MoneyAu::MAX;
+        let state = test_gateway_state_from_models(vec![model.clone()])
+            .with_receipt_balance_au(initial_balance)
+            .with_session_backend(Arc::new(BuyerLocalLimiterFailureBackend));
+        let route = &model.mayhem.route_candidates[0];
+        let options = GatewayRequestOptions {
+            max_wait_ms: 0,
+            ..GatewayRequestOptions::default()
+        };
+
+        let error =
+            match run_chat_with_route_retry(&state, &model, &test_chat_request(&model.id), options)
+                .await
+            {
+                Ok(_) => panic!("the buyer-local receive limiter should fail the attempt"),
+                Err(error) => error,
+            };
+
+        assert!(error.message.contains("failed before spend"));
+        assert_eq!(state.ledger_balance_au(), initial_balance);
+        assert!(state.receipts().is_empty());
+        assert!(state
+            .wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .reservations
+            .is_empty());
+        assert!(!state.route_provider_in_cooloff(route, now_millis_u64()));
+        let entry = state
+            .provider_table
+            .lock_recover("provider table")
+            .entries(now_millis_u64())
+            .into_iter()
+            .find(|entry| entry.key == route_key(route))
+            .expect("provider table entry");
+        assert_eq!(entry.observed.samples, 0);
+        assert_eq!(entry.observed.consecutive_failures, 0);
+        assert_eq!(entry.observed.ewma_error_rate, 0.0);
+        assert!(state.reputation_events().is_empty());
     }
 
     #[test]
@@ -33140,6 +35593,30 @@ mod tests {
     }
 
     #[test]
+    fn artifact_generation_prompt_does_not_require_chat_context_capacity() {
+        let prompt = "Write a vivid orchestral passage praising OpenMayhem. ".repeat(64);
+        let request = artifact_generation_request(
+            "mayhem/music-test",
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            json!({
+                "model": "mayhem/music-test",
+                "prompt": prompt,
+                "duration_seconds": 10,
+                "response_format": "wav"
+            }),
+        )
+        .unwrap();
+        let model = test_model();
+        let state = GatewayState::from_models(vec![model.clone()]);
+
+        let requirements =
+            request_requirements_for_artifact_generation(&state, &model, &request, 1, None, None);
+
+        assert!(requirements.input_tokens > 1);
+        assert_eq!(requirements.min_ctx, 1);
+    }
+
+    #[test]
     fn music_inline_audio_drives_gateway_route_load_and_auto_duration() {
         let source = test_wav_b64_with_samples(16_000);
         let reference = test_wav_b64_with_samples(8_000);
@@ -33241,6 +35718,64 @@ mod tests {
     }
 
     #[test]
+    fn buyer_local_direct_session_limits_are_modality_neutral_and_unpenalized() {
+        let receive_rate = direct_session_transport_closed_error(
+            &["s.delta"],
+            "session-buyer",
+            "Session session-buyer exceeded its receive rate.",
+        );
+        let ingress_limit = GatewaySessionError::from(BridgeError::ResourceLimit(
+            "async event queue exceeds the buyer ingress limit".to_owned(),
+        ));
+        let provider_fault = direct_session_transport_closed_error(
+            &["s.delta"],
+            "session-provider",
+            "remote provider closed",
+        );
+
+        assert_eq!(
+            receive_rate.failure_class,
+            GatewaySessionFailureClass::BuyerLocal
+        );
+        assert!(receive_rate.retryable);
+        assert_eq!(
+            ingress_limit.failure_class,
+            GatewaySessionFailureClass::BuyerLocal
+        );
+        assert_eq!(
+            provider_fault.failure_class,
+            GatewaySessionFailureClass::ProviderFault
+        );
+
+        for modality in ["text", "image", "audio", "video", "embedding"] {
+            let mut model = test_routed_model(1);
+            model.mayhem.route_candidates[0].served_modalities = vec![modality.to_owned()];
+            let state = test_gateway_state_from_models(vec![model.clone()]);
+            let route = &model.mayhem.route_candidates[0];
+
+            for error in [&receive_rate, &ingress_limit] {
+                record_route_attempt_error(&state, Some(route), Duration::from_millis(5), error);
+            }
+
+            assert!(
+                !state.route_provider_in_cooloff(route, now_millis_u64()),
+                "{modality} route was cooled for a buyer-local limit"
+            );
+            let entry = state
+                .provider_table
+                .lock_recover("provider table")
+                .entries(now_millis_u64())
+                .into_iter()
+                .find(|entry| entry.key == route_key(route))
+                .expect("route remains in provider table");
+            assert_eq!(entry.observed.samples, 0, "{modality}");
+            assert_eq!(entry.observed.consecutive_failures, 0, "{modality}");
+            assert_eq!(entry.observed.ewma_error_rate, 0.0, "{modality}");
+            assert!(state.reputation_events().is_empty(), "{modality}");
+        }
+    }
+
+    #[test]
     fn provider_reject_session_error_marks_self_protection_codes_clean() {
         for code in [
             "CAPACITY",
@@ -33316,10 +35851,10 @@ mod tests {
             Some("CAPACITY"),
         );
 
-        record_retryable_route_attempt(&state, Some(route), Duration::from_millis(5), &capacity);
-        record_retryable_route_attempt(&state, Some(route), Duration::from_millis(5), &capacity);
+        record_route_attempt_error(&state, Some(route), Duration::from_millis(5), &capacity);
+        record_route_attempt_error(&state, Some(route), Duration::from_millis(5), &capacity);
         assert!(state.reputation_events().is_empty());
-        record_retryable_route_attempt(&state, Some(route), Duration::from_millis(5), &capacity);
+        record_route_attempt_error(&state, Some(route), Duration::from_millis(5), &capacity);
         assert!(state.reputation_events().is_empty());
 
         let received_base = now_millis_u64().saturating_add(10);
@@ -33331,12 +35866,7 @@ mod tests {
                     heartbeat_for_route(&model, route, received_base + offset),
                     received_base + offset,
                 );
-            record_retryable_route_attempt(
-                &state,
-                Some(route),
-                Duration::from_millis(5),
-                &capacity,
-            );
+            record_route_attempt_error(&state, Some(route), Duration::from_millis(5), &capacity);
         }
 
         let events = state.reputation_events();
@@ -33361,7 +35891,7 @@ mod tests {
             .lock_recover("provider table")
             .upsert_heartbeat(saturated, now_millis_u64());
         for _ in 0..3 {
-            record_retryable_route_attempt(
+            record_route_attempt_error(
                 &honest_state,
                 Some(route),
                 Duration::from_millis(5),

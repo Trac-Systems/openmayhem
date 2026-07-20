@@ -4,6 +4,7 @@ mod catalog;
 mod endpoint_calibration;
 mod gemma4;
 mod python_runtime;
+mod release_bundle;
 
 #[cfg(test)]
 use endpoint_calibration::run_endpoint_calibration_matrix;
@@ -38,7 +39,6 @@ use anyhow::{bail, ensure, Context, Result};
 use base64::Engine as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use flate2::read::GzDecoder;
 use hf_hub::progress::{
     DownloadEvent as HfDownloadEvent, ProgressEvent as HfProgressEvent,
     ProgressHandler as HfProgressHandler,
@@ -47,6 +47,7 @@ use hf_hub::repository::RepoTreeEntry;
 use hf_hub::{HFClient, HFClientSync};
 use image::ImageReader;
 use indicatif::{ProgressBar, ProgressStyle};
+use mayhem_attestation::{AttestationPolicyChain, EvidenceBinding, ValidatedAttestationPolicy};
 use mayhem_bridge::{
     BridgeError, PeerRpcClient, ScBridgeClient, ScBridgeConfig, DEFAULT_RPC_URL,
     DEFAULT_SC_BRIDGE_URL,
@@ -75,13 +76,13 @@ use mayhem_gateway::{
     normalize_canary_transcript, normalize_rate_map,
     openai::{
         gateway_bind_is_loopback, gateway_token_hash, serve as serve_gateway,
-        validate_gateway_bind_access, GatewayAccessControl, GatewayCanaryProbePolicy,
-        GatewayCanaryRegistry, GatewayLocalRunBadge, GatewayMarketInfo, GatewayModel,
-        GatewayRouteCandidate, GatewayState, GatewayTokenBudgetPeriod, GatewayTokenRecord,
-        GatewayTokenStore, GatewayUpdateModelNotice, MayhemModelInfo, ModelCaps, PriceRefAu,
-        ProviderKybInfo, SamplingProfile, ScBridgeGatewaySessionBackend,
-        ScBridgeGatewaySessionConfig, ShapeAdapterInfo, DEFAULT_ROUTE_MAX_WAIT_MS,
-        MAX_PREFERRED_PROVIDERS_PER_MODEL, MAX_ROUTE_MAX_WAIT_MS,
+        validate_gateway_bind_access, GatewayAccessControl, GatewayAttestationAuthority,
+        GatewayAttestationCollateral, GatewayCanaryProbePolicy, GatewayCanaryRegistry,
+        GatewayLocalRunBadge, GatewayMarketInfo, GatewayModel, GatewayRouteCandidate, GatewayState,
+        GatewayTokenBudgetPeriod, GatewayTokenRecord, GatewayTokenStore, GatewayUpdateModelNotice,
+        MayhemModelInfo, ModelCaps, PriceRefAu, ProviderKybInfo, SamplingProfile,
+        ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig, ShapeAdapterInfo,
+        DEFAULT_ROUTE_MAX_WAIT_MS, MAX_PREFERRED_PROVIDERS_PER_MODEL, MAX_ROUTE_MAX_WAIT_MS,
     },
     rate_gate_basis_au, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_au,
     HardwareQuoteVerifierCommand, HeartbeatModalityCapacity, HeartbeatReceiver,
@@ -102,17 +103,21 @@ use mayhem_proto::{
     metered_output_units, payload_chunk_at, payload_chunk_manifest, reassemble_json_payload,
     receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
     spend_voucher_signing_bytes, stable_json_bytes, validate_ctx_bracket_schedule,
-    validated_audio_metadata, validated_wav_audio_metadata, AttestationRuntimeConfig,
-    CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind,
-    MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
-    ReceiptUsage, SpendVoucher, TranscriptionResult, TranscriptionResultLimits,
+    validated_audio_metadata, validated_wav_audio_metadata, AdminAttestationPolicy,
+    AttestationRuntimeConfig, AttestationTrustDataRef, CatalogEnclaveIdentity, CheckpointPolicy,
+    CtxBracketSchedule, HardwareQuote, HardwareQuoteKind, HardwareQuoteRoutePolicyBinding, MoneyAu,
+    PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
+    ReceiptUsage, SpendVoucher, TpmActivateCredentialChallengeFrame,
+    TpmActivateCredentialResponseFrame, TranscriptionResult, TranscriptionResultLimits,
     TranscriptionTimestamp, ValidatedAudioFormat, VisibleToolCall, CONTRACT_VERSION,
     DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
     DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
-    SESSION_RECEIPT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME,
-    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP,
-    USAGE_VIDEO_SECOND, VISIBLE_OUTPUT_BYTES_PER_UNIT,
+    SESSION_RECEIPT_SCHEMA_VERSION, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
+    TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION, TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE,
+    USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
+    USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
+    VISIBLE_OUTPUT_BYTES_PER_UNIT,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -269,6 +274,12 @@ const DEFAULT_PROVIDER_HEARTBEAT_RECONNECT_MAX_MILLIS: u64 = 5_000;
 const DEFAULT_RECEIPT_CHECKPOINT_TOKENS: u64 = 8192;
 const DEFAULT_RECEIPT_CHECKPOINT_MS: u64 = 30_000;
 const DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS: u64 = 120;
+const MAX_HARDWARE_QUOTE_COMMAND_STDOUT_BYTES: usize = 512 * 1024;
+const MAX_HARDWARE_QUOTE_COMMAND_STDERR_BYTES: usize = 64 * 1024;
+const MAX_TPM_ACTIVATION_COMMAND_INPUT_BYTES: usize = 64 * 1024;
+const MAX_TPM_ACTIVATION_COMMAND_OUTPUT_BYTES: usize = 4 * 1024;
+const DEFAULT_TPM_ACTIVATIONS_PER_MINUTE: usize = 60;
+const DEFAULT_TPM_ACTIVATIONS_PER_PEER_PER_MINUTE: usize = 12;
 const DEFAULT_PROVIDER_SESSION_REQUEST_STALL_TIMEOUT_MILLIS: u64 = 300_000;
 const DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN: usize = 256;
 const DEFAULT_PROVIDER_SESSION_REQUEST_JSON_OVERHEAD_BYTES: usize = 1024 * 1024;
@@ -298,9 +309,16 @@ const MAYHEMD_STATE_FILE: &str = "mayhemd-state.json";
 const MAYHEMD_UP_CONFIG_FILE: &str = "mayhemd-up.toml";
 const MAYHEMD_CONTROL_TOKEN_FILE: &str = "mayhemd-control-token";
 const SC_BRIDGE_TOKEN_FILE: &str = "sc-bridge-token";
+const PAYGATE_INTERNAL_AUTH_SECRET_FILE: &str = "paygate/internal-auth.secret";
 const MAYHEMD_CONTROL_TOKEN_ENV: &str = "MAYHEMD_CONTROL_TOKEN";
 const MAYHEMD_RESTART_STABLE_AFTER_MILLIS: u64 = 60_000;
 const MAYHEMD_CRASH_LOOP_THRESHOLD: u64 = 5;
+const PROVIDER_LEAVE_OUTBOX_SCHEMA_VERSION: u64 = 1;
+const PROVIDER_LEAVE_OUTBOX_MAX_ENTRIES: usize = 512;
+const PROVIDER_LEAVE_OUTBOX_MAX_ENTRY_BYTES: u64 = 64 * 1024;
+const PROVIDER_LEAVE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(10);
+const PROVIDER_LEAVE_CONFIRM_TIMEOUT: Duration = Duration::from_secs(30);
+const PROVIDER_LEAVE_REPLAY_BUDGET: Duration = Duration::from_secs(30);
 const DEFAULT_RELEASE_FEED_URL: &str =
     "https://api.github.com/repos/Trac-Systems/openmayhem/releases/latest";
 const RELEASE_MANIFEST_DOMAIN: &[u8] = b"mayhem.release-manifest.v1\n";
@@ -449,7 +467,7 @@ enum Commands {
     },
     /// Run a gateway, peer, opencode, and receipt smoke test.
     Test(TestArgs),
-    /// Check for a signed release, verify it, and stage the Mayhem binary.
+    /// Check for, verify, stage, and apply a complete signed Mayhem release.
     Update(UpdateArgs),
     /// Sign a release manifest with the operator release key.
     #[command(hide = true)]
@@ -466,6 +484,11 @@ enum ProviderCommands {
     Rails {
         #[command(subcommand)]
         command: ProviderRailsCommands,
+    },
+    /// Inspect or set this provider's TAP/TNK payout destination.
+    Payout {
+        #[command(subcommand)]
+        command: ProviderPayoutCommands,
     },
     /// Onboard and inspect this provider's Stripe Connect payout account.
     Stripe {
@@ -541,6 +564,8 @@ enum ProviderServeCommands {
     Add(ProviderServeAddArgs),
     /// Remove one enclave worker from the running local supervisor.
     Remove(ProviderServeRemoveArgs),
+    /// Replace one supervised worker, leaving durable registration only when changing enclaves.
+    Switch(ProviderServeSwitchArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -552,10 +577,24 @@ enum ProviderRailsCommands {
 }
 
 #[derive(Debug, Subcommand)]
+enum ProviderPayoutCommands {
+    /// Read provider-selected TAP/TNK payout destinations from contract state.
+    Get(ProviderPayoutGetArgs),
+    /// Sign and submit the first TAP/TNK payout destination selection.
+    Set(ProviderPayoutSetArgs),
+    /// Rotate an existing TAP/TNK payout destination with revision CAS.
+    Rotate(ProviderPayoutSetArgs),
+}
+
+#[derive(Debug, Subcommand)]
 enum ProviderStripeCommands {
     /// Create or refresh the hosted Stripe Connect onboarding link.
     Onboard(ProviderStripeOnboardArgs),
-    /// Refresh Stripe account readiness and admin payout binding status.
+    /// Replace the current Stripe Connect account through hosted onboarding.
+    Rotate(ProviderStripeOnboardArgs),
+    /// Relink an existing ready Connect account with source and target provider consent.
+    Relink(ProviderStripeRelinkArgs),
+    /// Refresh Stripe account readiness and verified payout binding status.
     Status(ProviderStripeStatusArgs),
 }
 
@@ -603,6 +642,8 @@ enum AdminCommands {
     SetParams(AdminSetParamsArgs),
     /// Publish canonical discovery for fiat, TAP, and TNK payment rails.
     SetPayments(AdminSetPaymentsArgs),
+    /// Publish the immutable payout context for the current payment configuration.
+    PublishPayoutContext(AdminPublishPayoutContextArgs),
     /// Set the admin model reference price used to bound enclave prices.
     SetModelRef(AdminSetModelRefArgs),
     /// Publish the latest signed catalog release anchor for network discovery.
@@ -636,8 +677,6 @@ enum AdminCommands {
         #[command(subcommand)]
         command: AdminDisputeCommands,
     },
-    /// Set an admin-approved provider payout target.
-    SetProviderPayout(AdminSetProviderPayoutArgs),
     /// Verify a provider business identity for Tier 4 accountability.
     SetProviderKyb(AdminSetProviderKybArgs),
     /// Revoke a provider business identity verification.
@@ -687,8 +726,6 @@ enum AdminCommands {
     FiatDeposit(AdminFiatDepositArgs),
     /// Record a fiat chargeback clawback and account freeze.
     FiatChargeback(AdminFiatChargebackArgs),
-    /// Retired: use rail-specific epoch settlement and claim flows.
-    PayoutConfirm(AdminPayoutConfirmArgs),
     /// Anchor recomputed epoch roots permissionlessly.
     EpochCommit(AdminEpochCommitArgs),
     /// Admin-seal one elapsed empty/unsubmittable epoch so later epochs can settle.
@@ -923,6 +960,8 @@ enum CatalogCommands {
     Verify(CatalogVerifyArgs),
     /// Sign an admin-reviewed catalog draft with an operator-held Ed25519 seed file.
     Sign(CatalogSignArgs),
+    /// Apply a validated attestation policy, bindings, and six-target verifier release matrix.
+    ApplyAttestationAuthority(CatalogApplyAttestationAuthorityArgs),
     /// Compute launch catalog metadata for a local admin artifact without loading model weights.
     ArtifactMetadata(CatalogArtifactMetadataArgs),
     /// Apply bound artifact metadata reports into a catalog draft.
@@ -1077,6 +1116,10 @@ struct DownArgs {
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
 
+    /// File containing the encrypted provider keypair.json password.
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = read_secret_file_arg)]
+    wallet_password: Option<String>,
+
     /// Maximum seconds to wait for the supervisor to stop.
     #[arg(long, default_value_t = 30)]
     timeout_seconds: u64,
@@ -1084,6 +1127,10 @@ struct DownArgs {
     /// Send a hard kill if graceful shutdown does not complete before the timeout.
     #[arg(long)]
     force: bool,
+
+    /// Preserve provider registrations for a temporary update or restart.
+    #[arg(long)]
+    restart: bool,
 
     /// Print a machine-readable shutdown report.
     #[arg(long)]
@@ -1341,14 +1388,6 @@ struct UpArgs {
     #[arg(long, default_value_t = DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS)]
     provider_hardware_quote_timeout_seconds: u64,
 
-    /// Gateway/admin-side command that verifies raw hardware quote evidence.
-    #[arg(long, value_name = "PATH")]
-    hardware_quote_verifier_command: Option<PathBuf>,
-
-    /// Seconds to wait for the gateway/admin hardware quote verifier.
-    #[arg(long, default_value_t = DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS)]
-    hardware_quote_verifier_timeout_seconds: u64,
-
     /// Also supervise the fraud-proof challenger watcher from this one-terminal stack.
     #[arg(long)]
     fraud_challenger: bool,
@@ -1527,30 +1566,6 @@ struct UseArgs {
     /// Epoch value stamped into automatic catalog canary probe evidence.
     #[arg(long)]
     canary_probe_epoch: Option<u64>,
-
-    /// Trusted Apple App Attest JWKS JSON file for verifying Tier 2 Apple hardware-identity quotes.
-    #[arg(long, value_name = "PATH")]
-    apple_app_attest_jwks_file: Option<PathBuf>,
-
-    /// Trusted NVIDIA GB10 device JWKS JSON file for verifying Tier 2 GPU hardware-identity quotes.
-    #[arg(long, value_name = "PATH")]
-    nvidia_gb10_device_jwks_file: Option<PathBuf>,
-
-    /// Trusted NVIDIA NRAS JWKS JSON file for verifying NVIDIA confidential-compute quotes.
-    #[arg(long, value_name = "PATH")]
-    nvidia_nras_jwks_file: Option<PathBuf>,
-
-    /// Trusted NVIDIA nvTrust/local-verifier JWKS JSON file for offline confidential-compute quotes.
-    #[arg(long, value_name = "PATH")]
-    nvidia_offline_jwks_file: Option<PathBuf>,
-
-    /// Gateway/admin-side command that verifies raw hardware quote evidence.
-    #[arg(long, value_name = "PATH")]
-    hardware_quote_verifier_command: Option<PathBuf>,
-
-    /// Seconds to wait for the gateway/admin hardware quote verifier.
-    #[arg(long, default_value_t = DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS)]
-    hardware_quote_verifier_timeout_seconds: u64,
 
     /// Address to bind, for example 127.0.0.1:11435. Defaults to 127.0.0.1:<port>.
     #[arg(long)]
@@ -2479,7 +2494,8 @@ struct TestArgs {
     json: bool,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Deserialize, Parser, Serialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
@@ -2521,7 +2537,7 @@ struct UpdateArgs {
     #[arg(long, value_name = "PATH")]
     signature_path: Option<PathBuf>,
 
-    /// Directory containing trusted release-signing public keys.
+    /// Locally provisioned directory containing trusted release-signing public keys.
     #[arg(long, value_name = "PATH")]
     release_keys_dir: Option<PathBuf>,
 
@@ -2541,13 +2557,9 @@ struct UpdateArgs {
     #[arg(long)]
     apply_staged: bool,
 
-    /// Staged update directory to apply. Defaults to the newest <home>/updates/staged entry.
+    /// Staged update directory to apply. Defaults to the newest <home>/.mayhem-update/staged entry.
     #[arg(long, value_name = "PATH")]
     stage_dir: Option<PathBuf>,
-
-    /// Binary to replace when applying. Defaults to the current mayhem executable.
-    #[arg(long, value_name = "PATH")]
-    current_bin: Option<PathBuf>,
 
     /// Delay before a staged update may be applied.
     #[arg(long, default_value_t = 3_600)]
@@ -2561,13 +2573,13 @@ struct UpdateArgs {
     #[arg(long = "post-upgrade-arg")]
     post_upgrade_args: Vec<String>,
 
-    /// State path to snapshot before apply and restore on rollback. Repeatable.
-    #[arg(long = "state-path", value_name = "PATH")]
-    state_paths: Vec<PathBuf>,
-
     /// Print a machine-readable update report.
     #[arg(long)]
     json: bool,
+
+    /// Internal detached Windows updater request.
+    #[arg(long, value_name = "PATH", hide = true)]
+    internal_helper_request: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -2862,6 +2874,77 @@ struct CatalogSignArgs {
     force: bool,
 
     /// Print a machine-readable signing report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum CatalogAttestationAuthorityApplyMode {
+    FinalRelease,
+    IncrementalDraft,
+}
+
+impl CatalogAttestationAuthorityApplyMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FinalRelease => "final-release",
+            Self::IncrementalDraft => "incremental-draft",
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+struct CatalogApplyAttestationAuthorityArgs {
+    /// Path to the catalog draft receiving the attestation authority.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: PathBuf,
+
+    /// Typed JSON array containing the complete admin attestation policy chain.
+    #[arg(long, value_name = "PATH")]
+    policy_chain: PathBuf,
+
+    /// Typed JSON array containing the complete enclave attestation bindings.
+    #[arg(long, value_name = "PATH")]
+    bindings: PathBuf,
+
+    /// Directory containing one or more authenticated target release publications. Repeatable.
+    #[arg(long, value_name = "DIR", required = true)]
+    release_dir: Vec<PathBuf>,
+
+    /// Independently provisioned trusted release public-key record.
+    #[arg(long, value_name = "PATH")]
+    release_key: PathBuf,
+
+    /// Exact trusted release key id required on every detached signature.
+    #[arg(long, value_name = "ID")]
+    release_key_id: String,
+
+    /// Exact source Git commit required in every signed release manifest.
+    #[arg(long, value_name = "40_LOWER_HEX")]
+    source_git_sha: String,
+
+    /// Whether this is a complete final publication or an incremental draft.
+    #[arg(long, value_enum)]
+    mode: CatalogAttestationAuthorityApplyMode,
+
+    /// Canonical semantic version used in every release-matrix file name.
+    #[arg(long, value_name = "SEMVER")]
+    release_version: String,
+
+    /// Canonical public HTTPS origin serving the detached verifier artifacts.
+    #[arg(long, value_name = "HTTPS_ORIGIN")]
+    public_origin: String,
+
+    /// Canonical absolute path below the public origin containing the detached artifacts.
+    #[arg(long, value_name = "PATH")]
+    public_path: String,
+
+    /// Write the deterministic unsigned catalog draft here.
+    #[arg(long, value_name = "PATH")]
+    output: PathBuf,
+
+    /// Print a machine-readable apply report.
     #[arg(long)]
     json: bool,
 }
@@ -3369,18 +3452,16 @@ struct CatalogApplyCanaryReportsArgs {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
-enum AdminPayoutMethod {
-    Tnk,
+enum ProviderPayoutRail {
     Tap,
-    Stripe,
+    Tnk,
 }
 
-impl AdminPayoutMethod {
+impl ProviderPayoutRail {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Tnk => "tnk",
             Self::Tap => "tap",
-            Self::Stripe => "stripe",
+            Self::Tnk => "tnk",
         }
     }
 }
@@ -3426,12 +3507,6 @@ impl AdminTapRateSource {
             Self::Config => "config",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
-enum AdminPayoutConfirmKind {
-    Provider,
-    FeeSweep,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
@@ -3899,6 +3974,16 @@ struct AdminSetPaymentsArgs {
 }
 
 #[derive(Debug, Parser)]
+struct AdminPublishPayoutContextArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    /// Admin-selected canonical Intercom subnet bootstrap (32-byte hex).
+    #[arg(long)]
+    bootstrap: String,
+}
+
+#[derive(Debug, Parser)]
 struct AdminSetModelRefArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
@@ -4251,25 +4336,6 @@ struct AdminFeeSetArgs {
 }
 
 #[derive(Debug, Parser)]
-struct AdminSetProviderPayoutArgs {
-    #[command(flatten)]
-    tx: AdminTxArgs,
-
-    #[arg(long)]
-    provider: String,
-
-    #[arg(long, value_enum)]
-    payout_method: AdminPayoutMethod,
-
-    #[arg(long)]
-    payout_addr: String,
-
-    /// Provider payout currency for fiat payout rails.
-    #[arg(long)]
-    payout_currency: Option<String>,
-}
-
-#[derive(Debug, Parser)]
 struct AdminSetProviderKybArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
@@ -4509,11 +4575,11 @@ struct AdminTnkSettlementArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
 
-    /// Full tnk_settlement feature JSON produced by the settlement runner.
+    /// Full settle_targeted_tnk feature JSON produced by the settlement runner.
     #[arg(long)]
     settlement_json: Option<String>,
 
-    /// Path to full tnk_settlement feature JSON produced by the settlement runner.
+    /// Path to full settle_targeted_tnk feature JSON produced by the settlement runner.
     #[arg(long, value_name = "PATH")]
     settlement_file: Option<PathBuf>,
 
@@ -4572,11 +4638,11 @@ struct AdminFiatSettlementArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
 
-    /// Full fiat_settlement feature JSON produced by the settlement runner.
+    /// Full settle_targeted_fiat feature JSON produced by the settlement runner.
     #[arg(long)]
     settlement_json: Option<String>,
 
-    /// Path to full fiat_settlement feature JSON produced by the settlement runner.
+    /// Path to full settle_targeted_fiat feature JSON produced by the settlement runner.
     #[arg(long, value_name = "PATH")]
     settlement_file: Option<PathBuf>,
 
@@ -4854,54 +4920,6 @@ struct AdminFiatChargebackArgs {
 }
 
 #[derive(Debug, Parser)]
-struct AdminPayoutConfirmArgs {
-    #[command(flatten)]
-    tx: AdminTxArgs,
-
-    /// Payout confirmation kind.
-    #[arg(long, value_enum, default_value_t = AdminPayoutConfirmKind::Provider)]
-    kind: AdminPayoutConfirmKind,
-
-    /// Executed payout rail.
-    #[arg(long, value_enum, default_value_t = AdminPayoutMethod::Tnk)]
-    rail: AdminPayoutMethod,
-
-    #[arg(long)]
-    epoch: u64,
-
-    /// Provider public key, or treasury for fee sweeps.
-    #[arg(long)]
-    who: String,
-
-    /// Confirmed amount in canonical atto-USD.
-    #[arg(long)]
-    au: MoneyAu,
-
-    /// TNK payout amount as 18-decimal integer string. Required for TNK payouts.
-    #[arg(long)]
-    tnk_e18: Option<String>,
-
-    /// MSB transfer hash. Required for TNK payouts.
-    #[arg(long)]
-    msb_tx_hash: Option<String>,
-
-    /// External fiat transfer reference. Required for fiat payouts.
-    #[arg(long)]
-    external_ref: Option<String>,
-
-    /// Fiat payout currency. Required for fiat payouts.
-    #[arg(long)]
-    fiat_currency: Option<String>,
-
-    /// Fiat payout amount in minor units. Required for fiat payouts.
-    #[arg(long)]
-    fiat_amount_minor: Option<u64>,
-
-    #[arg(long)]
-    at: u64,
-}
-
-#[derive(Debug, Parser)]
 struct AdminEpochCommitArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
@@ -4995,6 +5013,14 @@ struct AdminEpochApplyArgs {
     /// Path to a JSON array of {provider,gross_au} earnings.
     #[arg(long, value_name = "PATH")]
     earnings_file: Option<PathBuf>,
+
+    /// JSON array of exact {session_id,user,rail,provider,payout_revision,au} allocations.
+    #[arg(long)]
+    allocations_json: Option<String>,
+
+    /// Path to exact per-session payout allocation JSON.
+    #[arg(long, value_name = "PATH")]
+    allocations_file: Option<PathBuf>,
 
     /// JSON array of {enclave_id,demand_au,session_count} market usage.
     #[arg(long)]
@@ -5143,6 +5169,42 @@ struct ProviderRailsSetArgs {
 }
 
 #[derive(Debug, Parser)]
+struct ProviderPayoutGetArgs {
+    #[command(flatten)]
+    read: ProviderReadArgs,
+
+    /// Limit output to one crypto payout rail.
+    #[arg(long, value_enum)]
+    rail: Option<ProviderPayoutRail>,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderPayoutSetArgs {
+    #[command(flatten)]
+    tx: ProviderContractTxArgs,
+
+    /// Crypto payout rail. Stripe is available only through provider stripe onboard.
+    #[arg(long, value_enum)]
+    rail: ProviderPayoutRail,
+
+    /// Destination address. Defaults to this provider wallet's rail-specific address.
+    #[arg(long)]
+    address: Option<String>,
+
+    /// Local wallet key file that owns --address. Defaults to the provider wallet.
+    #[arg(long, value_name = "PATH")]
+    target_wallet_key_file: Option<PathBuf>,
+
+    /// File containing the target wallet key-file password.
+    #[arg(long, value_name = "PATH", value_parser = read_secret_file_arg)]
+    target_wallet_password: Option<String>,
+
+    /// Number of applied settlement epochs for which the signed intent remains valid.
+    #[arg(long, default_value_t = 10)]
+    valid_for_epochs: u64,
+}
+
+#[derive(Debug, Parser)]
 struct ProviderStripeArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
@@ -5182,7 +5244,7 @@ struct ProviderStripeOnboardArgs {
     #[arg(long)]
     no_wait: bool,
 
-    /// Maximum seconds to wait for Stripe readiness and admin payout binding.
+    /// Maximum seconds to wait for Stripe readiness and verified payout binding.
     #[arg(long, default_value_t = 900)]
     timeout_seconds: u64,
 
@@ -5195,6 +5257,28 @@ struct ProviderStripeOnboardArgs {
 struct ProviderStripeStatusArgs {
     #[command(flatten)]
     provider: ProviderStripeArgs,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderStripeRelinkArgs {
+    #[command(flatten)]
+    provider: ProviderStripeArgs,
+
+    /// Local key file for the provider that currently owns the Connect account.
+    #[arg(long, value_name = "PATH")]
+    source_wallet_key_file: PathBuf,
+
+    /// File containing the source provider wallet key-file password.
+    #[arg(long, value_name = "PATH", value_parser = read_secret_file_arg)]
+    source_wallet_password: Option<String>,
+
+    /// Two-letter ISO country code for the provider business or individual.
+    #[arg(long)]
+    country: String,
+
+    /// Print the OAuth URL but do not launch a browser.
+    #[arg(long)]
+    no_open: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -5316,6 +5400,22 @@ struct ProviderDrainArgs {
     #[arg(long)]
     enclave: Option<String>,
 
+    /// After in-flight sessions finish, leave canonical rooms/enclaves and remove supervised workers.
+    #[arg(long)]
+    stop: bool,
+
+    /// Maximum seconds to wait for supervised workers to finish draining.
+    #[arg(long, default_value_t = 300)]
+    timeout_seconds: u64,
+
+    /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or the bridge default.
+    #[arg(long)]
+    rpc_url: Option<String>,
+
+    /// Build and sign leave records without appending them or removing workers.
+    #[arg(long)]
+    sim: bool,
+
     /// Clear the local drain flag so a restarted provider can accept sessions again.
     #[arg(long)]
     clear: bool,
@@ -5396,6 +5496,10 @@ struct ProviderLeaveArgs {
 struct ProviderStopArgs {
     #[command(flatten)]
     tx: ProviderTxArgs,
+
+    /// Maximum seconds to wait for supervised workers to finish draining.
+    #[arg(long, default_value_t = 300)]
+    timeout_seconds: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -5551,18 +5655,61 @@ struct ProviderServeAddArgs {
     json: bool,
 }
 
-#[derive(Clone, Debug, Parser)]
+#[derive(Debug, Parser)]
 struct ProviderServeRemoveArgs {
-    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
-    #[arg(long, value_name = "PATH")]
-    home: Option<PathBuf>,
+    #[command(flatten)]
+    tx: ProviderTxArgs,
 
     /// Enclave/model id, or supervisor child name, to remove.
     target: String,
 
-    /// Print a machine-readable report.
+    /// Maximum seconds to wait for the worker to finish draining.
+    #[arg(long, default_value_t = 300)]
+    timeout_seconds: u64,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderServeSwitchArgs {
+    #[command(flatten)]
+    tx: ProviderTxArgs,
+
+    /// Existing enclave/model id, or supervisor child name, to replace.
+    target: String,
+
+    /// Admin-created enclave or model id for the replacement worker.
+    enclave: String,
+
+    /// Override llama.cpp GPU layer count. Defaults to provider.gpu_layers config if set.
     #[arg(long)]
-    json: bool,
+    gpu_layers: Option<u32>,
+
+    /// Maximum context tokens this provider commits to serve for the selected enclave.
+    #[arg(long)]
+    ctx: Option<u64>,
+
+    /// Disable a non-core catalog modality for this worker. Repeat or comma-separate.
+    #[arg(long = "disable-modality", value_delimiter = ',')]
+    disable_modalities: Vec<String>,
+
+    /// Bound admin-defined model speciality levels for this worker. Repeat per speciality.
+    #[arg(long = "speciality-levels", value_name = "NAME=LEVEL,...")]
+    speciality_levels: Vec<String>,
+
+    /// Hardware quote kind used to admit a Tier-2/3 market, for example tpm2_quote_ek.
+    #[arg(long, value_name = "KIND")]
+    hardware_quote_kind: Option<String>,
+
+    /// Command that prints nonce-bound hardware quote evidence for the worker.
+    #[arg(long, value_name = "PATH")]
+    hardware_quote_command: Option<PathBuf>,
+
+    /// Maximum seconds to wait for the per-session hardware quote command.
+    #[arg(long, default_value_t = DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS)]
+    hardware_quote_timeout_seconds: u64,
+
+    /// Maximum seconds to wait for the old worker to finish draining.
+    #[arg(long, default_value_t = 300)]
+    timeout_seconds: u64,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -6119,6 +6266,9 @@ async fn mayhem_main() -> Result<()> {
             CatalogCommands::List(args) => catalog_list(args),
             CatalogCommands::Verify(args) => catalog_verify(args),
             CatalogCommands::Sign(args) => catalog_sign(args),
+            CatalogCommands::ApplyAttestationAuthority(args) => {
+                catalog_apply_attestation_authority(args)
+            }
             CatalogCommands::ArtifactMetadata(args) => catalog_artifact_metadata(args),
             CatalogCommands::ApplyArtifactMetadata(args) => catalog_apply_artifact_metadata(args),
             CatalogCommands::ArtifactPlan(args) => catalog_artifact_plan(args),
@@ -6188,8 +6338,15 @@ async fn provider_command(command: ProviderCommands, verbose: bool) -> Result<()
             ProviderRailsCommands::Get(args) => provider_rails_get(args).await,
             ProviderRailsCommands::Set(args) => provider_rails_set(args).await,
         },
+        ProviderCommands::Payout { command } => match command {
+            ProviderPayoutCommands::Get(args) => provider_payout_get(args).await,
+            ProviderPayoutCommands::Set(args) => provider_payout_set(args, false).await,
+            ProviderPayoutCommands::Rotate(args) => provider_payout_set(args, true).await,
+        },
         ProviderCommands::Stripe { command } => match command {
-            ProviderStripeCommands::Onboard(args) => provider_stripe_onboard(args).await,
+            ProviderStripeCommands::Onboard(args) => provider_stripe_onboard(args, false).await,
+            ProviderStripeCommands::Rotate(args) => provider_stripe_onboard(args, true).await,
+            ProviderStripeCommands::Relink(args) => provider_stripe_relink(args).await,
             ProviderStripeCommands::Status(args) => provider_stripe_status(args).await,
         },
         ProviderCommands::MinAsk { command } => match command {
@@ -6207,6 +6364,7 @@ async fn provider_command(command: ProviderCommands, verbose: bool) -> Result<()
             ProviderServeCommands::Plan(args) => provider_serve_plan(args).await,
             ProviderServeCommands::Add(args) => provider_serve_add(args).await,
             ProviderServeCommands::Remove(args) => provider_serve_remove(args).await,
+            ProviderServeCommands::Switch(args) => provider_serve_switch(args).await,
         },
         ProviderCommands::Join(args) => provider_join(args).await,
         ProviderCommands::Leave(args) => provider_leave(args).await,
@@ -6336,6 +6494,7 @@ async fn setup(args: SetupArgs) -> Result<()> {
     let password = args.wallet_password.clone().unwrap_or_default();
 
     fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
+    load_or_create_paygate_internal_auth_secret(&home)?;
     fs::create_dir_all(keypair_path.parent().expect("keypair has parent"))
         .with_context(|| format!("creating {}", keypair_path.display()))?;
 
@@ -8196,6 +8355,9 @@ fn catalog_verify(args: CatalogVerifyArgs) -> Result<()> {
         for error in &report.errors {
             eprintln!("Catalog error: {error}");
         }
+        for error in &report.attestation_policy_errors {
+            eprintln!("Catalog attestation authority error: {error}");
+        }
         for check in report.source_checks.iter().filter(|check| !check.ok) {
             let metadata_errors = if check.metadata_errors.is_empty() {
                 String::new()
@@ -8219,6 +8381,1224 @@ fn catalog_verify(args: CatalogVerifyArgs) -> Result<()> {
         bail!("catalog verification failed");
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct CatalogApplyAttestationAuthorityRequest {
+    catalog_path: PathBuf,
+    policy_chain_path: PathBuf,
+    bindings_path: PathBuf,
+    release_dirs: Vec<PathBuf>,
+    release_key: PathBuf,
+    release_key_id: String,
+    source_git_sha: String,
+    mode: CatalogAttestationAuthorityApplyMode,
+    release_version: String,
+    public_origin: String,
+    public_path: String,
+    output: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogApplyAttestationAuthorityReport {
+    ok: bool,
+    catalog_path: PathBuf,
+    output: PathBuf,
+    policy_chain_path: PathBuf,
+    bindings_path: PathBuf,
+    mode: CatalogAttestationAuthorityApplyMode,
+    release_dirs: Vec<PathBuf>,
+    release_key: PathBuf,
+    release_key_id: String,
+    release_public_key: String,
+    release_version: String,
+    source_git_sha: String,
+    verifier_id: String,
+    verifier_version: u32,
+    policy_sequence: u64,
+    target_count: usize,
+    published_target_count: usize,
+    preserved_target_count: usize,
+    managed_quote_kind_count: usize,
+    managed_reference_count: usize,
+}
+
+const CATALOG_AUTHORITY_INCREMENTAL_DRAFT_SCHEMA_VERSION: u32 = 1;
+const CATALOG_AUTHORITY_INCREMENTAL_DRAFT_DOCUMENT_TYPE: &str =
+    "mayhem.catalog-attestation-authority.incremental-draft";
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogAttestationAuthorityIncrementalDraft {
+    schema_version: u32,
+    document_type: String,
+    mode: CatalogAttestationAuthorityApplyMode,
+    catalog_path: PathBuf,
+    policy_chain_path: PathBuf,
+    bindings_path: PathBuf,
+    release_dirs: Vec<PathBuf>,
+    release_key: PathBuf,
+    release_key_id: String,
+    release_public_key: String,
+    release_version: String,
+    source_git_sha: String,
+    public_origin: String,
+    public_path: String,
+    candidate_catalog: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct CatalogManagedVerifierManifest {
+    schema_version: u32,
+    target: String,
+    verifier_id: String,
+    version: u32,
+    executable_sha256: String,
+    profiles: BTreeMap<mayhem_proto::AttestationVerifierProfile, BTreeSet<u32>>,
+}
+
+#[derive(Debug)]
+struct CatalogAuthorityTargetArtifacts {
+    target: &'static str,
+    executable_file_name: String,
+    executable_sha256: String,
+    executable_bytes: u64,
+    manifest_file_name: String,
+    manifest_sha256: String,
+    manifest_bytes: u64,
+}
+
+#[derive(Debug)]
+struct CatalogAuthorityTargetPublication {
+    target: &'static str,
+    release_dir: PathBuf,
+}
+
+const CATALOG_AUTHORITY_MAX_RELEASE_KEY_BYTES: u64 = 64 * 1024;
+const CATALOG_AUTHORITY_MAX_SIGNATURE_BYTES: u64 = 64 * 1024;
+const CATALOG_AUTHORITY_MAX_MANAGED_MANIFEST_BYTES: u64 = 1024 * 1024;
+const CATALOG_AUTHORITY_MAX_RELEASE_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+const CATALOG_AUTHORITY_MAX_VERIFIER_BYTES: u64 = 512 * 1024 * 1024;
+
+fn immediate_prior_attestation_policy(
+    policies: &[AdminAttestationPolicy],
+) -> Option<AdminAttestationPolicy> {
+    policies.last().cloned()
+}
+
+fn enabled_managed_quote_kind_policies(
+    policy: &AdminAttestationPolicy,
+) -> Vec<mayhem_proto::AttestationQuoteKindPolicy> {
+    let mut entries = policy
+        .quote_kinds
+        .iter()
+        .filter(|entry| {
+            entry.enabled && ValidatedAttestationPolicy::is_managed_verifier_kind(entry.kind)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.kind);
+    entries
+}
+
+fn all_managed_quote_kind_policies(
+    policy: &AdminAttestationPolicy,
+) -> Vec<mayhem_proto::AttestationQuoteKindPolicy> {
+    let mut entries = policy
+        .quote_kinds
+        .iter()
+        .filter(|entry| ValidatedAttestationPolicy::is_managed_verifier_kind(entry.kind))
+        .cloned()
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.kind);
+    entries
+}
+
+fn managed_emergency_disabled_quote_kinds(
+    policy: &AdminAttestationPolicy,
+) -> BTreeSet<HardwareQuoteKind> {
+    policy
+        .emergency_disabled_quote_kinds
+        .iter()
+        .copied()
+        .filter(|kind| ValidatedAttestationPolicy::is_managed_verifier_kind(*kind))
+        .collect()
+}
+
+fn preserve_omitted_managed_verifier_targets(
+    intended_policy: &mut AdminAttestationPolicy,
+    previous_policy: Option<&AdminAttestationPolicy>,
+    published_targets: &BTreeSet<&'static str>,
+) -> Result<BTreeSet<&'static str>> {
+    if published_targets.len() == ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS.len() {
+        return Ok(BTreeSet::new());
+    }
+    let Some(previous_policy) = previous_policy else {
+        return Ok(BTreeSet::new());
+    };
+    let mut has_omitted_reference = false;
+    for reference in &previous_policy.trust_data {
+        if ValidatedAttestationPolicy::parse_managed_verifier_trust_data(reference)
+            .map_err(anyhow::Error::msg)?
+            .is_some_and(|(_, target, _)| !published_targets.contains(target))
+        {
+            has_omitted_reference = true;
+            break;
+        }
+    }
+    if !has_omitted_reference {
+        return Ok(BTreeSet::new());
+    }
+    let intended_requirements = all_managed_quote_kind_policies(intended_policy);
+    let previous_requirements = all_managed_quote_kind_policies(previous_policy);
+    ensure!(
+        intended_policy.min_verifier_version == previous_policy.min_verifier_version
+            && intended_requirements == previous_requirements
+            && managed_emergency_disabled_quote_kinds(intended_policy)
+                == managed_emergency_disabled_quote_kinds(previous_policy),
+        "partial managed-verifier publication cannot preserve omitted targets while verifier policy requirements change; publish every target"
+    );
+    let intended_kinds = enabled_managed_quote_kind_policies(intended_policy);
+
+    let mut preserved_targets = BTreeSet::new();
+    let mut required_origins = BTreeSet::new();
+    for target in ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS {
+        if published_targets.contains(target) {
+            continue;
+        }
+        let mut preserved_references = Vec::new();
+        for entry in &intended_kinds {
+            let (executable_id, manifest_id) =
+                ValidatedAttestationPolicy::managed_verifier_trust_data_ids(entry.kind, target)
+                    .map_err(anyhow::Error::msg)?;
+            let executable = previous_policy
+                .trust_data
+                .iter()
+                .find(|reference| reference.id == executable_id);
+            let manifest = previous_policy
+                .trust_data
+                .iter()
+                .find(|reference| reference.id == manifest_id);
+            match (executable, manifest) {
+                (None, None) => {}
+                (Some(executable), Some(manifest)) => {
+                    preserved_references.push(executable.clone());
+                    preserved_references.push(manifest.clone());
+                }
+                _ => bail!(
+                    "previous managed-verifier policy has an incomplete {target} release pair for {}",
+                    entry.kind.as_str()
+                ),
+            }
+        }
+        if preserved_references.is_empty() {
+            continue;
+        }
+        ensure!(
+            preserved_references.len() == intended_kinds.len() * 2,
+            "previous managed-verifier policy only partially covers omitted target {target}; publish that target explicitly"
+        );
+        for reference in preserved_references {
+            if let Some(source) = &reference.source {
+                required_origins.insert(source.origin_pin.clone());
+            }
+            intended_policy.trust_data.push(reference);
+        }
+        preserved_targets.insert(target);
+    }
+
+    for origin_id in required_origins {
+        let prior_origin = previous_policy
+            .origin_pins
+            .iter()
+            .find(|origin| origin.id == origin_id)
+            .with_context(|| {
+                format!("previous managed-verifier policy is missing origin pin {origin_id}")
+            })?;
+        if let Some(existing) = intended_policy
+            .origin_pins
+            .iter()
+            .find(|origin| origin.id == origin_id)
+        {
+            ensure!(
+                existing == prior_origin,
+                "intended policy redefines preserved managed-verifier origin {origin_id}"
+            );
+        } else {
+            intended_policy.origin_pins.push(prior_origin.clone());
+        }
+    }
+    Ok(preserved_targets)
+}
+
+fn managed_verifier_targets_in_policy(
+    policy: &AdminAttestationPolicy,
+) -> Result<BTreeSet<&'static str>> {
+    let managed_kinds = enabled_managed_quote_kind_policies(policy);
+    let mut targets = BTreeSet::new();
+    for target in ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS {
+        let mut matched = 0usize;
+        for entry in &managed_kinds {
+            let (executable_id, manifest_id) =
+                ValidatedAttestationPolicy::managed_verifier_trust_data_ids(entry.kind, target)
+                    .map_err(anyhow::Error::msg)?;
+            matched += usize::from(
+                policy
+                    .trust_data
+                    .iter()
+                    .any(|reference| reference.id == executable_id),
+            );
+            matched += usize::from(
+                policy
+                    .trust_data
+                    .iter()
+                    .any(|reference| reference.id == manifest_id),
+            );
+        }
+        if matched == 0 {
+            continue;
+        }
+        ensure!(
+            matched == managed_kinds.len() * 2,
+            "managed-verifier policy only partially covers target {target}"
+        );
+        targets.insert(target);
+    }
+    Ok(targets)
+}
+
+fn catalog_apply_attestation_authority(args: CatalogApplyAttestationAuthorityArgs) -> Result<()> {
+    let request = CatalogApplyAttestationAuthorityRequest {
+        catalog_path: absolutize(args.catalog_path)?,
+        policy_chain_path: absolutize(args.policy_chain)?,
+        bindings_path: absolutize(args.bindings)?,
+        release_dirs: args
+            .release_dir
+            .into_iter()
+            .map(absolutize)
+            .collect::<Result<Vec<_>>>()?,
+        release_key: absolutize(args.release_key)?,
+        release_key_id: args.release_key_id,
+        source_git_sha: args.source_git_sha,
+        mode: args.mode,
+        release_version: args.release_version,
+        public_origin: args.public_origin,
+        public_path: args.public_path,
+        output: absolutize(args.output)?,
+    };
+    let report = catalog_apply_attestation_authority_report(request)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Catalog attestation authority applied.");
+        println!("Catalog: {}", report.catalog_path.display());
+        println!("Output: {}", report.output.display());
+        println!("Mode: {}", report.mode.as_str());
+        for release_dir in &report.release_dirs {
+            println!("Release directory: {}", release_dir.display());
+        }
+        println!(
+            "Trusted release key: {} ({}, {})",
+            report.release_key.display(),
+            report.release_key_id,
+            report.release_public_key
+        );
+        println!(
+            "Release: {} @ expected source Git SHA {}",
+            report.release_version, report.source_git_sha
+        );
+        println!(
+            "Verifier: {} v{} across {} active targets ({} published, {} preserved)",
+            report.verifier_id,
+            report.verifier_version,
+            report.target_count,
+            report.published_target_count,
+            report.preserved_target_count
+        );
+        println!(
+            "Policy: sequence {}, {} managed quote kinds, {} generated refs",
+            report.policy_sequence, report.managed_quote_kind_count, report.managed_reference_count
+        );
+        match report.mode {
+            CatalogAttestationAuthorityApplyMode::FinalRelease => {
+                println!();
+                println!(
+                    "Next: review the final catalog, then run `mayhem catalog sign --catalog-path {}` with the normal signing options.",
+                    shell_single_quote(&report.output.display().to_string())
+                );
+            }
+            CatalogAttestationAuthorityApplyMode::IncrementalDraft => {
+                println!();
+                println!(
+                    "Incremental draft is review-only and cannot be signed; rerun in final-release mode with all six targets."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn catalog_apply_attestation_authority_report(
+    mut request: CatalogApplyAttestationAuthorityRequest,
+) -> Result<CatalogApplyAttestationAuthorityReport> {
+    ensure!(
+        request.output != request.catalog_path,
+        "refusing to overwrite {}; pass a separate --output path for the unsigned catalog draft",
+        request.catalog_path.display()
+    );
+    ensure!(
+        request.output != request.policy_chain_path && request.output != request.bindings_path,
+        "catalog authority output must not overwrite a typed policy or bindings input"
+    );
+    ensure!(
+        request.output != request.release_key,
+        "catalog authority output must be isolated from --release-key"
+    );
+    ensure!(
+        request.source_git_sha.len() == 40
+            && request
+                .source_git_sha
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "--source-git-sha must be exactly 40 lowercase hexadecimal characters"
+    );
+    validate_catalog_authority_release_key_id(&request.release_key_id)?;
+    let trusted_key_bytes = read_bounded_regular_file(
+        &request.release_key,
+        CATALOG_AUTHORITY_MAX_RELEASE_KEY_BYTES,
+        "trusted release key record",
+    )?;
+    let trusted_key: ReleasePublicKeyRecord = serde_json::from_slice(&trusted_key_bytes)
+        .with_context(|| {
+            format!(
+                "parsing trusted release key record {}",
+                request.release_key.display()
+            )
+        })?;
+    validate_catalog_authority_release_key(&trusted_key, &request.release_key_id)?;
+    let canonical_release_key = fs::canonicalize(&request.release_key).with_context(|| {
+        format!(
+            "canonicalizing trusted release key {}",
+            request.release_key.display()
+        )
+    })?;
+    let canonical_release_dirs =
+        canonicalize_catalog_authority_release_dirs(&request.release_dirs)?;
+    for release_dir in &canonical_release_dirs {
+        ensure!(
+            !canonical_release_key.starts_with(release_dir),
+            "independent --release-key {} must be outside --release-dir {}",
+            canonical_release_key.display(),
+            release_dir.display()
+        );
+    }
+    let canonical_output = canonical_catalog_authority_new_output_path(&request.output)?;
+    ensure!(
+        canonical_output != canonical_release_key,
+        "catalog authority output must be isolated from the trusted release key"
+    );
+    for release_dir in &canonical_release_dirs {
+        ensure!(
+            !canonical_output.starts_with(release_dir),
+            "catalog authority output {} must be outside --release-dir {}",
+            canonical_output.display(),
+            release_dir.display()
+        );
+    }
+    for (input, label) in [
+        (&request.catalog_path, "catalog"),
+        (&request.policy_chain_path, "policy chain"),
+        (&request.bindings_path, "bindings"),
+    ] {
+        let canonical_input = fs::canonicalize(input)
+            .with_context(|| format!("canonicalizing {label} input {}", input.display()))?;
+        ensure!(
+            canonical_output != canonical_input,
+            "catalog authority output must not overwrite the {label} input"
+        );
+    }
+    request.release_key = canonical_release_key;
+    request.release_dirs = canonical_release_dirs;
+    request.output = canonical_output;
+    let trusted_keys =
+        BTreeMap::from([(trusted_key.key_id.clone(), trusted_key.public_key.clone())]);
+    let parsed_version = semver::Version::parse(&request.release_version)
+        .context("--release-version must be a canonical semantic version")?;
+    ensure!(
+        parsed_version.pre.is_empty()
+            && parsed_version.build.is_empty()
+            && parsed_version.to_string() == request.release_version,
+        "--release-version must use canonical major.minor.patch form"
+    );
+    ensure!(
+        request.public_path.starts_with('/')
+            && (request.public_path == "/" || !request.public_path.ends_with('/')),
+        "--public-path must be an absolute canonical path without a trailing slash"
+    );
+    let target_publications = discover_catalog_authority_target_publications(
+        &request.release_dirs,
+        &request.release_version,
+    )?;
+
+    let mut policies: Vec<AdminAttestationPolicy> =
+        read_typed_json_file(&request.policy_chain_path, "attestation policy chain")?;
+    let bindings: Vec<mayhem_proto::AdminEnclaveAttestationBinding> =
+        read_typed_json_file(&request.bindings_path, "enclave attestation bindings")?;
+    AttestationPolicyChain::from_catalog_records(Some(policies.clone()), bindings.clone())
+        .map_err(anyhow::Error::msg)
+        .context("validating typed attestation policy chain and bindings before apply")?;
+    let intended_policy_index = policies
+        .len()
+        .checked_sub(1)
+        .context("attestation policy chain input must not be empty")?;
+    let previous_managed_policy =
+        immediate_prior_attestation_policy(&policies[..intended_policy_index]);
+    let intended_policy = policies
+        .last_mut()
+        .context("attestation policy chain input must not be empty")?;
+    for reference in &intended_policy.trust_data {
+        ensure!(
+            ValidatedAttestationPolicy::parse_managed_verifier_trust_data(reference)
+                .map_err(anyhow::Error::msg)?
+                .is_none(),
+            "intended policy already contains managed verifier trust data {}; provide the pre-authority policy input",
+            reference.id
+        );
+    }
+    let managed_quote_kinds = intended_policy
+        .quote_kinds
+        .iter()
+        .filter(|entry| {
+            entry.enabled && ValidatedAttestationPolicy::is_managed_verifier_kind(entry.kind)
+        })
+        .map(|entry| {
+            (
+                entry.kind,
+                entry.verifier_profile,
+                entry.evidence_schema_version,
+            )
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        !managed_quote_kinds.is_empty(),
+        "intended policy enables no managed verifier quote kinds"
+    );
+
+    let mut expected_verifier_manifest: Option<CatalogManagedVerifierManifest> = None;
+    let mut target_artifacts = Vec::new();
+    for publication in &target_publications {
+        let target = publication.target;
+        let windows = target.ends_with("-pc-windows-msvc");
+        let executable_file_name = format!(
+            "mayhem-attestation-verifier-{}-{}{}",
+            request.release_version,
+            target,
+            if windows { ".exe" } else { "" }
+        );
+        let manifest_file_name = format!(
+            "mayhem-attestation-verifier-{}-{}.manifest.json",
+            request.release_version, target
+        );
+        let generic_manifest_file_name = format!(
+            "mayhem-{}-{}.manifest.json",
+            request.release_version, target
+        );
+        let generic_signature_file_name = format!("{generic_manifest_file_name}.sig");
+        let target_key_file_name = format!(
+            "mayhem-{}-{}.release-key.json",
+            request.release_version, target
+        );
+        let executable_path = publication.release_dir.join(&executable_file_name);
+        let managed_manifest_path = publication.release_dir.join(&manifest_file_name);
+        let generic_manifest_path = publication.release_dir.join(&generic_manifest_file_name);
+        let generic_signature_path = publication.release_dir.join(&generic_signature_file_name);
+        let target_key_path = publication.release_dir.join(&target_key_file_name);
+        let executable = read_bounded_regular_file(
+            &executable_path,
+            CATALOG_AUTHORITY_MAX_VERIFIER_BYTES,
+            "detached attestation verifier",
+        )?;
+        let managed_manifest_bytes = read_bounded_regular_file(
+            &managed_manifest_path,
+            CATALOG_AUTHORITY_MAX_MANAGED_MANIFEST_BYTES,
+            "managed verifier manifest",
+        )?;
+        let generic_manifest_bytes = read_bounded_regular_file(
+            &generic_manifest_path,
+            CATALOG_AUTHORITY_MAX_RELEASE_MANIFEST_BYTES,
+            "signed release manifest",
+        )?;
+        let generic_signature_bytes = read_bounded_regular_file(
+            &generic_signature_path,
+            CATALOG_AUTHORITY_MAX_SIGNATURE_BYTES,
+            "detached release manifest signature",
+        )?;
+        let target_key_bytes = read_bounded_regular_file(
+            &target_key_path,
+            CATALOG_AUTHORITY_MAX_RELEASE_KEY_BYTES,
+            "target release key record",
+        )?;
+        ensure!(
+            target_key_bytes == trusted_key_bytes,
+            "target release key record {} does not exactly match independently trusted key {}",
+            target_key_path.display(),
+            request.release_key.display()
+        );
+        let (generic_manifest, _) = release_bundle::authenticate_release_manifest(
+            &generic_manifest_bytes,
+            &generic_signature_bytes,
+            &trusted_keys,
+            Some(&request.release_key_id),
+        )
+        .with_context(|| {
+            format!(
+                "authenticating release manifest {}",
+                generic_manifest_path.display()
+            )
+        })?;
+        ensure!(
+            generic_manifest.version == request.release_version,
+            "signed release version {} does not match requested version {}",
+            generic_manifest.version,
+            request.release_version
+        );
+        ensure!(
+            generic_manifest.target == target,
+            "signed release target {} does not match supplied target {target}",
+            generic_manifest.target
+        );
+        ensure!(
+            generic_manifest.source_git_sha == request.source_git_sha,
+            "signed release source Git SHA {} does not match caller-bound SHA {}",
+            generic_manifest.source_git_sha,
+            request.source_git_sha
+        );
+        let managed_manifest: CatalogManagedVerifierManifest =
+            serde_json::from_slice(&managed_manifest_bytes).with_context(|| {
+                format!(
+                    "parsing managed verifier manifest {}",
+                    managed_manifest_path.display()
+                )
+            })?;
+
+        ensure!(
+            managed_manifest.schema_version == 1,
+            "managed verifier manifest for {target} has unsupported schema {}",
+            managed_manifest.schema_version
+        );
+        ensure!(
+            managed_manifest.target == target,
+            "managed verifier manifest target {} does not match file target {target}",
+            managed_manifest.target
+        );
+        ensure!(
+            managed_manifest.verifier_id == "mayhem-attestation-verifier",
+            "managed verifier manifest for {target} has invalid verifier id {}",
+            managed_manifest.verifier_id
+        );
+        ensure!(
+            managed_manifest.version >= intended_policy.min_verifier_version,
+            "managed verifier version {} for {target} is below policy minimum {}",
+            managed_manifest.version,
+            intended_policy.min_verifier_version
+        );
+        for (_, profile, evidence_schema_version) in &managed_quote_kinds {
+            ensure!(
+                managed_manifest
+                    .profiles
+                    .get(profile)
+                    .is_some_and(|versions| versions.contains(evidence_schema_version)),
+                "managed verifier manifest for {target} does not advertise {:?} evidence schema {}",
+                profile,
+                evidence_schema_version
+            );
+        }
+        let executable_sha256 = sha256_bytes_hex(&executable);
+        ensure!(
+            managed_manifest.executable_sha256 == executable_sha256,
+            "managed verifier manifest for {target} does not bind its detached executable digest"
+        );
+        let comparable_manifest = CatalogManagedVerifierManifest {
+            target: String::new(),
+            executable_sha256: String::new(),
+            ..managed_manifest.clone()
+        };
+        match expected_verifier_manifest.as_ref() {
+            None => expected_verifier_manifest = Some(comparable_manifest),
+            Some(expected) => ensure!(
+                &comparable_manifest == expected,
+                "managed verifier manifests disagree across release targets at {target}"
+            ),
+        }
+
+        let installed_executable_name = format!(
+            "mayhem-attestation-verifier{}",
+            if windows { ".exe" } else { "" }
+        );
+        let installed_executable_path = format!("bin/{installed_executable_name}");
+        validate_catalog_authority_binary_inventory_entry(
+            &generic_manifest.binaries,
+            &installed_executable_path,
+            &installed_executable_name,
+            &executable_sha256,
+            "verifier binary",
+        )?;
+        validate_catalog_authority_asset_inventory_entry(
+            &generic_manifest.assets,
+            &executable_file_name,
+            &executable_sha256,
+            "detached verifier asset",
+        )?;
+        let manifest_sha256 = sha256_bytes_hex(&managed_manifest_bytes);
+        validate_catalog_authority_asset_inventory_entry(
+            &generic_manifest.assets,
+            &manifest_file_name,
+            &manifest_sha256,
+            "detached managed verifier manifest asset",
+        )?;
+
+        target_artifacts.push(CatalogAuthorityTargetArtifacts {
+            target,
+            executable_file_name,
+            executable_sha256,
+            executable_bytes: u64::try_from(executable.len())
+                .context("detached verifier length does not fit u64")?,
+            manifest_file_name,
+            manifest_sha256,
+            manifest_bytes: u64::try_from(managed_manifest_bytes.len())
+                .context("managed verifier manifest length does not fit u64")?,
+        });
+    }
+    if request.mode == CatalogAttestationAuthorityApplyMode::FinalRelease {
+        ensure!(
+            target_artifacts.len() == ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS.len(),
+            "final-release requires all six canonical targets to be freshly supplied"
+        );
+    }
+    let verifier_manifest = expected_verifier_manifest.context("release matrix was empty")?;
+    let published_targets = target_artifacts
+        .iter()
+        .map(|artifacts| artifacts.target)
+        .collect::<BTreeSet<_>>();
+    let preserved_targets = match request.mode {
+        CatalogAttestationAuthorityApplyMode::FinalRelease => BTreeSet::new(),
+        CatalogAttestationAuthorityApplyMode::IncrementalDraft => {
+            preserve_omitted_managed_verifier_targets(
+                intended_policy,
+                previous_managed_policy.as_ref(),
+                &published_targets,
+            )?
+        }
+    };
+    let origin_id = format!("managed-verifier-release-{}", request.source_git_sha);
+    let release_origin = mayhem_proto::AttestationOriginPin {
+        id: origin_id.clone(),
+        https_origin: request.public_origin.clone(),
+    };
+    if let Some(existing) = intended_policy
+        .origin_pins
+        .iter()
+        .find(|origin| origin.id == origin_id)
+    {
+        ensure!(
+            existing == &release_origin,
+            "generated release origin {origin_id} conflicts with preserved policy data"
+        );
+    } else {
+        intended_policy.origin_pins.push(release_origin);
+    }
+    for (kind, _, _) in &managed_quote_kinds {
+        for artifacts in &target_artifacts {
+            let (executable_id, manifest_id) =
+                ValidatedAttestationPolicy::managed_verifier_trust_data_ids(
+                    *kind,
+                    artifacts.target,
+                )
+                .map_err(anyhow::Error::msg)?;
+            intended_policy
+                .trust_data
+                .push(mayhem_proto::AttestationTrustDataRef {
+                    id: executable_id,
+                    kind: mayhem_proto::AttestationTrustDataKind::VerificationKey,
+                    sha256: artifacts.executable_sha256.clone(),
+                    media_type: ValidatedAttestationPolicy::MANAGED_VERIFIER_EXECUTABLE_MEDIA_TYPE
+                        .to_owned(),
+                    max_bytes: artifacts.executable_bytes,
+                    valid_from_epoch: None,
+                    valid_until_epoch: None,
+                    source: Some(mayhem_proto::AttestationTrustDataSource {
+                        origin_pin: origin_id.clone(),
+                        path: catalog_authority_public_path(
+                            &request.public_path,
+                            &artifacts.executable_file_name,
+                        )?,
+                    }),
+                });
+            intended_policy
+                .trust_data
+                .push(mayhem_proto::AttestationTrustDataRef {
+                    id: manifest_id,
+                    kind: mayhem_proto::AttestationTrustDataKind::VerificationKey,
+                    sha256: artifacts.manifest_sha256.clone(),
+                    media_type: ValidatedAttestationPolicy::MANAGED_VERIFIER_MANIFEST_MEDIA_TYPE
+                        .to_owned(),
+                    max_bytes: artifacts.manifest_bytes,
+                    valid_from_epoch: None,
+                    valid_until_epoch: None,
+                    source: Some(mayhem_proto::AttestationTrustDataSource {
+                        origin_pin: origin_id.clone(),
+                        path: catalog_authority_public_path(
+                            &request.public_path,
+                            &artifacts.manifest_file_name,
+                        )?,
+                    }),
+                });
+        }
+    }
+    intended_policy
+        .origin_pins
+        .sort_by(|left, right| left.id.cmp(&right.id));
+    intended_policy
+        .trust_data
+        .sort_by(|left, right| left.id.cmp(&right.id));
+    intended_policy.quote_kinds.sort_by_key(|entry| entry.kind);
+    let active_targets = managed_verifier_targets_in_policy(intended_policy)?;
+    let mut managed_reference_count = 0usize;
+    for reference in &intended_policy.trust_data {
+        if ValidatedAttestationPolicy::parse_managed_verifier_trust_data(reference)
+            .map_err(anyhow::Error::msg)?
+            .is_some()
+        {
+            managed_reference_count += 1;
+        }
+    }
+
+    let authority = catalog::CatalogAttestationAuthority {
+        attestation_policy_chain: Some(policies),
+        enclave_attestation_bindings: bindings,
+    };
+    catalog::validate_catalog_attestation_authority_canonical(&authority)
+        .context("validating complete catalog attestation authority after apply")?;
+
+    let mut catalog_value = read_json_file(&request.catalog_path)?;
+    let models_before = catalog_value
+        .get("models")
+        .cloned()
+        .context("catalog draft must contain models")?;
+    let catalog_object = catalog_value
+        .as_object_mut()
+        .context("catalog draft must be a JSON object")?;
+    catalog_object.remove("attestation_policy_chain");
+    catalog_object.remove("enclave_attestation_bindings");
+    catalog_object.insert(
+        "attestation_policy_chain".to_owned(),
+        serde_json::to_value(
+            authority
+                .attestation_policy_chain
+                .as_ref()
+                .expect("authority policy chain was set above"),
+        )?,
+    );
+    catalog_object.insert(
+        "enclave_attestation_bindings".to_owned(),
+        serde_json::to_value(&authority.enclave_attestation_bindings)?,
+    );
+    ensure!(
+        catalog_value.get("models") == Some(&models_before),
+        "attestation authority apply changed catalog model semantics"
+    );
+    serde_json::from_value::<catalog::CatalogDocument>(catalog_value.clone())
+        .context("validating catalog document after attestation authority apply")?;
+    let output_bytes = serde_json::to_vec_pretty(&catalog_value)?;
+    catalog::validate_catalog_attestation_authority_bytes(&output_bytes)?;
+    match request.mode {
+        CatalogAttestationAuthorityApplyMode::FinalRelease => {
+            write_new_json_file(&request.output, &catalog_value)?;
+        }
+        CatalogAttestationAuthorityApplyMode::IncrementalDraft => {
+            let draft = CatalogAttestationAuthorityIncrementalDraft {
+                schema_version: CATALOG_AUTHORITY_INCREMENTAL_DRAFT_SCHEMA_VERSION,
+                document_type: CATALOG_AUTHORITY_INCREMENTAL_DRAFT_DOCUMENT_TYPE.to_owned(),
+                mode: request.mode,
+                catalog_path: request.catalog_path.clone(),
+                policy_chain_path: request.policy_chain_path.clone(),
+                bindings_path: request.bindings_path.clone(),
+                release_dirs: request.release_dirs.clone(),
+                release_key: request.release_key.clone(),
+                release_key_id: request.release_key_id.clone(),
+                release_public_key: trusted_key.public_key.clone(),
+                release_version: request.release_version.clone(),
+                source_git_sha: request.source_git_sha.clone(),
+                public_origin: request.public_origin.clone(),
+                public_path: request.public_path.clone(),
+                candidate_catalog: catalog_value,
+            };
+            write_new_json_file(&request.output, &draft)?;
+        }
+    }
+
+    Ok(CatalogApplyAttestationAuthorityReport {
+        ok: true,
+        catalog_path: request.catalog_path,
+        output: request.output,
+        policy_chain_path: request.policy_chain_path,
+        bindings_path: request.bindings_path,
+        mode: request.mode,
+        release_dirs: request.release_dirs,
+        release_key: request.release_key,
+        release_key_id: request.release_key_id,
+        release_public_key: trusted_key.public_key,
+        release_version: request.release_version,
+        source_git_sha: request.source_git_sha,
+        verifier_id: verifier_manifest.verifier_id,
+        verifier_version: verifier_manifest.version,
+        policy_sequence: authority
+            .attestation_policy_chain
+            .as_ref()
+            .and_then(|policies| policies.last())
+            .expect("validated non-empty policy chain")
+            .sequence,
+        target_count: active_targets.len(),
+        published_target_count: published_targets.len(),
+        preserved_target_count: preserved_targets.len(),
+        managed_quote_kind_count: managed_quote_kinds.len(),
+        managed_reference_count,
+    })
+}
+
+fn read_typed_json_file<T: DeserializeOwned>(path: &Path, label: &str) -> Result<T> {
+    let bytes = read_regular_file(path, label)?;
+    serde_json::from_slice(&bytes).with_context(|| format!("parsing {label} {}", path.display()))
+}
+
+fn read_regular_file(path: &Path, label: &str) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting {label} {}", path.display()))?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "{label} {} must be a regular non-symlink file",
+        path.display()
+    );
+    let bytes = fs::read(path).with_context(|| format!("reading {label} {}", path.display()))?;
+    ensure!(!bytes.is_empty(), "{label} {} is empty", path.display());
+    Ok(bytes)
+}
+
+fn read_bounded_regular_file(path: &Path, max_bytes: u64, label: &str) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspecting {label} {}", path.display()))?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "{label} {} must be a regular non-symlink file",
+        path.display()
+    );
+    ensure!(
+        metadata.len() > 0 && metadata.len() <= max_bytes,
+        "{label} {} must contain between 1 and {max_bytes} bytes",
+        path.display()
+    );
+    let file =
+        fs::File::open(path).with_context(|| format!("opening {label} {}", path.display()))?;
+    let read_limit = max_bytes
+        .checked_add(1)
+        .context("bounded release file limit overflowed")?;
+    let mut bytes = Vec::new();
+    file.take(read_limit)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {label} {}", path.display()))?;
+    ensure!(
+        !bytes.is_empty() && u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= max_bytes,
+        "{label} {} changed size or exceeds its {max_bytes}-byte limit",
+        path.display()
+    );
+    Ok(bytes)
+}
+
+fn canonicalize_catalog_authority_release_dirs(release_dirs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    ensure!(
+        !release_dirs.is_empty(),
+        "at least one --release-dir is required"
+    );
+    release_dirs
+        .iter()
+        .map(|release_dir| {
+            let metadata = fs::symlink_metadata(release_dir).with_context(|| {
+                format!("inspecting release directory {}", release_dir.display())
+            })?;
+            ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "release directory {} must be a real non-symlink directory",
+                release_dir.display()
+            );
+            fs::canonicalize(release_dir).with_context(|| {
+                format!("canonicalizing release directory {}", release_dir.display())
+            })
+        })
+        .collect()
+}
+
+fn canonical_catalog_authority_new_output_path(output: &Path) -> Result<PathBuf> {
+    let output = absolutize(output.to_path_buf())?;
+    match fs::symlink_metadata(&output) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!(
+                "catalog authority output {} must not be a symbolic link",
+                output.display()
+            )
+        }
+        Ok(_) => bail!(
+            "catalog authority output {} already exists; choose a new output path",
+            output.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("inspecting catalog authority output {}", output.display())
+            })
+        }
+    }
+    let parent = output
+        .parent()
+        .context("catalog authority output must have a parent directory")?;
+    let canonical_parent = fs::canonicalize(parent).with_context(|| {
+        format!(
+            "canonicalizing catalog authority output parent {}",
+            parent.display()
+        )
+    })?;
+    let parent_metadata = fs::metadata(&canonical_parent).with_context(|| {
+        format!(
+            "inspecting catalog authority output parent {}",
+            canonical_parent.display()
+        )
+    })?;
+    ensure!(
+        parent_metadata.is_dir(),
+        "catalog authority output parent {} must be a directory",
+        canonical_parent.display()
+    );
+    let file_name = output
+        .file_name()
+        .context("catalog authority output must have a file name")?;
+    Ok(canonical_parent.join(file_name))
+}
+
+fn write_new_json_file(path: &Path, value: &impl Serialize) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    let write_result = (|| -> Result<()> {
+        file.write_all(&bytes)
+            .with_context(|| format!("writing {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing {}", path.display()))
+    })();
+    if write_result.is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+    }
+    write_result
+}
+
+fn validate_catalog_authority_release_key_id(key_id: &str) -> Result<()> {
+    validate_release_key_id(key_id)?;
+    ensure!(
+        key_id.len() <= 128,
+        "--release-key-id must not exceed 128 ASCII bytes"
+    );
+    Ok(())
+}
+
+fn validate_catalog_authority_release_key(
+    key: &ReleasePublicKeyRecord,
+    expected_key_id: &str,
+) -> Result<()> {
+    validate_catalog_authority_release_key_id(&key.key_id)?;
+    ensure!(
+        key.key_id == expected_key_id,
+        "trusted release key id {} does not exactly match --release-key-id {expected_key_id}",
+        key.key_id
+    );
+    ensure!(key.alg == "ed25519", "trusted release key must use ed25519");
+    ensure!(
+        key.status == "active",
+        "trusted release key must have active status"
+    );
+    ensure!(
+        key.public_key.len() == 64
+            && key
+                .public_key
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "trusted release public key must be exactly 64 lowercase hexadecimal characters"
+    );
+    ensure!(
+        !key.created_at.is_empty()
+            && key.created_at == key.created_at.trim()
+            && key.created_at.is_ascii()
+            && !key.created_at.bytes().any(|byte| byte.is_ascii_control()),
+        "trusted release key created_at must be clean, non-empty ASCII"
+    );
+    Ok(())
+}
+
+fn catalog_authority_target_file_names(version: &str, target: &str) -> [String; 5] {
+    let executable = format!(
+        "mayhem-attestation-verifier-{version}-{target}{}",
+        if target.ends_with("-pc-windows-msvc") {
+            ".exe"
+        } else {
+            ""
+        }
+    );
+    let managed_manifest = format!("mayhem-attestation-verifier-{version}-{target}.manifest.json");
+    let release_manifest = format!("mayhem-{version}-{target}.manifest.json");
+    let signature = format!("{release_manifest}.sig");
+    let release_key = format!("mayhem-{version}-{target}.release-key.json");
+    [
+        executable,
+        managed_manifest,
+        release_manifest,
+        signature,
+        release_key,
+    ]
+}
+
+fn discover_catalog_authority_target_publications(
+    release_dirs: &[PathBuf],
+    release_version: &str,
+) -> Result<Vec<CatalogAuthorityTargetPublication>> {
+    ensure!(
+        !release_dirs.is_empty(),
+        "at least one --release-dir is required"
+    );
+    let mut by_target = BTreeMap::new();
+    for release_dir in release_dirs {
+        let metadata = fs::symlink_metadata(release_dir)
+            .with_context(|| format!("inspecting release directory {}", release_dir.display()))?;
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "release directory {} must be a real non-symlink directory",
+            release_dir.display()
+        );
+        let mut discovered_in_dir = 0usize;
+        for target in ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS {
+            let file_names = catalog_authority_target_file_names(release_version, target);
+            let presence = file_names
+                .iter()
+                .map(|file_name| {
+                    let path = release_dir.join(file_name);
+                    match fs::symlink_metadata(&path) {
+                        Ok(_) => Ok(true),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                        Err(error) => Err(error).with_context(|| {
+                            format!("inspecting release target file {}", path.display())
+                        }),
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if presence.iter().all(|present| !present) {
+                continue;
+            }
+            ensure!(
+                presence.iter().all(|present| *present),
+                "release target {target} in {} is incomplete; verifier executable, managed verifier manifest, signed release manifest, detached signature, and target release key must be published together",
+                release_dir.display()
+            );
+            if let Some(previous) = by_target.insert(target, release_dir.clone()) {
+                bail!(
+                    "duplicate target publication for {target} across {} and {}",
+                    previous.display(),
+                    release_dir.display()
+                );
+            }
+            discovered_in_dir += 1;
+        }
+        ensure!(
+            discovered_in_dir > 0,
+            "--release-dir {} contains no complete canonical target publication for version {release_version}",
+            release_dir.display()
+        );
+    }
+    ensure!(!by_target.is_empty(), "release publication set is empty");
+    Ok(ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS
+        .into_iter()
+        .filter_map(|target| {
+            by_target
+                .remove(target)
+                .map(|release_dir| CatalogAuthorityTargetPublication {
+                    target,
+                    release_dir,
+                })
+        })
+        .collect())
+}
+
+fn validate_catalog_authority_binary_inventory_entry(
+    entries: &[release_bundle::ReleaseBundleBinary],
+    expected_path: &str,
+    expected_name: &str,
+    expected_sha256: &str,
+    label: &str,
+) -> Result<()> {
+    let matches = entries
+        .iter()
+        .filter(|entry| entry.path == expected_path)
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() == 1,
+        "signed release inventory must contain exactly one {label} at {expected_path}"
+    );
+    let entry = matches[0];
+    ensure!(
+        entry.name == expected_name,
+        "signed release {label} name does not match {expected_name}"
+    );
+    ensure!(
+        entry.sha256 == expected_sha256,
+        "signed release {label} digest does not match its detached artifact"
+    );
+    Ok(())
+}
+
+fn validate_catalog_authority_asset_inventory_entry(
+    entries: &[release_bundle::ReleaseBundleAsset],
+    expected_path: &str,
+    expected_sha256: &str,
+    label: &str,
+) -> Result<()> {
+    let matches = entries
+        .iter()
+        .filter(|entry| entry.path == expected_path)
+        .collect::<Vec<_>>();
+    ensure!(
+        matches.len() == 1,
+        "signed release inventory must contain exactly one {label} at {expected_path}"
+    );
+    ensure!(
+        matches[0].sha256 == expected_sha256,
+        "signed release {label} digest does not match its detached artifact"
+    );
+    Ok(())
+}
+
+fn catalog_authority_public_path(base: &str, file_name: &str) -> Result<String> {
+    ensure!(
+        !file_name.is_empty()
+            && file_name.is_ascii()
+            && !file_name.contains('/')
+            && !file_name.contains('\\'),
+        "managed verifier release file name is invalid"
+    );
+    Ok(if base == "/" {
+        format!("/{file_name}")
+    } else {
+        format!("{base}/{file_name}")
+    })
 }
 
 fn catalog_sign(args: CatalogSignArgs) -> Result<()> {
@@ -8418,10 +9798,29 @@ struct CatalogPublicKeyRecord {
     created_at: String,
 }
 
+fn validate_catalog_signing_document(catalog_bytes: &[u8]) -> Result<()> {
+    let value: Value = serde_json::from_slice(catalog_bytes)
+        .context("catalog signing input must be valid JSON")?;
+    if value.get("document_type").and_then(Value::as_str)
+        == Some(CATALOG_AUTHORITY_INCREMENTAL_DRAFT_DOCUMENT_TYPE)
+    {
+        bail!(
+            "incremental-draft attestation authority output is review-only and cannot be catalog-signed"
+        );
+    }
+    serde_json::from_value::<catalog::CatalogDocument>(value)
+        .context("catalog signing input must be a catalog document")?;
+    Ok(())
+}
+
 fn catalog_sign_report(request: CatalogSignRequest) -> Result<CatalogSignReport> {
     validate_catalog_key_id(&request.key_id)?;
     let catalog_bytes = fs::read(&request.catalog_path)
         .with_context(|| format!("reading {}", request.catalog_path.display()))?;
+    validate_catalog_signing_document(&catalog_bytes)
+        .context("refusing to sign non-catalog input")?;
+    catalog::validate_catalog_attestation_authority_bytes(&catalog_bytes)
+        .context("refusing to sign invalid catalog attestation authority")?;
     let file_name = request
         .catalog_path
         .file_name()
@@ -8575,18 +9974,8 @@ struct ReleaseSignReport {
     sha256: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct ReleaseDetachedSignature {
-    schema_version: u32,
-    alg: String,
-    signed_path: String,
-    key_id: String,
-    public_key: String,
-    sha256: String,
-    sig: String,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ReleasePublicKeyRecord {
     key_id: String,
     alg: String,
@@ -8599,21 +9988,32 @@ fn release_sign_report(request: ReleaseSignRequest) -> Result<ReleaseSignReport>
     validate_release_key_id(&request.key_id)?;
     let manifest_bytes = fs::read(&request.manifest_path)
         .with_context(|| format!("reading {}", request.manifest_path.display()))?;
+    let manifest: release_bundle::ReleaseBundleManifest =
+        serde_json::from_slice(&manifest_bytes).context("parsing release bundle manifest")?;
+    manifest.validate()?;
+    let signed_path = format!(
+        "mayhem-{}-{}.manifest.json",
+        manifest.version, manifest.target
+    );
     let file_name = request
         .manifest_path
         .file_name()
         .and_then(|name| name.to_str())
-        .context("manifest path must have a UTF-8 file name")?
-        .to_owned();
+        .context("manifest path must have a UTF-8 file name")?;
+    if file_name != signed_path {
+        bail!(
+            "release manifest file name {file_name} does not match the signed bundle identity {signed_path}"
+        );
+    }
     let seed = read_release_signing_seed(&request.seed_file)?;
     let signing_key = SigningKey::from_bytes(&seed);
     let public_key = hex_encode(&signing_key.verifying_key().to_bytes());
     let sha256 = sha256_bytes_hex(&manifest_bytes);
     let signature = signing_key.sign(&release_manifest_signing_bytes(&manifest_bytes));
-    let detached = ReleaseDetachedSignature {
+    let detached = release_bundle::ReleaseDetachedSignature {
         schema_version: 1,
         alg: "ed25519".to_owned(),
-        signed_path: file_name.clone(),
+        signed_path: signed_path.clone(),
         key_id: request.key_id.clone(),
         public_key: public_key.clone(),
         sha256: sha256.clone(),
@@ -8670,7 +10070,7 @@ fn release_sign_report(request: ReleaseSignRequest) -> Result<ReleaseSignReport>
         key_written,
         key_id: request.key_id,
         public_key,
-        signed_path: file_name,
+        signed_path,
         sha256,
     })
 }
@@ -8686,68 +10086,31 @@ fn read_release_signing_seed(path: &Path) -> Result<[u8; 32]> {
 }
 
 async fn update(args: UpdateArgs) -> Result<()> {
-    let json = args.json;
-    if args.apply_staged {
-        let report = update_apply_report(args)?;
-        if json {
+    if let Some(request_path) = args.internal_helper_request.clone() {
+        return run_detached_update_helper(request_path).await;
+    }
+
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let layout = ReleaseInstallLayout::new(absolutize(home)?);
+    ensure_release_install_layout(&layout)?;
+
+    #[cfg(windows)]
+    if update_requires_detached_helper(&args, &layout)? {
+        let report = launch_detached_update_helper(args, &layout)?;
+        if report.json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
-            println!("Applied staged update: {}", report.stage_dir.display());
-            println!("Current binary: {}", report.current_bin.display());
-            println!("Backup dir: {}", report.backup_dir.display());
-            println!("Health gate: passed");
+            println!(
+                "Detached update helper started: {}",
+                report.helper.display()
+            );
+            println!("Update result: {}", report.result_path.display());
+            println!("Update log: {}", report.log_path.display());
         }
         return Ok(());
     }
 
-    let report = update_report(args).await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        println!("Update verified: {} ({})", report.version, report.target);
-        println!("Release key: {} {}", report.key_id, report.public_key);
-        println!("Manifest SHA-256: {}", report.manifest_sha256);
-        println!("Archive source: {}", report.sources.archive);
-        println!("Manifest source: {}", report.sources.manifest);
-        println!("Signature source: {}", report.sources.signature);
-        if report.dry_run {
-            println!("Staged: false (--dry-run)");
-        } else {
-            println!(
-                "Staged binary: {}",
-                report
-                    .staged_binary
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "<none>".to_owned())
-            );
-            println!(
-                "Staged release dir: {}",
-                report
-                    .stage_dir
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "<none>".to_owned())
-            );
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug, Deserialize)]
-struct ReleaseManifest {
-    schema: u32,
-    name: String,
-    version: String,
-    target: String,
-    binaries: Vec<ReleaseManifestBinary>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReleaseManifestBinary {
-    name: String,
-    path: String,
-    sha256: String,
+    update_in_process(args, layout).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -8764,10 +10127,9 @@ struct GithubReleaseAsset {
 
 #[derive(Debug)]
 struct UpdateSourceBytes {
-    archive: Vec<u8>,
+    archive_path: PathBuf,
     manifest: Vec<u8>,
     signature: Vec<u8>,
-    archive_name: String,
     sources: UpdateSourceSummary,
 }
 
@@ -8787,139 +10149,398 @@ struct UpdateReport {
     public_key: String,
     manifest_sha256: String,
     stage_dir: Option<PathBuf>,
-    staged_binary: Option<PathBuf>,
+    staged_primary_binary: Option<PathBuf>,
+    intercom_tree_sha256: String,
+    intercom_file_count: usize,
     dry_run: bool,
+    recovery: String,
     sources: UpdateSourceSummary,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct ReleaseStageMetadata {
-    schema: u32,
-    version: String,
-    target: String,
-    manifest_sha256: String,
-    key_id: String,
-    public_key: String,
-    staged_at_unix: u64,
 }
 
 #[derive(Debug, Serialize)]
 struct UpdateApplyReport {
     ok: bool,
     stage_dir: PathBuf,
-    current_bin: PathBuf,
-    backup_dir: PathBuf,
+    install_root: PathBuf,
+    bin_root: PathBuf,
+    asset_root: PathBuf,
+    anti_rollback_floor: PathBuf,
+    version: String,
+    target: String,
+    key_id: String,
+    manifest_sha256: String,
+    intercom_tree_sha256: String,
     delay_seconds: u64,
     health_args: Vec<String>,
-    state_snapshots: Vec<PathBuf>,
+    recovery: String,
+    stage_removed: bool,
 }
 
-#[derive(Debug)]
-struct StateSnapshotEntry {
-    original: PathBuf,
-    backup: PathBuf,
-    existed: bool,
+#[derive(Clone, Debug)]
+struct ReleaseInstallLayout {
+    install_root: PathBuf,
+    bin_root: PathBuf,
+    asset_root: PathBuf,
+    update_root: PathBuf,
+    staged_root: PathBuf,
+    trusted_keys_root: PathBuf,
+    helper_root: PathBuf,
+    helper_requests_root: PathBuf,
+    helper_results_root: PathBuf,
+    anti_rollback_floor: PathBuf,
 }
 
-async fn update_report(args: UpdateArgs) -> Result<UpdateReport> {
-    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
-    let home = absolutize(home)?;
-    let target = args.target.clone().unwrap_or_else(release_host_target);
-    let keys_dir = if args.release_public_key.is_none() {
-        Some(absolutize(
-            args.release_keys_dir
-                .clone()
-                .map(Ok)
-                .unwrap_or_else(|| repo_path("release/keys"))?,
-        )?)
+impl ReleaseInstallLayout {
+    fn new(install_root: PathBuf) -> Self {
+        let update_root = install_root.join(".mayhem-update");
+        Self {
+            bin_root: install_root.join(release_bundle::RELEASE_BIN_ROOT),
+            asset_root: install_root.join(release_bundle::MAYHEM_ASSET_ROOT),
+            staged_root: update_root.join("staged"),
+            trusted_keys_root: update_root.join("trusted-release-keys"),
+            helper_root: update_root.join("helper"),
+            helper_requests_root: update_root.join("helper").join("requests"),
+            helper_results_root: update_root.join("helper").join("results"),
+            anti_rollback_floor: update_root.join("release-floor.json"),
+            update_root,
+            install_root,
+        }
+    }
+}
+
+async fn update_in_process(args: UpdateArgs, layout: ReleaseInstallLayout) -> Result<()> {
+    let protected_paths = protected_release_paths(&layout, args.release_keys_dir.as_deref())?;
+    let recovery = recover_release_install(&layout, &protected_paths)?;
+    initialize_release_floor_if_needed(&layout)?;
+
+    if args.apply_staged {
+        let report = update_apply_report(&args, &layout, &protected_paths, recovery)?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!(
+                "Applied signed release: {} ({})",
+                report.version, report.target
+            );
+            println!("Release key: {}", report.key_id);
+            println!("Install root: {}", report.install_root.display());
+            println!("Intercom tree: {}", report.intercom_tree_sha256);
+            println!("Health gate: passed");
+        }
+        return Ok(());
+    }
+
+    let report = update_report(&args, &layout, recovery).await?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        args.release_keys_dir.clone().map(absolutize).transpose()?
-    };
+        println!("Update verified: {} ({})", report.version, report.target);
+        println!("Release key: {} {}", report.key_id, report.public_key);
+        println!("Manifest SHA-256: {}", report.manifest_sha256);
+        println!("Intercom tree: {}", report.intercom_tree_sha256);
+        println!("Archive source: {}", report.sources.archive);
+        println!("Manifest source: {}", report.sources.manifest);
+        println!("Signature source: {}", report.sources.signature);
+        if report.dry_run {
+            println!("Staged: false (--dry-run)");
+        } else if let Some(stage_dir) = &report.stage_dir {
+            println!("Staged release: {}", stage_dir.display());
+        }
+    }
+    Ok(())
+}
 
-    let sources = resolve_update_sources(&args, &target).await?;
+fn ensure_release_install_layout(layout: &ReleaseInstallLayout) -> Result<()> {
+    let directories: [(&Path, &str); 8] = [
+        (layout.install_root.as_path(), "release install root"),
+        (layout.update_root.as_path(), "release update root"),
+        (layout.staged_root.as_path(), "release staged root"),
+        (
+            layout.trusted_keys_root.as_path(),
+            "trusted release key root",
+        ),
+        (layout.helper_root.as_path(), "release helper root"),
+        (
+            layout.helper_requests_root.as_path(),
+            "release helper request root",
+        ),
+        (
+            layout.helper_results_root.as_path(),
+            "release helper result root",
+        ),
+        (
+            layout
+                .asset_root
+                .parent()
+                .context("release asset root must have a parent")?,
+            "release share root",
+        ),
+    ];
+    for (path, label) in directories {
+        ensure_real_update_directory(path, label)?;
+    }
+    Ok(())
+}
+
+fn ensure_real_update_directory(path: &Path, label: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!("{label} must be a real directory: {}", path.display());
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)
+                .with_context(|| format!("creating {label} {}", path.display()))?;
+            let metadata = fs::symlink_metadata(path)
+                .with_context(|| format!("inspecting {label} {}", path.display()))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!("{label} must be a real directory: {}", path.display());
+            }
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting {label} {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn initialize_release_floor_if_needed(layout: &ReleaseInstallLayout) -> Result<()> {
+    if layout.anti_rollback_floor.exists() {
+        return Ok(());
+    }
+    if release_bundle::activation_journal_path(&layout.install_root).exists() {
+        bail!(
+            "release anti-rollback floor is unavailable while an activation journal exists; recovery must complete first"
+        );
+    }
+    release_bundle::initialize_release_anti_rollback_floor(
+        &layout.anti_rollback_floor,
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+fn protected_release_paths(
+    layout: &ReleaseInstallLayout,
+    configured_keys_dir: Option<&Path>,
+) -> Result<Vec<PathBuf>> {
+    let mut protected = Vec::new();
+    if layout.install_root.is_dir() {
+        for entry in fs::read_dir(&layout.install_root)
+            .with_context(|| format!("reading {}", layout.install_root.display()))?
+        {
+            let entry =
+                entry.with_context(|| format!("reading {}", layout.install_root.display()))?;
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("inspecting {}", entry.path().display()))?;
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+            let name = entry.file_name();
+            if name == OsStr::new(release_bundle::RELEASE_BIN_ROOT)
+                || name == OsStr::new("share")
+                || name == OsStr::new(".mayhem-update")
+                || name == OsStr::new(".mayhem-activation-journal")
+            {
+                continue;
+            }
+            protected.push(entry.path());
+        }
+    }
+    for state_dir in [
+        "stores",
+        "provider-control",
+        "secrets",
+        "rules",
+        "catalog-cache",
+        "receipts",
+    ] {
+        let path = layout.install_root.join(state_dir);
+        if !protected.iter().any(|protected| protected == &path) {
+            protected.push(path);
+        }
+    }
+    protected.push(layout.trusted_keys_root.clone());
+    if let Some(configured) = configured_keys_dir {
+        let configured = absolutize(configured.to_path_buf())?;
+        if !protected.iter().any(|path| path == &configured) {
+            protected.push(configured);
+        }
+    }
+    Ok(protected)
+}
+
+fn recover_release_install(
+    layout: &ReleaseInstallLayout,
+    protected_paths: &[PathBuf],
+) -> Result<release_bundle::ActivationRecovery> {
+    release_bundle::recover_release_activation(
+        &layout.install_root,
+        &layout.bin_root,
+        &layout.asset_root,
+        &layout.anti_rollback_floor,
+        protected_paths,
+    )
+}
+
+fn activation_recovery_name(recovery: release_bundle::ActivationRecovery) -> &'static str {
+    match recovery {
+        release_bundle::ActivationRecovery::NoJournal => "none",
+        release_bundle::ActivationRecovery::RolledBack => "rolled_back",
+        release_bundle::ActivationRecovery::CommitCompleted => "commit_completed",
+    }
+}
+
+async fn update_report(
+    args: &UpdateArgs,
+    layout: &ReleaseInstallLayout,
+    recovery: release_bundle::ActivationRecovery,
+) -> Result<UpdateReport> {
+    let work_dir = temp_work_dir("mayhem-update-verify")?;
+    let result = update_report_inner(args, layout, recovery, &work_dir).await;
+    let _ = fs::remove_dir_all(&work_dir);
+    result
+}
+
+async fn update_report_inner(
+    args: &UpdateArgs,
+    layout: &ReleaseInstallLayout,
+    recovery: release_bundle::ActivationRecovery,
+    work_dir: &Path,
+) -> Result<UpdateReport> {
+    let target = args.target.clone().unwrap_or_else(release_host_target);
+    let limits = release_bundle::ReleaseExtractionLimits::default();
+    let sources = resolve_update_sources(args, &target, work_dir, &limits).await?;
     let manifest_sha256 = sha256_bytes_hex(&sources.manifest);
-    let signature: ReleaseDetachedSignature =
-        serde_json::from_slice(&sources.signature).context("parsing release manifest signature")?;
-    let manifest: ReleaseManifest =
-        serde_json::from_slice(&sources.manifest).context("parsing release manifest")?;
+    let manifest: release_bundle::ReleaseBundleManifest =
+        serde_json::from_slice(&sources.manifest).context("parsing release bundle manifest")?;
+    manifest.validate()?;
+    if manifest.target != target {
+        bail!(
+            "signed release target {} does not match requested target {target}",
+            manifest.target
+        );
+    }
 
-    validate_release_manifest(&manifest, &target)?;
-    verify_release_manifest_signature(
+    let published_stage_dir = if args.dry_run {
+        None
+    } else {
+        Some(layout.staged_root.join(format!(
+            "{}-{}-{}",
+            safe_path_component(&manifest.version),
+            safe_path_component(&manifest.target),
+            &manifest_sha256[..12]
+        )))
+    };
+    let stage_dir = if args.dry_run {
+        work_dir.join("verified-stage")
+    } else {
+        layout.staged_root.join(format!(
+            ".candidate-{}-{}",
+            std::process::id(),
+            now_nanos_for_path()
+        ))
+    };
+    remove_existing_release_stage(&stage_dir)?;
+    release_bundle::stage_release_archive(
+        &sources.archive_path,
         &sources.manifest,
-        &signature,
-        keys_dir.as_deref(),
-        args.release_public_key.as_deref(),
-        args.key_id.as_deref(),
+        &sources.signature,
+        &stage_dir,
+        unix_epoch_seconds()?,
+        &limits,
     )?;
 
-    let work_dir = temp_work_dir("mayhem-update-verify")?;
-    let archive_path = work_dir.join(&sources.archive_name);
-    fs::write(&archive_path, &sources.archive)
-        .with_context(|| format!("writing {}", archive_path.display()))?;
-    let extract_dir = work_dir.join("extract");
-    fs::create_dir_all(&extract_dir)
-        .with_context(|| format!("creating {}", extract_dir.display()))?;
-    extract_release_archive(&archive_path, &extract_dir)?;
-    let release_root = find_extracted_release_root(&extract_dir, &manifest)?;
-    let archive_manifest_path = release_root.join("manifest.json");
-    let archive_manifest = fs::read(&archive_manifest_path)
-        .with_context(|| format!("reading {}", archive_manifest_path.display()))?;
-    if archive_manifest != sources.manifest {
-        bail!("release archive manifest.json does not match the signed detached manifest");
-    }
-    let verified_binary = verify_release_binaries(&manifest, &release_root)?;
-
-    let (stage_dir, staged_binary) = if args.dry_run {
-        (None, None)
-    } else {
-        let staged = stage_release_update(
-            &home,
-            &manifest,
-            &manifest_sha256,
-            &signature,
-            &sources.signature,
-            &release_root,
-            &verified_binary,
+    let authentication = (|| -> Result<_> {
+        let trusted_keys = load_trusted_release_keys(args, layout)?;
+        let authenticated = release_bundle::reauthenticate_release_stage(
+            &stage_dir,
+            &target,
+            &layout.anti_rollback_floor,
+            &trusted_keys,
+            args.key_id.as_deref(),
         )?;
-        (Some(staged.stage_dir), Some(staged.staged_binary))
+        let intercom = release_bundle::verify_staged_intercom_tree(
+            &authenticated.manifest().intercom,
+            authenticated.verified_release().release_root(),
+        )?;
+        Ok((authenticated, intercom))
+    })();
+    let (authenticated, intercom) = match authentication {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&stage_dir);
+            return Err(error);
+        }
     };
-    let _ = fs::remove_dir_all(&work_dir);
 
+    let signature = authenticated.signature().clone();
+    let staged_primary_relative = authenticated
+        .verified_release()
+        .primary_binary()
+        .strip_prefix(&stage_dir)
+        .context("authenticated primary binary escaped its release stage")?
+        .to_path_buf();
+    let version = authenticated.manifest().version.clone();
+    let target = authenticated.manifest().target.clone();
+    let staged_primary_binary = if let Some(published) = &published_stage_dir {
+        let publish = remove_existing_release_stage(published).and_then(|()| {
+            fs::rename(&stage_dir, published).with_context(|| {
+                format!(
+                    "publishing authenticated release stage {} at {}",
+                    stage_dir.display(),
+                    published.display()
+                )
+            })
+        });
+        if let Err(error) = publish {
+            let _ = fs::remove_dir_all(&stage_dir);
+            return Err(error);
+        }
+        Some(published.join(staged_primary_relative))
+    } else {
+        None
+    };
     Ok(UpdateReport {
         ok: true,
-        version: manifest.version,
-        target: manifest.target,
+        version,
+        target,
         key_id: signature.key_id,
         public_key: signature.public_key,
         manifest_sha256,
-        stage_dir,
-        staged_binary,
+        stage_dir: published_stage_dir,
+        staged_primary_binary,
+        intercom_tree_sha256: intercom.tree_sha256,
+        intercom_file_count: intercom.file_count,
         dry_run: args.dry_run,
+        recovery: activation_recovery_name(recovery).to_owned(),
         sources: sources.sources,
     })
 }
 
-fn update_apply_report(args: UpdateArgs) -> Result<UpdateApplyReport> {
-    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
-    let home = absolutize(home)?;
+fn update_apply_report(
+    args: &UpdateArgs,
+    layout: &ReleaseInstallLayout,
+    protected_paths: &[PathBuf],
+    recovery: release_bundle::ActivationRecovery,
+) -> Result<UpdateApplyReport> {
     let stage_dir = args
         .stage_dir
         .clone()
         .map(absolutize)
         .transpose()?
         .map(Ok)
-        .unwrap_or_else(|| latest_staged_update(&home))?;
-    let metadata: ReleaseStageMetadata =
-        serde_json::from_value(read_json_file(&stage_dir.join("stage.json"))?)
-            .with_context(|| format!("parsing {}", stage_dir.join("stage.json").display()))?;
-    if metadata.schema != 1 {
-        bail!("staged update metadata schema must be 1");
-    }
+        .unwrap_or_else(|| latest_staged_update(layout))?;
+    let stage_dir = canonical_staged_update(layout, &stage_dir)?;
+    let metadata_path = stage_dir.join(release_bundle::RELEASE_STAGE_METADATA_PATH);
+    let metadata = read_release_stage_metadata(&metadata_path)?;
     if !args.bypass_apply_delay {
         let now = unix_epoch_seconds()?;
         let ready_at = metadata
             .staged_at_unix
-            .saturating_add(args.apply_delay_seconds);
+            .checked_add(args.apply_delay_seconds)
+            .context("staged update ready time overflowed")?;
         if now < ready_at {
             bail!(
                 "staged update delay has not elapsed: ready at {ready_at}, now {now}; pass --bypass-apply-delay only for tests/emergency use"
@@ -8927,116 +10548,693 @@ fn update_apply_report(args: UpdateArgs) -> Result<UpdateApplyReport> {
         }
     }
 
-    let current_bin = args
-        .current_bin
-        .clone()
-        .map(absolutize)
-        .transpose()?
-        .unwrap_or(env::current_exe().context("locating current mayhem executable")?);
-    let staged_binary = stage_dir.join("bin").join(release_mayhem_binary_name());
-    if !staged_binary.is_file() {
-        bail!("staged update binary missing: {}", staged_binary.display());
-    }
-    if current_bin == staged_binary {
-        bail!("current binary and staged binary are the same path");
+    let target = args.target.clone().unwrap_or_else(release_host_target);
+    let trusted_keys = load_trusted_release_keys(args, layout)?;
+    let authenticated = release_bundle::reauthenticate_release_stage(
+        &stage_dir,
+        &target,
+        &layout.anti_rollback_floor,
+        &trusted_keys,
+        args.key_id.as_deref(),
+    )?;
+    let intercom = release_bundle::verify_staged_intercom_tree(
+        &authenticated.manifest().intercom,
+        authenticated.verified_release().release_root(),
+    )?;
+    let live_trusted_keys = load_trusted_release_keys(args, layout)?;
+    if trusted_keys != live_trusted_keys {
+        bail!("locally provisioned release trust changed during apply");
     }
 
-    let backup_dir = home.join("updates").join("backups").join(format!(
-        "{}-{}-{}",
-        safe_path_component(&metadata.version),
-        safe_path_component(&metadata.target),
-        now_nanos_for_path()
-    ));
-    let backup_bin = backup_dir.join("bin").join(
-        current_bin
-            .file_name()
-            .unwrap_or_else(|| OsStr::new(release_mayhem_binary_name())),
-    );
-    copy_file_preserve_mode(&current_bin, &backup_bin)?;
-    let state_snapshots = snapshot_update_state(&home, &args.state_paths, &backup_dir)?;
-    copy_file_preserve_mode(&staged_binary, &current_bin)?;
-
+    let version = authenticated.manifest().version.clone();
+    let release_target = authenticated.manifest().target.clone();
+    let key_id = authenticated.signature().key_id.clone();
+    let manifest_sha256 = authenticated.metadata().manifest_sha256.clone();
+    let health_binary = authenticated
+        .verified_release()
+        .primary_binary_in(&layout.bin_root);
+    let activation = release_bundle::activate_authenticated_release(
+        &layout.install_root,
+        authenticated,
+        &layout.bin_root,
+        &layout.asset_root,
+        protected_paths,
+    )?;
     let health_args = if args.post_upgrade_args.is_empty() {
         vec!["doctor".to_owned(), "--json".to_owned()]
     } else {
         args.post_upgrade_args.clone()
     };
-    let health = std::process::Command::new(&current_bin)
+    let health = std::process::Command::new(&health_binary)
         .args(&health_args)
+        .env("MAYHEM_HOME", &layout.install_root)
+        .env("MAYHEM_ASSET_DIR", &layout.asset_root)
+        .current_dir(&layout.install_root)
         .status();
-    match health {
-        Ok(status) if status.success() => Ok(UpdateApplyReport {
-            ok: true,
-            stage_dir,
-            current_bin,
-            backup_dir,
-            delay_seconds: args.apply_delay_seconds,
-            health_args,
-            state_snapshots: state_snapshots
-                .iter()
-                .filter(|entry| entry.existed)
-                .map(|entry| entry.backup.clone())
-                .collect(),
-        }),
-        Ok(status) => {
-            rollback_update(&current_bin, &backup_bin, &state_snapshots)?;
-            bail!(
-                "post-upgrade health gate failed with status {}; rolled back to {}",
-                status
-                    .code()
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| "terminated".to_owned()),
-                backup_dir.display()
-            );
+    let health_error = match health {
+        Ok(status) if status.success() => None,
+        Ok(status) => Some(anyhow!(
+            "post-upgrade health gate failed with status {}",
+            status
+                .code()
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "terminated".to_owned())
+        )),
+        Err(error) => Some(anyhow!(
+            "post-upgrade health gate could not run {}: {error}",
+            health_binary.display()
+        )),
+    };
+    if let Some(error) = health_error {
+        return match activation.rollback() {
+            Ok(()) => Err(error.context("release activation rolled back")),
+            Err(rollback_error) => Err(error.context(format!(
+                "release activation rollback also failed: {rollback_error:#}"
+            ))),
+        };
+    }
+    activation.commit()?;
+    let stage_removed = fs::remove_dir_all(&stage_dir).is_ok();
+
+    Ok(UpdateApplyReport {
+        ok: true,
+        stage_dir,
+        install_root: layout.install_root.clone(),
+        bin_root: layout.bin_root.clone(),
+        asset_root: layout.asset_root.clone(),
+        anti_rollback_floor: layout.anti_rollback_floor.clone(),
+        version,
+        target: release_target,
+        key_id,
+        manifest_sha256,
+        intercom_tree_sha256: intercom.tree_sha256,
+        delay_seconds: args.apply_delay_seconds,
+        health_args,
+        recovery: activation_recovery_name(recovery).to_owned(),
+        stage_removed,
+    })
+}
+
+fn remove_existing_release_stage(stage_dir: &Path) -> Result<()> {
+    match fs::symlink_metadata(stage_dir) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!(
+                    "release stage must be absent or a real directory: {}",
+                    stage_dir.display()
+                );
+            }
+            fs::remove_dir_all(stage_dir)
+                .with_context(|| format!("removing prior release stage {}", stage_dir.display()))?;
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
-            rollback_update(&current_bin, &backup_bin, &state_snapshots)?;
-            bail!(
-                "post-upgrade health gate could not run: {error}; rolled back to {}",
-                backup_dir.display()
-            );
+            return Err(error)
+                .with_context(|| format!("inspecting release stage {}", stage_dir.display()));
         }
     }
+    Ok(())
 }
 
-#[derive(Debug)]
-struct StagedRelease {
-    stage_dir: PathBuf,
-    staged_binary: PathBuf,
-}
-
-fn latest_staged_update(home: &Path) -> Result<PathBuf> {
-    let staged_root = home.join("updates").join("staged");
-    let mut newest: Option<(u64, PathBuf)> = None;
+fn latest_staged_update(layout: &ReleaseInstallLayout) -> Result<PathBuf> {
+    let staged_root = &layout.staged_root;
+    let mut newest: Option<(u64, String, PathBuf)> = None;
     for entry in fs::read_dir(&staged_root)
         .with_context(|| format!("reading staged updates in {}", staged_root.display()))?
     {
         let entry = entry.with_context(|| format!("reading {}", staged_root.display()))?;
         let path = entry.path();
-        if !path.is_dir() {
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with('.'))
+        {
             continue;
         }
-        let metadata_path = path.join("stage.json");
-        if !metadata_path.is_file() {
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("inspecting {}", path.display()))?;
+        if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
-        let metadata: ReleaseStageMetadata =
-            serde_json::from_value(read_json_file(&metadata_path)?)
-                .with_context(|| format!("parsing {}", metadata_path.display()))?;
+        let metadata_path = path.join(release_bundle::RELEASE_STAGE_METADATA_PATH);
+        let Ok(metadata) = read_release_stage_metadata(&metadata_path) else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let candidate = (metadata.staged_at_unix, name, path);
         if newest
             .as_ref()
-            .map(|(staged_at, _)| metadata.staged_at_unix > *staged_at)
+            .map(|current| (&candidate.0, &candidate.1) > (&current.0, &current.1))
             .unwrap_or(true)
         {
-            newest = Some((metadata.staged_at_unix, path));
+            newest = Some(candidate);
         }
     }
     newest
-        .map(|(_, path)| path)
+        .map(|(_, _, path)| path)
         .with_context(|| format!("no staged updates found in {}", staged_root.display()))
 }
 
-async fn resolve_update_sources(args: &UpdateArgs, target: &str) -> Result<UpdateSourceBytes> {
+fn canonical_staged_update(layout: &ReleaseInstallLayout, stage_dir: &Path) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(stage_dir)
+        .with_context(|| format!("inspecting staged release {}", stage_dir.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "staged release must be a real directory: {}",
+            stage_dir.display()
+        );
+    }
+    let canonical_root = fs::canonicalize(&layout.staged_root).with_context(|| {
+        format!(
+            "canonicalizing staged release root {}",
+            layout.staged_root.display()
+        )
+    })?;
+    let canonical_stage = fs::canonicalize(stage_dir)
+        .with_context(|| format!("canonicalizing staged release {}", stage_dir.display()))?;
+    let stage_name = canonical_stage
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("staged release directory must have a UTF-8 name")?;
+    if stage_name.starts_with('.') || canonical_stage.parent() != Some(canonical_root.as_path()) {
+        bail!(
+            "staged release must be a published immediate child of {}: {}",
+            layout.staged_root.display(),
+            stage_dir.display()
+        );
+    }
+    Ok(canonical_stage)
+}
+
+fn read_release_stage_metadata(
+    metadata_path: &Path,
+) -> Result<release_bundle::ReleaseStageMetadata> {
+    let limit = release_bundle::ReleaseExtractionLimits::default().max_archive_metadata_bytes;
+    ensure_bounded_update_file(metadata_path, limit, "release stage metadata")?;
+    serde_json::from_slice(
+        &fs::read(metadata_path).with_context(|| format!("reading {}", metadata_path.display()))?,
+    )
+    .with_context(|| format!("parsing {}", metadata_path.display()))
+}
+
+fn load_trusted_release_keys(
+    args: &UpdateArgs,
+    layout: &ReleaseInstallLayout,
+) -> Result<Vec<release_bundle::TrustedReleaseKey>> {
+    if let Some(public_key) = args.release_public_key.as_deref() {
+        if args.release_keys_dir.is_some() {
+            bail!("pass either --release-public-key or --release-keys-dir, not both");
+        }
+        let key_id = args
+            .key_id
+            .as_deref()
+            .context("--key-id is required with --release-public-key")?;
+        validate_release_key_id(key_id)?;
+        return Ok(vec![release_bundle::TrustedReleaseKey::new(
+            key_id, public_key,
+        )]);
+    }
+
+    let keys_dir = args
+        .release_keys_dir
+        .clone()
+        .map(absolutize)
+        .transpose()?
+        .unwrap_or_else(|| layout.trusted_keys_root.clone());
+    let metadata = fs::symlink_metadata(&keys_dir)
+        .with_context(|| format!("inspecting trusted release key root {}", keys_dir.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "trusted release key root must be a real local directory: {}",
+            keys_dir.display()
+        );
+    }
+
+    let mut trusted = Vec::new();
+    for entry in fs::read_dir(&keys_dir)
+        .with_context(|| format!("reading trusted release keys in {}", keys_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading {}", keys_dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(OsStr::to_str) != Some("json") {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("inspecting trusted release key {}", path.display()))?;
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("inspecting trusted release key {}", path.display()))?;
+        if file_type.is_symlink() || !metadata.is_file() {
+            bail!(
+                "trusted release key must be a real file: {}",
+                path.display()
+            );
+        }
+        let record: ReleasePublicKeyRecord = serde_json::from_slice(
+            &fs::read(&path)
+                .with_context(|| format!("reading trusted release key {}", path.display()))?,
+        )
+        .with_context(|| format!("parsing trusted release key {}", path.display()))?;
+        validate_release_key_id(&record.key_id)?;
+        let expected_name = format!("{}.json", record.key_id);
+        if path.file_name().and_then(OsStr::to_str) != Some(expected_name.as_str()) {
+            bail!(
+                "trusted release key file name must match its key id: {}",
+                path.display()
+            );
+        }
+        if record.alg != "ed25519" {
+            bail!("trusted release key {} must use ed25519", record.key_id);
+        }
+        if record.status == "active" {
+            trusted.push(release_bundle::TrustedReleaseKey::new(
+                record.key_id,
+                record.public_key,
+            ));
+        }
+    }
+    trusted.sort_by(|left, right| left.key_id.cmp(&right.key_id));
+    if trusted.is_empty() {
+        bail!(
+            "no active locally provisioned release keys found in {}; provision trust before updating",
+            keys_dir.display()
+        );
+    }
+    Ok(trusted)
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct WindowsUpdateProcessIdentity {
+    pid: u32,
+    creation_time_utc_ticks: String,
+    executable_path: PathBuf,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DetachedUpdateHelperRequest {
+    schema: u32,
+    args: UpdateArgs,
+    helper_path: PathBuf,
+    helper_sha256: String,
+    expected_processes: Vec<WindowsUpdateProcessIdentity>,
+    created_at_unix: u64,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Serialize)]
+struct DetachedUpdateLaunchReport {
+    ok: bool,
+    helper: PathBuf,
+    request_path: PathBuf,
+    result_path: PathBuf,
+    log_path: PathBuf,
+    #[serde(skip)]
+    json: bool,
+}
+
+async fn run_detached_update_helper(request_path: PathBuf) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        let _ = request_path;
+        bail!("the detached update helper is Windows-only");
+    }
+    #[cfg(windows)]
+    {
+        let request_path = absolutize(request_path)?;
+        ensure_bounded_update_file(&request_path, 4 * 1024 * 1024, "update helper request")?;
+        let request: DetachedUpdateHelperRequest =
+            serde_json::from_slice(&fs::read(&request_path).with_context(|| {
+                format!("reading detached update request {}", request_path.display())
+            })?)
+            .context("parsing detached update helper request")?;
+        if request.schema != 1 {
+            bail!("detached update helper request schema must be 1");
+        }
+        let now = unix_epoch_seconds()?;
+        if request.created_at_unix > now.saturating_add(60)
+            || now.saturating_sub(request.created_at_unix) > 600
+        {
+            bail!("detached update helper request is outside its 10-minute validity window");
+        }
+        let home = request
+            .args
+            .home
+            .clone()
+            .context("detached update helper request must carry an install root")?;
+        let layout = ReleaseInstallLayout::new(absolutize(home)?);
+        ensure_release_install_layout(&layout)?;
+        let canonical_request =
+            fs::canonicalize(&request_path).context("canonicalizing update helper request")?;
+        let canonical_request_root = fs::canonicalize(&layout.helper_requests_root)
+            .context("canonicalizing update helper request root")?;
+        if !windows_path_is_within(&canonical_request, &canonical_request_root) {
+            bail!(
+                "detached update request must be inside {}",
+                layout.helper_requests_root.display()
+            );
+        }
+        let current_helper =
+            fs::canonicalize(env::current_exe().context("locating detached update helper")?)
+                .context("canonicalizing detached update helper")?;
+        let expected_helper =
+            fs::canonicalize(&request.helper_path).context("canonicalizing expected helper")?;
+        if !windows_paths_equal(&current_helper, &expected_helper) {
+            bail!("detached update helper executable path does not match the request");
+        }
+        if windows_path_is_within(&current_helper, &layout.bin_root)
+            || windows_path_is_within(&current_helper, &layout.asset_root)
+        {
+            bail!("detached update helper must execute outside active release roots");
+        }
+        let helper_sha256 = file_sha256_hex(&current_helper)?;
+        if helper_sha256 != request.helper_sha256 {
+            bail!("detached update helper executable hash does not match the request");
+        }
+        if request.expected_processes.is_empty() {
+            bail!("detached update helper request has no parent process identity");
+        }
+        for expected in &request.expected_processes {
+            let actual = windows_process_identity(expected.pid)?.with_context(|| {
+                format!("expected update parent pid {} is absent", expected.pid)
+            })?;
+            validate_windows_update_process_identity(expected, &actual)?;
+        }
+
+        let ack_path = request_path.with_extension("ack");
+        write_private_file(&ack_path, b"validated\n")
+            .with_context(|| format!("writing helper acknowledgement {}", ack_path.display()))?;
+        for expected in &request.expected_processes {
+            wait_for_windows_update_process_exit(expected, Duration::from_secs(300))?;
+        }
+
+        let request_stem = request_path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .context("detached update request must have a UTF-8 file stem")?;
+        let result_path = layout
+            .helper_results_root
+            .join(format!("{request_stem}.json"));
+        let mut args = request.args;
+        args.internal_helper_request = None;
+        let outcome = update_in_process(args, layout).await;
+        let result = match &outcome {
+            Ok(()) => json!({"ok": true}),
+            Err(error) => json!({"ok": false, "error": format!("{error:#}")}),
+        };
+        let mut result_bytes =
+            serde_json::to_vec_pretty(&result).context("serializing update helper result")?;
+        result_bytes.push(b'\n');
+        write_private_file(&result_path, &result_bytes)
+            .with_context(|| format!("writing update helper result {}", result_path.display()))?;
+        let _ = fs::remove_file(&ack_path);
+        let _ = fs::remove_file(&request_path);
+        outcome
+    }
+}
+
+#[cfg(any(windows, test))]
+fn validate_windows_update_process_identity(
+    expected: &WindowsUpdateProcessIdentity,
+    actual: &WindowsUpdateProcessIdentity,
+) -> Result<()> {
+    if expected.pid != actual.pid
+        || expected.creation_time_utc_ticks != actual.creation_time_utc_ticks
+        || !windows_paths_equal(&expected.executable_path, &actual.executable_path)
+    {
+        bail!(
+            "Windows update process identity changed for pid {}",
+            expected.pid
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn windows_paths_equal(left: &Path, right: &Path) -> bool {
+    normalized_windows_path(left).eq_ignore_ascii_case(&normalized_windows_path(right))
+}
+
+#[cfg(any(windows, test))]
+fn windows_path_is_within(path: &Path, root: &Path) -> bool {
+    let path = normalized_windows_path(path);
+    let root = normalized_windows_path(root);
+    path.eq_ignore_ascii_case(&root)
+        || path
+            .get(..root.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&root))
+            && path.as_bytes().get(root.len()) == Some(&b'\\')
+}
+
+#[cfg(any(windows, test))]
+fn normalized_windows_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_owned()
+}
+
+#[cfg(windows)]
+fn update_requires_detached_helper(
+    args: &UpdateArgs,
+    layout: &ReleaseInstallLayout,
+) -> Result<bool> {
+    if !args.apply_staged && !release_bundle::activation_journal_path(&layout.install_root).exists()
+    {
+        return Ok(false);
+    }
+    Ok(matches!(
+        release_bundle::release_activation_requirement(&layout.bin_root)?,
+        release_bundle::ReleaseActivationRequirement::DetachedHelperRequired { .. }
+    ))
+}
+
+#[cfg(windows)]
+fn launch_detached_update_helper(
+    mut args: UpdateArgs,
+    layout: &ReleaseInstallLayout,
+) -> Result<DetachedUpdateLaunchReport> {
+    let current_executable =
+        fs::canonicalize(env::current_exe().context("locating running update binary")?)
+            .context("canonicalizing running update binary")?;
+    let current_identity = windows_process_identity(std::process::id())?
+        .context("running update process disappeared before helper launch")?;
+    if !windows_paths_equal(&current_identity.executable_path, &current_executable) {
+        bail!("running update process executable path could not be authenticated");
+    }
+    let active_processes = windows_processes_in_bin_root(&layout.bin_root)?;
+    if !active_processes.iter().any(|identity| {
+        validate_windows_update_process_identity(&current_identity, identity).is_ok()
+    }) {
+        bail!(
+            "Windows release process enumeration did not authenticate the running updater under {}",
+            layout.bin_root.display()
+        );
+    }
+    let siblings = active_processes
+        .iter()
+        .filter(|identity| identity.pid != current_identity.pid)
+        .collect::<Vec<_>>();
+    if !siblings.is_empty() {
+        bail!(
+            "Windows release activation requires Mayhem services to be stopped first; {} sibling process(es) still execute from {}",
+            siblings.len(),
+            layout.bin_root.display()
+        );
+    }
+
+    let source_sha256 = file_sha256_hex(&current_executable)?;
+    let helper_path = layout
+        .helper_root
+        .join(format!("mayhem-update-helper-{}.exe", &source_sha256[..16]));
+    match fs::symlink_metadata(&helper_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || file_sha256_hex(&helper_path)? != source_sha256
+            {
+                bail!(
+                    "existing detached update helper is not the authenticated running binary: {}",
+                    helper_path.display()
+                );
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::copy(&current_executable, &helper_path).with_context(|| {
+                format!(
+                    "copying detached update helper {} to {}",
+                    current_executable.display(),
+                    helper_path.display()
+                )
+            })?;
+            if file_sha256_hex(&helper_path)? != source_sha256 {
+                let _ = fs::remove_file(&helper_path);
+                bail!("detached update helper copy failed hash verification");
+            }
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&helper_path)
+                .and_then(|file| file.sync_all())
+                .with_context(|| format!("syncing update helper {}", helper_path.display()))?;
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspecting update helper {}", helper_path.display()));
+        }
+    }
+
+    args.home = Some(layout.install_root.clone());
+    args.internal_helper_request = None;
+    let request_id = format!("update-{}-{}", std::process::id(), now_nanos_for_path());
+    let request_path = layout
+        .helper_requests_root
+        .join(format!("{request_id}.json"));
+    let result_path = layout
+        .helper_results_root
+        .join(format!("{request_id}.json"));
+    let log_path = layout.helper_results_root.join(format!("{request_id}.log"));
+    let request = DetachedUpdateHelperRequest {
+        schema: 1,
+        args: args.clone(),
+        helper_path: helper_path.clone(),
+        helper_sha256: source_sha256,
+        expected_processes: vec![current_identity],
+        created_at_unix: unix_epoch_seconds()?,
+    };
+    let mut request_bytes =
+        serde_json::to_vec_pretty(&request).context("serializing detached update request")?;
+    request_bytes.push(b'\n');
+    write_private_file(&request_path, &request_bytes)
+        .with_context(|| format!("writing detached update request {}", request_path.display()))?;
+    write_private_file(&log_path, b"")
+        .with_context(|| format!("creating detached update log {}", log_path.display()))?;
+    let stdout = fs::OpenOptions::new()
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("opening {}", log_path.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .with_context(|| format!("cloning {}", log_path.display()))?;
+    let mut command = windows_detached_command(&helper_path);
+    command
+        .arg("update")
+        .arg("--internal-helper-request")
+        .arg(&request_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    command
+        .spawn()
+        .with_context(|| format!("starting detached update helper {}", helper_path.display()))?;
+
+    let ack_path = request_path.with_extension("ack");
+    let ack_deadline = Instant::now() + Duration::from_secs(15);
+    while !ack_path.is_file() {
+        if Instant::now() >= ack_deadline {
+            bail!(
+                "detached update helper did not authenticate the parent process; see {}",
+                log_path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(DetachedUpdateLaunchReport {
+        ok: true,
+        helper: helper_path,
+        request_path,
+        result_path,
+        log_path,
+        json: args.json,
+    })
+}
+
+#[cfg(windows)]
+fn windows_process_identity(pid: u32) -> Result<Option<WindowsUpdateProcessIdentity>> {
+    let script = format!(
+        "$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue; \
+         if ($null -eq $p) {{ exit 3 }}; \
+         [ordered]@{{pid=[uint32]$p.Id;creation_time_utc_ticks=$p.StartTime.ToUniversalTime().Ticks.ToString([Globalization.CultureInfo]::InvariantCulture);executable_path=$p.Path}} \
+         | ConvertTo-Json -Compress"
+    );
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .with_context(|| format!("querying Windows process identity for pid {pid}"))?;
+    if output.status.code() == Some(3) {
+        return Ok(None);
+    }
+    if !output.status.success() {
+        bail!(
+            "Windows process identity query failed for pid {pid}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let identity: WindowsUpdateProcessIdentity =
+        serde_json::from_slice(&output.stdout).context("parsing Windows process identity")?;
+    Ok(Some(identity))
+}
+
+#[cfg(windows)]
+fn windows_processes_in_bin_root(root: &Path) -> Result<Vec<WindowsUpdateProcessIdentity>> {
+    let script = concat!(
+        "$root=[IO.Path]::GetFullPath($env:MAYHEM_UPDATE_BIN_ROOT).TrimEnd('\\')+'\\';",
+        "$items=@();",
+        "Get-Process | ForEach-Object { try {",
+        "$path=$_.Path;",
+        "if ($path -and $path.StartsWith($root,[StringComparison]::OrdinalIgnoreCase)) {",
+        "$items += [ordered]@{pid=[uint32]$_.Id;creation_time_utc_ticks=$_.StartTime.ToUniversalTime().Ticks.ToString([Globalization.CultureInfo]::InvariantCulture);executable_path=$path}",
+        "}} catch {} };",
+        "ConvertTo-Json -InputObject @($items) -Compress"
+    );
+    let output = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("MAYHEM_UPDATE_BIN_ROOT", root)
+        .output()
+        .with_context(|| format!("enumerating processes under {}", root.display()))?;
+    if !output.status.success() {
+        bail!(
+            "Windows release process enumeration failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("parsing Windows release process identities")
+}
+
+#[cfg(windows)]
+fn wait_for_windows_update_process_exit(
+    expected: &WindowsUpdateProcessIdentity,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let Some(actual) = windows_process_identity(expected.pid)? else {
+            return Ok(());
+        };
+        if validate_windows_update_process_identity(expected, &actual).is_err() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for authenticated update parent pid {} to exit",
+                expected.pid
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+async fn resolve_update_sources(
+    args: &UpdateArgs,
+    target: &str,
+    work_dir: &Path,
+    limits: &release_bundle::ReleaseExtractionLimits,
+) -> Result<UpdateSourceBytes> {
     let direct_count = [
         args.archive_url.is_some() || args.archive_path.is_some(),
         args.manifest_url.is_some() || args.manifest_path.is_some(),
@@ -9049,32 +11247,34 @@ async fn resolve_update_sources(args: &UpdateArgs, target: &str) -> Result<Updat
         if direct_count != 3 {
             bail!("direct update mode requires archive, manifest, and signature sources");
         }
-        let archive = load_update_blob(
+        let archive = load_update_archive(
             args.archive_path.as_ref(),
             args.archive_url.as_deref(),
-            "archive",
+            work_dir,
+            limits.max_archive_bytes,
         )
         .await?;
-        let manifest = load_update_blob(
+        let manifest = load_update_metadata_blob(
             args.manifest_path.as_ref(),
             args.manifest_url.as_deref(),
             "manifest",
+            limits.max_archive_metadata_bytes,
         )
         .await?;
-        let signature = load_update_blob(
+        let signature = load_update_metadata_blob(
             args.signature_path.as_ref(),
             args.signature_url.as_deref(),
             "signature",
+            limits.max_archive_metadata_bytes,
         )
         .await?;
         return Ok(UpdateSourceBytes {
-            archive_name: archive.name,
+            archive_path: archive.path,
             sources: UpdateSourceSummary {
                 archive: archive.source,
                 manifest: manifest.source,
                 signature: signature.source,
             },
-            archive: archive.bytes,
             manifest: manifest.bytes,
             signature: signature.bytes,
         });
@@ -9085,32 +11285,59 @@ async fn resolve_update_sources(args: &UpdateArgs, target: &str) -> Result<Updat
         .clone()
         .or_else(|| env::var("MAYHEM_RELEASE_FEED_URL").ok())
         .unwrap_or_else(|| DEFAULT_RELEASE_FEED_URL.to_owned());
-    let feed_bytes = fetch_update_url(&feed_url).await?;
+    let feed_bytes =
+        fetch_update_url_bounded(&feed_url, limits.max_archive_metadata_bytes, "release feed")
+            .await?;
     let feed: GithubRelease = serde_json::from_slice(&feed_bytes)
         .with_context(|| format!("parsing GitHub release feed {feed_url}"))?;
-    let version = args
+    let requested_version = args
         .version
         .clone()
         .unwrap_or_else(|| feed.tag_name.clone());
+    let version = requested_version
+        .strip_prefix('v')
+        .unwrap_or(&requested_version);
+    semver::Version::parse(version)
+        .with_context(|| format!("release version must be semantic: {requested_version}"))?;
     let base_name = format!("mayhem-{version}-{target}");
     let manifest_name = format!("{base_name}.manifest.json");
     let signature_name = format!("{manifest_name}{RELEASE_SIGNATURE_FILE_SUFFIX}");
-    let archive_name = [format!("{base_name}.tar.gz"), format!("{base_name}.zip")]
-        .into_iter()
-        .find(|name| feed.assets.iter().any(|asset| asset.name == *name))
-        .with_context(|| format!("release feed has no archive asset for {base_name}"))?;
+    let archive_name = if target.contains("windows") {
+        format!("{base_name}.zip")
+    } else {
+        format!("{base_name}.tar.gz")
+    };
+    if !feed.assets.iter().any(|asset| asset.name == archive_name) {
+        bail!("release feed has no archive asset {archive_name}");
+    }
     let archive_url = github_asset_url(&feed, &archive_name)?;
     let manifest_url = github_asset_url(&feed, &manifest_name)?;
     let signature_url = github_asset_url(&feed, &signature_name)?;
-    let archive = fetch_update_url(&archive_url).await?;
-    let manifest = fetch_update_url(&manifest_url).await?;
-    let signature = fetch_update_url(&signature_url).await?;
+    let archive_path = work_dir.join(&archive_name);
+    download_update_url_bounded(
+        &archive_url,
+        &archive_path,
+        limits.max_archive_bytes,
+        "release archive",
+    )
+    .await?;
+    let manifest = fetch_update_url_bounded(
+        &manifest_url,
+        limits.max_archive_metadata_bytes,
+        "release manifest",
+    )
+    .await?;
+    let signature = fetch_update_url_bounded(
+        &signature_url,
+        limits.max_archive_metadata_bytes,
+        "release signature",
+    )
+    .await?;
 
     Ok(UpdateSourceBytes {
-        archive,
+        archive_path,
         manifest,
         signature,
-        archive_name,
         sources: UpdateSourceSummary {
             archive: archive_url,
             manifest: manifest_url,
@@ -9120,65 +11347,229 @@ async fn resolve_update_sources(args: &UpdateArgs, target: &str) -> Result<Updat
 }
 
 #[derive(Debug)]
-struct UpdateBlob {
-    bytes: Vec<u8>,
-    name: String,
+struct UpdateArchive {
+    path: PathBuf,
     source: String,
 }
 
-async fn load_update_blob(
+#[derive(Debug)]
+struct UpdateBlob {
+    bytes: Vec<u8>,
+    source: String,
+}
+
+async fn load_update_archive(
+    path: Option<&PathBuf>,
+    url: Option<&str>,
+    work_dir: &Path,
+    max_bytes: u64,
+) -> Result<UpdateArchive> {
+    match (path, url) {
+        (Some(_), Some(_)) => bail!("pass either --archive-path or --archive-url, not both"),
+        (Some(path), None) => {
+            let path = absolutize(path.clone())?;
+            ensure_bounded_update_file(&path, max_bytes, "release archive")?;
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("archive path must have a UTF-8 file name")?
+                .to_owned();
+            validate_update_asset_name(&name, "archive")?;
+            Ok(UpdateArchive {
+                source: path.display().to_string(),
+                path,
+            })
+        }
+        (None, Some(url)) => {
+            let name = update_url_basename(url, "archive")?;
+            validate_update_asset_name(&name, "archive")?;
+            let path = work_dir.join(&name);
+            download_update_url_bounded(url, &path, max_bytes, "release archive").await?;
+            Ok(UpdateArchive {
+                path,
+                source: url.to_owned(),
+            })
+        }
+        (None, None) => bail!("missing archive source"),
+    }
+}
+
+async fn load_update_metadata_blob(
     path: Option<&PathBuf>,
     url: Option<&str>,
     label: &str,
+    max_bytes: u64,
 ) -> Result<UpdateBlob> {
     match (path, url) {
         (Some(_), Some(_)) => bail!("pass either --{label}-path or --{label}-url, not both"),
         (Some(path), None) => {
             let path = absolutize(path.clone())?;
+            ensure_bounded_update_file(&path, max_bytes, label)?;
             let bytes = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .with_context(|| format!("{label} path must have a UTF-8 file name"))?
-                .to_owned();
             Ok(UpdateBlob {
                 bytes,
-                name,
                 source: path.display().to_string(),
             })
         }
-        (None, Some(url)) => {
-            let bytes = fetch_update_url(url).await?;
-            Ok(UpdateBlob {
-                bytes,
-                name: update_url_basename(url, label)?,
-                source: url.to_owned(),
-            })
-        }
+        (None, Some(url)) => Ok(UpdateBlob {
+            bytes: fetch_update_url_bounded(url, max_bytes, label).await?,
+            source: url.to_owned(),
+        }),
         (None, None) => bail!("missing {label} source"),
     }
 }
 
-async fn fetch_update_url(url: &str) -> Result<Vec<u8>> {
+fn ensure_bounded_update_file(path: &Path, max_bytes: u64, label: &str) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("inspecting {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("{label} must be a real file: {}", path.display());
+    }
+    if metadata.len() > max_bytes {
+        bail!(
+            "{label} exceeds its byte limit ({} > {max_bytes})",
+            metadata.len()
+        );
+    }
+    Ok(())
+}
+
+async fn fetch_update_url_bounded(url: &str, max_bytes: u64, label: &str) -> Result<Vec<u8>> {
     if let Some(path) = url.strip_prefix("file://") {
+        let path = Path::new(path);
+        ensure_bounded_update_file(path, max_bytes, label)?;
         return fs::read(path).with_context(|| format!("reading {url}"));
     }
     let client = reqwest::Client::builder()
         .user_agent(format!("mayhem-update/{}", env!("CARGO_PKG_VERSION")))
         .build()
         .context("building update HTTP client")?;
-    let response = client
+    let mut response = client
         .get(url)
         .send()
         .await
         .with_context(|| format!("fetching {url}"))?
         .error_for_status()
         .with_context(|| format!("fetching {url}"))?;
-    Ok(response
-        .bytes()
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes)
+    {
+        bail!("{label} exceeds its byte limit");
+    }
+    let capacity = response
+        .content_length()
+        .unwrap_or(0)
+        .min(max_bytes)
+        .try_into()
+        .unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    while let Some(chunk) = response
+        .chunk()
         .await
         .with_context(|| format!("reading {url}"))?
-        .to_vec())
+    {
+        let next_len = bytes
+            .len()
+            .checked_add(chunk.len())
+            .context("download size overflowed")?;
+        if u64::try_from(next_len).unwrap_or(u64::MAX) > max_bytes {
+            bail!("{label} exceeds its byte limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn download_update_url_bounded(
+    url: &str,
+    destination: &Path,
+    max_bytes: u64,
+    label: &str,
+) -> Result<()> {
+    if destination.exists() {
+        bail!(
+            "refusing to overwrite update download {}",
+            destination.display()
+        );
+    }
+    let download = async {
+        if let Some(source) = url.strip_prefix("file://") {
+            ensure_bounded_update_file(Path::new(source), max_bytes, label)?;
+            let input = fs::File::open(source).with_context(|| format!("opening {source}"))?;
+            let mut output = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(destination)
+                .with_context(|| format!("creating {}", destination.display()))?;
+            let copied = io::copy(&mut input.take(max_bytes.saturating_add(1)), &mut output)
+                .with_context(|| format!("copying {source} to {}", destination.display()))?;
+            if copied > max_bytes {
+                bail!("{label} exceeds its byte limit");
+            }
+            output
+                .sync_all()
+                .with_context(|| format!("syncing {}", destination.display()))?;
+            return Ok(());
+        }
+
+        let client = reqwest::Client::builder()
+            .user_agent(format!("mayhem-update/{}", env!("CARGO_PKG_VERSION")))
+            .build()
+            .context("building update HTTP client")?;
+        let mut response = client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("fetching {url}"))?
+            .error_for_status()
+            .with_context(|| format!("fetching {url}"))?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes)
+        {
+            bail!("{label} exceeds its byte limit");
+        }
+        let mut output = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(destination)
+            .with_context(|| format!("creating {}", destination.display()))?;
+        let mut written = 0u64;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .with_context(|| format!("reading {url}"))?
+        {
+            written = written
+                .checked_add(u64::try_from(chunk.len()).context("chunk length overflowed")?)
+                .context("download size overflowed")?;
+            if written > max_bytes {
+                bail!("{label} exceeds its byte limit");
+            }
+            output
+                .write_all(&chunk)
+                .with_context(|| format!("writing {}", destination.display()))?;
+        }
+        output
+            .sync_all()
+            .with_context(|| format!("syncing {}", destination.display()))
+    }
+    .await;
+    if download.is_err() {
+        let _ = fs::remove_file(destination);
+    }
+    download
+}
+
+fn validate_update_asset_name(name: &str, label: &str) -> Result<()> {
+    if name.is_empty()
+        || Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name)
+        || name.bytes().any(|byte| byte.is_ascii_control())
+    {
+        bail!("{label} source has an unsafe file name");
+    }
+    Ok(())
 }
 
 fn github_asset_url(feed: &GithubRelease, name: &str) -> Result<String> {
@@ -9203,366 +11594,6 @@ fn release_manifest_signing_bytes(manifest_bytes: &[u8]) -> Vec<u8> {
     bytes.extend_from_slice(RELEASE_MANIFEST_DOMAIN);
     bytes.extend_from_slice(manifest_bytes);
     bytes
-}
-
-fn verify_release_manifest_signature(
-    manifest_bytes: &[u8],
-    signature: &ReleaseDetachedSignature,
-    keys_dir: Option<&Path>,
-    trusted_public_key: Option<&str>,
-    expected_key_id: Option<&str>,
-) -> Result<()> {
-    if signature.schema_version != 1 {
-        bail!("release manifest signature schema_version must be 1");
-    }
-    if signature.alg != "ed25519" {
-        bail!("release manifest signature alg must be ed25519");
-    }
-    validate_release_key_id(&signature.key_id)?;
-    if let Some(expected) = expected_key_id {
-        if signature.key_id != expected {
-            bail!(
-                "release manifest signed by key id {}, expected {}",
-                signature.key_id,
-                expected
-            );
-        }
-    }
-    let actual_sha256 = sha256_bytes_hex(manifest_bytes);
-    if !signature.sha256.eq_ignore_ascii_case(&actual_sha256) {
-        bail!(
-            "release manifest sha256 mismatch: signature says {}, actual {}",
-            signature.sha256,
-            actual_sha256
-        );
-    }
-    let trusted_key = match (trusted_public_key, keys_dir) {
-        (Some(public_key), _) => public_key.to_owned(),
-        (None, Some(keys_dir)) => {
-            let key_path = keys_dir.join(format!("{}.json", signature.key_id));
-            let record: ReleasePublicKeyRecord = serde_json::from_value(read_json_file(&key_path)?)
-                .with_context(|| format!("parsing release key record {}", key_path.display()))?;
-            if record.key_id != signature.key_id
-                || record.alg != "ed25519"
-                || record.status != "active"
-            {
-                bail!(
-                    "release key record {} is not active/valid",
-                    key_path.display()
-                );
-            }
-            record.public_key
-        }
-        (None, None) => bail!("no trusted release public key configured"),
-    };
-    if !trusted_key.eq_ignore_ascii_case(&signature.public_key) {
-        bail!("release manifest signature public key is not trusted");
-    }
-    let key_bytes = hex_decode_array::<32>(&signature.public_key, "release public key")?;
-    let sig_bytes = hex_decode_array::<64>(&signature.sig, "release manifest signature")?;
-    let verifying_key =
-        VerifyingKey::from_bytes(&key_bytes).context("release public key is invalid")?;
-    verifying_key
-        .verify_strict(
-            &release_manifest_signing_bytes(manifest_bytes),
-            &Signature::from_bytes(&sig_bytes),
-        )
-        .context("release manifest signature verification failed")
-}
-
-fn validate_release_manifest(manifest: &ReleaseManifest, target: &str) -> Result<()> {
-    if manifest.schema != 1 {
-        bail!("release manifest schema must be 1");
-    }
-    if manifest.name != "mayhem" {
-        bail!("release manifest name must be mayhem");
-    }
-    if manifest.version.trim().is_empty() {
-        bail!("release manifest version is required");
-    }
-    if manifest.target != target {
-        bail!(
-            "release manifest target {} does not match requested target {}",
-            manifest.target,
-            target
-        );
-    }
-    if manifest.binaries.is_empty() {
-        bail!("release manifest must list binaries");
-    }
-    if !manifest
-        .binaries
-        .iter()
-        .any(|binary| binary.name == release_mayhem_binary_name())
-    {
-        bail!(
-            "release manifest does not include {}",
-            release_mayhem_binary_name()
-        );
-    }
-    Ok(())
-}
-
-fn extract_release_archive(archive_path: &Path, extract_dir: &Path) -> Result<()> {
-    let name = archive_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("release archive path must have a UTF-8 file name")?;
-    if !name.ends_with(".tar.gz") {
-        bail!("mayhem update currently stages .tar.gz release archives; got {name}");
-    }
-    let file = fs::File::open(archive_path)
-        .with_context(|| format!("opening {}", archive_path.display()))?;
-    let decoder = GzDecoder::new(file);
-    let mut archive = tar::Archive::new(decoder);
-    archive
-        .unpack(extract_dir)
-        .with_context(|| format!("extracting {}", archive_path.display()))
-}
-
-fn find_extracted_release_root(extract_dir: &Path, manifest: &ReleaseManifest) -> Result<PathBuf> {
-    let expected = extract_dir.join(format!("mayhem-{}-{}", manifest.version, manifest.target));
-    if expected.join("manifest.json").is_file() {
-        return Ok(expected);
-    }
-    if extract_dir.join("manifest.json").is_file() {
-        return Ok(extract_dir.to_path_buf());
-    }
-    for entry in
-        fs::read_dir(extract_dir).with_context(|| format!("reading {}", extract_dir.display()))?
-    {
-        let entry = entry.with_context(|| format!("reading {}", extract_dir.display()))?;
-        let path = entry.path();
-        if path.is_dir() && path.join("manifest.json").is_file() {
-            return Ok(path);
-        }
-    }
-    bail!("release archive did not contain manifest.json")
-}
-
-fn verify_release_binaries(manifest: &ReleaseManifest, release_root: &Path) -> Result<PathBuf> {
-    let mut mayhem_binary = None;
-    for binary in &manifest.binaries {
-        if !is_hex_len(&binary.sha256, 64) {
-            bail!("release manifest binary {} sha256 is invalid", binary.name);
-        }
-        let path = release_relative_path(release_root, &binary.path)?;
-        if !path.is_file() {
-            bail!(
-                "release manifest binary {} missing at {}",
-                binary.name,
-                path.display()
-            );
-        }
-        let actual = file_sha256_hex(&path)?;
-        if !actual.eq_ignore_ascii_case(&binary.sha256) {
-            bail!(
-                "release binary {} sha256 mismatch: expected {}, actual {}",
-                binary.name,
-                binary.sha256,
-                actual
-            );
-        }
-        if binary.name == release_mayhem_binary_name() {
-            mayhem_binary = Some(path);
-        }
-    }
-    mayhem_binary
-        .with_context(|| format!("release manifest missing {}", release_mayhem_binary_name()))
-}
-
-fn release_relative_path(root: &Path, relative: &str) -> Result<PathBuf> {
-    let path = Path::new(relative);
-    if path.is_absolute() {
-        bail!("release manifest path {relative} must be relative");
-    }
-    for component in path.components() {
-        if matches!(
-            component,
-            std::path::Component::ParentDir | std::path::Component::Prefix(_)
-        ) {
-            bail!("release manifest path {relative} escapes release root");
-        }
-    }
-    Ok(root.join(path))
-}
-
-fn stage_release_update(
-    home: &Path,
-    manifest: &ReleaseManifest,
-    manifest_sha256: &str,
-    signature: &ReleaseDetachedSignature,
-    signature_bytes: &[u8],
-    release_root: &Path,
-    verified_binary: &Path,
-) -> Result<StagedRelease> {
-    let stage_parent = home.join("updates").join("staged");
-    fs::create_dir_all(&stage_parent)
-        .with_context(|| format!("creating {}", stage_parent.display()))?;
-    let dir_name = format!(
-        "{}-{}-{}",
-        safe_path_component(&manifest.version),
-        safe_path_component(&manifest.target),
-        &manifest_sha256[..12]
-    );
-    let stage_dir = stage_parent.join(dir_name);
-    let tmp_stage = stage_parent.join(format!(
-        ".tmp-{}-{}",
-        std::process::id(),
-        now_millis_for_path()
-    ));
-    if tmp_stage.exists() {
-        fs::remove_dir_all(&tmp_stage)
-            .with_context(|| format!("removing {}", tmp_stage.display()))?;
-    }
-    copy_dir_all(release_root, &tmp_stage)?;
-    fs::write(tmp_stage.join("manifest.json.sig"), signature_bytes)
-        .with_context(|| format!("writing {}", tmp_stage.join("manifest.json.sig").display()))?;
-    write_json_file(
-        &tmp_stage.join("stage.json"),
-        &ReleaseStageMetadata {
-            schema: 1,
-            version: manifest.version.clone(),
-            target: manifest.target.clone(),
-            manifest_sha256: manifest_sha256.to_owned(),
-            key_id: signature.key_id.clone(),
-            public_key: signature.public_key.clone(),
-            staged_at_unix: unix_epoch_seconds()?,
-        },
-    )?;
-    if stage_dir.exists() {
-        fs::remove_dir_all(&stage_dir)
-            .with_context(|| format!("replacing staged update {}", stage_dir.display()))?;
-    }
-    fs::rename(&tmp_stage, &stage_dir).with_context(|| {
-        format!(
-            "moving staged update {} to {}",
-            tmp_stage.display(),
-            stage_dir.display()
-        )
-    })?;
-    let relative_binary = verified_binary
-        .strip_prefix(release_root)
-        .context("verified binary is not inside release root")?;
-    Ok(StagedRelease {
-        staged_binary: stage_dir.join(relative_binary),
-        stage_dir,
-    })
-}
-
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
-    for entry in fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
-        let entry = entry.with_context(|| format!("reading {}", src.display()))?;
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("reading file type for {}", entry.path().display()))?;
-        let to = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_all(&entry.path(), &to)?;
-        } else if file_type.is_file() {
-            fs::copy(entry.path(), &to).with_context(|| {
-                format!("copying {} to {}", entry.path().display(), to.display())
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn copy_file_preserve_mode(src: &Path, dst: &Path) -> Result<()> {
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    fs::copy(src, dst)
-        .with_context(|| format!("copying {} to {}", src.display(), dst.display()))?;
-    #[cfg(unix)]
-    {
-        let permissions = fs::metadata(src)
-            .with_context(|| format!("reading permissions for {}", src.display()))?
-            .permissions();
-        fs::set_permissions(dst, permissions)
-            .with_context(|| format!("setting permissions on {}", dst.display()))?;
-    }
-    Ok(())
-}
-
-fn snapshot_update_state(
-    home: &Path,
-    requested_paths: &[PathBuf],
-    backup_dir: &Path,
-) -> Result<Vec<StateSnapshotEntry>> {
-    let paths = if requested_paths.is_empty() {
-        vec![home.join("config.toml"), home.join("rules")]
-    } else {
-        requested_paths
-            .iter()
-            .map(|path| absolutize(path.clone()))
-            .collect::<Result<Vec<_>>>()?
-    };
-    let mut snapshots = Vec::new();
-    for original in paths {
-        let name = original
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(safe_path_component)
-            .unwrap_or_else(|| "state".to_owned());
-        let backup = backup_dir.join("state").join(name);
-        if original.exists() {
-            copy_path(&original, &backup)?;
-            snapshots.push(StateSnapshotEntry {
-                original,
-                backup,
-                existed: true,
-            });
-        } else {
-            snapshots.push(StateSnapshotEntry {
-                original,
-                backup,
-                existed: false,
-            });
-        }
-    }
-    Ok(snapshots)
-}
-
-fn rollback_update(
-    current_bin: &Path,
-    backup_bin: &Path,
-    state_snapshots: &[StateSnapshotEntry],
-) -> Result<()> {
-    copy_file_preserve_mode(backup_bin, current_bin)?;
-    for entry in state_snapshots {
-        if entry.existed {
-            remove_path_if_exists(&entry.original)?;
-            copy_path(&entry.backup, &entry.original)?;
-        } else {
-            remove_path_if_exists(&entry.original)?;
-        }
-    }
-    Ok(())
-}
-
-fn copy_path(src: &Path, dst: &Path) -> Result<()> {
-    if src.is_dir() {
-        if dst.exists() {
-            fs::remove_dir_all(dst)
-                .with_context(|| format!("removing existing {}", dst.display()))?;
-        }
-        copy_dir_all(src, dst)
-    } else {
-        copy_file_preserve_mode(src, dst)
-    }
-}
-
-fn remove_path_if_exists(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    if path.is_dir() {
-        fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))
-    } else {
-        fs::remove_file(path).with_context(|| format!("removing {}", path.display()))
-    }
 }
 
 fn validate_release_key_id(key_id: &str) -> Result<()> {
@@ -9590,6 +11621,7 @@ fn release_host_target() -> String {
     format!("{arch}-{os}")
 }
 
+#[cfg(test)]
 fn release_mayhem_binary_name() -> &'static str {
     if cfg!(windows) {
         "mayhem.exe"
@@ -19519,6 +21551,9 @@ async fn admin(command: AdminCommands) -> Result<()> {
         AdminCommands::Ban { command } => return admin_ban(command).await,
         AdminCommands::Tier3 { command } => return admin_tier3(command).await,
         AdminCommands::EpochApply(args) => return run_admin_epoch_apply_feature(args).await,
+        AdminCommands::PublishPayoutContext(args) => {
+            return run_admin_publish_payout_context_feature(args).await;
+        }
         AdminCommands::TnkDeposit(args) => {
             return run_admin_deposit_feature(
                 &args.tx,
@@ -19574,11 +21609,6 @@ async fn admin(command: AdminCommands) -> Result<()> {
         }
         AdminCommands::ReputationAnchor(args) => {
             return run_admin_reputation_anchor(args).await;
-        }
-        AdminCommands::PayoutConfirm(_) => {
-            bail!(
-                "payout-confirm is retired; use TNK tnk-settlement evidence, TAP claim-proof tools, or Stripe settlement"
-            );
         }
         _ => {}
     }
@@ -20504,7 +22534,6 @@ async fn admin_disputes_resolve(args: &AdminDisputesResolveArgs) -> Result<()> {
         report["rpc_url"] = json!(rpc_url);
         report["wallet"] = json!({
             "public_key": wallet.public_key,
-            "keypair_path": wallet.keypair_path,
         });
         report["before"] = before.unwrap_or(Value::Null);
         report["tx"] = submitted;
@@ -20828,7 +22857,26 @@ fn print_dispute_alert_report(report: &Value) -> Result<()> {
 async fn run_admin_epoch_apply_feature(args: &AdminEpochApplyArgs) -> Result<()> {
     let value = admin_epoch_apply_payload(args)?;
     let key = epoch_apply_feature_key(&value)?;
-    run_admin_feature_command(&args.tx, "epochApply", key, value).await
+    run_admin_feature_command(&args.tx, "applyTargetedEpoch", key, value).await
+}
+
+async fn run_admin_publish_payout_context_feature(
+    args: &AdminPublishPayoutContextArgs,
+) -> Result<()> {
+    let home = args.tx.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.tx.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let admin = read_state_value(&rpc, "admin")
+        .await?
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .context("contract admin is not initialized")?;
+    let payments = read_state_value(&rpc, "payments/current")
+        .await?
+        .context("canonical payments/current is missing")?;
+    let value = admin_publish_payout_context_value(&payments, &admin, &args.bootstrap)?;
+    let key = admin_publish_payout_context_feature_key(&value)?;
+    run_admin_feature_command(&args.tx, "publishPayoutContext", key, value).await
 }
 
 async fn run_admin_deposit_feature(
@@ -20853,7 +22901,7 @@ async fn run_admin_tnk_settlement_feature(args: &AdminTnkSettlementArgs) -> Resu
     if args.settlement_json.is_some() || args.settlement_file.is_some() {
         let value = admin_tnk_settlement_payload(args)?;
         let key = tnk_settlement_feature_key(&value)?;
-        return run_admin_feature_command(&args.tx, "tnkSettlement", key, value).await;
+        return run_admin_feature_command(&args.tx, "settleTargetedTnk", key, value).await;
     }
     run_admin_tnk_settlement_runner(args).await
 }
@@ -21202,6 +23250,7 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::SetRules(args) => &args.tx,
         AdminCommands::SetParams(args) => &args.tx,
         AdminCommands::SetPayments(args) => &args.tx,
+        AdminCommands::PublishPayoutContext(args) => &args.tx,
         AdminCommands::SetModelRef(args) => &args.tx,
         AdminCommands::PublishCatalog(args) => &args.tx,
         AdminCommands::RegisterEnclave(args) => &args.tx,
@@ -21220,7 +23269,6 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::Disputes { .. } => {
             unreachable!("admin disputes are handled before admin_tx_args")
         }
-        AdminCommands::SetProviderPayout(args) => &args.tx,
         AdminCommands::SetProviderKyb(args) => &args.tx,
         AdminCommands::RevokeProviderKyb(args) => &args.tx,
         AdminCommands::BanProvider(args) => &args.tx,
@@ -21247,7 +23295,6 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::TapDepositReversal(args) => &args.tx,
         AdminCommands::FiatDeposit(args) => &args.tx,
         AdminCommands::FiatChargeback(args) => &args.tx,
-        AdminCommands::PayoutConfirm(args) => &args.tx,
         AdminCommands::EpochCommit(args) => &args.tx,
         AdminCommands::EpochSealEmpty(args) => &args.tx,
         AdminCommands::EpochApply(args) => &args.tx,
@@ -21262,6 +23309,9 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         AdminCommands::SetRules(args) => Ok(("setRules", admin_set_rules_payload(args))),
         AdminCommands::SetParams(args) => Ok(("setParams", admin_set_params_payload(args)?)),
         AdminCommands::SetPayments(args) => Ok(("setPayments", admin_set_payments_payload(args)?)),
+        AdminCommands::PublishPayoutContext(_) => {
+            bail!("payout context publication is a free admin feature, not a paid admin tx")
+        }
         AdminCommands::SetModelRef(args) => Ok(("setModelRef", admin_set_model_ref_payload(args)?)),
         AdminCommands::PublishCatalog(args) => {
             Ok(("publishCatalog", admin_publish_catalog_payload(args)?))
@@ -21301,10 +23351,6 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         AdminCommands::Disputes { .. } => {
             bail!("admin disputes are handled outside generic paid admin commands")
         }
-        AdminCommands::SetProviderPayout(args) => Ok((
-            "setProviderPayout",
-            admin_set_provider_payout_payload(args)?,
-        )),
         AdminCommands::SetProviderKyb(args) => {
             Ok(("setProviderKyb", admin_set_provider_kyb_payload(args)?))
         }
@@ -21356,14 +23402,13 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         AdminCommands::FiatChargeback(args) => {
             Ok(("fiatChargeback", admin_fiat_chargeback_payload(args)?))
         }
-        AdminCommands::PayoutConfirm(args) => {
-            admin_payout_confirm_payload(args).map(|value| ("payoutConfirm", value))
-        }
         AdminCommands::EpochCommit(args) => Ok(("epochCommit", admin_epoch_commit_payload(args)?)),
         AdminCommands::EpochSealEmpty(args) => {
             Ok(("epochSealEmpty", admin_epoch_seal_empty_payload(args)?))
         }
-        AdminCommands::EpochApply(args) => Ok(("epochApply", admin_epoch_apply_payload(args)?)),
+        AdminCommands::EpochApply(args) => {
+            Ok(("applyTargetedEpoch", admin_epoch_apply_payload(args)?))
+        }
     }
 }
 
@@ -21481,6 +23526,53 @@ fn admin_set_payments_payload(args: &AdminSetPaymentsArgs) -> Result<Value> {
             "treasury_address": treasury,
         },
     }))
+}
+
+fn admin_publish_payout_context_value(
+    payments_value: &Value,
+    admin: &str,
+    bootstrap: &str,
+) -> Result<Value> {
+    ensure!(
+        is_hex_len(admin, 64) && admin == admin.to_ascii_lowercase(),
+        "contract admin must be 32-byte lower-case hexadecimal"
+    );
+    ensure!(
+        is_hex_len(bootstrap, 64) && bootstrap == bootstrap.to_ascii_lowercase(),
+        "--bootstrap must be 32-byte lower-case hexadecimal"
+    );
+    let payments: CanonicalPayments = serde_json::from_value(payments_value.clone())
+        .context("canonical payments/current has an invalid schema")?;
+    validate_canonical_payments(&payments, admin)?;
+    ensure!(
+        is_safe_key_part(&payments.tnk.network),
+        "canonical payout network is invalid"
+    );
+    Ok(json!({
+        "op": "publish_payout_context",
+        "network": payments.tnk.network,
+        "admin": admin,
+        "bootstrap": bootstrap,
+        "payment_config_version": payments.ver,
+        "payment_config_hash": opaque_value_hash(
+            "mayhem-payout-payment-config-v1",
+            payments_value,
+        ),
+    }))
+}
+
+fn admin_publish_payout_context_feature_key(value: &Value) -> Result<String> {
+    ensure!(
+        value.get("op").and_then(Value::as_str) == Some("publish_payout_context"),
+        "payout context feature op must be publish_payout_context"
+    );
+    let version = value
+        .get("payment_config_version")
+        .and_then(Value::as_u64)
+        .filter(|version| *version > 0)
+        .context("payout context payment config version must be positive")?;
+    let revision = opaque_value_hash("mayhem-payout-context-feature-v1", value);
+    Ok(format!("payout/context/{version}/{revision}"))
 }
 
 fn admin_set_model_ref_payload(args: &AdminSetModelRefArgs) -> Result<Value> {
@@ -22299,30 +24391,6 @@ fn normalize_admin_fiat_currency(value: &str) -> Result<String> {
     }
 }
 
-fn admin_set_provider_payout_payload(args: &AdminSetProviderPayoutArgs) -> Result<Value> {
-    let mut payload = json!({
-        "op": "set_provider_payout",
-        "provider": &args.provider,
-        "payout_method": args.payout_method.as_str(),
-        "payout_addr": &args.payout_addr,
-    });
-    match args.payout_method {
-        AdminPayoutMethod::Tnk | AdminPayoutMethod::Tap => {
-            if args.payout_currency.is_some() {
-                bail!("crypto payout targets must not include --payout-currency");
-            }
-        }
-        AdminPayoutMethod::Stripe => {
-            let payout_currency = args
-                .payout_currency
-                .as_deref()
-                .context("fiat payout targets require --payout-currency")?;
-            payload["payout_currency"] = json!(normalize_admin_fiat_currency(payout_currency)?);
-        }
-    }
-    Ok(payload)
-}
-
 fn admin_set_provider_kyb_payload(args: &AdminSetProviderKybArgs) -> Result<Value> {
     if !is_hex_len(&args.provider, 64) {
         bail!("--provider must be a 32-byte hex public key");
@@ -22541,8 +24609,8 @@ fn admin_tnk_settlement_payload(args: &AdminTnkSettlementArgs) -> Result<Value> 
         None,
         "TNK settlement",
     )?;
-    if value.get("op").and_then(Value::as_str) != Some("tnk_settlement") {
-        bail!("TNK settlement payload must have op=tnk_settlement");
+    if value.get("op").and_then(Value::as_str) != Some("settle_targeted_tnk") {
+        bail!("TNK settlement payload must have op=settle_targeted_tnk");
     }
     Ok(value)
 }
@@ -22554,8 +24622,8 @@ fn admin_fiat_settlement_payload(args: &AdminFiatSettlementArgs) -> Result<Value
         None,
         "fiat settlement",
     )?;
-    if value.get("op").and_then(Value::as_str) != Some("fiat_settlement") {
-        bail!("fiat settlement payload must have op=fiat_settlement");
+    if value.get("op").and_then(Value::as_str) != Some("settle_targeted_fiat") {
+        bail!("fiat settlement payload must have op=settle_targeted_fiat");
     }
     Ok(value)
 }
@@ -22765,7 +24833,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             .cloned()
             .unwrap_or(Value::Null);
         settlement_state = Some(
-            wait_for_state(&rpc, &format!("settle/tnk/{epoch}"), |value| {
+            wait_for_state(&rpc, &format!("settle/targeted/tnk/{epoch}"), |value| {
                 value.get("msb_transfers") == Some(&expected_transfers)
                     && value.get("transfer_root") == Some(&expected_root)
                     && value.get("epoch").and_then(Value::as_u64) == Some(epoch)
@@ -22892,7 +24960,7 @@ async fn run_admin_fiat_settlement_feature(args: &AdminFiatSettlementArgs) -> Re
     if args.settlement_json.is_some() || args.settlement_file.is_some() {
         let value = admin_fiat_settlement_payload(args)?;
         let key = fiat_settlement_feature_key(&value)?;
-        return run_admin_feature_command(&args.tx, "fiatSettlement", key, value).await;
+        return run_admin_feature_command(&args.tx, "settleTargetedFiat", key, value).await;
     }
     run_admin_fiat_settlement_runner(args).await
 }
@@ -23029,6 +25097,10 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                             .provider
                             .as_deref()
                             .context("Stripe provider transfer output missing provider")?,
+                        output
+                            .payout_revision
+                            .as_deref()
+                            .context("Stripe provider transfer output missing payout revision")?,
                         &plan.epoch_apply_hash,
                     )?,
                     epoch,
@@ -23127,7 +25199,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             .cloned()
             .unwrap_or(Value::Null);
         settlement_state = Some(
-            wait_for_state(&rpc, &format!("settle/fiat/{epoch}"), |value| {
+            wait_for_state(&rpc, &format!("settle/targeted/fiat/{epoch}"), |value| {
                 value.get("stripe_transfers") == Some(&expected_transfers)
                     && value.get("transfer_root") == Some(&expected_root)
                     && value.get("epoch").and_then(Value::as_u64) == Some(epoch)
@@ -23185,8 +25257,16 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                 .provider
                 .as_deref()
                 .context("Stripe provider transfer output missing provider")?;
-            let idempotency_key =
-                stripe_transfer_idempotency_key(epoch, provider, &plan.epoch_apply_hash)?;
+            let payout_revision = output
+                .payout_revision
+                .as_deref()
+                .context("Stripe provider transfer output missing payout revision")?;
+            let idempotency_key = stripe_transfer_idempotency_key(
+                epoch,
+                provider,
+                payout_revision,
+                &plan.epoch_apply_hash,
+            )?;
             let transfer_group = format!(
                 "mayhem_fiat_epoch_{epoch}_{}",
                 plan.epoch_apply_hash
@@ -23194,7 +25274,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                     .unwrap_or(&plan.epoch_apply_hash)
             );
             Ok(format!(
-                "curl -sS {} -u \"$STRIPE_SECRET_KEY:\" -H {} -d amount={} -d currency={} -d destination={} -d transfer_group={} -d metadata[mayhem_provider]={} -d metadata[mayhem_epoch]={} -d metadata[mayhem_output_index]={} -d metadata[mayhem_epoch_apply_hash]={}",
+                "curl -sS {} -u \"$STRIPE_SECRET_KEY:\" -H {} -d amount={} -d currency={} -d destination={} -d transfer_group={} -d metadata[mayhem_provider]={} -d metadata[mayhem_payout_revision]={} -d metadata[mayhem_epoch]={} -d metadata[mayhem_output_index]={} -d metadata[mayhem_epoch_apply_hash]={}",
                 shell_single_quote(&format!("{}/v1/transfers", stripe_api_base_url(args.stripe_api_base_url.as_deref()).unwrap_or_else(|_| "https://api.stripe.com".to_owned()).trim_end_matches('/'))),
                 shell_single_quote(&format!("Idempotency-Key: {idempotency_key}")),
                 output.amount_minor,
@@ -23202,6 +25282,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                 shell_single_quote(&output.to),
                 shell_single_quote(&transfer_group),
                 shell_single_quote(provider),
+                shell_single_quote(payout_revision),
                 epoch,
                 index,
                 shell_single_quote(&plan.epoch_apply_hash)
@@ -23340,12 +25421,6 @@ fn admin_fiat_chargeback_payload(args: &AdminFiatChargebackArgs) -> Result<Value
     }))
 }
 
-fn admin_payout_confirm_payload(_args: &AdminPayoutConfirmArgs) -> Result<Value> {
-    bail!(
-        "payout-confirm is retired; use TNK tnk-settlement evidence, TAP claim-proof tools, or Stripe settlement"
-    )
-}
-
 fn admin_epoch_commit_payload(args: &AdminEpochCommitArgs) -> Result<Value> {
     let recomputed = read_optional_json_file(args.recomputed_file.as_ref(), "recomputed epoch")?;
     let epoch = epoch_arg_or_recomputed(args.epoch, recomputed.as_ref())?;
@@ -23396,6 +25471,12 @@ fn admin_epoch_apply_payload(args: &AdminEpochApplyArgs) -> Result<Value> {
         recomputed_field(recomputed.as_ref(), "earnings").or_else(|| Some(json!([]))),
         "epoch earnings",
     )?;
+    let allocations = json_arg_or_file_array(
+        args.allocations_json.as_deref(),
+        args.allocations_file.as_ref(),
+        recomputed_field(recomputed.as_ref(), "allocations"),
+        "epoch payout allocations",
+    )?;
     let explicit_market_usage = optional_json_arg_or_file(
         args.market_usage_json.as_deref(),
         args.market_usage_file.as_ref(),
@@ -23407,11 +25488,12 @@ fn admin_epoch_apply_payload(args: &AdminEpochApplyArgs) -> Result<Value> {
         ensure_json_array(value, "epoch market usage")?;
     }
     let mut payload = json!({
-        "op": "epoch_apply",
+        "op": "apply_targeted_epoch",
         "epoch": epoch,
         "at": args.at,
         "debits": debits,
         "earnings": earnings,
+        "allocations": allocations,
     });
     if paged {
         if args.roots_json.is_some()
@@ -23451,10 +25533,10 @@ fn epoch_apply_feature_key(value: &Value) -> Result<String> {
         .and_then(Value::as_u64)
         .context("epoch apply payload missing epoch")?;
     let digest = stable_value_hash(&json!({
-        "domain": "mayhem-epoch-apply-feature-v1",
+        "domain": "mayhem-targeted-epoch-feature-v1",
         "value": value,
     }));
-    Ok(format!("epoch/apply/{epoch}/{digest}"))
+    Ok(format!("epoch/targeted/{epoch}/{digest}"))
 }
 
 fn deposit_feature_key(value: &Value) -> Result<String> {
@@ -23554,10 +25636,10 @@ fn tnk_settlement_feature_key(value: &Value) -> Result<String> {
         .and_then(Value::as_u64)
         .context("TNK settlement feature payload missing epoch")?;
     let digest = stable_value_hash(&json!({
-        "domain": "mayhem-tnk-settlement-feature-v1",
+        "domain": "mayhem-targeted-tnk-settlement-feature-v1",
         "value": value,
     }));
-    Ok(format!("settle/tnk/{epoch}/{digest}"))
+    Ok(format!("settle/targeted/tnk/{epoch}/{digest}"))
 }
 
 fn fiat_settlement_feature_key(value: &Value) -> Result<String> {
@@ -23566,10 +25648,10 @@ fn fiat_settlement_feature_key(value: &Value) -> Result<String> {
         .and_then(Value::as_u64)
         .context("fiat settlement feature payload missing epoch")?;
     let digest = stable_value_hash(&json!({
-        "domain": "mayhem-fiat-settlement-feature-v1",
+        "domain": "mayhem-targeted-fiat-settlement-feature-v1",
         "value": value,
     }));
-    Ok(format!("settle/fiat/{epoch}/{digest}"))
+    Ok(format!("settle/targeted/fiat/{epoch}/{digest}"))
 }
 
 fn fiat_dust_sweep_feature_key(value: &Value) -> Result<String> {
@@ -23819,7 +25901,7 @@ async fn run_admin_feature_command(
         report["submitted"] = json!(true);
         report["rpc_url"] = json!(rpc_url);
         report["result"] = submitted;
-        if feature_type == "epochApply" {
+        if feature_type == "applyTargetedEpoch" {
             let epoch = value
                 .get("epoch")
                 .and_then(Value::as_u64)
@@ -26593,8 +28675,10 @@ struct UpPlan {
     supervisor_config_path: PathBuf,
     mayhemd_path: PathBuf,
     mayhem_path: PathBuf,
+    paygate_path: PathBuf,
     pear_runtime: PathBuf,
     intercom_dir: PathBuf,
+    paygate_internal_auth_secret_path: PathBuf,
     role: Role,
     provider: bool,
     network: String,
@@ -26630,8 +28714,6 @@ struct UpPlan {
     provider_hardware_quote_kind: Option<String>,
     provider_hardware_quote_command: Option<PathBuf>,
     provider_hardware_quote_timeout_seconds: u64,
-    hardware_quote_verifier_command: Option<PathBuf>,
-    hardware_quote_verifier_timeout_seconds: u64,
     fraud_challenger: bool,
     fraud_challenger_poll_interval_seconds: u64,
 }
@@ -26814,6 +28896,15 @@ async fn up(args: UpArgs) -> Result<()> {
     } else {
         None
     };
+    let provider_leave_outbox = {
+        let rpc = PeerRpcClient::new(&plan.rpc_url)?;
+        let result =
+            flush_provider_leave_outbox_with_budget(&plan.home, &rpc, PROVIDER_LEAVE_REPLAY_BUDGET)
+                .await;
+        let report = provider_leave_replay_report_for_up(result, &plan.home);
+        enforce_provider_leave_replay_before_worker_start(plan.provider, &report)?;
+        report
+    };
     let bridge_health = wait_until_ready("SC-Bridge", deadline, || {
         let url = plan.sc_bridge_url.clone();
         let token = plan.sc_bridge_token.clone();
@@ -26904,6 +28995,7 @@ async fn up(args: UpArgs) -> Result<()> {
             },
         },
         "provider": plan.provider,
+        "provider_leave_outbox": &provider_leave_outbox,
         "provider_workers": provider_worker_report,
         "provider_auto_fit": &provider_auto_fit_report,
         "provider_explicit_launch": &provider_explicit_launch_report,
@@ -26956,7 +29048,31 @@ async fn up(args: UpArgs) -> Result<()> {
                 "Shared gateway notice: serving unencrypted HTTP on this network bind; use a TLS reverse proxy or Tailscale/VPN for WAN exposure."
             );
         }
+        if provider_leave_outbox["remaining"].as_u64().unwrap_or(0) > 0 {
+            println!(
+                "Provider leave replay retained {} pending entr{} under {}.",
+                provider_leave_outbox["remaining"].as_u64().unwrap_or(0),
+                if provider_leave_outbox["remaining"].as_u64() == Some(1) {
+                    "y"
+                } else {
+                    "ies"
+                },
+                provider_leave_outbox_dir(&plan.home).display()
+            );
+        }
         if plan.provider {
+            if provider_leave_outbox["replayed"]
+                .as_array()
+                .is_some_and(|replayed| !replayed.is_empty())
+            {
+                println!(
+                    "Confirmed {} pending provider leave(s) before starting workers.",
+                    provider_leave_outbox["replayed"]
+                        .as_array()
+                        .map(Vec::len)
+                        .unwrap_or(0)
+                );
+            }
             let deferred_report = provider_auto_fit_report
                 .as_ref()
                 .or(provider_explicit_launch_report.as_ref());
@@ -27348,6 +29464,7 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
     let supervisor_bind = format!("127.0.0.1:{}", args.supervisor_port);
     let supervisor_url = format!("http://{supervisor_bind}");
     let mayhemd_control_token = load_or_create_mayhemd_control_token(&home)?;
+    let paygate_internal_auth_secret_path = load_or_create_paygate_internal_auth_secret(&home)?;
     let wallet_password = args
         .wallet_password
         .clone()
@@ -27481,6 +29598,7 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
 
     let mayhem_path = env::current_exe().context("resolving current mayhem binary")?;
     let mayhemd_path = sibling_binary_path(&mayhem_path, "mayhemd");
+    let paygate_path = sibling_binary_path(&mayhem_path, "mayhem-paygate");
     let pear_runtime = resolve_pear_runtime_path()?;
     let intercom_dir = repo_path("intercom")?;
     let supervisor_config_path = home.join("mayhemd-up.toml");
@@ -27502,23 +29620,16 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
             "--provider-hardware-quote-kind is required with --provider-hardware-quote-command"
         ),
     };
-    let hardware_quote_verifier_command = match args.hardware_quote_verifier_command.as_ref() {
-        Some(command) => {
-            if args.hardware_quote_verifier_timeout_seconds == 0 {
-                bail!("--hardware-quote-verifier-timeout-seconds must be positive");
-            }
-            Some(resolve_provider_quote_command(command)?)
-        }
-        None => None,
-    };
     Ok(UpPlan {
         home,
         config_path,
         supervisor_config_path,
         mayhemd_path,
         mayhem_path,
+        paygate_path,
         pear_runtime,
         intercom_dir,
+        paygate_internal_auth_secret_path,
         role,
         provider: args.provider,
         network,
@@ -27554,8 +29665,6 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
         provider_hardware_quote_kind: args.provider_hardware_quote_kind.clone(),
         provider_hardware_quote_command,
         provider_hardware_quote_timeout_seconds: args.provider_hardware_quote_timeout_seconds,
-        hardware_quote_verifier_command,
-        hardware_quote_verifier_timeout_seconds: args.hardware_quote_verifier_timeout_seconds,
         fraud_challenger: args.fraud_challenger,
         fraud_challenger_poll_interval_seconds: args.fraud_challenger_poll_interval_seconds,
     })
@@ -27889,6 +29998,11 @@ fn validate_hex32_config(name: &str, value: Option<&str>) -> Result<()> {
 }
 
 fn write_up_supervisor_config(plan: &UpPlan) -> Result<()> {
+    ensure!(
+        plan.paygate_internal_auth_secret_path == paygate_internal_auth_secret_path(&plan.home),
+        "paygate internal authentication path does not match the selected Mayhem home"
+    );
+    validate_paygate_internal_auth_secret(&plan.paygate_internal_auth_secret_path)?;
     if let Some(parent) = plan.supervisor_config_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
@@ -27912,6 +30026,8 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
     writeln!(&mut out)?;
 
     let stores_directory = plan.home.join("stores").display().to_string();
+    let paygate_auth_secret_path = plan.paygate_internal_auth_secret_path.display().to_string();
+    let mayhem_home = plan.home.display().to_string();
     let mut peer_args = vec![
         "run".to_owned(),
         ".".to_owned(),
@@ -28004,7 +30120,26 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         &plan.pear_runtime,
         &peer_args,
         Some(&plan.intercom_dir),
-        &[],
+        &[(
+            "MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE",
+            paygate_auth_secret_path.as_str(),
+        )],
+    )?;
+
+    let paygate_args = vec!["--contract-rpc-url".to_owned(), plan.rpc_url.clone()];
+    write_supervisor_child(
+        &mut out,
+        "paygate",
+        &plan.paygate_path,
+        &paygate_args,
+        None,
+        &[
+            ("MAYHEM_HOME", mayhem_home.as_str()),
+            (
+                "MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE",
+                paygate_auth_secret_path.as_str(),
+            ),
+        ],
     )?;
 
     let mut gateway_args = vec![
@@ -28022,14 +30157,6 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
     ];
     if plan.gateway_require_auth {
         gateway_args.push("--require-auth".to_owned());
-    }
-    if let Some(command) = &plan.hardware_quote_verifier_command {
-        gateway_args.extend([
-            "--hardware-quote-verifier-command".to_owned(),
-            command.display().to_string(),
-            "--hardware-quote-verifier-timeout-seconds".to_owned(),
-            plan.hardware_quote_verifier_timeout_seconds.to_string(),
-        ]);
     }
     if plan.dev_embedded_catalog {
         gateway_args.push("--dev-embedded-catalog".to_owned());
@@ -28275,6 +30402,82 @@ fn sc_bridge_token_file_path(home: &Path) -> PathBuf {
     home.join(SC_BRIDGE_TOKEN_FILE)
 }
 
+fn paygate_internal_auth_secret_path(home: &Path) -> PathBuf {
+    home.join(PAYGATE_INTERNAL_AUTH_SECRET_FILE)
+}
+
+fn validate_paygate_internal_auth_secret(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading metadata for {}", path.display()))?;
+    ensure!(
+        !metadata.file_type().is_symlink() && metadata.is_file(),
+        "{} must be a regular private secret file",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        ensure!(
+            metadata.permissions().mode() & 0o077 == 0,
+            "{} must not be group/world accessible",
+            path.display()
+        );
+    }
+    let secret = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let secret = secret.trim();
+    ensure!(
+        is_hex_len(secret, 64) && secret == secret.to_ascii_lowercase(),
+        "{} contains an invalid internal authentication secret",
+        path.display()
+    );
+    Ok(())
+}
+
+fn load_or_create_paygate_internal_auth_secret(home: &Path) -> Result<PathBuf> {
+    let path = paygate_internal_auth_secret_path(home);
+    if path.exists() {
+        validate_paygate_internal_auth_secret(&path)?;
+        return Ok(path);
+    }
+    let parent = path
+        .parent()
+        .context("paygate internal authentication secret path has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("securing {}", parent.display()))?;
+    }
+    let mut random = [0_u8; 32];
+    getrandom::fill(&mut random).context("generating paygate internal authentication entropy")?;
+    let secret = hex_encode(&random);
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&path) {
+        Ok(mut file) => {
+            writeln!(file, "{secret}").with_context(|| format!("writing {}", path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("syncing {}", path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("securing {}", path.display()))?;
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).with_context(|| format!("creating {}", path.display())),
+    }
+    validate_paygate_internal_auth_secret(&path)?;
+    Ok(path)
+}
+
 fn load_or_create_mayhemd_control_token(home: &Path) -> Result<String> {
     let path = mayhemd_control_token_path(home);
     if path.exists() {
@@ -28309,12 +30512,37 @@ fn read_pid_file(path: &Path) -> Result<Option<u32>> {
     Ok(Some(pid))
 }
 
+#[cfg(unix)]
+fn unix_process_id(pid: u32) -> Option<i32> {
+    i32::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_state(stat: &str) -> Option<u8> {
+    let (_, fields) = stat.rsplit_once(") ")?;
+    let state = fields.split_ascii_whitespace().next()?.as_bytes();
+    (state.len() == 1).then_some(state[0])
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_state(pid: i32) -> Option<u8> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_linux_process_state(&stat)
+}
+
 fn process_is_running(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
     #[cfg(unix)]
     {
+        let Some(pid) = unix_process_id(pid) else {
+            return false;
+        };
+        #[cfg(target_os = "linux")]
+        if linux_process_state(pid) == Some(b'Z') {
+            return false;
+        }
         return std::process::Command::new("kill")
             .arg("-0")
             .arg(pid.to_string())
@@ -28348,6 +30576,9 @@ fn send_process_signal(pid: u32, force: bool) -> Result<bool> {
     }
     #[cfg(unix)]
     {
+        let Some(pid) = unix_process_id(pid) else {
+            return Ok(false);
+        };
         let signal = if force { "-KILL" } else { "-TERM" };
         let status = std::process::Command::new("kill")
             .arg(signal)
@@ -29235,11 +31466,18 @@ const DEFAULT_GATEWAY_CATALOG_REFRESH_MILLIS: u64 = 60_000;
 #[derive(Clone)]
 struct GatewayCatalogWatcherConfig {
     rpc_url: String,
-    catalog_doc: Option<catalog::CatalogDocument>,
+    dev_catalog: Option<GatewayDevCatalogSnapshot>,
     hardware: HardwareReport,
     home: PathBuf,
     refresh_interval: Duration,
-    initial_models_json: String,
+}
+
+#[derive(Clone)]
+struct GatewayDevCatalogSnapshot {
+    catalog_hash: String,
+    catalog_doc: catalog::CatalogDocument,
+    canary_registry: GatewayCanaryRegistry,
+    attestation_authority: catalog::CatalogAttestationAuthority,
 }
 
 fn spawn_gateway_catalog_watcher(state: GatewayState, config: GatewayCatalogWatcherConfig) {
@@ -29273,18 +31511,79 @@ async fn run_gateway_catalog_watcher(
 ) -> Result<()> {
     let rpc =
         PeerRpcClient::new(&config.rpc_url).context("creating gateway catalog watcher RPC")?;
-    let mut applied_models_json = config.initial_models_json.clone();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("building gateway catalog watcher HTTP client")?;
+    let mut applied_snapshot = String::new();
     let mut last_error = None;
     loop {
         sleep(config.refresh_interval).await;
         let refresh = async {
             let contract = read_contract_catalog(&rpc).await?;
-            let models = gateway_models_from_contract(&contract)?;
-            let (models, _version_gates) = match config.catalog_doc.as_ref() {
-                Some(catalog_doc) => filter_gateway_models_by_app_version(models, catalog_doc)?,
-                None => (models, Vec::new()),
+            let contract_models = gateway_models_from_contract(&contract)?;
+            let policy_epoch = active_billing_epoch(&rpc).await?;
+            let (catalog_hash, catalog_doc, canary_registry, attestation_authority) =
+                match config.dev_catalog.as_ref() {
+                    Some(dev) => (
+                        dev.catalog_hash.clone(),
+                        Some(dev.catalog_doc.clone()),
+                        dev.canary_registry.clone(),
+                        dev.attestation_authority.clone(),
+                    ),
+                    None => match read_optional_catalog_release_anchor(&rpc).await? {
+                        Some(release) => {
+                            let files =
+                                fetch_catalog_release_files(&client, &config.home, &release)
+                                    .await?;
+                            let catalog_doc = catalog::load_document(&files.catalog_path)
+                                .with_context(|| {
+                                    format!(
+                                        "loading refreshed ledger catalog {}",
+                                        files.catalog_path.display()
+                                    )
+                                })?;
+                            let catalog_json = fs::read_to_string(&files.catalog_path)
+                                .with_context(|| {
+                                    format!(
+                                        "reading refreshed ledger catalog {}",
+                                        files.catalog_path.display()
+                                    )
+                                })?;
+                            let canary_json_by_set =
+                                load_catalog_canary_json_by_set(&catalog_doc, &files.canaries_dir)?;
+                            let canary_registry =
+                                GatewayState::canary_registry_from_catalog_and_canary_json(
+                                    &catalog_json,
+                                    &canary_json_by_set,
+                                )
+                                .map_err(anyhow::Error::msg)
+                                .context("loading refreshed gateway canary registry")?;
+                            (
+                                release.catalog_hash,
+                                Some(catalog_doc),
+                                canary_registry,
+                                files.attestation_authority,
+                            )
+                        }
+                        None if contract_models.is_empty() => (
+                            "unpublished-empty".to_owned(),
+                            None,
+                            GatewayCanaryRegistry::default(),
+                            catalog::CatalogAttestationAuthority::default(),
+                        ),
+                        None => bail!(
+                            "catalog/current disappeared while canonical models remain published"
+                        ),
+                    },
+                };
+            let (models, _version_gates) = match catalog_doc.as_ref() {
+                Some(catalog_doc) => {
+                    filter_gateway_models_by_app_version(contract_models, catalog_doc)?
+                }
+                None => (contract_models, Vec::new()),
             };
-            let models = match config.catalog_doc.as_ref() {
+            let models = match catalog_doc.as_ref() {
                 Some(catalog_doc) => annotate_gateway_models_with_local_runs(
                     models,
                     &contract,
@@ -29294,20 +31593,31 @@ async fn run_gateway_catalog_watcher(
                 ),
                 None => models,
             };
-            Result::<_, anyhow::Error>::Ok(models)
+            let authority = load_gateway_attestation_authority(
+                &client,
+                &config.home,
+                &attestation_authority,
+                policy_epoch,
+            )
+            .await?;
+            let snapshot = serde_json::to_string(&json!({
+                "catalog_hash": catalog_hash,
+                "policy_epoch": policy_epoch,
+                "models": &models,
+            }))
+            .context("serializing refreshed authenticated catalog fingerprint")?;
+            Result::<_, anyhow::Error>::Ok((models, canary_registry, authority, snapshot))
         }
         .await;
         match refresh {
-            Ok(models) => {
+            Ok((models, canary_registry, authority, snapshot)) => {
                 last_error = None;
-                let models_json = serde_json::to_string(&models)
-                    .context("serializing refreshed gateway models")?;
-                if models_json != applied_models_json {
+                if snapshot != applied_snapshot {
                     let model_count = models.len();
-                    state.replace_model_catalog(models);
-                    applied_models_json = models_json;
+                    state.replace_authenticated_catalog(models, canary_registry, authority);
+                    applied_snapshot = snapshot;
                     eprintln!(
-                        "Gateway model catalog refreshed from contract: {model_count} model(s)"
+                        "Gateway authenticated catalog refreshed from contract: {model_count} model(s)"
                     );
                 }
             }
@@ -29429,7 +31739,13 @@ async fn run_gateway_provider_heartbeat_watcher(
                 }
                 let now = unix_epoch_millis()?;
                 if let Some(heartbeat) = receiver.receive(&raw, now) {
-                    state.ingest_provider_heartbeat(heartbeat, now);
+                    if let Err(err) =
+                        state.ingest_authenticated_provider_heartbeat(&raw, heartbeat, now)
+                    {
+                        eprintln!(
+                            "Gateway provider heartbeat attestation advertisement rejected: {err}"
+                        );
+                    }
                 } else if let Some(drop) = receiver.drops().last() {
                     eprintln!(
                         "Gateway provider heartbeat dropped for provider {:?} room {:?}: {}",
@@ -29474,6 +31790,19 @@ fn configured_nonnegative_millis(env_name: &str, default_value: u64) -> Result<u
         Err(std::env::VarError::NotPresent) => Ok(default_value),
         Err(err) => Err(err).with_context(|| format!("reading {env_name}")),
     }
+}
+
+fn configured_positive_count(env_name: &str, default_value: usize, label: &str) -> Result<usize> {
+    let value = match std::env::var(env_name) {
+        Ok(value) => value
+            .trim()
+            .parse::<usize>()
+            .with_context(|| format!("{env_name} must be a positive integer"))?,
+        Err(std::env::VarError::NotPresent) => default_value,
+        Err(err) => return Err(err).with_context(|| format!("reading {env_name}")),
+    };
+    ensure!(value > 0, "{label} must be positive");
+    Ok(value)
 }
 
 fn gateway_startup_wallet_report(
@@ -29605,61 +31934,6 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     );
     let gateway_url = gateway_public_url(bind);
     let openai_base_url = gateway_v1_url(&gateway_url);
-    let apple_app_attest_jwks = match &args.apple_app_attest_jwks_file {
-        Some(path) => {
-            let path = absolutize(path.clone())?;
-            Some(read_json_file(&path).with_context(|| {
-                format!("loading Apple App Attest JWKS from {}", path.display())
-            })?)
-        }
-        None => None,
-    };
-    let nvidia_gb10_device_jwks = match &args.nvidia_gb10_device_jwks_file {
-        Some(path) => {
-            let path = absolutize(path.clone())?;
-            Some(read_json_file(&path).with_context(|| {
-                format!(
-                    "loading NVIDIA GB10 device-attestation JWKS from {}",
-                    path.display()
-                )
-            })?)
-        }
-        None => None,
-    };
-    let nvidia_nras_jwks = match &args.nvidia_nras_jwks_file {
-        Some(path) => {
-            let path = absolutize(path.clone())?;
-            Some(
-                read_json_file(&path)
-                    .with_context(|| format!("loading NVIDIA NRAS JWKS from {}", path.display()))?,
-            )
-        }
-        None => None,
-    };
-    let nvidia_offline_jwks = match &args.nvidia_offline_jwks_file {
-        Some(path) => {
-            let path = absolutize(path.clone())?;
-            Some(read_json_file(&path).with_context(|| {
-                format!(
-                    "loading NVIDIA offline-verifier JWKS from {}",
-                    path.display()
-                )
-            })?)
-        }
-        None => None,
-    };
-    let hardware_quote_verifier_command = match &args.hardware_quote_verifier_command {
-        Some(command) => {
-            if args.hardware_quote_verifier_timeout_seconds == 0 {
-                bail!("--hardware-quote-verifier-timeout-seconds must be positive");
-            }
-            Some(HardwareQuoteVerifierCommand {
-                command: resolve_provider_quote_command(command)?,
-                timeout: Duration::from_secs(args.hardware_quote_verifier_timeout_seconds),
-            })
-        }
-        None => None,
-    };
     let mut catalog_watcher: Option<GatewayCatalogWatcherConfig> = None;
     let (
         state,
@@ -29699,9 +31973,13 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         .await?;
         let contract = read_contract_catalog(&rpc).await?;
         let models = gateway_models_from_contract(&contract)?;
-        let (catalog_doc, canary_registry, catalog_source) = if let Some(dev_catalog_path) =
-            args.dev_catalog_path.clone()
-        {
+        let (
+            catalog_doc,
+            canary_registry,
+            catalog_source,
+            catalog_attestation_authority,
+            catalog_hash,
+        ) = if let Some(dev_catalog_path) = args.dev_catalog_path.clone() {
             let catalog_path = absolutize(dev_catalog_path)?;
             let canaries_dir = args
                 .dev_canaries_dir
@@ -29709,8 +31987,11 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 .map(Ok)
                 .unwrap_or_else(|| repo_path("catalog/canaries"))?;
             let canaries_dir = absolutize(canaries_dir)?;
-            let catalog_hash = if args.dev_skip_catalog_verify {
-                blake3_file_hex(&catalog_path)?
+            let (catalog_hash, attestation_authority) = if args.dev_skip_catalog_verify {
+                (
+                    blake3_file_hex(&catalog_path)?,
+                    catalog::CatalogAttestationAuthority::default(),
+                )
             } else {
                 let signature_path = args
                     .dev_signature_path
@@ -29736,7 +32017,17 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 if !report.ok {
                     bail!("local dev catalog verification failed");
                 }
-                report.catalog_hash
+                if !report.attestation_policy_errors.is_empty() {
+                    bail!(
+                        "local dev catalog attestation authority is invalid: {}",
+                        report.attestation_policy_errors.join("; ")
+                    );
+                }
+                let authority = report
+                    .verified_attestation_authority()
+                    .cloned()
+                    .context("verified local catalog did not retain its attestation authority")?;
+                (report.catalog_hash, authority)
             };
             let catalog_doc = catalog::load_document(&catalog_path)
                 .with_context(|| format!("loading local dev catalog {}", catalog_path.display()))?;
@@ -29758,6 +32049,8 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 Some(catalog_doc),
                 canary_registry,
                 format!("contract:{rpc_url}; catalog:{trust}:{catalog_hash}"),
+                attestation_authority,
+                catalog_hash,
             )
         } else {
             match read_optional_catalog_release_anchor(&rpc).await? {
@@ -29795,17 +32088,41 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                         Some(catalog_doc),
                         canary_registry,
                         format!("contract:{rpc_url}; catalog:{}", release.catalog_hash),
+                        catalog_files.attestation_authority,
+                        release.catalog_hash,
                     )
                 }
                 None if models.is_empty() => (
                     None,
                     GatewayCanaryRegistry::default(),
                     format!("contract:{rpc_url}; catalog:unpublished-empty"),
+                    catalog::CatalogAttestationAuthority::default(),
+                    "unpublished-empty".to_owned(),
                 ),
                 None => bail!(
                     "catalog/current not found; ask the admin to run `mayhem admin publish-catalog`"
                 ),
             }
+        };
+        let policy_epoch = active_billing_epoch(&rpc).await?;
+        let attestation_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context("building attestation collateral HTTP client")?;
+        let gateway_attestation_authority = load_gateway_attestation_authority(
+            &attestation_client,
+            &home,
+            &catalog_attestation_authority,
+            policy_epoch,
+        )
+        .await?;
+        let managed_hardware_quote_verifier = if catalog_attestation_requires_managed_verifier(
+            &catalog_attestation_authority,
+            policy_epoch,
+        )? {
+            Some(resolve_managed_hardware_quote_verifier()?)
+        } else {
+            None
         };
         let wallet_password = args.wallet_password.clone().unwrap_or_default();
         let wallet = resolve_cli_wallet_with_keypair(
@@ -29856,12 +32173,20 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         if catalog_refresh_millis > 0 {
             catalog_watcher = Some(GatewayCatalogWatcherConfig {
                 rpc_url: rpc_url.clone(),
-                catalog_doc: catalog_doc.clone(),
+                dev_catalog: args
+                    .dev_catalog_path
+                    .as_ref()
+                    .map(|_| GatewayDevCatalogSnapshot {
+                        catalog_hash: catalog_hash.clone(),
+                        catalog_doc: catalog_doc
+                            .clone()
+                            .expect("development catalog path produced a catalog document"),
+                        canary_registry: canary_registry.clone(),
+                        attestation_authority: catalog_attestation_authority.clone(),
+                    }),
                 hardware: hardware.clone(),
                 home: home.clone(),
                 refresh_interval: Duration::from_millis(catalog_refresh_millis),
-                initial_models_json: serde_json::to_string(&models)
-                    .context("serializing startup gateway models")?,
             });
         }
         let model_count = models.len();
@@ -29921,7 +32246,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             min_tok_s: session_config.min_tok_s,
         };
         let backend = ScBridgeGatewaySessionBackend::new(session_config);
-        let state = GatewayState::from_models(models)
+        let mut state = GatewayState::from_models(models)
             .with_canary_registry(canary_registry)
             .with_provider_earnings(provider_earnings)
             .with_local_provider_id(wallet.public_key.clone())
@@ -29935,6 +32260,12 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             .context("opening encrypted gateway job vault")?
             .with_receipt_balance_au(balance_au)
             .with_session_backend(Arc::new(backend));
+        if let Some(authority) = gateway_attestation_authority {
+            state = state.with_attestation_authority(authority);
+        }
+        if let Some(verifier) = managed_hardware_quote_verifier {
+            state = state.with_hardware_quote_verifier_command(verifier);
+        }
         (
             state,
             catalog_source,
@@ -29951,26 +32282,6 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 rail: args.rail.as_str().to_owned(),
             }),
         )
-    };
-    let state = match apple_app_attest_jwks {
-        Some(jwks) => state.with_apple_app_attest_jwks(jwks),
-        None => state,
-    };
-    let state = match nvidia_gb10_device_jwks {
-        Some(jwks) => state.with_nvidia_gb10_device_jwks(jwks),
-        None => state,
-    };
-    let state = match nvidia_nras_jwks {
-        Some(jwks) => state.with_nvidia_nras_jwks(jwks),
-        None => state,
-    };
-    let state = match nvidia_offline_jwks {
-        Some(jwks) => state.with_nvidia_offline_jwks(jwks),
-        None => state,
-    };
-    let state = match hardware_quote_verifier_command {
-        Some(verifier) => state.with_hardware_quote_verifier_command(verifier),
-        None => state,
     };
     let state = state
         .with_provider_heartbeat_ttl_millis(provider_heartbeat_ttl_millis)
@@ -30046,11 +32357,6 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "shared_gateway_notice": shared_gateway_notice,
         "models": model_count,
         "version_gates": &blocked_version_gates,
-        "apple_app_attest_jwks": args.apple_app_attest_jwks_file.is_some(),
-        "nvidia_gb10_device_jwks": args.nvidia_gb10_device_jwks_file.is_some(),
-        "nvidia_nras_jwks": args.nvidia_nras_jwks_file.is_some(),
-        "nvidia_offline_jwks": args.nvidia_offline_jwks_file.is_some(),
-        "hardware_quote_verifier_command": args.hardware_quote_verifier_command.as_ref().map(|path| path.display().to_string()),
     });
 
     if args.json {
@@ -30112,25 +32418,6 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             );
             if let Some(ctx) = default_min_ctx {
                 println!("Default minimum context: {ctx} tokens.");
-            }
-            if args.apple_app_attest_jwks_file.is_some() {
-                println!("Tier 2 Apple App Attest verification: trusted JWKS loaded.");
-            }
-            if args.nvidia_gb10_device_jwks_file.is_some() {
-                println!("Tier 2 NVIDIA GB10 device verification: trusted JWKS loaded.");
-            }
-            if args.nvidia_nras_jwks_file.is_some() {
-                println!("NVIDIA NRAS verification: trusted JWKS loaded.");
-            }
-            if args.nvidia_offline_jwks_file.is_some() {
-                println!("NVIDIA offline verifier fallback: trusted JWKS loaded.");
-            }
-            if let Some(command) = &args.hardware_quote_verifier_command {
-                println!(
-                    "Hardware quote verifier: {} (timeout {}s).",
-                    command.display(),
-                    args.hardware_quote_verifier_timeout_seconds
-                );
             }
         }
         println!("Use Ctrl-C to stop.");
@@ -30747,11 +33034,53 @@ async fn status(args: StatusArgs) -> Result<()> {
 }
 
 async fn down(args: DownArgs) -> Result<()> {
+    ensure!(
+        args.timeout_seconds > 0,
+        "--timeout-seconds must be positive"
+    );
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
-    let report = down_home(&home, args.timeout_seconds, args.force).await?;
+    let provider_shutdown = provider_cleanup_result_before_down(
+        retire_provider_stack_before_down(
+            &home,
+            args.timeout_seconds,
+            args.wallet_password
+                .clone()
+                .or_else(|| env::var("MAYHEM_WALLET_PASSWORD").ok()),
+            provider_down_retirement(args.restart),
+        )
+        .await,
+        args.force,
+    )?;
+    let mut report = down_home(&home, args.timeout_seconds, args.force).await?;
+    let drain_cleanup = match clear_stopped_global_provider_drain_requests(&home) {
+        Ok(cleanup) => json!({ "ok": true, "result": cleanup }),
+        Err(err) => json!({
+            "ok": false,
+            "error": format!("{err:#}"),
+        }),
+    };
+    let lifecycle_ok = provider_shutdown.get("ok").and_then(Value::as_bool) == Some(true);
+    let drain_cleanup_ok = drain_cleanup.get("ok").and_then(Value::as_bool) == Some(true);
+    report["ok"] = json!(lifecycle_ok && drain_cleanup_ok);
+    report["provider_shutdown"] = provider_shutdown;
+    report["provider_drain_cleanup"] = drain_cleanup;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if !lifecycle_ok {
+        println!(
+            "Mayhem supervisor stopped; provider lifecycle cleanup remains pending: {}",
+            report["provider_shutdown"]["error"]
+                .as_str()
+                .unwrap_or("unknown provider lifecycle error")
+        );
+    } else if !drain_cleanup_ok {
+        println!(
+            "Mayhem supervisor stopped; global provider drain cleanup failed: {}",
+            report["provider_drain_cleanup"]["error"]
+                .as_str()
+                .unwrap_or("unknown drain cleanup error")
+        );
     } else if report["pid"].is_null() {
         println!("Mayhem is already down.");
     } else if report["stopped"].as_bool() == Some(true) {
@@ -30762,7 +33091,37 @@ async fn down(args: DownArgs) -> Result<()> {
     } else {
         println!("Mayhem down OK.");
     }
+    if !args.json
+        && report["provider_shutdown"]["retirement"]["left_registration"].as_bool() == Some(true)
+    {
+        println!("Provider workers drained and canonical routes retired.");
+    } else if !args.json
+        && report["provider_shutdown"]["retirement"]["resume"].as_str()
+            == Some("durable_registration")
+    {
+        println!("Provider registrations preserved for restart.");
+    }
     Ok(())
+}
+
+fn provider_cleanup_failure_report(error: &anyhow::Error) -> Value {
+    json!({
+        "ok": false,
+        "error": format!("{error:#}"),
+        "retirement": {
+            "left_registration": false,
+            "confirmed_leave": false,
+            "status": "pending_or_unknown",
+        },
+    })
+}
+
+fn provider_cleanup_result_before_down(result: Result<Value>, force: bool) -> Result<Value> {
+    match result {
+        Ok(report) => Ok(report),
+        Err(err) if force => Ok(provider_cleanup_failure_report(&err)),
+        Err(err) => Err(err),
+    }
 }
 
 async fn session_history(args: SessionHistoryArgs, group_sessions: bool) -> Result<()> {
@@ -32975,6 +35334,7 @@ struct CatalogReleaseFiles {
     catalog_path: PathBuf,
     signature_path: PathBuf,
     canaries_dir: PathBuf,
+    attestation_authority: catalog::CatalogAttestationAuthority,
 }
 
 struct ProviderResolvedCatalog {
@@ -33100,6 +35460,12 @@ async fn fetch_catalog_release_files(
     if !report.ok {
         bail!("ledger catalog release verification failed");
     }
+    if !report.attestation_policy_errors.is_empty() {
+        bail!(
+            "ledger catalog attestation authority is invalid: {}",
+            report.attestation_policy_errors.join("; ")
+        );
+    }
     if report.catalog_hash != release.catalog_hash
         || report.key_id != release.key_id
         || report.model_count != release.model_count
@@ -33107,11 +35473,16 @@ async fn fetch_catalog_release_files(
     {
         bail!("ledger catalog release metadata does not match fetched catalog");
     }
+    let attestation_authority = report
+        .verified_attestation_authority()
+        .cloned()
+        .context("verified ledger catalog did not retain its attestation authority")?;
 
     Ok(CatalogReleaseFiles {
         catalog_path,
         signature_path,
         canaries_dir,
+        attestation_authority,
     })
 }
 
@@ -33208,6 +35579,201 @@ async fn fetch_release_bytes(
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
+}
+
+fn catalog_attestation_policy_chain(
+    authority: &catalog::CatalogAttestationAuthority,
+) -> Result<AttestationPolicyChain> {
+    AttestationPolicyChain::from_catalog_records(
+        authority.attestation_policy_chain.clone(),
+        authority.enclave_attestation_bindings.clone(),
+    )
+    .map_err(anyhow::Error::msg)
+    .context("validating catalog attestation authority")
+}
+
+fn catalog_attestation_trust_data_url(
+    policy: &ValidatedAttestationPolicy,
+    reference: &AttestationTrustDataRef,
+) -> Result<String> {
+    let url = policy.policy_source_url(&reference.id).with_context(|| {
+        format!(
+            "attestation trust data {} has no canonical source",
+            reference.id
+        )
+    })?;
+    validate_https_url(&url, "attestation trust data")?;
+    Ok(url)
+}
+
+fn attestation_collateral_cache_path(home: &Path, sha256: &str) -> Result<PathBuf> {
+    ensure!(
+        sha256.len() == 64
+            && sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "attestation collateral digest must be lowercase SHA-256"
+    );
+    Ok(home
+        .join("attestation-cache")
+        .join("sha256")
+        .join(&sha256[..2])
+        .join(sha256))
+}
+
+async fn cache_attestation_collateral(
+    client: &reqwest::Client,
+    home: &Path,
+    policy: &ValidatedAttestationPolicy,
+    reference: &AttestationTrustDataRef,
+) -> Result<Vec<u8>> {
+    let cache_path = attestation_collateral_cache_path(home, &reference.sha256)?;
+    if let Ok(bytes) = fs::read(&cache_path) {
+        if !bytes.is_empty()
+            && bytes.len() as u64 <= reference.max_bytes
+            && sha256_bytes_hex(&bytes) == reference.sha256
+        {
+            return Ok(bytes);
+        }
+        let metadata = fs::symlink_metadata(&cache_path)
+            .with_context(|| format!("inspecting {}", cache_path.display()))?;
+        ensure!(
+            metadata.is_file() && !metadata.file_type().is_symlink(),
+            "invalid attestation cache entry is not a regular file"
+        );
+        fs::remove_file(&cache_path)
+            .with_context(|| format!("removing invalid cache {}", cache_path.display()))?;
+    }
+
+    let url = catalog_attestation_trust_data_url(policy, reference)?;
+    let max_bytes = usize::try_from(reference.max_bytes)
+        .context("attestation trust-data maximum does not fit this platform")?;
+    let bytes = fetch_release_bytes(client, &url, max_bytes, "attestation trust data").await?;
+    ensure!(
+        !bytes.is_empty() && sha256_bytes_hex(&bytes) == reference.sha256,
+        "attestation trust data {} SHA-256 mismatch from {}",
+        reference.id,
+        url
+    );
+    if let Some(parent) = cache_path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let temporary_path = cache_path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temporary_path, &bytes)
+        .with_context(|| format!("writing {}", temporary_path.display()))?;
+    fs::rename(&temporary_path, &cache_path)
+        .with_context(|| format!("publishing {}", cache_path.display()))?;
+    Ok(bytes)
+}
+
+fn local_attestation_collateral_references<'a>(
+    active_policy: &'a ValidatedAttestationPolicy,
+    target: Option<&'static str>,
+) -> Result<(Vec<&'a AttestationTrustDataRef>, bool)> {
+    let mut references = Vec::new();
+    for reference in &active_policy.policy().trust_data {
+        match ValidatedAttestationPolicy::parse_managed_verifier_trust_data(reference)
+            .map_err(anyhow::Error::msg)?
+        {
+            None => references.push(reference),
+            Some((_, managed_target, _)) if Some(managed_target) == target => {
+                references.push(reference)
+            }
+            Some(_) => {}
+        }
+    }
+
+    let managed_verifier_needed = active_policy
+        .policy()
+        .quote_kinds
+        .iter()
+        .any(|kind_policy| {
+            if !kind_policy.enabled
+                || !ValidatedAttestationPolicy::is_managed_verifier_kind(kind_policy.kind)
+            {
+                return false;
+            }
+            let Some(target) = target else {
+                return false;
+            };
+            let Ok((executable_id, manifest_id)) =
+                ValidatedAttestationPolicy::managed_verifier_trust_data_ids(
+                    kind_policy.kind,
+                    target,
+                )
+            else {
+                return false;
+            };
+            active_policy.trust_data(&executable_id).is_some()
+                && active_policy.trust_data(&manifest_id).is_some()
+        });
+    Ok((references, managed_verifier_needed))
+}
+
+async fn load_gateway_attestation_authority(
+    client: &reqwest::Client,
+    home: &Path,
+    authority: &catalog::CatalogAttestationAuthority,
+    policy_epoch: u64,
+) -> Result<Option<GatewayAttestationAuthority>> {
+    let policy_chain = catalog_attestation_policy_chain(authority)?;
+    let Some(active_policy) = policy_chain.active_at(policy_epoch) else {
+        return Ok(None);
+    };
+    let target = ValidatedAttestationPolicy::compiled_managed_verifier_target().ok();
+    let (references, _) = local_attestation_collateral_references(active_policy, target)?;
+    let mut collateral = Vec::with_capacity(references.len());
+    for reference in references {
+        let bytes = cache_attestation_collateral(client, home, active_policy, reference).await?;
+        collateral.push(GatewayAttestationCollateral {
+            reference: reference.clone(),
+            bytes,
+            observed_epoch: policy_epoch,
+        });
+    }
+    GatewayAttestationAuthority::from_catalog_records(
+        authority.attestation_policy_chain.clone(),
+        authority.enclave_attestation_bindings.clone(),
+        collateral,
+        policy_epoch,
+    )
+    .map(Some)
+    .map_err(anyhow::Error::msg)
+}
+
+fn catalog_attestation_requires_managed_verifier(
+    authority: &catalog::CatalogAttestationAuthority,
+    policy_epoch: u64,
+) -> Result<bool> {
+    let policy_chain = catalog_attestation_policy_chain(authority)?;
+    let Some(active_policy) = policy_chain.active_at(policy_epoch) else {
+        return Ok(false);
+    };
+    let target = ValidatedAttestationPolicy::compiled_managed_verifier_target().ok();
+    let (_, needed) = local_attestation_collateral_references(active_policy, target)?;
+    Ok(needed)
+}
+
+fn resolve_managed_hardware_quote_verifier() -> Result<HardwareQuoteVerifierCommand> {
+    let current_exe = env::current_exe().context("resolving the running Mayhem binary")?;
+    let command = current_exe.with_file_name(executable_sibling_name(
+        "mayhem-attestation-verifier",
+        cfg!(windows),
+    ));
+    let metadata = fs::symlink_metadata(&command).with_context(|| {
+        format!(
+            "the authenticated Mayhem install is missing sibling verifier {}",
+            command.display()
+        )
+    })?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "managed attestation verifier must be a regular non-symlink file beside mayhem"
+    );
+    Ok(HardwareQuoteVerifierCommand {
+        command,
+        timeout: Duration::from_secs(DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS),
+    })
 }
 
 const DEFAULT_CATALOG_CANARY_MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -36136,7 +38702,7 @@ fn read_tnk_settlement_manifest(
         .cloned()
         .context("TNK settlement manifest missing frozen payload")?;
     for (field, expected) in [
-        ("op", "tnk_settlement"),
+        ("op", "settle_targeted_tnk"),
         ("rail", "tnk"),
         ("network", network),
         ("treasury_from", treasury_address),
@@ -36169,7 +38735,7 @@ fn read_tnk_settlement_manifest(
         .and_then(Value::as_array)
         .context("TNK settlement manifest frozen payload missing outputs")?;
     let expected_root = stable_value_hash(&json!({
-        "domain": "mayhem-tnk-settlement-transfer-root-v1",
+        "domain": "mayhem-targeted-tnk-settlement-transfer-root-v1",
         "value": outputs,
     }));
     if payload.get("transfer_root").and_then(Value::as_str) != Some(expected_root.as_str()) {
@@ -36203,7 +38769,7 @@ fn tnk_settlement_manifest_path(home: &Path, network: &str, epoch: u64) -> PathB
     home.join("settlement")
         .join("tnk")
         .join(network)
-        .join(format!("epoch-{epoch}.json"))
+        .join(format!("targeted-epoch-{epoch}.json"))
 }
 
 fn ensure_tnk_settlement_manifest(path: &Path, expected: &Value) -> Result<()> {
@@ -36267,7 +38833,7 @@ fn tnk_settlement_output_operation_id(
     output: &MsbSettlementTransferOutput,
 ) -> String {
     stable_value_hash(&json!({
-        "domain": "mayhem-tnk-msb-output-v1",
+        "domain": "mayhem-targeted-tnk-msb-output-v1",
         "epoch": manifest.get("epoch"),
         "network": manifest.get("network"),
         "treasury_from": manifest.get("treasury_from"),
@@ -36304,7 +38870,7 @@ async fn build_tnk_settlement_plan(
             bail!("{label} is not contract-safe");
         }
     }
-    if let Some(existing) = read_state_value(rpc, &format!("settle/tnk/{epoch}")).await? {
+    if let Some(existing) = read_state_value(rpc, &format!("settle/targeted/tnk/{epoch}")).await? {
         return Ok(TnkSettlementPlan {
             payload: existing.clone(),
             msb_outputs: Vec::new(),
@@ -36379,10 +38945,6 @@ async fn build_tnk_settlement_plan(
         );
     }
 
-    let admin = read_state_value(rpc, "admin")
-        .await?
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .context("admin key missing; provider payout targets cannot be verified")?;
     let providers = read_prefix_entries(rpc, "prov/")
         .await?
         .into_iter()
@@ -36398,38 +38960,48 @@ async fn build_tnk_settlement_plan(
 
     let mut skipped_providers = Vec::new();
     let mut outputs = Vec::new();
-    let mut earnings = read_prefix_values::<LedgerEarningRecord>(rpc, "earn/tnk/").await?;
-    earnings.sort_by(|left, right| left.provider.cmp(&right.provider));
-    for earning in earnings {
-        if earning.rail != "tnk" {
+    let mut liabilities =
+        read_prefix_values::<LedgerPayoutLiability>(rpc, "payout/liability/tnk/").await?;
+    liabilities.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.revision.cmp(&right.revision))
+    });
+    for liability in liabilities {
+        if liability.rail != "tnk" {
             continue;
         }
-        let Some(provider) = providers.get(&earning.provider) else {
+        let Some(provider) = providers.get(&liability.provider) else {
             skipped_providers.push(json!({
-                "provider": earning.provider,
+                "provider": liability.provider,
+                "payout_revision": liability.revision,
                 "au": money_au_json(0),
                 "reason": "provider record missing",
                 "blocking": true,
             }));
             continue;
         };
+        let earning = liability.earning_view();
         let (_, payable_au) =
             tnk_payable_earning_state(rpc, &earning, provider, epoch, &params).await?;
         if payable_au == 0 {
             continue;
         }
-        match tnk_provider_payout_target(provider, &earning.provider, &admin) {
-            Ok(to) => outputs.push(json!({
+        match targeted_payout_liability_binding(rpc, &liability, epoch).await {
+            Ok(binding) => outputs.push(json!({
                 "role": "provider",
-                "provider": earning.provider,
-                "to": to,
+                "provider": liability.provider,
+                "payout_revision": liability.revision,
+                "to": binding["target"],
                 "au": money_au_json(payable_au),
                 "tnk_e18": au_to_tnk_e18_ceil_u128(payable_au, rate.tnk_usd_au)?.to_string(),
             })),
             Err(error) => skipped_providers.push(json!({
-                "provider": earning.provider,
+                "provider": liability.provider,
+                "payout_revision": liability.revision,
                 "au": money_au_json(payable_au),
                 "reason": error.to_string(),
+                "blocking": true,
             })),
         }
     }
@@ -36455,11 +39027,11 @@ async fn build_tnk_settlement_plan(
 
     let totals = tnk_settlement_output_totals(&outputs)?;
     let transfer_root = stable_value_hash(&json!({
-        "domain": "mayhem-tnk-settlement-transfer-root-v1",
+        "domain": "mayhem-targeted-tnk-settlement-transfer-root-v1",
         "value": outputs,
     }));
     let payload = json!({
-        "op": "tnk_settlement",
+        "op": "settle_targeted_tnk",
         "epoch": epoch,
         "at": at,
         "rail": "tnk",
@@ -36868,45 +39440,44 @@ fn normalize_tnk_holdbacks(earning: &LedgerEarningRecord) -> Result<Vec<LedgerHo
         .collect())
 }
 
-fn tnk_provider_payout_target(provider: &Value, provider_id: &str, admin: &str) -> Result<String> {
-    if !matches!(
-        provider.get("status").and_then(Value::as_str),
-        Some("active" | "banned")
-    ) {
-        bail!("provider status is not payable");
-    }
-    let payout = provider
-        .get("payouts")
-        .and_then(|payouts| payouts.get("tnk"))
-        .and_then(Value::as_object)
-        .context("provider TNK payout target is not set")?;
-    if payout.get("method").and_then(Value::as_str) != Some("tnk") {
-        bail!("provider payout target is not TNK");
-    }
-    if payout.get("set_by").and_then(Value::as_str) != Some(admin) {
-        bail!("provider payout target was not set by the current admin");
-    }
-    if payout.get("set_by_role").and_then(Value::as_str) != Some("admin") {
-        bail!("provider payout target must be admin-set");
-    }
-    let addr = payout
-        .get("addr")
-        .and_then(Value::as_str)
-        .context("provider payout target missing address")?;
-    if !is_safe_key_part(addr) {
-        bail!("provider payout target address is not contract-safe");
-    }
-    if provider
-        .get("provider")
-        .and_then(Value::as_str)
-        .is_some_and(|actual| actual != provider_id)
-    {
-        bail!("provider payout record owner mismatch");
-    }
-    Ok(addr.to_owned())
-}
-
 const FIAT_MINOR_AU_CLI: MoneyAu = 10_000_000_000_000_000;
+
+async fn targeted_payout_liability_binding(
+    rpc: &PeerRpcClient,
+    liability: &LedgerPayoutLiability,
+    epoch: u64,
+) -> Result<Value> {
+    ensure!(
+        matches!(liability.rail.as_str(), "tap" | "tnk" | "fiat")
+            && is_hex_len(&liability.provider, 64)
+            && liability.provider == liability.provider.to_ascii_lowercase()
+            && is_hex_len(&liability.revision, 64)
+            && liability.revision == liability.revision.to_ascii_lowercase(),
+        "targeted payout liability identity is invalid"
+    );
+    let key = format!(
+        "payout/binding/{}/{}/{}",
+        liability.rail, liability.provider, liability.revision
+    );
+    let binding = read_state_value(rpc, &key)
+        .await?
+        .context("immutable payout binding is missing")?;
+    ensure!(
+        binding.get("verified").and_then(Value::as_bool) == Some(true)
+            && binding.get("provider").and_then(Value::as_str) == Some(liability.provider.as_str())
+            && binding.get("rail").and_then(Value::as_str) == Some(liability.rail.as_str())
+            && binding.get("revision").and_then(Value::as_str) == Some(liability.revision.as_str())
+            && binding.get("target").and_then(Value::as_str) == Some(liability.target.as_str())
+            && binding.get("currency").and_then(Value::as_str) == liability.currency.as_deref()
+            && binding.get("chain_id").and_then(Value::as_u64) == liability.chain_id
+            && binding
+                .get("activation_epoch")
+                .and_then(Value::as_u64)
+                .is_some_and(|activation_epoch| activation_epoch <= epoch),
+        "immutable payout binding does not match targeted liability"
+    );
+    Ok(binding)
+}
 
 async fn build_fiat_settlement_plan(
     rpc: &PeerRpcClient,
@@ -36919,7 +39490,7 @@ async fn build_fiat_settlement_plan(
         bail!("operator Stripe account is not contract-safe");
     }
     let operator_currency = normalize_admin_fiat_currency(operator_currency)?;
-    if let Some(existing) = read_state_value(rpc, &format!("settle/fiat/{epoch}")).await? {
+    if let Some(existing) = read_state_value(rpc, &format!("settle/targeted/fiat/{epoch}")).await? {
         return Ok(FiatSettlementPlan {
             payload: existing.clone(),
             stripe_outputs: Vec::new(),
@@ -36949,10 +39520,6 @@ async fn build_fiat_settlement_plan(
         .to_ascii_lowercase();
 
     let params = read_tnk_settlement_params(rpc, at).await?;
-    let admin = read_state_value(rpc, "admin")
-        .await?
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .context("admin key missing; provider payout targets cannot be verified")?;
     let providers = read_prefix_entries(rpc, "prov/")
         .await?
         .into_iter()
@@ -36968,27 +39535,36 @@ async fn build_fiat_settlement_plan(
 
     let mut skipped_providers = Vec::new();
     let mut outputs = Vec::new();
-    let mut earnings = read_prefix_values::<LedgerEarningRecord>(rpc, "earn/fiat/").await?;
-    earnings.sort_by(|left, right| left.provider.cmp(&right.provider));
-    for earning in earnings {
-        if earning.rail != "fiat" {
+    let mut liabilities =
+        read_prefix_values::<LedgerPayoutLiability>(rpc, "payout/liability/fiat/").await?;
+    liabilities.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.revision.cmp(&right.revision))
+    });
+    for liability in liabilities {
+        if liability.rail != "fiat" {
             continue;
         }
-        let Some(provider) = providers.get(&earning.provider) else {
+        let Some(provider) = providers.get(&liability.provider) else {
             skipped_providers.push(json!({
-                "provider": earning.provider,
+                "provider": liability.provider,
+                "payout_revision": liability.revision,
                 "au": money_au_json(0),
                 "reason": "provider record missing",
+                "blocking": true,
             }));
             continue;
         };
+        let earning = liability.earning_view();
         let (_, payable_au) =
             tnk_payable_earning_state(rpc, &earning, provider, epoch, &params).await?;
         let transferable_au = fiat_whole_minor_au(payable_au);
         if transferable_au == 0 {
             if payable_au > 0 {
                 skipped_providers.push(json!({
-                    "provider": earning.provider,
+                    "provider": liability.provider,
+                    "payout_revision": liability.revision,
                     "au": money_au_json(payable_au),
                     "reason": "payable amount is below one Stripe minor unit",
                     "blocking": false,
@@ -36996,17 +39572,37 @@ async fn build_fiat_settlement_plan(
             }
             continue;
         }
-        match fiat_provider_payout_target(provider, &earning.provider, &admin) {
-            Ok((to, currency)) => outputs.push(FiatSettlementOutput {
-                role: "provider".to_owned(),
-                provider: Some(earning.provider),
-                to,
-                currency,
-                amount_minor: fiat_au_to_minor(transferable_au)?,
-                au: transferable_au,
-            }),
+        match targeted_payout_liability_binding(rpc, &liability, epoch).await {
+            Ok(binding)
+                if stripe_payout_binding_currently_ready(rpc, &liability.provider, &binding)
+                    .await? =>
+            {
+                outputs.push(FiatSettlementOutput {
+                    role: "provider".to_owned(),
+                    provider: Some(liability.provider),
+                    payout_revision: Some(liability.revision),
+                    to: binding["target"]
+                        .as_str()
+                        .context("verified fiat payout binding is missing target")?
+                        .to_owned(),
+                    currency: binding["currency"]
+                        .as_str()
+                        .context("verified fiat payout binding is missing currency")
+                        .and_then(normalize_admin_fiat_currency)?,
+                    amount_minor: fiat_au_to_minor(transferable_au)?,
+                    au: transferable_au,
+                })
+            }
+            Ok(_) => skipped_providers.push(json!({
+                "provider": liability.provider,
+                "payout_revision": liability.revision,
+                "au": money_au_json(transferable_au),
+                "reason": "Stripe payout binding is temporarily not ready",
+                "blocking": true,
+            })),
             Err(error) => skipped_providers.push(json!({
-                "provider": earning.provider,
+                "provider": liability.provider,
+                "payout_revision": liability.revision,
                 "au": money_au_json(transferable_au),
                 "reason": error.to_string(),
                 "blocking": true,
@@ -37024,6 +39620,7 @@ async fn build_fiat_settlement_plan(
         outputs.push(FiatSettlementOutput {
             role: "operator_fee".to_owned(),
             provider: None,
+            payout_revision: None,
             to: operator_to.to_owned(),
             currency: operator_currency,
             amount_minor: fiat_au_to_minor(operator_fee_au)?,
@@ -37032,12 +39629,12 @@ async fn build_fiat_settlement_plan(
     }
     let output_values = fiat_settlement_output_values(&outputs);
     let transfer_root = stable_value_hash(&json!({
-        "domain": "mayhem-fiat-settlement-transfer-root-v1",
+        "domain": "mayhem-targeted-fiat-settlement-transfer-root-v1",
         "value": output_values,
     }));
     let totals = fiat_settlement_output_totals(&outputs)?;
     let payload = json!({
-        "op": "fiat_settlement",
+        "op": "settle_targeted_fiat",
         "epoch": epoch,
         "at": at,
         "rail": "fiat",
@@ -37075,6 +39672,10 @@ fn fiat_settlement_output_values(outputs: &[FiatSettlementOutput]) -> Vec<Value>
             });
             if let Some(provider) = output.provider.as_ref() {
                 value["provider"] = json!(provider);
+                value["payout_revision"] = json!(output
+                    .payout_revision
+                    .as_deref()
+                    .expect("provider fiat output has a payout revision"));
             }
             value
         })
@@ -37202,50 +39803,10 @@ fn fiat_au_to_minor(au: MoneyAu) -> Result<u64> {
         .context("fiat settlement amount exceeds Stripe u64 minor units")
 }
 
-fn fiat_provider_payout_target(
-    provider: &Value,
-    provider_id: &str,
-    admin: &str,
-) -> Result<(String, String)> {
-    let payout = provider
-        .get("payouts")
-        .and_then(|payouts| payouts.get("stripe"))
-        .and_then(Value::as_object)
-        .context("provider Stripe payout target is not set")?;
-    if payout.get("method").and_then(Value::as_str) != Some("stripe") {
-        bail!("provider payout target is not Stripe");
-    }
-    if payout.get("set_by").and_then(Value::as_str) != Some(admin) {
-        bail!("provider payout target was not set by the current admin");
-    }
-    if payout.get("set_by_role").and_then(Value::as_str) != Some("admin") {
-        bail!("provider payout target must be admin-set");
-    }
-    let addr = payout
-        .get("addr")
-        .and_then(Value::as_str)
-        .context("provider payout target missing address")?;
-    if !is_safe_key_part(addr) {
-        bail!("provider payout target address is not contract-safe");
-    }
-    let currency = payout
-        .get("currency")
-        .and_then(Value::as_str)
-        .context("provider payout target missing fiat currency")
-        .and_then(normalize_admin_fiat_currency)?;
-    if provider
-        .get("provider")
-        .and_then(Value::as_str)
-        .is_some_and(|actual| actual != provider_id)
-    {
-        bail!("provider payout record owner mismatch");
-    }
-    Ok((addr.to_owned(), currency))
-}
-
 fn stripe_transfer_idempotency_key(
     epoch: u64,
     provider: &str,
+    payout_revision: &str,
     epoch_apply_hash: &str,
 ) -> Result<String> {
     if epoch == 0 {
@@ -37254,12 +39815,16 @@ fn stripe_transfer_idempotency_key(
     if !is_hex_len(provider, 64) {
         bail!("Stripe transfer idempotency provider must be a 32-byte hex key");
     }
+    if !is_hex_len(payout_revision, 64) {
+        bail!("Stripe transfer idempotency payout revision must be 32-byte hex");
+    }
     if !is_hex_len(epoch_apply_hash, 64) {
         bail!("Stripe transfer idempotency apply hash must be 32-byte hex");
     }
     Ok(format!(
-        "mayhem:fiat:settle:v1:{epoch}:{}:{}",
+        "mayhem:fiat:targeted:v1:{epoch}:{}:{}:{}",
         provider.to_ascii_lowercase(),
+        payout_revision.to_ascii_lowercase(),
         epoch_apply_hash.to_ascii_lowercase()
     ))
 }
@@ -37482,6 +40047,10 @@ async fn stripe_create_transfer_verified(
         .provider
         .as_deref()
         .context("Stripe provider transfer output missing provider")?;
+    let payout_revision = output
+        .payout_revision
+        .as_deref()
+        .context("Stripe provider transfer output missing payout revision")?;
     let transfer_group = format!(
         "mayhem_fiat_epoch_{epoch}_{}",
         epoch_apply_hash.get(..16).unwrap_or(epoch_apply_hash)
@@ -37492,6 +40061,10 @@ async fn stripe_create_transfer_verified(
         ("destination", output.to.clone()),
         ("transfer_group", transfer_group.clone()),
         ("metadata[mayhem_provider]", provider.to_owned()),
+        (
+            "metadata[mayhem_payout_revision]",
+            payout_revision.to_owned(),
+        ),
         ("metadata[mayhem_au]", output.au.to_string()),
         ("metadata[mayhem_epoch]", epoch.to_string()),
         ("metadata[mayhem_output_index]", output_index.to_string()),
@@ -37508,6 +40081,7 @@ async fn stripe_create_transfer_verified(
         output,
         &transfer_group,
         provider,
+        payout_revision,
         epoch,
         output_index,
         epoch_apply_hash,
@@ -37602,6 +40176,7 @@ async fn stripe_create_transfer_verified(
         verified_identity = stripe_transfer_has_identity(
             &value,
             provider,
+            payout_revision,
             output.au,
             epoch,
             output_index,
@@ -37633,6 +40208,7 @@ async fn stripe_find_existing_transfer(
     output: &FiatSettlementOutput,
     transfer_group: &str,
     provider: &str,
+    payout_revision: &str,
     epoch: u64,
     output_index: usize,
     epoch_apply_hash: &str,
@@ -37688,6 +40264,7 @@ async fn stripe_find_existing_transfer(
                 stripe_transfer_has_identity(
                     candidate,
                     provider,
+                    payout_revision,
                     output.au,
                     epoch,
                     output_index,
@@ -37718,6 +40295,7 @@ async fn stripe_find_existing_transfer(
 fn stripe_transfer_has_identity(
     value: &Value,
     provider: &str,
+    payout_revision: &str,
     au: MoneyAu,
     epoch: u64,
     output_index: usize,
@@ -37730,6 +40308,10 @@ fn stripe_transfer_has_identity(
         .pointer("/metadata/mayhem_provider")
         .and_then(Value::as_str)
         == Some(provider)
+        && value
+            .pointer("/metadata/mayhem_payout_revision")
+            .and_then(Value::as_str)
+            == Some(payout_revision)
         && value.pointer("/metadata/mayhem_au").and_then(Value::as_str) == Some(au.as_str())
         && value
             .pointer("/metadata/mayhem_epoch")
@@ -39385,6 +41967,7 @@ struct ContractCatalog {
     tier3_measurements: Vec<LedgerTier3MeasurementSet>,
     ctx_bracket_schedule: CtxBracketSchedule,
     rules: Option<RulesRef>,
+    active_payout_revisions: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -39429,6 +42012,51 @@ struct LedgerEarningRecord {
     last_settlement_epoch: Option<u64>,
     #[serde(default)]
     last_settlement_msb_tx_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LedgerPayoutLiability {
+    provider: String,
+    rail: String,
+    revision: String,
+    target: String,
+    #[serde(default)]
+    currency: Option<String>,
+    #[serde(default)]
+    chain_id: Option<u64>,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    total_au: MoneyAu,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    held_au: MoneyAu,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    paid_cum_au: MoneyAu,
+    #[serde(default)]
+    holdbacks: Vec<LedgerHoldbackBucket>,
+    #[serde(default)]
+    updated_epoch: u64,
+}
+
+impl LedgerPayoutLiability {
+    fn earning_view(&self) -> LedgerEarningRecord {
+        LedgerEarningRecord {
+            provider: self.provider.clone(),
+            rail: self.rail.clone(),
+            denom: "au_usd".to_owned(),
+            chain_id: self.chain_id,
+            pool_address: None,
+            total_au: self.total_au,
+            held_au: self.held_au,
+            paid_cum_au: self.paid_cum_au,
+            holdbacks: self.holdbacks.clone(),
+            updated_epoch: self.updated_epoch,
+            updated_at: None,
+            last_holdback_release_epoch: None,
+            last_payout_rate_ts: None,
+            last_payout_msb_tx_hash: None,
+            last_settlement_epoch: None,
+            last_settlement_msb_tx_hash: None,
+        }
+    }
 }
 
 fn earning_matches_current_payment_scope(
@@ -39497,6 +42125,7 @@ struct FiatSettlementPlan {
 struct FiatSettlementOutput {
     role: String,
     provider: Option<String>,
+    payout_revision: Option<String>,
     to: String,
     currency: String,
     amount_minor: u64,
@@ -39772,10 +42401,16 @@ struct ProviderHardwareQuoteConfig {
     kind: HardwareQuoteKind,
     command: PathBuf,
     timeout: Duration,
+    tpm_state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HardwareQuoteCommandOutput {
+    #[serde(default)]
+    hardware_quote: Option<HardwareQuote>,
+    #[serde(default)]
+    tpm_activate_credential_hello: Option<mayhem_proto::TpmActivateCredentialHello>,
     kind: Option<String>,
     evidence: Option<String>,
     evidence_path: Option<String>,
@@ -39818,6 +42453,20 @@ struct HardwareQuoteCommandOutput {
     tpm: Value,
 }
 
+#[derive(Clone, Debug)]
+struct ProviderAttestationMaterial {
+    report: Tier1AttestationReport,
+    device_key: Option<String>,
+    tpm_activation_hello: Option<mayhem_proto::TpmActivateCredentialHello>,
+}
+
+#[derive(Clone, Debug)]
+struct CollectedProviderHardwareQuote {
+    quote: HardwareQuote,
+    device_key: Option<String>,
+    tpm_activation_hello: Option<mayhem_proto::TpmActivateCredentialHello>,
+}
+
 const TRT_CHECKPOINT_REQUIRED_SIDECARS: [(&str, &str); 3] = [
     ("trt_checkpoint_config", "config.json"),
     ("trt_tokenizer_json", "tokenizer.json"),
@@ -39841,6 +42490,7 @@ struct HeartbeatContext<'a> {
     attestation: &'a Tier1AttestationReport,
     attestation_head: &'a str,
     identity_anchor: &'a str,
+    tpm_activation_hello: Option<&'a mayhem_proto::TpmActivateCredentialHello>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40282,6 +42932,61 @@ impl ProviderProtectionState {
             .is_some_and(|accepted| now.duration_since(*accepted) >= Duration::from_secs(60))
         {
             self.accepted_at.pop_front();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ProviderTpmActivationLimiter {
+    global_limit: usize,
+    per_peer_limit: usize,
+    accepted_at: VecDeque<Instant>,
+    accepted_by_peer: HashMap<String, VecDeque<Instant>>,
+}
+
+impl ProviderTpmActivationLimiter {
+    fn from_environment() -> Result<Self> {
+        Ok(Self {
+            global_limit: configured_positive_count(
+                "MAYHEM_PROVIDER_TPM_ACTIVATIONS_PER_MINUTE",
+                DEFAULT_TPM_ACTIVATIONS_PER_MINUTE,
+                "provider TPM activation global rate",
+            )?,
+            per_peer_limit: configured_positive_count(
+                "MAYHEM_PROVIDER_TPM_ACTIVATIONS_PER_PEER_PER_MINUTE",
+                DEFAULT_TPM_ACTIVATIONS_PER_PEER_PER_MINUTE,
+                "provider TPM activation per-peer rate",
+            )?,
+            accepted_at: VecDeque::new(),
+            accepted_by_peer: HashMap::new(),
+        })
+    }
+
+    fn admit(&mut self, remote: &str, now: Instant) -> Result<()> {
+        Self::prune(&mut self.accepted_at, now);
+        self.accepted_by_peer.retain(|_, accepted| {
+            Self::prune(accepted, now);
+            !accepted.is_empty()
+        });
+        ensure!(
+            self.accepted_at.len() < self.global_limit,
+            "provider TPM activation global rate limit reached"
+        );
+        let peer = self.accepted_by_peer.entry(remote.to_owned()).or_default();
+        ensure!(
+            peer.len() < self.per_peer_limit,
+            "provider TPM activation per-peer rate limit reached"
+        );
+        self.accepted_at.push_back(now);
+        peer.push_back(now);
+        Ok(())
+    }
+
+    fn prune(accepted: &mut VecDeque<Instant>, now: Instant) {
+        while accepted.front().is_some_and(|accepted_at| {
+            now.saturating_duration_since(*accepted_at) >= Duration::from_secs(60)
+        }) {
+            accepted.pop_front();
         }
     }
 }
@@ -40790,6 +43495,7 @@ struct ProviderSessionHeartbeatTask {
     attestation: Tier1AttestationReport,
     attestation_head: String,
     identity_anchor: String,
+    tpm_activation_hello: Option<mayhem_proto::TpmActivateCredentialHello>,
     min_ask_au: MoneyAu,
     max_sessions: u32,
     load: ProviderHeartbeatLoad,
@@ -40814,6 +43520,7 @@ struct ProviderSessionContext<'a> {
     attestation: &'a Tier1AttestationReport,
     attestation_head: &'a str,
     identity_anchor: &'a str,
+    tpm_activation_hello: Option<&'a mayhem_proto::TpmActivateCredentialHello>,
     rules: &'a RulesRef,
 }
 
@@ -40841,6 +43548,7 @@ struct ProviderSessionRuntime<'a> {
     runtime_keypair: &'a RuntimeKeypair,
     binary_path: &'a Path,
     boot_epoch: u64,
+    tpm_activation_hello: Option<&'a mayhem_proto::TpmActivateCredentialHello>,
 }
 
 #[derive(Clone, Debug)]
@@ -41391,14 +44099,46 @@ async fn provider_serve_plan(args: ProviderServePlanArgs) -> Result<()> {
 }
 
 async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
-    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
-    let home = absolutize(home)?;
+    let prepared = prepare_provider_serve_worker(&args, None).await?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .context("building mayhemd control HTTP client")?;
+    let report = add_prepared_provider_worker(&client, prepared).await?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Provider worker added: {}",
+            report["response"]["name"].as_str().unwrap_or("provider")
+        );
+        println!(
+            "Copy/paste status command: mayhem status --home {}",
+            report["home"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+struct PreparedProviderServeWorker {
+    home: PathBuf,
+    supervisor_url: String,
+    requested: String,
+    enclave_id: String,
+    model_id: String,
+    served_ctx: u64,
+    serve_terms: ProviderJoinContextTerms,
+    runtime: ProviderBackendRuntime,
+    child: Value,
+}
+
+async fn prepare_provider_serve_worker(
+    args: &ProviderServeAddArgs,
+    name: Option<String>,
+) -> Result<PreparedProviderServeWorker> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
     let supervisor_url = mayhemd_control_url(&home)?;
-    let control_token = load_or_create_mayhemd_control_token(&home)?;
     let serve_plan_args = ProviderServePlanArgs {
         home: Some(home.clone()),
         rpc_url: None,
@@ -41449,46 +44189,71 @@ async fn provider_serve_add(args: ProviderServeAddArgs) -> Result<()> {
         &selected.served_modalities,
         &selected.served_specialities,
         computed.hardware_quote_config.as_ref(),
-        None,
+        name,
     )?;
+    let serve_terms = provider_join_context_terms_for_candidate(selected)?;
+    Ok(PreparedProviderServeWorker {
+        home,
+        supervisor_url,
+        requested: args.enclave.clone(),
+        enclave_id: selected.enclave.enclave_id.clone(),
+        model_id: selected.enclave.model_id.clone(),
+        served_ctx: selected.served_ctx,
+        serve_terms,
+        runtime,
+        child,
+    })
+}
+
+async fn add_prepared_provider_worker(
+    client: &reqwest::Client,
+    prepared: PreparedProviderServeWorker,
+) -> Result<Value> {
+    let rpc_url = resolve_cli_rpc_url(Some(&prepared.home), None)?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let activation_leave_replay = replay_provider_leaves_before_activation(
+        &prepared.home,
+        &rpc,
+        &ProviderActivationLeaveScope {
+            provider: None,
+            enclave_id: prepared.enclave_id.clone(),
+            room_ids: None,
+        },
+        false,
+    )
+    .await
+    .context("replaying pending signed leaves before adding provider worker")?;
+    let control_token = load_or_create_mayhemd_control_token(&prepared.home)?;
     let response = post_mayhemd_json(
-        &client,
-        &format!("{supervisor_url}/children/add"),
-        &child,
+        client,
+        &format!("{}/children/add", prepared.supervisor_url),
+        &prepared.child,
         &control_token,
     )
     .await
     .context("adding provider worker to mayhemd")?;
-    let report = json!({
+    Ok(json!({
         "ok": true,
-        "home": home,
-        "supervisor_url": supervisor_url,
-        "requested": args.enclave,
-        "enclave": selected.enclave.enclave_id,
-        "model_id": selected.enclave.model_id,
-        "served_ctx": selected.served_ctx,
-        "runtime": runtime,
-        "child": provider_serve_public_child_report(&child),
+        "home": prepared.home,
+        "supervisor_url": prepared.supervisor_url,
+        "requested": prepared.requested,
+        "enclave": prepared.enclave_id,
+        "model_id": prepared.model_id,
+        "served_ctx": prepared.served_ctx,
+        "runtime": prepared.runtime,
+        "activation_leave_replay": activation_leave_replay,
+        "child": provider_serve_public_child_report(&prepared.child),
         "response": response,
-    });
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        println!(
-            "Provider worker added: {}",
-            report["response"]["name"].as_str().unwrap_or("provider")
-        );
-        println!(
-            "Copy/paste status command: mayhem status --home {}",
-            report["home"].as_str().unwrap_or("")
-        );
-    }
-    Ok(())
+    }))
 }
 
 async fn provider_serve_remove(args: ProviderServeRemoveArgs) -> Result<()> {
-    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
-    let home = absolutize(home)?;
+    ensure!(
+        args.timeout_seconds > 0,
+        "--timeout-seconds must be positive"
+    );
+    let ctx = provider_tx_context(&args.tx).await?;
+    let home = ctx.home.clone();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -41496,28 +44261,56 @@ async fn provider_serve_remove(args: ProviderServeRemoveArgs) -> Result<()> {
     let supervisor_url = mayhemd_control_url(&home)?;
     let control_token = load_or_create_mayhemd_control_token(&home)?;
     let status = fetch_gateway_json(&client, &format!("{supervisor_url}/status")).await?;
-    let child_name = provider_serve_child_name_for_target(&status, &args.target)?;
-    let response = post_mayhemd_json(
-        &client,
-        &format!("{supervisor_url}/children/remove"),
-        &json!({ "name": child_name }),
-        &control_token,
+    let serves = read_active_provider_serves(&ctx.rpc, &ctx.wallet.public_key).await?;
+    let worker = provider_serve_worker_for_target(&status, &serves, &args.target)?;
+    let contract = read_contract_catalog(&ctx.rpc).await?;
+    let drain = if args.tx.sim {
+        Value::Null
+    } else {
+        drain_supervised_provider_workers(
+            &home,
+            &ctx.wallet.public_key,
+            std::slice::from_ref(&worker),
+            Some(&worker.enclave_id),
+            Duration::from_secs(args.timeout_seconds),
+        )
+        .await?
+    };
+    let retirement = retire_provider_registrations(
+        &ctx,
+        &contract,
+        std::slice::from_ref(&worker.enclave_id),
+        ProviderWorkerRetirement::DeliberateRemove,
+        args.tx.sim,
     )
-    .await
-    .context("removing provider worker from mayhemd")?;
+    .await?;
+    let response = if args.tx.sim {
+        Value::Null
+    } else {
+        remove_supervised_provider_worker(&client, &supervisor_url, &control_token, &worker).await?
+    };
     let report = json!({
         "ok": true,
         "home": home,
         "supervisor_url": supervisor_url,
         "target": args.target,
-        "child_name": child_name,
+        "child_name": worker.name,
+        "enclave_id": worker.enclave_id,
+        "sim": args.tx.sim,
+        "drain": drain,
+        "retirement": retirement,
         "response": response,
     });
-    if args.json {
+    if args.tx.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
-            "Provider worker removed: {}",
+            "Provider worker {}: {}",
+            if args.tx.sim {
+                "removal simulated"
+            } else {
+                "removed"
+            },
             report["child_name"].as_str().unwrap_or("provider")
         );
         println!(
@@ -41528,14 +44321,186 @@ async fn provider_serve_remove(args: ProviderServeRemoveArgs) -> Result<()> {
     Ok(())
 }
 
+async fn provider_serve_switch(args: ProviderServeSwitchArgs) -> Result<()> {
+    ensure!(
+        args.timeout_seconds > 0,
+        "--timeout-seconds must be positive"
+    );
+    let ctx = provider_tx_context(&args.tx).await?;
+    let home = ctx.home.clone();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("building mayhemd control HTTP client")?;
+    let supervisor_url = mayhemd_control_url(&home)?;
+    let control_token = load_or_create_mayhemd_control_token(&home)?;
+    let status = fetch_gateway_json(&client, &format!("{supervisor_url}/status")).await?;
+    let serves = read_active_provider_serves(&ctx.rpc, &ctx.wallet.public_key).await?;
+    let old_worker = provider_serve_worker_for_target(&status, &serves, &args.target)?;
+    let contract = read_contract_catalog(&ctx.rpc).await?;
+    let requested_enclave = resolve_provider_lifecycle_enclave(&contract.enclaves, &args.enclave)?;
+    let sequencing =
+        provider_switch_sequencing_policy(&old_worker.enclave_id, &requested_enclave.enclave_id);
+    let existing_serve_row = serves
+        .iter()
+        .find(|serve| serve.enclave_id == old_worker.enclave_id);
+    let preserving_same_enclave = sequencing.clear_completed_scoped_drain_before_add;
+    let inherited_disabled_modalities = preserving_same_enclave
+        .then(|| {
+            existing_serve_row.map(|serve| {
+                ["text", "embedding", "image", "video", "audio"]
+                    .into_iter()
+                    .filter(|modality| {
+                        !serve
+                            .served_modalities
+                            .iter()
+                            .any(|served| served == *modality)
+                    })
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+        })
+        .flatten()
+        .unwrap_or_default();
+    let inherited_speciality_levels = preserving_same_enclave
+        .then(|| {
+            existing_serve_row.map(|serve| {
+                serve
+                    .served_specialities
+                    .iter()
+                    .map(|(name, levels)| format!("{name}={}", levels.join(",")))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .flatten()
+        .unwrap_or_default();
+    let add_args = ProviderServeAddArgs {
+        home: Some(home.clone()),
+        enclave: args.enclave.clone(),
+        gpu_layers: args.gpu_layers,
+        ctx: args.ctx.or_else(|| {
+            preserving_same_enclave
+                .then_some(existing_serve_row?.served_ctx)
+                .flatten()
+        }),
+        disable_modalities: if preserving_same_enclave && args.disable_modalities.is_empty() {
+            inherited_disabled_modalities
+        } else {
+            args.disable_modalities.clone()
+        },
+        speciality_levels: if preserving_same_enclave && args.speciality_levels.is_empty() {
+            inherited_speciality_levels
+        } else {
+            args.speciality_levels.clone()
+        },
+        hardware_quote_kind: args.hardware_quote_kind.clone(),
+        hardware_quote_command: args.hardware_quote_command.clone(),
+        hardware_quote_timeout_seconds: args.hardware_quote_timeout_seconds,
+        json: true,
+    };
+    let existing_serve = read_state_value(
+        &ctx.rpc,
+        &format!("serve/{}/{}", ctx.wallet.public_key, old_worker.enclave_id),
+    )
+    .await?;
+    let prepared = prepare_provider_serve_worker(&add_args, Some(old_worker.name.clone())).await?;
+    let temporary_update = provider_switch_preserves_durable_registration(
+        &old_worker.enclave_id,
+        &prepared.enclave_id,
+        existing_serve.as_ref(),
+        &prepared.serve_terms,
+    );
+    let retirement_reason = if temporary_update {
+        ProviderWorkerRetirement::TemporaryUpdate
+    } else {
+        ProviderWorkerRetirement::EnclaveSwitch
+    };
+    let drain = if args.tx.sim {
+        Value::Null
+    } else {
+        drain_supervised_provider_workers(
+            &home,
+            &ctx.wallet.public_key,
+            std::slice::from_ref(&old_worker),
+            Some(&old_worker.enclave_id),
+            Duration::from_secs(args.timeout_seconds),
+        )
+        .await?
+    };
+    let retirement = retire_provider_registrations(
+        &ctx,
+        &contract,
+        std::slice::from_ref(&old_worker.enclave_id),
+        retirement_reason,
+        args.tx.sim,
+    )
+    .await?;
+    let (removed, added) = if args.tx.sim {
+        (Value::Null, Value::Null)
+    } else {
+        let removed = remove_supervised_provider_worker(
+            &client,
+            &supervisor_url,
+            &control_token,
+            &old_worker,
+        )
+        .await?;
+        if sequencing.clear_completed_scoped_drain_before_add {
+            clear_completed_provider_drain_request(
+                &home,
+                &ctx.wallet.public_key,
+                &old_worker,
+                &drain,
+            )?;
+        }
+        let added = add_prepared_provider_worker(&client, prepared).await?;
+        (removed, added)
+    };
+    let report = json!({
+        "ok": true,
+        "action": "provider.serve.switch",
+        "home": home,
+        "supervisor_url": supervisor_url,
+        "target": args.target,
+        "old_worker": old_worker,
+        "new_enclave_id": requested_enclave.enclave_id,
+        "temporary_update": temporary_update,
+        "durable_registration_preserved": temporary_update,
+        "sequencing": sequencing,
+        "sim": args.tx.sim,
+        "drain": drain,
+        "retirement": retirement,
+        "removed": removed,
+        "added": added,
+    });
+    if args.tx.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Provider worker switched: {} -> {}",
+            report["old_worker"]["enclave_id"].as_str().unwrap_or(""),
+            report["added"]["enclave"]
+                .as_str()
+                .unwrap_or_else(|| { report["new_enclave_id"].as_str().unwrap_or("") })
+        );
+    }
+    Ok(())
+}
+
 fn mayhemd_control_url(home: &Path) -> Result<String> {
-    let _pid = read_pid_file(&mayhemd_pid_path(home))?
-        .filter(|pid| process_is_running(*pid))
-        .context("mayhemd is not running; start it with `mayhem up` first")?;
+    mayhemd_control_url_if_running(home)?
+        .context("mayhemd is not running; start it with `mayhem up` first")
+}
+
+fn mayhemd_control_url_if_running(home: &Path) -> Result<Option<String>> {
+    let Some(_pid) = read_pid_file(&mayhemd_pid_path(home))?.filter(|pid| process_is_running(*pid))
+    else {
+        return Ok(None);
+    };
     let state = read_json_file_if_exists(&mayhemd_state_path(home))?;
     let bind = supervisor_bind_from_home(home, state.as_ref())
         .context("could not determine mayhemd supervisor bind address")?;
-    Ok(format!("http://{bind}"))
+    Ok(Some(format!("http://{bind}")))
 }
 
 fn provider_serve_child_config(
@@ -41550,6 +44515,10 @@ fn provider_serve_child_config(
     hardware_quote_config: Option<&ProviderHardwareQuoteConfig>,
     name: Option<String>,
 ) -> Result<Value> {
+    debug_assert!(
+        !ProviderWorkerRetirement::Crash.leaves_durable_registration(),
+        "supervisor crash restarts must preserve durable provider registration"
+    );
     let config_path = config_path_for_home(home);
     let config = read_config_toml_value(&config_path)
         .with_context(|| format!("reading {}", config_path.display()))?;
@@ -41696,29 +44665,130 @@ fn provider_serve_public_child_report(child: &Value) -> Value {
     })
 }
 
-fn provider_serve_child_name_for_target(status: &Value, target: &str) -> Result<String> {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct SupervisedProviderWorker {
+    name: String,
+    enclave_id: String,
+    running: bool,
+    pid: Option<u32>,
+}
+
+fn supervisor_child_is_provider_start(child: &Value) -> bool {
+    let args = child
+        .get("args")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(2)
+        .collect::<Vec<_>>();
+    args.as_slice() == ["provider", "start"]
+}
+
+fn supervised_running_provider_child_count(status: &Value) -> usize {
+    status
+        .get("children")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|children| children.values())
+        .filter(|child| {
+            supervisor_child_is_provider_start(child)
+                && child.get("running").and_then(Value::as_bool) == Some(true)
+        })
+        .count()
+}
+
+fn supervised_provider_workers(status: &Value) -> Vec<SupervisedProviderWorker> {
     let children = status
         .get("children")
         .and_then(Value::as_object)
-        .context("mayhemd status did not include children")?;
-    for child in children.values() {
-        let name = child.get("name").and_then(Value::as_str).unwrap_or("");
-        if name == target {
-            return Ok(name.to_owned());
-        }
-        let args = child
-            .get("args")
-            .and_then(Value::as_array)
-            .map(|args| args.iter().filter_map(Value::as_str).collect::<Vec<_>>())
-            .unwrap_or_default();
-        if args
-            .windows(2)
-            .any(|pair| pair[0] == "--enclave" && pair[1] == target)
-        {
-            return Ok(name.to_owned());
-        }
+        .into_iter()
+        .flat_map(|children| children.values());
+    let mut workers = children
+        .filter_map(|child| {
+            if !supervisor_child_is_provider_start(child) {
+                return None;
+            }
+            let name = child.get("name").and_then(Value::as_str)?.to_owned();
+            let args = child
+                .get("args")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            let enclave_id = args
+                .windows(2)
+                .find(|pair| pair[0] == "--enclave")
+                .map(|pair| pair[1].to_owned())?;
+            Some(SupervisedProviderWorker {
+                name,
+                enclave_id,
+                running: child.get("running").and_then(Value::as_bool) == Some(true),
+                pid: child
+                    .get("pid")
+                    .and_then(Value::as_u64)
+                    .and_then(|pid| u32::try_from(pid).ok())
+                    .filter(|pid| *pid > 0),
+            })
+        })
+        .collect::<Vec<_>>();
+    workers.sort_by(|a, b| {
+        a.enclave_id
+            .cmp(&b.enclave_id)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    workers
+}
+
+fn provider_serve_worker_for_target(
+    status: &Value,
+    serves: &[LedgerServe],
+    target: &str,
+) -> Result<SupervisedProviderWorker> {
+    let workers = supervised_provider_workers(status);
+    let model_enclaves = serves
+        .iter()
+        .filter(|serve| serve.status == "active" && serve.model_id == target)
+        .map(|serve| serve.enclave_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let matches = workers
+        .into_iter()
+        .filter(|worker| {
+            worker.name == target
+                || worker.enclave_id == target
+                || model_enclaves.contains(worker.enclave_id.as_str())
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [worker] => Ok(worker.clone()),
+        [] => bail!("no running supervised provider worker found for {target}"),
+        _ => bail!("multiple supervised provider workers matched {target}"),
     }
-    bail!("no running supervised provider worker found for {target}");
+}
+
+async fn remove_supervised_provider_worker(
+    client: &reqwest::Client,
+    supervisor_url: &str,
+    control_token: &str,
+    worker: &SupervisedProviderWorker,
+) -> Result<Value> {
+    let response = post_mayhemd_json(
+        client,
+        &format!("{supervisor_url}/children/remove"),
+        &json!({ "name": worker.name }),
+        control_token,
+    )
+    .await
+    .with_context(|| format!("removing provider worker {} from mayhemd", worker.name))?;
+    if let Some(pid) = worker.pid {
+        ensure!(
+            wait_for_process_stop(pid, Duration::from_secs(10)).await,
+            "provider worker {} pid {} did not stop after supervisor removal",
+            worker.name,
+            pid
+        );
+    }
+    Ok(response)
 }
 
 fn provider_start_args_for_serve_plan(
@@ -42098,7 +45168,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             .and_then(|provider| provider.gpu_layers);
     }
     apply_provider_resource_config_defaults(&mut args, config.as_ref());
-    let hardware_quote_config = provider_hardware_quote_config(&args)?;
+    let mut hardware_quote_config = provider_hardware_quote_config(&args)?;
     let (disk_reserve_bytes, disk_reserve_source) =
         provider_disk_reserve_bytes(args.disk_reserve.as_deref())?;
     let rpc_url = args
@@ -42129,6 +45199,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         });
     let password = args.wallet_password.clone().unwrap_or_default();
     let wallet = inspect_wallet(&keypair_path, &password).await?;
+    bind_provider_tpm_state_dir(hardware_quote_config.as_mut(), &home, &wallet.public_key)?;
     let rpc = PeerRpcClient::new(&rpc_url)?;
     let session_rpc_url = args
         .session_rpc_url
@@ -42372,7 +45443,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     } else {
         None
     };
-    let attestation = provider_attestation_report(
+    let attestation_material = provider_attestation_report(
         hardware_quote_config.as_ref(),
         attestation_identity.clone(),
         &runtime_keypair,
@@ -42386,8 +45457,10 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         now,
         nonce_u,
         runtime_config.clone(),
+        None,
     )
     .await?;
+    let attestation = &attestation_material.report;
     if attestation.report.enclave_id != selected.enclave.enclave_id {
         bail!(
             "admin enclave id {} is not bound to the measured identity {}; providers cannot serve unbound enclaves",
@@ -42395,7 +45468,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             attestation.report.enclave_id
         );
     }
-    let device_key = provider_attestation_device_key(&attestation)?;
+    let device_key = attestation_material.device_key.as_deref();
     write_provider_load_progress_stage(&args, "prepare attestation", "attest", "complete", 100);
 
     let session_context = ProviderSessionContext {
@@ -42409,9 +45482,10 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         artifact_paths: &artifact_paths,
         canaries_dir: &provider_catalog.canaries_dir,
         rooms: &rooms,
-        attestation: &attestation,
+        attestation,
         attestation_head: &attestation.report_head,
         identity_anchor: &identity_anchor,
+        tpm_activation_hello: attestation_material.tpm_activation_hello.as_ref(),
         rules: &rules,
     };
     let (session_responder, modality_health) = if args.serve_sessions {
@@ -42422,6 +45496,18 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         (None, Vec::new())
     };
 
+    let activation_leave_replay = replay_provider_leaves_before_activation(
+        &home,
+        &rpc,
+        &ProviderActivationLeaveScope {
+            provider: Some(wallet.public_key.clone()),
+            enclave_id: selected.enclave.enclave_id.clone(),
+            room_ids: Some(rooms.iter().map(|room| room.room_id.clone()).collect()),
+        },
+        args.sim,
+    )
+    .await
+    .context("replaying pending signed leaves before provider activation")?;
     provider_log(&args, "Submitting provider opt-in feature records");
     write_provider_load_progress_stage(&args, "join canonical rooms", "register", "running", 0);
     let provider_feature =
@@ -42439,7 +45525,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         &selected.enclave,
         &serve_terms,
         Some(&hardware_fingerprint),
-        device_key.as_deref(),
+        device_key,
         &join_attestation,
         args.sim,
     )
@@ -42467,9 +45553,10 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             wallet: &wallet,
             selected: &selected,
             rooms: &rooms,
-            attestation: &attestation,
+            attestation,
             attestation_head: &attestation.report_head,
             identity_anchor: &identity_anchor,
+            tpm_activation_hello: attestation_material.tpm_activation_hello.as_ref(),
         })
         .await?
     };
@@ -42569,6 +45656,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             "serve_budget_period_seconds": protection_config.budget_period.as_secs(),
         },
         "rooms": rooms.clone(),
+        "activation_leave_replay": activation_leave_replay,
         "local_heartbeat_cache": heartbeat_cache,
         "features": {
             "provider": provider_feature,
@@ -42616,9 +45704,10 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
                 artifact_paths: &artifact_paths,
                 canaries_dir: &provider_catalog.canaries_dir,
                 rooms: &rooms,
-                attestation: &attestation,
+                attestation,
                 attestation_head: &attestation.report_head,
                 identity_anchor: &identity_anchor,
+                tpm_activation_hello: attestation_material.tpm_activation_hello.as_ref(),
                 rules: &rules,
             },
             ProviderSessionRuntime {
@@ -42633,6 +45722,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
                 runtime_keypair: &runtime_keypair,
                 binary_path: &binary_path,
                 boot_epoch: attestation.report.boot_epoch,
+                tpm_activation_hello: attestation_material.tpm_activation_hello.as_ref(),
             },
             responder,
         )
@@ -42845,9 +45935,624 @@ async fn provider_rails_set(args: ProviderRailsSetArgs) -> Result<()> {
     print_provider_rails_report(&report, args.tx.json)
 }
 
+async fn provider_payout_get(args: ProviderPayoutGetArgs) -> Result<()> {
+    let ctx = provider_read_context(&args.read).await?;
+    let key = format!("prov/{}", ctx.provider);
+    let provider_record = read_state_value(&ctx.rpc, &key).await?;
+    let rails = args
+        .rail
+        .map(|rail| vec![rail])
+        .unwrap_or_else(|| vec![ProviderPayoutRail::Tap, ProviderPayoutRail::Tnk]);
+    let mut payouts = serde_json::Map::new();
+    for rail in rails {
+        let pointer_key = format!("payout/current/{}/{}", rail.as_str(), ctx.provider);
+        let pointer = read_state_value(&ctx.rpc, &pointer_key).await?;
+        let current = match pointer
+            .as_ref()
+            .and_then(|value| value.get("current_revision"))
+            .and_then(Value::as_str)
+        {
+            Some(revision) => {
+                read_state_value(
+                    &ctx.rpc,
+                    &format!(
+                        "payout/binding/{}/{}/{}",
+                        rail.as_str(),
+                        ctx.provider,
+                        revision
+                    ),
+                )
+                .await?
+            }
+            None => None,
+        };
+        let pending = match pointer
+            .as_ref()
+            .and_then(|value| value.get("pending_revision"))
+            .and_then(Value::as_str)
+        {
+            Some(revision) => {
+                read_state_value(
+                    &ctx.rpc,
+                    &format!(
+                        "payout/binding/{}/{}/{}",
+                        rail.as_str(),
+                        ctx.provider,
+                        revision
+                    ),
+                )
+                .await?
+            }
+            None => None,
+        };
+        payouts.insert(
+            rail.as_str().to_owned(),
+            json!({
+                "pointer": pointer,
+                "current": current,
+                "pending": pending,
+            }),
+        );
+    }
+    let report = json!({
+        "ok": provider_record.is_some(),
+        "action": "provider.payout.get",
+        "provider": ctx.provider,
+        "rail": args.rail.map(ProviderPayoutRail::as_str),
+        "payouts": Value::Object(payouts),
+        "provider_record": provider_record,
+    });
+    print_provider_payout_report(&report, args.read.json)
+}
+
+async fn provider_payout_previous_revision(
+    rpc: &PeerRpcClient,
+    provider: &str,
+    rail: &str,
+) -> Result<Option<String>> {
+    let key = format!("payout/current/{rail}/{provider}");
+    let Some(current) = read_state_value(rpc, &key).await? else {
+        return Ok(None);
+    };
+    let revision = current
+        .get("latest_revision")
+        .and_then(Value::as_str)
+        .context("provider payout pointer has no latest CAS revision")?
+        .to_ascii_lowercase();
+    ensure!(
+        is_hex_len(&revision, 64),
+        "current provider payout target has an invalid CAS revision"
+    );
+    Ok(Some(revision))
+}
+
+fn normalize_provider_payout_address(
+    rail: ProviderPayoutRail,
+    address: &str,
+    payments: &CanonicalPayments,
+) -> Result<String> {
+    let address = address.trim();
+    ensure!(
+        !address.is_empty() && address.split_whitespace().count() == 1,
+        "provider payout address must be one non-empty address"
+    );
+    match rail {
+        ProviderPayoutRail::Tap => {
+            ensure!(
+                is_eth_address(address),
+                "TAP payout address must be a 20-byte 0x address"
+            );
+            Ok(address.to_ascii_lowercase())
+        }
+        ProviderPayoutRail::Tnk => {
+            let expected_prefix = match payments.tnk.network.as_str() {
+                "mainnet" => "trac1",
+                "testnet1" => "testtrac1",
+                _ => bail!("canonical TNK payment network must be mainnet or testnet1"),
+            };
+            ensure!(
+                address.starts_with(expected_prefix),
+                "TNK payout address does not match canonical {} network",
+                payments.tnk.network
+            );
+            ensure!(
+                address.len() <= 256
+                    && address
+                        .as_bytes()
+                        .iter()
+                        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+                "TNK payout address is not canonical lower-case bech32m"
+            );
+            Ok(address.to_owned())
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderPayoutIntentContext {
+    network: String,
+    admin: String,
+    bootstrap: String,
+    context_revision: String,
+    chain_id: Option<u64>,
+    payment_config_version: u64,
+    updated_epoch: u64,
+}
+
+async fn provider_payout_intent_context(
+    rpc: &PeerRpcClient,
+    payments: &CanonicalPayments,
+    rail: &str,
+) -> Result<ProviderPayoutIntentContext> {
+    ensure!(
+        payments.rails.iter().any(|configured| configured == rail),
+        "canonical payments do not enable the {} payout rail",
+        rail
+    );
+    let pointer = read_state_value(rpc, "payout/context/current")
+        .await?
+        .context("admin-published payout context is required")?;
+    let context_revision = pointer
+        .get("revision")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .context("payout context pointer is missing revision")?;
+    ensure!(
+        is_hex_len(&context_revision, 64),
+        "payout context revision must be 32-byte hexadecimal"
+    );
+    let record_key = pointer
+        .get("record_key")
+        .and_then(Value::as_str)
+        .context("payout context pointer is missing immutable record key")?;
+    let context = read_state_value(rpc, record_key)
+        .await?
+        .context("immutable payout context record is missing")?;
+    ensure!(
+        context.get("revision").and_then(Value::as_str) == Some(context_revision.as_str())
+            && context
+                .get("payment_config_version")
+                .and_then(Value::as_u64)
+                == Some(payments.ver),
+        "payout context pointer does not match canonical payments"
+    );
+    let network = context
+        .get("network")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .context("payout context is missing network")?;
+    ensure!(
+        is_safe_key_part(&network),
+        "canonical payout network is invalid"
+    );
+    let admin = context
+        .get("admin")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .context("payout context is missing admin")?;
+    let bootstrap = context
+        .get("bootstrap")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .context("payout context is missing bootstrap")?;
+    ensure!(
+        is_hex_len(&admin, 64) && is_hex_len(&bootstrap, 64),
+        "payout context admin/bootstrap must be 32-byte hexadecimal"
+    );
+    ensure!(
+        network == payments.tnk.network && admin == payments.set_by.to_ascii_lowercase(),
+        "payout context does not match canonical payment/admin state"
+    );
+    let updated_epoch = read_state_value(rpc, "epoch/apply/state")
+        .await?
+        .map(|state| {
+            state
+                .get("updated_epoch")
+                .and_then(Value::as_u64)
+                .context("epoch/apply/state is missing updated_epoch")
+        })
+        .transpose()?
+        .unwrap_or(0);
+    Ok(ProviderPayoutIntentContext {
+        network,
+        admin,
+        bootstrap,
+        context_revision,
+        chain_id: match rail {
+            "tap" => Some(payments.tap.chain_id),
+            _ => None,
+        },
+        payment_config_version: payments.ver,
+        updated_epoch,
+    })
+}
+
+fn provider_payout_unsigned_intent(
+    context: &ProviderPayoutIntentContext,
+    provider: &str,
+    rail: ProviderPayoutRail,
+    target: &str,
+    target_wallet: Option<&str>,
+    previous_revision: Option<&str>,
+    nonce: &str,
+    expires_after_epoch: u64,
+) -> Result<Value> {
+    ensure!(
+        is_hex_len(provider, 64),
+        "provider payout identity must be 32-byte hexadecimal"
+    );
+    ensure!(
+        is_hex_len(&context.admin, 64),
+        "provider payout admin must be 32-byte hexadecimal"
+    );
+    ensure!(
+        is_hex_len(&context.bootstrap, 64),
+        "provider payout bootstrap must be 32-byte hexadecimal"
+    );
+    ensure!(
+        is_hex_len(nonce, 64),
+        "provider payout nonce must be 32-byte hexadecimal"
+    );
+    if let Some(revision) = previous_revision {
+        ensure!(
+            is_hex_len(revision, 64),
+            "previous provider payout revision must be 32-byte hexadecimal"
+        );
+    }
+    Ok(json!({
+        "op": "bind_provider_payout",
+        "network": context.network,
+        "admin": context.admin,
+        "bootstrap": context.bootstrap,
+        "context_revision": context.context_revision,
+        "provider": provider,
+        "rail": rail.as_str(),
+        "currency": null,
+        "chain_id": context.chain_id,
+        "target": target,
+        "target_wallet": target_wallet,
+        "target_signature": null,
+        "previous_revision": previous_revision,
+        "payment_config_version": context.payment_config_version,
+        "nonce": nonce,
+        "expires_after_epoch": expires_after_epoch,
+    }))
+}
+
+fn provider_payout_target_signing_message(unsigned_intent: &Value) -> String {
+    format!(
+        "mayhem-provider-payout-target-binding-v1{}",
+        stable_json_value(&json!({
+            "admin": unsigned_intent["admin"],
+            "bootstrap": unsigned_intent["bootstrap"],
+            "chain_id": unsigned_intent["chain_id"],
+            "context_revision": unsigned_intent["context_revision"],
+            "currency": unsigned_intent["currency"],
+            "expires_after_epoch": unsigned_intent["expires_after_epoch"],
+            "network": unsigned_intent["network"],
+            "nonce": unsigned_intent["nonce"],
+            "payment_config_version": unsigned_intent["payment_config_version"],
+            "previous_revision": unsigned_intent["previous_revision"],
+            "provider": unsigned_intent["provider"],
+            "rail": unsigned_intent["rail"],
+            "target": unsigned_intent["target"],
+            "target_wallet": unsigned_intent["target_wallet"],
+        }))
+    )
+}
+
+fn provider_payout_intent(unsigned_intent: Value, target_signature: &str) -> Result<Value> {
+    let mut intent = unsigned_intent
+        .as_object()
+        .cloned()
+        .context("provider payout unsigned intent must be an object")?;
+    ensure!(
+        intent.get("target_signature") == Some(&Value::Null),
+        "provider payout unsigned intent must contain a null target_signature"
+    );
+    intent.insert(
+        "target_signature".to_owned(),
+        Value::String(target_signature.to_owned()),
+    );
+    Ok(Value::Object(intent))
+}
+
+fn provider_payout_binding_message(intent: &Value) -> String {
+    format!(
+        "mayhem-provider-payout-binding-v1{}",
+        stable_json_value(intent)
+    )
+}
+
+fn provider_payout_binding_feature(intent: Value, provider_signature: &str) -> Result<Value> {
+    ensure!(
+        is_hex_len(provider_signature, 128),
+        "provider payout signature must be 64-byte hexadecimal"
+    );
+    let revision = blake3::hash(provider_payout_binding_message(&intent).as_bytes())
+        .to_hex()
+        .to_string();
+    let provider = intent
+        .get("provider")
+        .and_then(Value::as_str)
+        .context("provider payout intent is missing provider")?;
+    let rail = intent
+        .get("rail")
+        .and_then(Value::as_str)
+        .context("provider payout intent is missing rail")?;
+    Ok(json!({
+        "feature": "mayhem",
+        "key": format!("payout/binding/{rail}/{provider}/{revision}"),
+        "value": {
+            "op": "bind_provider_payout",
+            "intent": intent,
+            "provider_signature": provider_signature,
+        },
+    }))
+}
+
+async fn provider_payout_set(args: ProviderPayoutSetArgs, rotate: bool) -> Result<()> {
+    ensure!(
+        args.valid_for_epochs > 0,
+        "--valid-for-epochs must be positive"
+    );
+    let address_arg = args
+        .address
+        .as_deref()
+        .map(|address| format!(" --address {}", shell_single_quote(address.trim())))
+        .unwrap_or_default();
+    let operation = if rotate { "rotate" } else { "set" };
+    let copy_paste = format!(
+        "mayhem provider payout {operation} --rail {}{} --valid-for-epochs {} --submit --sim",
+        args.rail.as_str(),
+        address_arg,
+        args.valid_for_epochs,
+    );
+    let mut report = json!({
+        "ok": true,
+        "action": format!("provider.payout.{operation}"),
+        "submitted": false,
+        "sim": false,
+        "feature": "mayhem",
+        "intent_op": "bind_provider_payout",
+        "rail": args.rail.as_str(),
+        "target": args.address.clone(),
+        "valid_for_epochs": args.valid_for_epochs,
+        "copy_paste": {
+            "mayhem_sim": copy_paste,
+        },
+    });
+
+    if args.tx.submit {
+        let ctx = provider_contract_tx_context(&args.tx).await?;
+        let payments = read_canonical_payments(&ctx.rpc).await?;
+        let provider_key = format!("prov/{}", ctx.wallet.public_key);
+        let provider = read_state_value(&ctx.rpc, &provider_key)
+            .await?
+            .context("active provider registration required before setting a payout destination")?;
+        ensure!(
+            provider.get("status").and_then(Value::as_str) == Some("active")
+                && provider.get("provider").and_then(Value::as_str)
+                    == Some(ctx.wallet.public_key.as_str()),
+            "active provider registration ownership required"
+        );
+        ensure!(
+            provider
+                .get("accepted_rails")
+                .and_then(Value::as_array)
+                .is_some_and(|rails| {
+                    rails
+                        .iter()
+                        .any(|rail| rail.as_str() == Some(args.rail.as_str()))
+                }),
+            "provider must accept the {} rail before selecting its payout destination",
+            args.rail.as_str()
+        );
+        let target_keypair_path = match args.target_wallet_key_file.as_ref() {
+            Some(path) => absolutize(path.clone())?,
+            None => ctx.keypair_path.clone(),
+        };
+        let target_password = if args.target_wallet_key_file.is_some() {
+            args.target_wallet_password.clone().unwrap_or_default()
+        } else {
+            ctx.password.clone()
+        };
+        let target_wallet = match args.rail {
+            ProviderPayoutRail::Tap => {
+                inspect_wallet(&target_keypair_path, &target_password).await?
+            }
+            ProviderPayoutRail::Tnk => {
+                inspect_wallet_for_network_prefix(
+                    &target_keypair_path,
+                    &target_password,
+                    msb_network_address_prefix(&payments.tnk.network)?,
+                )
+                .await?
+            }
+        };
+        let wallet_target = match args.rail {
+            ProviderPayoutRail::Tap => target_wallet
+                .ethereum_address
+                .clone()
+                .context("target wallet has no Ethereum address for TAP payouts")?,
+            ProviderPayoutRail::Tnk => target_wallet
+                .address
+                .clone()
+                .context("target wallet has no Trac address for TNK payouts")?,
+        };
+        let wallet_target =
+            normalize_provider_payout_address(args.rail, &wallet_target, &payments)?;
+        let target = normalize_provider_payout_address(
+            args.rail,
+            args.address.as_deref().unwrap_or(&wallet_target),
+            &payments,
+        )?;
+        ensure!(
+            target == wallet_target,
+            "--address must match the selected target wallet's {} address",
+            args.rail.as_str()
+        );
+        let target_wallet_identity = match args.rail {
+            ProviderPayoutRail::Tap => None,
+            ProviderPayoutRail::Tnk => {
+                let identity = target_wallet.public_key.to_ascii_lowercase();
+                ensure!(
+                    is_hex_len(&identity, 64),
+                    "TNK target wallet identity must be 32-byte hexadecimal"
+                );
+                Some(identity)
+            }
+        };
+        let previous_revision =
+            provider_payout_previous_revision(&ctx.rpc, &ctx.wallet.public_key, args.rail.as_str())
+                .await?;
+        if rotate {
+            ensure!(
+                previous_revision.is_some(),
+                "no current {} payout revision exists; use provider payout set",
+                args.rail.as_str()
+            );
+        } else {
+            ensure!(
+                previous_revision.is_none(),
+                "a current {} payout revision already exists; use provider payout rotate",
+                args.rail.as_str()
+            );
+        }
+        let intent_context =
+            provider_payout_intent_context(&ctx.rpc, &payments, args.rail.as_str()).await?;
+        const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+        let expires_after_epoch = intent_context
+            .updated_epoch
+            .checked_add(args.valid_for_epochs)
+            .filter(|epoch| *epoch <= MAX_SAFE_JSON_INTEGER)
+            .context("provider payout expiry exceeds the contract integer range")?;
+        let nonce = service_request_nonce()?;
+        let unsigned_intent = provider_payout_unsigned_intent(
+            &intent_context,
+            &ctx.wallet.public_key,
+            args.rail,
+            &target,
+            target_wallet_identity.as_deref(),
+            previous_revision.as_deref(),
+            &nonce,
+            expires_after_epoch,
+        )?;
+        let target_message = provider_payout_target_signing_message(&unsigned_intent);
+        let target_sig = match args.rail {
+            ProviderPayoutRail::Tap => {
+                let signed =
+                    sign_ethereum_message(&target_keypair_path, &target_password, &target_message)
+                        .await
+                        .context("signing TAP payout target ownership proof")?;
+                ensure!(
+                    signed.address.eq_ignore_ascii_case(&target),
+                    "TAP target ownership signature came from {}, expected {}",
+                    signed.address,
+                    target
+                );
+                ensure!(
+                    signed.signature.starts_with("0x") && is_hex_len(&signed.signature[2..], 130),
+                    "TAP target ownership signature must be a 65-byte 0x signature"
+                );
+                signed.signature.to_ascii_lowercase()
+            }
+            ProviderPayoutRail::Tnk => {
+                let signature =
+                    sign_message(&target_keypair_path, &target_password, &target_message)
+                        .await
+                        .context("signing TNK payout target ownership proof")?;
+                ensure!(
+                    is_hex_len(&signature, 128),
+                    "TNK target ownership signature must be 64-byte hexadecimal"
+                );
+                signature.to_ascii_lowercase()
+            }
+        };
+        let intent = provider_payout_intent(unsigned_intent, &target_sig)?;
+        let provider_signature = sign_message(
+            &ctx.keypair_path,
+            &ctx.password,
+            &provider_payout_binding_message(&intent),
+        )
+        .await
+        .context("signing provider payout binding")?;
+        let feature = provider_payout_binding_feature(intent, &provider_signature)?;
+        let submitted = if args.tx.sim {
+            json!({
+                "feature": feature,
+                "sim": true,
+                "submitted": false,
+            })
+        } else {
+            let result = ctx
+                .rpc
+                .submit_feature(feature.clone())
+                .await
+                .context("submitting provider payout binding through participant relay")?;
+            ensure!(
+                result.get("ok").and_then(Value::as_bool) == Some(true),
+                "provider payout binding was not accepted: {result}"
+            );
+            json!({
+                "feature": feature,
+                "result": result,
+            })
+        };
+        report["submitted"] = json!(true);
+        report["sim"] = json!(args.tx.sim);
+        report["provider"] = json!(ctx.wallet.public_key.clone());
+        report["target"] = json!(target);
+        report["target_sig"] = json!(target_sig);
+        report["previous_revision"] = json!(previous_revision);
+        report["network"] = json!(intent_context.network);
+        report["admin"] = json!(intent_context.admin);
+        report["bootstrap"] = json!(intent_context.bootstrap);
+        report["context_revision"] = json!(intent_context.context_revision);
+        report["currency"] = Value::Null;
+        report["chain_id"] = json!(intent_context.chain_id);
+        report["target_wallet"] = json!(target_wallet_identity);
+        report["nonce"] = json!(nonce);
+        report["expires_after_epoch"] = json!(expires_after_epoch);
+        report["activation_epoch"] =
+            json!(intent_context.updated_epoch + if rotate { 2 } else { 1 });
+        report["payment_config_version"] = json!(intent_context.payment_config_version);
+        report["wallet"] = json!({
+            "public_key": ctx.wallet.public_key.clone(),
+            "trac_address": ctx.wallet.address.clone(),
+            "ethereum_address": ctx.wallet.ethereum_address.clone(),
+        });
+        report["feature_submission"] = submitted;
+        if !args.tx.sim {
+            let feature_key = report["feature_submission"]["feature"]["key"]
+                .as_str()
+                .context("payout feature submission did not return its key")?
+                .to_owned();
+            let revision = feature_key
+                .rsplit('/')
+                .next()
+                .context("payout feature key did not contain a revision")?
+                .to_owned();
+            report["revision"] = json!(revision);
+            let pointer_key = format!(
+                "payout/current/{}/{}",
+                args.rail.as_str(),
+                ctx.wallet.public_key
+            );
+            report["payout_pointer"] = wait_for_state(&ctx.rpc, &pointer_key, |value| {
+                value.get("latest_revision").and_then(Value::as_str) == Some(revision.as_str())
+            })
+            .await?;
+            report["binding"] = read_state_value(&ctx.rpc, &feature_key)
+                .await?
+                .context("accepted provider payout binding is missing from contract state")?;
+        }
+    }
+
+    print_provider_payout_report(&report, args.tx.json)
+}
+
 struct ProviderStripeContext {
-    home: PathBuf,
-    rpc_url: String,
     rpc: PeerRpcClient,
     wallet: WalletInfo,
     wallet_password: String,
@@ -42868,12 +46573,76 @@ async fn provider_stripe_context(args: &ProviderStripeArgs) -> Result<ProviderSt
     .await
     .context("resolving provider wallet")?;
     Ok(ProviderStripeContext {
-        home,
         rpc: PeerRpcClient::new(&rpc_url)?,
-        rpc_url,
         wallet,
         wallet_password,
     })
+}
+
+async fn provider_stripe_relink_source(
+    rpc: &PeerRpcClient,
+    source_provider: &str,
+) -> Result<(String, String)> {
+    let provider = read_state_value(rpc, &format!("prov/{source_provider}"))
+        .await?
+        .context("source provider is not registered")?;
+    ensure!(
+        provider.get("status").and_then(Value::as_str) == Some("active")
+            && provider
+                .get("accepted_rails")
+                .and_then(Value::as_array)
+                .is_some_and(|rails| rails.iter().any(|rail| rail.as_str() == Some("fiat"))),
+        "source provider must be active and accept fiat"
+    );
+    let context_pointer = read_state_value(rpc, "payout/context/current")
+        .await?
+        .context("current payout context is missing")?;
+    let context_revision = context_pointer
+        .get("revision")
+        .and_then(Value::as_str)
+        .context("current payout context pointer is missing its revision")?;
+    ensure!(
+        is_hex_len(context_revision, 64)
+            && context_revision == context_revision.to_ascii_lowercase(),
+        "current payout context revision is invalid"
+    );
+    let verification_pointer = read_state_value(
+        rpc,
+        &format!("payout/stripe-verified/current/{source_provider}"),
+    )
+    .await?
+    .context("source provider has no current Stripe verification")?;
+    let record_key = verification_pointer
+        .get("record_key")
+        .and_then(Value::as_str)
+        .context("source Stripe verification pointer is missing its immutable record")?;
+    let verification = read_state_value(rpc, record_key)
+        .await?
+        .context("source Stripe verification record is missing")?;
+    let account_id = verification
+        .get("target")
+        .and_then(Value::as_str)
+        .context("source Stripe verification is missing its account")?;
+    ensure!(
+        verification.get("type").and_then(Value::as_str) == Some("stripe_payout_verification")
+            && verification.get("provider").and_then(Value::as_str) == Some(source_provider)
+            && verification.get("context_revision").and_then(Value::as_str)
+                == Some(context_revision)
+            && verification.get("ready").and_then(Value::as_bool) == Some(true)
+            && verification
+                .get("details_submitted")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && verification.get("payouts_enabled").and_then(Value::as_bool) == Some(true)
+            && verification
+                .get("transfers_enabled")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && account_id.starts_with("acct_")
+            && is_safe_key_part(account_id),
+        "source provider Stripe account is not verified and ready in the current payout context"
+    );
+    Ok((account_id.to_owned(), context_revision.to_owned()))
 }
 
 fn service_request_nonce() -> Result<String> {
@@ -42899,6 +46668,37 @@ fn service_request_signing_message(
         "transport": transport,
     }))
     .to_string()
+}
+
+fn stripe_connect_relink_consent_message(value: &Value) -> Result<String> {
+    let required_string = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .with_context(|| format!("Stripe relink consent is missing {key}"))
+    };
+    let provider = required_string("provider")?;
+    let source_provider = required_string("source_provider")?;
+    let account_id = required_string("account_id")?;
+    let context_revision = required_string("context_revision")?;
+    let country = required_string("country")?;
+    let request_nonce = required_string("request_nonce")?;
+    let consent_expires_at = value
+        .get("consent_expires_at")
+        .and_then(Value::as_u64)
+        .context("Stripe relink consent is missing consent_expires_at")?;
+    Ok(stable_json_value(&json!({
+        "account_id": account_id,
+        "consent_expires_at": consent_expires_at,
+        "context_revision": context_revision,
+        "country": country,
+        "domain": "mayhem-stripe-connect-relink-consent-v1",
+        "request_nonce": request_nonce,
+        "signing_version": 1,
+        "source_provider": source_provider,
+        "target_provider": provider,
+    }))
+    .to_string())
 }
 
 async fn signed_service_request(
@@ -43002,6 +46802,139 @@ fn provider_stripe_ready(value: &Value) -> bool {
             != Some(true)
 }
 
+async fn ensure_provider_stripe_payout_binding(
+    ctx: &ProviderStripeContext,
+    response: &Value,
+) -> Result<Value> {
+    if response.pointer("/account/ready").and_then(Value::as_bool) != Some(true) {
+        return Ok(json!({ "ok": false, "pending": true, "reason": "stripe_not_ready" }));
+    }
+    let verification = response
+        .pointer("/payout_verification/verification")
+        .and_then(Value::as_object)
+        .context("ready Stripe response is missing verified payout evidence")?;
+    let target = verification
+        .get("target")
+        .and_then(Value::as_str)
+        .context("Stripe payout verification is missing target")?;
+    ensure!(
+        target.starts_with("acct_"),
+        "Stripe payout verification target is invalid"
+    );
+    let currency = verification
+        .get("currency")
+        .and_then(Value::as_str)
+        .context("Stripe payout verification is missing currency")?;
+    let payments = read_canonical_payments(&ctx.rpc).await?;
+    let context = provider_payout_intent_context(&ctx.rpc, &payments, "fiat").await?;
+    ensure!(
+        verification.get("provider").and_then(Value::as_str)
+            == Some(ctx.wallet.public_key.as_str())
+            && verification.get("network").and_then(Value::as_str)
+                == Some(context.network.as_str())
+            && verification.get("admin").and_then(Value::as_str) == Some(context.admin.as_str())
+            && verification.get("bootstrap").and_then(Value::as_str)
+                == Some(context.bootstrap.as_str())
+            && verification.get("context_revision").and_then(Value::as_str)
+                == Some(context.context_revision.as_str())
+            && verification
+                .get("payment_config_version")
+                .and_then(Value::as_u64)
+                == Some(context.payment_config_version),
+        "Stripe payout verification does not match the current immutable context"
+    );
+    let pointer_key = format!("payout/current/fiat/{}", ctx.wallet.public_key);
+    let pointer = read_state_value(&ctx.rpc, &pointer_key).await?;
+    let previous_revision = pointer
+        .as_ref()
+        .and_then(|value| value.get("latest_revision"))
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase);
+    if let Some(revision) = previous_revision.as_deref() {
+        let binding_key = format!("payout/binding/fiat/{}/{revision}", ctx.wallet.public_key);
+        if let Some(binding) = read_state_value(&ctx.rpc, &binding_key).await? {
+            if binding.get("verified").and_then(Value::as_bool) == Some(true)
+                && binding.get("target").and_then(Value::as_str) == Some(target)
+                && binding.get("currency").and_then(Value::as_str) == Some(currency)
+                && binding.get("context_revision").and_then(Value::as_str)
+                    == Some(context.context_revision.as_str())
+            {
+                let pending = pointer
+                    .as_ref()
+                    .and_then(|value| value.get("pending_revision"))
+                    .and_then(Value::as_str)
+                    == Some(revision);
+                return Ok(json!({
+                    "ok": true,
+                    "changed": false,
+                    "pending": pending,
+                    "revision": revision,
+                    "binding": binding,
+                }));
+            }
+        }
+    }
+    let nonce = service_request_nonce()?;
+    let expires_after_epoch = context
+        .updated_epoch
+        .checked_add(10)
+        .context("Stripe payout binding expiry overflow")?;
+    let intent = json!({
+        "op": "bind_provider_payout",
+        "network": context.network,
+        "admin": context.admin,
+        "bootstrap": context.bootstrap,
+        "context_revision": context.context_revision,
+        "provider": ctx.wallet.public_key,
+        "rail": "fiat",
+        "currency": currency,
+        "chain_id": null,
+        "target": target,
+        "target_wallet": null,
+        "target_signature": null,
+        "previous_revision": previous_revision,
+        "payment_config_version": context.payment_config_version,
+        "nonce": nonce,
+        "expires_after_epoch": expires_after_epoch,
+    });
+    let provider_signature = sign_message(
+        Path::new(&ctx.wallet.keypair_path),
+        &ctx.wallet_password,
+        &provider_payout_binding_message(&intent),
+    )
+    .await
+    .context("signing verified Stripe payout binding")?;
+    let feature = provider_payout_binding_feature(intent, &provider_signature)?;
+    let revision = feature["key"]
+        .as_str()
+        .and_then(|key| key.rsplit('/').next())
+        .context("Stripe payout binding feature key is invalid")?
+        .to_owned();
+    let submitted = ctx
+        .rpc
+        .submit_feature(feature.clone())
+        .await
+        .context("submitting Stripe payout binding through participant relay")?;
+    ensure!(
+        submitted.get("ok").and_then(Value::as_bool) == Some(true),
+        "Stripe payout binding was not accepted: {submitted}"
+    );
+    let pointer = wait_for_state(&ctx.rpc, &pointer_key, |value| {
+        value.get("latest_revision").and_then(Value::as_str) == Some(revision.as_str())
+    })
+    .await?;
+    Ok(json!({
+        "ok": true,
+        "changed": true,
+        "pending": pointer.get("pending_revision").and_then(Value::as_str)
+            == Some(revision.as_str()),
+        "revision": revision,
+        "feature": feature,
+        "result": submitted,
+        "pointer": pointer,
+    }))
+}
+
 fn provider_stripe_onboarding_url(value: &Value) -> Result<Option<String>> {
     let Some(onboarding) = value.get("onboarding").filter(|value| !value.is_null()) else {
         return Ok(None);
@@ -43075,7 +47008,7 @@ fn print_provider_stripe_report(report: &Value, json_output: bool) -> Result<()>
             .unwrap_or(false),
     );
     println!(
-        "Admin payout binding: {}",
+        "Verified payout binding: {}",
         if provider_stripe_ready(report) {
             "ready"
         } else {
@@ -43085,7 +47018,7 @@ fn print_provider_stripe_report(report: &Value, json_output: bool) -> Result<()>
     Ok(())
 }
 
-async fn provider_stripe_onboard(args: ProviderStripeOnboardArgs) -> Result<()> {
+async fn provider_stripe_onboard(args: ProviderStripeOnboardArgs, rotate: bool) -> Result<()> {
     if args.timeout_seconds == 0 {
         bail!("--timeout-seconds must be positive");
     }
@@ -43097,6 +47030,21 @@ async fn provider_stripe_onboard(args: ProviderStripeOnboardArgs) -> Result<()> 
         bail!("--country must be a two-letter ISO country code");
     }
     let ctx = provider_stripe_context(&args.provider).await?;
+    let previous_account_id = if rotate {
+        let status = request_provider_stripe_status(&ctx)
+            .await
+            .context("reading the current Stripe account before rotation")?;
+        validate_provider_stripe_response(&status, &ctx.wallet.public_key)?;
+        Some(
+            status
+                .pointer("/account/id")
+                .and_then(Value::as_str)
+                .context("provider has no current Stripe account; use provider stripe onboard")?
+                .to_owned(),
+        )
+    } else {
+        None
+    };
     let signed = signed_service_request(
         "stripe_connect_onboard",
         &ctx.rpc,
@@ -43106,6 +47054,8 @@ async fn provider_stripe_onboard(args: ProviderStripeOnboardArgs) -> Result<()> 
             "provider": ctx.wallet.public_key,
             "country": country,
             "request_nonce": service_request_nonce()?,
+            "rotate": rotate,
+            "previous_account_id": previous_account_id.clone(),
         }),
     )
     .await?;
@@ -43115,6 +47065,10 @@ async fn provider_stripe_onboard(args: ProviderStripeOnboardArgs) -> Result<()> 
         .await
         .context("requesting Stripe Connect onboarding through the local Intercom peer")?;
     validate_provider_stripe_response(&report, &ctx.wallet.public_key)?;
+    if report.pointer("/account/ready").and_then(Value::as_bool) == Some(true) {
+        let binding = ensure_provider_stripe_payout_binding(&ctx, &report).await?;
+        report["payout_binding"] = binding;
+    }
     let onboarding_url = provider_stripe_onboarding_url(&report)?;
     let mut browser_opened = false;
     if let Some(url) = onboarding_url.as_deref() {
@@ -43133,13 +47087,21 @@ async fn provider_stripe_onboard(args: ProviderStripeOnboardArgs) -> Result<()> 
             sleep(interval).await;
             report = request_provider_stripe_status(&ctx).await?;
             validate_provider_stripe_response(&report, &ctx.wallet.public_key)?;
+            if report.pointer("/account/ready").and_then(Value::as_bool) == Some(true) {
+                let binding = ensure_provider_stripe_payout_binding(&ctx, &report).await?;
+                report["payout_binding"] = binding;
+            }
             if provider_stripe_ready(&report) {
                 break;
             }
         }
     }
-    report["home"] = json!(ctx.home);
-    report["rpc_url"] = json!(ctx.rpc_url);
+    report["action"] = json!(if rotate {
+        "provider.stripe.rotate"
+    } else {
+        "provider.stripe.onboard"
+    });
+    report["previous_account_id"] = json!(previous_account_id);
     report["browser_opened"] = json!(browser_opened);
     report["wait"] = json!({
         "requested": !args.no_wait,
@@ -43149,12 +47111,87 @@ async fn provider_stripe_onboard(args: ProviderStripeOnboardArgs) -> Result<()> 
     print_provider_stripe_report(&report, args.provider.json)
 }
 
+async fn provider_stripe_relink(args: ProviderStripeRelinkArgs) -> Result<()> {
+    let country = args.country.trim();
+    ensure!(
+        country.len() == 2 && country.bytes().all(|byte| byte.is_ascii_uppercase()),
+        "--country must be a canonical upper-case ISO country code"
+    );
+    let ctx = provider_stripe_context(&args.provider).await?;
+    let source_keypair_path = absolutize(args.source_wallet_key_file)?;
+    let source_password = args.source_wallet_password.unwrap_or_default();
+    let source_wallet = inspect_wallet(&source_keypair_path, &source_password)
+        .await
+        .context("inspecting source provider wallet")?;
+    let source_provider = source_wallet.public_key.to_ascii_lowercase();
+    ensure!(
+        is_hex_len(&source_provider, 64),
+        "source provider wallet must have a 32-byte hexadecimal public key"
+    );
+    ensure!(
+        source_provider != ctx.wallet.public_key,
+        "Stripe relink source must be a different provider identity"
+    );
+    let (account_id, context_revision) =
+        provider_stripe_relink_source(&ctx.rpc, &source_provider).await?;
+    let request_nonce = service_request_nonce()?;
+    let consent_expires_at = unix_epoch_seconds()?
+        .checked_add(300)
+        .context("Stripe relink consent expiry overflow")?;
+    let mut payload = json!({
+        "provider": ctx.wallet.public_key,
+        "source_provider": source_provider,
+        "account_id": account_id,
+        "context_revision": context_revision,
+        "country": country,
+        "request_nonce": request_nonce,
+        "consent_expires_at": consent_expires_at,
+    });
+    let source_consent_signature = sign_message(
+        &source_keypair_path,
+        &source_password,
+        &stripe_connect_relink_consent_message(&payload)?,
+    )
+    .await
+    .context("signing source provider Stripe relink consent")?;
+    payload["source_consent_signature"] = json!(source_consent_signature);
+    let signed = signed_service_request(
+        "stripe_connect_relink",
+        &ctx.rpc,
+        &ctx.wallet,
+        &ctx.wallet_password,
+        payload,
+    )
+    .await?;
+    let mut report = ctx
+        .rpc
+        .post("payment/stripe/connect/relink", &signed)
+        .await
+        .context("requesting dual-provider authenticated Stripe relink")?;
+    validate_provider_stripe_response(&report, &ctx.wallet.public_key)?;
+    ensure!(
+        report.get("source_provider").and_then(Value::as_str) == Some(source_provider.as_str()),
+        "Stripe relink response did not match the source provider"
+    );
+    if let Some(url) = provider_stripe_onboarding_url(&report)? {
+        emit_provider_stripe_handoff(args.provider.json, &url)?;
+        report["browser_opened"] = json!(open_checkout_url(&url, args.no_open).await);
+    }
+    if report.pointer("/account/ready").and_then(Value::as_bool) == Some(true) {
+        let binding = ensure_provider_stripe_payout_binding(&ctx, &report).await?;
+        report["payout_binding"] = binding;
+    }
+    print_provider_stripe_report(&report, args.provider.json)
+}
+
 async fn provider_stripe_status(args: ProviderStripeStatusArgs) -> Result<()> {
     let ctx = provider_stripe_context(&args.provider).await?;
     let mut report = request_provider_stripe_status(&ctx).await?;
     validate_provider_stripe_response(&report, &ctx.wallet.public_key)?;
-    report["home"] = json!(ctx.home);
-    report["rpc_url"] = json!(ctx.rpc_url);
+    if report.pointer("/account/ready").and_then(Value::as_bool) == Some(true) {
+        let binding = ensure_provider_stripe_payout_binding(&ctx, &report).await?;
+        report["payout_binding"] = binding;
+    }
     print_provider_stripe_report(&report, args.provider.json)
 }
 
@@ -43492,18 +47529,33 @@ fn ensure_provider_modality_limits_table<'a>(
 }
 
 async fn provider_drain(args: ProviderDrainArgs) -> Result<()> {
-    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
-    let home = absolutize(home)?;
-    let config = read_mayhem_config(&home)?;
-    let wallet = resolve_cli_wallet(
-        &home,
-        config.as_ref(),
-        &args.peer_store_name,
-        args.wallet_password.as_deref().unwrap_or(""),
-    )
-    .await
-    .context("resolving provider wallet")?;
-    let path = provider_drain_flag_path(&home, &wallet.public_key, args.enclave.as_deref());
+    ensure!(
+        !(args.clear && args.stop),
+        "--clear and --stop cannot be used together"
+    );
+    ensure!(
+        !args.stop || args.timeout_seconds > 0,
+        "--timeout-seconds must be positive"
+    );
+    ensure!(
+        !args.sim || args.stop,
+        "--sim is available only with --stop"
+    );
+    let ctx = provider_tx_context(&ProviderTxArgs {
+        home: args.home.clone(),
+        rpc_url: args.rpc_url.clone(),
+        peer_store_name: args.peer_store_name.clone(),
+        wallet_password: args.wallet_password.clone(),
+        sim: args.sim,
+        json: args.json,
+    })
+    .await?;
+    let home = ctx.home.clone();
+    let path = provider_drain_flag_path(&home, &ctx.wallet.public_key, args.enclave.as_deref());
+    let mut drain = Value::Null;
+    let mut retirement = Value::Null;
+    let mut removed = Vec::new();
+    let mut reused_request = false;
     let changed = if args.clear {
         if path.exists() {
             fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
@@ -43511,26 +47563,97 @@ async fn provider_drain(args: ProviderDrainArgs) -> Result<()> {
         } else {
             false
         }
-    } else {
-        write_json_file(
-            &path,
-            &json!({
-                "active": true,
-                "provider": wallet.public_key,
-                "enclave_id": args.enclave,
-                "created_at": unix_epoch_seconds()?,
-            }),
-        )?;
+    } else if args.stop {
         true
+    } else {
+        let request_id = provider_lifecycle_nonce(
+            &ctx.wallet.public_key,
+            "drain",
+            args.enclave.as_deref(),
+            None,
+        )?;
+        let (_, reused) = ensure_provider_drain_request(
+            &path,
+            &ctx.wallet.public_key,
+            args.enclave.as_deref(),
+            &request_id,
+        )?;
+        reused_request = reused;
+        !reused
     };
+    if args.stop {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .context("building mayhemd control HTTP client")?;
+        let supervisor_url = mayhemd_control_url(&home)?;
+        let control_token = load_or_create_mayhemd_control_token(&home)?;
+        let status = fetch_gateway_json(&client, &format!("{supervisor_url}/status")).await?;
+        let workers = supervised_provider_workers(&status)
+            .into_iter()
+            .filter(|worker| {
+                args.enclave
+                    .as_deref()
+                    .map_or(true, |enclave| worker.enclave_id == enclave)
+            })
+            .collect::<Vec<_>>();
+        if !args.sim {
+            drain = drain_supervised_provider_workers(
+                &home,
+                &ctx.wallet.public_key,
+                &workers,
+                args.enclave.as_deref(),
+                Duration::from_secs(args.timeout_seconds),
+            )
+            .await?;
+        }
+        let enclave_ids = workers
+            .iter()
+            .map(|worker| worker.enclave_id.clone())
+            .collect::<Vec<_>>();
+        let contract = read_contract_catalog(&ctx.rpc).await?;
+        retirement = retire_provider_registrations(
+            &ctx,
+            &contract,
+            &enclave_ids,
+            provider_drain_retirement(args.stop)
+                .context("provider drain without --stop must not retire registrations")?,
+            args.sim,
+        )
+        .await?;
+        if !args.sim {
+            for worker in &workers {
+                removed.push(
+                    remove_supervised_provider_worker(
+                        &client,
+                        &supervisor_url,
+                        &control_token,
+                        worker,
+                    )
+                    .await?,
+                );
+            }
+        }
+    }
     let report = json!({
         "ok": true,
-        "action": if args.clear { "provider.drain.clear" } else { "provider.drain" },
+        "action": if args.clear {
+            "provider.drain.clear"
+        } else if args.stop {
+            "provider.drain.stop"
+        } else {
+            "provider.drain"
+        },
         "home": home,
-        "provider": wallet.public_key,
+        "provider": ctx.wallet.public_key,
         "enclave_id": args.enclave,
         "path": path,
         "changed": changed,
+        "reused_request": reused_request,
+        "sim": args.sim,
+        "drain": drain,
+        "retirement": retirement,
+        "removed": removed,
     });
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -43544,9 +47667,13 @@ async fn provider_drain(args: ProviderDrainArgs) -> Result<()> {
             "Provider drain requested: {}",
             report["path"].as_str().unwrap_or("")
         );
-        println!(
-            "Running provider processes will stop accepting new sessions after the next poll."
-        );
+        if args.stop {
+            println!("Provider workers drained, left canonical routes, and stopped.");
+        } else {
+            println!(
+                "Running provider processes will stop accepting new sessions after the next poll."
+            );
+        }
     }
     Ok(())
 }
@@ -43951,9 +48078,440 @@ fn provider_drain_flag_path(home: &Path, provider: &str, enclave: Option<&str>) 
 
 fn provider_drain_flag_paths(home: &Path, provider: &str, enclave: &str) -> Vec<PathBuf> {
     vec![
-        provider_drain_flag_path(home, provider, Some(enclave)),
         provider_drain_flag_path(home, provider, None),
+        provider_drain_flag_path(home, provider, Some(enclave)),
     ]
+}
+
+fn provider_drain_completion_path(home: &Path, provider: &str, enclave: &str) -> PathBuf {
+    provider_control_dir(home, provider)
+        .join(format!("{}.drained.json", safe_path_component(enclave)))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProviderDrainRequest {
+    path: PathBuf,
+    request_id: Option<String>,
+    provider: Option<String>,
+    enclave_id: Option<String>,
+}
+
+fn provider_drain_request(paths: &[PathBuf]) -> Result<Option<ProviderDrainRequest>> {
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let value = read_json_file(path)?;
+        if value.get("active").and_then(Value::as_bool).unwrap_or(true) {
+            return Ok(Some(ProviderDrainRequest {
+                path: path.clone(),
+                request_id: value
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                provider: value
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                enclave_id: value
+                    .get("enclave_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn write_provider_drain_request(
+    path: &Path,
+    provider: &str,
+    enclave: Option<&str>,
+    request_id: &str,
+) -> Result<()> {
+    write_json_file(
+        path,
+        &json!({
+            "active": true,
+            "provider": provider,
+            "enclave_id": enclave,
+            "request_id": request_id,
+            "created_at": unix_epoch_seconds()?,
+        }),
+    )
+}
+
+fn ensure_provider_drain_request(
+    path: &Path,
+    provider: &str,
+    enclave: Option<&str>,
+    request_id: &str,
+) -> Result<(ProviderDrainRequest, bool)> {
+    if let Some(request) = provider_drain_request(std::slice::from_ref(&path.to_path_buf()))? {
+        ensure!(
+            request.provider.as_deref() == Some(provider)
+                && request.enclave_id.as_deref() == enclave,
+            "active provider drain request {} belongs to a different provider or scope",
+            path.display()
+        );
+        ensure!(
+            request.request_id.is_some(),
+            "active provider drain request {} is missing request_id",
+            path.display()
+        );
+        return Ok((request, true));
+    }
+    write_provider_drain_request(path, provider, enclave, request_id)?;
+    let request = provider_drain_request(std::slice::from_ref(&path.to_path_buf()))?
+        .context("new provider drain request was not readable")?;
+    Ok((request, false))
+}
+
+fn complete_provider_drain_request(
+    home: &Path,
+    provider: &str,
+    enclave: &str,
+    request: &ProviderDrainRequest,
+) -> Result<Value> {
+    let path = provider_drain_completion_path(home, provider, enclave);
+    let report = json!({
+        "ok": true,
+        "provider": provider,
+        "enclave_id": enclave,
+        "request_id": request.request_id,
+        "request_path": request.path,
+        "completed_at": unix_epoch_seconds()?,
+    });
+    write_json_file(&path, &report)?;
+    Ok(json!({
+        "path": path,
+        "request_id": request.request_id,
+    }))
+}
+
+async fn wait_for_provider_drain_completion(
+    home: &Path,
+    provider: &str,
+    worker: &SupervisedProviderWorker,
+    request_id: &str,
+    deadline: Instant,
+) -> Result<Value> {
+    let path = provider_drain_completion_path(home, provider, &worker.enclave_id);
+    loop {
+        if let Some(completion) = read_json_file_if_exists(&path)? {
+            if completion.get("request_id").and_then(Value::as_str) == Some(request_id) {
+                return Ok(json!({
+                    "worker": worker,
+                    "path": path,
+                    "completion": completion,
+                }));
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for provider worker {} ({}) to finish draining; registration remains active",
+                worker.name,
+                worker.enclave_id
+            );
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn drain_supervised_provider_workers(
+    home: &Path,
+    provider: &str,
+    workers: &[SupervisedProviderWorker],
+    enclave: Option<&str>,
+    timeout: Duration,
+) -> Result<Value> {
+    ensure!(
+        !timeout.is_zero(),
+        "provider drain timeout must be positive"
+    );
+    ensure!(
+        !workers.is_empty(),
+        "no supervised provider workers matched the drain request"
+    );
+    let path = provider_drain_flag_path(home, provider, enclave);
+    let requested_id = provider_lifecycle_nonce(provider, "drain_to_stop", enclave, None)?;
+    let (request, reused_request) =
+        ensure_provider_drain_request(&path, provider, enclave, &requested_id)?;
+    let request_id = request
+        .request_id
+        .as_deref()
+        .context("active provider drain request is missing request_id")?;
+    let deadline = Instant::now() + timeout;
+    let mut completions = Vec::with_capacity(workers.len());
+    for worker in workers {
+        completions.push(
+            wait_for_provider_drain_completion(home, provider, worker, &request_id, deadline)
+                .await?,
+        );
+    }
+    Ok(json!({
+        "request_id": request_id,
+        "path": path,
+        "reused_request": reused_request,
+        "workers": workers,
+        "completions": completions,
+    }))
+}
+
+fn completed_provider_stack_drains(
+    home: &Path,
+    provider: &str,
+    request_id: &str,
+) -> Result<Vec<Value>> {
+    let directory = provider_control_dir(home, provider);
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("reading {}", directory.display()));
+        }
+    };
+    let mut completions = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.ends_with(".drained.json"))
+        })
+        .map(|entry| {
+            let path = entry.path();
+            let completion = read_json_file(&path)?;
+            Ok((path, completion))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, completion)| {
+            completion.get("provider").and_then(Value::as_str) == Some(provider)
+                && completion.get("request_id").and_then(Value::as_str) == Some(request_id)
+        })
+        .map(|(path, completion)| {
+            json!({
+                "path": path,
+                "completion": completion,
+            })
+        })
+        .collect::<Vec<_>>();
+    completions.sort_by(|a, b| {
+        a["completion"]["enclave_id"]
+            .as_str()
+            .cmp(&b["completion"]["enclave_id"].as_str())
+    });
+    Ok(completions)
+}
+
+async fn drain_supervised_provider_stack(
+    home: &Path,
+    provider: &str,
+    state: &Value,
+    timeout: Duration,
+) -> Result<Value> {
+    ensure!(
+        !timeout.is_zero(),
+        "provider drain timeout must be positive"
+    );
+    let child_count = supervised_running_provider_child_count(state);
+    ensure!(child_count > 0, "no supervised provider workers to drain");
+    let workers = supervised_provider_workers(state)
+        .into_iter()
+        .filter(|worker| worker.running)
+        .collect::<Vec<_>>();
+    if workers.len() == child_count {
+        return drain_supervised_provider_workers(home, provider, &workers, None, timeout).await;
+    }
+
+    let path = provider_drain_flag_path(home, provider, None);
+    let requested_id = provider_lifecycle_nonce(provider, "drain_to_stop", None, None)?;
+    let (request, reused_request) =
+        ensure_provider_drain_request(&path, provider, None, &requested_id)?;
+    let request_id = request
+        .request_id
+        .as_deref()
+        .context("active provider drain request is missing request_id")?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let completions = completed_provider_stack_drains(home, provider, &request_id)?;
+        if completions.len() >= child_count {
+            return Ok(json!({
+                "request_id": request_id,
+                "path": path,
+                "reused_request": reused_request,
+                "provider_child_count": child_count,
+                "workers": workers,
+                "completions": completions,
+            }));
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for all {child_count} supervised provider worker(s) to finish draining; observed {} request-bound completion(s), registration remains active",
+                completions.len()
+            );
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+fn clear_completed_provider_drain_request(
+    home: &Path,
+    provider: &str,
+    worker: &SupervisedProviderWorker,
+    drain: &Value,
+) -> Result<()> {
+    let request_id = drain
+        .get("request_id")
+        .and_then(Value::as_str)
+        .context("completed provider drain report is missing request_id")?;
+    let request_path = drain
+        .get("path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .context("completed provider drain report is missing path")?;
+    let expected_request_path = provider_drain_flag_path(home, provider, Some(&worker.enclave_id));
+    ensure!(
+        request_path == expected_request_path,
+        "completed provider drain report names an unexpected request path"
+    );
+    let request = provider_drain_request(std::slice::from_ref(&request_path))?
+        .context("completed provider drain request is no longer active")?;
+    ensure!(
+        request.request_id.as_deref() == Some(request_id),
+        "completed provider drain request id changed before replacement"
+    );
+    ensure!(
+        request.provider.as_deref() == Some(provider)
+            && request.enclave_id.as_deref() == Some(worker.enclave_id.as_str()),
+        "completed provider drain request identity changed before replacement"
+    );
+    let completion_path = provider_drain_completion_path(home, provider, &worker.enclave_id);
+    let completion = read_json_file(&completion_path)?;
+    ensure!(
+        completion.get("request_id").and_then(Value::as_str) == Some(request_id),
+        "provider drain completion id changed before replacement"
+    );
+    ensure!(
+        completion.get("provider").and_then(Value::as_str) == Some(provider)
+            && completion.get("enclave_id").and_then(Value::as_str)
+                == Some(worker.enclave_id.as_str()),
+        "provider drain completion identity changed before replacement"
+    );
+    ensure!(
+        completion.get("request_path").and_then(Value::as_str) == request_path.to_str(),
+        "provider drain completion is bound to a different request path"
+    );
+    fs::remove_file(&request_path).with_context(|| {
+        format!(
+            "clearing completed drain request {}",
+            request_path.display()
+        )
+    })?;
+    fs::remove_file(&completion_path).with_context(|| {
+        format!(
+            "clearing completed drain report {}",
+            completion_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn clear_completed_global_provider_drain_request(
+    home: &Path,
+    provider: &str,
+    request: &ProviderDrainRequest,
+) -> Result<Value> {
+    let expected_path = provider_drain_flag_path(home, provider, None);
+    ensure!(
+        request.path == expected_path
+            && request.provider.as_deref() == Some(provider)
+            && request.enclave_id.is_none(),
+        "global provider drain cleanup received a mismatched request"
+    );
+    let request_id = request
+        .request_id
+        .as_deref()
+        .context("global provider drain request is missing request_id")?;
+    let active = provider_drain_request(std::slice::from_ref(&expected_path))?
+        .context("global provider drain request is no longer active")?;
+    ensure!(
+        active.request_id.as_deref() == Some(request_id)
+            && active.provider.as_deref() == Some(provider)
+            && active.enclave_id.is_none(),
+        "global provider drain request changed before cleanup"
+    );
+
+    let mut removed_completions = Vec::new();
+    for completion in completed_provider_stack_drains(home, provider, request_id)? {
+        if completion["completion"]["request_path"].as_str() != expected_path.to_str() {
+            continue;
+        }
+        let path = PathBuf::from(
+            completion["path"]
+                .as_str()
+                .context("provider drain completion is missing path")?,
+        );
+        fs::remove_file(&path).with_context(|| {
+            format!("clearing completed global drain report {}", path.display())
+        })?;
+        removed_completions.push(path);
+    }
+    fs::remove_file(&expected_path).with_context(|| {
+        format!(
+            "clearing completed global drain request {}",
+            expected_path.display()
+        )
+    })?;
+    Ok(json!({
+        "provider": provider,
+        "request_id": request_id,
+        "request_path": expected_path,
+        "removed_completions": removed_completions,
+    }))
+}
+
+fn clear_stopped_global_provider_drain_requests(home: &Path) -> Result<Value> {
+    let root = home.join("provider-control");
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(json!({ "cleared": [] }));
+        }
+        Err(err) => return Err(err).with_context(|| format!("reading {}", root.display())),
+    };
+    let mut provider_dirs = entries
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("reading {}", root.display()))?;
+    provider_dirs.sort_by_key(|entry| entry.file_name());
+
+    let mut cleared = Vec::new();
+    for entry in provider_dirs {
+        if !entry
+            .file_type()
+            .with_context(|| format!("inspecting {}", entry.path().display()))?
+            .is_dir()
+        {
+            continue;
+        }
+        let path = entry.path().join("all.drain.json");
+        let Some(request) = provider_drain_request(std::slice::from_ref(&path))? else {
+            continue;
+        };
+        let provider = request
+            .provider
+            .as_deref()
+            .context("global provider drain request is missing provider")?;
+        ensure!(
+            provider_control_dir(home, provider) == entry.path(),
+            "global provider drain request provider does not match its control directory"
+        );
+        cleared.push(clear_completed_global_provider_drain_request(
+            home, provider, &request,
+        )?);
+    }
+    Ok(json!({ "cleared": cleared }))
 }
 
 fn provider_serve_active_drain_flag(home: &Path, enclave: &str) -> Result<Option<PathBuf>> {
@@ -43999,16 +48557,7 @@ fn bail_provider_start_drained(home: &Path, enclave: &str, path: &Path) -> Resul
 }
 
 fn provider_drain_requested(paths: &[PathBuf]) -> Result<Option<PathBuf>> {
-    for path in paths {
-        if !path.exists() {
-            continue;
-        }
-        let value = read_json_file(path)?;
-        if value.get("active").and_then(Value::as_bool).unwrap_or(true) {
-            return Ok(Some(path.clone()));
-        }
-    }
-    Ok(None)
+    Ok(provider_drain_request(paths)?.map(|request| request.path))
 }
 
 struct ProviderTxContext {
@@ -44105,6 +48654,18 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
     let hardware_fingerprint = current_provider_hardware_fingerprint();
     let join_attestation =
         provider_tier1_join_attestation(&ctx.wallet.public_key, &enclave, &hardware_fingerprint)?;
+    let activation_leave_replay = replay_provider_leaves_before_activation(
+        &ctx.home,
+        &ctx.rpc,
+        &ProviderActivationLeaveScope {
+            provider: Some(ctx.wallet.public_key.clone()),
+            enclave_id: enclave.enclave_id.clone(),
+            room_ids: Some(rooms.iter().map(|room| room.room_id.clone()).collect()),
+        },
+        args.tx.sim,
+    )
+    .await
+    .context("replaying pending signed leaves before provider join")?;
     let provider_feature = ensure_provider_registered(
         &ctx.rpc,
         &ctx.keypair_path,
@@ -44150,6 +48711,7 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         "served_modalities": serve_terms.served_modalities,
         "served_specialities": serve_terms.served_specialities,
         "rooms": rooms,
+        "activation_leave_replay": activation_leave_replay,
         "features": {
             "provider": provider_feature,
             "serve": serve_feature,
@@ -44221,13 +48783,90 @@ async fn provider_leave(args: ProviderLeaveArgs) -> Result<()> {
     print_provider_lifecycle_report(&report, args.tx.json)
 }
 
-async fn provider_stop(args: ProviderStopArgs) -> Result<()> {
-    let ctx = provider_tx_context(&args.tx).await?;
-    let contract = read_contract_catalog(&ctx.rpc).await?;
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ProviderWorkerRetirement {
+    DeliberateRemove,
+    EnclaveSwitch,
+    DrainToStop,
+    ProviderStop,
+    MayhemDown,
+    Crash,
+    TemporaryUpdate,
+}
+
+impl ProviderWorkerRetirement {
+    fn leaves_durable_registration(self) -> bool {
+        matches!(
+            self,
+            Self::DeliberateRemove
+                | Self::EnclaveSwitch
+                | Self::DrainToStop
+                | Self::ProviderStop
+                | Self::MayhemDown
+        )
+    }
+}
+
+fn provider_down_retirement(restart: bool) -> ProviderWorkerRetirement {
+    if restart {
+        ProviderWorkerRetirement::TemporaryUpdate
+    } else {
+        ProviderWorkerRetirement::MayhemDown
+    }
+}
+
+fn provider_stack_requires_graceful_drain(provider_child_count: usize) -> bool {
+    provider_child_count > 0
+}
+
+fn provider_drain_retirement(stop: bool) -> Option<ProviderWorkerRetirement> {
+    stop.then_some(ProviderWorkerRetirement::DrainToStop)
+}
+
+fn provider_stop_retirement() -> ProviderWorkerRetirement {
+    ProviderWorkerRetirement::ProviderStop
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+struct ProviderSwitchSequencingPolicy {
+    prepare_replacement_before_drain: bool,
+    clear_completed_scoped_drain_before_add: bool,
+}
+
+fn provider_switch_sequencing_policy(
+    old_enclave_id: &str,
+    new_enclave_id: &str,
+) -> ProviderSwitchSequencingPolicy {
+    ProviderSwitchSequencingPolicy {
+        prepare_replacement_before_drain: true,
+        clear_completed_scoped_drain_before_add: old_enclave_id == new_enclave_id,
+    }
+}
+
+fn provider_switch_preserves_durable_registration(
+    old_enclave_id: &str,
+    new_enclave_id: &str,
+    existing_serve: Option<&Value>,
+    new_terms: &ProviderJoinContextTerms,
+) -> bool {
+    old_enclave_id == new_enclave_id
+        && existing_serve.is_some_and(|serve| serve_state_matches_context_terms(serve, new_terms))
+}
+
+fn active_provider_rooms_for_retirement(
+    contract: &ContractCatalog,
+    provider: &str,
+    enclave_ids: &BTreeSet<String>,
+) -> Vec<LedgerRoomServe> {
     let mut active_rooms = contract
         .roomserve
         .iter()
-        .filter(|room| room.provider == ctx.wallet.public_key && room.status == "active")
+        .filter(|room| {
+            room.provider == provider
+                && room.status == "active"
+                && enclave_ids.contains(&room.enclave_id)
+        })
         .cloned()
         .collect::<Vec<_>>();
     active_rooms.sort_by(|a, b| {
@@ -44235,28 +48874,342 @@ async fn provider_stop(args: ProviderStopArgs) -> Result<()> {
             .cmp(&b.enclave_id)
             .then_with(|| a.room_id.cmp(&b.room_id))
     });
+    active_rooms
+}
+
+fn provider_retirement_intent_order(
+    active_rooms: &[LedgerRoomServe],
+    enclave_ids: &BTreeSet<String>,
+) -> Vec<Value> {
+    active_rooms
+        .iter()
+        .map(|room| {
+            json!({
+                "op": "leave_room",
+                "room_id": room.room_id,
+                "enclave_id": room.enclave_id,
+            })
+        })
+        .chain(enclave_ids.iter().map(|enclave_id| {
+            json!({
+                "op": "leave_enclave",
+                "enclave_id": enclave_id,
+            })
+        }))
+        .collect()
+}
+
+async fn retire_provider_registrations(
+    ctx: &ProviderTxContext,
+    contract: &ContractCatalog,
+    enclave_ids: &[String],
+    reason: ProviderWorkerRetirement,
+    sim: bool,
+) -> Result<Value> {
+    let requested_enclave_ids = enclave_ids.iter().cloned().collect::<BTreeSet<_>>();
+    if !reason.leaves_durable_registration() {
+        return Ok(json!({
+            "reason": reason,
+            "left_registration": false,
+            "resume": "durable_registration",
+            "enclave_ids": requested_enclave_ids,
+            "rooms": [],
+            "serves": [],
+        }));
+    }
+
+    let active_rooms = active_provider_rooms_for_retirement(
+        contract,
+        &ctx.wallet.public_key,
+        &requested_enclave_ids,
+    );
+    let active_enclave_ids = contract
+        .serves
+        .iter()
+        .filter(|serve| {
+            serve.provider == ctx.wallet.public_key
+                && serve.status == "active"
+                && requested_enclave_ids.contains(&serve.enclave_id)
+        })
+        .map(|serve| serve.enclave_id.clone())
+        .collect::<BTreeSet<_>>();
+    let order = provider_retirement_intent_order(&active_rooms, &active_enclave_ids);
+
     let mut room_features = Vec::with_capacity(active_rooms.len());
-    for room in &active_rooms {
-        room_features.push(
-            ensure_left_room(&ctx, &room.room_id, &room.enclave_id, args.tx.sim)
+    let mut serve_features = Vec::with_capacity(active_enclave_ids.len());
+    if sim {
+        for room in &active_rooms {
+            room_features.push(
+                ensure_left_room(ctx, &room.room_id, &room.enclave_id, true)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "simulating leave for room {} and enclave {}",
+                            room.room_id, room.enclave_id
+                        )
+                    })?,
+            );
+        }
+        for enclave_id in &active_enclave_ids {
+            serve_features.push(
+                ensure_left_enclave(ctx, enclave_id, true)
+                    .await
+                    .with_context(|| format!("simulating leave for enclave {enclave_id}"))?,
+            );
+        }
+    } else {
+        let mut queued_rooms = Vec::with_capacity(active_rooms.len());
+        for room in &active_rooms {
+            queued_rooms.push(
+                queue_signed_provider_leave(
+                    ctx,
+                    ProviderLeaveOp::Room,
+                    &room.enclave_id,
+                    Some(&room.room_id),
+                )
                 .await
                 .with_context(|| {
                     format!(
-                        "leaving room {} for enclave {}",
+                        "queueing signed leave for room {} and enclave {}",
                         room.room_id, room.enclave_id
                     )
                 })?,
-        );
+            );
+        }
+        let mut queued_enclaves = Vec::with_capacity(active_enclave_ids.len());
+        for enclave_id in &active_enclave_ids {
+            queued_enclaves.push(
+                queue_signed_provider_leave(ctx, ProviderLeaveOp::Enclave, enclave_id, None)
+                    .await
+                    .with_context(|| format!("queueing signed leave for enclave {enclave_id}"))?,
+            );
+        }
+        for queued in &queued_rooms {
+            room_features.push(
+                submit_queued_provider_leave(&ctx.rpc, queued)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "leaving room {} for enclave {}",
+                            queued.room_id.as_deref().unwrap_or(""),
+                            queued.enclave_id
+                        )
+                    })?,
+            );
+        }
+        for queued in &queued_enclaves {
+            serve_features.push(
+                submit_queued_provider_leave(&ctx.rpc, queued)
+                    .await
+                    .with_context(|| format!("leaving enclave {}", queued.enclave_id))?,
+            );
+        }
+    }
+    Ok(json!({
+        "reason": reason,
+        "left_registration": true,
+        "confirmed_leave": true,
+        "enclave_ids": active_enclave_ids,
+        "rooms": active_rooms,
+        "features": {
+            "rooms": room_features,
+            "serves": serve_features,
+        },
+        "intent_order": order,
+    }))
+}
+
+async fn retire_provider_stack_before_down(
+    home: &Path,
+    timeout_seconds: u64,
+    wallet_password: Option<String>,
+    reason: ProviderWorkerRetirement,
+) -> Result<Value> {
+    let pid = read_pid_file(&mayhemd_pid_path(home))?;
+    let supervisor_running = pid.map(process_is_running).unwrap_or(false);
+    let state = read_json_file_if_exists(&mayhemd_state_path(home))?;
+    let provider_child_count = state
+        .as_ref()
+        .map(supervised_running_provider_child_count)
+        .unwrap_or(0);
+    let workers = state
+        .as_ref()
+        .map(supervised_provider_workers)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|worker| worker.running)
+        .collect::<Vec<_>>();
+
+    if !supervisor_running
+        || (!provider_stack_requires_graceful_drain(provider_child_count)
+            && !reason.leaves_durable_registration())
+    {
+        let skipped = if !supervisor_running {
+            "supervisor_not_running"
+        } else {
+            "no_supervised_provider_workers"
+        };
+        return Ok(json!({
+            "ok": true,
+            "supervisor_running": supervisor_running,
+            "provider_child_count": provider_child_count,
+            "workers": workers,
+            "drain": Value::Null,
+            "retirement": {
+                "reason": reason,
+                "left_registration": false,
+                "resume": if reason == ProviderWorkerRetirement::TemporaryUpdate {
+                    "durable_registration"
+                } else {
+                    "none"
+                },
+                "skipped": skipped,
+            },
+        }));
     }
 
+    let ctx = provider_tx_context(&ProviderTxArgs {
+        home: Some(home.to_path_buf()),
+        rpc_url: None,
+        peer_store_name: "main".to_owned(),
+        wallet_password,
+        sim: false,
+        json: true,
+    })
+    .await
+    .context("preparing provider lifecycle cleanup before mayhem down")?;
+    let drain = if !provider_stack_requires_graceful_drain(provider_child_count) {
+        Value::Null
+    } else {
+        drain_supervised_provider_stack(
+            home,
+            &ctx.wallet.public_key,
+            state.as_ref().context("mayhemd state is unavailable")?,
+            Duration::from_secs(timeout_seconds),
+        )
+        .await
+        .context("draining provider workers before mayhem down")?
+    };
+    if !reason.leaves_durable_registration() {
+        return Ok(json!({
+            "ok": true,
+            "provider": ctx.wallet.public_key,
+            "supervisor_running": true,
+            "provider_child_count": provider_child_count,
+            "workers": workers,
+            "drain": drain,
+            "retirement": {
+                "reason": reason,
+                "left_registration": false,
+                "confirmed_leave": false,
+                "resume": "durable_registration",
+            },
+        }));
+    }
+    let contract = read_contract_catalog(&ctx.rpc)
+        .await
+        .context("reading provider registrations before mayhem down")?;
     let serves = read_active_provider_serves(&ctx.rpc, &ctx.wallet.public_key).await?;
-    let mut serve_features = Vec::with_capacity(serves.len());
-    for serve in &serves {
-        serve_features.push(
-            ensure_left_enclave(&ctx, &serve.enclave_id, args.tx.sim)
-                .await
-                .with_context(|| format!("leaving enclave {}", serve.enclave_id))?,
-        );
+    let enclave_ids = workers
+        .iter()
+        .map(|worker| worker.enclave_id.clone())
+        .chain(serves.iter().map(|serve| serve.enclave_id.clone()))
+        .chain(
+            contract
+                .roomserve
+                .iter()
+                .filter(|room| room.provider == ctx.wallet.public_key && room.status == "active")
+                .map(|room| room.enclave_id.clone()),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let retirement =
+        retire_provider_registrations(&ctx, &contract, &enclave_ids, reason, false).await?;
+    Ok(json!({
+        "ok": true,
+        "provider": ctx.wallet.public_key,
+        "supervisor_running": true,
+        "provider_child_count": provider_child_count,
+        "workers": workers,
+        "drain": drain,
+        "retirement": retirement,
+    }))
+}
+
+async fn provider_stop(args: ProviderStopArgs) -> Result<()> {
+    ensure!(
+        args.timeout_seconds > 0,
+        "--timeout-seconds must be positive"
+    );
+    let ctx = provider_tx_context(&args.tx).await?;
+    let contract = read_contract_catalog(&ctx.rpc).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("building mayhemd control HTTP client")?;
+    let supervisor_url = mayhemd_control_url_if_running(&ctx.home)?;
+    let workers = if let Some(supervisor_url) = supervisor_url.as_ref() {
+        let status = fetch_gateway_json(&client, &format!("{supervisor_url}/status")).await?;
+        supervised_provider_workers(&status)
+    } else {
+        Vec::new()
+    };
+    let drain = if args.tx.sim || workers.is_empty() {
+        Value::Null
+    } else {
+        drain_supervised_provider_workers(
+            &ctx.home,
+            &ctx.wallet.public_key,
+            &workers,
+            None,
+            Duration::from_secs(args.timeout_seconds),
+        )
+        .await?
+    };
+    let active_rooms = contract
+        .roomserve
+        .iter()
+        .filter(|room| room.provider == ctx.wallet.public_key && room.status == "active")
+        .cloned()
+        .collect::<Vec<_>>();
+    let serves = read_active_provider_serves(&ctx.rpc, &ctx.wallet.public_key).await?;
+    let enclave_ids = workers
+        .iter()
+        .map(|worker| worker.enclave_id.clone())
+        .chain(serves.iter().map(|serve| serve.enclave_id.clone()))
+        .chain(active_rooms.iter().map(|room| room.enclave_id.clone()))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let retirement = retire_provider_registrations(
+        &ctx,
+        &contract,
+        &enclave_ids,
+        provider_stop_retirement(),
+        args.tx.sim,
+    )
+    .await?;
+    let features = retirement
+        .get("features")
+        .cloned()
+        .unwrap_or_else(|| json!({ "rooms": [], "serves": [] }));
+    let mut removed = Vec::new();
+    if !args.tx.sim {
+        if let Some(supervisor_url) = supervisor_url.as_ref() {
+            let control_token = load_or_create_mayhemd_control_token(&ctx.home)?;
+            for worker in &workers {
+                removed.push(
+                    remove_supervised_provider_worker(
+                        &client,
+                        supervisor_url,
+                        &control_token,
+                        worker,
+                    )
+                    .await?,
+                );
+            }
+        }
     }
     let report = json!({
         "ok": true,
@@ -44267,10 +49220,12 @@ async fn provider_stop(args: ProviderStopArgs) -> Result<()> {
         "sim": args.tx.sim,
         "rooms": active_rooms,
         "enclaves": serves,
-        "features": {
-            "rooms": room_features,
-            "serves": serve_features,
-        },
+        "supervisor_url": supervisor_url,
+        "workers": workers,
+        "drain": drain,
+        "features": features,
+        "retirement": retirement,
+        "removed": removed,
     });
     print_provider_lifecycle_report(&report, args.tx.json)
 }
@@ -44310,6 +49265,18 @@ async fn provider_room_join(args: ProviderRoomJoinArgs) -> Result<()> {
         );
     }
     let price = require_current_au_usd_price(&contract.prices, &enclave.enclave_id)?;
+    let activation_leave_replay = replay_provider_leaves_before_activation(
+        &ctx.home,
+        &ctx.rpc,
+        &ProviderActivationLeaveScope {
+            provider: Some(ctx.wallet.public_key.clone()),
+            enclave_id: enclave.enclave_id.clone(),
+            room_ids: Some([room.room_id.clone()].into_iter().collect()),
+        },
+        args.tx.sim,
+    )
+    .await
+    .context("replaying pending signed leaves before provider room join")?;
     let serve_key = format!("serve/{}/{}", ctx.wallet.public_key, enclave.enclave_id);
     let serving = read_state_value(&ctx.rpc, &serve_key).await?;
     if serving
@@ -44345,6 +49312,7 @@ async fn provider_room_join(args: ProviderRoomJoinArgs) -> Result<()> {
         "enclave": enclave,
         "price": price,
         "rooms": [room],
+        "activation_leave_replay": activation_leave_replay,
         "features": {
             "rooms": room_features,
         },
@@ -44401,6 +49369,744 @@ fn provider_lifecycle_feature_key(intent: &Value) -> Result<String> {
         .to_hex()
         .to_string();
     Ok(format!("intent/provider/{provider}/{op}/{digest}"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ProviderLeaveOp {
+    Room,
+    Enclave,
+}
+
+impl ProviderLeaveOp {
+    fn parse(op: &str) -> Result<Self> {
+        match op {
+            "leave_room" => Ok(Self::Room),
+            "leave_enclave" => Ok(Self::Enclave),
+            _ => bail!("provider leave outbox accepts only leave_room or leave_enclave"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Room => "leave_room",
+            Self::Enclave => "leave_enclave",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SignedProviderLeaveOutboxEntry {
+    path: PathBuf,
+    feature: Value,
+    op: ProviderLeaveOp,
+    provider: String,
+    enclave_id: String,
+    room_id: Option<String>,
+    state_key: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderLeaveDeliveryStatus {
+    Accepted,
+    Confirmed,
+}
+
+fn provider_leave_outbox_dir(home: &Path) -> PathBuf {
+    home.join("provider-lifecycle-leave-outbox")
+}
+
+fn checked_provider_leave_outbox_dir(home: &Path, create: bool) -> Result<Option<PathBuf>> {
+    let directory = provider_leave_outbox_dir(home);
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) => {
+            ensure!(
+                !metadata.file_type().is_symlink() && metadata.file_type().is_dir(),
+                "provider leave outbox {} must be a real directory, not a symlink",
+                directory.display()
+            );
+            Ok(Some(directory))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound && !create => Ok(None),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(&directory)
+                .with_context(|| format!("creating {}", directory.display()))?;
+            let metadata = fs::symlink_metadata(&directory)
+                .with_context(|| format!("inspecting {}", directory.display()))?;
+            ensure!(
+                !metadata.file_type().is_symlink() && metadata.file_type().is_dir(),
+                "provider leave outbox {} must be a real directory, not a symlink",
+                directory.display()
+            );
+            Ok(Some(directory))
+        }
+        Err(err) => Err(err).with_context(|| format!("inspecting {}", directory.display())),
+    }
+}
+
+fn exact_json_object<'a>(
+    value: &'a Value,
+    label: &str,
+    expected_fields: &[&str],
+) -> Result<&'a Map<String, Value>> {
+    let object = value
+        .as_object()
+        .with_context(|| format!("{label} must be a JSON object"))?;
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = expected_fields.iter().copied().collect::<BTreeSet<_>>();
+    ensure!(
+        actual == expected,
+        "{label} fields must be exactly {}; got {}",
+        expected.into_iter().collect::<Vec<_>>().join(", "),
+        actual.into_iter().collect::<Vec<_>>().join(", ")
+    );
+    Ok(object)
+}
+
+fn provider_leave_outbox_path(home: &Path, feature: &Value) -> Result<PathBuf> {
+    let feature = exact_json_object(
+        feature,
+        "provider leave feature",
+        &["feature", "key", "value"],
+    )?;
+    let key = feature
+        .get("key")
+        .and_then(Value::as_str)
+        .context("provider leave feature key must be a string")?;
+    let digest = key
+        .rsplit('/')
+        .next()
+        .filter(|digest| is_hex_len(digest, 64))
+        .context("provider leave feature key must end in a 32-byte hex digest")?;
+    Ok(provider_leave_outbox_dir(home).join(format!("{digest}.json")))
+}
+
+fn validate_provider_leave_outbox_document(
+    path: &Path,
+    bytes: &[u8],
+    expected_provider: Option<&str>,
+) -> Result<SignedProviderLeaveOutboxEntry> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() as u64 <= PROVIDER_LEAVE_OUTBOX_MAX_ENTRY_BYTES,
+        "provider leave outbox entry {} must be between 1 and {} bytes",
+        path.display(),
+        PROVIDER_LEAVE_OUTBOX_MAX_ENTRY_BYTES
+    );
+    let document: Value =
+        serde_json::from_slice(bytes).with_context(|| format!("parsing {}", path.display()))?;
+    let document_object = exact_json_object(
+        &document,
+        "provider leave outbox document",
+        &["feature", "schema_version"],
+    )?;
+    ensure!(
+        document_object
+            .get("schema_version")
+            .and_then(Value::as_u64)
+            == Some(PROVIDER_LEAVE_OUTBOX_SCHEMA_VERSION),
+        "provider leave outbox entry {} has an unsupported schema_version",
+        path.display()
+    );
+    let feature = document_object
+        .get("feature")
+        .context("provider leave outbox document is missing feature")?;
+    let feature_object = exact_json_object(
+        feature,
+        "provider leave feature",
+        &["feature", "key", "value"],
+    )?;
+    ensure!(
+        feature_object.get("feature").and_then(Value::as_str) == Some("mayhem"),
+        "provider leave outbox feature must be mayhem"
+    );
+    let key = feature_object
+        .get("key")
+        .and_then(Value::as_str)
+        .context("provider leave outbox feature key must be a string")?;
+    ensure!(
+        key.len() <= 256,
+        "provider leave outbox feature key is too large"
+    );
+    let value = feature_object
+        .get("value")
+        .context("provider leave outbox feature is missing value")?;
+    let value_object = exact_json_object(
+        value,
+        "provider leave feature value",
+        &["intent", "op", "sig"],
+    )?;
+    ensure!(
+        value_object.get("op").and_then(Value::as_str) == Some("provider_lifecycle"),
+        "provider leave outbox value op must be provider_lifecycle"
+    );
+    let signature = value_object
+        .get("sig")
+        .and_then(Value::as_str)
+        .context("provider leave outbox signature must be a string")?;
+    ensure!(
+        is_hex_len(signature, 128),
+        "provider leave outbox signature must be 64-byte hex"
+    );
+    let intent = value_object
+        .get("intent")
+        .context("provider leave outbox value is missing intent")?;
+    let intent_object = intent
+        .as_object()
+        .context("provider leave outbox intent must be a JSON object")?;
+    let op = ProviderLeaveOp::parse(
+        intent_object
+            .get("op")
+            .and_then(Value::as_str)
+            .context("provider leave outbox intent op must be a string")?,
+    )?;
+    let expected_intent_fields = match op {
+        ProviderLeaveOp::Room => &["enclave_id", "nonce", "op", "provider", "room_id"][..],
+        ProviderLeaveOp::Enclave => &["enclave_id", "nonce", "op", "provider"][..],
+    };
+    let intent_object = exact_json_object(intent, "provider leave intent", expected_intent_fields)?;
+    let provider = intent_object
+        .get("provider")
+        .and_then(Value::as_str)
+        .context("provider leave intent provider must be a string")?;
+    ensure!(
+        is_hex_len(provider, 64),
+        "provider leave intent provider must be a 32-byte hex public key"
+    );
+    if let Some(expected_provider) = expected_provider {
+        ensure!(
+            provider == expected_provider,
+            "provider leave outbox entry belongs to a different provider"
+        );
+    }
+    let enclave_id = intent_object
+        .get("enclave_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+        .context("provider leave intent enclave_id must be 1..=256 bytes")?;
+    let room_id = match op {
+        ProviderLeaveOp::Room => Some(
+            intent_object
+                .get("room_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty() && value.len() <= 256)
+                .context("provider leave intent room_id must be 1..=256 bytes")?,
+        ),
+        ProviderLeaveOp::Enclave => None,
+    };
+    ensure!(
+        intent_object
+            .get("nonce")
+            .and_then(Value::as_str)
+            .is_some_and(|nonce| is_hex_len(nonce, 64)),
+        "provider leave intent nonce must be a 32-byte hex digest"
+    );
+    let expected_key = provider_lifecycle_feature_key(intent)?;
+    ensure!(
+        key == expected_key,
+        "provider leave outbox feature key does not match its signed intent"
+    );
+    let expected_path = provider_leave_outbox_path(
+        path.parent()
+            .and_then(Path::parent)
+            .context("provider leave outbox entry path is outside MAYHEM_HOME")?,
+        feature,
+    )?;
+    ensure!(
+        path == expected_path,
+        "provider leave outbox filename does not match its feature key"
+    );
+
+    let key_bytes = hex_decode_array::<32>(provider, "provider leave public key")?;
+    let sig_bytes = hex_decode_array::<64>(signature, "provider leave signature")?;
+    let verifying_key =
+        VerifyingKey::from_bytes(&key_bytes).context("invalid provider leave public key")?;
+    verifying_key
+        .verify_strict(
+            provider_lifecycle_intent_message(intent).as_bytes(),
+            &Signature::from_bytes(&sig_bytes),
+        )
+        .context("provider leave outbox signature failed")?;
+
+    let state_key = match op {
+        ProviderLeaveOp::Room => format!(
+            "roomserve/{}/{}/{}",
+            room_id.context("validated room leave lost room_id")?,
+            provider,
+            enclave_id
+        ),
+        ProviderLeaveOp::Enclave => format!("serve/{provider}/{enclave_id}"),
+    };
+    Ok(SignedProviderLeaveOutboxEntry {
+        path: path.to_path_buf(),
+        feature: feature.clone(),
+        op,
+        provider: provider.to_owned(),
+        enclave_id: enclave_id.to_owned(),
+        room_id: room_id.map(str::to_owned),
+        state_key,
+    })
+}
+
+fn load_provider_leave_outbox_entry(
+    path: &Path,
+    expected_provider: Option<&str>,
+) -> Result<SignedProviderLeaveOutboxEntry> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("inspecting {}", path.display()))?;
+    ensure!(
+        !metadata.file_type().is_symlink() && metadata.file_type().is_file(),
+        "provider leave outbox entry {} must be a real regular file, not a symlink",
+        path.display()
+    );
+    ensure!(
+        metadata.len() > 0 && metadata.len() <= PROVIDER_LEAVE_OUTBOX_MAX_ENTRY_BYTES,
+        "provider leave outbox entry {} must be between 1 and {} bytes",
+        path.display(),
+        PROVIDER_LEAVE_OUTBOX_MAX_ENTRY_BYTES
+    );
+    let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    validate_provider_leave_outbox_document(path, &bytes, expected_provider)
+}
+
+fn load_provider_leave_outbox(home: &Path) -> Result<Vec<SignedProviderLeaveOutboxEntry>> {
+    let Some(directory) = checked_provider_leave_outbox_dir(home, false)? else {
+        return Ok(Vec::new());
+    };
+    let entries =
+        fs::read_dir(&directory).with_context(|| format!("reading {}", directory.display()))?;
+    let mut paths = entries
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("reading {}", directory.display()))?
+        .into_iter()
+        .filter(|entry| entry.path().extension() == Some(OsStr::new("json")))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    ensure!(
+        paths.len() <= PROVIDER_LEAVE_OUTBOX_MAX_ENTRIES,
+        "provider leave outbox exceeds its {} entry bound",
+        PROVIDER_LEAVE_OUTBOX_MAX_ENTRIES
+    );
+    paths.sort();
+    let mut entries = paths
+        .iter()
+        .map(|path| load_provider_leave_outbox_entry(path, None))
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_by(|left, right| {
+        left.op
+            .cmp(&right.op)
+            .then_with(|| left.enclave_id.cmp(&right.enclave_id))
+            .then_with(|| left.room_id.cmp(&right.room_id))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(entries)
+}
+
+#[cfg(unix)]
+fn sync_provider_leave_outbox_directory(directory: &Path) -> Result<()> {
+    fs::File::open(directory)
+        .with_context(|| format!("opening {}", directory.display()))?
+        .sync_all()
+        .with_context(|| format!("syncing {}", directory.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_provider_leave_outbox_directory(_directory: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn persist_provider_leave_outbox_feature(
+    home: &Path,
+    feature: &Value,
+    expected_provider: &str,
+) -> Result<SignedProviderLeaveOutboxEntry> {
+    let directory = checked_provider_leave_outbox_dir(home, true)?
+        .context("provider leave outbox directory was not created")?;
+    let path = provider_leave_outbox_path(home, feature)?;
+    if path.exists() {
+        let existing = load_provider_leave_outbox_entry(&path, Some(expected_provider))?;
+        ensure!(
+            existing.feature == *feature,
+            "provider leave outbox key already exists with different signed content"
+        );
+        return Ok(existing);
+    }
+    ensure!(
+        load_provider_leave_outbox(home)?.len() < PROVIDER_LEAVE_OUTBOX_MAX_ENTRIES,
+        "provider leave outbox reached its {} entry bound",
+        PROVIDER_LEAVE_OUTBOX_MAX_ENTRIES
+    );
+    let document = json!({
+        "schema_version": PROVIDER_LEAVE_OUTBOX_SCHEMA_VERSION,
+        "feature": feature,
+    });
+    let bytes = serde_json::to_vec_pretty(&document)?;
+    ensure!(
+        bytes.len() as u64 <= PROVIDER_LEAVE_OUTBOX_MAX_ENTRY_BYTES,
+        "provider leave outbox entry exceeds its {} byte bound",
+        PROVIDER_LEAVE_OUTBOX_MAX_ENTRY_BYTES
+    );
+    validate_provider_leave_outbox_document(&path, &bytes, Some(expected_provider))?;
+    let temp_path = directory.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_stem().and_then(OsStr::to_str).unwrap_or("leave"),
+        std::process::id(),
+        unix_epoch_millis()?
+    ));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp_path)
+        .with_context(|| format!("creating {}", temp_path.display()))?;
+    file.write_all(&bytes)
+        .with_context(|| format!("writing {}", temp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing {}", temp_path.display()))?;
+    drop(file);
+    if let Err(err) = fs::hard_link(&temp_path, &path) {
+        let _ = fs::remove_file(&temp_path);
+        if path.exists() {
+            let existing = load_provider_leave_outbox_entry(&path, Some(expected_provider))?;
+            ensure!(
+                existing.feature == *feature,
+                "provider leave outbox key raced with different signed content"
+            );
+            return Ok(existing);
+        }
+        return Err(err).with_context(|| format!("committing {}", path.display()));
+    }
+    fs::remove_file(&temp_path).with_context(|| format!("removing {}", temp_path.display()))?;
+    sync_provider_leave_outbox_directory(&directory)?;
+    load_provider_leave_outbox_entry(&path, Some(expected_provider))
+}
+
+fn finalize_provider_leave_outbox_entry(
+    entry: &SignedProviderLeaveOutboxEntry,
+    status: ProviderLeaveDeliveryStatus,
+) -> Result<bool> {
+    if status != ProviderLeaveDeliveryStatus::Confirmed {
+        return Ok(false);
+    }
+    let current = load_provider_leave_outbox_entry(&entry.path, Some(&entry.provider))?;
+    ensure!(
+        current.feature == entry.feature,
+        "provider leave outbox entry changed before confirmation cleanup"
+    );
+    fs::remove_file(&entry.path)
+        .with_context(|| format!("removing confirmed leave {}", entry.path.display()))?;
+    if let Some(directory) = entry.path.parent() {
+        sync_provider_leave_outbox_directory(directory)?;
+    }
+    Ok(true)
+}
+
+async fn confirmed_provider_leave_state(
+    rpc: &PeerRpcClient,
+    entry: &SignedProviderLeaveOutboxEntry,
+) -> Result<Option<Value>> {
+    let state = rpc
+        .state(Some(&entry.state_key), Some(true))
+        .await
+        .with_context(|| format!("reading confirmed state {}", entry.state_key))?;
+    let value = state.get("value").cloned().unwrap_or(Value::Null);
+    Ok(provider_leave_state_is_confirmed(entry, &value)?.then_some(value))
+}
+
+fn provider_leave_state_is_confirmed(
+    entry: &SignedProviderLeaveOutboxEntry,
+    value: &Value,
+) -> Result<bool> {
+    if value.is_null() {
+        return Ok(false);
+    }
+    let state = value
+        .as_object()
+        .context("confirmed provider leave state must be an object or null")?;
+    ensure!(
+        state.get("provider").and_then(Value::as_str) == Some(entry.provider.as_str())
+            && state.get("enclave_id").and_then(Value::as_str) == Some(entry.enclave_id.as_str()),
+        "confirmed provider leave state identity does not match its outbox entry"
+    );
+    match entry.op {
+        ProviderLeaveOp::Room => ensure!(
+            state.get("room_id").and_then(Value::as_str) == entry.room_id.as_deref(),
+            "confirmed provider room leave state identity does not match its outbox entry"
+        ),
+        ProviderLeaveOp::Enclave => ensure!(
+            !state.contains_key("room_id"),
+            "confirmed provider enclave leave state contains an unexpected room_id"
+        ),
+    }
+    match state.get("status").and_then(Value::as_str) {
+        Some("inactive") => Ok(true),
+        Some("active") => Ok(false),
+        _ => bail!("confirmed provider leave state has an invalid or missing status"),
+    }
+}
+
+async fn wait_for_confirmed_provider_leave(
+    rpc: &PeerRpcClient,
+    entry: &SignedProviderLeaveOutboxEntry,
+) -> Result<Value> {
+    loop {
+        if let Some(state) = confirmed_provider_leave_state(rpc, entry).await? {
+            return Ok(state);
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn submit_queued_provider_leave(
+    rpc: &PeerRpcClient,
+    entry: &SignedProviderLeaveOutboxEntry,
+) -> Result<Value> {
+    let already_confirmed = timeout(
+        PROVIDER_LEAVE_CONFIRM_TIMEOUT,
+        confirmed_provider_leave_state(rpc, entry),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "timed out checking confirmed provider leave state {}",
+            entry.state_key
+        )
+    })??;
+    if let Some(state) = already_confirmed {
+        finalize_provider_leave_outbox_entry(entry, ProviderLeaveDeliveryStatus::Confirmed)?;
+        return Ok(json!({
+            "op": entry.op.as_str(),
+            "provider": entry.provider,
+            "enclave_id": entry.enclave_id,
+            "room_id": entry.room_id,
+            "accepted": Value::Null,
+            "confirmed": true,
+            "state": state,
+            "outbox_path": entry.path,
+        }));
+    }
+
+    let submitted = timeout(
+        PROVIDER_LEAVE_SUBMIT_TIMEOUT,
+        rpc.submit_feature(entry.feature.clone()),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "timed out submitting queued provider lifecycle {}",
+            entry.op.as_str()
+        )
+    })?
+    .with_context(|| format!("submitting queued provider lifecycle {}", entry.op.as_str()))?;
+    ensure!(
+        submitted.get("ok").and_then(Value::as_bool) == Some(true),
+        "queued provider lifecycle {} was not accepted: {}",
+        entry.op.as_str(),
+        submitted
+    );
+    ensure!(
+        !finalize_provider_leave_outbox_entry(entry, ProviderLeaveDeliveryStatus::Accepted)?,
+        "accepted provider leave was removed before confirmed state"
+    );
+    let state = timeout(
+        PROVIDER_LEAVE_CONFIRM_TIMEOUT,
+        wait_for_confirmed_provider_leave(rpc, entry),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "timed out waiting for confirmed provider lifecycle {}",
+            entry.op.as_str()
+        )
+    })??;
+    finalize_provider_leave_outbox_entry(entry, ProviderLeaveDeliveryStatus::Confirmed)?;
+    Ok(json!({
+        "op": entry.op.as_str(),
+        "provider": entry.provider,
+        "enclave_id": entry.enclave_id,
+        "room_id": entry.room_id,
+        "accepted": true,
+        "confirmed": true,
+        "result": submitted,
+        "state": state,
+        "outbox_path": entry.path,
+    }))
+}
+
+fn provider_leave_outbox_entry_report(entry: &SignedProviderLeaveOutboxEntry) -> Value {
+    json!({
+        "path": entry.path,
+        "op": entry.op.as_str(),
+        "provider": entry.provider,
+        "enclave_id": entry.enclave_id,
+        "room_id": entry.room_id,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProviderActivationLeaveScope {
+    provider: Option<String>,
+    enclave_id: String,
+    room_ids: Option<BTreeSet<String>>,
+}
+
+impl ProviderActivationLeaveScope {
+    fn matches(&self, entry: &SignedProviderLeaveOutboxEntry) -> bool {
+        self.provider
+            .as_deref()
+            .is_none_or(|provider| provider == entry.provider)
+            && self.enclave_id == entry.enclave_id
+            && match entry.op {
+                ProviderLeaveOp::Enclave => true,
+                ProviderLeaveOp::Room => self.room_ids.as_ref().is_none_or(|room_ids| {
+                    entry
+                        .room_id
+                        .as_ref()
+                        .is_some_and(|room_id| room_ids.contains(room_id))
+                }),
+            }
+    }
+}
+
+fn provider_leave_outbox_paths_for_report(home: &Path) -> Vec<Value> {
+    let directory = provider_leave_outbox_dir(home);
+    let Ok(metadata) = fs::symlink_metadata(&directory) else {
+        return Vec::new();
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return vec![json!({ "path": directory, "invalid_directory": true })];
+    }
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return vec![json!({ "path": directory, "unreadable_directory": true })];
+    };
+    let mut paths = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension() == Some(OsStr::new("json")))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| json!({ "path": path }))
+        .collect()
+}
+
+async fn flush_provider_leave_outbox_with_budget(
+    home: &Path,
+    rpc: &PeerRpcClient,
+    budget: Duration,
+) -> Result<Value> {
+    flush_provider_leave_outbox_scope_with_budget(home, rpc, budget, None).await
+}
+
+async fn flush_provider_leave_outbox_scope_with_budget(
+    home: &Path,
+    rpc: &PeerRpcClient,
+    budget: Duration,
+    scope: Option<&ProviderActivationLeaveScope>,
+) -> Result<Value> {
+    ensure!(
+        !budget.is_zero(),
+        "provider leave replay budget must be positive"
+    );
+    let entries = load_provider_leave_outbox(home)?
+        .into_iter()
+        .filter(|entry| scope.is_none_or(|scope| scope.matches(entry)))
+        .collect::<Vec<_>>();
+    let pending = entries.len();
+    let mut replayed = Vec::with_capacity(pending);
+    let deadline = Instant::now() + budget;
+    let mut error = None;
+    let mut budget_exhausted = false;
+    for entry in &entries {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            budget_exhausted = true;
+            break;
+        };
+        match timeout(remaining, submit_queued_provider_leave(rpc, entry)).await {
+            Ok(Ok(report)) => replayed.push(report),
+            Ok(Err(err)) => {
+                error = Some(format!(
+                    "replaying provider leave {}: {err:#}",
+                    entry.path.display()
+                ));
+                break;
+            }
+            Err(_) => {
+                budget_exhausted = true;
+                break;
+            }
+        }
+    }
+    let retained = load_provider_leave_outbox(home)?
+        .into_iter()
+        .filter(|entry| scope.is_none_or(|scope| scope.matches(entry)))
+        .map(|entry| provider_leave_outbox_entry_report(&entry))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "ok": retained.is_empty(),
+        "pending": pending,
+        "replayed": replayed,
+        "remaining": retained.len(),
+        "retained": retained,
+        "budget_millis": budget.as_millis(),
+        "budget_exhausted": budget_exhausted,
+        "error": error,
+    }))
+}
+
+async fn replay_provider_leaves_before_activation(
+    home: &Path,
+    rpc: &PeerRpcClient,
+    scope: &ProviderActivationLeaveScope,
+    sim: bool,
+) -> Result<Value> {
+    if sim {
+        return Ok(json!({
+            "ok": true,
+            "sim": true,
+            "replay_attempted": false,
+            "remaining": Value::Null,
+        }));
+    }
+    let result = flush_provider_leave_outbox_scope_with_budget(
+        home,
+        rpc,
+        PROVIDER_LEAVE_REPLAY_BUDGET,
+        Some(scope),
+    )
+    .await;
+    let report = provider_leave_replay_report_for_up(result, home);
+    enforce_provider_leave_replay_before_worker_start(true, &report)?;
+    Ok(report)
+}
+
+fn provider_leave_replay_report_for_up(result: Result<Value>, home: &Path) -> Value {
+    result.unwrap_or_else(|err| {
+        let retained = provider_leave_outbox_paths_for_report(home);
+        json!({
+            "ok": false,
+            "pending": Value::Null,
+            "replayed": [],
+            "remaining": retained.len(),
+            "retained": retained,
+            "budget_millis": PROVIDER_LEAVE_REPLAY_BUDGET.as_millis(),
+            "budget_exhausted": false,
+            "error": format!("{err:#}"),
+        })
+    })
+}
+
+fn enforce_provider_leave_replay_before_worker_start(
+    provider_requested: bool,
+    report: &Value,
+) -> Result<()> {
+    if provider_requested {
+        ensure!(
+            report.get("ok").and_then(Value::as_bool) == Some(true)
+                && report.get("remaining").and_then(Value::as_u64) == Some(0),
+            "provider workers cannot start while signed provider leaves remain pending: {}",
+            report
+        );
+    }
+    Ok(())
 }
 
 fn provider_lifecycle_nonce(
@@ -44823,32 +50529,30 @@ async fn ensure_left_room(
             "state": existing,
         }));
     }
-    let submitted = submit_provider_lifecycle_feature(
-        ProviderLifecycleSubmitContext {
-            rpc: &ctx.rpc,
-            keypair_path: &ctx.keypair_path,
-            password: &ctx.password,
-            wallet: &ctx.wallet,
-            sim,
-        },
-        "leave_room",
-        Some(enclave_id),
-        Some(room_id),
-    )
-    .await?;
     if sim {
+        let submitted = submit_provider_lifecycle_feature(
+            ProviderLifecycleSubmitContext {
+                rpc: &ctx.rpc,
+                keypair_path: &ctx.keypair_path,
+                password: &ctx.password,
+                wallet: &ctx.wallet,
+                sim: true,
+            },
+            "leave_room",
+            Some(enclave_id),
+            Some(room_id),
+        )
+        .await?;
         return Ok(json!({ "room_id": room_id, "enclave_id": enclave_id, "feature": submitted }));
     }
-    let state = wait_for_state(&ctx.rpc, &key, |value| {
-        value.get("status").and_then(Value::as_str) == Some("inactive")
-    })
-    .await?;
+    let queued =
+        queue_signed_provider_leave(ctx, ProviderLeaveOp::Room, enclave_id, Some(room_id)).await?;
+    let delivery = submit_queued_provider_leave(&ctx.rpc, &queued).await?;
     Ok(json!({
         "room_id": room_id,
         "enclave_id": enclave_id,
         "skipped": false,
-        "feature": submitted,
-        "state": state,
+        "delivery": delivery,
     }))
 }
 
@@ -44872,31 +50576,29 @@ async fn ensure_left_enclave(
             "state": existing,
         }));
     }
-    let submitted = submit_provider_lifecycle_feature(
-        ProviderLifecycleSubmitContext {
-            rpc: &ctx.rpc,
-            keypair_path: &ctx.keypair_path,
-            password: &ctx.password,
-            wallet: &ctx.wallet,
-            sim,
-        },
-        "leave_enclave",
-        Some(enclave_id),
-        None,
-    )
-    .await?;
     if sim {
+        let submitted = submit_provider_lifecycle_feature(
+            ProviderLifecycleSubmitContext {
+                rpc: &ctx.rpc,
+                keypair_path: &ctx.keypair_path,
+                password: &ctx.password,
+                wallet: &ctx.wallet,
+                sim: true,
+            },
+            "leave_enclave",
+            Some(enclave_id),
+            None,
+        )
+        .await?;
         return Ok(json!({ "enclave_id": enclave_id, "feature": submitted }));
     }
-    let state = wait_for_state(&ctx.rpc, &key, |value| {
-        value.get("status").and_then(Value::as_str) == Some("inactive")
-    })
-    .await?;
+    let queued =
+        queue_signed_provider_leave(ctx, ProviderLeaveOp::Enclave, enclave_id, None).await?;
+    let delivery = submit_queued_provider_leave(&ctx.rpc, &queued).await?;
     Ok(json!({
         "enclave_id": enclave_id,
         "skipped": false,
-        "feature": submitted,
-        "state": state,
+        "delivery": delivery,
     }))
 }
 
@@ -45252,6 +50954,38 @@ fn print_provider_rails_report(report: &Value, json_output: bool) -> Result<()> 
         println!("Submitted: true");
         if let Some(key) = report["feature_submission"]["key"].as_str() {
             println!("Feature key: {key}");
+        }
+    }
+    Ok(())
+}
+
+fn print_provider_payout_report(report: &Value, json_output: bool) -> Result<()> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    println!("Provider payout command complete.");
+    println!("Action: {}", report["action"].as_str().unwrap_or(""));
+    if let Some(provider) = report["provider"].as_str() {
+        println!("Provider: {provider}");
+    }
+    if let Some(rail) = report["rail"].as_str() {
+        println!("Rail: {rail}");
+    }
+    if let Some(address) = report["address"].as_str() {
+        println!("Destination: {address}");
+    }
+    if !report["payouts"].is_null() {
+        println!("{}", serde_json::to_string_pretty(&report["payouts"])?);
+    }
+    if let Some(command) = report["copy_paste"]["mayhem_sim"].as_str() {
+        println!("Copy/paste Mayhem simulation command:");
+        println!("{command}");
+    }
+    if report["submitted"].as_bool() == Some(true) {
+        println!("Submitted: true");
+        if let Some(revision) = report["revision"].as_str() {
+            println!("Revision: {revision}");
         }
     }
     Ok(())
@@ -45975,6 +51709,9 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
         .map(|entry| entry.value)
         .collect::<Vec<_>>();
     let ctx_bracket_schedule = read_ctx_bracket_schedule(rpc).await?;
+    let active_billing_epoch = active_billing_epoch(rpc).await?;
+    let active_payout_revisions =
+        read_active_provider_payout_revisions(rpc, active_billing_epoch).await?;
     Ok(ContractCatalog {
         enclaves: read_prefix_values_filtered(rpc, "enclave/", |tail| !tail.contains('/')).await?,
         rooms: read_prefix_values_filtered(rpc, "room/", |tail| !tail.contains('/')).await?,
@@ -45995,7 +51732,106 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
             .map(serde_json::from_value)
             .transpose()
             .context("parsing rules/current")?,
+        active_payout_revisions,
     })
+}
+
+async fn read_active_provider_payout_revisions(
+    rpc: &PeerRpcClient,
+    active_epoch: u64,
+) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
+    let mut revisions = BTreeMap::<String, BTreeMap<String, String>>::new();
+    for entry in read_prefix_entries(rpc, "payout/current/").await? {
+        let Some(tail) = entry.key.strip_prefix("payout/current/") else {
+            continue;
+        };
+        let parts = tail.split('/').collect::<Vec<_>>();
+        let [rail, provider] = parts.as_slice() else {
+            continue;
+        };
+        if !matches!(*rail, "fiat" | "tap" | "tnk")
+            || !is_hex_len(provider, 64)
+            || *provider != provider.to_ascii_lowercase()
+        {
+            continue;
+        }
+        let Some(revision) = payout_pointer_revision_at_epoch(&entry.value, active_epoch) else {
+            continue;
+        };
+        if !is_hex_len(revision, 64) || revision != revision.to_ascii_lowercase() {
+            continue;
+        }
+        let binding_key = format!("payout/binding/{rail}/{provider}/{revision}");
+        let Some(binding) = read_state_value(rpc, &binding_key).await? else {
+            continue;
+        };
+        if binding.get("verified").and_then(Value::as_bool) != Some(true)
+            || binding.get("provider").and_then(Value::as_str) != Some(*provider)
+            || binding.get("rail").and_then(Value::as_str) != Some(*rail)
+            || binding.get("revision").and_then(Value::as_str) != Some(revision)
+            || !binding
+                .get("activation_epoch")
+                .and_then(Value::as_u64)
+                .is_some_and(|activation_epoch| activation_epoch <= active_epoch)
+        {
+            continue;
+        }
+        if *rail == "fiat" {
+            let Some(target) = binding.get("target").and_then(Value::as_str) else {
+                continue;
+            };
+            let verification_pointer_key =
+                format!("payout/stripe-verified/target/{provider}/{target}");
+            let Some(verification_pointer) =
+                read_state_value(rpc, &verification_pointer_key).await?
+            else {
+                continue;
+            };
+            let Some(record_key) = verification_pointer
+                .get("record_key")
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let Some(verification) = read_state_value(rpc, record_key).await? else {
+                continue;
+            };
+            if verification_pointer.get("ready").and_then(Value::as_bool) != Some(true)
+                || verification.get("ready").and_then(Value::as_bool) != Some(true)
+                || verification.get("provider").and_then(Value::as_str) != Some(*provider)
+                || verification.get("target").and_then(Value::as_str)
+                    != binding.get("target").and_then(Value::as_str)
+                || verification.get("currency").and_then(Value::as_str)
+                    != binding.get("currency").and_then(Value::as_str)
+                || verification
+                    .get("processor_revision")
+                    .and_then(Value::as_str)
+                    != binding
+                        .get("stripe_processor_revision")
+                        .and_then(Value::as_str)
+            {
+                continue;
+            }
+        }
+        revisions
+            .entry((*provider).to_owned())
+            .or_default()
+            .insert((*rail).to_owned(), revision.to_owned());
+    }
+    Ok(revisions)
+}
+
+fn provider_routable_payout_rails(
+    provider: &LedgerProvider,
+    active_payout_revisions: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Vec<String> {
+    let revisions = active_payout_revisions.get(&provider.provider);
+    provider
+        .accepted_rails
+        .iter()
+        .filter(|rail| revisions.is_some_and(|entries| entries.contains_key(rail.as_str())))
+        .cloned()
+        .collect()
 }
 
 fn is_price_schedule_tail(tail: &str) -> bool {
@@ -46296,6 +52132,14 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         if enclave.model_id != serving.model_id {
             continue;
         }
+        let Some(provider_record) = active_provider_by_id.get(serving.provider.as_str()) else {
+            continue;
+        };
+        let accepted_rails =
+            provider_routable_payout_rails(provider_record, &contract.active_payout_revisions);
+        if accepted_rails.is_empty() {
+            continue;
+        }
         providers_by_model
             .entry(enclave.model_id.clone())
             .or_default()
@@ -46319,10 +52163,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                 ),
                 GatewayRouteCandidate {
                     provider: serving.provider.clone(),
-                    accepted_rails: active_provider_by_id
-                        .get(serving.provider.as_str())
-                        .map(|provider| provider.accepted_rails.clone())
-                        .unwrap_or_default(),
+                    accepted_rails,
                     served_modalities,
                     served_specialities,
                     enclave_id: serving.enclave_id.clone(),
@@ -47948,13 +53789,43 @@ fn provider_hardware_quote_config(
             if args.hardware_quote_timeout_seconds == 0 {
                 bail!("--hardware-quote-timeout-seconds must be positive");
             }
+            let kind = parse_hardware_quote_kind(kind)?;
             Ok(Some(ProviderHardwareQuoteConfig {
-                kind: parse_hardware_quote_kind(kind)?,
+                kind,
                 command: resolve_provider_quote_command(command)?,
                 timeout: Duration::from_secs(args.hardware_quote_timeout_seconds),
+                tpm_state_dir: None,
             }))
         }
     }
+}
+
+fn bind_provider_tpm_state_dir(
+    config: Option<&mut ProviderHardwareQuoteConfig>,
+    home: &Path,
+    provider_pubkey: &str,
+) -> Result<()> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    if config.kind != HardwareQuoteKind::Tpm2QuoteEk {
+        ensure!(
+            config.tpm_state_dir.is_none(),
+            "non-TPM hardware quote config must not carry TPM state"
+        );
+        return Ok(());
+    }
+    ensure!(
+        is_hex_len(provider_pubkey, 64),
+        "provider public key must be 32-byte hexadecimal before binding TPM state"
+    );
+    let state_dir = absolutize(
+        home.join("attestation")
+            .join("tpm2-provider")
+            .join(provider_pubkey.to_ascii_lowercase()),
+    )?;
+    config.tpm_state_dir = Some(state_dir);
+    Ok(())
 }
 
 fn provider_hardware_quote_config_for_enclave(
@@ -48017,7 +53888,8 @@ async fn collect_provider_hardware_quote(
     report_ts: u64,
     nonce_u: &str,
     runtime_config: &AttestationRuntimeConfig,
-) -> Result<HardwareQuote> {
+    policy_binding: Option<&HardwareQuoteRoutePolicyBinding>,
+) -> Result<CollectedProviderHardwareQuote> {
     let binding_options = HardwareQuoteBindingOptions {
         identity: identity.clone(),
         runtime_keypair: runtime_keypair.clone(),
@@ -48036,15 +53908,42 @@ async fn collect_provider_hardware_quote(
         None => prepare_hardware_quote_binding(&binding_options),
     }
     .context("preparing Mayhem hardware quote binding")?;
+    let evidence_nonce = match policy_binding {
+        Some(policy) => {
+            ensure!(
+                policy.kind == config.kind,
+                "buyer attestation policy kind does not match provider quote kind"
+            );
+            let enclave_id = catalog_enclave_id(identity);
+            let evidence_binding = EvidenceBinding::new(
+                policy,
+                nonce_u,
+                enclave_id,
+                policy.device_id.clone(),
+                binding.clone(),
+            )
+            .context("binding hardware evidence to the buyer's authenticated route policy")?;
+            hex_encode(
+                &evidence_binding
+                    .digest()
+                    .context("hashing hardware evidence policy binding")?,
+            )
+        }
+        None => binding.clone(),
+    };
     let kind_name = hardware_quote_kind_name(&config.kind);
-    let (program, program_args) =
+    let (program, mut program_args) =
         provider_hardware_quote_invocation(&config.command, cfg!(windows));
+    if config.kind == HardwareQuoteKind::Tpm2QuoteEk {
+        program_args.push("quote".to_owned());
+    }
     let mut command = Command::new(program);
     command
         .args(program_args)
         .env("MAYHEM_HW_QUOTE_KIND", &kind_name)
         .env("MAYHEM_HW_QUOTE_BINDING", &binding)
-        .env("MAYHEM_HW_QUOTE_NONCE", &binding)
+        .env("MAYHEM_HW_QUOTE_NONCE", &evidence_nonce)
+        .env("MAYHEM_HW_QUOTE_EVIDENCE_BINDING", &evidence_nonce)
         .env("MAYHEM_ATTESTATION_NONCE_U", nonce_u)
         .env(
             "MAYHEM_ATTESTATION_ENCLAVE_ID",
@@ -48052,6 +53951,20 @@ async fn collect_provider_hardware_quote(
         )
         .env("MAYHEM_ATTESTATION_BINARY_HASH", &identity.binary_hash)
         .env("MAYHEM_ATTESTATION_MANIFEST_HASH", &identity.manifest_hash);
+    if config.kind == HardwareQuoteKind::Tpm2QuoteEk {
+        let state_dir = config
+            .tpm_state_dir
+            .as_ref()
+            .context("TPM quote state directory is not bound to the provider identity")?;
+        command
+            .env("MAYHEM_TPM2_STATE_DIR", state_dir)
+            .env("MAYHEM_TPM2_QUOTE_EXTRA_DATA", &evidence_nonce);
+    } else {
+        ensure!(
+            config.tpm_state_dir.is_none(),
+            "non-TPM hardware quote config must not carry TPM state"
+        );
+    }
     let output =
         run_provider_hardware_quote_command(&mut command, &config.command, config.timeout).await?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -48078,8 +53991,106 @@ async fn run_provider_hardware_quote_command(
     command_path: &Path,
     command_timeout: Duration,
 ) -> Result<std::process::Output> {
+    run_provider_helper_command(
+        command,
+        command_path,
+        command_timeout,
+        None,
+        MAX_HARDWARE_QUOTE_COMMAND_STDOUT_BYTES,
+    )
+    .await
+}
+
+async fn run_provider_tpm_activation_command(
+    config: &ProviderHardwareQuoteConfig,
+    challenge: &mayhem_proto::TpmActivateCredentialChallenge,
+) -> Result<mayhem_proto::TpmActivateCredentialResponse> {
+    ensure!(
+        config.kind == HardwareQuoteKind::Tpm2QuoteEk,
+        "TPM activation requires a tpm2_quote_ek helper"
+    );
+    let state_dir = config
+        .tpm_state_dir
+        .as_ref()
+        .context("TPM activation state directory is not bound to the provider identity")?;
+    let now = unix_epoch_seconds()?;
+    ensure!(
+        challenge.issued_at_unix <= now && now < challenge.expires_at_unix,
+        "TPM activation challenge is not currently valid"
+    );
+    let remaining = challenge.expires_at_unix.saturating_sub(now);
+    let command_timeout = config.timeout.min(Duration::from_secs(remaining));
+    ensure!(
+        !command_timeout.is_zero(),
+        "TPM activation challenge expired before helper execution"
+    );
+    let input = serde_json::to_vec(challenge).context("serializing TPM activation helper input")?;
+    ensure!(
+        input.len() <= MAX_TPM_ACTIVATION_COMMAND_INPUT_BYTES,
+        "TPM activation challenge exceeds {} bytes",
+        MAX_TPM_ACTIVATION_COMMAND_INPUT_BYTES
+    );
+
+    let (program, mut program_args) =
+        provider_hardware_quote_invocation(&config.command, cfg!(windows));
+    program_args.push("activate_credential".to_owned());
+    let mut command = Command::new(program);
+    command
+        .args(program_args)
+        .env("MAYHEM_TPM2_STATE_DIR", state_dir);
+    let output = run_provider_helper_command(
+        &mut command,
+        &config.command,
+        command_timeout,
+        Some(&input),
+        MAX_TPM_ACTIVATION_COMMAND_OUTPUT_BYTES,
+    )
+    .await?;
+    if !output.status.success() {
+        bail!(
+            "TPM activation helper {} failed with status {}; stderr: {}",
+            config.command.display(),
+            output.status,
+            truncate_log_for_error(String::from_utf8_lossy(&output.stderr).trim())
+        );
+    }
+    let response =
+        serde_json::from_slice::<mayhem_proto::TpmActivateCredentialResponse>(&output.stdout)
+            .context("TPM activation helper returned invalid response JSON")?;
+    ensure!(
+        response.schema_version == mayhem_proto::TPM_ACTIVATE_CREDENTIAL_SCHEMA_VERSION,
+        "TPM activation response schema version is unsupported"
+    );
+    ensure!(
+        response.challenge_id == challenge.challenge_id
+            && response.ak_name_b64 == challenge.ak_name_b64
+            && response.quote_binding == challenge.quote_binding,
+        "TPM activation response does not match the challenge"
+    );
+    Ok(response)
+}
+
+async fn run_provider_helper_command(
+    command: &mut Command,
+    command_path: &Path,
+    command_timeout: Duration,
+    input: Option<&[u8]>,
+    stdout_limit: usize,
+) -> Result<std::process::Output> {
+    if let Some(input) = input {
+        ensure!(
+            input.len() <= MAX_TPM_ACTIVATION_COMMAND_INPUT_BYTES,
+            "hardware helper input exceeds {} bytes",
+            MAX_TPM_ACTIVATION_COMMAND_INPUT_BYTES
+        );
+    }
     command
         .kill_on_drop(true)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -48098,13 +54109,42 @@ async fn run_provider_hardware_quote_command(
         .take()
         .context("hardware quote command stderr pipe is missing")?;
     let stdout_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).await.map(|_| bytes)
+        read_bounded_provider_helper_stream(&mut stdout, stdout_limit).await
     });
     let stderr_task = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).await.map(|_| bytes)
+        read_bounded_provider_helper_stream(&mut stderr, MAX_HARDWARE_QUOTE_COMMAND_STDERR_BYTES)
+            .await
     });
+    if let Some(input) = input {
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("hardware helper stdin pipe is missing")?;
+        if let Err(err) = stdin.write_all(input).await {
+            terminate_hardware_quote_process_tree(child_pid);
+            let _ = child.kill().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(err).with_context(|| {
+                format!(
+                    "writing input to hardware helper {}",
+                    command_path.display()
+                )
+            });
+        }
+        if let Err(err) = stdin.shutdown().await {
+            terminate_hardware_quote_process_tree(child_pid);
+            let _ = child.kill().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(err).with_context(|| {
+                format!(
+                    "closing input to hardware helper {}",
+                    command_path.display()
+                )
+            });
+        }
+    }
 
     let status = match timeout(command_timeout, child.wait()).await {
         Ok(Ok(status)) => status,
@@ -48148,12 +54188,30 @@ async fn run_provider_hardware_quote_command(
     })
 }
 
+async fn read_bounded_provider_helper_stream(
+    reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    limit: usize,
+) -> io::Result<Vec<u8>> {
+    let read_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+    let mut bytes = Vec::new();
+    reader.take(read_limit).read_to_end(&mut bytes).await?;
+    if bytes.len() > limit {
+        return Err(io::Error::other(format!(
+            "hardware helper output exceeds {limit} bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
 fn terminate_hardware_quote_process_tree(pid: Option<u32>) {
     let Some(pid) = pid else {
         return;
     };
     #[cfg(unix)]
     {
+        let Some(pid) = unix_process_id(pid) else {
+            return;
+        };
         let _ = std::process::Command::new("kill")
             .arg("-KILL")
             .arg("--")
@@ -48200,7 +54258,7 @@ fn parse_hardware_quote_command_output(
     expected_kind: &HardwareQuoteKind,
     expected_binding: &str,
     stdout: &str,
-) -> Result<HardwareQuote> {
+) -> Result<CollectedProviderHardwareQuote> {
     if stdout.is_empty() {
         bail!("hardware quote command printed no evidence");
     }
@@ -48215,53 +54273,169 @@ fn parse_hardware_quote_command_output(
         })
         .ok();
     let Some(parsed) = parsed else {
-        return Ok(HardwareQuote {
-            kind: expected_kind.clone(),
-            evidence: stdout.to_owned(),
-            binding: expected_binding.to_owned(),
-            endorsements: Vec::new(),
-            metadata: Value::Null,
+        ensure!(
+            expected_kind != &HardwareQuoteKind::Tpm2QuoteEk,
+            "TPM 2.0 quote command must emit the typed Mayhem helper envelope"
+        );
+        return Ok(CollectedProviderHardwareQuote {
+            quote: HardwareQuote {
+                kind: expected_kind.clone(),
+                evidence: stdout.to_owned(),
+                binding: expected_binding.to_owned(),
+                endorsements: Vec::new(),
+                metadata: Value::Null,
+            },
+            device_key: None,
+            tpm_activation_hello: None,
         });
     };
-    let kind = match parsed.kind.as_deref() {
-        Some(kind) => parse_hardware_quote_kind(kind)?,
-        None => expected_kind.clone(),
+    let typed_envelope = parsed.hardware_quote.is_some();
+    let quote = if let Some(quote) = parsed.hardware_quote.clone() {
+        ensure!(
+            parsed.kind.is_none()
+                && parsed.evidence.is_none()
+                && parsed.evidence_path.is_none()
+                && parsed.binding.is_none()
+                && parsed.endorsements.is_empty()
+                && parsed.metadata.is_null()
+                && parsed.platform.is_none()
+                && parsed.platform_id.is_none()
+                && parsed.region.is_none()
+                && parsed.snp_chip_family.is_none()
+                && parsed.snp_chip_id.is_none()
+                && parsed.snp_tcb.is_none()
+                && parsed.snp_firmware_svn.is_none()
+                && parsed.snp.is_null()
+                && parsed.gpu_model.is_none()
+                && parsed.gpu_driver.is_none()
+                && parsed.gpu_vbios.is_none()
+                && parsed.gpu.is_null()
+                && parsed.tpm.is_null(),
+            "typed hardware quote envelope must not mix nested and legacy quote fields"
+        );
+        quote
+    } else {
+        let kind = match parsed.kind.as_deref() {
+            Some(kind) => parse_hardware_quote_kind(kind)?,
+            None => expected_kind.clone(),
+        };
+        let evidence = match (parsed.evidence.as_deref(), parsed.evidence_path.as_deref()) {
+            (Some(evidence), None) => evidence.to_owned(),
+            (None, Some(path)) => {
+                let path = absolutize(PathBuf::from(path))?;
+                fs::read_to_string(&path).with_context(|| {
+                    format!("reading hardware quote evidence {}", path.display())
+                })?
+            }
+            (Some(_), Some(_)) => {
+                bail!("hardware quote command JSON must set only one of evidence or evidence_path")
+            }
+            (None, None) => bail!("hardware quote command JSON missing evidence"),
+        };
+        HardwareQuote {
+            kind,
+            evidence,
+            binding: parsed
+                .binding
+                .clone()
+                .unwrap_or_else(|| expected_binding.to_owned()),
+            endorsements: parsed.endorsements.clone(),
+            metadata: hardware_quote_command_metadata(&parsed),
+        }
     };
-    if &kind != expected_kind {
-        bail!(
-            "hardware quote command returned kind {}, expected {}",
-            hardware_quote_kind_name(&kind),
-            hardware_quote_kind_name(expected_kind)
+    ensure!(
+        &quote.kind == expected_kind,
+        "hardware quote command returned kind {}, expected {}",
+        hardware_quote_kind_name(&quote.kind),
+        hardware_quote_kind_name(expected_kind)
+    );
+    ensure!(
+        quote.binding == expected_binding,
+        "hardware quote command returned a binding different from Mayhem's binding"
+    );
+    ensure!(
+        !quote.evidence.trim().is_empty(),
+        "hardware quote command returned empty evidence"
+    );
+
+    let declared_device_key = hardware_quote_command_declared_device_key(&parsed)?;
+    let metadata_device_key = hardware_quote_device_key(&quote)?;
+    if let (Some(declared), Some(metadata)) = (
+        declared_device_key.as_deref(),
+        metadata_device_key.as_deref(),
+    ) {
+        ensure!(
+            declared == metadata,
+            "hardware quote command returned conflicting device keys"
         );
     }
-    if let Some(binding) = parsed.binding.as_deref() {
-        if binding != expected_binding {
-            bail!("hardware quote command returned a binding different from Mayhem's binding");
-        }
+    let device_key = declared_device_key.or(metadata_device_key);
+    let tpm_activation_hello = parsed.tpm_activate_credential_hello.clone();
+    if expected_kind == &HardwareQuoteKind::Tpm2QuoteEk {
+        ensure!(
+            typed_envelope,
+            "TPM 2.0 quote command must emit the typed Mayhem helper envelope"
+        );
+        ensure!(
+            quote.metadata.is_null(),
+            "TPM 2.0 hardware quote metadata must be null"
+        );
+        ensure!(
+            device_key.is_some(),
+            "TPM 2.0 quote command must return the EK-backed device_key"
+        );
+        let hello = tpm_activation_hello
+            .as_ref()
+            .context("TPM 2.0 quote command must return tpm_activate_credential_hello")?;
+        ensure!(
+            hello.schema_version == mayhem_proto::TPM_ACTIVATE_CREDENTIAL_SCHEMA_VERSION,
+            "TPM activation hello schema version is unsupported"
+        );
+        ensure!(
+            hello.quote_binding == expected_binding,
+            "TPM activation hello is bound to a different quote"
+        );
+    } else {
+        ensure!(
+            tpm_activation_hello.is_none(),
+            "TPM activation hello is only valid for tpm2_quote_ek"
+        );
     }
-    let evidence = match (parsed.evidence.as_deref(), parsed.evidence_path.as_deref()) {
-        (Some(evidence), None) => evidence.to_owned(),
-        (None, Some(path)) => {
-            let path = absolutize(PathBuf::from(path))?;
-            fs::read_to_string(&path)
-                .with_context(|| format!("reading hardware quote evidence {}", path.display()))?
-        }
-        (Some(_), Some(_)) => {
-            bail!("hardware quote command JSON must set only one of evidence or evidence_path")
-        }
-        (None, None) => bail!("hardware quote command JSON missing evidence"),
-    };
-    if evidence.trim().is_empty() {
-        bail!("hardware quote command returned empty evidence");
-    }
-    let metadata = hardware_quote_command_metadata(&parsed);
-    Ok(HardwareQuote {
-        kind,
-        evidence,
-        binding: expected_binding.to_owned(),
-        endorsements: parsed.endorsements,
-        metadata,
+
+    Ok(CollectedProviderHardwareQuote {
+        quote,
+        device_key,
+        tpm_activation_hello,
     })
+}
+
+fn hardware_quote_command_declared_device_key(
+    parsed: &HardwareQuoteCommandOutput,
+) -> Result<Option<String>> {
+    let mut normalized = None::<String>;
+    for value in [
+        parsed.device_key.as_deref(),
+        parsed.ek_fingerprint.as_deref(),
+        parsed.tpm_ek_sha256.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let value = value.trim().to_ascii_lowercase();
+        ensure!(
+            is_hex_len(&value, 64),
+            "hardware quote device_key must be a 32-byte hexadecimal digest"
+        );
+        if let Some(existing) = normalized.as_deref() {
+            ensure!(
+                existing == value,
+                "hardware quote command returned conflicting device keys"
+            );
+        } else {
+            normalized = Some(value);
+        }
+    }
+    Ok(normalized)
 }
 
 fn hardware_quote_command_metadata(parsed: &HardwareQuoteCommandOutput) -> Value {
@@ -48389,19 +54563,6 @@ fn hardware_quote_device_key(quote: &HardwareQuote) -> Result<Option<String>> {
     Ok(Some(device_key.to_ascii_lowercase()))
 }
 
-fn provider_attestation_device_key(attestation: &Tier1AttestationReport) -> Result<Option<String>> {
-    let Some(quote) = attestation.report.hw_quote.as_ref() else {
-        return Ok(None);
-    };
-    let device_key = hardware_quote_device_key(quote)?;
-    if matches!(quote.kind, HardwareQuoteKind::Tpm2QuoteEk) && device_key.is_none() {
-        bail!(
-            "TPM 2.0 quote command must return device_key, ek_fingerprint, or tpm_ek_sha256 so admin device bans bind to the TPM EK"
-        );
-    }
-    Ok(device_key)
-}
-
 async fn provider_attestation_report(
     quote_config: Option<&ProviderHardwareQuoteConfig>,
     identity: CatalogEnclaveIdentity,
@@ -48416,11 +54577,12 @@ async fn provider_attestation_report(
     report_ts: u64,
     nonce_u: String,
     runtime_config: AttestationRuntimeConfig,
-) -> Result<Tier1AttestationReport> {
+    policy_binding: Option<&HardwareQuoteRoutePolicyBinding>,
+) -> Result<ProviderAttestationMaterial> {
     if let Some(config) = quote_config {
         let provider_signing_seed = provider_signing_seed
             .context("hardware quote attestation requires provider signing seed")?;
-        let hw_quote = collect_provider_hardware_quote(
+        let collected = collect_provider_hardware_quote(
             config,
             &identity,
             runtime_keypair,
@@ -48431,6 +54593,7 @@ async fn provider_attestation_report(
             report_ts,
             &nonce_u,
             &runtime_config,
+            policy_binding,
         )
         .await?;
         let report_options = HardwareAttestationOptions {
@@ -48441,16 +54604,21 @@ async fn provider_attestation_report(
             boot_epoch,
             report_ts,
             nonce_u,
-            hw_quote,
+            hw_quote: collected.quote,
             runtime_config,
         };
-        return match measured_binary_hash {
+        let report = match measured_binary_hash {
             Some(binary_hash) => {
                 build_hardware_attestation_report_for_measured_binary(&report_options, binary_hash)
             }
             None => build_hardware_attestation_report(&report_options),
         }
-        .context("building hardware provider attestation report");
+        .context("building hardware provider attestation report")?;
+        return Ok(ProviderAttestationMaterial {
+            report,
+            device_key: collected.device_key,
+            tpm_activation_hello: collected.tpm_activation_hello,
+        });
     }
 
     let report_options = Tier1ExternalProviderAttestationOptions {
@@ -48471,8 +54639,13 @@ async fn provider_attestation_report(
     }?;
     let provider_attestation_sig =
         sign_hex(keypair_path, password, &draft.provider_signing_message_hex).await?;
-    finalize_tier1_attestation_report(draft, provider_attestation_sig)
-        .context("finalizing provider attestation")
+    let report = finalize_tier1_attestation_report(draft, provider_attestation_sig)
+        .context("finalizing provider attestation")?;
+    Ok(ProviderAttestationMaterial {
+        report,
+        device_key: None,
+        tpm_activation_hello: None,
+    })
 }
 
 fn merge_model_caps(target: &mut ModelCaps, next: &ModelCaps) {
@@ -50605,6 +56778,53 @@ async fn ensure_joined_rooms(
     Ok(reports)
 }
 
+fn admin_contract_tx_feature(
+    tx: &str,
+    prepared_command: &Value,
+    address: &str,
+    signature: &str,
+    nonce: &str,
+    sim: bool,
+) -> Result<Value> {
+    ensure!(
+        is_hex_len(tx, 64),
+        "prepared admin transaction id must be 32-byte hexadecimal"
+    );
+    ensure!(
+        is_hex_len(address, 64),
+        "admin signing address must be 32-byte hexadecimal"
+    );
+    ensure!(
+        is_hex_len(signature, 128),
+        "admin transaction signature must be 64-byte hexadecimal"
+    );
+    ensure!(
+        is_hex_len(nonce, 64),
+        "admin transaction nonce must be 32-byte hexadecimal"
+    );
+    prepared_command
+        .get("type")
+        .and_then(Value::as_str)
+        .context("prepared admin command is missing type")?;
+    ensure!(
+        prepared_command.get("value").is_some(),
+        "prepared admin command is missing value"
+    );
+    Ok(json!({
+        "feature": "mayhem",
+        "key": format!("admin/contract-tx/{tx}"),
+        "value": {
+            "op": "admin_contract_tx",
+            "tx": tx,
+            "prepared_command": prepared_command,
+            "address": address,
+            "signature": signature,
+            "nonce": nonce,
+            "sim": sim,
+        },
+    }))
+}
+
 async fn submit_contract_command(
     rpc: &PeerRpcClient,
     keypair_path: &Path,
@@ -50618,6 +56838,48 @@ async fn submit_contract_command(
         "type": tx_type,
         "value": value,
     });
+    let admin = read_state_value(rpc, "admin")
+        .await?
+        .and_then(|value| value.as_str().map(str::to_ascii_lowercase))
+        .context("contract admin is not initialized")?;
+    ensure!(
+        is_hex_len(&admin, 64),
+        "contract admin must be 32-byte hexadecimal"
+    );
+    ensure!(
+        wallet.public_key.eq_ignore_ascii_case(&admin),
+        "admin command signing wallet does not match the current contract admin"
+    );
+    let status = rpc
+        .status()
+        .await
+        .context("reading local Intercom transport for admin submission")?;
+    let peer = status
+        .get("peer")
+        .and_then(Value::as_object)
+        .context("local Intercom status is missing peer identity")?;
+    let transport = peer
+        .get("pubKeyHex")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .context("local Intercom status is missing transport identity")?;
+    ensure!(
+        is_hex_len(&transport, 64),
+        "local Intercom transport must be 32-byte hexadecimal"
+    );
+    let status_admin = peer
+        .get("admin")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .context("local Intercom status is missing canonical admin identity")?;
+    ensure!(
+        status_admin == admin,
+        "local Intercom and contract state disagree on admin identity"
+    );
+    let base_writable = peer
+        .get("baseWritable")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let nonce_response = rpc
         .contract_nonce()
         .await
@@ -50629,7 +56891,7 @@ async fn submit_contract_command(
     let prepared = rpc
         .prepare_tx(json!({
             "prepared_command": prepared_command.clone(),
-            "address": wallet.public_key,
+            "address": admin,
             "nonce": nonce,
         }))
         .await
@@ -50644,17 +56906,40 @@ async fn submit_contract_command(
         .and_then(Value::as_str)
         .map(str::to_owned);
     let signature = sign_hex(keypair_path, password, &tx).await?;
-    let submitted = rpc
-        .submit_tx(json!({
-            "tx": tx,
-            "prepared_command": prepared_command.clone(),
-            "address": wallet.public_key,
-            "signature": signature,
-            "nonce": nonce,
-            "sim": sim,
-        }))
-        .await
-        .with_context(|| format!("submitting {tx_type} tx"))?;
+    let signed_tx = json!({
+        "tx": tx,
+        "prepared_command": prepared_command.clone(),
+        "address": admin,
+        "signature": signature,
+        "nonce": nonce,
+        "sim": sim,
+    });
+    let (submitted, submission_transport) = if base_writable {
+        (
+            rpc.submit_tx(signed_tx.clone())
+                .await
+                .with_context(|| format!("submitting {tx_type} tx"))?,
+            "contract_tx",
+        )
+    } else {
+        let feature = admin_contract_tx_feature(
+            signed_tx["tx"].as_str().unwrap_or_default(),
+            &signed_tx["prepared_command"],
+            signed_tx["address"].as_str().unwrap_or_default(),
+            signed_tx["signature"].as_str().unwrap_or_default(),
+            signed_tx["nonce"].as_str().unwrap_or_default(),
+            sim,
+        )?;
+        (
+            rpc.submit_feature(&feature)
+                .await
+                .with_context(|| format!("relaying signed {tx_type} tx through PF.5"))?,
+            "admin_feature_relay",
+        )
+    };
+    if submitted.get("ok").and_then(Value::as_bool) == Some(false) {
+        bail!("contract {tx_type} rejected command: {submitted}");
+    }
     let result = submitted
         .get("result")
         .cloned()
@@ -50666,8 +56951,10 @@ async fn submit_contract_command(
         bail!("contract {tx_type} rejected command: {result}");
     }
     Ok(json!({
-        "tx": tx,
+        "tx": signed_tx["tx"],
         "command_hash": command_hash,
+        "transport": submission_transport,
+        "transport_peer": transport,
         "result": result,
     }))
 }
@@ -50724,45 +57011,108 @@ async fn submit_provider_lifecycle_intent(
         .and_then(Value::as_str)
         .context("provider lifecycle intent missing op")?
         .to_owned();
-    let sig = sign_message(
-        ctx.keypair_path,
-        ctx.password,
-        &provider_lifecycle_intent_message(&intent),
-    )
-    .await?;
-    let key = provider_lifecycle_feature_key(&intent)?;
-    let value = json!({
-        "op": "provider_lifecycle",
-        "intent": intent,
-        "sig": sig,
-    });
+    let feature = signed_provider_lifecycle_feature(&ctx, &intent).await?;
     if ctx.sim {
         return Ok(json!({
-            "feature": "mayhem",
-            "key": key,
-            "value": value,
+            "feature": feature["feature"].clone(),
+            "key": feature["key"].clone(),
+            "value": feature["value"].clone(),
             "sim": true,
             "submitted": false,
         }));
     }
+    ensure!(
+        !matches!(op.as_str(), "leave_room" | "leave_enclave"),
+        "provider leave submissions must use the durable leave outbox"
+    );
     let submitted = ctx
         .rpc
-        .submit_feature(json!({
-            "feature": "mayhem",
-            "key": key,
-            "value": value,
-        }))
+        .submit_feature(feature.clone())
         .await
         .with_context(|| format!("submitting free provider lifecycle feature {op}"))?;
     if submitted.get("ok").and_then(Value::as_bool) != Some(true) {
         bail!("provider lifecycle feature {op} was not accepted: {submitted}");
     }
     Ok(json!({
+        "feature": feature["feature"].clone(),
+        "key": feature["key"].clone(),
+        "value": feature["value"].clone(),
+        "result": submitted,
+    }))
+}
+
+async fn signed_provider_lifecycle_feature(
+    ctx: &ProviderLifecycleSubmitContext<'_>,
+    intent: &Value,
+) -> Result<Value> {
+    let sig = sign_message(
+        ctx.keypair_path,
+        ctx.password,
+        &provider_lifecycle_intent_message(intent),
+    )
+    .await?;
+    let key = provider_lifecycle_feature_key(intent)?;
+    let value = json!({
+        "op": "provider_lifecycle",
+        "intent": intent,
+        "sig": sig,
+    });
+    Ok(json!({
         "feature": "mayhem",
         "key": key,
         "value": value,
-        "result": submitted,
     }))
+}
+
+async fn queue_signed_provider_leave(
+    ctx: &ProviderTxContext,
+    op: ProviderLeaveOp,
+    enclave_id: &str,
+    room_id: Option<&str>,
+) -> Result<SignedProviderLeaveOutboxEntry> {
+    ensure!(
+        matches!(
+            (op, room_id),
+            (ProviderLeaveOp::Room, Some(_)) | (ProviderLeaveOp::Enclave, None)
+        ),
+        "provider leave outbox op and room scope do not match"
+    );
+    let mut pending = load_provider_leave_outbox(&ctx.home)?
+        .into_iter()
+        .filter(|entry| {
+            entry.provider == ctx.wallet.public_key
+                && entry.op == op
+                && entry.enclave_id == enclave_id
+                && entry.room_id.as_deref() == room_id
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        pending.len() <= 1,
+        "provider leave outbox contains duplicate pending entries for {}",
+        op.as_str()
+    );
+    if let Some(entry) = pending.pop() {
+        return Ok(entry);
+    }
+    let intent = provider_lifecycle_intent_with_anchors(
+        &ctx.wallet.public_key,
+        op.as_str(),
+        Some(enclave_id),
+        room_id,
+        None,
+        None,
+        None,
+        None,
+    )?;
+    let submit_context = ProviderLifecycleSubmitContext {
+        rpc: &ctx.rpc,
+        keypair_path: &ctx.keypair_path,
+        password: &ctx.password,
+        wallet: &ctx.wallet,
+        sim: false,
+    };
+    let feature = signed_provider_lifecycle_feature(&submit_context, &intent).await?;
+    persist_provider_leave_outbox_feature(&ctx.home, &feature, &ctx.wallet.public_key)
 }
 
 async fn read_state_value(rpc: &PeerRpcClient, key: &str) -> Result<Option<Value>> {
@@ -50844,6 +57194,7 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
                 ctx.attestation,
                 ctx.attestation_head,
                 ctx.identity_anchor,
+                ctx.tpm_activation_hello,
                 ctx.args.min_ask_au,
                 protection.max_sessions,
                 Some(transport_peer.as_str()),
@@ -50867,6 +57218,7 @@ async fn send_provider_heartbeat_round(
     attestation: &Tier1AttestationReport,
     attestation_head: &str,
     identity_anchor: &str,
+    tpm_activation_hello: Option<&mayhem_proto::TpmActivateCredentialHello>,
     min_ask_au: MoneyAu,
     max_sessions: u32,
     transport_peer: Option<&str>,
@@ -50949,6 +57301,7 @@ async fn send_provider_heartbeat_round(
             "ts": ts,
             "nonce": blake3::hash(format!("{}:{}:{}:{}", room.room_id, provider_pubkey, ts, seq).as_bytes()).to_hex().to_string(),
         });
+        project_provider_heartbeat_attestation(&mut heartbeat, attestation, tpm_activation_hello)?;
         if let Some(transport_peer) = transport_peer {
             heartbeat["transport_peer"] = json!(transport_peer);
         }
@@ -50974,6 +57327,55 @@ async fn send_provider_heartbeat_round(
         }));
     }
     Ok(sent)
+}
+
+fn project_provider_heartbeat_attestation(
+    heartbeat: &mut Value,
+    attestation: &Tier1AttestationReport,
+    tpm_activation_hello: Option<&mayhem_proto::TpmActivateCredentialHello>,
+) -> Result<()> {
+    if let Some(quote) = attestation.report.hw_quote.as_ref() {
+        heartbeat["att"]["quote_kind"] = serde_json::to_value(&quote.kind)
+            .context("serializing provider heartbeat quote kind")?;
+        if let Some(platform) = provider_hardware_quote_platform(quote)? {
+            heartbeat["att"]["declared_platform"] = json!(platform);
+        }
+    }
+    if let Some(hello) = tpm_activation_hello {
+        ensure!(
+            attestation
+                .report
+                .hw_quote
+                .as_ref()
+                .is_some_and(|quote| quote.kind == HardwareQuoteKind::Tpm2QuoteEk),
+            "TPM activation hello requires a TPM 2.0 hardware quote"
+        );
+        heartbeat["att"]["tpm_activation_hello"] =
+            serde_json::to_value(hello).context("serializing TPM activation hello")?;
+    }
+    Ok(())
+}
+
+fn provider_hardware_quote_platform(quote: &HardwareQuote) -> Result<Option<&str>> {
+    let platform = quote
+        .metadata
+        .get("platform_id")
+        .or_else(|| quote.metadata.get("platform"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if let Some(platform) = platform {
+        ensure!(
+            platform.len() <= 128
+                && platform.bytes().enumerate().all(|(index, byte)| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || (index > 0 && matches!(byte, b'.' | b'_' | b'-'))
+                }),
+            "hardware quote platform must be a safe lowercase identifier"
+        );
+    }
+    Ok(platform)
 }
 
 fn provider_heartbeat_tok_s(
@@ -51068,6 +57470,7 @@ async fn run_provider_session_heartbeat_connection(
                 &ctx.attestation,
                 &ctx.attestation_head,
                 &ctx.identity_anchor,
+                ctx.tpm_activation_hello.as_ref(),
                 ctx.min_ask_au,
                 ctx.max_sessions,
                 Some(transport_peer.as_str()),
@@ -51264,6 +57667,7 @@ async fn serve_provider_sessions(
         attestation: ctx.attestation.clone(),
         attestation_head: ctx.attestation_head.to_owned(),
         identity_anchor: ctx.identity_anchor.to_owned(),
+        tpm_activation_hello: ctx.tpm_activation_hello.cloned(),
         min_ask_au: ctx.args.min_ask_au,
         max_sessions: protection_config.max_sessions,
         load: heartbeat_load.clone(),
@@ -51283,7 +57687,9 @@ async fn serve_provider_sessions(
     let mut pending_requests = HashMap::new();
     let mut pending_payloads = HashMap::new();
     let mut protection = ProviderProtectionState::new(protection_config);
+    let mut tpm_activation_limiter = ProviderTpmActivationLimiter::from_environment()?;
     let mut draining = false;
+    let mut local_drain_request = None::<ProviderDrainRequest>;
     let mut runtime_floor_reject: Option<ProviderRuntimeFloorRejection> = None;
     let mut engine_watchdog_reject: Option<ProviderRuntimeFloorRejection> = None;
     let mut engine_recovery = ProviderEngineRecovery::new(
@@ -51464,14 +57870,15 @@ async fn serve_provider_sessions(
                 );
             }
             if !draining {
-                match provider_drain_requested(&drain_paths) {
-                    Ok(Some(path)) => {
+                match provider_drain_request(&drain_paths) {
+                    Ok(Some(request)) => {
                         provider_session_debug(format!(
                             "local drain flag {} observed; refusing new sessions",
-                            path.display()
+                            request.path.display()
                         ));
                         heartbeat_load.set_accepting_new(false);
                         draining = true;
+                        local_drain_request = Some(request);
                         if sessions.is_empty() {
                             break;
                         }
@@ -51567,6 +57974,7 @@ async fn serve_provider_sessions(
                         &mut pending_payloads,
                         &heartbeat_load,
                         &mut protection,
+                        &mut tpm_activation_limiter,
                         &terms,
                         &runtime,
                         &sc_bridge_url,
@@ -51681,6 +58089,16 @@ async fn serve_provider_sessions(
             Err(_) => {
                 provider_session_debug("live provider heartbeat task did not stop before timeout");
             }
+        }
+    }
+    if serve_result.is_ok() {
+        if let Some(request) = local_drain_request.as_ref() {
+            complete_provider_drain_request(
+                ctx.home,
+                &ctx.wallet.public_key,
+                &ctx.selected.enclave.enclave_id,
+                request,
+            )?;
         }
     }
     serve_result
@@ -52798,6 +59216,7 @@ async fn handle_provider_session_frame(
     pending_payloads: &mut HashMap<String, PendingProviderPayload>,
     heartbeat_load: &ProviderHeartbeatLoad,
     protection: &mut ProviderProtectionState,
+    tpm_activation_limiter: &mut ProviderTpmActivationLimiter,
     terms: &ProviderSessionTerms,
     runtime: &ProviderSessionRuntime<'_>,
     sc_bridge_url: &str,
@@ -52847,6 +59266,61 @@ async fn handle_provider_session_frame(
         return Ok(());
     }
     match frame_type {
+        TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE => {
+            let challenge_frame: TpmActivateCredentialChallengeFrame =
+                serde_json::from_value(frame.clone())
+                    .context("TPM activation challenge frame is invalid")?;
+            ensure!(
+                challenge_frame.frame_type == TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE
+                    && challenge_frame.version == TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
+                "TPM activation challenge frame version is unsupported"
+            );
+            ensure!(
+                challenge_frame.session_id == session_id
+                    && challenge_frame.challenge.challenge_id == session_id,
+                "TPM activation challenge session binding mismatch"
+            );
+            ensure!(
+                challenge_frame.provider == terms.provider
+                    && challenge_frame.enclave_id == terms.enclave_id
+                    && terms.room_ids.contains(&challenge_frame.room_id),
+                "TPM activation challenge targets a different provider route"
+            );
+            let hello = runtime
+                .tpm_activation_hello
+                .context("provider has no TPM activation material")?;
+            ensure!(
+                challenge_frame.challenge.ak_name_b64 == hello.ak_name_b64
+                    && challenge_frame.challenge.quote_binding == hello.quote_binding,
+                "TPM activation challenge does not match the signed provider hello"
+            );
+            tpm_activation_limiter.admit(&remote, Instant::now())?;
+            let config = runtime
+                .hardware_quote_config
+                .as_ref()
+                .filter(|config| config.kind == HardwareQuoteKind::Tpm2QuoteEk)
+                .context("provider has no TPM 2.0 activation helper")?;
+            open_provider_direct_session(bridge, &remote, &session_id)
+                .await
+                .context("opening provider side of TPM activation session")?;
+            let response =
+                run_provider_tpm_activation_command(config, &challenge_frame.challenge).await?;
+            let response_frame = TpmActivateCredentialResponseFrame {
+                frame_type: TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE.to_owned(),
+                version: TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
+                session_id: session_id.clone(),
+                provider: terms.provider.clone(),
+                enclave_id: terms.enclave_id.clone(),
+                room_id: challenge_frame.room_id,
+                response,
+            };
+            let send_result = bridge
+                .session_send(&remote, &session_id, response_frame)
+                .await
+                .context("sending TPM activation response");
+            let _ = bridge.session_close(&remote, &session_id).await;
+            send_result?;
+        }
         "s.open" => {
             if let Some(existing) = sessions.get(&session_id) {
                 if existing.remote != remote {
@@ -52908,7 +59382,15 @@ async fn handle_provider_session_frame(
                 ctx_bracket_schedule: contract.ctx_bracket_schedule.clone(),
                 ..terms.clone()
             };
-            let static_decision = provider_session_open_decision(&frame, &validation_terms);
+            let policy_binding =
+                provider_session_attestation_policy_binding(&frame, &validation_terms, runtime);
+            let static_decision = match &policy_binding {
+                Ok(_) => provider_session_open_decision(&frame, &validation_terms),
+                Err(error) => ProviderSessionDecision::Reject {
+                    code: "ATTESTATION_POLICY",
+                    reason: error.to_string(),
+                },
+            };
             let decision = match static_decision {
                 ProviderSessionDecision::Accept => {
                     let protection_decision = if let Some(reject) = runtime_floor_reject {
@@ -53003,10 +59485,17 @@ async fn handle_provider_session_frame(
                         .get("att_nonce")
                         .and_then(Value::as_str)
                         .context("accepted s.open missing validated att_nonce")?;
-                    let session_attestation =
-                        provider_session_attestation(runtime, terms, att_nonce)
-                            .await
-                            .context("building per-session s.accept attestation")?;
+                    let session_attestation = provider_session_attestation(
+                        runtime,
+                        terms,
+                        att_nonce,
+                        policy_binding
+                            .as_ref()
+                            .expect("accepted session policy binding was validated")
+                            .as_ref(),
+                    )
+                    .await
+                    .context("building per-session s.accept attestation")?;
                     let mut accept_frame = json!({
                         "t": "s.accept",
                         "v": 1,
@@ -53630,8 +60119,19 @@ fn provider_session_event_belongs_to_process(
     let Some(frame) = event.get("frame") else {
         return false;
     };
-    frame.get("t").and_then(Value::as_str) == Some("s.open")
-        && provider_session_open_targets_enclave(frame, terms)
+    match frame.get("t").and_then(Value::as_str) {
+        Some("s.open") => provider_session_open_targets_enclave(frame, terms),
+        Some(TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE) => {
+            frame.get("provider").and_then(Value::as_str) == Some(terms.provider.as_str())
+                && frame.get("enclave_id").and_then(Value::as_str)
+                    == Some(terms.enclave_id.as_str())
+                && frame
+                    .get("room_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|room_id| terms.room_ids.iter().any(|owned| owned == room_id))
+        }
+        _ => false,
+    }
 }
 
 async fn open_provider_direct_session(
@@ -55644,10 +62144,47 @@ fn provider_embedding_input_token_count(inputs: &[String]) -> u64 {
         .fold(0_u64, u64::saturating_add)
 }
 
+fn provider_session_attestation_policy_binding(
+    frame: &Value,
+    terms: &ProviderSessionTerms,
+    runtime: &ProviderSessionRuntime<'_>,
+) -> Result<Option<HardwareQuoteRoutePolicyBinding>> {
+    let raw = frame.get("attestation_policy_binding");
+    let Some(config) = runtime.hardware_quote_config.as_ref() else {
+        ensure!(
+            raw.is_none_or(Value::is_null),
+            "Tier-1 session must not carry a higher-tier attestation policy binding"
+        );
+        return Ok(None);
+    };
+    let value = raw
+        .filter(|value| !value.is_null())
+        .context("Tier-2/Tier-3 session is missing attestation_policy_binding")?;
+    let binding: HardwareQuoteRoutePolicyBinding = serde_json::from_value(value.clone())
+        .context("session attestation_policy_binding is invalid")?;
+    ensure!(
+        binding.kind == config.kind,
+        "session attestation policy kind does not match the provider quote kind"
+    );
+    ensure!(
+        binding.enclave_id == terms.enclave_id,
+        "session attestation policy targets a different enclave"
+    );
+    ensure!(
+        binding.policy_sequence > 0
+            && is_hex_len(&binding.policy_digest, 64)
+            && is_hex_len(&binding.device_id, 64)
+            && binding.evidence_schema_version > 0,
+        "session attestation policy binding is incomplete"
+    );
+    Ok(Some(binding))
+}
+
 async fn provider_session_attestation(
     runtime: &ProviderSessionRuntime<'_>,
     terms: &ProviderSessionTerms,
     att_nonce: &str,
+    policy_binding: Option<&HardwareQuoteRoutePolicyBinding>,
 ) -> Result<Tier1AttestationReport> {
     let report_ts = unix_epoch_seconds()?;
     provider_attestation_report(
@@ -55664,8 +62201,10 @@ async fn provider_session_attestation(
         report_ts,
         att_nonce.to_owned(),
         runtime.runtime_config.clone(),
+        policy_binding,
     )
     .await
+    .map(|material| material.report)
     .context("preparing per-session provider attestation")
 }
 
@@ -57455,16 +63994,32 @@ async fn provider_session_spend_reservation_decision(
         Ok(at) => at,
         Err(err) => return Ok(reject(format!("invalid spend reservation: {err:#}"))),
     };
-    let mut value = match provider_session_spend_reservation_value(terms, frame, rail, epoch, at) {
+    let payout_revision =
+        match active_provider_payout_revision(rpc, &terms.provider, rail, epoch).await {
+            Ok(revision) => revision,
+            Err(err) => {
+                return Ok(reject(format!(
+                    "provider has no active verified {rail} payout binding: {err:#}"
+                )))
+            }
+        };
+    let mut value = match provider_session_spend_reservation_value(
+        terms,
+        frame,
+        rail,
+        epoch,
+        at,
+        &payout_revision,
+    ) {
         Ok(value) => value,
         Err(err) => return Ok(reject(format!("invalid spend reservation: {err:#}"))),
     };
-    let message = spend_reservation_message(&value);
+    let message = targeted_spend_reservation_message(&value);
     let provider_sig = sign_message(keypair_path, password, &message)
         .await
         .context("signing provider spend reservation")?;
     value["provider_sig"] = json!(provider_sig);
-    let key = spend_reservation_feature_key(&value)?;
+    let key = targeted_spend_reservation_feature_key(&value)?;
     // The local relay comes up shortly after the peer process; an admission that
     // races that window should wait it out (bounded) instead of rejecting the
     // session outright (observed live 2026-07-12: s.reject BALANCE on a relay that
@@ -57532,6 +64087,115 @@ async fn active_billing_epoch(rpc: &PeerRpcClient) -> Result<u64> {
     active_billing_epoch_from_state(state.as_ref())
 }
 
+async fn active_provider_payout_revision(
+    rpc: &PeerRpcClient,
+    provider: &str,
+    rail: &str,
+    epoch: u64,
+) -> Result<String> {
+    ensure!(
+        is_hex_len(provider, 64) && provider == provider.to_ascii_lowercase(),
+        "provider payout identity must be 32-byte lower-case hexadecimal"
+    );
+    ensure!(
+        matches!(rail, "tap" | "tnk" | "fiat"),
+        "provider payout rail must be tap, tnk, or fiat"
+    );
+    let pointer_key = format!("payout/current/{rail}/{provider}");
+    let pointer = read_state_value(rpc, &pointer_key)
+        .await?
+        .context("provider payout pointer is missing")?;
+    let revision = payout_pointer_revision_at_epoch(&pointer, epoch)
+        .context("provider payout pointer has no active revision")?
+        .to_ascii_lowercase();
+    ensure!(
+        is_hex_len(&revision, 64),
+        "provider payout pointer active revision is invalid"
+    );
+    let binding_key = format!("payout/binding/{rail}/{provider}/{revision}");
+    let binding = read_state_value(rpc, &binding_key)
+        .await?
+        .context("active provider payout binding is missing")?;
+    ensure!(
+        binding.get("verified").and_then(Value::as_bool) == Some(true)
+            && binding.get("provider").and_then(Value::as_str) == Some(provider)
+            && binding.get("rail").and_then(Value::as_str) == Some(rail)
+            && binding.get("revision").and_then(Value::as_str) == Some(revision.as_str())
+            && binding
+                .get("activation_epoch")
+                .and_then(Value::as_u64)
+                .is_some_and(|activation_epoch| activation_epoch <= epoch),
+        "active provider payout binding does not match its immutable pointer"
+    );
+    if rail == "fiat" {
+        ensure!(
+            stripe_payout_binding_currently_ready(rpc, provider, &binding).await?,
+            "active provider Stripe payout binding is not currently ready"
+        );
+    }
+    Ok(revision)
+}
+
+async fn stripe_payout_binding_currently_ready(
+    rpc: &PeerRpcClient,
+    provider: &str,
+    binding: &Value,
+) -> Result<bool> {
+    let Some(target) = binding.get("target").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let Some(pointer) = read_state_value(
+        rpc,
+        &format!("payout/stripe-verified/target/{provider}/{target}"),
+    )
+    .await?
+    else {
+        return Ok(false);
+    };
+    if pointer.get("ready").and_then(Value::as_bool) != Some(true)
+        || pointer.get("target").and_then(Value::as_str)
+            != binding.get("target").and_then(Value::as_str)
+        || pointer.get("processor_revision").and_then(Value::as_str)
+            != binding
+                .get("stripe_processor_revision")
+                .and_then(Value::as_str)
+    {
+        return Ok(false);
+    }
+    let Some(record_key) = pointer.get("record_key").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let Some(record) = read_state_value(rpc, record_key).await? else {
+        return Ok(false);
+    };
+    Ok(
+        record.get("type").and_then(Value::as_str) == Some("stripe_payout_verification")
+            && record.get("provider").and_then(Value::as_str) == Some(provider)
+            && record.get("target").and_then(Value::as_str) == Some(target)
+            && record.get("currency").and_then(Value::as_str)
+                == binding.get("currency").and_then(Value::as_str)
+            && record.get("ready").and_then(Value::as_bool) == Some(true)
+            && record.get("processor_revision").and_then(Value::as_str)
+                == binding
+                    .get("stripe_processor_revision")
+                    .and_then(Value::as_str),
+    )
+}
+
+fn payout_pointer_revision_at_epoch(pointer: &Value, epoch: u64) -> Option<&str> {
+    pointer
+        .get("pending_revision")
+        .and_then(Value::as_str)
+        .zip(
+            pointer
+                .get("pending_activation_epoch")
+                .and_then(Value::as_u64),
+        )
+        .filter(|(_, activation_epoch)| *activation_epoch <= epoch)
+        .map(|(revision, _)| revision)
+        .or_else(|| pointer.get("current_revision").and_then(Value::as_str))
+}
+
 fn active_billing_epoch_from_state(state: Option<&Value>) -> Result<u64> {
     let updated_epoch = state
         .context(
@@ -57551,6 +64215,7 @@ fn provider_session_spend_reservation_value(
     rail: &str,
     epoch: u64,
     at: u64,
+    payout_revision: &str,
 ) -> Result<Value> {
     let session_id = frame
         .get("session_id")
@@ -57566,8 +64231,13 @@ fn provider_session_spend_reservation_value(
         .context("s.open missing spend voucher")?;
     let spend_voucher: SpendVoucher =
         serde_json::from_value(voucher.clone()).context("invalid spend voucher")?;
+    ensure!(
+        is_hex_len(payout_revision, 64) && payout_revision == payout_revision.to_ascii_lowercase(),
+        "active payout revision must be 32-byte lower-case hexadecimal"
+    );
     Ok(json!({
-        "op": "spend_reserve",
+        "op": "spend_reserve_targeted",
+        "payout_revision": payout_revision,
         "contract_version": CONTRACT_VERSION,
         "session_id": session_id,
         "epoch": epoch,
@@ -57629,14 +64299,17 @@ fn spend_reservation_evidence(value: &Value) -> Value {
     evidence
 }
 
-fn spend_reservation_message(value: &Value) -> String {
+fn targeted_spend_reservation_message(value: &Value) -> String {
     format!(
-        "mayhem-spend-reservation-v1{}",
-        stable_json_value(&spend_reservation_evidence(value))
+        "mayhem-targeted-spend-reservation-v1{}",
+        stable_json_value(&json!({
+            "payout_revision": value.get("payout_revision").cloned().unwrap_or(Value::Null),
+            "reservation": spend_reservation_evidence(value),
+        }))
     )
 }
 
-fn spend_reservation_feature_key(value: &Value) -> Result<String> {
+fn targeted_spend_reservation_feature_key(value: &Value) -> Result<String> {
     let rail = value
         .get("rail")
         .and_then(Value::as_str)
@@ -57653,12 +64326,20 @@ fn spend_reservation_feature_key(value: &Value) -> Result<String> {
         .get("session_id")
         .and_then(Value::as_str)
         .context("spend reservation missing session_id")?;
+    let payout_revision = value
+        .get("payout_revision")
+        .and_then(Value::as_str)
+        .filter(|revision| is_hex_len(revision, 64) && *revision == revision.to_ascii_lowercase())
+        .context("targeted spend reservation missing payout revision")?;
     let digest = stable_value_hash(&json!({
-        "domain": "mayhem-spend-reservation-feature-v1",
-        "value": spend_reservation_evidence(value),
+        "domain": "mayhem-targeted-spend-reservation-feature-v1",
+        "value": {
+            "payout_revision": payout_revision,
+            "reservation": spend_reservation_evidence(value),
+        },
     }));
     Ok(format!(
-        "hold/reserve/{rail}/{user}/{epoch}/{session_id}/{digest}"
+        "hold/targeted/{rail}/{user}/{epoch}/{session_id}/{digest}"
     ))
 }
 
@@ -62328,7 +69009,7 @@ fn print_human_report(report: &Value) -> Result<()> {
 
 fn setup_admin_payout_notice(role: &str) -> Option<&'static str> {
     matches!(role, "provider" | "both").then_some(
-        "Provider payout target: admin-set later; setup does not set provider payout terms.",
+        "Provider payouts: use 'mayhem provider payout set' for TAP/TNK; Stripe remains Connect-verification gated.",
     )
 }
 
@@ -63391,6 +70072,7 @@ mod tests {
         assert_eq!(args.home.as_deref(), Some(Path::new("/tmp/mayhem-down")));
         assert_eq!(args.timeout_seconds, 7);
         assert!(args.force);
+        assert!(!args.restart);
         assert!(args.json);
 
         let history = Cli::try_parse_from([
@@ -64449,6 +71131,35 @@ mod tests {
         assert_eq!(args.home.as_deref(), Some(Path::new("/tmp/mayhem-mainnet")));
         assert!(args.confirm);
         assert!(args.json);
+    }
+
+    #[test]
+    fn admin_publish_payout_context_cli_requires_explicit_bootstrap() {
+        let bootstrap = "bb".repeat(32);
+        let parsed = Cli::try_parse_from([
+            "mayhem",
+            "admin",
+            "publish-payout-context",
+            "--bootstrap",
+            &bootstrap,
+            "--submit",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Admin { command } = parsed.command else {
+            panic!("expected admin command");
+        };
+        let AdminCommands::PublishPayoutContext(args) = *command else {
+            panic!("expected publish-payout-context command");
+        };
+        assert_eq!(args.bootstrap, bootstrap);
+        assert!(args.tx.submit);
+        assert!(args.tx.json);
+
+        assert!(
+            Cli::try_parse_from(["mayhem", "admin", "publish-payout-context", "--submit",])
+                .is_err()
+        );
     }
 
     #[test]
@@ -65916,52 +72627,6 @@ mod tests {
     }
 
     #[test]
-    fn admin_payout_payload_is_admin_set_not_provider_supplied() {
-        let (tx_type, payload) = admin_command_payload(&AdminCommands::SetProviderPayout(
-            AdminSetProviderPayoutArgs {
-                tx: test_admin_tx_args(),
-                provider: "provider-a".to_owned(),
-                payout_method: AdminPayoutMethod::Stripe,
-                payout_addr: "acct_adminapproved".to_owned(),
-                payout_currency: Some("EUR".to_owned()),
-            },
-        ))
-        .unwrap();
-
-        assert_eq!(tx_type, "setProviderPayout");
-        assert_eq!(
-            payload,
-            json!({
-                "op": "set_provider_payout",
-                "provider": "provider-a",
-                "payout_method": "stripe",
-                "payout_addr": "acct_adminapproved",
-                "payout_currency": "eur",
-            })
-        );
-
-        let (_, tap_payload) = admin_command_payload(&AdminCommands::SetProviderPayout(
-            AdminSetProviderPayoutArgs {
-                tx: test_admin_tx_args(),
-                provider: "provider-a".to_owned(),
-                payout_method: AdminPayoutMethod::Tap,
-                payout_addr: "0x1111111111111111111111111111111111111111".to_owned(),
-                payout_currency: None,
-            },
-        ))
-        .unwrap();
-        assert_eq!(
-            tap_payload,
-            json!({
-                "op": "set_provider_payout",
-                "provider": "provider-a",
-                "payout_method": "tap",
-                "payout_addr": "0x1111111111111111111111111111111111111111",
-            })
-        );
-    }
-
-    #[test]
     fn admin_kyb_payloads_match_contract_schemas() {
         let (tx_type, payload) =
             admin_command_payload(&AdminCommands::SetProviderKyb(AdminSetProviderKybArgs {
@@ -66090,7 +72755,7 @@ mod tests {
         );
 
         let settlement_payload = json!({
-            "op": "tnk_settlement",
+            "op": "settle_targeted_tnk",
             "epoch": 7,
             "at": 25_200,
             "rail": "tnk",
@@ -66146,12 +72811,12 @@ mod tests {
         );
         assert!(tnk_settlement_feature_key(&settlement_payload)
             .unwrap()
-            .starts_with("settle/tnk/7/"));
+            .starts_with("settle/targeted/tnk/7/"));
         assert_eq!(
             tnk_settlement_feature_key(&settlement_payload)
                 .unwrap()
                 .len(),
-            "settle/tnk/7/".len() + 64
+            "settle/targeted/tnk/7/".len() + 64
         );
         assert_eq!(
             admin_command_payload(&AdminCommands::TnkSettlement(AdminTnkSettlementArgs {
@@ -66176,7 +72841,7 @@ mod tests {
         );
 
         let fiat_settlement_payload = json!({
-            "op": "fiat_settlement",
+            "op": "settle_targeted_fiat",
             "epoch": 7,
             "at": 25_200,
             "rail": "fiat",
@@ -66212,6 +72877,7 @@ mod tests {
                 {
                     "role": "provider",
                     "provider": "b".repeat(64),
+                    "payout_revision": "d".repeat(64),
                     "to": "acct_provider",
                     "currency": "usd",
                     "amount_minor": "85",
@@ -66246,12 +72912,12 @@ mod tests {
         );
         assert!(fiat_settlement_feature_key(&fiat_settlement_payload)
             .unwrap()
-            .starts_with("settle/fiat/7/"));
+            .starts_with("settle/targeted/fiat/7/"));
         assert_eq!(
             fiat_settlement_feature_key(&fiat_settlement_payload)
                 .unwrap()
                 .len(),
-            "settle/fiat/7/".len() + 64
+            "settle/targeted/fiat/7/".len() + 64
         );
         assert_eq!(
             admin_command_payload(&AdminCommands::FiatSettlement(AdminFiatSettlementArgs {
@@ -66469,12 +73135,6 @@ mod tests {
     }
 
     #[test]
-    fn admin_payout_confirm_payload_is_retired() {
-        let err = admin_payout_confirm_payload(&test_payout_confirm_args()).unwrap_err();
-        assert!(err.to_string().contains("payout-confirm is retired"));
-    }
-
-    #[test]
     fn fiat_settlement_helpers_floor_to_stripe_minor_units_and_bind_platform_balance() {
         assert_eq!(
             fiat_whole_minor_au(FIAT_MINOR_AU_CLI * 85 + 1),
@@ -66561,11 +73221,13 @@ mod tests {
     #[tokio::test]
     async fn stripe_transfer_retries_and_replays_with_one_deterministic_identity() {
         let provider = "aa".repeat(32);
+        let payout_revision = "cc".repeat(32);
         let apply_hash = "bb".repeat(32);
-        let idempotency_key = stripe_transfer_idempotency_key(7, &provider, &apply_hash).unwrap();
+        let idempotency_key =
+            stripe_transfer_idempotency_key(7, &provider, &payout_revision, &apply_hash).unwrap();
         assert_eq!(
             idempotency_key,
-            format!("mayhem:fiat:settle:v1:7:{provider}:{apply_hash}")
+            format!("mayhem:fiat:targeted:v1:7:{provider}:{payout_revision}:{apply_hash}")
         );
 
         let transfer_group = format!("mayhem_fiat_epoch_7_{}", &apply_hash[..16]);
@@ -66577,6 +73239,7 @@ mod tests {
             "transfer_group": transfer_group,
             "metadata": {
                 "mayhem_provider": provider,
+                "mayhem_payout_revision": payout_revision,
                 "mayhem_au": (FIAT_MINOR_AU_CLI * 85).to_string(),
                 "mayhem_epoch": "7",
                 "mayhem_output_index": "0",
@@ -66654,6 +73317,7 @@ mod tests {
         let output = FiatSettlementOutput {
             role: "provider".to_owned(),
             provider: Some(provider.clone()),
+            payout_revision: Some(payout_revision),
             to: "acct_provider".to_owned(),
             currency: "usd".to_owned(),
             amount_minor: 85,
@@ -66724,6 +73388,7 @@ mod tests {
             FiatSettlementOutput {
                 role: "provider".to_owned(),
                 provider: Some("aa".repeat(32)),
+                payout_revision: Some("bb".repeat(32)),
                 to: "acct_provider".to_owned(),
                 currency: "usd".to_owned(),
                 amount_minor: 85,
@@ -66732,6 +73397,7 @@ mod tests {
             FiatSettlementOutput {
                 role: "operator_fee".to_owned(),
                 provider: None,
+                payout_revision: None,
                 to: "platform_balance".to_owned(),
                 currency: "eur".to_owned(),
                 amount_minor: 15,
@@ -66835,10 +73501,25 @@ mod tests {
             page: None,
             last_page: false,
             recomputed_file: None,
-            debits_json: Some(r#"[{"user":"user-a","au": "2000"}]"#.to_owned()),
+            debits_json: Some(
+                r#"[{"rail":"fiat","user":"user-a","au":"2000"}]"#.to_owned(),
+            ),
             debits_file: None,
-            earnings_json: Some(r#"[{"provider":"provider-a","gross_au": "2000"}]"#.to_owned()),
+            earnings_json: Some(
+                format!(
+                    r#"[{{"rail":"fiat","provider":"provider-a","gross_au":"2000","payout_revision":"{}"}}]"#,
+                    "b".repeat(64)
+                ),
+            ),
             earnings_file: None,
+            allocations_json: Some(
+                format!(
+                    r#"[{{"session_id":"{}","user":"user-a","rail":"fiat","provider":"provider-a","payout_revision":"{}","au":"2000"}}]"#,
+                    "a".repeat(64),
+                    "b".repeat(64)
+                ),
+            ),
+            allocations_file: None,
             market_usage_json: Some(
                 r#"[{"enclave_id":"enclave-a","demand_au": "2000","session_count":1,"provider_count":1}]"#
                     .to_owned(),
@@ -66853,30 +73534,32 @@ mod tests {
         assert_eq!(
             apply,
             json!({
-                "op": "epoch_apply",
+                "op": "apply_targeted_epoch",
                 "epoch": 7,
                 "at": 25_200,
-                "debits": [{"user": "user-a", "au": "2000"}],
-                "earnings": [{"provider": "provider-a", "gross_au": "2000"}],
+                "debits": [{"rail": "fiat", "user": "user-a", "au": "2000"}],
+                "earnings": [{"rail": "fiat", "provider": "provider-a", "gross_au": "2000", "payout_revision": "b".repeat(64)}],
+                "allocations": [{"session_id": "a".repeat(64), "user": "user-a", "rail": "fiat", "provider": "provider-a", "payout_revision": "b".repeat(64), "au": "2000"}],
                 "market_usage": [{"enclave_id": "enclave-a", "demand_au": "2000", "session_count": 1, "provider_count": 1}],
                 "roots": commit["roots"],
                 "totals": commit["totals"],
             })
         );
         let apply_key = epoch_apply_feature_key(&apply).unwrap();
-        assert!(apply_key.starts_with("epoch/apply/7/"));
-        assert_eq!(apply_key.len(), "epoch/apply/7/".len() + 64);
+        assert!(apply_key.starts_with("epoch/targeted/7/"));
+        assert_eq!(apply_key.len(), "epoch/targeted/7/".len() + 64);
         assert_eq!(
             apply_key,
             epoch_apply_feature_key(&json!({
                 "totals": commit["totals"],
                 "roots": commit["roots"],
-                "earnings": [{"gross_au": "2000", "provider": "provider-a"}],
-                "debits": [{"au": "2000", "user": "user-a"}],
+                "earnings": [{"gross_au": "2000", "payout_revision": "b".repeat(64), "provider": "provider-a", "rail": "fiat"}],
+                "debits": [{"au": "2000", "rail": "fiat", "user": "user-a"}],
+                "allocations": [{"au": "2000", "payout_revision": "b".repeat(64), "provider": "provider-a", "rail": "fiat", "session_id": "a".repeat(64), "user": "user-a"}],
                 "market_usage": [{"demand_au": "2000", "enclave_id": "enclave-a", "session_count": 1, "provider_count": 1}],
                 "at": 25_200,
                 "epoch": 7,
-                "op": "epoch_apply",
+                "op": "apply_targeted_epoch",
             }))
             .unwrap()
         );
@@ -66908,10 +73591,25 @@ mod tests {
             page: Some(0),
             last_page: false,
             recomputed_file: None,
-            debits_json: Some(r#"[{"user":"user-a","au": "2000"}]"#.to_owned()),
+            debits_json: Some(
+                r#"[{"rail":"fiat","user":"user-a","au":"2000"}]"#.to_owned(),
+            ),
             debits_file: None,
-            earnings_json: Some(r#"[{"provider":"provider-a","gross_au": "2000"}]"#.to_owned()),
+            earnings_json: Some(
+                format!(
+                    r#"[{{"rail":"fiat","provider":"provider-a","gross_au":"2000","payout_revision":"{}"}}]"#,
+                    "b".repeat(64)
+                ),
+            ),
             earnings_file: None,
+            allocations_json: Some(
+                format!(
+                    r#"[{{"session_id":"{}","user":"user-a","rail":"fiat","provider":"provider-a","payout_revision":"{}","au":"2000"}}]"#,
+                    "a".repeat(64),
+                    "b".repeat(64)
+                ),
+            ),
+            allocations_file: None,
             market_usage_json: None,
             market_usage_file: None,
             roots_json: None,
@@ -66923,11 +73621,12 @@ mod tests {
         assert_eq!(
             paged_apply,
             json!({
-                "op": "epoch_apply",
+                "op": "apply_targeted_epoch",
                 "epoch": 8,
                 "at": 28_800,
-                "debits": [{"user": "user-a", "au": "2000"}],
-                "earnings": [{"provider": "provider-a", "gross_au": "2000"}],
+                "debits": [{"rail": "fiat", "user": "user-a", "au": "2000"}],
+                "earnings": [{"rail": "fiat", "provider": "provider-a", "gross_au": "2000", "payout_revision": "b".repeat(64)}],
+                "allocations": [{"session_id": "a".repeat(64), "user": "user-a", "rail": "fiat", "provider": "provider-a", "payout_revision": "b".repeat(64), "au": "2000"}],
                 "page": 0,
                 "last_page": false,
             })
@@ -66970,6 +73669,8 @@ mod tests {
             debits_file: None,
             earnings_json: Some("[]".to_owned()),
             earnings_file: None,
+            allocations_json: Some("[]".to_owned()),
+            allocations_file: None,
             market_usage_json: None,
             market_usage_file: None,
             roots_json: Some(roots.to_string()),
@@ -67024,13 +73725,88 @@ mod tests {
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 12);
+        assert_eq!(CONTRACT_VERSION, 13);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 9);
     }
 
     #[test]
-    fn provider_lifecycle_intents_are_current_version_and_limited_to_opt_in_and_out_ops() {
+    fn admin_payout_context_matches_contract_hash_and_key_domains() {
+        let admin = "aa".repeat(32);
+        let bootstrap = "bb".repeat(32);
+        let payments = json!({
+            "denom": "au_usd",
+            "rails": ["fiat", "tap", "tnk"],
+            "fiat": {
+                "processor": "stripe",
+                "currencies": ["usd", "eur"],
+                "locale": "en",
+            },
+            "tap": {
+                "chain_id": 61_000,
+                "token_address": "0x1111111111111111111111111111111111111111",
+                "pool_address": "0x2222222222222222222222222222222222222222",
+            },
+            "tnk": {
+                "network": "mainnet",
+                "treasury_address": "trac1treasury",
+            },
+            "ver": 7,
+            "updated_at": "tx/7",
+            "set_by": admin,
+            "set_by_role": "admin",
+        });
+        let value = admin_publish_payout_context_value(&payments, &admin, &bootstrap).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "op": "publish_payout_context",
+                "network": "mainnet",
+                "admin": admin,
+                "bootstrap": bootstrap,
+                "payment_config_version": 7,
+                "payment_config_hash": opaque_value_hash(
+                    "mayhem-payout-payment-config-v1",
+                    &payments,
+                ),
+            })
+        );
+        assert_eq!(
+            admin_publish_payout_context_feature_key(&value).unwrap(),
+            format!(
+                "payout/context/7/{}",
+                opaque_value_hash("mayhem-payout-context-feature-v1", &value)
+            )
+        );
+        assert!(admin_publish_payout_context_value(&payments, &admin, &"BB".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn stripe_relink_source_consent_matches_intercom_canonical_message() {
+        let provider = "bb".repeat(32);
+        let source_provider = "cc".repeat(32);
+        let context_revision = "78".repeat(32);
+        let request_nonce = "56".repeat(32);
+        let consent = json!({
+            "provider": provider,
+            "source_provider": source_provider,
+            "account_id": "acct_test_provider",
+            "context_revision": context_revision,
+            "country": "DE",
+            "request_nonce": request_nonce,
+            "consent_expires_at": 1_900_000_000_u64,
+        });
+        assert_eq!(
+            stripe_connect_relink_consent_message(&consent).unwrap(),
+            format!(
+                "{{\"account_id\":\"acct_test_provider\",\"consent_expires_at\":1900000000,\"context_revision\":\"{}\",\"country\":\"DE\",\"domain\":\"mayhem-stripe-connect-relink-consent-v1\",\"request_nonce\":\"{}\",\"signing_version\":1,\"source_provider\":\"{}\",\"target_provider\":\"{}\"}}",
+                context_revision, request_nonce, source_provider, provider
+            )
+        );
+    }
+
+    #[test]
+    fn provider_lifecycle_intents_include_signed_payout_selection() {
         let provider = "11".repeat(32);
         let intent = json!({
             "op": "join_room",
@@ -67101,6 +73877,118 @@ mod tests {
         assert_eq!(rails["rails"], json!(["tap"]));
         assert!(is_hex_len(rails["nonce"].as_str().unwrap(), 64));
         assert!(provider_lifecycle_intent_message(&rails).contains("\"rails\":[\"tap\"]"));
+
+        let previous_revision = "44".repeat(32);
+        let payout_context = ProviderPayoutIntentContext {
+            network: "mainnet".to_owned(),
+            admin: "aa".repeat(32),
+            bootstrap: "bb".repeat(32),
+            context_revision: "cc".repeat(32),
+            chain_id: Some(61_000),
+            payment_config_version: 7,
+            updated_epoch: 80,
+        };
+        let nonce = "66".repeat(32);
+        let unsigned_payout = provider_payout_unsigned_intent(
+            &payout_context,
+            &provider,
+            ProviderPayoutRail::Tap,
+            "0x5555555555555555555555555555555555555555",
+            None,
+            Some(&previous_revision),
+            &nonce,
+            90,
+        )
+        .expect("unsigned provider payout intent");
+        assert_eq!(
+            provider_payout_target_signing_message(&unsigned_payout),
+            format!(
+                "mayhem-provider-payout-target-binding-v1{{\"admin\":\"{}\",\"bootstrap\":\"{}\",\"chain_id\":61000,\"context_revision\":\"{}\",\"currency\":null,\"expires_after_epoch\":90,\"network\":\"mainnet\",\"nonce\":\"{}\",\"payment_config_version\":7,\"previous_revision\":\"{}\",\"provider\":\"{}\",\"rail\":\"tap\",\"target\":\"0x5555555555555555555555555555555555555555\",\"target_wallet\":null}}",
+                payout_context.admin,
+                payout_context.bootstrap,
+                payout_context.context_revision,
+                nonce,
+                previous_revision,
+                provider,
+            )
+        );
+        let payout = provider_payout_intent(unsigned_payout, &format!("0x{}", "77".repeat(65)))
+            .expect("provider payout intent");
+        assert_eq!(payout["op"], "bind_provider_payout");
+        assert_eq!(payout["network"], "mainnet");
+        assert_eq!(payout["admin"], payout_context.admin);
+        assert_eq!(payout["bootstrap"], payout_context.bootstrap);
+        assert_eq!(payout["provider"], provider);
+        assert_eq!(payout["rail"], "tap");
+        assert_eq!(payout["currency"], Value::Null);
+        assert_eq!(payout["chain_id"], 61_000);
+        assert_eq!(
+            payout["target"],
+            "0x5555555555555555555555555555555555555555"
+        );
+        assert_eq!(payout["target_signature"], format!("0x{}", "77".repeat(65)));
+        assert_eq!(payout["previous_revision"], previous_revision);
+        assert_eq!(payout["payment_config_version"], 7);
+        assert_eq!(payout["nonce"], nonce);
+        assert_eq!(payout["expires_after_epoch"], 90);
+        assert_eq!(payout["context_revision"], payout_context.context_revision);
+        assert_eq!(payout["target_wallet"], Value::Null);
+        assert_eq!(payout.as_object().unwrap().len(), 16);
+        let signed_message = provider_payout_binding_message(&payout);
+        assert!(
+            signed_message.contains("\"target\":\"0x5555555555555555555555555555555555555555\"")
+        );
+        assert!(signed_message.contains("\"target_signature\":\"0x77777777"));
+        assert!(signed_message.contains("\"previous_revision\":\"44444444"));
+    }
+
+    #[test]
+    fn admin_contract_tx_feature_matches_pf5_rpc_shape_and_preserves_admin_capabilities() {
+        let tx = "11".repeat(32);
+        let admin = "22".repeat(32);
+        let signature = "33".repeat(64);
+        let nonce = "44".repeat(32);
+        let prepared_command = json!({
+            "type": "setParams",
+            "value": {
+                "op": "set_params",
+                "submitted_at": 90_000,
+                "effective_at": 93_600,
+                "values": { "fee_bps": 1_500 },
+            },
+        });
+        assert_eq!(
+            admin_contract_tx_feature(&tx, &prepared_command, &admin, &signature, &nonce, false,)
+                .unwrap(),
+            json!({
+                "feature": "mayhem",
+                "key": format!("admin/contract-tx/{tx}"),
+                "value": {
+                    "op": "admin_contract_tx",
+                    "tx": tx,
+                    "prepared_command": prepared_command,
+                    "address": admin,
+                    "signature": signature,
+                    "nonce": nonce,
+                    "sim": false,
+                },
+            })
+        );
+
+        let capability = json!({
+            "type": "addWriter",
+            "value": { "key": "55".repeat(32) },
+        });
+        let relayed = admin_contract_tx_feature(
+            &"66".repeat(32),
+            &capability,
+            &"22".repeat(32),
+            &"33".repeat(64),
+            &"44".repeat(32),
+            false,
+        )
+        .expect("base-protocol admin capabilities must remain relayable");
+        assert_eq!(relayed["value"]["prepared_command"], capability);
     }
 
     #[test]
@@ -67411,7 +74299,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_lifecycle_cli_parses_join_leave_and_room_commands() {
+    fn provider_lifecycle_cli_parses_join_room_and_payout_commands() {
         let join = Cli::try_parse_from([
             "mayhem",
             "provider",
@@ -67529,6 +74417,69 @@ mod tests {
         assert!(normalize_provider_accepted_rails_arg("fiat,fiat").is_err());
         assert!(normalize_provider_accepted_rails_arg("unsupported").is_err());
 
+        let payout = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "payout",
+            "set",
+            "--rail",
+            "tap",
+            "--address",
+            "0x1111111111111111111111111111111111111111",
+            "--valid-for-epochs",
+            "12",
+            "--submit",
+            "--sim",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = payout.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Payout { command } = *command else {
+            panic!("expected provider payout command");
+        };
+        let ProviderPayoutCommands::Set(args) = command else {
+            panic!("expected provider payout set command");
+        };
+        assert_eq!(args.rail, ProviderPayoutRail::Tap);
+        assert_eq!(
+            args.address.as_deref(),
+            Some("0x1111111111111111111111111111111111111111")
+        );
+        assert_eq!(args.valid_for_epochs, 12);
+        assert!(args.tx.submit);
+        assert!(args.tx.sim);
+        assert!(args.tx.json);
+        assert!(Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "payout",
+            "set",
+            "--rail",
+            "stripe",
+            "--address",
+            "acct_unverified",
+            "--submit",
+        ])
+        .is_err());
+        let rotate = Cli::try_parse_from([
+            "mayhem", "provider", "payout", "rotate", "--rail", "tnk", "--submit",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = rotate.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Payout { command } = *command else {
+            panic!("expected provider payout command");
+        };
+        let ProviderPayoutCommands::Rotate(args) = command else {
+            panic!("expected provider payout rotate command");
+        };
+        assert_eq!(args.rail, ProviderPayoutRail::Tnk);
+        assert_eq!(args.valid_for_epochs, 10);
+        assert!(args.tx.submit);
+
         let stripe = Cli::try_parse_from([
             "mayhem",
             "provider",
@@ -67554,6 +74505,86 @@ mod tests {
         assert!(args.no_open);
         assert!(args.no_wait);
         assert!(args.provider.json);
+        assert!(Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "stripe",
+            "onboard",
+            "--country",
+            "DE",
+            "--account",
+            "acct_unverified",
+        ])
+        .is_err());
+
+        let rotate = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "stripe",
+            "rotate",
+            "--country",
+            "DE",
+            "--no-open",
+            "--no-wait",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = rotate.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Stripe { command } = *command else {
+            panic!("expected provider Stripe command");
+        };
+        let ProviderStripeCommands::Rotate(args) = command else {
+            panic!("expected provider Stripe rotation command");
+        };
+        assert_eq!(args.country, "DE");
+        assert!(args.no_open);
+        assert!(args.no_wait);
+        assert!(args.provider.json);
+
+        let relink = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "stripe",
+            "relink",
+            "--source-wallet-key-file",
+            "/tmp/source-provider/keypair.json",
+            "--country",
+            "DE",
+            "--no-open",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = relink.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Stripe { command } = *command else {
+            panic!("expected provider Stripe command");
+        };
+        let ProviderStripeCommands::Relink(args) = command else {
+            panic!("expected provider Stripe relink command");
+        };
+        assert_eq!(
+            args.source_wallet_key_file,
+            PathBuf::from("/tmp/source-provider/keypair.json")
+        );
+        assert_eq!(args.country, "DE");
+        assert!(args.no_open);
+        assert!(args.provider.json);
+        assert!(Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "stripe",
+            "relink",
+            "--source-provider",
+            &"cc".repeat(32),
+            "--country",
+            "DE",
+            "--account",
+            "acct_unverified",
+        ])
+        .is_err());
 
         let serve_plan = Cli::try_parse_from([
             "mayhem",
@@ -67625,6 +74656,8 @@ mod tests {
             "serve",
             "remove",
             "enclave-a",
+            "--timeout-seconds",
+            "45",
             "--json",
         ])
         .unwrap();
@@ -67638,7 +74671,78 @@ mod tests {
             panic!("expected provider serve remove command");
         };
         assert_eq!(args.target, "enclave-a");
+        assert_eq!(args.timeout_seconds, 45);
+        assert!(args.tx.json);
+
+        let serve_switch = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "serve",
+            "switch",
+            "enclave-a",
+            "enclave-b",
+            "--ctx",
+            "32768",
+            "--timeout-seconds",
+            "90",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = serve_switch.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Serve { command } = *command else {
+            panic!("expected provider serve command");
+        };
+        let ProviderServeCommands::Switch(args) = command else {
+            panic!("expected provider serve switch command");
+        };
+        assert_eq!(args.target, "enclave-a");
+        assert_eq!(args.enclave, "enclave-b");
+        assert_eq!(args.ctx, Some(32_768));
+        assert_eq!(args.timeout_seconds, 90);
+        assert!(args.tx.json);
+
+        let drain_stop = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "drain",
+            "--enclave",
+            "enclave-a",
+            "--stop",
+            "--timeout-seconds",
+            "75",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = drain_stop.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Drain(args) = *command else {
+            panic!("expected provider drain command");
+        };
+        assert_eq!(args.enclave.as_deref(), Some("enclave-a"));
+        assert!(args.stop);
+        assert_eq!(args.timeout_seconds, 75);
         assert!(args.json);
+
+        let stop = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "stop",
+            "--timeout-seconds",
+            "120",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = stop.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Stop(args) = *command else {
+            panic!("expected provider stop command");
+        };
+        assert_eq!(args.timeout_seconds, 120);
+        assert!(args.tx.json);
 
         assert!(Cli::try_parse_from(["mayhem", "pay", "unsupported"]).is_err());
     }
@@ -67693,6 +74797,819 @@ mod tests {
     }
 
     #[test]
+    fn provider_worker_retirement_policy_leaves_only_for_deliberate_shutdowns() {
+        let cases = [
+            (ProviderWorkerRetirement::DeliberateRemove, true),
+            (ProviderWorkerRetirement::EnclaveSwitch, true),
+            (ProviderWorkerRetirement::DrainToStop, true),
+            (ProviderWorkerRetirement::ProviderStop, true),
+            (ProviderWorkerRetirement::MayhemDown, true),
+            (ProviderWorkerRetirement::Crash, false),
+            (ProviderWorkerRetirement::TemporaryUpdate, false),
+        ];
+
+        for (reason, expected) in cases {
+            assert_eq!(reason.leaves_durable_registration(), expected, "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn shutdown_commands_bind_provider_retirement_to_deliberate_intent() {
+        let down = Cli::try_parse_from(["mayhem", "down"]).unwrap();
+        let Commands::Down(args) = down.command else {
+            panic!("expected down command");
+        };
+        let reason = provider_down_retirement(args.restart);
+        assert_eq!(reason, ProviderWorkerRetirement::MayhemDown);
+        assert!(reason.leaves_durable_registration());
+
+        let restart = Cli::try_parse_from(["mayhem", "down", "--restart"]).unwrap();
+        let Commands::Down(args) = restart.command else {
+            panic!("expected down command");
+        };
+        let reason = provider_down_retirement(args.restart);
+        assert_eq!(reason, ProviderWorkerRetirement::TemporaryUpdate);
+        assert!(!reason.leaves_durable_registration());
+
+        let drain = Cli::try_parse_from(["mayhem", "provider", "drain"]).unwrap();
+        let Commands::Provider { command, .. } = drain.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Drain(args) = *command else {
+            panic!("expected provider drain command");
+        };
+        assert_eq!(provider_drain_retirement(args.stop), None);
+
+        let drain_stop = Cli::try_parse_from(["mayhem", "provider", "drain", "--stop"]).unwrap();
+        let Commands::Provider { command, .. } = drain_stop.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Drain(args) = *command else {
+            panic!("expected provider drain command");
+        };
+        let reason = provider_drain_retirement(args.stop).unwrap();
+        assert_eq!(reason, ProviderWorkerRetirement::DrainToStop);
+        assert!(reason.leaves_durable_registration());
+
+        let stop = Cli::try_parse_from(["mayhem", "provider", "stop"]).unwrap();
+        let Commands::Provider { command, .. } = stop.command else {
+            panic!("expected provider command");
+        };
+        assert!(matches!(*command, ProviderCommands::Stop(_)));
+        let reason = provider_stop_retirement();
+        assert_eq!(reason, ProviderWorkerRetirement::ProviderStop);
+        assert!(reason.leaves_durable_registration());
+    }
+
+    #[test]
+    fn provider_restart_drains_workers_without_leaving_registration() {
+        let restart = provider_down_retirement(true);
+        let ordinary = provider_down_retirement(false);
+
+        assert!(provider_stack_requires_graceful_drain(1));
+        assert!(!provider_stack_requires_graceful_drain(0));
+        assert_eq!(restart, ProviderWorkerRetirement::TemporaryUpdate);
+        assert!(!restart.leaves_durable_registration());
+        assert_eq!(ordinary, ProviderWorkerRetirement::MayhemDown);
+        assert!(ordinary.leaves_durable_registration());
+    }
+
+    #[test]
+    fn forced_down_cleanup_failure_never_claims_confirmed_leave() {
+        let cli = Cli::try_parse_from(["mayhem", "down", "--force"]).unwrap();
+        let Commands::Down(args) = cli.command else {
+            panic!("expected down command");
+        };
+        assert!(args.force);
+
+        assert!(provider_cleanup_result_before_down(
+            Err(anyhow!("provider leave confirmation timed out")),
+            false,
+        )
+        .is_err());
+        let report = provider_cleanup_result_before_down(
+            Err(anyhow!("provider leave confirmation timed out")),
+            true,
+        )
+        .unwrap();
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["retirement"]["left_registration"], false);
+        assert_eq!(report["retirement"]["confirmed_leave"], false);
+        assert_eq!(
+            report["retirement"]["status"].as_str(),
+            Some("pending_or_unknown")
+        );
+        assert!(report["error"]
+            .as_str()
+            .unwrap()
+            .contains("confirmation timed out"));
+    }
+
+    #[test]
+    fn provider_temporary_switch_requires_identical_enclave_and_durable_terms() {
+        let terms = ProviderJoinContextTerms {
+            served_ctx: 8192,
+            served_modalities: vec!["text".to_owned()],
+            served_specialities: BTreeMap::new(),
+            ctx_bracket: Some("ctx_8k".to_owned()),
+            ctx_bracket_table_ver: Some(1),
+        };
+        let mut existing = json!({
+            "status": "active",
+            "served_ctx": 8192,
+            "served_modalities": ["text"],
+            "served_specialities": {},
+            "ctx_bracket": "ctx_8k",
+            "ctx_bracket_table_ver": 1,
+        });
+
+        assert!(provider_switch_preserves_durable_registration(
+            "enclave-a",
+            "enclave-a",
+            Some(&existing),
+            &terms,
+        ));
+        assert!(!provider_switch_preserves_durable_registration(
+            "enclave-a",
+            "enclave-b",
+            Some(&existing),
+            &terms,
+        ));
+        existing["served_ctx"] = json!(4096);
+        assert!(!provider_switch_preserves_durable_registration(
+            "enclave-a",
+            "enclave-a",
+            Some(&existing),
+            &terms,
+        ));
+
+        let changed_terms = provider_switch_sequencing_policy("enclave-a", "enclave-a");
+        assert!(changed_terms.prepare_replacement_before_drain);
+        assert!(changed_terms.clear_completed_scoped_drain_before_add);
+
+        let different_enclave = provider_switch_sequencing_policy("enclave-a", "enclave-b");
+        assert!(different_enclave.prepare_replacement_before_drain);
+        assert!(!different_enclave.clear_completed_scoped_drain_before_add);
+    }
+
+    #[test]
+    fn supervised_provider_worker_selection_supports_name_enclave_and_model() {
+        let status = json!({
+            "children": {
+                "gateway": {
+                    "name": "gateway",
+                    "args": ["gateway", "--home", "/tmp/mayhem"],
+                    "running": true,
+                },
+                "provider-live-old": {
+                    "name": "provider-live-old",
+                    "args": [
+                        "provider",
+                        "start",
+                        "--home",
+                        "/tmp/mayhem",
+                        "--enclave",
+                        "enclave-old",
+                        "--serve-sessions"
+                    ],
+                    "running": true,
+                },
+                "provider-live-other": {
+                    "name": "provider-live-other",
+                    "args": [
+                        "provider",
+                        "start",
+                        "--enclave",
+                        "enclave-other",
+                        "--serve-sessions"
+                    ],
+                    "running": false,
+                },
+                "provider-auto": {
+                    "name": "provider-auto",
+                    "args": [
+                        "provider",
+                        "start",
+                        "--home",
+                        "/tmp/mayhem",
+                        "--serve-sessions"
+                    ],
+                    "running": true,
+                }
+            }
+        });
+        let serves = vec![
+            LedgerServe {
+                provider: "provider-a".to_owned(),
+                enclave_id: "enclave-old".to_owned(),
+                model_id: "model-a".to_owned(),
+                status: "active".to_owned(),
+                served_ctx: Some(8192),
+                served_modalities: vec!["text".to_owned()],
+                served_specialities: BTreeMap::new(),
+                hardware_fingerprint: None,
+                device_key: None,
+                rooms: vec!["room-a".to_owned()],
+            },
+            LedgerServe {
+                provider: "provider-a".to_owned(),
+                enclave_id: "enclave-other".to_owned(),
+                model_id: "model-b".to_owned(),
+                status: "active".to_owned(),
+                served_ctx: Some(8192),
+                served_modalities: vec!["text".to_owned()],
+                served_specialities: BTreeMap::new(),
+                hardware_fingerprint: None,
+                device_key: None,
+                rooms: vec!["room-b".to_owned()],
+            },
+        ];
+
+        let workers = supervised_provider_workers(&status);
+        assert_eq!(supervised_running_provider_child_count(&status), 2);
+        assert_eq!(workers.len(), 2);
+        assert_eq!(
+            provider_serve_worker_for_target(&status, &serves, "provider-live-old")
+                .unwrap()
+                .enclave_id,
+            "enclave-old"
+        );
+        assert_eq!(
+            provider_serve_worker_for_target(&status, &serves, "enclave-other")
+                .unwrap()
+                .name,
+            "provider-live-other"
+        );
+        assert_eq!(
+            provider_serve_worker_for_target(&status, &serves, "model-a")
+                .unwrap()
+                .enclave_id,
+            "enclave-old"
+        );
+        assert!(provider_serve_worker_for_target(&status, &serves, "missing-model").is_err());
+    }
+
+    #[test]
+    fn provider_retirement_rooms_are_scoped_and_sorted_before_enclave_leave() {
+        let root = "aa".repeat(32);
+        let mut contract = test_contract(&root);
+        let provider = "55".repeat(32);
+        let enclave = "11".repeat(32);
+        contract.roomserve.push(LedgerRoomServe {
+            room_id: "00".repeat(16),
+            provider: provider.clone(),
+            enclave_id: enclave.clone(),
+            model_id: "test/model@4bit".to_owned(),
+            status: "active".to_owned(),
+        });
+        contract.roomserve.push(LedgerRoomServe {
+            room_id: "room-inactive".to_owned(),
+            provider: provider.clone(),
+            enclave_id: enclave.clone(),
+            model_id: "test/model@4bit".to_owned(),
+            status: "inactive".to_owned(),
+        });
+        contract.roomserve.push(LedgerRoomServe {
+            room_id: "room-other-provider".to_owned(),
+            provider: "66".repeat(32),
+            enclave_id: enclave.clone(),
+            model_id: "test/model@4bit".to_owned(),
+            status: "active".to_owned(),
+        });
+        let enclave_ids = [enclave].into_iter().collect::<BTreeSet<_>>();
+
+        let rooms = active_provider_rooms_for_retirement(&contract, &provider, &enclave_ids);
+        assert_eq!(rooms.len(), 2);
+        assert_eq!(rooms[0].room_id, "00".repeat(16));
+        assert_eq!(rooms[1].room_id, "aa".repeat(16));
+        let order = provider_retirement_intent_order(&rooms, &enclave_ids);
+        assert_eq!(order[0]["op"], "leave_room");
+        assert_eq!(order[1]["op"], "leave_room");
+        assert_eq!(order[2]["op"], "leave_enclave");
+    }
+
+    fn test_signed_provider_leave_feature(
+        signing_key: &SigningKey,
+        op: ProviderLeaveOp,
+        enclave_id: &str,
+        room_id: Option<&str>,
+    ) -> Value {
+        let provider = hex_encode(&signing_key.verifying_key().to_bytes());
+        let intent =
+            provider_lifecycle_intent(&provider, op.as_str(), Some(enclave_id), room_id).unwrap();
+        let signature = hex_encode(
+            &signing_key
+                .sign(provider_lifecycle_intent_message(&intent).as_bytes())
+                .to_bytes(),
+        );
+        json!({
+            "feature": "mayhem",
+            "key": provider_lifecycle_feature_key(&intent).unwrap(),
+            "value": {
+                "op": "provider_lifecycle",
+                "intent": intent,
+                "sig": signature,
+            },
+        })
+    }
+
+    #[test]
+    fn provider_activation_leave_scope_blocks_only_matching_reactivation() {
+        let provider = "11".repeat(32);
+        let other_provider = "22".repeat(32);
+        let enclave = "33".repeat(32);
+        let other_enclave = "44".repeat(32);
+        let room = "55".repeat(16);
+        let other_room = "66".repeat(16);
+        let entry = |op, provider: &str, enclave_id: &str, room_id: Option<&str>| {
+            SignedProviderLeaveOutboxEntry {
+                path: PathBuf::from("pending.json"),
+                feature: Value::Null,
+                op,
+                provider: provider.to_owned(),
+                enclave_id: enclave_id.to_owned(),
+                room_id: room_id.map(str::to_owned),
+                state_key: "state".to_owned(),
+            }
+        };
+        let selected_room_scope = ProviderActivationLeaveScope {
+            provider: Some(provider.clone()),
+            enclave_id: enclave.clone(),
+            room_ids: Some([room.clone()].into_iter().collect()),
+        };
+
+        assert!(selected_room_scope.matches(&entry(
+            ProviderLeaveOp::Room,
+            &provider,
+            &enclave,
+            Some(&room),
+        )));
+        assert!(selected_room_scope.matches(&entry(
+            ProviderLeaveOp::Enclave,
+            &provider,
+            &enclave,
+            None,
+        )));
+        assert!(!selected_room_scope.matches(&entry(
+            ProviderLeaveOp::Room,
+            &provider,
+            &enclave,
+            Some(&other_room),
+        )));
+        assert!(!selected_room_scope.matches(&entry(
+            ProviderLeaveOp::Room,
+            &other_provider,
+            &enclave,
+            Some(&room),
+        )));
+        assert!(!selected_room_scope.matches(&entry(
+            ProviderLeaveOp::Room,
+            &provider,
+            &other_enclave,
+            Some(&room),
+        )));
+
+        let worker_scope = ProviderActivationLeaveScope {
+            provider: None,
+            enclave_id: enclave.clone(),
+            room_ids: None,
+        };
+        assert!(worker_scope.matches(&entry(
+            ProviderLeaveOp::Room,
+            &other_provider,
+            &enclave,
+            Some(&other_room),
+        )));
+        assert!(worker_scope.matches(&entry(
+            ProviderLeaveOp::Enclave,
+            &other_provider,
+            &enclave,
+            None,
+        )));
+    }
+
+    #[test]
+    fn provider_leave_outbox_validates_strictly_orders_and_retains_until_confirmed() {
+        let home = test_temp_dir("mayhem-provider-leave-outbox");
+        let signing_key = SigningKey::from_bytes(&[41_u8; 32]);
+        let provider = hex_encode(&signing_key.verifying_key().to_bytes());
+        let enclave = "22".repeat(32);
+        let room = "33".repeat(16);
+        let enclave_feature = test_signed_provider_leave_feature(
+            &signing_key,
+            ProviderLeaveOp::Enclave,
+            &enclave,
+            None,
+        );
+        let room_feature = test_signed_provider_leave_feature(
+            &signing_key,
+            ProviderLeaveOp::Room,
+            &enclave,
+            Some(&room),
+        );
+
+        let enclave_entry =
+            persist_provider_leave_outbox_feature(&home, &enclave_feature, &provider).unwrap();
+        let room_entry =
+            persist_provider_leave_outbox_feature(&home, &room_feature, &provider).unwrap();
+        let replay = load_provider_leave_outbox(&home).unwrap();
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].op, ProviderLeaveOp::Room);
+        assert_eq!(replay[1].op, ProviderLeaveOp::Enclave);
+
+        assert!(!finalize_provider_leave_outbox_entry(
+            &room_entry,
+            ProviderLeaveDeliveryStatus::Accepted,
+        )
+        .unwrap());
+        assert!(room_entry.path.exists());
+        assert!(finalize_provider_leave_outbox_entry(
+            &room_entry,
+            ProviderLeaveDeliveryStatus::Confirmed,
+        )
+        .unwrap());
+        assert!(!room_entry.path.exists());
+        assert!(enclave_entry.path.exists());
+        assert!(!provider_leave_state_is_confirmed(&enclave_entry, &Value::Null).unwrap());
+        assert!(provider_leave_state_is_confirmed(
+            &enclave_entry,
+            &json!({
+                "provider": provider,
+                "enclave_id": enclave,
+                "status": "active",
+            }),
+        )
+        .is_ok_and(|confirmed| !confirmed));
+        assert!(provider_leave_state_is_confirmed(
+            &enclave_entry,
+            &json!({
+                "provider": provider,
+                "enclave_id": enclave,
+                "status": "inactive",
+            }),
+        )
+        .unwrap());
+        assert!(provider_leave_state_is_confirmed(
+            &enclave_entry,
+            &json!({
+                "provider": provider,
+                "enclave_id": enclave,
+            }),
+        )
+        .is_err());
+        assert!(provider_leave_state_is_confirmed(
+            &enclave_entry,
+            &json!({
+                "provider": "44".repeat(32),
+                "enclave_id": enclave,
+                "status": "inactive",
+            }),
+        )
+        .is_err());
+        assert!(provider_leave_state_is_confirmed(
+            &room_entry,
+            &json!({
+                "provider": provider,
+                "enclave_id": enclave,
+                "room_id": room,
+                "status": "inactive",
+            }),
+        )
+        .unwrap());
+        assert!(provider_leave_state_is_confirmed(
+            &room_entry,
+            &json!({
+                "provider": provider,
+                "enclave_id": enclave,
+                "room_id": "55".repeat(16),
+                "status": "inactive",
+            }),
+        )
+        .is_err());
+        assert!(enclave_entry.path.exists());
+
+        let valid_path = provider_leave_outbox_path(&home, &enclave_feature).unwrap();
+        let valid_document = json!({
+            "schema_version": PROVIDER_LEAVE_OUTBOX_SCHEMA_VERSION,
+            "feature": enclave_feature,
+        });
+        let valid_bytes = serde_json::to_vec(&valid_document).unwrap();
+        validate_provider_leave_outbox_document(&valid_path, &valid_bytes, Some(&provider))
+            .unwrap();
+
+        let mut tampered = valid_document.clone();
+        tampered["schema_version"] = json!(2);
+        assert!(validate_provider_leave_outbox_document(
+            &valid_path,
+            &serde_json::to_vec(&tampered).unwrap(),
+            Some(&provider),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("schema_version"));
+
+        let mut tampered = valid_document.clone();
+        tampered["feature"]["feature"] = json!("other");
+        assert!(validate_provider_leave_outbox_document(
+            &valid_path,
+            &serde_json::to_vec(&tampered).unwrap(),
+            Some(&provider),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("must be mayhem"));
+
+        let mut tampered = valid_document.clone();
+        tampered["feature"]["key"] = json!(format!(
+            "intent/provider/{}/leave_enclave/{}",
+            provider,
+            "00".repeat(32)
+        ));
+        assert!(validate_provider_leave_outbox_document(
+            &valid_path,
+            &serde_json::to_vec(&tampered).unwrap(),
+            Some(&provider),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("key"));
+
+        let mut tampered = valid_document.clone();
+        tampered["feature"]["value"]["op"] = json!("other");
+        assert!(validate_provider_leave_outbox_document(
+            &valid_path,
+            &serde_json::to_vec(&tampered).unwrap(),
+            Some(&provider),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("provider_lifecycle"));
+
+        let mut tampered = valid_document.clone();
+        tampered["feature"]["value"]["intent"]["provider"] = json!("44".repeat(32));
+        assert!(validate_provider_leave_outbox_document(
+            &valid_path,
+            &serde_json::to_vec(&tampered).unwrap(),
+            Some(&provider),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("different provider"));
+
+        let mut tampered = valid_document.clone();
+        tampered["feature"]["value"]["sig"] = json!("00".repeat(64));
+        assert!(validate_provider_leave_outbox_document(
+            &valid_path,
+            &serde_json::to_vec(&tampered).unwrap(),
+            Some(&provider),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("signature failed"));
+
+        let oversized = vec![b' '; PROVIDER_LEAVE_OUTBOX_MAX_ENTRY_BYTES as usize + 1];
+        assert!(
+            validate_provider_leave_outbox_document(&valid_path, &oversized, Some(&provider),)
+                .unwrap_err()
+                .to_string()
+                .contains("must be between")
+        );
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_leave_outbox_rejects_symlink_entries_and_directory() {
+        use std::os::unix::fs::symlink;
+
+        let home = test_temp_dir("mayhem-provider-leave-outbox-symlink");
+        let signing_key = SigningKey::from_bytes(&[42_u8; 32]);
+        let feature = test_signed_provider_leave_feature(
+            &signing_key,
+            ProviderLeaveOp::Enclave,
+            &"22".repeat(32),
+            None,
+        );
+        let outbox = provider_leave_outbox_dir(&home);
+        fs::create_dir_all(&outbox).unwrap();
+        let entry_path = provider_leave_outbox_path(&home, &feature).unwrap();
+        let real_entry = home.join("real-entry.json");
+        write_json_file(
+            &real_entry,
+            &json!({
+                "schema_version": PROVIDER_LEAVE_OUTBOX_SCHEMA_VERSION,
+                "feature": feature,
+            }),
+        )
+        .unwrap();
+        symlink(&real_entry, &entry_path).unwrap();
+        assert!(load_provider_leave_outbox(&home)
+            .unwrap_err()
+            .to_string()
+            .contains("not a symlink"));
+
+        fs::remove_file(&entry_path).unwrap();
+        fs::remove_dir(&outbox).unwrap();
+        let real_directory = home.join("real-outbox");
+        fs::create_dir(&real_directory).unwrap();
+        symlink(&real_directory, &outbox).unwrap();
+        assert!(load_provider_leave_outbox(&home)
+            .unwrap_err()
+            .to_string()
+            .contains("real directory"));
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_leave_replay_has_one_total_budget_and_provider_start_fails_closed() {
+        let home = test_temp_dir("mayhem-provider-leave-replay-budget");
+        let signing_key = SigningKey::from_bytes(&[43_u8; 32]);
+        let provider = hex_encode(&signing_key.verifying_key().to_bytes());
+        let feature = test_signed_provider_leave_feature(
+            &signing_key,
+            ProviderLeaveOp::Enclave,
+            &"22".repeat(32),
+            None,
+        );
+        persist_provider_leave_outbox_feature(&home, &feature, &provider).unwrap();
+
+        let matching_scope = ProviderActivationLeaveScope {
+            provider: Some(provider.clone()),
+            enclave_id: "22".repeat(32),
+            room_ids: Some(BTreeSet::new()),
+        };
+        let offline_rpc = PeerRpcClient::new("http://127.0.0.1:9/v1").unwrap();
+        let simulated =
+            replay_provider_leaves_before_activation(&home, &offline_rpc, &matching_scope, true)
+                .await
+                .unwrap();
+        assert_eq!(simulated["sim"], true);
+        assert_eq!(simulated["replay_attempted"], false);
+        assert_eq!(load_provider_leave_outbox(&home).unwrap().len(), 1);
+
+        let unrelated_scope = ProviderActivationLeaveScope {
+            provider: Some(provider.clone()),
+            enclave_id: "33".repeat(32),
+            room_ids: None,
+        };
+        let unrelated = flush_provider_leave_outbox_scope_with_budget(
+            &home,
+            &offline_rpc,
+            Duration::from_millis(50),
+            Some(&unrelated_scope),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unrelated["ok"], true);
+        assert_eq!(unrelated["pending"], 0);
+        assert_eq!(unrelated["remaining"], 0);
+        assert_eq!(load_provider_leave_outbox(&home).unwrap().len(), 1);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(200));
+        });
+        let rpc = PeerRpcClient::new(format!("http://{address}/v1")).unwrap();
+        let started = Instant::now();
+        let report =
+            flush_provider_leave_outbox_with_budget(&home, &rpc, Duration::from_millis(50))
+                .await
+                .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["budget_exhausted"], true);
+        assert_eq!(report["remaining"], 1);
+        assert_eq!(report["retained"].as_array().unwrap().len(), 1);
+        assert!(enforce_provider_leave_replay_before_worker_start(false, &report).is_ok());
+        assert!(enforce_provider_leave_replay_before_worker_start(true, &report).is_err());
+        assert_eq!(load_provider_leave_outbox(&home).unwrap().len(), 1);
+
+        server.join().unwrap();
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn provider_drain_completion_is_bound_to_the_observed_request() {
+        let home = test_temp_dir("mayhem-provider-drain-completion");
+        let provider = "11".repeat(32);
+        let enclave = "22".repeat(32);
+        let request_id = "33".repeat(32);
+        let path = provider_drain_flag_path(&home, &provider, Some(&enclave));
+        write_provider_drain_request(&path, &provider, Some(&enclave), &request_id).unwrap();
+
+        let request =
+            provider_drain_request(&provider_drain_flag_paths(&home, &provider, &enclave))
+                .unwrap()
+                .unwrap();
+        assert_eq!(request.request_id.as_deref(), Some(request_id.as_str()));
+        let completed =
+            complete_provider_drain_request(&home, &provider, &enclave, &request).unwrap();
+        let completion = read_json_file(Path::new(completed["path"].as_str().unwrap())).unwrap();
+        assert_eq!(completion["request_id"].as_str(), Some(request_id.as_str()));
+        assert_eq!(completion["enclave_id"].as_str(), Some(enclave.as_str()));
+        let stack_completions =
+            completed_provider_stack_drains(&home, &provider, &request_id).unwrap();
+        assert_eq!(stack_completions.len(), 1);
+        assert_eq!(
+            stack_completions[0]["completion"]["enclave_id"].as_str(),
+            Some(enclave.as_str())
+        );
+        assert!(
+            completed_provider_stack_drains(&home, &provider, &"44".repeat(32))
+                .unwrap()
+                .is_empty()
+        );
+
+        let worker = SupervisedProviderWorker {
+            name: "provider-test".to_owned(),
+            enclave_id: enclave,
+            running: false,
+            pid: None,
+        };
+        let stale = json!({
+            "request_id": "44".repeat(32),
+            "path": path,
+        });
+        assert!(clear_completed_provider_drain_request(&home, &provider, &worker, &stale).is_err());
+        assert!(path.exists());
+        assert!(Path::new(completed["path"].as_str().unwrap()).exists());
+
+        let matching = json!({
+            "request_id": request_id,
+            "path": path,
+        });
+        clear_completed_provider_drain_request(&home, &provider, &worker, &matching).unwrap();
+        assert!(!path.exists());
+        assert!(!Path::new(completed["path"].as_str().unwrap()).exists());
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn provider_drain_reuses_active_request_and_accepts_late_completion() {
+        let home = test_temp_dir("mayhem-provider-drain-request-reuse");
+        let provider = "11".repeat(32);
+        let enclave = "22".repeat(32);
+        let first_id = "33".repeat(32);
+        let replacement_id = "44".repeat(32);
+        let path = provider_drain_flag_path(&home, &provider, Some(&enclave));
+
+        let (first, reused) =
+            ensure_provider_drain_request(&path, &provider, Some(&enclave), &first_id).unwrap();
+        assert!(!reused);
+        let (active, reused) =
+            ensure_provider_drain_request(&path, &provider, Some(&enclave), &replacement_id)
+                .unwrap();
+        assert!(reused);
+        assert_eq!(active.request_id.as_deref(), Some(first_id.as_str()));
+
+        let completion =
+            complete_provider_drain_request(&home, &provider, &enclave, &first).unwrap();
+        let completion = read_json_file(Path::new(completion["path"].as_str().unwrap())).unwrap();
+        assert_eq!(completion["request_id"].as_str(), Some(first_id.as_str()));
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn provider_global_drain_cleanup_preserves_scoped_requests_and_reports() {
+        let home = test_temp_dir("mayhem-provider-global-drain-cleanup");
+        let provider = "11".repeat(32);
+        let global_enclave = "22".repeat(32);
+        let scoped_enclave = "33".repeat(32);
+        let global_id = "44".repeat(32);
+        let scoped_id = "55".repeat(32);
+        let global_path = provider_drain_flag_path(&home, &provider, None);
+        let scoped_path = provider_drain_flag_path(&home, &provider, Some(&scoped_enclave));
+        let (global, _) =
+            ensure_provider_drain_request(&global_path, &provider, None, &global_id).unwrap();
+        let (scoped, _) = ensure_provider_drain_request(
+            &scoped_path,
+            &provider,
+            Some(&scoped_enclave),
+            &scoped_id,
+        )
+        .unwrap();
+        let global_completion =
+            complete_provider_drain_request(&home, &provider, &global_enclave, &global).unwrap();
+        let scoped_completion =
+            complete_provider_drain_request(&home, &provider, &scoped_enclave, &scoped).unwrap();
+
+        let cleanup = clear_stopped_global_provider_drain_requests(&home).unwrap();
+        assert_eq!(cleanup["cleared"].as_array().unwrap().len(), 1);
+        assert!(!global_path.exists());
+        assert!(!Path::new(global_completion["path"].as_str().unwrap()).exists());
+        assert!(scoped_path.exists());
+        assert!(Path::new(scoped_completion["path"].as_str().unwrap()).exists());
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn provider_serve_child_inherits_sc_bridge_token_without_argv_exposure() {
         let home = test_temp_dir("provider-child-secret-channel");
         let config = toml::from_str::<toml::Value>(
@@ -67736,6 +75653,7 @@ mod tests {
             kind: HardwareQuoteKind::Tpm2QuoteEk,
             command: PathBuf::from(r"C:\mayhem\scripts\mayhem-tpm2-quote-windows.ps1"),
             timeout: Duration::from_secs(90),
+            tpm_state_dir: Some(PathBuf::from(r"C:\mayhem\attestation\tpm2-provider")),
         };
         let mut args = vec!["provider".to_owned(), "start".to_owned()];
 
@@ -68148,17 +76066,17 @@ mod tests {
     }
 
     #[test]
-    fn setup_notice_keeps_provider_payout_targets_admin_set() {
+    fn setup_notice_exposes_self_service_crypto_payouts() {
         assert_eq!(
             setup_admin_payout_notice("provider"),
             Some(
-                "Provider payout target: admin-set later; setup does not set provider payout terms."
+                "Provider payouts: use 'mayhem provider payout set' for TAP/TNK; Stripe remains Connect-verification gated."
             )
         );
         assert_eq!(
             setup_admin_payout_notice("both"),
             Some(
-                "Provider payout target: admin-set later; setup does not set provider payout terms."
+                "Provider payouts: use 'mayhem provider payout set' for TAP/TNK; Stripe remains Connect-verification gated."
             )
         );
         assert_eq!(setup_admin_payout_notice("user"), None);
@@ -68696,6 +76614,43 @@ mod tests {
         assert_eq!(claimed, 123);
         assert!(live_path.exists());
         assert!(!dead_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_liveness_rejects_unrepresentable_unix_pids() {
+        assert_eq!(unix_process_id(0), None);
+        assert_eq!(unix_process_id(i32::MAX as u32), Some(i32::MAX));
+        assert_eq!(unix_process_id(i32::MAX as u32 + 1), None);
+        assert_eq!(unix_process_id(u32::MAX), None);
+        assert!(!process_is_running(u32::MAX));
+        assert!(!send_process_signal(u32::MAX, false).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_liveness_treats_linux_zombies_as_stopped() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived child");
+        let pid = child.id();
+        let pid = i32::try_from(pid).expect("Linux child pid fits pid_t");
+
+        for _ in 0..100 {
+            if linux_process_state(pid) == Some(b'Z') {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            linux_process_state(pid),
+            Some(b'Z'),
+            "short-lived child should remain a zombie until it is reaped"
+        );
+        assert!(!process_is_running(pid as u32));
+
+        child.wait().expect("reap short-lived child");
     }
 
     #[test]
@@ -69328,6 +77283,202 @@ mod tests {
     }
 
     #[test]
+    fn tpm_state_is_stable_and_scoped_to_provider_identity() {
+        let home = test_temp_dir("mayhem-tpm-state-binding");
+        let mut first = ProviderHardwareQuoteConfig {
+            kind: HardwareQuoteKind::Tpm2QuoteEk,
+            command: PathBuf::from("mayhem-tpm2-quote"),
+            timeout: Duration::from_secs(30),
+            tpm_state_dir: None,
+        };
+        let mut same_provider = first.clone();
+        let mut other_provider = first.clone();
+
+        bind_provider_tpm_state_dir(Some(&mut first), &home, &"11".repeat(32)).unwrap();
+        bind_provider_tpm_state_dir(Some(&mut same_provider), &home, &"11".repeat(32)).unwrap();
+        bind_provider_tpm_state_dir(Some(&mut other_provider), &home, &"22".repeat(32)).unwrap();
+
+        assert_eq!(first.tpm_state_dir, same_provider.tpm_state_dir);
+        assert_ne!(first.tpm_state_dir, other_provider.tpm_state_dir);
+        assert!(first
+            .tpm_state_dir
+            .as_ref()
+            .unwrap()
+            .starts_with(home.join("attestation").join("tpm2-provider")));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn tpm_activation_rate_limit_is_global_per_peer_and_time_bounded() {
+        let mut limiter = ProviderTpmActivationLimiter {
+            global_limit: 3,
+            per_peer_limit: 2,
+            accepted_at: VecDeque::new(),
+            accepted_by_peer: HashMap::new(),
+        };
+        let started = Instant::now();
+
+        limiter.admit("peer-a", started).unwrap();
+        limiter.admit("peer-a", started).unwrap();
+        let peer_error = limiter.admit("peer-a", started).unwrap_err();
+        assert!(peer_error.to_string().contains("per-peer"));
+
+        limiter.admit("peer-b", started).unwrap();
+        let global_error = limiter.admit("peer-c", started).unwrap_err();
+        assert!(global_error.to_string().contains("global"));
+
+        let next_window = started + Duration::from_secs(60);
+        limiter.admit("peer-a", next_window).unwrap();
+        assert_eq!(limiter.accepted_at.len(), 1);
+        assert_eq!(limiter.accepted_by_peer["peer-a"].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_helper_output_reader_is_strictly_bounded() {
+        let mut within_limit = &b"abcd"[..];
+        assert_eq!(
+            read_bounded_provider_helper_stream(&mut within_limit, 4)
+                .await
+                .unwrap(),
+            b"abcd"
+        );
+
+        let mut over_limit = &b"abcde"[..];
+        let error = read_bounded_provider_helper_stream(&mut over_limit, 4)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeds 4 bytes"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tpm_provider_helper_uses_typed_quote_and_activation_contract() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = test_temp_dir("mayhem-tpm-provider-helper");
+        let helper = temp.join("tpm-helper.sh");
+        let state_dir = temp.join("state");
+        let calls_path = temp.join("calls.log");
+        let challenge_path = temp.join("challenge.json");
+        fs::create_dir_all(&state_dir).unwrap();
+        let device_key = "ab".repeat(32);
+        let challenge_id = "cd".repeat(32);
+        let quote_binding = "ef".repeat(32);
+        let helper_source = r#"#!/bin/sh
+printf '%s|%s|%s\n' "$1" "$MAYHEM_TPM2_STATE_DIR" "$MAYHEM_TPM2_QUOTE_EXTRA_DATA" >> '__CALLS__'
+case "$1" in
+  quote)
+    test "$MAYHEM_TPM2_QUOTE_EXTRA_DATA" = "$MAYHEM_HW_QUOTE_EVIDENCE_BINDING" || exit 71
+    printf '{"hardware_quote":{"kind":"tpm2_quote_ek","evidence":"fixture TPM quote","binding":"%s","endorsements":["Y2VydA=="],"metadata":null},"device_key":"__DEVICE_KEY__","tpm_activate_credential_hello":{"schema_version":1,"ek_profile":"rsa_sha256_aes128_cfb","ek_public_spki_der_b64":"c3BraQ==","ak_name_b64":"YWstbmFtZQ==","quote_binding":"%s"}}\n' "$MAYHEM_HW_QUOTE_BINDING" "$MAYHEM_HW_QUOTE_BINDING"
+    ;;
+  activate_credential)
+    cat > '__CHALLENGE__'
+    printf '{"schema_version":1,"challenge_id":"__CHALLENGE_ID__","ak_name_b64":"YWstbmFtZQ==","quote_binding":"__QUOTE_BINDING__","activated_secret_b64":"YWN0aXZhdGVk"}\n'
+    ;;
+  *)
+    exit 72
+    ;;
+esac
+"#
+        .replace("__CALLS__", &calls_path.display().to_string())
+        .replace("__CHALLENGE__", &challenge_path.display().to_string())
+        .replace("__DEVICE_KEY__", &device_key)
+        .replace("__CHALLENGE_ID__", &challenge_id)
+        .replace("__QUOTE_BINDING__", &quote_binding);
+        fs::write(&helper, helper_source).unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let binary_path = std::env::current_exe().unwrap();
+        let identity = CatalogEnclaveIdentity {
+            admin_pubkey: "11".repeat(32),
+            model_id: "test/model@tpm".to_owned(),
+            artifact_root: "22".repeat(32),
+            artifact_sidecar_roots: BTreeMap::new(),
+            manifest_hash: "33".repeat(32),
+            binary_hash: measure_binary(&binary_path).unwrap(),
+        };
+        let runtime_keypair = RuntimeKeypair::from_seed([9; 32]);
+        let runtime_config = AttestationRuntimeConfig {
+            model_class: DEFAULT_MODEL_CLASS.to_owned(),
+            backend: "llama.cpp".to_owned(),
+            ctx: 8192,
+            tp_degree: 1,
+            max_batch_size: None,
+            max_num_tokens: None,
+        };
+        let config = ProviderHardwareQuoteConfig {
+            kind: HardwareQuoteKind::Tpm2QuoteEk,
+            command: helper.clone(),
+            timeout: Duration::from_secs(30),
+            tpm_state_dir: Some(state_dir.clone()),
+        };
+        let quote = collect_provider_hardware_quote(
+            &config,
+            &identity,
+            &runtime_keypair,
+            [7; 32],
+            &binary_path,
+            None,
+            1,
+            unix_epoch_seconds().unwrap(),
+            &"44".repeat(32),
+            &runtime_config,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(quote.device_key.as_deref(), Some(device_key.as_str()));
+        assert_eq!(
+            quote
+                .tpm_activation_hello
+                .as_ref()
+                .map(|hello| hello.quote_binding.as_str()),
+            Some(quote.quote.binding.as_str())
+        );
+
+        let now = unix_epoch_seconds().unwrap();
+        let challenge = mayhem_proto::TpmActivateCredentialChallenge {
+            schema_version: mayhem_proto::TPM_ACTIVATE_CREDENTIAL_SCHEMA_VERSION,
+            challenge_id: challenge_id.clone(),
+            ek_public_sha256: device_key,
+            ak_name_b64: "YWstbmFtZQ==".to_owned(),
+            quote_binding: quote_binding.clone(),
+            credential_blob_b64: "Y3JlZGVudGlhbA==".to_owned(),
+            encrypted_secret_b64: "c2VjcmV0".to_owned(),
+            issued_at_unix: now.saturating_sub(1),
+            expires_at_unix: now.saturating_add(30),
+        };
+        let response = run_provider_tpm_activation_command(&config, &challenge)
+            .await
+            .unwrap();
+        assert_eq!(response.challenge_id, challenge_id);
+        assert_eq!(response.quote_binding, quote_binding);
+        assert_eq!(
+            serde_json::from_slice::<mayhem_proto::TpmActivateCredentialChallenge>(
+                &fs::read(&challenge_path).unwrap()
+            )
+            .unwrap(),
+            challenge
+        );
+
+        let calls = fs::read_to_string(&calls_path).unwrap();
+        let mut calls = calls.lines();
+        let quote_call = calls.next().unwrap().split('|').collect::<Vec<_>>();
+        assert_eq!(quote_call[0], "quote");
+        assert_eq!(quote_call[1], state_dir.display().to_string());
+        assert_eq!(quote_call[2], quote.quote.binding);
+        let activation_call = calls.next().unwrap().split('|').collect::<Vec<_>>();
+        let state_dir_text = state_dir.display().to_string();
+        assert_eq!(
+            activation_call,
+            ["activate_credential", &state_dir_text, ""]
+        );
+        assert!(calls.next().is_none());
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn windows_powershell_quote_helpers_need_no_wrapper_script() {
         let helper = Path::new(r"C:\mayhem\scripts\mayhem-tpm2-quote-windows.ps1");
         let (program, args) = provider_hardware_quote_invocation(helper, true);
@@ -69370,46 +77521,88 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(quote.binding, "binding-1");
-        assert_eq!(quote.metadata["platform_id"], "azure-ncc");
-        assert_eq!(quote.metadata["region"], "centralus");
-        assert_eq!(quote.metadata["snp"]["chip_id"], "chip-123");
-        assert_eq!(quote.metadata["gpu"]["model"], "H100");
+        assert_eq!(quote.quote.binding, "binding-1");
+        assert_eq!(quote.quote.metadata["platform_id"], "azure-ncc");
+        assert_eq!(quote.quote.metadata["region"], "centralus");
+        assert_eq!(quote.quote.metadata["snp"]["chip_id"], "chip-123");
+        assert_eq!(quote.quote.metadata["gpu"]["model"], "H100");
     }
 
     #[test]
-    fn provider_quote_parser_carries_tpm_ek_device_key_metadata() {
+    fn provider_quote_parser_preserves_typed_tpm_identity_material() {
         let device_key = "AA".repeat(32);
-        let quote = parse_hardware_quote_command_output(
+        let material = parse_hardware_quote_command_output(
             &HardwareQuoteKind::Tpm2QuoteEk,
             "binding-1",
             &format!(
                 r#"{{
-                  "kind":"tpm2_quote_ek",
-                  "evidence":"raw tpm quote",
-                  "tpm_ek_sha256":"{device_key}"
+                  "hardware_quote":{{
+                    "kind":"tpm2_quote_ek",
+                    "evidence":"raw tpm quote",
+                    "binding":"binding-1",
+                    "endorsements":["Y2VydA=="],
+                    "metadata":null
+                  }},
+                  "device_key":"{device_key}",
+                  "tpm_activate_credential_hello":{{
+                    "schema_version":1,
+                    "ek_profile":"rsa_sha256_aes128_cfb",
+                    "ek_public_spki_der_b64":"c3BraQ==",
+                    "ak_name_b64":"YWstbmFtZQ==",
+                    "quote_binding":"binding-1"
+                  }}
                 }}"#
             ),
         )
         .unwrap();
 
-        assert_eq!(quote.binding, "binding-1");
-        assert_eq!(quote.metadata["device_key"], "aa".repeat(32));
-        assert_eq!(quote.metadata["tpm"]["ek_sha256"], "aa".repeat(32));
+        assert_eq!(material.quote.binding, "binding-1");
+        assert!(material.quote.metadata.is_null());
+        assert_eq!(material.device_key, Some("aa".repeat(32)));
         assert_eq!(
-            hardware_quote_device_key(&quote).unwrap(),
-            Some("aa".repeat(32))
+            material
+                .tpm_activation_hello
+                .as_ref()
+                .map(|hello| hello.quote_binding.as_str()),
+            Some("binding-1")
         );
     }
 
     #[test]
-    fn tpm_provider_quote_requires_device_key_for_contract_ban_anchor() {
-        let quote = HardwareQuote {
-            kind: HardwareQuoteKind::Tpm2QuoteEk,
-            evidence: "raw tpm quote".to_owned(),
-            binding: "binding-1".to_owned(),
-            endorsements: Vec::new(),
-            metadata: json!({}),
+    fn typed_tpm_provider_quote_requires_device_key_for_contract_ban_anchor() {
+        let err = parse_hardware_quote_command_output(
+            &HardwareQuoteKind::Tpm2QuoteEk,
+            "binding-1",
+            r#"{
+              "hardware_quote":{
+                "kind":"tpm2_quote_ek",
+                "evidence":"raw tpm quote",
+                "binding":"binding-1",
+                "endorsements":["Y2VydA=="],
+                "metadata":null
+              },
+              "tpm_activate_credential_hello":{
+                "schema_version":1,
+                "ek_profile":"rsa_sha256_aes128_cfb",
+                "ek_public_spki_der_b64":"c3BraQ==",
+                "ak_name_b64":"YWstbmFtZQ==",
+                "quote_binding":"binding-1"
+              }
+            }"#,
+        )
+        .expect_err("TPM quote must expose EK-derived device key");
+
+        assert!(err.to_string().contains("device_key"));
+    }
+
+    #[test]
+    fn signed_provider_heartbeat_projects_tpm_activation_hello() {
+        let hello = mayhem_proto::TpmActivateCredentialHello {
+            schema_version: mayhem_proto::TPM_ACTIVATE_CREDENTIAL_SCHEMA_VERSION,
+            ek_profile: mayhem_proto::TpmEkProfile::RsaSha256Aes128Cfb,
+            ek_public_spki_der_b64: "c3BraQ==".to_owned(),
+            ak_name_b64: "YWstbmFtZQ==".to_owned(),
+            quote_binding: "aa".repeat(32),
         };
         let attestation = Tier1AttestationReport {
             report: mayhem_proto::AttestationReport {
@@ -69421,7 +77614,13 @@ mod tests {
                 manifest_hash: "44".repeat(32),
                 binary_hash: "55".repeat(32),
                 att_tier: mayhem_proto::TIER2_DEVICE_IDENTITY_TIER,
-                hw_quote: Some(quote),
+                hw_quote: Some(HardwareQuote {
+                    kind: HardwareQuoteKind::Tpm2QuoteEk,
+                    evidence: "{}".to_owned(),
+                    binding: hello.quote_binding.clone(),
+                    endorsements: vec!["Y2VydA==".to_owned()],
+                    metadata: Value::Null,
+                }),
                 boot_epoch: 1,
                 report_ts: 2,
                 nonce_u: "66".repeat(32),
@@ -69431,11 +77630,20 @@ mod tests {
             },
             report_head: "99".repeat(32),
         };
+        let mut heartbeat = json!({
+            "att": {
+                "epoch": 1,
+                "head": attestation.report_head,
+            }
+        });
 
-        let err = provider_attestation_device_key(&attestation)
-            .expect_err("TPM quote must expose EK-derived device key");
+        project_provider_heartbeat_attestation(&mut heartbeat, &attestation, Some(&hello)).unwrap();
 
-        assert!(err.to_string().contains("must return device_key"));
+        assert_eq!(heartbeat["att"]["quote_kind"], "tpm2_quote_ek");
+        assert_eq!(
+            heartbeat["att"]["tpm_activation_hello"],
+            serde_json::to_value(hello).unwrap()
+        );
     }
 
     #[test]
@@ -69693,6 +77901,49 @@ mod tests {
     }
 
     #[test]
+    fn gateway_routes_require_active_verified_payout_rails_at_billing_epoch() {
+        let root = "aa".repeat(32);
+        let provider = "55".repeat(32);
+        let old_revision = "11".repeat(32);
+        let new_revision = "22".repeat(32);
+        let pointer = json!({
+            "current_revision": old_revision,
+            "pending_revision": new_revision,
+            "pending_activation_epoch": 9,
+        });
+        assert_eq!(
+            payout_pointer_revision_at_epoch(&pointer, 8),
+            pointer["current_revision"].as_str()
+        );
+        assert_eq!(
+            payout_pointer_revision_at_epoch(&pointer, 9),
+            pointer["pending_revision"].as_str()
+        );
+
+        let mut contract = test_contract(&root);
+        contract.active_payout_revisions.clear();
+        let models = gateway_models_from_contract(&contract).unwrap();
+        assert_eq!(contract.providers[0].accepted_rails, vec!["fiat"]);
+        assert!(models[0].mayhem.route_candidates.is_empty());
+        assert_eq!(models[0].mayhem.providers_online, 0);
+        assert_eq!(
+            models[0].mayhem.markets[0].availability,
+            "no_eligible_provider_yet"
+        );
+
+        contract.active_payout_revisions.insert(
+            provider,
+            BTreeMap::from([("fiat".to_owned(), old_revision)]),
+        );
+        let models = gateway_models_from_contract(&contract).unwrap();
+        assert_eq!(models[0].mayhem.route_candidates.len(), 1);
+        assert_eq!(
+            models[0].mayhem.route_candidates[0].accepted_rails,
+            vec!["fiat"]
+        );
+    }
+
+    #[test]
     fn gateway_model_version_gates_use_signed_catalog_requirements() {
         let root = "aa".repeat(32);
         let contract = test_contract(&root);
@@ -69740,6 +77991,17 @@ mod tests {
             status: "active".to_owned(),
             accepted_rails: vec!["tap".to_owned()],
         });
+        contract.active_payout_revisions.insert(
+            second_provider.clone(),
+            BTreeMap::from([
+                ("fiat".to_owned(), "16".repeat(32)),
+                ("tnk".to_owned(), "17".repeat(32)),
+            ]),
+        );
+        contract.active_payout_revisions.insert(
+            third_provider.clone(),
+            BTreeMap::from([("tap".to_owned(), "18".repeat(32))]),
+        );
 
         contract.roomserve.push(LedgerRoomServe {
             room_id: "aa".repeat(16),
@@ -69872,6 +78134,10 @@ mod tests {
             status: "active".to_owned(),
             accepted_rails: vec!["fiat".to_owned()],
         });
+        contract.active_payout_revisions.insert(
+            second_provider.clone(),
+            BTreeMap::from([("fiat".to_owned(), "16".repeat(32))]),
+        );
 
         let mut tier3_enclave = contract.enclaves[0].clone();
         tier3_enclave.enclave_id = tier3_enclave_id.clone();
@@ -70378,6 +78644,32 @@ mod tests {
             &terms
         ));
 
+        let activation_event = json!({
+            "type": "session_frame",
+            "session_id": "bb".repeat(32),
+            "remote": "22".repeat(32),
+            "frame": {
+                "t": TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
+                "v": TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
+                "session_id": "bb".repeat(32),
+                "provider": terms.provider,
+                "enclave_id": terms.enclave_id,
+                "room_id": terms.room_ids[0],
+            },
+        });
+        assert!(provider_session_event_belongs_to_process(
+            &activation_event,
+            &sessions,
+            &terms
+        ));
+        let mut other_provider_activation = activation_event.clone();
+        other_provider_activation["frame"]["provider"] = json!("44".repeat(32));
+        assert!(!provider_session_event_belongs_to_process(
+            &other_provider_activation,
+            &sessions,
+            &terms
+        ));
+
         for frame_type in [
             "s.accept",
             "s.reject",
@@ -70481,10 +78773,19 @@ mod tests {
     fn provider_session_spend_reservation_feature_is_contract_shaped() {
         let terms = test_provider_session_terms();
         let frame = test_session_open_frame(&terms);
-        let value =
-            provider_session_spend_reservation_value(&terms, &frame, "fiat", 7, 25_200).unwrap();
+        let payout_revision = "11".repeat(32);
+        let value = provider_session_spend_reservation_value(
+            &terms,
+            &frame,
+            "fiat",
+            7,
+            25_200,
+            &payout_revision,
+        )
+        .unwrap();
 
-        assert_eq!(value["op"], "spend_reserve");
+        assert_eq!(value["op"], "spend_reserve_targeted");
+        assert_eq!(value["payout_revision"], payout_revision);
         assert_eq!(value["contract_version"], CONTRACT_VERSION);
         assert_eq!(value["epoch"], 7);
         assert_eq!(value["at"], 25_200);
@@ -70495,8 +78796,9 @@ mod tests {
         assert_eq!(value["max_spend_au"], "1000");
         assert_eq!(value["provider_sig"], "");
 
-        let message = spend_reservation_message(&value);
-        assert!(message.starts_with("mayhem-spend-reservation-v1"));
+        let message = targeted_spend_reservation_message(&value);
+        assert!(message.starts_with("mayhem-targeted-spend-reservation-v1"));
+        assert!(message.contains("\"payout_revision\""));
         assert!(message.contains("\"max_spend_au\":\"1000\""));
         assert!(!message.contains("provider_sig"));
         assert!(
@@ -70508,16 +78810,16 @@ mod tests {
         specialised["required_specialities"] = json!({ "reasoning_effort": ["high"] });
         specialised["voucher"]["required_specialities"] = json!({ "reasoning_effort": ["high"] });
         assert_eq!(
-            spend_reservation_message(&specialised)
+            targeted_spend_reservation_message(&specialised)
                 .matches("required_specialities")
                 .count(),
             2,
             "non-empty speciality maps remain bound in both reservation and voucher evidence"
         );
 
-        let key = spend_reservation_feature_key(&value).unwrap();
+        let key = targeted_spend_reservation_feature_key(&value).unwrap();
         assert!(key.starts_with(&format!(
-            "hold/reserve/fiat/{}/7/{}/",
+            "hold/targeted/fiat/{}/7/{}/",
             value["user"].as_str().unwrap(),
             value["session_id"].as_str().unwrap()
         )));
@@ -70526,7 +78828,7 @@ mod tests {
         let mut signed = value.clone();
         signed["provider_sig"] = json!("11".repeat(64));
         assert_eq!(
-            spend_reservation_feature_key(&signed).unwrap(),
+            targeted_spend_reservation_feature_key(&signed).unwrap(),
             key,
             "provider signature is not part of the reservation feature key"
         );
@@ -70859,6 +79161,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             kind: HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
             command: quote_command.clone(),
             timeout: Duration::from_secs(5),
+            tpm_state_dir: None,
         };
         let provider_pubkey = "55".repeat(32);
         let runtime_config = AttestationRuntimeConfig {
@@ -70884,6 +79187,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             101,
             "88".repeat(32),
             runtime_config.clone(),
+            None,
         )
         .await
         .unwrap();
@@ -70901,15 +79205,16 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             201,
             "99".repeat(32),
             runtime_config,
+            None,
         )
         .await
         .unwrap();
 
-        assert_eq!(first.report.boot_epoch, 100);
-        assert_eq!(second.report.boot_epoch, 200);
-        assert_ne!(first.report_head, second.report_head);
-        let first_quote = first.report.hw_quote.as_ref().unwrap();
-        let second_quote = second.report.hw_quote.as_ref().unwrap();
+        assert_eq!(first.report.report.boot_epoch, 100);
+        assert_eq!(second.report.report.boot_epoch, 200);
+        assert_ne!(first.report.report_head, second.report.report_head);
+        let first_quote = first.report.report.hw_quote.as_ref().unwrap();
+        let second_quote = second.report.report.hw_quote.as_ref().unwrap();
         assert!(first_quote.evidence.contains(&"88".repeat(32)));
         assert!(second_quote.evidence.contains(&"99".repeat(32)));
         assert_ne!(first_quote.binding, second_quote.binding);
@@ -77002,17 +85307,18 @@ State initialization...
         let outputs = vec![json!({
             "role": "provider",
             "provider": "11".repeat(32),
+            "payout_revision": "22".repeat(32),
             "to": "testtrac1provider",
             "au": "62500000000000000",
             "tnk_e18": "1250000000000000000",
         })];
         let transfer_root = stable_value_hash(&json!({
-            "domain": "mayhem-tnk-settlement-transfer-root-v1",
+            "domain": "mayhem-targeted-tnk-settlement-transfer-root-v1",
             "value": &outputs,
         }));
         let plan = TnkSettlementPlan {
             payload: json!({
-                "op": "tnk_settlement",
+                "op": "settle_targeted_tnk",
                 "epoch": 7,
                 "at": 90_000,
                 "rail": "tnk",
@@ -77122,67 +85428,6 @@ State initialization...
             }))
             .len(),
             64
-        );
-    }
-
-    #[test]
-    fn tnk_settlement_provider_payout_requires_admin_set_tnk_target() {
-        let admin = "aa".repeat(32);
-        let provider_id = "11".repeat(32);
-        let provider = json!({
-            "provider": provider_id,
-            "status": "active",
-            "payouts": {
-                "tnk": {
-                    "method": "tnk",
-                    "addr": "testtrac1provider",
-                    "set_by": admin,
-                    "set_by_role": "admin",
-                }
-            }
-        });
-
-        assert_eq!(
-            tnk_provider_payout_target(&provider, &provider_id, &admin).unwrap(),
-            "testtrac1provider"
-        );
-
-        let mut wrong_method = provider.clone();
-        wrong_method["payouts"]["tnk"]["method"] = json!("stripe");
-        assert!(tnk_provider_payout_target(&wrong_method, &provider_id, &admin).is_err());
-
-        let mut wrong_admin = provider.clone();
-        wrong_admin["payouts"]["tnk"]["set_by"] = json!("bb".repeat(32));
-        assert!(tnk_provider_payout_target(&wrong_admin, &provider_id, &admin).is_err());
-    }
-
-    #[test]
-    fn fiat_settlement_provider_payout_uses_rail_specific_stripe_target() {
-        let admin = "aa".repeat(32);
-        let provider_id = "11".repeat(32);
-        let provider = json!({
-            "provider": provider_id,
-            "status": "active",
-            "payouts": {
-                "tnk": {
-                    "method": "tnk",
-                    "addr": "trac1provider",
-                    "set_by": admin,
-                    "set_by_role": "admin",
-                },
-                "stripe": {
-                    "method": "stripe",
-                    "addr": "acct_provider",
-                    "currency": "eur",
-                    "set_by": admin,
-                    "set_by_role": "admin",
-                }
-            }
-        });
-
-        assert_eq!(
-            fiat_provider_payout_target(&provider, &provider_id, &admin).unwrap(),
-            ("acct_provider".to_owned(), "eur".to_owned())
         );
     }
 
@@ -80929,6 +89174,900 @@ State initialization...
     }
 
     #[test]
+    fn catalog_apply_attestation_authority_command_parses_typed_inputs() {
+        let cli = Cli::try_parse_from([
+            "mayhem",
+            "catalog",
+            "apply-attestation-authority",
+            "--catalog-path",
+            "catalog.json",
+            "--policy-chain",
+            "policy-chain.json",
+            "--bindings",
+            "bindings.json",
+            "--release-dir",
+            "release-a",
+            "--release-dir",
+            "release-b",
+            "--release-key",
+            "trusted-release-key.json",
+            "--release-key-id",
+            "test-release-key",
+            "--source-git-sha",
+            TEST_CATALOG_AUTHORITY_SOURCE_GIT_SHA,
+            "--mode",
+            "final-release",
+            "--release-version",
+            "0.2.23",
+            "--public-origin",
+            "https://downloads.example",
+            "--public-path",
+            "/mayhem/0.2.23",
+            "--output",
+            "draft.json",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Catalog {
+            command: CatalogCommands::ApplyAttestationAuthority(args),
+        } = cli.command
+        else {
+            panic!("expected catalog apply-attestation-authority command");
+        };
+        assert_eq!(
+            args.release_dir,
+            [PathBuf::from("release-a"), PathBuf::from("release-b")]
+        );
+        assert_eq!(args.release_key, PathBuf::from("trusted-release-key.json"));
+        assert_eq!(args.release_key_id, "test-release-key");
+        assert_eq!(args.source_git_sha, TEST_CATALOG_AUTHORITY_SOURCE_GIT_SHA);
+        assert_eq!(
+            args.mode,
+            CatalogAttestationAuthorityApplyMode::FinalRelease
+        );
+        assert_eq!(args.release_version, "0.2.23");
+        assert_eq!(args.public_origin, "https://downloads.example");
+        assert_eq!(args.public_path, "/mayhem/0.2.23");
+        assert!(args.json);
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_command_requires_authentication_inputs_and_mode() {
+        let complete = vec![
+            "mayhem",
+            "catalog",
+            "apply-attestation-authority",
+            "--catalog-path",
+            "catalog.json",
+            "--policy-chain",
+            "policy-chain.json",
+            "--bindings",
+            "bindings.json",
+            "--release-dir",
+            "release",
+            "--release-key",
+            "trusted-release-key.json",
+            "--release-key-id",
+            "test-release-key",
+            "--source-git-sha",
+            TEST_CATALOG_AUTHORITY_SOURCE_GIT_SHA,
+            "--mode",
+            "incremental-draft",
+            "--release-version",
+            TEST_CATALOG_AUTHORITY_VERSION,
+            "--public-origin",
+            "https://downloads.example",
+            "--public-path",
+            "/mayhem/0.2.23",
+            "--output",
+            "draft.json",
+        ];
+        for required in [
+            "--release-dir",
+            "--release-key",
+            "--release-key-id",
+            "--source-git-sha",
+            "--mode",
+        ] {
+            let mut omitted = complete.clone();
+            let index = omitted
+                .iter()
+                .position(|argument| *argument == required)
+                .unwrap();
+            omitted.drain(index..=index + 1);
+            assert!(
+                Cli::try_parse_from(omitted).is_err(),
+                "parser accepted omission of {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_writes_deterministic_final_and_non_signable_draft() {
+        let fixture = write_catalog_authority_test_fixture("catalog-authority-positive");
+        let models_before = read_json_file(&fixture.catalog_path).unwrap()["models"].clone();
+        let first_output = fixture.temp.join("final-a.json");
+        let report =
+            catalog_apply_attestation_authority_report(fixture.final_request(first_output.clone()))
+                .unwrap();
+        let second_output = fixture.temp.join("final-b.json");
+        catalog_apply_attestation_authority_report(fixture.final_request(second_output.clone()))
+            .unwrap();
+        let first_draft = fixture.temp.join("draft-a.json");
+        catalog_apply_attestation_authority_report(fixture.draft_request(first_draft.clone()))
+            .unwrap();
+        let second_draft = fixture.temp.join("draft-b.json");
+        catalog_apply_attestation_authority_report(fixture.draft_request(second_draft.clone()))
+            .unwrap();
+
+        assert_eq!(
+            report.mode,
+            CatalogAttestationAuthorityApplyMode::FinalRelease
+        );
+        assert_eq!(
+            report.release_dirs,
+            [fs::canonicalize(&fixture.release_dir).unwrap()]
+        );
+        assert_eq!(
+            report.release_key,
+            fs::canonicalize(&fixture.release_key).unwrap()
+        );
+        assert_eq!(report.release_key_id, "test-release-key");
+        assert_eq!(report.release_public_key.len(), 64);
+        assert_eq!(report.target_count, 6);
+        assert_eq!(report.published_target_count, 6);
+        assert_eq!(report.preserved_target_count, 0);
+        assert_eq!(report.managed_quote_kind_count, 1);
+        assert_eq!(report.managed_reference_count, 12);
+        assert_eq!(report.source_git_sha, TEST_CATALOG_AUTHORITY_SOURCE_GIT_SHA);
+        assert_eq!(
+            fs::read(&first_output).unwrap(),
+            fs::read(&second_output).unwrap()
+        );
+        assert_eq!(
+            fs::read(&first_draft).unwrap(),
+            fs::read(&second_draft).unwrap()
+        );
+        assert_ne!(
+            fs::read(&first_output).unwrap(),
+            fs::read(&first_draft).unwrap()
+        );
+        let applied = read_json_file(&first_output).unwrap();
+        assert_eq!(applied["models"], models_before);
+        let draft: CatalogAttestationAuthorityIncrementalDraft =
+            serde_json::from_value(read_json_file(&first_draft).unwrap()).unwrap();
+        assert_eq!(
+            draft.document_type,
+            CATALOG_AUTHORITY_INCREMENTAL_DRAFT_DOCUMENT_TYPE
+        );
+        assert_eq!(
+            draft.mode,
+            CatalogAttestationAuthorityApplyMode::IncrementalDraft
+        );
+        assert_eq!(draft.candidate_catalog, applied);
+        let authority: catalog::CatalogAttestationAuthority =
+            serde_json::from_value(applied.clone()).unwrap();
+        catalog::validate_catalog_attestation_authority_canonical(&authority).unwrap();
+        let policy = authority
+            .attestation_policy_chain
+            .as_ref()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(
+            policy
+                .trust_data
+                .iter()
+                .filter(|reference| reference.id.starts_with("managed-verifier."))
+                .count(),
+            12
+        );
+        assert!(policy
+            .trust_data
+            .iter()
+            .all(|reference| reference.source.is_some()));
+
+        let chain = catalog_attestation_policy_chain(&authority).unwrap();
+        let active = chain.active_at(1).unwrap();
+        let target = ValidatedAttestationPolicy::compiled_managed_verifier_target().unwrap();
+        let (selected, needed) =
+            local_attestation_collateral_references(active, Some(target)).unwrap();
+        assert!(needed);
+        assert_eq!(selected.len(), 5);
+        assert!(selected.iter().all(|reference| {
+            ValidatedAttestationPolicy::parse_managed_verifier_trust_data(reference)
+                .unwrap()
+                .is_none_or(|(_, managed_target, _)| managed_target == target)
+        }));
+        let (unsupported_target, unsupported_needed) =
+            local_attestation_collateral_references(active, None).unwrap();
+        assert!(!unsupported_needed);
+        assert_eq!(unsupported_target.len(), 3);
+        assert!(unsupported_target.iter().all(|reference| {
+            ValidatedAttestationPolicy::parse_managed_verifier_trust_data(reference)
+                .unwrap()
+                .is_none()
+        }));
+        let seed_file = fixture.temp.join("catalog-seed.hex");
+        fs::write(&seed_file, "42".repeat(32)).unwrap();
+        let signature_output = fixture.temp.join("final-a.json.sig");
+        let signed = catalog_sign_report(CatalogSignRequest {
+            catalog_path: first_output,
+            signature_output: signature_output.clone(),
+            keys_dir: fixture.temp.join("keys"),
+            key_id: "authority-draft-test".to_owned(),
+            seed_file,
+            write_key: false,
+            created_at: None,
+        })
+        .unwrap();
+        assert!(signed.ok);
+        assert!(signature_output.is_file());
+
+        let draft_signature_output = fixture.temp.join("draft-a.json.sig");
+        let error = catalog_sign_report(CatalogSignRequest {
+            catalog_path: first_draft,
+            signature_output: draft_signature_output.clone(),
+            keys_dir: fixture.temp.join("keys"),
+            key_id: "authority-draft-test".to_owned(),
+            seed_file: fixture.temp.join("catalog-seed.hex"),
+            write_key: false,
+            created_at: None,
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("review-only and cannot be catalog-signed"));
+        assert!(!draft_signature_output.exists());
+        let _ = fs::remove_dir_all(&fixture.temp);
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_accepts_per_target_release_dirs() {
+        let fixture = write_catalog_authority_test_fixture("catalog-authority-per-target");
+        let mut release_dirs = Vec::new();
+        for target in ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS {
+            let target_dir = fixture.temp.join(target);
+            fs::create_dir(&target_dir).unwrap();
+            for file_name in
+                catalog_authority_target_file_names(TEST_CATALOG_AUTHORITY_VERSION, target)
+            {
+                fs::rename(
+                    fixture.release_dir.join(&file_name),
+                    target_dir.join(file_name),
+                )
+                .unwrap();
+            }
+            release_dirs.push(target_dir);
+        }
+        let mut request = fixture.final_request(fixture.temp.join("per-target-output.json"));
+        request.release_dirs = release_dirs.clone();
+        let report = catalog_apply_attestation_authority_report(request).unwrap();
+        assert_eq!(
+            report.release_dirs,
+            release_dirs
+                .iter()
+                .map(fs::canonicalize)
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap()
+        );
+        assert_eq!(report.published_target_count, 6);
+        assert_eq!(report.preserved_target_count, 0);
+        let _ = fs::remove_dir_all(&fixture.temp);
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_canonicalizes_key_and_isolates_output() {
+        let key_inside =
+            write_catalog_authority_test_fixture("catalog-authority-key-inside-release");
+        let nested = key_inside.release_dir.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let inside_key = key_inside.release_dir.join("independent-release-key.json");
+        fs::copy(&key_inside.release_key, &inside_key).unwrap();
+        let mut request = key_inside.final_request(key_inside.temp.join("key-inside-output.json"));
+        request.release_key = nested.join("..").join("independent-release-key.json");
+        let error = catalog_apply_attestation_authority_report(request).unwrap_err();
+        assert!(format!("{error:#}").contains("must be outside --release-dir"));
+        assert!(!key_inside.temp.join("key-inside-output.json").exists());
+        let _ = fs::remove_dir_all(&key_inside.temp);
+
+        let output_inside =
+            write_catalog_authority_test_fixture("catalog-authority-output-inside-release");
+        let nested = output_inside.release_dir.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let output = nested.join("..").join("authority-output.json");
+        let error =
+            catalog_apply_attestation_authority_report(output_inside.final_request(output.clone()))
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("must be outside --release-dir"));
+        assert!(!output_inside
+            .release_dir
+            .join("authority-output.json")
+            .exists());
+        let _ = fs::remove_dir_all(&output_inside.temp);
+
+        let output_is_key = write_catalog_authority_test_fixture("catalog-authority-output-is-key");
+        let key_bytes = fs::read(&output_is_key.release_key).unwrap();
+        let error = catalog_apply_attestation_authority_report(
+            output_is_key.final_request(output_is_key.release_key.clone()),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("isolated from --release-key"));
+        assert_eq!(fs::read(&output_is_key.release_key).unwrap(), key_bytes);
+        let _ = fs::remove_dir_all(&output_is_key.temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn catalog_apply_attestation_authority_rejects_symlink_output() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = write_catalog_authority_test_fixture("catalog-authority-output-symlink");
+        let victim = fixture.temp.join("victim.json");
+        fs::write(&victim, b"do-not-overwrite").unwrap();
+        let output = fixture.temp.join("authority-output.json");
+        symlink(&victim, &output).unwrap();
+        let error =
+            catalog_apply_attestation_authority_report(fixture.final_request(output)).unwrap_err();
+        assert!(format!("{error:#}").contains("must not be a symbolic link"));
+        assert_eq!(fs::read(&victim).unwrap(), b"do-not-overwrite");
+        let _ = fs::remove_dir_all(&fixture.temp);
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_accepts_complete_target_subset() {
+        let fixture = write_catalog_authority_test_fixture("catalog-authority-target-subset");
+        let omitted_target = ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS[0];
+        fixture.remove_target(omitted_target);
+
+        let output = fixture.temp.join("subset-output.json");
+        let report =
+            catalog_apply_attestation_authority_report(fixture.draft_request(output.clone()))
+                .unwrap();
+        assert_eq!(report.target_count, 5);
+        assert_eq!(report.published_target_count, 5);
+        assert_eq!(report.preserved_target_count, 0);
+        assert_eq!(report.managed_reference_count, 10);
+
+        let authority: catalog::CatalogAttestationAuthority =
+            serde_json::from_value(read_catalog_authority_candidate(&output)).unwrap();
+        catalog::validate_catalog_attestation_authority_canonical(&authority).unwrap();
+        let policy = authority
+            .attestation_policy_chain
+            .as_ref()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert!(policy.trust_data.iter().all(|reference| {
+            ValidatedAttestationPolicy::parse_managed_verifier_trust_data(reference)
+                .unwrap()
+                .is_none_or(|(_, target, _)| target != omitted_target)
+        }));
+        let _ = fs::remove_dir_all(&fixture.temp);
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_preserves_omitted_active_targets() {
+        let fixture = write_catalog_authority_test_fixture("catalog-authority-target-preserve");
+        let initial_output = fixture.temp.join("initial-output.json");
+        catalog_apply_attestation_authority_report(fixture.final_request(initial_output.clone()))
+            .unwrap();
+        let initial: catalog::CatalogAttestationAuthority =
+            serde_json::from_value(read_json_file(&initial_output).unwrap()).unwrap();
+        let previous = initial
+            .attestation_policy_chain
+            .as_ref()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let intended = next_catalog_authority_policy(&previous, 2);
+        write_json_file(
+            &fixture.policy_chain_path,
+            &vec![previous.clone(), intended],
+        )
+        .unwrap();
+
+        let omitted_target = ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS[0];
+        fixture.remove_target(omitted_target);
+
+        let output = fixture.temp.join("preserved-output.json");
+        let report =
+            catalog_apply_attestation_authority_report(fixture.draft_request(output.clone()))
+                .unwrap();
+        assert_eq!(report.target_count, 6);
+        assert_eq!(report.published_target_count, 5);
+        assert_eq!(report.preserved_target_count, 1);
+        assert_eq!(report.managed_reference_count, 12);
+
+        let authority: catalog::CatalogAttestationAuthority =
+            serde_json::from_value(read_catalog_authority_candidate(&output)).unwrap();
+        catalog::validate_catalog_attestation_authority_canonical(&authority).unwrap();
+        let latest = authority
+            .attestation_policy_chain
+            .as_ref()
+            .unwrap()
+            .last()
+            .unwrap();
+        let target_references = |policy: &AdminAttestationPolicy| {
+            policy
+                .trust_data
+                .iter()
+                .filter(|reference| {
+                    ValidatedAttestationPolicy::parse_managed_verifier_trust_data(reference)
+                        .unwrap()
+                        .is_some_and(|(_, target, _)| target == omitted_target)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(target_references(latest), target_references(&previous));
+        let chain = catalog_attestation_policy_chain(&authority).unwrap();
+        let active = chain.active_at(2).unwrap();
+        let (executable_id, manifest_id) =
+            ValidatedAttestationPolicy::managed_verifier_trust_data_ids(
+                HardwareQuoteKind::AmdSevSnpVcek,
+                omitted_target,
+            )
+            .unwrap();
+        assert!(active.trust_data(&executable_id).is_some());
+        assert!(active.trust_data(&manifest_id).is_some());
+        let _ = fs::remove_dir_all(&fixture.temp);
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_rejects_partial_policy_change() {
+        let fixture = write_catalog_authority_test_fixture("catalog-authority-partial-policy");
+        let initial_output = fixture.temp.join("initial-output.json");
+        catalog_apply_attestation_authority_report(fixture.final_request(initial_output.clone()))
+            .unwrap();
+        let initial: catalog::CatalogAttestationAuthority =
+            serde_json::from_value(read_json_file(&initial_output).unwrap()).unwrap();
+        let previous = initial
+            .attestation_policy_chain
+            .as_ref()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let mut intended = next_catalog_authority_policy(&previous, 2);
+        intended
+            .quote_kinds
+            .iter_mut()
+            .find(|entry| entry.kind == HardwareQuoteKind::AmdSevSnpVcek)
+            .unwrap()
+            .platforms
+            .insert("amd-sev-snp-next".to_owned());
+        write_json_file(&fixture.policy_chain_path, &vec![previous, intended]).unwrap();
+
+        let omitted_target = ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS[0];
+        fixture.remove_target(omitted_target);
+
+        let error = catalog_apply_attestation_authority_report(
+            fixture.draft_request(fixture.temp.join("rejected-output.json")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(
+            "partial managed-verifier publication cannot preserve omitted targets while verifier policy requirements change"
+        ));
+        let _ = fs::remove_dir_all(&fixture.temp);
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_allows_full_policy_change() {
+        let fixture = write_catalog_authority_test_fixture("catalog-authority-full-policy");
+        let initial_output = fixture.temp.join("initial-output.json");
+        catalog_apply_attestation_authority_report(fixture.final_request(initial_output.clone()))
+            .unwrap();
+        let initial: catalog::CatalogAttestationAuthority =
+            serde_json::from_value(read_json_file(&initial_output).unwrap()).unwrap();
+        let previous = initial
+            .attestation_policy_chain
+            .as_ref()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let mut intended = next_catalog_authority_policy(&previous, 2);
+        intended
+            .quote_kinds
+            .iter_mut()
+            .find(|entry| entry.kind == HardwareQuoteKind::AmdSevSnpVcek)
+            .unwrap()
+            .platforms
+            .insert("amd-sev-snp-next".to_owned());
+        write_json_file(&fixture.policy_chain_path, &vec![previous, intended]).unwrap();
+
+        let report = catalog_apply_attestation_authority_report(
+            fixture.final_request(fixture.temp.join("full-policy-output.json")),
+        )
+        .unwrap();
+        assert_eq!(report.target_count, 6);
+        assert_eq!(report.published_target_count, 6);
+        assert_eq!(report.preserved_target_count, 0);
+        let _ = fs::remove_dir_all(&fixture.temp);
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_does_not_resurrect_historical_targets() {
+        let fixture = write_catalog_authority_test_fixture("catalog-authority-no-resurrection");
+        let initial_output = fixture.temp.join("initial-output.json");
+        catalog_apply_attestation_authority_report(fixture.final_request(initial_output.clone()))
+            .unwrap();
+        let initial: catalog::CatalogAttestationAuthority =
+            serde_json::from_value(read_json_file(&initial_output).unwrap()).unwrap();
+        let previous = initial
+            .attestation_policy_chain
+            .as_ref()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let middle = next_catalog_authority_policy(&previous, 2);
+        let intended = next_catalog_authority_policy(&middle, 3);
+        write_json_file(
+            &fixture.policy_chain_path,
+            &vec![previous, middle, intended],
+        )
+        .unwrap();
+
+        let omitted_target = ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS[0];
+        fixture.remove_target(omitted_target);
+
+        let output = fixture.temp.join("no-resurrection-output.json");
+        let report =
+            catalog_apply_attestation_authority_report(fixture.draft_request(output.clone()))
+                .unwrap();
+        assert_eq!(report.target_count, 5);
+        assert_eq!(report.preserved_target_count, 0);
+        let authority: catalog::CatalogAttestationAuthority =
+            serde_json::from_value(read_catalog_authority_candidate(&output)).unwrap();
+        let latest = authority
+            .attestation_policy_chain
+            .as_ref()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert!(latest.trust_data.iter().all(|reference| {
+            ValidatedAttestationPolicy::parse_managed_verifier_trust_data(reference)
+                .unwrap()
+                .is_none_or(|(_, target, _)| target != omitted_target)
+        }));
+        let _ = fs::remove_dir_all(&fixture.temp);
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_rejects_partial_emergency_reactivation() {
+        let fixture = write_catalog_authority_test_fixture("catalog-authority-emergency-change");
+        let initial_output = fixture.temp.join("initial-output.json");
+        catalog_apply_attestation_authority_report(fixture.final_request(initial_output.clone()))
+            .unwrap();
+        let initial: catalog::CatalogAttestationAuthority =
+            serde_json::from_value(read_json_file(&initial_output).unwrap()).unwrap();
+        let mut previous = initial
+            .attestation_policy_chain
+            .as_ref()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        previous
+            .emergency_disabled_quote_kinds
+            .insert(HardwareQuoteKind::AmdSevSnpVcek);
+        let mut intended = next_catalog_authority_policy(&previous, 2);
+        intended
+            .emergency_disabled_quote_kinds
+            .remove(&HardwareQuoteKind::AmdSevSnpVcek);
+        write_json_file(&fixture.policy_chain_path, &vec![previous, intended]).unwrap();
+
+        let omitted_target = ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS[0];
+        fixture.remove_target(omitted_target);
+
+        let error = catalog_apply_attestation_authority_report(
+            fixture.draft_request(fixture.temp.join("rejected-output.json")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(
+            "partial managed-verifier publication cannot preserve omitted targets while verifier policy requirements change"
+        ));
+        let _ = fs::remove_dir_all(&fixture.temp);
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_rejects_partial_disabled_kind_change() {
+        let fixture = write_catalog_authority_test_fixture("catalog-authority-disabled-change");
+        let initial_output = fixture.temp.join("initial-output.json");
+        catalog_apply_attestation_authority_report(fixture.final_request(initial_output.clone()))
+            .unwrap();
+        let initial: catalog::CatalogAttestationAuthority =
+            serde_json::from_value(read_json_file(&initial_output).unwrap()).unwrap();
+        let previous = initial
+            .attestation_policy_chain
+            .as_ref()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let mut intended = next_catalog_authority_policy(&previous, 2);
+        let disabled = intended
+            .quote_kinds
+            .iter_mut()
+            .find(|entry| entry.kind == HardwareQuoteKind::IntelTdxDcap)
+            .unwrap();
+        assert!(!disabled.enabled);
+        disabled.platforms.insert("intel-tdx-next".to_owned());
+        write_json_file(&fixture.policy_chain_path, &vec![previous, intended]).unwrap();
+
+        let omitted_target = ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS[0];
+        fixture.remove_target(omitted_target);
+
+        let error = catalog_apply_attestation_authority_report(
+            fixture.draft_request(fixture.temp.join("rejected-output.json")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(
+            "partial managed-verifier publication cannot preserve omitted targets while verifier policy requirements change"
+        ));
+        let _ = fs::remove_dir_all(&fixture.temp);
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_preserves_repository_models_exactly() {
+        let mut fixture = write_catalog_authority_test_fixture("catalog-authority-repo-models");
+        fixture.catalog_path = repo_path("catalog/models.json").unwrap();
+        let models_before = read_json_file(&fixture.catalog_path).unwrap()["models"].clone();
+        let output = fixture.temp.join("repository-model-output.json");
+        catalog_apply_attestation_authority_report(fixture.final_request(output.clone())).unwrap();
+        let models_after = read_json_file(&output).unwrap()["models"].clone();
+        assert_eq!(models_after, models_before);
+        let _ = fs::remove_dir_all(&fixture.temp);
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_final_rejects_missing_target() {
+        let fixture = write_catalog_authority_test_fixture("catalog-authority-final-missing");
+        let target = ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS[0];
+        fixture.remove_target(target);
+        assert_catalog_authority_rejected(&fixture, "requires all six canonical targets");
+        let _ = fs::remove_dir_all(&fixture.temp);
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_rejects_incomplete_unsigned_and_tampered_publications() {
+        let target = ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS[0];
+
+        let missing_manifest =
+            write_catalog_authority_test_fixture("catalog-authority-missing-manifest");
+        fs::remove_file(missing_manifest.generic_manifest_path(target)).unwrap();
+        assert_catalog_authority_rejected(&missing_manifest, "incomplete");
+        let _ = fs::remove_dir_all(&missing_manifest.temp);
+
+        let unsigned = write_catalog_authority_test_fixture("catalog-authority-unsigned");
+        fs::remove_file(unsigned.signature_path(target)).unwrap();
+        assert_catalog_authority_rejected(&unsigned, "incomplete");
+        let _ = fs::remove_dir_all(&unsigned.temp);
+
+        let tampered_manifest =
+            write_catalog_authority_test_fixture("catalog-authority-tampered-manifest");
+        let path = tampered_manifest.generic_manifest_path(target);
+        let mut manifest = read_json_file(&path).unwrap();
+        manifest["built_at_utc"] = json!("2026-07-20T00:00:01Z");
+        write_json_file(&path, &manifest).unwrap();
+        assert_catalog_authority_rejected(&tampered_manifest, "signature hash mismatch");
+        let _ = fs::remove_dir_all(&tampered_manifest.temp);
+
+        let tampered_signature =
+            write_catalog_authority_test_fixture("catalog-authority-tampered-signature");
+        let path = tampered_signature.signature_path(target);
+        let mut signature = read_json_file(&path).unwrap();
+        signature["sig"] = json!("00".repeat(64));
+        write_json_file(&path, &signature).unwrap();
+        assert_catalog_authority_rejected(&tampered_signature, "signature verification failed");
+        let _ = fs::remove_dir_all(&tampered_signature.temp);
+
+        let missing_key = write_catalog_authority_test_fixture("catalog-authority-missing-key");
+        fs::remove_file(missing_key.target_key_path(target)).unwrap();
+        assert_catalog_authority_rejected(&missing_key, "incomplete");
+        let _ = fs::remove_dir_all(&missing_key.temp);
+
+        let tampered_key = write_catalog_authority_test_fixture("catalog-authority-tampered-key");
+        fs::write(tampered_key.target_key_path(target), b"{\"tampered\":true}").unwrap();
+        assert_catalog_authority_rejected(&tampered_key, "does not exactly match");
+        let _ = fs::remove_dir_all(&tampered_key.temp);
+
+        let tampered_verifier =
+            write_catalog_authority_test_fixture("catalog-authority-tampered-verifier");
+        fs::write(
+            tampered_verifier.executable_path(target),
+            b"tampered-verifier",
+        )
+        .unwrap();
+        assert_catalog_authority_rejected(
+            &tampered_verifier,
+            "does not bind its detached executable digest",
+        );
+        let _ = fs::remove_dir_all(&tampered_verifier.temp);
+
+        let malformed_trust =
+            write_catalog_authority_test_fixture("catalog-authority-malformed-trust");
+        let mut key = read_json_file(&malformed_trust.release_key).unwrap();
+        key["unknown"] = json!(true);
+        write_json_file(&malformed_trust.release_key, &key).unwrap();
+        assert_catalog_authority_rejected(&malformed_trust, "unknown field");
+        let _ = fs::remove_dir_all(&malformed_trust.temp);
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_rejects_self_consistent_verifier_substitution() {
+        let fixture =
+            write_catalog_authority_test_fixture("catalog-authority-verifier-substitution");
+        let target = ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS[0];
+        let signed_manifest_before = fs::read(fixture.generic_manifest_path(target)).unwrap();
+        let signature_before = fs::read(fixture.signature_path(target)).unwrap();
+        let replacement = b"self-consistent-substituted-verifier";
+        fs::write(fixture.executable_path(target), replacement).unwrap();
+        let managed_manifest_path = fixture.managed_manifest_path(target);
+        let mut managed_manifest = read_json_file(&managed_manifest_path).unwrap();
+        managed_manifest["executable_sha256"] = json!(sha256_bytes_hex(replacement));
+        write_json_file(&managed_manifest_path, &managed_manifest).unwrap();
+        assert_eq!(
+            fs::read(fixture.generic_manifest_path(target)).unwrap(),
+            signed_manifest_before
+        );
+        assert_eq!(
+            fs::read(fixture.signature_path(target)).unwrap(),
+            signature_before
+        );
+
+        assert_catalog_authority_rejected(
+            &fixture,
+            "signed release verifier binary digest does not match its detached artifact",
+        );
+        let _ = fs::remove_dir_all(&fixture.temp);
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_rejects_wrong_signed_identity() {
+        let target = ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS[0];
+
+        let wrong_sha = write_catalog_authority_test_fixture("catalog-authority-wrong-sha");
+        let path = wrong_sha.generic_manifest_path(target);
+        let mut manifest: release_bundle::ReleaseBundleManifest =
+            read_typed_json_file(&path, "test release manifest").unwrap();
+        manifest.source_git_sha = "89abcdef0123456789abcdef0123456789abcdef".to_owned();
+        write_json_file(&path, &manifest).unwrap();
+        wrong_sha.resign_target(target);
+        assert_catalog_authority_rejected(&wrong_sha, "does not match caller-bound SHA");
+        let _ = fs::remove_dir_all(&wrong_sha.temp);
+
+        let wrong_version = write_catalog_authority_test_fixture("catalog-authority-wrong-version");
+        let mut manifest: release_bundle::ReleaseBundleManifest = read_typed_json_file(
+            &wrong_version.generic_manifest_path(target),
+            "test release manifest",
+        )
+        .unwrap();
+        manifest.version = "0.2.24".to_owned();
+        manifest.intercom.release_version = "0.2.24".to_owned();
+        wrong_version.install_signed_manifest(target, &manifest);
+        assert_catalog_authority_rejected(
+            &wrong_version,
+            "does not match requested version 0.2.23",
+        );
+        let _ = fs::remove_dir_all(&wrong_version.temp);
+
+        let wrong_target = write_catalog_authority_test_fixture("catalog-authority-wrong-target");
+        let mut manifest: release_bundle::ReleaseBundleManifest = read_typed_json_file(
+            &wrong_target.generic_manifest_path(target),
+            "test release manifest",
+        )
+        .unwrap();
+        manifest.target = "noncanonical-target".to_owned();
+        wrong_target.install_signed_manifest(target, &manifest);
+        assert_catalog_authority_rejected(&wrong_target, "does not match supplied target");
+        let _ = fs::remove_dir_all(&wrong_target.temp);
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_rejects_duplicate_target_and_malformed_inventory() {
+        let duplicate = write_catalog_authority_test_fixture("catalog-authority-duplicate-target");
+        let duplicate_dir = duplicate.temp.join("duplicate");
+        fs::create_dir(&duplicate_dir).unwrap();
+        let target = ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS[0];
+        for file_name in catalog_authority_target_file_names(TEST_CATALOG_AUTHORITY_VERSION, target)
+        {
+            fs::copy(
+                duplicate.release_dir.join(&file_name),
+                duplicate_dir.join(file_name),
+            )
+            .unwrap();
+        }
+        let mut request = duplicate.final_request(duplicate.temp.join("duplicate-output.json"));
+        request.release_dirs.push(duplicate_dir);
+        let error = catalog_apply_attestation_authority_report(request).unwrap_err();
+        assert!(format!("{error:#}").contains("duplicate target publication"));
+        let _ = fs::remove_dir_all(&duplicate.temp);
+
+        let malformed = write_catalog_authority_test_fixture("catalog-authority-bad-inventory");
+        let path = malformed.generic_manifest_path(target);
+        let mut manifest: release_bundle::ReleaseBundleManifest =
+            read_typed_json_file(&path, "test release manifest").unwrap();
+        manifest
+            .binaries
+            .retain(|binary| !binary.name.starts_with("mayhem-pay"));
+        manifest
+            .assets
+            .retain(|asset| !asset.path.starts_with("bin/mayhem-pay"));
+        write_json_file(&path, &manifest).unwrap();
+        assert_catalog_authority_rejected(&malformed, "does not include required sibling binary");
+        let _ = fs::remove_dir_all(&malformed.temp);
+    }
+
+    #[test]
+    fn catalog_apply_and_sign_reject_source_less_catalog_authority() {
+        let fixture = write_catalog_authority_test_fixture("catalog-authority-source-less");
+        let mut policies: Vec<AdminAttestationPolicy> =
+            read_typed_json_file(&fixture.policy_chain_path, "test policy chain").unwrap();
+        policies[0].trust_data[0].source = None;
+        write_json_file(&fixture.policy_chain_path, &policies).unwrap();
+        let output = fixture.temp.join("source-less-output.json");
+        let error =
+            catalog_apply_attestation_authority_report(fixture.final_request(output.clone()))
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("has no canonical HTTPS source"));
+        assert!(!output.exists());
+
+        let mut source_less_catalog = read_json_file(&fixture.catalog_path).unwrap();
+        source_less_catalog["attestation_policy_chain"] = json!(policies);
+        source_less_catalog["enclave_attestation_bindings"] =
+            read_json_file(&fixture.bindings_path).unwrap();
+        let source_less_catalog_path = fixture.temp.join("source-less-catalog.json");
+        write_json_file(&source_less_catalog_path, &source_less_catalog).unwrap();
+        let seed_file = fixture.temp.join("seed.hex");
+        fs::write(&seed_file, "31".repeat(32)).unwrap();
+        let sign_error = catalog_sign_report(CatalogSignRequest {
+            catalog_path: source_less_catalog_path,
+            signature_output: fixture.temp.join("source-less.sig"),
+            keys_dir: fixture.temp.join("keys"),
+            key_id: "source-less-test".to_owned(),
+            seed_file,
+            write_key: false,
+            created_at: None,
+        })
+        .unwrap_err();
+        assert!(format!("{sign_error:#}").contains("refusing to sign"));
+        assert!(format!("{sign_error:#}").contains("has no canonical HTTPS source"));
+        let _ = fs::remove_dir_all(&fixture.temp);
+    }
+
+    #[test]
+    fn managed_verifier_parser_rejects_malformed_media_and_id_pairs() {
+        let malformed = AttestationTrustDataRef {
+            id: "managed-verifier.amd_sev_snp_vcek.bad-target.executable".to_owned(),
+            kind: mayhem_proto::AttestationTrustDataKind::VerificationKey,
+            sha256: "11".repeat(32),
+            media_type: ValidatedAttestationPolicy::MANAGED_VERIFIER_EXECUTABLE_MEDIA_TYPE
+                .to_owned(),
+            max_bytes: 1,
+            valid_from_epoch: None,
+            valid_until_epoch: None,
+            source: None,
+        };
+        assert!(ValidatedAttestationPolicy::parse_managed_verifier_trust_data(&malformed).is_err());
+        let mut wrong_media = malformed;
+        wrong_media.id = format!(
+            "managed-verifier.amd_sev_snp_vcek.{}.executable",
+            ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS[0]
+        );
+        wrong_media.media_type = "application/octet-stream".to_owned();
+        assert!(
+            ValidatedAttestationPolicy::parse_managed_verifier_trust_data(&wrong_media).is_err()
+        );
+        wrong_media.id = "ordinary-collateral".to_owned();
+        wrong_media.media_type = "application/vnd.mayhem.attestation-verifier-unknown".to_owned();
+        assert!(
+            ValidatedAttestationPolicy::parse_managed_verifier_trust_data(&wrong_media).is_err()
+        );
+    }
+
+    #[test]
     fn catalog_signing_guard_requires_additive_or_explicit_model_updates() {
         let temp = test_temp_dir("mayhem-catalog-additive-signing");
         let base_path = temp.join("base.json");
@@ -80999,76 +90138,76 @@ State initialization...
     }
 
     #[tokio::test]
-    async fn update_report_accepts_signed_test_release_and_stages_binary() {
+    async fn release_bundle_update_stages_complete_authenticated_tree() {
         let temp = test_temp_dir("mayhem-release-update-ok");
-        let release = write_test_release(&temp, b"mayhem-test-binary").unwrap();
-
-        let report = update_report(UpdateArgs {
-            home: Some(release.home.clone()),
-            target: Some(release.target.clone()),
-            version: None,
-            release_feed_url: None,
-            archive_url: None,
-            manifest_url: None,
-            signature_url: None,
-            archive_path: Some(release.archive_path.clone()),
-            manifest_path: Some(release.manifest_path.clone()),
-            signature_path: Some(release.signature_path.clone()),
-            release_keys_dir: Some(release.keys_dir.clone()),
-            release_public_key: None,
-            key_id: Some("test-release-key".to_owned()),
-            dry_run: false,
-            apply_staged: false,
-            stage_dir: None,
-            current_bin: None,
-            apply_delay_seconds: 3_600,
-            bypass_apply_delay: false,
-            post_upgrade_args: Vec::new(),
-            state_paths: Vec::new(),
-            json: true,
-        })
+        let release = write_test_release(&temp, "#!/bin/sh\nexit 0\n").unwrap();
+        let args = update_test_args(&release);
+        let layout = prepare_test_release_layout(&release.home).unwrap();
+        let report = update_report(
+            &args,
+            &layout,
+            release_bundle::ActivationRecovery::NoJournal,
+        )
         .await
         .unwrap();
 
         assert!(report.ok);
         assert_eq!(report.version, release.version);
         assert_eq!(report.target, release.target);
-        let staged_binary = report.staged_binary.unwrap();
+        let staged_binary = report.staged_primary_binary.unwrap();
         assert!(staged_binary.exists());
-        assert_eq!(fs::read(staged_binary).unwrap(), b"mayhem-test-binary");
-        assert!(report.stage_dir.unwrap().join("stage.json").exists());
+        assert_eq!(fs::read(staged_binary).unwrap(), b"#!/bin/sh\nexit 0\n");
+        let stage_dir = report.stage_dir.unwrap();
+        assert!(stage_dir
+            .join(release_bundle::RELEASE_STAGE_METADATA_PATH)
+            .exists());
+        assert!(stage_dir
+            .join(release_bundle::RELEASE_STAGE_PAYLOAD_ROOT)
+            .join("share/mayhem/intercom/src/main.js")
+            .exists());
+        assert_ne!(report.intercom_file_count, 0);
 
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn release_manifest_signature_rejects_low_order_forgery() {
+    #[tokio::test]
+    async fn release_bundle_update_rejects_low_order_signature_forgery() {
+        let temp = test_temp_dir("mayhem-release-update-low-order");
+        let release = write_test_release(&temp, "#!/bin/sh\nexit 0\n").unwrap();
         let (weak_key, weak_signature) = weak_identity_key_and_signature();
-        let manifest_bytes = br#"{"schema":1,"name":"mayhem"}"#;
-        let signature = ReleaseDetachedSignature {
-            schema_version: 1,
-            alg: "ed25519".to_owned(),
-            signed_path: "manifest.json".to_owned(),
-            key_id: "test-release-key".to_owned(),
-            public_key: weak_key.clone(),
-            sha256: sha256_bytes_hex(manifest_bytes),
-            sig: weak_signature,
-        };
-
-        verify_release_manifest_signature(
-            manifest_bytes,
-            &signature,
-            None,
-            Some(&weak_key),
-            Some("test-release-key"),
+        let mut signature: release_bundle::ReleaseDetachedSignature =
+            serde_json::from_slice(&fs::read(&release.signature_path).unwrap()).unwrap();
+        signature.public_key = weak_key.clone();
+        signature.sig = weak_signature;
+        write_json_file(&release.signature_path, &signature).unwrap();
+        write_json_file(
+            &release.keys_dir.join("test-release-key.json"),
+            &ReleasePublicKeyRecord {
+                key_id: "test-release-key".to_owned(),
+                alg: "ed25519".to_owned(),
+                public_key: weak_key,
+                status: "active".to_owned(),
+                created_at: "2026-07-19T00:00:00Z".to_owned(),
+            },
         )
+        .unwrap();
+        let args = update_test_args(&release);
+        let layout = prepare_test_release_layout(&release.home).unwrap();
+        let error = update_report(
+            &args,
+            &layout,
+            release_bundle::ActivationRecovery::NoJournal,
+        )
+        .await
         .expect_err("low-order release manifest forgery must fail strict verification");
+        assert!(format!("{error:#}").contains("signature verification failed"));
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[tokio::test]
-    async fn update_report_rejects_tampered_release_archive() {
+    async fn release_bundle_update_rejects_tampered_archive() {
         let temp = test_temp_dir("mayhem-release-update-tamper");
-        let release = write_test_release(&temp, b"mayhem-test-binary").unwrap();
+        let release = write_test_release(&temp, "#!/bin/sh\nexit 0\n").unwrap();
         fs::write(&release.binary_path, b"tampered-binary").unwrap();
         write_release_archive(
             &release.release_root,
@@ -81081,90 +90220,203 @@ State initialization...
             sha256_bytes_hex(b"tampered-binary")
         );
 
-        let err = update_report(UpdateArgs {
-            home: Some(release.home),
-            target: Some(release.target),
-            version: None,
-            release_feed_url: None,
-            archive_url: None,
-            manifest_url: None,
-            signature_url: None,
-            archive_path: Some(release.archive_path),
-            manifest_path: Some(release.manifest_path),
-            signature_path: Some(release.signature_path),
-            release_keys_dir: Some(release.keys_dir),
-            release_public_key: None,
-            key_id: Some("test-release-key".to_owned()),
-            dry_run: false,
-            apply_staged: false,
-            stage_dir: None,
-            current_bin: None,
-            apply_delay_seconds: 3_600,
-            bypass_apply_delay: false,
-            post_upgrade_args: Vec::new(),
-            state_paths: Vec::new(),
-            json: true,
-        })
+        let args = update_test_args(&release);
+        let layout = prepare_test_release_layout(&release.home).unwrap();
+        let error = update_report(
+            &args,
+            &layout,
+            release_bundle::ActivationRecovery::NoJournal,
+        )
         .await
         .expect_err("tampered archive must fail verification");
 
-        assert!(format!("{err:#}").contains("sha256 mismatch"));
+        assert!(format!("{error:#}").contains("SHA-256 mismatch"));
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[test]
-    fn update_apply_rejects_staged_update_before_delay() {
+    #[tokio::test]
+    async fn release_bundle_update_apply_enforces_delay() {
         let temp = test_temp_dir("mayhem-update-delay");
-        let home = temp.join("home");
-        let current_bin = temp.join("current-mayhem");
-        write_executable_file(&current_bin, "#!/bin/sh\nexit 0\n").unwrap();
-        let stage_dir =
-            write_test_stage(&home, "#!/bin/sh\nexit 0\n", unix_epoch_seconds().unwrap()).unwrap();
-
-        let err = update_apply_report(update_apply_test_args(
-            &home,
-            &stage_dir,
-            &current_bin,
-            3_600,
-            false,
-        ))
+        let release = write_test_release(&temp, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut args = update_test_args(&release);
+        let layout = prepare_test_release_layout(&release.home).unwrap();
+        let staged = update_report(
+            &args,
+            &layout,
+            release_bundle::ActivationRecovery::NoJournal,
+        )
+        .await
+        .unwrap();
+        args.apply_staged = true;
+        args.stage_dir = staged.stage_dir;
+        args.apply_delay_seconds = 3_600;
+        let protected = protected_release_paths(&layout, args.release_keys_dir.as_deref()).unwrap();
+        let error = update_apply_report(
+            &args,
+            &layout,
+            &protected,
+            release_bundle::ActivationRecovery::NoJournal,
+        )
         .expect_err("apply must wait for the configured delay");
 
-        assert!(format!("{err:#}").contains("delay has not elapsed"));
-        assert!(std::process::Command::new(&current_bin)
-            .status()
-            .unwrap()
-            .success());
+        assert!(format!("{error:#}").contains("delay has not elapsed"));
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn release_bundle_update_rejects_stage_path_escape() {
+        let temp = test_temp_dir("mayhem-update-stage-escape");
+        let release = write_test_release(&temp, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut args = update_test_args(&release);
+        let layout = prepare_test_release_layout(&release.home).unwrap();
+        let staged = update_report(
+            &args,
+            &layout,
+            release_bundle::ActivationRecovery::NoJournal,
+        )
+        .await
+        .unwrap();
+        let escaped_stage = layout.update_root.join("escaped-stage");
+        fs::rename(staged.stage_dir.unwrap(), &escaped_stage).unwrap();
+        args.apply_staged = true;
+        args.stage_dir = Some(layout.staged_root.join("..").join("escaped-stage"));
+        args.bypass_apply_delay = true;
+        let protected = protected_release_paths(&layout, args.release_keys_dir.as_deref()).unwrap();
+        let error = update_apply_report(
+            &args,
+            &layout,
+            &protected,
+            release_bundle::ActivationRecovery::NoJournal,
+        )
+        .expect_err("a lexical stage-root escape must never be applied");
+
+        assert!(format!("{error:#}").contains("published immediate child"));
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn release_bundle_update_apply_rolls_back_bin_share_and_floor() {
+        let temp = test_temp_dir("mayhem-update-rollback");
+        let release = write_test_release(&temp, "#!/bin/sh\nexit 23\n").unwrap();
+        let mut args = update_test_args(&release);
+        let layout = prepare_test_release_layout(&release.home).unwrap();
+        write_test_active_release(&layout).unwrap();
+        let state_path = release.home.join("stores").join("main").join("db");
+        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        fs::write(&state_path, b"canonical-state").unwrap();
+        let old_floor =
+            release_bundle::read_release_anti_rollback_floor(&layout.anti_rollback_floor).unwrap();
+        let staged = update_report(
+            &args,
+            &layout,
+            release_bundle::ActivationRecovery::NoJournal,
+        )
+        .await
+        .unwrap();
+        args.apply_staged = true;
+        args.stage_dir = staged.stage_dir;
+        args.bypass_apply_delay = true;
+        args.post_upgrade_args = vec!["--health".to_owned()];
+        let protected = protected_release_paths(&layout, args.release_keys_dir.as_deref()).unwrap();
+        let error = update_apply_report(
+            &args,
+            &layout,
+            &protected,
+            release_bundle::ActivationRecovery::NoJournal,
+        )
+        .expect_err("broken staged release must roll back");
+
+        assert!(format!("{error:#}").contains("rolled back"));
+        assert_eq!(
+            fs::read(layout.bin_root.join(release_mayhem_binary_name())).unwrap(),
+            b"#!/bin/sh\nexit 0\n"
+        );
+        assert_eq!(
+            fs::read(layout.asset_root.join("RULES.md")).unwrap(),
+            b"old-rules"
+        );
+        assert_eq!(
+            release_bundle::read_release_anti_rollback_floor(&layout.anti_rollback_floor).unwrap(),
+            old_floor
+        );
+        assert_eq!(fs::read(state_path).unwrap(), b"canonical-state");
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[tokio::test]
+    async fn release_bundle_update_apply_commits_complete_release_and_preserves_store() {
+        let temp = test_temp_dir("mayhem-update-commit");
+        let release = write_test_release(&temp, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut args = update_test_args(&release);
+        let layout = prepare_test_release_layout(&release.home).unwrap();
+        write_test_active_release(&layout).unwrap();
+        let state_path = release.home.join("stores").join("main").join("db");
+        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        fs::write(&state_path, b"canonical-state").unwrap();
+        let staged = update_report(
+            &args,
+            &layout,
+            release_bundle::ActivationRecovery::NoJournal,
+        )
+        .await
+        .unwrap();
+        let stage_dir = staged.stage_dir.clone().unwrap();
+        args.apply_staged = true;
+        args.stage_dir = staged.stage_dir;
+        args.bypass_apply_delay = true;
+        args.post_upgrade_args = vec!["--health".to_owned()];
+        let protected = protected_release_paths(&layout, args.release_keys_dir.as_deref()).unwrap();
+        let report = update_apply_report(
+            &args,
+            &layout,
+            &protected,
+            release_bundle::ActivationRecovery::NoJournal,
+        )
+        .unwrap();
+
+        assert!(report.ok);
+        assert_eq!(
+            fs::read(layout.bin_root.join(release_mayhem_binary_name())).unwrap(),
+            b"#!/bin/sh\nexit 0\n"
+        );
+        assert_eq!(
+            fs::read(layout.asset_root.join("RULES.md")).unwrap(),
+            b"new-rules"
+        );
+        assert!(layout
+            .asset_root
+            .join("intercom/contract/release.json")
+            .is_file());
+        assert_eq!(fs::read(state_path).unwrap(), b"canonical-state");
+        assert_eq!(
+            release_bundle::read_release_anti_rollback_floor(&layout.anti_rollback_floor).unwrap(),
+            release.version
+        );
+        assert!(!stage_dir.exists());
+        assert!(!release_bundle::activation_journal_path(&layout.install_root).exists());
         let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
-    fn update_apply_rolls_back_broken_staged_binary() {
-        let temp = test_temp_dir("mayhem-update-rollback");
-        let home = temp.join("home");
-        let current_bin = temp.join("current-mayhem");
-        write_executable_file(&current_bin, "#!/bin/sh\nexit 0\n").unwrap();
-        let state_path = home.join("config.toml");
-        write_json_file(&state_path, &json!({ "version": "old" })).unwrap();
-        let stage_dir = write_test_stage(&home, "#!/bin/sh\nexit 23\n", 0).unwrap();
-
-        let mut args = update_apply_test_args(&home, &stage_dir, &current_bin, 0, false);
-        args.state_paths = vec![state_path.clone()];
-        args.post_upgrade_args = vec!["--health".to_owned()];
-        let err = update_apply_report(args).expect_err("broken staged update must roll back");
-
-        assert!(format!("{err:#}").contains("rolled back"));
-        assert!(std::process::Command::new(&current_bin)
-            .arg("--health")
-            .status()
-            .unwrap()
-            .success());
-        assert_eq!(
-            read_json_file(&state_path).unwrap(),
-            json!({ "version": "old" })
-        );
-        assert!(home.join("updates").join("backups").exists());
-        let _ = fs::remove_dir_all(temp);
+    fn release_bundle_windows_helper_identity_binds_pid_time_and_path() {
+        let expected = WindowsUpdateProcessIdentity {
+            pid: 42,
+            creation_time_utc_ticks: "638885000000000000".to_owned(),
+            executable_path: PathBuf::from(r"C:\Users\Test\.mayhem\bin\mayhem.exe"),
+        };
+        let mut actual = expected.clone();
+        actual.executable_path = PathBuf::from(r"c:/users/test/.mayhem/bin/MAYHEM.exe");
+        validate_windows_update_process_identity(&expected, &actual).unwrap();
+        assert!(windows_path_is_within(
+            &actual.executable_path,
+            Path::new(r"C:\Users\Test\.mayhem\bin")
+        ));
+        assert!(!windows_path_is_within(
+            Path::new(r"C:\Users\Test\.mayhem\bin-shadow\mayhem.exe"),
+            Path::new(r"C:\Users\Test\.mayhem\bin")
+        ));
+        actual.creation_time_utc_ticks = "638885000000000001".to_owned();
+        assert!(validate_windows_update_process_identity(&expected, &actual).is_err());
     }
 
     #[test]
@@ -81586,23 +90838,6 @@ State initialization...
             submit: false,
             sim: false,
             json: true,
-        }
-    }
-
-    fn test_payout_confirm_args() -> AdminPayoutConfirmArgs {
-        AdminPayoutConfirmArgs {
-            tx: test_admin_tx_args(),
-            kind: AdminPayoutConfirmKind::Provider,
-            rail: AdminPayoutMethod::Tnk,
-            epoch: 7,
-            who: "provider-a".to_owned(),
-            au: 1_000_000,
-            tnk_e18: Some("500000000000000000".to_owned()),
-            msb_tx_hash: Some("msb-tx".to_owned()),
-            external_ref: None,
-            fiat_currency: None,
-            fiat_amount_minor: None,
-            at: 25_200,
         }
     }
 
@@ -82255,31 +91490,626 @@ State initialization...
         dir
     }
 
-    fn write_test_release(temp: &Path, binary_bytes: &[u8]) -> Result<TestRelease> {
-        let version = "test-d1".to_owned();
+    const TEST_CATALOG_AUTHORITY_VERSION: &str = "0.2.23";
+    const TEST_CATALOG_AUTHORITY_SOURCE_GIT_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    struct CatalogAuthorityTestFixture {
+        temp: PathBuf,
+        catalog_path: PathBuf,
+        policy_chain_path: PathBuf,
+        bindings_path: PathBuf,
+        release_dir: PathBuf,
+        release_key: PathBuf,
+        release_seed_file: PathBuf,
+    }
+
+    impl CatalogAuthorityTestFixture {
+        fn request(
+            &self,
+            output: PathBuf,
+            mode: CatalogAttestationAuthorityApplyMode,
+        ) -> CatalogApplyAttestationAuthorityRequest {
+            CatalogApplyAttestationAuthorityRequest {
+                catalog_path: self.catalog_path.clone(),
+                policy_chain_path: self.policy_chain_path.clone(),
+                bindings_path: self.bindings_path.clone(),
+                release_dirs: vec![self.release_dir.clone()],
+                release_key: self.release_key.clone(),
+                release_key_id: "test-release-key".to_owned(),
+                source_git_sha: TEST_CATALOG_AUTHORITY_SOURCE_GIT_SHA.to_owned(),
+                mode,
+                release_version: TEST_CATALOG_AUTHORITY_VERSION.to_owned(),
+                public_origin: "https://downloads.example".to_owned(),
+                public_path: format!("/mayhem/{TEST_CATALOG_AUTHORITY_VERSION}"),
+                output,
+            }
+        }
+
+        fn final_request(&self, output: PathBuf) -> CatalogApplyAttestationAuthorityRequest {
+            self.request(output, CatalogAttestationAuthorityApplyMode::FinalRelease)
+        }
+
+        fn draft_request(&self, output: PathBuf) -> CatalogApplyAttestationAuthorityRequest {
+            self.request(
+                output,
+                CatalogAttestationAuthorityApplyMode::IncrementalDraft,
+            )
+        }
+
+        fn executable_path(&self, target: &str) -> PathBuf {
+            self.release_dir.join(format!(
+                "mayhem-attestation-verifier-{TEST_CATALOG_AUTHORITY_VERSION}-{target}{}",
+                if target.ends_with("-pc-windows-msvc") {
+                    ".exe"
+                } else {
+                    ""
+                }
+            ))
+        }
+
+        fn managed_manifest_path(&self, target: &str) -> PathBuf {
+            self.release_dir.join(format!(
+                "mayhem-attestation-verifier-{TEST_CATALOG_AUTHORITY_VERSION}-{target}.manifest.json"
+            ))
+        }
+
+        fn generic_manifest_path(&self, target: &str) -> PathBuf {
+            self.release_dir.join(format!(
+                "mayhem-{TEST_CATALOG_AUTHORITY_VERSION}-{target}.manifest.json"
+            ))
+        }
+
+        fn signature_path(&self, target: &str) -> PathBuf {
+            self.release_dir.join(format!(
+                "mayhem-{TEST_CATALOG_AUTHORITY_VERSION}-{target}.manifest.json.sig"
+            ))
+        }
+
+        fn target_key_path(&self, target: &str) -> PathBuf {
+            self.release_dir.join(format!(
+                "mayhem-{TEST_CATALOG_AUTHORITY_VERSION}-{target}.release-key.json"
+            ))
+        }
+
+        fn remove_target(&self, target: &str) {
+            for path in [
+                self.executable_path(target),
+                self.managed_manifest_path(target),
+                self.generic_manifest_path(target),
+                self.signature_path(target),
+                self.target_key_path(target),
+            ] {
+                fs::remove_file(path).unwrap();
+            }
+        }
+
+        fn resign_target(&self, target: &str) {
+            release_sign_report(ReleaseSignRequest {
+                manifest_path: self.generic_manifest_path(target),
+                signature_output: self.signature_path(target),
+                keys_dir: self.temp.join("release-keys"),
+                key_id: "test-release-key".to_owned(),
+                seed_file: self.release_seed_file.clone(),
+                write_key: false,
+                created_at: None,
+            })
+            .unwrap();
+        }
+
+        fn install_signed_manifest(
+            &self,
+            publication_target: &str,
+            manifest: &release_bundle::ReleaseBundleManifest,
+        ) {
+            let signing_dir = self
+                .temp
+                .join(format!("resign-{}-{}", manifest.version, manifest.target));
+            fs::create_dir_all(&signing_dir).unwrap();
+            let signing_manifest_path = signing_dir.join(format!(
+                "mayhem-{}-{}.manifest.json",
+                manifest.version, manifest.target
+            ));
+            let signing_signature_path = signing_manifest_path.with_file_name(format!(
+                "mayhem-{}-{}.manifest.json.sig",
+                manifest.version, manifest.target
+            ));
+            write_json_file(&signing_manifest_path, manifest).unwrap();
+            release_sign_report(ReleaseSignRequest {
+                manifest_path: signing_manifest_path.clone(),
+                signature_output: signing_signature_path.clone(),
+                keys_dir: self.temp.join("release-keys"),
+                key_id: "test-release-key".to_owned(),
+                seed_file: self.release_seed_file.clone(),
+                write_key: false,
+                created_at: None,
+            })
+            .unwrap();
+            fs::copy(
+                signing_manifest_path,
+                self.generic_manifest_path(publication_target),
+            )
+            .unwrap();
+            fs::copy(
+                signing_signature_path,
+                self.signature_path(publication_target),
+            )
+            .unwrap();
+        }
+    }
+
+    fn read_catalog_authority_candidate(path: &Path) -> Value {
+        let value = read_json_file(path).unwrap();
+        if value.get("document_type").and_then(Value::as_str)
+            == Some(CATALOG_AUTHORITY_INCREMENTAL_DRAFT_DOCUMENT_TYPE)
+        {
+            let draft: CatalogAttestationAuthorityIncrementalDraft =
+                serde_json::from_value(value).unwrap();
+            assert_eq!(
+                draft.schema_version,
+                CATALOG_AUTHORITY_INCREMENTAL_DRAFT_SCHEMA_VERSION
+            );
+            assert_eq!(
+                draft.document_type,
+                CATALOG_AUTHORITY_INCREMENTAL_DRAFT_DOCUMENT_TYPE
+            );
+            assert_eq!(
+                draft.mode,
+                CatalogAttestationAuthorityApplyMode::IncrementalDraft
+            );
+            draft.candidate_catalog
+        } else {
+            value
+        }
+    }
+
+    fn assert_catalog_authority_rejected(
+        fixture: &CatalogAuthorityTestFixture,
+        expected_error: &str,
+    ) {
+        let output = fixture.temp.join("rejected-output.json");
+        let error =
+            catalog_apply_attestation_authority_report(fixture.final_request(output.clone()))
+                .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(expected_error),
+            "unexpected error: {error:#}"
+        );
+        assert!(!output.exists());
+    }
+
+    fn next_catalog_authority_policy(
+        previous: &AdminAttestationPolicy,
+        sequence: u64,
+    ) -> AdminAttestationPolicy {
+        let previous_digest = ValidatedAttestationPolicy::validate(previous.clone())
+            .unwrap()
+            .digest()
+            .to_owned();
+        let mut intended = previous.clone();
+        intended.sequence = sequence;
+        intended.previous_policy_digest = Some(previous_digest);
+        intended.issued_epoch = sequence;
+        intended.effective_epoch = sequence;
+        intended.trust_data.retain(|reference| {
+            ValidatedAttestationPolicy::parse_managed_verifier_trust_data(reference)
+                .unwrap()
+                .is_none()
+        });
+        let retained_origins = intended
+            .trust_data
+            .iter()
+            .filter_map(|reference| {
+                reference
+                    .source
+                    .as_ref()
+                    .map(|source| source.origin_pin.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        intended
+            .origin_pins
+            .retain(|origin| retained_origins.contains(&origin.id));
+        intended
+    }
+
+    fn write_catalog_authority_test_fixture(prefix: &str) -> CatalogAuthorityTestFixture {
+        let temp = test_temp_dir(prefix);
+        let catalog_path = temp.join("catalog.json");
+        write_semantically_valid_test_catalog(&catalog_path);
+        let policy_chain_path = temp.join("policy-chain.json");
+        let bindings_path = temp.join("bindings.json");
+        let release_dir = temp.join("release");
+        fs::create_dir_all(&release_dir).unwrap();
+
+        let ordinary_source = |path: &str| {
+            Some(mayhem_proto::AttestationTrustDataSource {
+                origin_pin: "policy-input".to_owned(),
+                path: path.to_owned(),
+            })
+        };
+        let trust_data = vec![
+            AttestationTrustDataRef {
+                id: "amd-cpu".to_owned(),
+                kind: mayhem_proto::AttestationTrustDataKind::Measurement,
+                sha256: "11".repeat(32),
+                media_type: "application/json".to_owned(),
+                max_bytes: 1024,
+                valid_from_epoch: None,
+                valid_until_epoch: None,
+                source: ordinary_source("/amd-cpu.json"),
+            },
+            AttestationTrustDataRef {
+                id: "amd-root".to_owned(),
+                kind: mayhem_proto::AttestationTrustDataKind::TrustAnchor,
+                sha256: "22".repeat(32),
+                media_type: "application/pkix-cert".to_owned(),
+                max_bytes: 1024,
+                valid_from_epoch: None,
+                valid_until_epoch: None,
+                source: ordinary_source("/amd-root.der"),
+            },
+            AttestationTrustDataRef {
+                id: "amd-workload".to_owned(),
+                kind: mayhem_proto::AttestationTrustDataKind::Measurement,
+                sha256: "33".repeat(32),
+                media_type: "application/json".to_owned(),
+                max_bytes: 1024,
+                valid_from_epoch: None,
+                valid_until_epoch: None,
+                source: ordinary_source("/amd-workload.json"),
+            },
+        ];
+        let quote_kinds = HardwareQuoteKind::ALL
+            .into_iter()
+            .map(|kind| {
+                let enabled = kind == HardwareQuoteKind::AmdSevSnpVcek;
+                mayhem_proto::AttestationQuoteKindPolicy {
+                    kind,
+                    enabled,
+                    verifier_profile: test_attestation_verifier_profile(kind),
+                    evidence_schema_version: 1,
+                    required_trust_data: if enabled {
+                        BTreeSet::from([
+                            "amd-cpu".to_owned(),
+                            "amd-root".to_owned(),
+                            "amd-workload".to_owned(),
+                        ])
+                    } else {
+                        BTreeSet::new()
+                    },
+                    measurement_trust_data: if enabled {
+                        BTreeSet::from(["amd-cpu".to_owned(), "amd-workload".to_owned()])
+                    } else {
+                        BTreeSet::new()
+                    },
+                    required_measurement_layers: if enabled {
+                        BTreeSet::from([
+                            mayhem_proto::AttestationMeasurementLayer::Cpu,
+                            mayhem_proto::AttestationMeasurementLayer::Workload,
+                        ])
+                    } else {
+                        BTreeSet::new()
+                    },
+                    platforms: if enabled {
+                        BTreeSet::from(["amd-sev-snp".to_owned()])
+                    } else {
+                        BTreeSet::new()
+                    },
+                }
+            })
+            .collect();
+        let policy = AdminAttestationPolicy {
+            schema_version: mayhem_proto::ATTESTATION_POLICY_SCHEMA_VERSION,
+            sequence: 1,
+            previous_policy_digest: None,
+            issued_epoch: 1,
+            effective_epoch: 1,
+            expires_epoch: None,
+            min_verifier_version: 1,
+            emergency_disabled_quote_kinds: BTreeSet::new(),
+            origin_pins: vec![mayhem_proto::AttestationOriginPin {
+                id: "policy-input".to_owned(),
+                https_origin: "https://policy.example".to_owned(),
+            }],
+            trust_data,
+            quote_kinds,
+        };
+        let bindings = vec![mayhem_proto::AdminEnclaveAttestationBinding {
+            enclave_id: "44".repeat(32),
+            kind: HardwareQuoteKind::AmdSevSnpVcek,
+            platform: Some("amd-sev-snp".to_owned()),
+            measurement_trust_data: BTreeMap::from([
+                (
+                    mayhem_proto::AttestationMeasurementLayer::Cpu,
+                    "amd-cpu".to_owned(),
+                ),
+                (
+                    mayhem_proto::AttestationMeasurementLayer::Workload,
+                    "amd-workload".to_owned(),
+                ),
+            ]),
+        }];
+        write_json_file(&policy_chain_path, &vec![policy]).unwrap();
+        write_json_file(&bindings_path, &bindings).unwrap();
+
+        let release_seed_file = temp.join("release-seed.hex");
+        fs::write(&release_seed_file, "2a".repeat(32)).unwrap();
+        let release_keys_dir = temp.join("release-keys");
+        let release_key = release_keys_dir.join("test-release-key.json");
+        for target in ValidatedAttestationPolicy::MANAGED_VERIFIER_TARGETS {
+            let windows = target.ends_with("-pc-windows-msvc");
+            let executable_name = format!(
+                "mayhem-attestation-verifier-{TEST_CATALOG_AUTHORITY_VERSION}-{target}{}",
+                if windows { ".exe" } else { "" }
+            );
+            let manifest_name = format!(
+                "mayhem-attestation-verifier-{TEST_CATALOG_AUTHORITY_VERSION}-{target}.manifest.json"
+            );
+            let executable = format!("test-verifier-binary:{target}").into_bytes();
+            let executable_sha256 = sha256_bytes_hex(&executable);
+            fs::write(release_dir.join(&executable_name), &executable).unwrap();
+            let managed_manifest = json!({
+                "schema_version": 1,
+                "target": target,
+                "verifier_id": "mayhem-attestation-verifier",
+                "version": 1,
+                "executable_sha256": executable_sha256,
+                "profiles": {
+                    "amd_sev_snp_vcek_v1": [1],
+                    "intel_tdx_dcap_v1": [1],
+                    "nvidia_nras_composite_v1": [1],
+                    "nvidia_nvtrust_offline_composite_v1": [1]
+                }
+            });
+            let managed_manifest_bytes = serde_json::to_vec_pretty(&managed_manifest).unwrap();
+            fs::write(release_dir.join(&manifest_name), &managed_manifest_bytes).unwrap();
+            let mut binaries = Vec::new();
+            let mut assets = Vec::new();
+            for base_name in [
+                "mayhem",
+                "mayhem-gateway",
+                "mayhem-pay",
+                "mayhemd",
+                "mayhem-enclave",
+                "mayhem-paygate",
+                "mayhem-attestation-verifier",
+            ] {
+                let name = format!("{base_name}{}", if windows { ".exe" } else { "" });
+                let path = format!("bin/{name}");
+                let sha256 = if base_name == "mayhem-attestation-verifier" {
+                    executable_sha256.clone()
+                } else {
+                    sha256_bytes_hex(format!("test-binary:{target}:{name}").as_bytes())
+                };
+                binaries.push(release_bundle::ReleaseBundleBinary {
+                    name,
+                    path: path.clone(),
+                    sha256: sha256.clone(),
+                });
+                assets.push(release_bundle::ReleaseBundleAsset { path, sha256 });
+            }
+            assets.push(release_bundle::ReleaseBundleAsset {
+                path: executable_name,
+                sha256: executable_sha256,
+            });
+            assets.push(release_bundle::ReleaseBundleAsset {
+                path: manifest_name,
+                sha256: sha256_bytes_hex(&managed_manifest_bytes),
+            });
+            let intercom_path = "share/mayhem/intercom/contract/contract.js".to_owned();
+            let intercom_sha256 =
+                sha256_bytes_hex(format!("test-intercom-contract:{target}").as_bytes());
+            assets.push(release_bundle::ReleaseBundleAsset {
+                path: intercom_path.clone(),
+                sha256: intercom_sha256.clone(),
+            });
+            assets.sort_by(|left, right| left.path.cmp(&right.path));
+            let release_manifest = release_bundle::ReleaseBundleManifest {
+                schema: 1,
+                name: "mayhem".to_owned(),
+                version: TEST_CATALOG_AUTHORITY_VERSION.to_owned(),
+                target: target.to_owned(),
+                built_at_utc: "2026-07-20T00:00:00Z".to_owned(),
+                source_git_sha: TEST_CATALOG_AUTHORITY_SOURCE_GIT_SHA.to_owned(),
+                binaries,
+                assets,
+                intercom: release_bundle::IntercomBundleManifest {
+                    schema: 1,
+                    release_version: TEST_CATALOG_AUTHORITY_VERSION.to_owned(),
+                    contract_version: 13,
+                    contract_code_sha256: intercom_sha256.clone(),
+                    assets: vec![release_bundle::IntercomBundleAsset {
+                        path: intercom_path,
+                        sha256: intercom_sha256,
+                    }],
+                },
+            };
+            release_manifest.validate().unwrap();
+            let generic_manifest_path = release_dir.join(format!(
+                "mayhem-{TEST_CATALOG_AUTHORITY_VERSION}-{target}.manifest.json"
+            ));
+            write_json_file(&generic_manifest_path, &release_manifest).unwrap();
+            let signature_path = release_dir.join(format!(
+                "mayhem-{TEST_CATALOG_AUTHORITY_VERSION}-{target}.manifest.json.sig"
+            ));
+            release_sign_report(ReleaseSignRequest {
+                manifest_path: generic_manifest_path,
+                signature_output: signature_path,
+                keys_dir: release_keys_dir.clone(),
+                key_id: "test-release-key".to_owned(),
+                seed_file: release_seed_file.clone(),
+                write_key: true,
+                created_at: Some("2026-07-20T00:00:00Z".to_owned()),
+            })
+            .unwrap();
+            fs::copy(
+                &release_key,
+                release_dir.join(format!(
+                    "mayhem-{TEST_CATALOG_AUTHORITY_VERSION}-{target}.release-key.json"
+                )),
+            )
+            .unwrap();
+        }
+
+        CatalogAuthorityTestFixture {
+            temp,
+            catalog_path,
+            policy_chain_path,
+            bindings_path,
+            release_dir,
+            release_key,
+            release_seed_file,
+        }
+    }
+
+    fn test_attestation_verifier_profile(
+        kind: HardwareQuoteKind,
+    ) -> mayhem_proto::AttestationVerifierProfile {
+        match kind {
+            HardwareQuoteKind::AppleAppAttestJwt => {
+                mayhem_proto::AttestationVerifierProfile::AppleAppAttestNativeV1
+            }
+            HardwareQuoteKind::AmdSevSnpVcek => {
+                mayhem_proto::AttestationVerifierProfile::AmdSevSnpVcekV1
+            }
+            HardwareQuoteKind::IntelTdxDcap => {
+                mayhem_proto::AttestationVerifierProfile::IntelTdxDcapV1
+            }
+            HardwareQuoteKind::NvidiaGb10DeviceJwt => {
+                mayhem_proto::AttestationVerifierProfile::NvidiaGb10DeviceV1
+            }
+            HardwareQuoteKind::NvidiaNrasJwt => {
+                mayhem_proto::AttestationVerifierProfile::NvidiaNrasCompositeV1
+            }
+            HardwareQuoteKind::NvidiaNvtrustOfflineJwt => {
+                mayhem_proto::AttestationVerifierProfile::NvidiaNvtrustOfflineCompositeV1
+            }
+            HardwareQuoteKind::Tpm2QuoteEk => {
+                mayhem_proto::AttestationVerifierProfile::Tpm2EkActivateCredentialV1
+            }
+        }
+    }
+
+    fn write_test_release(temp: &Path, primary_binary: &str) -> Result<TestRelease> {
+        let version = "0.2.23".to_owned();
         let target = release_host_target();
         let base_name = format!("mayhem-{version}-{target}");
         let release_root = temp.join(&base_name);
         let bin_dir = release_root.join("bin");
         fs::create_dir_all(&bin_dir)?;
         let binary_path = bin_dir.join(release_mayhem_binary_name());
-        fs::write(&binary_path, binary_bytes)?;
-        let binary_sha256 = file_sha256_hex(&binary_path)?;
+        write_executable_file(&binary_path, primary_binary)?;
+        let binary_names = [
+            "mayhem",
+            "mayhem-gateway",
+            "mayhem-pay",
+            "mayhemd",
+            "mayhem-enclave",
+            "mayhem-paygate",
+            "mayhem-attestation-verifier",
+        ];
+        let mut binaries = Vec::new();
+        let mut assets = Vec::new();
+        for base_name in binary_names {
+            let name = if target.contains("windows") {
+                format!("{base_name}.exe")
+            } else {
+                base_name.to_owned()
+            };
+            let path = bin_dir.join(&name);
+            if name != release_mayhem_binary_name() {
+                write_executable_file(&path, "#!/bin/sh\nexit 0\n")?;
+            }
+            let sha256 = file_sha256_hex(&path)?;
+            let relative = format!("bin/{name}");
+            binaries.push(release_bundle::ReleaseBundleBinary {
+                name,
+                path: relative.clone(),
+                sha256: sha256.clone(),
+            });
+            assets.push(release_bundle::ReleaseBundleAsset {
+                path: relative,
+                sha256,
+            });
+        }
+
+        let payload_files: [(&str, &[u8]); 5] = [
+            ("README.md", b"release readme"),
+            ("share/mayhem/RULES.md", b"new-rules"),
+            (
+                "share/mayhem/intercom/contract/release.json",
+                br#"{"schema":1}"#,
+            ),
+            (
+                "share/mayhem/intercom/contract/contract.js",
+                b"module.exports = {};",
+            ),
+            (
+                "share/mayhem/intercom/src/main.js",
+                b"export const release = true;",
+            ),
+        ];
+        for (relative, contents) in payload_files {
+            let path = release_root.join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&path, contents)?;
+            assets.push(release_bundle::ReleaseBundleAsset {
+                path: relative.to_owned(),
+                sha256: file_sha256_hex(&path)?,
+            });
+        }
+        assets.sort_by(|left, right| left.path.cmp(&right.path));
+        let intercom_assets = assets
+            .iter()
+            .filter(|asset| {
+                asset
+                    .path
+                    .starts_with(release_bundle::INTERCOM_BUNDLE_ASSET_PREFIX)
+            })
+            .map(|asset| release_bundle::IntercomBundleAsset {
+                path: asset.path.clone(),
+                sha256: asset.sha256.clone(),
+            })
+            .collect::<Vec<_>>();
+        let contract_code_sha256 =
+            file_sha256_hex(&release_root.join("share/mayhem/intercom/contract/contract.js"))?;
+        let manifest = release_bundle::ReleaseBundleManifest {
+            schema: 1,
+            name: "mayhem".to_owned(),
+            version: version.clone(),
+            target: target.clone(),
+            built_at_utc: "2026-07-19T00:00:00Z".to_owned(),
+            source_git_sha: TEST_CATALOG_AUTHORITY_SOURCE_GIT_SHA.to_owned(),
+            binaries,
+            assets,
+            intercom: release_bundle::IntercomBundleManifest {
+                schema: 1,
+                release_version: version.clone(),
+                contract_version: 13,
+                contract_code_sha256,
+                assets: intercom_assets,
+            },
+        };
         let manifest_path = release_root.join("manifest.json");
-        write_json_file(
-            &manifest_path,
-            &json!({
-                "schema": 1,
-                "name": "mayhem",
-                "version": version,
-                "target": target,
-                "built_at_utc": "2026-07-05T00:00:00Z",
-                "binaries": [{
-                    "name": release_mayhem_binary_name(),
-                    "path": format!("bin/{}", release_mayhem_binary_name()),
-                    "sha256": binary_sha256
-                }]
-            }),
+        write_json_file(&manifest_path, &manifest)?;
+        let mut checksum_entries = manifest
+            .assets
+            .iter()
+            .map(|asset| (asset.path.clone(), asset.sha256.clone()))
+            .collect::<Vec<_>>();
+        checksum_entries.push((
+            release_bundle::RELEASE_MANIFEST_PATH.to_owned(),
+            file_sha256_hex(&manifest_path)?,
+        ));
+        checksum_entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut checksums = String::new();
+        for (relative, sha256) in checksum_entries {
+            writeln!(&mut checksums, "{sha256}  {relative}")?;
+        }
+        fs::write(
+            release_root.join(release_bundle::RELEASE_CHECKSUMS_PATH),
+            checksums,
         )?;
         let detached_manifest_path = temp.join(format!("{base_name}.manifest.json"));
         fs::copy(&manifest_path, &detached_manifest_path)?;
@@ -82333,29 +92163,6 @@ State initialization...
         Ok(())
     }
 
-    fn write_test_stage(home: &Path, script: &str, staged_at_unix: u64) -> Result<PathBuf> {
-        let stage_dir = home.join("updates").join("staged").join(format!(
-            "test-stage-{}",
-            TEST_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let bin_dir = stage_dir.join("bin");
-        fs::create_dir_all(&bin_dir)?;
-        write_executable_file(&bin_dir.join(release_mayhem_binary_name()), script)?;
-        write_json_file(
-            &stage_dir.join("stage.json"),
-            &ReleaseStageMetadata {
-                schema: 1,
-                version: "test-d2".to_owned(),
-                target: release_host_target(),
-                manifest_sha256: "aa".repeat(32),
-                key_id: "test-release-key".to_owned(),
-                public_key: "bb".repeat(32),
-                staged_at_unix,
-            },
-        )?;
-        Ok(stage_dir)
-    }
-
     fn write_executable_file(path: &Path, content: &str) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -82369,37 +92176,49 @@ State initialization...
         Ok(())
     }
 
-    fn update_apply_test_args(
-        home: &Path,
-        stage_dir: &Path,
-        current_bin: &Path,
-        delay_seconds: u64,
-        bypass_delay: bool,
-    ) -> UpdateArgs {
+    fn update_test_args(release: &TestRelease) -> UpdateArgs {
         UpdateArgs {
-            home: Some(home.to_path_buf()),
-            target: None,
+            home: Some(release.home.clone()),
+            target: Some(release.target.clone()),
             version: None,
             release_feed_url: None,
             archive_url: None,
             manifest_url: None,
             signature_url: None,
-            archive_path: None,
-            manifest_path: None,
-            signature_path: None,
-            release_keys_dir: None,
+            archive_path: Some(release.archive_path.clone()),
+            manifest_path: Some(release.manifest_path.clone()),
+            signature_path: Some(release.signature_path.clone()),
+            release_keys_dir: Some(release.keys_dir.clone()),
             release_public_key: None,
-            key_id: None,
+            key_id: Some("test-release-key".to_owned()),
             dry_run: false,
-            apply_staged: true,
-            stage_dir: Some(stage_dir.to_path_buf()),
-            current_bin: Some(current_bin.to_path_buf()),
-            apply_delay_seconds: delay_seconds,
-            bypass_apply_delay: bypass_delay,
+            apply_staged: false,
+            stage_dir: None,
+            apply_delay_seconds: 3_600,
+            bypass_apply_delay: false,
             post_upgrade_args: Vec::new(),
-            state_paths: Vec::new(),
             json: true,
+            internal_helper_request: None,
         }
+    }
+
+    fn prepare_test_release_layout(home: &Path) -> Result<ReleaseInstallLayout> {
+        let layout = ReleaseInstallLayout::new(absolutize(home.to_path_buf())?);
+        ensure_release_install_layout(&layout)?;
+        initialize_release_floor_if_needed(&layout)?;
+        Ok(layout)
+    }
+
+    fn write_test_active_release(layout: &ReleaseInstallLayout) -> Result<()> {
+        fs::create_dir_all(&layout.bin_root)?;
+        fs::create_dir_all(&layout.asset_root)?;
+        write_executable_file(
+            &layout.bin_root.join(release_mayhem_binary_name()),
+            "#!/bin/sh\nexit 0\n",
+        )?;
+        fs::write(layout.bin_root.join("old-sibling"), b"old-bin")?;
+        fs::write(layout.asset_root.join("RULES.md"), b"old-rules")?;
+        Ok(())
     }
 
     fn write_temp_calibration_report(report: &CatalogCanaryCalibrationReport) -> PathBuf {
@@ -82437,8 +92256,10 @@ State initialization...
             supervisor_config_path: home.join("mayhemd-up.toml"),
             mayhemd_path: PathBuf::from("/tmp/mayhemd"),
             mayhem_path: PathBuf::from("/tmp/mayhem"),
+            paygate_path: PathBuf::from("/tmp/mayhem-paygate"),
             pear_runtime: PathBuf::from("/tmp/pear-runtime"),
             intercom_dir: PathBuf::from("/tmp/intercom"),
+            paygate_internal_auth_secret_path: paygate_internal_auth_secret_path(&home),
             role: Role::Both,
             provider: !provider_workers.is_empty(),
             network: "mainnet".to_owned(),
@@ -82474,8 +92295,6 @@ State initialization...
             provider_hardware_quote_kind: None,
             provider_hardware_quote_command: None,
             provider_hardware_quote_timeout_seconds: DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS,
-            hardware_quote_verifier_command: None,
-            hardware_quote_verifier_timeout_seconds: DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS,
             fraud_challenger: false,
             fraud_challenger_poll_interval_seconds: 15,
         }
@@ -82506,7 +92325,7 @@ State initialization...
             .iter()
             .filter_map(|child| child.get("name").and_then(toml::Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["peer", "gateway"]);
+        assert_eq!(names, vec!["peer", "paygate", "gateway"]);
         assert!(up_provider_workers_deferred(&plan));
         assert!(children.iter().all(|child| {
             child
@@ -82519,7 +92338,15 @@ State initialization...
                     })
                 })
         }));
-        assert!(children[0].get("env").is_none());
+        assert_eq!(
+            children[0]["env"]["MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE"].as_str(),
+            Some(
+                paygate_internal_auth_secret_path(&home)
+                    .display()
+                    .to_string()
+                    .as_str()
+            )
+        );
         let peer_args = children[0]["args"].as_array().unwrap();
         let token_file_index = peer_args
             .iter()
@@ -82535,8 +92362,16 @@ State initialization...
             )
         );
         assert_eq!(
-            children[1]["env"]["MAYHEM_SC_BRIDGE_TOKEN"].as_str(),
+            children[2]["env"]["MAYHEM_SC_BRIDGE_TOKEN"].as_str(),
             Some("test-token")
+        );
+        assert_eq!(
+            children[1]["env"]["MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE"].as_str(),
+            children[0]["env"]["MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE"].as_str()
+        );
+        assert_eq!(
+            children[1]["env"]["MAYHEM_HOME"].as_str(),
+            Some(home.display().to_string().as_str())
         );
         assert!(text.contains("test-token"));
         assert!(text.contains("--subnet-channel"));
@@ -82570,6 +92405,7 @@ State initialization...
         let home = test_temp_dir("mayhem-up-private-config");
         let plan = test_up_supervisor_plan(home.clone(), Vec::new());
         fs::create_dir_all(&home).unwrap();
+        load_or_create_paygate_internal_auth_secret(&home).unwrap();
         fs::write(&plan.supervisor_config_path, "stale").unwrap();
         fs::set_permissions(
             &plan.supervisor_config_path,
@@ -82620,6 +92456,33 @@ State initialization...
 
         fs::write(&path, "weak-token\n").unwrap();
         assert!(load_or_create_mayhemd_control_token(&home).is_err());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paygate_internal_auth_secret_is_private_and_stable_across_restart() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let home = test_temp_dir("paygate-internal-auth-secret");
+        let first_path = load_or_create_paygate_internal_auth_secret(&home).unwrap();
+        let first = fs::read_to_string(&first_path).unwrap();
+        let second_path = load_or_create_paygate_internal_auth_secret(&home).unwrap();
+        assert_eq!(second_path, first_path);
+        assert_eq!(fs::read_to_string(&second_path).unwrap(), first);
+        assert!(is_hex_len(first.trim(), 64));
+        assert_eq!(
+            fs::metadata(&first_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::set_permissions(&first_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_or_create_paygate_internal_auth_secret(&home).is_err());
+        fs::remove_file(&first_path).unwrap();
+        let target = home.join("other-secret");
+        fs::write(&target, "11".repeat(32)).unwrap();
+        symlink(&target, &first_path).unwrap();
+        assert!(load_or_create_paygate_internal_auth_secret(&home).is_err());
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -82729,7 +92592,10 @@ State initialization...
             .iter()
             .filter_map(|child| child.get("name").and_then(toml::Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["peer", "gateway", "fraud-challenger"]);
+        assert_eq!(
+            names,
+            vec!["peer", "paygate", "gateway", "fraud-challenger"]
+        );
 
         let challenger = children
             .iter()
@@ -82913,7 +92779,7 @@ State initialization...
             .iter()
             .filter_map(|child| child.get("name").and_then(toml::Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(names, vec!["peer", "gateway"]);
+        assert_eq!(names, vec!["peer", "paygate", "gateway"]);
     }
 
     #[test]
@@ -83054,8 +92920,6 @@ State initialization...
             provider_hardware_quote_kind: None,
             provider_hardware_quote_command: None,
             provider_hardware_quote_timeout_seconds: DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS,
-            hardware_quote_verifier_command: None,
-            hardware_quote_verifier_timeout_seconds: DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS,
             fraud_challenger: false,
             fraud_challenger_poll_interval_seconds: 15,
             network: None,
@@ -83581,6 +93445,10 @@ State initialization...
                 ver: 3,
                 hash: "99".repeat(32),
             }),
+            active_payout_revisions: BTreeMap::from([(
+                "55".repeat(32),
+                BTreeMap::from([("fiat".to_owned(), "aa".repeat(32))]),
+            )]),
         }
     }
 

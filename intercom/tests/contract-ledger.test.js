@@ -16,7 +16,7 @@ import {
   seedSpendHold,
   seedSpendHoldsForApply,
   signConsent,
-  signSpendReservation,
+  signTargetedSpendReservation,
   signSpendVoucher,
   spendReservationFeatureKey,
 } from './helpers/contract.js';
@@ -30,6 +30,7 @@ const EMBEDDING_LOCKED_RATE_MAP = Object.freeze([
   { unit: 'input_token', per_unit_au: '2', granularity: 1_000 },
 ]);
 const CTX_BRACKET_TABLE_VERSION = 1;
+const TEST_STRIPE_PROCESSOR_REVISION = 'c'.repeat(64);
 const ctxBracketForTokens = (tokens) => {
   if (tokens <= 8_192) return 'le8k';
   if (tokens <= 32_768) return 'le32k';
@@ -84,6 +85,51 @@ const mapPaidOps = (commands) => {
     .map((command) => protocol.mapTxCommand(JSON.stringify(command)))
     .filter(Boolean);
 };
+
+async function seedTargetedFiatPayout(storage, provider, revision, target) {
+  const bindingKey = `payout/binding/fiat/${provider}/${revision}`;
+  const verificationKey = `payout/stripe-verified/${provider}/${revision}`;
+  await storage.put(bindingKey, {
+    type: 'provider_payout_binding',
+    provider,
+    rail: 'fiat',
+    revision,
+    target,
+    currency: 'usd',
+    chain_id: null,
+    stripe_processor_revision: TEST_STRIPE_PROCESSOR_REVISION,
+    activation_epoch: 1,
+    verified: true,
+  });
+  await storage.put(`payout/current/fiat/${provider}`, {
+    provider,
+    rail: 'fiat',
+    current_revision: revision,
+    pending_revision: null,
+    pending_activation_epoch: null,
+  });
+  await storage.put(verificationKey, {
+    type: 'stripe_payout_verification',
+    revision,
+    provider,
+    target,
+    processor_revision: TEST_STRIPE_PROCESSOR_REVISION,
+    ready: true,
+  });
+  const verificationPointer = {
+    provider,
+    revision,
+    record_key: verificationKey,
+    target,
+    processor_revision: TEST_STRIPE_PROCESSOR_REVISION,
+    ready: true,
+  };
+  await storage.put(`payout/stripe-verified/current/${provider}`, verificationPointer);
+  await storage.put(
+    `payout/stripe-verified/target/${provider}/${target}`,
+    verificationPointer
+  );
+}
 
 async function setupLedgerContract(identities = null) {
   const admin = identities?.admin ?? await makeIdentity();
@@ -161,8 +207,24 @@ async function setupLedgerContract(identities = null) {
   );
   assert.equal(payments.ok, true, payments.message);
 
+  const payoutRevisions = new Map([
+    [provider.publicKey, 'a'.repeat(64)],
+    [provider2.publicKey, 'b'.repeat(64)],
+  ]);
+  await seedTargetedFiatPayout(
+    storage,
+    provider.publicKey,
+    payoutRevisions.get(provider.publicKey),
+    'acct_ledger_provider_1'
+  );
+  await seedTargetedFiatPayout(
+    storage,
+    provider2.publicKey,
+    payoutRevisions.get(provider2.publicKey),
+    'acct_ledger_provider_2'
+  );
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 1_000_000));
-  return { admin, provider, provider2, user, outsider, storage, contract };
+  return { admin, provider, provider2, user, outsider, storage, contract, payoutRevisions };
 }
 
 async function seedReservationServing(ctx, provider = ctx.provider) {
@@ -291,6 +353,8 @@ function signedSpendReservation(
     at = epoch * 3_600,
   } = {}
 ) {
+  const payoutRevision = ctx.payoutRevisions.get(provider.publicKey);
+  if (!payoutRevision) throw new Error('Missing targeted payout fixture.');
   const maxSpendAuString = auString(maxSpendAu);
   const lockedPerReqAuString = auString(lockedPerReqAu);
   const lockedMinSessionAuString = auString(lockedMinSessionAu);
@@ -317,7 +381,8 @@ function signedSpendReservation(
     checkpoint_every: { tokens: 8192, ms: 30_000 },
   };
   const unsigned = {
-    op: 'spend_reserve',
+    op: 'spend_reserve_targeted',
+    payout_revision: payoutRevision,
     contract_version: CONTRACT_VERSION,
     session_id: sessionId,
     epoch,
@@ -344,7 +409,7 @@ function signedSpendReservation(
   };
   return {
     ...unsigned,
-    provider_sig: signSpendReservation(provider.wallet, unsigned),
+    provider_sig: signTargetedSpendReservation(provider.wallet, unsigned),
   };
 }
 
@@ -1055,7 +1120,7 @@ test('MayhemContract context bracket tables are admin scheduled and pinned by ve
     at: 86_400,
   });
   const key = await spendReservationFeatureKey(ctx.contract, currentTableAfterActivation, ctx.storage);
-  assert.match(key, /^hold\/reserve\/fiat\//);
+  assert.match(key, /^hold\/targeted\/fiat\//);
 });
 
 test('MayhemContract epochApply mutates credit, earning, and fee state in place', async () => {

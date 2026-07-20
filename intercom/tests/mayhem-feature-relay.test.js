@@ -2,16 +2,26 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import b4a from 'b4a';
 import sodium from 'sodium-universal';
+import { blake3 } from '@tracsystems/blake3';
+import { keccak256 } from 'ethereum-cryptography/keccak';
+import { secp256k1 } from 'ethereum-cryptography/secp256k1';
+import PeerWallet from 'trac-wallet';
+import {
+  providerPayoutBindingMessage,
+  providerPayoutTargetBindingMessage,
+} from '../contract/contract.js';
 import MayhemFeature, {
   MAYHEM_RELAY_CHANNEL,
   MAYHEM_RELAY_MAX_MESSAGE_BYTES,
   requestIdFor,
   serviceRequestIdFor,
   serviceSigningMessage,
+  stripeConnectRelinkConsentMessage,
 } from '../features/mayhem/index.js';
 import {
   adminWriterDiagnostics,
   createServer,
+  loadPrivateInternalAuthSecret,
   requestStripeCheckout,
   requestStripeConnect,
   submitMayhemFeature,
@@ -21,9 +31,61 @@ const adminKey = 'aa'.repeat(32);
 const providerKey = 'bb'.repeat(32);
 const otherKey = 'cc'.repeat(32);
 
+test('private Stripe auth secret loader uses Windows ACLs and rejects symlinks', () => {
+  const secret = '11'.repeat(32);
+  const pathModule = { resolve: (value) => `resolved:${value}` };
+  const regularFs = {
+    lstatSync: () => ({
+      mode: 0o100666,
+      isFile: () => true,
+      isSymbolicLink: () => false,
+    }),
+    readFileSync: () => `${secret}\n`,
+  };
+  assert.equal(loadPrivateInternalAuthSecret({
+    fsModule: regularFs,
+    pathModule,
+    secretPath: 'auth.secret',
+    platform: 'win32',
+  }), secret);
+  assert.throws(() => loadPrivateInternalAuthSecret({
+    fsModule: regularFs,
+    pathModule,
+    secretPath: 'auth.secret',
+    platform: 'linux',
+  }), /group\/world accessible/);
+  assert.throws(() => loadPrivateInternalAuthSecret({
+    fsModule: {
+      ...regularFs,
+      lstatSync: () => ({
+        mode: 0o100600,
+        isFile: () => true,
+        isSymbolicLink: () => true,
+      }),
+    },
+    pathModule,
+    secretPath: 'auth.secret',
+    platform: 'win32',
+  }), /non-symlink/);
+});
+
 const fakeSignature = (publicKey, message) => {
   const suffix = String(message).length.toString(16).padStart(4, '0');
   return `${publicKey}${suffix}`.padEnd(128, '0').slice(0, 128);
+};
+
+const signEthereumPersonalMessage = (privateKey, message) => {
+  const body = b4a.from(message, 'utf8');
+  const prefix = b4a.from(`\x19Ethereum Signed Message:\n${body.length}`, 'utf8');
+  const signature = secp256k1.sign(
+    keccak256(b4a.concat([prefix, body])),
+    privateKey,
+    { lowS: true }
+  );
+  const bytes = b4a.alloc(65);
+  bytes.set(signature.toCompactRawBytes(), 0);
+  bytes[64] = signature.recovery + 27;
+  return `0x${b4a.toString(bytes, 'hex')}`;
 };
 
 const viewFor = (state) => ({
@@ -32,7 +94,7 @@ const viewFor = (state) => ({
   },
 });
 
-const peerFor = (publicKey, { writable = false } = {}) => {
+const peerFor = (publicKey, { writable = false, bootstrap = '11'.repeat(32) } = {}) => {
   const state = new Map([['admin', adminKey]]);
   const appended = [];
   const flushes = [];
@@ -47,6 +109,7 @@ const peerFor = (publicKey, { writable = false } = {}) => {
       },
     },
     base: {
+      key: b4a.from(bootstrap, 'hex'),
       writable,
       view: viewFor(state),
       async append(op) {
@@ -113,6 +176,26 @@ const stripeConnectValue = (provider = providerKey) => ({
   request_nonce: '12'.repeat(32),
 });
 
+const stripeConnectRelinkValue = (provider = providerKey, overrides = {}) => {
+  const unsigned = {
+    provider,
+    source_provider: otherKey,
+    account_id: 'acct_test_provider',
+    context_revision: '78'.repeat(32),
+    country: 'DE',
+    request_nonce: '56'.repeat(32),
+    consent_expires_at: Math.floor(Date.now() / 1_000) + 300,
+    ...overrides,
+  };
+  return {
+    ...unsigned,
+    source_consent_signature: fakeSignature(
+      unsigned.source_provider,
+      stripeConnectRelinkConsentMessage(unsigned)
+    ),
+  };
+};
+
 const signedServiceValue = (signer, service, payload, transport = signer.wallet.publicKey) => {
   const actor = payload.who || payload.provider;
   const envelope = {
@@ -141,6 +224,21 @@ test('service signing message has one cross-runtime canonical form', () => {
       transport: otherKey,
     }),
     `{"actor":"${providerKey}","admin":"${adminKey}","domain":"mayhem-service-request","payload":{"provider":"${providerKey}","request_nonce":"${'12'.repeat(32)}"},"service":"stripe_connect_status","signing_version":1,"transport":"${otherKey}"}`
+  );
+});
+
+test('Stripe relink source consent has one cross-runtime canonical form', () => {
+  assert.equal(
+    stripeConnectRelinkConsentMessage({
+      provider: providerKey,
+      source_provider: otherKey,
+      account_id: 'acct_test_provider',
+      context_revision: '78'.repeat(32),
+      country: 'DE',
+      request_nonce: '56'.repeat(32),
+      consent_expires_at: 1_900_000_000,
+    }),
+    `{"account_id":"acct_test_provider","consent_expires_at":1900000000,"context_revision":"${'78'.repeat(32)}","country":"DE","domain":"mayhem-stripe-connect-relink-consent-v1","request_nonce":"${'56'.repeat(32)}","signing_version":1,"source_provider":"${otherKey}","target_provider":"${providerKey}"}`
   );
 });
 
@@ -529,7 +627,7 @@ test('relay accepts only the dedicated channel and drops oversized feature envel
   assert.equal(writer.appended.length, 1);
 });
 
-test('16KB relay cap fits a maximal canonical spend-reserve envelope', () => {
+test('16KB relay cap fits a maximal canonical targeted spend-reserve envelope', () => {
   const participant = peerFor(providerKey);
   const feature = new MayhemFeature(participant.peer, {});
   feature.key = 'mayhem';
@@ -559,8 +657,9 @@ test('16KB relay cap fits a maximal canonical spend-reserve envelope', () => {
     user_sig: '33'.repeat(64),
   };
   const value = {
-    op: 'spend_reserve',
-    contract_version: 12,
+    op: 'spend_reserve_targeted',
+    payout_revision: '77'.repeat(32),
+    contract_version: 13,
     session_id: voucher.session_id,
     epoch: Number.MAX_SAFE_INTEGER,
     at: Number.MAX_SAFE_INTEGER,
@@ -578,7 +677,7 @@ test('16KB relay cap fits a maximal canonical spend-reserve envelope', () => {
     voucher,
     provider_sig: '55'.repeat(64),
   };
-  const key = `spend/reserve/${voucher.session_id}`;
+  const key = `hold/targeted/tap/${value.user}/${value.epoch}/${voucher.session_id}/${'88'.repeat(32)}`;
   const message = {
     control: 'mayhem_feature_request',
     version: 1,
@@ -643,6 +742,509 @@ test('read-only provider relays a signed rails preference through the existing l
   assert.equal(writer.appended.length, 1);
   assert.equal(writer.appended[0].value.dispatch.address, adminKey);
   assert.deepEqual(writer.appended[0].value.dispatch.value, value);
+});
+
+test('read-only provider relays a verified payout binding only to the sole admin writer', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const participantFeature = new MayhemFeature(participant.peer, { timeoutMs: 1_000, retryMs: 100 });
+  const writerFeature = new MayhemFeature(writer.peer, { timeoutMs: 1_000, retryMs: 100 });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  connect(participant.peer, participantFeature, writer.peer, writerFeature);
+  connect(writer.peer, writerFeature, participant.peer, participantFeature);
+
+  const target = PeerWallet.encodeBech32mSafe('trac', b4a.from(providerKey, 'hex'));
+  const intent = {
+    op: 'bind_provider_payout',
+    network: 'mainnet',
+    admin: adminKey,
+    bootstrap: '11'.repeat(32),
+    context_revision: '22'.repeat(32),
+    provider: providerKey,
+    rail: 'tnk',
+    currency: null,
+    chain_id: null,
+    target,
+    target_wallet: providerKey,
+    target_signature: null,
+    previous_revision: null,
+    payment_config_version: 7,
+    nonce: '55'.repeat(32),
+    expires_after_epoch: 10,
+  };
+  intent.target_signature = fakeSignature(
+    providerKey,
+    b4a.from(providerPayoutTargetBindingMessage(intent))
+  );
+  const value = {
+    op: 'bind_provider_payout',
+    intent,
+    provider_signature: fakeSignature(
+      providerKey,
+      b4a.from(providerPayoutBindingMessage(intent))
+    ),
+  };
+  const revision = b4a.toString(
+    await blake3(b4a.from(providerPayoutBindingMessage(intent))),
+    'hex'
+  );
+  const key = `payout/binding/tnk/${providerKey}/${revision}`;
+  writer.state.set('payments/current', {
+    rails: ['fiat', 'tap', 'tnk'],
+    tap: { chain_id: 1 },
+    tnk: { network: 'mainnet' },
+    ver: 7,
+    set_by: adminKey,
+    set_by_role: 'admin',
+  });
+  writer.state.set('payout/context/current', {
+    payment_config_version: 7,
+    revision: intent.context_revision,
+  });
+  writer.state.set(`payout/context/7/${intent.context_revision}`, {
+    revision: intent.context_revision,
+    network: 'mainnet',
+    admin: adminKey,
+    bootstrap: '11'.repeat(32),
+    payment_config_version: 7,
+    published_by: adminKey,
+    published_by_role: 'admin',
+  });
+  writer.state.set(`prov/${providerKey}`, {
+    provider: providerKey,
+    status: 'active',
+    accepted_rails: ['tnk'],
+  });
+  const result = await submitMayhemFeature(participant.peer, { feature: 'mayhem', key, value });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.relayed, true);
+  assert.equal(participant.appended.length, 0);
+  assert.equal(writer.appended.length, 1);
+  assert.equal(writer.appended[0].value.dispatch.address, adminKey);
+  assert.deepEqual(writer.appended[0].value.dispatch.value, value);
+
+  writer.state.set(`payout/nonce/${providerKey}/${intent.nonce}`, {
+    provider: providerKey,
+    rail: 'tnk',
+    nonce: intent.nonce,
+    revision,
+  });
+  writer.state.set(key, {
+    type: 'provider_payout_binding',
+    provider: providerKey,
+    rail: 'tnk',
+    revision,
+    nonce: intent.nonce,
+    provider_signature: value.provider_signature,
+    target_signature: intent.target_signature,
+  });
+  const restartedParticipantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+  });
+  const restartedWriterFeature = new MayhemFeature(writer.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+  });
+  restartedParticipantFeature.key = 'mayhem';
+  restartedWriterFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = restartedParticipantFeature;
+  writer.peer.protocol.instance.features.mayhem = restartedWriterFeature;
+  connect(participant.peer, restartedParticipantFeature, writer.peer, restartedWriterFeature);
+  connect(writer.peer, restartedWriterFeature, participant.peer, restartedParticipantFeature);
+
+  const redelivered = await submitMayhemFeature(
+    participant.peer,
+    { feature: 'mayhem', key, value }
+  );
+  assert.equal(redelivered.ok, true);
+  assert.equal(redelivered.relayed, true);
+  assert.equal(writer.appended.length, 1);
+
+  const rejected = await restartedParticipantFeature.relay(key, {
+    ...value,
+    intent: {
+      ...intent,
+      rail: 'fiat',
+      currency: 'usd',
+      target: 'acct_unverified',
+      target_wallet: null,
+      target_signature: null,
+    },
+  });
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.message, /failed relay verification/);
+  assert.equal(writer.appended.length, 1);
+});
+
+test('fiat payout relay keeps the active account admissible during verified rotation', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  connect(participant.peer, participantFeature, writer.peer, writerFeature);
+  connect(writer.peer, writerFeature, participant.peer, participantFeature);
+
+  const activeTarget = 'acct_active';
+  const futureTarget = 'acct_future';
+  const contextRevision = '22'.repeat(32);
+  const intent = {
+    op: 'bind_provider_payout',
+    network: 'mainnet',
+    admin: adminKey,
+    bootstrap: '11'.repeat(32),
+    context_revision: contextRevision,
+    provider: providerKey,
+    rail: 'fiat',
+    currency: 'usd',
+    chain_id: null,
+    target: activeTarget,
+    target_wallet: null,
+    target_signature: null,
+    previous_revision: null,
+    payment_config_version: 7,
+    nonce: '77'.repeat(32),
+    expires_after_epoch: 10,
+  };
+  const value = {
+    op: 'bind_provider_payout',
+    intent,
+    provider_signature: fakeSignature(
+      providerKey,
+      b4a.from(providerPayoutBindingMessage(intent))
+    ),
+  };
+  const revision = b4a.toString(
+    await blake3(b4a.from(providerPayoutBindingMessage(intent))),
+    'hex'
+  );
+  const key = `payout/binding/fiat/${providerKey}/${revision}`;
+  writer.state.set('payments/current', {
+    rails: ['fiat', 'tap', 'tnk'],
+    fiat: { currencies: ['usd', 'eur'] },
+    tap: { chain_id: 1 },
+    tnk: { network: 'mainnet' },
+    ver: 7,
+    set_by: adminKey,
+    set_by_role: 'admin',
+  });
+  writer.state.set('payout/context/current', {
+    payment_config_version: 7,
+    revision: contextRevision,
+  });
+  writer.state.set(`payout/context/7/${contextRevision}`, {
+    revision: contextRevision,
+    network: 'mainnet',
+    admin: adminKey,
+    bootstrap: '11'.repeat(32),
+    payment_config_version: 7,
+    published_by: adminKey,
+    published_by_role: 'admin',
+  });
+  writer.state.set(`prov/${providerKey}`, {
+    provider: providerKey,
+    status: 'active',
+    accepted_rails: ['fiat'],
+  });
+  const activeRevision = '88'.repeat(32);
+  const activeRecordKey =
+    `payout/stripe-verified/${providerKey}/${activeRevision}`;
+  const activeRecord = {
+    type: 'stripe_payout_verification',
+    revision: activeRevision,
+    provider: providerKey,
+    target: activeTarget,
+    currency: 'usd',
+    processor_revision: '99'.repeat(32),
+    context_revision: contextRevision,
+    payment_config_version: 7,
+    details_submitted: true,
+    payouts_enabled: true,
+    transfers_enabled: true,
+    verified_by: adminKey,
+    verified_by_role: 'admin',
+  };
+  writer.state.set(activeRecordKey, activeRecord);
+  writer.state.set(
+    `payout/stripe-verified/target/${providerKey}/${activeTarget}`,
+    {
+      provider: providerKey,
+      target: activeTarget,
+      revision: activeRevision,
+      processor_revision: activeRecord.processor_revision,
+      record_key: activeRecordKey,
+    }
+  );
+  writer.state.set(`payout/stripe-verified/current/${providerKey}`, {
+    provider: providerKey,
+    target: futureTarget,
+    revision: 'aa'.repeat(32),
+    processor_revision: 'ab'.repeat(32),
+    record_key: `payout/stripe-verified/${providerKey}/${'aa'.repeat(32)}`,
+  });
+
+  const accepted = await submitMayhemFeature(
+    participant.peer,
+    { feature: 'mayhem', key, value }
+  );
+  assert.equal(accepted.ok, true);
+  assert.equal(accepted.relayed, true);
+  assert.equal(participant.appended.length, 0);
+  assert.equal(writer.appended.length, 1);
+});
+
+test('read-only provider relay verifies an exact TAP wallet co-signature', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  connect(participant.peer, participantFeature, writer.peer, writerFeature);
+  connect(writer.peer, writerFeature, participant.peer, participantFeature);
+
+  const targetPrivateKey = b4a.alloc(32, 7);
+  const targetPublicKey = secp256k1.getPublicKey(targetPrivateKey, false);
+  const target = `0x${b4a.toString(
+    keccak256(targetPublicKey.subarray(1)).subarray(12),
+    'hex'
+  )}`;
+  const intent = {
+    op: 'bind_provider_payout',
+    network: 'mainnet',
+    admin: adminKey,
+    bootstrap: '11'.repeat(32),
+    context_revision: '22'.repeat(32),
+    provider: providerKey,
+    rail: 'tap',
+    currency: null,
+    chain_id: 1,
+    target,
+    target_wallet: null,
+    target_signature: null,
+    previous_revision: null,
+    payment_config_version: 7,
+    nonce: '66'.repeat(32),
+    expires_after_epoch: 10,
+  };
+  intent.target_signature = signEthereumPersonalMessage(
+    targetPrivateKey,
+    providerPayoutTargetBindingMessage(intent)
+  );
+  const value = {
+    op: 'bind_provider_payout',
+    intent,
+    provider_signature: fakeSignature(
+      providerKey,
+      b4a.from(providerPayoutBindingMessage(intent))
+    ),
+  };
+  const revision = b4a.toString(
+    await blake3(b4a.from(providerPayoutBindingMessage(intent))),
+    'hex'
+  );
+  const key = `payout/binding/tap/${providerKey}/${revision}`;
+  writer.state.set('payments/current', {
+    rails: ['fiat', 'tap', 'tnk'],
+    tap: { chain_id: 1 },
+    tnk: { network: 'mainnet' },
+    ver: 7,
+    set_by: adminKey,
+    set_by_role: 'admin',
+  });
+  writer.state.set('payout/context/current', {
+    payment_config_version: 7,
+    revision: intent.context_revision,
+  });
+  writer.state.set(`payout/context/7/${intent.context_revision}`, {
+    revision: intent.context_revision,
+    network: 'mainnet',
+    admin: adminKey,
+    bootstrap: '11'.repeat(32),
+    payment_config_version: 7,
+    published_by: adminKey,
+    published_by_role: 'admin',
+  });
+  writer.state.set(`prov/${providerKey}`, {
+    provider: providerKey,
+    status: 'active',
+    accepted_rails: ['tap'],
+  });
+
+  const accepted = await submitMayhemFeature(
+    participant.peer,
+    { feature: 'mayhem', key, value }
+  );
+  assert.equal(accepted.ok, true);
+  assert.equal(participant.appended.length, 0);
+  assert.equal(writer.appended.length, 1);
+
+  const substituted = structuredClone(value);
+  substituted.intent.chain_id = 61_000;
+  substituted.provider_signature = fakeSignature(
+    providerKey,
+    b4a.from(providerPayoutBindingMessage(substituted.intent))
+  );
+  const substitutedRevision = b4a.toString(
+    await blake3(b4a.from(providerPayoutBindingMessage(substituted.intent))),
+    'hex'
+  );
+  const rejected = await participantFeature.relay(
+    `payout/binding/tap/${providerKey}/${substitutedRevision}`,
+    substituted
+  );
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.message, /failed relay verification/);
+  assert.equal(writer.appended.length, 1);
+});
+
+test('non-admin read-only transport relays a valid admin-signed tx without gaining writer authority', async () => {
+  const workstation = peerFor(otherKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const submitted = [];
+  const workstationFeature = new MayhemFeature(workstation.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+    async adminTxHandler(value) {
+      if (!writer.peer.wallet.verify(value.signature, value.tx, value.address)) {
+        return { result: { error: { message: 'Invalid admin signature.' } } };
+      }
+      submitted.push(value);
+      return { result: { ok: true, accepted: true } };
+    },
+  });
+  workstationFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  workstation.peer.protocol.instance.features.mayhem = workstationFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  connect(workstation.peer, workstationFeature, writer.peer, writerFeature);
+  connect(writer.peer, writerFeature, workstation.peer, workstationFeature);
+
+  const tx = '12'.repeat(32);
+  const value = {
+    op: 'admin_contract_tx',
+    tx,
+    prepared_command: {
+      type: 'setParams',
+      value: {
+        zeta: 'preserve-first',
+        op: 'set_params',
+        submitted_at: 90_000,
+        effective_at: 93_600,
+        values: { fee_bps: 1_500 },
+        alpha: 'preserve-last',
+      },
+    },
+    address: adminKey,
+    signature: fakeSignature(adminKey, tx),
+    nonce: '56'.repeat(32),
+    sim: false,
+  };
+  const key = `admin/contract-tx/${tx}`;
+  const server = createServer(workstation.peer);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  let first;
+  try {
+    const response = await fetch(`http://127.0.0.1:${address.port}/v1/contract/feature`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ feature: 'mayhem', key, value }),
+    });
+    assert.equal(response.status, 200);
+    first = await response.json();
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+  const replay = await submitMayhemFeature(workstation.peer, {
+    feature: 'mayhem',
+    key,
+    value,
+  });
+
+  assert.equal(first.ok, true);
+  assert.equal(first.status, 'submitted');
+  assert.equal(first.relayed, true);
+  assert.deepEqual(replay.result, first.result);
+  assert.equal(submitted.length, 1);
+  assert.deepEqual(submitted[0], {
+    tx,
+    prepared_command: value.prepared_command,
+    address: adminKey,
+    signature: value.signature,
+    nonce: value.nonce,
+    sim: false,
+  });
+  assert.equal(
+    JSON.stringify(submitted[0].prepared_command),
+    JSON.stringify(value.prepared_command),
+    'prepared admin command key order must survive the relay unchanged'
+  );
+  assert.equal(workstation.appended.length, 0);
+  assert.equal(writer.appended.length, 0);
+  assert.equal(workstation.peer.base.writable, false);
+
+  const capabilityTx = '78'.repeat(32);
+  const capability = await submitMayhemFeature(workstation.peer, {
+    feature: 'mayhem',
+    key: `admin/contract-tx/${capabilityTx}`,
+    value: {
+      ...value,
+      tx: capabilityTx,
+      prepared_command: { type: 'addWriter', value: { key: otherKey } },
+      signature: fakeSignature(adminKey, capabilityTx),
+      nonce: 'bc'.repeat(32),
+    },
+  });
+  assert.equal(capability.ok, true);
+  assert.equal(submitted.length, 2);
+  assert.deepEqual(submitted[1].prepared_command, {
+    type: 'addWriter',
+    value: { key: otherKey },
+  });
+  assert.equal(workstation.peer.base.writable, false);
+
+  const forgedTx = '9a'.repeat(32);
+  const forged = await submitMayhemFeature(workstation.peer, {
+    feature: 'mayhem',
+    key: `admin/contract-tx/${forgedTx}`,
+    value: {
+      ...value,
+      tx: forgedTx,
+      signature: fakeSignature(otherKey, forgedTx),
+      nonce: 'de'.repeat(32),
+    },
+  });
+  assert.equal(forged.ok, false);
+  assert.match(forged.message, /invalid admin signature/i);
+  assert.equal(submitted.length, 2);
+  assert.equal(workstation.peer.base.writable, false);
 });
 
 test('read-only user relays a dual-signed TAP account binding to the admin appender', async () => {
@@ -772,6 +1374,118 @@ test('read-only transport relays wallet-signed Stripe Connect onboarding without
   assert.equal(participant.appended.length, 0);
   assert.equal(writer.appended.length, 0);
   assert.equal(writer.flushes.length, 0);
+});
+
+test('read-only transport relays dual-provider-signed Stripe Connect relink consent once', async () => {
+  const participant = peerFor(otherKey);
+  const signer = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const relinkValue = stripeConnectRelinkValue();
+  const relinkRequest = signedServiceValue(
+    signer.peer,
+    'stripe_connect_relink',
+    relinkValue,
+    otherKey
+  );
+  let serviceCalls = 0;
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+    async serviceHandler(service, value, authorization) {
+      serviceCalls += 1;
+      assert.equal(service, 'stripe_connect_relink');
+      assert.deepEqual(value, relinkValue);
+      assert.equal(authorization.actor, providerKey);
+      assert.equal(authorization.transport, otherKey);
+      assert.equal(authorization.signature, relinkRequest.signature);
+      return {
+        ok: true,
+        rail: 'fiat',
+        processor_rail: 'stripe',
+        provider: providerKey,
+        source_provider: otherKey,
+        status: 'consent_required',
+        account: null,
+        onboarding: { url: 'https://connect.stripe.com/oauth/authorize?state=test' },
+      };
+    },
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  connect(participant.peer, participantFeature, writer.peer, writerFeature);
+  connect(writer.peer, writerFeature, participant.peer, participantFeature);
+
+  const result = await requestStripeConnect(
+    participant.peer,
+    'stripe_connect_relink',
+    relinkRequest
+  );
+  const replay = await requestStripeConnect(
+    participant.peer,
+    'stripe_connect_relink',
+    relinkRequest
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(replay, result);
+  assert.equal(result.relayed, true);
+  assert.equal(result.status, 'consent_required');
+  assert.match(result.onboarding.url, /^https:\/\/connect\.stripe\.com\//);
+  assert.equal(serviceCalls, 1);
+  assert.equal(participant.appended.length, 0);
+  assert.equal(writer.appended.length, 0);
+});
+
+test('Stripe relink rejects stale, source-forged, target-forged, and substituted consent locally', async () => {
+  const participant = peerFor(otherKey);
+  const target = peerFor(providerKey);
+  const feature = new MayhemFeature(participant.peer, {});
+  feature.key = 'mayhem';
+  let broadcasts = 0;
+  participant.peer.sidechannel = {
+    started: true,
+    broadcast() {
+      broadcasts += 1;
+      return true;
+    },
+  };
+
+  const valid = stripeConnectRelinkValue();
+  const forged = {
+    ...valid,
+    source_consent_signature: fakeSignature(providerKey, stripeConnectRelinkConsentMessage(valid)),
+  };
+  const substituted = {
+    ...valid,
+    account_id: 'acct_substituted_longer',
+  };
+  const stale = stripeConnectRelinkValue(providerKey, {
+    consent_expires_at: Math.floor(Date.now() / 1_000) - 1,
+  });
+
+  for (const payload of [forged, substituted, stale]) {
+    await assert.rejects(
+      feature.requestService(
+        'stripe_connect_relink',
+        signedServiceValue(target.peer, 'stripe_connect_relink', payload, otherKey)
+      ),
+      /Invalid Mayhem service request signature/
+    );
+  }
+  await assert.rejects(
+    feature.requestService(
+      'stripe_connect_relink',
+      signedServiceValue(participant.peer, 'stripe_connect_relink', valid, otherKey)
+    ),
+    /Invalid Mayhem service request signature/
+  );
+  assert.equal(broadcasts, 0);
 });
 
 test('Stripe Connect service relay rejects a forged provider signature locally', async () => {

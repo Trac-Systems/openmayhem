@@ -16,6 +16,7 @@ const HEALTH_PROTOCOL = 'mx/s-health';
 const DEFAULT_MAX_FRAME_BYTES = 256 * 1024;
 const DEFAULT_RATE_BYTES_PER_SECOND = 1_000_000;
 const DEFAULT_RATE_BURST_BYTES = 1_000_000;
+const DEFAULT_RECEIVE_BATCH_HEADROOM_BYTES = 64 * 1024 * 1024;
 const DEFAULT_SEND_DRAIN_TIMEOUT_MS = 0;
 const DEFAULT_CONNECT_MAX_WAIT_MS = 120_000;
 const DEFAULT_CONNECT_POLL_MS = 100;
@@ -74,6 +75,13 @@ class DirectSession extends Feature {
       this.maxFrameBytes,
       safeIntegerOr(config.rateBurstBytes, DEFAULT_RATE_BURST_BYTES)
     );
+    this.receiveBatchHeadroomBytes = Math.min(
+      DEFAULT_RECEIVE_BATCH_HEADROOM_BYTES,
+      safeIntegerOr(
+        config.receiveBatchHeadroomBytes,
+        DEFAULT_RECEIVE_BATCH_HEADROOM_BYTES
+      )
+    );
     this.sendDrainTimeoutMs = safeIntegerOr(
       config.sendDrainTimeoutMs,
       DEFAULT_SEND_DRAIN_TIMEOUT_MS,
@@ -114,6 +122,7 @@ class DirectSession extends Feature {
     this.sessions = new Map();
     this.pairedConnections = new WeakSet();
     this.connectionErrors = new WeakMap();
+    this.connectionReceiveLimiters = new WeakMap();
     this.connectionHealth = new Map();
     this.explicitPeers = new Set();
     this.reconnectSuspended = new Set();
@@ -148,6 +157,8 @@ class DirectSession extends Feature {
       rateBytesPerSecond: this.rateBytesPerSecond,
       rateBurstBytes: this.rateBurstBytes,
       receiveRateBurstBytes: this._receiveRateBurstBytes(),
+      receiveBatchHeadroomBytes: this.receiveBatchHeadroomBytes,
+      receiveRateCapacityBytes: this._receiveRateCapacityBytes(),
       sendDrainTimeoutMs: this.sendDrainTimeoutMs,
       connectMaxWaitMs: this.connectMaxWaitMs,
       connectPollMs: this.connectPollMs,
@@ -774,6 +785,7 @@ class DirectSession extends Feature {
       message: null,
       sendLimiter: this._newLimiter(),
       receiveLimiter: this._newReceiveLimiter(),
+      connectionReceiveLimiter: this._registerConnectionReceiveLimiter(connection),
       drainWaiters: new Set(),
       closed: false,
     };
@@ -802,7 +814,7 @@ class DirectSession extends Feature {
       return;
     }
     const frameBytes = this._frameBytes(frame);
-    if (!this._checkRate(session.receiveLimiter, frameBytes)) {
+    if (!this._checkReceiveRate(session, frameBytes)) {
       if (this.debug) console.log(`[direct-session:${session.sessionId}] drop (rate limit)`);
       this._closeRecord(
         session,
@@ -882,16 +894,19 @@ class DirectSession extends Feature {
     return decodedJsonByteLength(frame) ?? b4a.byteLength(JSON.stringify(frame), 'utf8');
   }
 
-  _newLimiter(capacity = this.rateBurstBytes) {
+  _newLimiter(capacity = this.rateBurstBytes, tokens = capacity) {
     return {
       capacity,
-      tokens: capacity,
+      tokens,
       lastRefill: Date.now(),
     };
   }
 
   _newReceiveLimiter() {
-    return this._newLimiter(this._receiveRateBurstBytes());
+    return this._newLimiter(
+      this._receiveRateCapacityBytes(),
+      this._receiveRateBurstBytes()
+    );
   }
 
   _receiveRateBurstBytes() {
@@ -901,21 +916,115 @@ class DirectSession extends Feature {
     );
   }
 
-  _checkRate(limiter, bytes) {
-    if (this.rateBytesPerSecond <= 0) return true;
-    const now = Date.now();
+  _receiveRateCapacityBytes() {
+    return Math.min(
+      Number.MAX_SAFE_INTEGER,
+      this._receiveRateBurstBytes() + this.receiveBatchHeadroomBytes
+    );
+  }
+
+  // Base bursts remain per session; only one earned transport-batch reserve is shared.
+  _connectionReceiveCapacity(sessionCount) {
+    if (sessionCount <= 0) return 0;
+    return Math.min(
+      Number.MAX_SAFE_INTEGER,
+      (this._receiveRateBurstBytes() * sessionCount) + this.receiveBatchHeadroomBytes
+    );
+  }
+
+  _connectionReceiveRate(sessionCount) {
+    return Math.min(
+      Number.MAX_SAFE_INTEGER,
+      this.rateBytesPerSecond * sessionCount
+    );
+  }
+
+  _refillLimiter(limiter, rateBytesPerSecond, now = Date.now()) {
+    if (!limiter || rateBytesPerSecond <= 0) return;
     const elapsedMs = now - limiter.lastRefill;
     if (elapsedMs > 0) {
-      const refill = (elapsedMs / 1000) * this.rateBytesPerSecond;
+      const refill = (elapsedMs / 1000) * rateBytesPerSecond;
       limiter.tokens = Math.min(
         limiter.capacity ?? this.rateBurstBytes,
         limiter.tokens + refill
       );
       limiter.lastRefill = now;
     }
+  }
+
+  _checkRate(limiter, bytes) {
+    if (this.rateBytesPerSecond <= 0) return true;
+    this._refillLimiter(limiter, this.rateBytesPerSecond);
     if (bytes > limiter.tokens) return false;
     limiter.tokens -= bytes;
     return true;
+  }
+
+  _checkReceiveRate(session, bytes) {
+    if (this.rateBytesPerSecond <= 0) return true;
+    if (!session?.receiveLimiter) return false;
+    const now = Date.now();
+    const connectionLimiter = session.connectionReceiveLimiter ?? null;
+    this._refillLimiter(session.receiveLimiter, this.rateBytesPerSecond, now);
+    if (connectionLimiter) {
+      this._refillLimiter(
+        connectionLimiter,
+        this._connectionReceiveRate(connectionLimiter.sessionCount),
+        now
+      );
+    }
+    if (
+      bytes > session.receiveLimiter.tokens
+      || (connectionLimiter && bytes > connectionLimiter.tokens)
+    ) {
+      return false;
+    }
+    session.receiveLimiter.tokens -= bytes;
+    if (connectionLimiter) connectionLimiter.tokens -= bytes;
+    return true;
+  }
+
+  _registerConnectionReceiveLimiter(connection) {
+    if (!connection || (typeof connection !== 'object' && typeof connection !== 'function')) {
+      return null;
+    }
+    let limiter = this.connectionReceiveLimiters.get(connection);
+    if (!limiter) {
+      limiter = {
+        capacity: 0,
+        tokens: 0,
+        lastRefill: Date.now(),
+        sessionCount: 0,
+      };
+      this.connectionReceiveLimiters.set(connection, limiter);
+    }
+    this._refillLimiter(
+      limiter,
+      this._connectionReceiveRate(limiter.sessionCount)
+    );
+    limiter.sessionCount += 1;
+    limiter.capacity = this._connectionReceiveCapacity(limiter.sessionCount);
+    limiter.tokens = Math.min(
+      limiter.capacity,
+      limiter.tokens + this._receiveRateBurstBytes()
+    );
+    return limiter;
+  }
+
+  _unregisterConnectionReceiveLimiter(session) {
+    const limiter = session?.connectionReceiveLimiter;
+    if (!limiter) return;
+    this._refillLimiter(
+      limiter,
+      this._connectionReceiveRate(limiter.sessionCount)
+    );
+    limiter.sessionCount = Math.max(0, limiter.sessionCount - 1);
+    limiter.capacity = this._connectionReceiveCapacity(limiter.sessionCount);
+    limiter.tokens = Math.min(limiter.tokens, limiter.capacity);
+    session.connectionReceiveLimiter = null;
+    if (limiter.sessionCount === 0 && session.connection) {
+      this.connectionReceiveLimiters.delete(session.connection);
+    }
   }
 
   async _acquireSendRate(session, bytes) {
@@ -967,6 +1076,7 @@ class DirectSession extends Feature {
   _closeRecord(session, error, closeChannel, emitClose = true) {
     if (!session || session.closed) return;
     session.closed = true;
+    this._unregisterConnectionReceiveLimiter(session);
     const transportError = this.connectionErrors.get(session.connection) ?? null;
     const closeReason = error?.message ?? 'Direct session closed.';
     this._rejectDrainWaiters(session, error);

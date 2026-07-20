@@ -1,0 +1,415 @@
+name: Release 0.2.23 native tail
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag (v0.2.23-rc.N or v0.2.23); dispatch from this tag
+        required: true
+        type: string
+      source_sha:
+        description: Exact lowercase 40-hex commit peeled from release_tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# REQUIRED GITHUB CONFIGURATION; this file does not claim it already exists:
+# - Create the release-signing environment and store MAYHEM_RELEASE_SEED_HEX
+#   only as an environment secret (no repository- or organization-secret copy).
+# - Require at least one designated release-maintainer reviewer, prevent
+#   self-review, and disallow admin bypass.
+# - Select deployment branches and tags with tag rules exactly v0.2.23 and
+#   v0.2.23-rc.* and no branch rules.
+# - Protect those two tag patterns with an active repository tag ruleset that
+#   restricts tag creation, update, and deletion to release maintainers.
+jobs:
+  verify_source:
+    name: Verify canonical release source
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.provenance.outputs.release_tag }}
+      source_sha: ${{ steps.provenance.outputs.source_sha }}
+    steps:
+      - name: Resolve protected tag from canonical origin
+        id: provenance
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v0\.2\.23(-rc\.[1-9][0-9]*)?$ ]]; then
+            printf '%s\n' "release_tag must be v0.2.23-rc.N or v0.2.23" >&2
+            exit 1
+          fi
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            printf '%s\n' "source_sha must be an exact lowercase 40-hex commit id" >&2
+            exit 1
+          fi
+          [[ "$GITHUB_REPOSITORY" == "Trac-Systems/openmayhem" ]] || {
+            printf '%s\n' "workflow is not running in the canonical repository" >&2
+            exit 1
+          }
+          [[ "$GITHUB_REF_TYPE" == "tag" ]] || {
+            printf '%s\n' "workflow_dispatch must run from the release tag" >&2
+            exit 1
+          }
+          [[ "$GITHUB_REF" == "refs/tags/$RELEASE_TAG" ]] || {
+            printf '%s\n' "dispatch ref does not match release_tag" >&2
+            exit 1
+          }
+          [[ "$GITHUB_SHA" == "$SOURCE_SHA" ]] || {
+            printf '%s\n' "dispatch commit does not match source_sha" >&2
+            exit 1
+          }
+          [[ "$WORKFLOW_SHA" == "$SOURCE_SHA" ]] || {
+            printf '%s\n' "workflow definition commit does not match source_sha" >&2
+            exit 1
+          }
+          [[ "$GITHUB_REF_PROTECTED" == "true" ]] || {
+            printf '%s\n' "release tag is not protected by an active ruleset" >&2
+            exit 1
+          }
+
+          provenance_repo="$RUNNER_TEMP/release-source.git"
+          rm -rf -- "$provenance_repo"
+          git init --bare "$provenance_repo"
+          git -C "$provenance_repo" remote add \
+            origin https://github.com/Trac-Systems/openmayhem.git
+          git -C "$provenance_repo" -c protocol.version=2 fetch \
+            --no-tags \
+            origin \
+            "+refs/heads/main:refs/remotes/origin/main" \
+            "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+
+          if ! tag_commit="$(
+            git -C "$provenance_repo" rev-parse \
+              --verify "refs/tags/$RELEASE_TAG^{commit}"
+          )"; then
+            printf '%s\n' "release_tag does not peel to a commit" >&2
+            exit 1
+          fi
+          [[ "$tag_commit" == "$SOURCE_SHA" ]] || {
+            printf '%s\n' "release_tag peeled commit does not match source_sha" >&2
+            exit 1
+          }
+          git -C "$provenance_repo" merge-base \
+            --is-ancestor "$tag_commit" refs/remotes/origin/main || {
+            printf '%s\n' "release commit is not on canonical origin/main history" >&2
+            exit 1
+          }
+
+          printf 'release_tag=%s\n' "$RELEASE_TAG" >>"$GITHUB_OUTPUT"
+          printf 'source_sha=%s\n' "$SOURCE_SHA" >>"$GITHUB_OUTPUT"
+
+  package:
+    name: Package ${{ matrix.target }}
+    needs: verify_source
+    if: >-
+      github.ref_type == 'tag' &&
+      github.sha == needs.verify_source.outputs.source_sha &&
+      github.workflow_sha == needs.verify_source.outputs.source_sha
+    environment:
+      name: release-signing
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive_suffix: .tar.gz
+            executable_suffix: ''
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive_suffix: .zip
+            executable_suffix: .exe
+
+    steps:
+      - name: Checkout exact source commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.verify_source.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Assert exact clean source
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.verify_source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse --verify HEAD)"
+          [[ "$actual" == "$SOURCE_SHA" ]] || {
+            printf '%s\n' "checked-out HEAD does not match source_sha" >&2
+            exit 1
+          }
+          status="$(
+            git status \
+              --porcelain=v1 \
+              --untracked-files=all \
+              --ignore-submodules=none
+          )"
+          [[ -z "$status" ]] || {
+            printf '%s\n' "checked-out source tree is not clean" >&2
+            exit 1
+          }
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.22.0
+
+      - name: Install native Rust toolchain
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install "1.85.0-$TARGET" --profile minimal
+          rustup default "1.85.0-$TARGET"
+
+      - name: Configure Visual Studio ARM64 tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            throw "vswhere is unavailable"
+          }
+          $installationPath = & $vswhere `
+            -latest `
+            -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+            -property installationPath
+          if ([string]::IsNullOrWhiteSpace($installationPath)) {
+            throw "Visual Studio ARM64 C++ tools are unavailable"
+          }
+          $devCmd = Join-Path $installationPath "Common7\Tools\VsDevCmd.bat"
+          if (-not (Test-Path -LiteralPath $devCmd -PathType Leaf)) {
+            throw "VsDevCmd.bat is unavailable"
+          }
+          $command = "call `"$devCmd`" -no_logo -arch=arm64 -host_arch=arm64 >nul && set"
+          $environment = & $env:ComSpec /d /s /c $command
+          if ($LASTEXITCODE -ne 0) {
+            throw "Visual Studio ARM64 environment setup failed"
+          }
+          foreach ($line in $environment) {
+            if ($line -match "^[^=]+=") {
+              Add-Content -LiteralPath $env:GITHUB_ENV -Value $line -Encoding utf8
+            }
+          }
+
+      - name: Assert native runner identity
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rust_host="$(rustc -vV | sed -n 's/^host: //p')"
+          [[ "$rust_host" == "$TARGET" ]] || {
+            printf '%s\n' "Rust host does not match the package target" >&2
+            exit 1
+          }
+
+          case "$RUNNER_OS" in
+            macOS)
+              [[ "$(uname -m)" == "x86_64" ]] || {
+                printf '%s\n' "macOS runner is not Intel" >&2
+                exit 1
+              }
+              translated="$(sysctl -n sysctl.proc_translated)"
+              [[ "$translated" == "0" ]] || {
+                printf '%s\n' "macOS process is translated" >&2
+                exit 1
+              }
+              ;;
+            Windows)
+              os_arch="$(
+                pwsh.exe -NoLogo -NoProfile -NonInteractive \
+                  -Command '[System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()' |
+                  tr -d '\r\n'
+              )"
+              [[ "$os_arch" == "Arm64" ]] || {
+                printf '%s\n' "Windows OS architecture is not Arm64" >&2
+                exit 1
+              }
+              [[ "${VSCMD_ARG_HOST_ARCH,,}" == "arm64" ]] || {
+                printf '%s\n' "Visual Studio host tools are not ARM64" >&2
+                exit 1
+              }
+              [[ "${VSCMD_ARG_TGT_ARCH,,}" == "arm64" ]] || {
+                printf '%s\n' "Visual Studio target tools are not ARM64" >&2
+                exit 1
+              }
+              cl_path="$(where.exe cl.exe | tr -d '\r' | sed -n '1p')"
+              cl_path="${cl_path//\\//}"
+              [[ "${cl_path,,}" == *"/hostarm64/arm64/cl.exe" ]] || {
+                printf '%s\n' "cl.exe is not the native ARM64 toolchain" >&2
+                exit 1
+              }
+              ;;
+            *)
+              printf '%s\n' "unsupported runner OS" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Run focused package verifier tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/tests/release-native-tail-workflow.test.mjs
+          bash scripts/tests/attestation-verifier-install-inventory.test.sh
+          bash scripts/tests/release-package-capabilities.test.sh
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            bash scripts/tests/attestation-verifier-package.test.sh
+          fi
+
+      - name: Build and sign native package
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          MAYHEM_RELEASE_SEED_HEX: ${{ secrets.MAYHEM_RELEASE_SEED_HEX }}
+          MAYHEM_RELEASE_KEY_ID: openmayhem-release-v1
+        run: |
+          set -euo pipefail
+          [[ "$MAYHEM_RELEASE_SEED_HEX" =~ ^[0-9A-Fa-f]{64}$ ]] || {
+            printf '%s\n' "release signing seed is missing or malformed" >&2
+            exit 1
+          }
+          [[ -n "$MAYHEM_RELEASE_KEY_ID" ]] || {
+            printf '%s\n' "release signing key id is missing" >&2
+            exit 1
+          }
+
+          umask 077
+          secret_dir="$(mktemp -d "${TMPDIR:-/tmp}/mayhem-release-secret.XXXXXX")"
+          seed_file="$secret_dir/seed.hex"
+          keys_dir="$secret_dir/keys"
+          trusted_key="$PWD/release/keys/$MAYHEM_RELEASE_KEY_ID.json"
+          cleanup() {
+            rm -rf -- "$secret_dir"
+          }
+          trap cleanup EXIT
+          trap 'exit 129' HUP
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          mkdir -p "$keys_dir"
+          printf '%s\n' "$MAYHEM_RELEASE_SEED_HEX" >"$seed_file"
+          chmod 0600 "$seed_file"
+          [[ -f "$trusted_key" && ! -L "$trusted_key" ]] || {
+            printf '%s\n' "canonical release public key record is unavailable" >&2
+            exit 1
+          }
+          cp "$trusted_key" "$keys_dir/$MAYHEM_RELEASE_KEY_ID.json"
+          release_created_at="$(
+            node --input-type=module -e '
+              import fs from "node:fs";
+              const record = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+              const expected = process.argv[2];
+              const keys = Object.keys(record);
+              if (JSON.stringify(keys) !== JSON.stringify([
+                "key_id", "alg", "public_key", "status", "created_at"
+              ]) ||
+                  record.key_id !== expected ||
+                  record.alg !== "ed25519" ||
+                  record.status !== "active" ||
+                  !/^[0-9a-f]{64}$/.test(record.public_key) ||
+                  typeof record.created_at !== "string" ||
+                  record.created_at.length === 0) {
+                throw new Error("canonical release public key record is invalid");
+              }
+              process.stdout.write(record.created_at);
+            ' "$trusted_key" "$MAYHEM_RELEASE_KEY_ID"
+          )"
+
+          rm -rf dist
+          bash scripts/package-release.sh \
+            --version 0.2.23 \
+            --target "$TARGET" \
+            --out-dir "$PWD/dist" \
+            --release-key-id "$MAYHEM_RELEASE_KEY_ID" \
+            --release-seed-file "$seed_file" \
+            --release-keys-dir "$keys_dir" \
+            --release-created-at "$release_created_at"
+          cmp "$keys_dir/$MAYHEM_RELEASE_KEY_ID.json" "$trusted_key"
+          cmp \
+            "dist/mayhem-0.2.23-$TARGET.release-key.json" \
+            "$trusted_key"
+
+      - name: Validate release output inventory
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          [[ -d dist && ! -L dist ]] || {
+            printf '%s\n' "release output root is not a real directory" >&2
+            exit 1
+          }
+          base="mayhem-0.2.23-$TARGET"
+          verifier_base="mayhem-attestation-verifier-0.2.23-$TARGET"
+          case "$TARGET" in
+            *-windows-*)
+              archive="$base.zip"
+              verifier="$verifier_base.exe"
+              ;;
+            *)
+              archive="$base.tar.gz"
+              verifier="$verifier_base"
+              ;;
+          esac
+          expected=(
+            "$archive"
+            "$archive.sha256"
+            "$base.SHA256SUMS"
+            "$base.manifest.json"
+            "$base.manifest.json.sig"
+            "$base.release-key.json"
+            "$verifier"
+            "$verifier_base.manifest.json"
+          )
+          for name in "${expected[@]}"; do
+            [[ -f "dist/$name" && ! -L "dist/$name" && -s "dist/$name" ]] || {
+              printf 'missing or invalid release output: %s\n' "$name" >&2
+              exit 1
+            }
+          done
+          expected_inventory="$(mktemp)"
+          actual_inventory="$(mktemp)"
+          cleanup_inventory() {
+            rm -f -- "$expected_inventory" "$actual_inventory"
+          }
+          trap cleanup_inventory EXIT
+          printf '%s\n' "${expected[@]}" | LC_ALL=C sort >"$expected_inventory"
+          find dist -mindepth 1 -maxdepth 1 -print |
+            sed 's#^dist/##' |
+            LC_ALL=C sort >"$actual_inventory"
+          cmp "$expected_inventory" "$actual_inventory" || {
+            printf '%s\n' \
+              "release output inventory contains unexpected or missing entries" >&2
+            exit 1
+          }
+
+      - name: Upload native release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mayhem-0.2.23-${{ matrix.target }}
+          path: |
+            dist/mayhem-0.2.23-${{ matrix.target }}${{ matrix.archive_suffix }}
+            dist/mayhem-0.2.23-${{ matrix.target }}${{ matrix.archive_suffix }}.sha256
+            dist/mayhem-0.2.23-${{ matrix.target }}.SHA256SUMS
+            dist/mayhem-0.2.23-${{ matrix.target }}.manifest.json
+            dist/mayhem-0.2.23-${{ matrix.target }}.manifest.json.sig
+            dist/mayhem-0.2.23-${{ matrix.target }}.release-key.json
+            dist/mayhem-attestation-verifier-0.2.23-${{ matrix.target }}${{ matrix.executable_suffix }}
+            dist/mayhem-attestation-verifier-0.2.23-${{ matrix.target }}.manifest.json
+          if-no-files-found: error
+          compression-level: 0

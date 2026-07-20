@@ -6,16 +6,29 @@ SOURCE_DIR="${MAYHEM_SOURCE_DIR:-$SCRIPT_DIR}"
 INSTALL_DIR="${MAYHEM_INSTALL_DIR:-$HOME/.mayhem/bin}"
 SHARE_DIR="${MAYHEM_SHARE_DIR:-}"
 VERSION="${MAYHEM_VERSION:-latest}"
+VERSION_EXPLICIT=0
+if [[ "${MAYHEM_VERSION+x}" == "x" ]]; then
+  VERSION_EXPLICIT=1
+fi
 ARTIFACT="${MAYHEM_ARTIFACT:-}"
 ARTIFACT_URL="${MAYHEM_ARTIFACT_URL:-}"
 ARTIFACT_SHA256="${MAYHEM_ARTIFACT_SHA256:-}"
+MANIFEST="${MAYHEM_RELEASE_MANIFEST:-}"
+MANIFEST_URL="${MAYHEM_RELEASE_MANIFEST_URL:-}"
+SIGNATURE="${MAYHEM_RELEASE_SIGNATURE:-}"
+SIGNATURE_URL="${MAYHEM_RELEASE_SIGNATURE_URL:-}"
+RELEASE_KEY="${MAYHEM_RELEASE_KEY:-}"
+RELEASE_KEY_ID="${MAYHEM_RELEASE_KEY_ID:-}"
+EXPECTED_SOURCE_GIT_SHA="${MAYHEM_SOURCE_GIT_SHA:-}"
 RELEASE_BASE_URL="${MAYHEM_RELEASE_BASE_URL:-}"
 FROM_SOURCE="${MAYHEM_FROM_SOURCE:-0}"
+UNSIGNED_LAYOUT="${MAYHEM_UNSIGNED_LAYOUT:-0}"
 SKIP_NODE="${MAYHEM_SKIP_NODE:-0}"
 SKIP_PEAR="${MAYHEM_SKIP_PEAR:-0}"
 NO_PATH_UPDATE="${MAYHEM_NO_PATH_UPDATE:-0}"
 ALLOW_UNVERIFIED="${MAYHEM_ALLOW_UNVERIFIED:-0}"
 NPM_PREFIX="${MAYHEM_NPM_PREFIX:-$HOME/.mayhem/node}"
+PEAR_VERSION="2.0.4"
 OPENCODE_VERSION="${MAYHEM_OPENCODE_VERSION:-1.17.13}"
 SKIP_OPENCODE="${MAYHEM_SKIP_OPENCODE:-0}"
 FORCE_OPENCODE="${MAYHEM_FORCE_OPENCODE:-0}"
@@ -23,6 +36,7 @@ FORCE_OPENCODE="${MAYHEM_FORCE_OPENCODE:-0}"
 BINS=(
   mayhem
   mayhem-gateway
+  mayhem-attestation-verifier
   mayhem-pay
   mayhemd
   mayhem-enclave
@@ -31,6 +45,9 @@ BINS=(
 
 PATH_ENTRIES=()
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/mayhem-install-root.XXXXXX")"
+chmod 0700 "$TMP_ROOT"
+SIGNED_ARCHIVE=""
+RELEASE_FLOOR_PRESENT=0
 VERIFIED_PACKAGE_ROOT=""
 VERIFIED_PACKAGE_FILES=""
 
@@ -46,9 +63,16 @@ Options:
   --source-dir <dir>        Source checkout for --from-source
   --artifact <path>         Install a local release archive
   --artifact-url <url>      Download and install a release archive
-  --sha256 <hex>            Expected SHA-256 for the release archive
+  --manifest <path>         Detached signed release manifest
+  --manifest-url <url>      Download the detached signed release manifest
+  --signature <path>        Detached Ed25519 manifest signature
+  --signature-url <url>     Download the detached manifest signature
+  --release-key <path>      Trusted public release-key record
+  --release-key-id <id>     Expected release signing key id
+  --source-git-sha <hex>    Expected signed source commit
+  --sha256 <hex>            Optional additional archive SHA-256 pin
   --release-base-url <url>  Base URL used with --version when no artifact URL is set
-  --version <version>       Version for release artifact lookup (default: latest)
+  --version <version>       Exact canonical signed release version
   --install-dir <dir>       Binary install directory (default: ~/.mayhem/bin)
   --share-dir <dir>         Runtime asset directory (default: sibling share/mayhem)
   --skip-node               Do not require Node/npm before Pear checks
@@ -57,7 +81,7 @@ Options:
   --opencode-version <ver>  Checksum-pinned opencode version (default: 1.17.13)
   --force-opencode          Install pinned opencode even when one is on PATH
   --no-path-update          Do not edit the shell profile
-  --allow-unverified        Allow archive installs without a checksum
+  --unsigned-layout         Install an updater-ineligible test layout
   -h, --help                Show this help
 
 Environment mirrors the long options with MAYHEM_* names, for example:
@@ -252,11 +276,7 @@ verify_archive() {
 
   expected="$(expected_checksum_for "$archive" | tr '[:upper:]' '[:lower:]')"
   if [[ -z "$expected" ]]; then
-    if [[ "$ALLOW_UNVERIFIED" == "1" ]]; then
-      warn "installing unverified archive because --allow-unverified was set"
-      return 0
-    fi
-    die "missing checksum for $archive; pass --sha256 or place a .sha256 sidecar next to it"
+    die "unsigned test layout is missing a checksum; pass --sha256 or place a .sha256 sidecar next to it"
   fi
 
   actual="$(sha256_file "$archive" | tr '[:upper:]' '[:lower:]')"
@@ -268,10 +288,11 @@ verify_archive() {
 
 archive_name() {
   local target="$1"
+  local artifact_version="${VERSION#v}"
 
   case "$target" in
-    *windows*) printf 'mayhem-%s-%s.zip\n' "$VERSION" "$target" ;;
-    *) printf 'mayhem-%s-%s.tar.gz\n' "$VERSION" "$target" ;;
+    *windows*) printf 'mayhem-%s-%s.zip\n' "$artifact_version" "$target" ;;
+    *) printf 'mayhem-%s-%s.tar.gz\n' "$artifact_version" "$target" ;;
   esac
 }
 
@@ -408,7 +429,7 @@ download_artifact_if_needed() {
   log "downloading $ARTIFACT_URL"
   download_file "$ARTIFACT_URL" "$archive"
 
-  if [[ -z "$ARTIFACT_SHA256" ]]; then
+  if [[ "$UNSIGNED_LAYOUT" == "1" && -z "$ARTIFACT_SHA256" ]]; then
     sidecar_url="$ARTIFACT_URL.sha256"
     if download_file "$sidecar_url" "$archive.sha256" >/dev/null 2>&1; then
       log "downloaded checksum sidecar"
@@ -418,6 +439,565 @@ download_artifact_if_needed() {
   fi
 
   printf '%s\n' "$archive"
+}
+
+release_artifact_stem() {
+  local value="$1"
+
+  case "$value" in
+    *.tar.gz) printf '%s\n' "${value%.tar.gz}" ;;
+    *.tgz) printf '%s\n' "${value%.tgz}" ;;
+    *.zip) printf '%s\n' "${value%.zip}" ;;
+    *) die "signed release archive must end in .tar.gz, .tgz, or .zip: $value" ;;
+  esac
+}
+
+validate_signed_release_selection() {
+  if [[ -n "$EXPECTED_SOURCE_GIT_SHA" &&
+    ! "$EXPECTED_SOURCE_GIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+    die "--source-git-sha must be exactly 40 lowercase hexadecimal characters"
+  fi
+
+  if [[ "$VERSION" == "latest" ]]; then
+    [[ -n "$EXPECTED_SOURCE_GIT_SHA" ]] ||
+      die "signed installs cannot use unpinned latest; pass an exact --version or --source-git-sha"
+    return 0
+  fi
+
+  [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+    die "--version must be an exact canonical semantic version for signed installs"
+  [[ "$VERSION_EXPLICIT" == "1" ]] ||
+    die "signed installs require an explicitly requested version or source_git_sha"
+}
+
+resolve_signed_release_metadata() {
+  local archive="$1"
+  local tmp local_stem remote_stem
+
+  tmp="$(make_temp_dir)"
+  if [[ -z "$MANIFEST" ]]; then
+    if [[ -n "$MANIFEST_URL" ]]; then
+      MANIFEST="$tmp/manifest.json"
+      log "downloading $MANIFEST_URL"
+      download_file "$MANIFEST_URL" "$MANIFEST"
+    elif [[ -n "$ARTIFACT_URL" ]]; then
+      remote_stem="$(release_artifact_stem "${ARTIFACT_URL%%\?*}")"
+      MANIFEST_URL="$remote_stem.manifest.json"
+      MANIFEST="$tmp/manifest.json"
+      log "downloading $MANIFEST_URL"
+      download_file "$MANIFEST_URL" "$MANIFEST"
+    else
+      local_stem="$(release_artifact_stem "$archive")"
+      MANIFEST="$local_stem.manifest.json"
+    fi
+  fi
+  if [[ -z "$SIGNATURE" ]]; then
+    if [[ -n "$SIGNATURE_URL" ]]; then
+      SIGNATURE="$tmp/manifest.json.sig"
+      log "downloading $SIGNATURE_URL"
+      download_file "$SIGNATURE_URL" "$SIGNATURE"
+    elif [[ -n "$ARTIFACT_URL" ]]; then
+      remote_stem="$(release_artifact_stem "${ARTIFACT_URL%%\?*}")"
+      SIGNATURE_URL="$remote_stem.manifest.json.sig"
+      SIGNATURE="$tmp/manifest.json.sig"
+      log "downloading $SIGNATURE_URL"
+      download_file "$SIGNATURE_URL" "$SIGNATURE"
+    else
+      local_stem="$(release_artifact_stem "$archive")"
+      SIGNATURE="$local_stem.manifest.json.sig"
+    fi
+  fi
+  [[ -n "$RELEASE_KEY" ]] ||
+    die "signed installs require --release-key with an independently trusted public key record"
+}
+
+snapshot_signed_release_inputs() {
+  local archive="$1"
+  local snapshot_root
+
+  case "$archive" in
+    *.tar.gz) ;;
+    *) die "install.sh signed releases require a canonical .tar.gz archive" ;;
+  esac
+
+  snapshot_root="$(make_temp_dir)"
+  chmod 0700 "$snapshot_root"
+  SIGNED_ARCHIVE="$snapshot_root/release.tar.gz"
+
+  RELEASE_SNAPSHOT_ARCHIVE_SOURCE="$archive" \
+    RELEASE_SNAPSHOT_MANIFEST_SOURCE="$MANIFEST" \
+    RELEASE_SNAPSHOT_SIGNATURE_SOURCE="$SIGNATURE" \
+    RELEASE_SNAPSHOT_KEY_SOURCE="$RELEASE_KEY" \
+    RELEASE_SNAPSHOT_ARCHIVE="$SIGNED_ARCHIVE" \
+    RELEASE_SNAPSHOT_MANIFEST="$snapshot_root/manifest.json" \
+    RELEASE_SNAPSHOT_SIGNATURE="$snapshot_root/manifest.json.sig" \
+    RELEASE_SNAPSHOT_KEY="$snapshot_root/release-key.json" \
+    node --input-type=module <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+
+const noFollow = fs.constants.O_NOFOLLOW;
+if (!Number.isInteger(noFollow) || noFollow === 0) {
+  throw new Error('this platform cannot snapshot release inputs without following links');
+}
+const inputs = [
+  {
+    source: process.env.RELEASE_SNAPSHOT_ARCHIVE_SOURCE,
+    output: process.env.RELEASE_SNAPSHOT_ARCHIVE,
+    maximum: 2 * 1024 * 1024 * 1024,
+    label: 'release archive',
+  },
+  {
+    source: process.env.RELEASE_SNAPSHOT_MANIFEST_SOURCE,
+    output: process.env.RELEASE_SNAPSHOT_MANIFEST,
+    maximum: 64 * 1024 * 1024,
+    label: 'release manifest',
+  },
+  {
+    source: process.env.RELEASE_SNAPSHOT_SIGNATURE_SOURCE,
+    output: process.env.RELEASE_SNAPSHOT_SIGNATURE,
+    maximum: 64 * 1024,
+    label: 'release signature',
+  },
+  {
+    source: process.env.RELEASE_SNAPSHOT_KEY_SOURCE,
+    output: process.env.RELEASE_SNAPSHOT_KEY,
+    maximum: 64 * 1024,
+    label: 'trusted release key',
+  },
+].map((input) => {
+  if (!input.source) throw new Error(`${input.label} path is required`);
+  const source = path.resolve(input.source);
+  const before = fs.lstatSync(source);
+  if (!before.isFile() || before.isSymbolicLink() ||
+      before.size === 0 || before.size > input.maximum) {
+    throw new Error(`${input.label} must be a bounded regular non-symlink file`);
+  }
+  return { ...input, source, before };
+});
+const identities = new Set();
+for (const input of inputs) {
+  const identity = `${input.before.dev}:${input.before.ino}`;
+  if (identities.has(identity)) {
+    throw new Error('release archive, manifest, signature, and key must be distinct files');
+  }
+  identities.add(identity);
+}
+for (const input of inputs) {
+  let sourceFd;
+  let outputFd;
+  try {
+    sourceFd = fs.openSync(input.source, fs.constants.O_RDONLY | noFollow);
+    const opened = fs.fstatSync(sourceFd);
+    if (!opened.isFile() ||
+        opened.dev !== input.before.dev ||
+        opened.ino !== input.before.ino ||
+        opened.size !== input.before.size ||
+        opened.size === 0 ||
+        opened.size > input.maximum) {
+      throw new Error(`${input.label} changed while its private snapshot was opened`);
+    }
+    outputFd = fs.openSync(
+      path.resolve(input.output),
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+      0o600,
+    );
+    const buffer = Buffer.allocUnsafe(128 * 1024);
+    let total = 0;
+    while (true) {
+      const read = fs.readSync(sourceFd, buffer, 0, buffer.length, null);
+      if (read === 0) break;
+      total += read;
+      if (total > input.maximum) {
+        throw new Error(`${input.label} exceeded its snapshot size limit`);
+      }
+      let offset = 0;
+      while (offset < read) {
+        offset += fs.writeSync(outputFd, buffer, offset, read - offset);
+      }
+    }
+    if (total !== opened.size) {
+      throw new Error(`${input.label} changed while it was snapshotted`);
+    }
+    fs.fsyncSync(outputFd);
+    fs.chmodSync(input.output, 0o600);
+  } finally {
+    if (outputFd !== undefined) fs.closeSync(outputFd);
+    if (sourceFd !== undefined) fs.closeSync(sourceFd);
+  }
+}
+NODE
+
+  MANIFEST="$snapshot_root/manifest.json"
+  SIGNATURE="$snapshot_root/manifest.json.sig"
+  RELEASE_KEY="$snapshot_root/release-key.json"
+  log "snapshotted signed release inputs into private installer state"
+}
+
+validate_signed_install_state() {
+  local install_root="$1"
+  local update_root="$install_root/.mayhem-update"
+  local floor="$update_root/release-floor.json"
+
+  RELEASE_FLOOR_PRESENT=0
+  if [[ -e "$install_root" || -L "$install_root" ]]; then
+    [[ -d "$install_root" && ! -L "$install_root" ]] ||
+      die "release install root must be a real directory: $install_root"
+  fi
+  if [[ -e "$update_root" || -L "$update_root" ]]; then
+    [[ -d "$update_root" && ! -L "$update_root" ]] ||
+      die "release update root must be a real directory: $update_root"
+  fi
+  if [[ -e "$floor" || -L "$floor" ]]; then
+    [[ -f "$floor" && ! -L "$floor" ]] ||
+      die "release anti-rollback floor must be a regular non-symlink file: $floor"
+    RELEASE_FLOOR_PRESENT=1
+  fi
+}
+
+verify_bootstrap_release_identity() {
+  local target="$1"
+  local floor="$2"
+  local requested_version=""
+
+  if [[ "$VERSION" != "latest" ]]; then
+    requested_version="$VERSION"
+  fi
+
+  RELEASE_BOOTSTRAP_MANIFEST="$MANIFEST" \
+    RELEASE_BOOTSTRAP_SIGNATURE="$SIGNATURE" \
+    RELEASE_BOOTSTRAP_KEY="$RELEASE_KEY" \
+    RELEASE_BOOTSTRAP_TARGET="$target" \
+    RELEASE_BOOTSTRAP_KEY_ID="$RELEASE_KEY_ID" \
+    RELEASE_BOOTSTRAP_SOURCE_GIT_SHA="$EXPECTED_SOURCE_GIT_SHA" \
+    RELEASE_BOOTSTRAP_REQUESTED_VERSION="$requested_version" \
+    RELEASE_BOOTSTRAP_FLOOR="$floor" \
+    RELEASE_BOOTSTRAP_FLOOR_PRESENT="$RELEASE_FLOOR_PRESENT" \
+    node --input-type=module <<'NODE'
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const readBounded = (input, maximum, label) => {
+  const resolved = path.resolve(input);
+  const before = fs.lstatSync(resolved);
+  if (!before.isFile() || before.isSymbolicLink() ||
+      before.size === 0 || before.size > maximum) {
+    throw new Error(`${label} must be a bounded regular non-symlink file`);
+  }
+  const descriptor = fs.openSync(
+    resolved,
+    fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
+  );
+  try {
+    const opened = fs.fstatSync(descriptor);
+    if (!opened.isFile() ||
+        opened.dev !== before.dev ||
+        opened.ino !== before.ino ||
+        opened.size !== before.size ||
+        opened.size === 0 ||
+        opened.size > maximum) {
+      throw new Error(`${label} changed while it was opened`);
+    }
+    return fs.readFileSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+};
+const manifestBytes = readBounded(
+  process.env.RELEASE_BOOTSTRAP_MANIFEST,
+  64 * 1024 * 1024,
+  'release manifest',
+);
+const signatureBytes = readBounded(
+  process.env.RELEASE_BOOTSTRAP_SIGNATURE,
+  64 * 1024,
+  'release signature',
+);
+const keyBytes = readBounded(
+  process.env.RELEASE_BOOTSTRAP_KEY,
+  64 * 1024,
+  'trusted release key',
+);
+const parse = (bytes, label) => {
+  try {
+    return JSON.parse(bytes.toString('utf8'));
+  } catch (error) {
+    throw new Error(`${label} is invalid JSON: ${error.message}`);
+  }
+};
+const manifest = parse(manifestBytes, 'release manifest');
+const signature = parse(signatureBytes, 'release signature');
+const key = parse(keyBytes, 'trusted release key');
+const exactKeys = (value, expected) =>
+  value !== null &&
+  typeof value === 'object' &&
+  !Array.isArray(value) &&
+  JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort());
+if (!exactKeys(signature, [
+  'schema_version',
+  'alg',
+  'signed_path',
+  'key_id',
+  'public_key',
+  'sha256',
+  'sig',
+])) {
+  throw new Error('release signature has an unexpected schema');
+}
+if (!exactKeys(key, ['key_id', 'alg', 'public_key', 'status', 'created_at'])) {
+  throw new Error('trusted release key has an unexpected schema');
+}
+const validKeyId = (value) =>
+  typeof value === 'string' &&
+  value.length > 0 &&
+  value.length <= 128 &&
+  /^[A-Za-z0-9._-]+$/.test(value);
+if (!validKeyId(key.key_id) ||
+    key.alg !== 'ed25519' ||
+    key.status !== 'active' ||
+    !/^[0-9a-f]{64}$/.test(key.public_key) ||
+    signature.schema_version !== 1 ||
+    signature.alg !== 'ed25519' ||
+    signature.key_id !== key.key_id ||
+    signature.public_key !== key.public_key ||
+    !/^[0-9a-f]{64}$/.test(signature.sha256) ||
+    !/^[0-9a-f]{128}$/.test(signature.sig)) {
+  throw new Error('release signature does not match the trusted active Ed25519 key');
+}
+const expectedKeyId = process.env.RELEASE_BOOTSTRAP_KEY_ID;
+if (expectedKeyId && signature.key_id !== expectedKeyId) {
+  throw new Error(`release signature key id ${signature.key_id} does not match ${expectedKeyId}`);
+}
+if (manifest?.schema !== 1 ||
+    manifest.name !== 'mayhem' ||
+    !/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(manifest.version) ||
+    manifest.target !== process.env.RELEASE_BOOTSTRAP_TARGET ||
+    !/^[0-9a-f]{40}$/.test(manifest.source_git_sha)) {
+  throw new Error('signed release identity, target, version, or source_git_sha is invalid');
+}
+const expectedSource = process.env.RELEASE_BOOTSTRAP_SOURCE_GIT_SHA;
+if (expectedSource && !/^[0-9a-f]{40}$/.test(expectedSource)) {
+  throw new Error('expected source_git_sha must be exactly 40 lowercase hexadecimal characters');
+}
+if (expectedSource && manifest.source_git_sha !== expectedSource) {
+  throw new Error(
+    `signed release source_git_sha ${manifest.source_git_sha} does not match ${expectedSource}`,
+  );
+}
+const expectedSignedPath = `mayhem-${manifest.version}-${manifest.target}.manifest.json`;
+if (signature.signed_path !== expectedSignedPath) {
+  throw new Error('release signature signed_path does not match the release identity');
+}
+const digest = crypto.createHash('sha256').update(manifestBytes).digest('hex');
+if (signature.sha256 !== digest) {
+  throw new Error('release signature manifest hash does not match');
+}
+const publicKey = crypto.createPublicKey({
+  key: Buffer.concat([
+    Buffer.from('302a300506032b6570032100', 'hex'),
+    Buffer.from(key.public_key, 'hex'),
+  ]),
+  format: 'der',
+  type: 'spki',
+});
+const signingBytes = Buffer.concat([
+  Buffer.from('mayhem.release-manifest.v1\n', 'ascii'),
+  manifestBytes,
+]);
+if (!crypto.verify(null, signingBytes, publicKey, Buffer.from(signature.sig, 'hex'))) {
+  throw new Error('release manifest Ed25519 signature verification failed');
+}
+const requestedVersion = process.env.RELEASE_BOOTSTRAP_REQUESTED_VERSION;
+if (requestedVersion &&
+    (!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(requestedVersion) ||
+     manifest.version !== requestedVersion)) {
+  throw new Error(
+    `signed release version ${manifest.version} does not match requested version ${requestedVersion}`,
+  );
+}
+if (!requestedVersion && !expectedSource) {
+  throw new Error('signed release is not bound to an exact version or source_git_sha');
+}
+const floorPath = process.env.RELEASE_BOOTSTRAP_FLOOR;
+if (process.env.RELEASE_BOOTSTRAP_FLOOR_PRESENT === '1') {
+  const floorBytes = readBounded(floorPath, 4 * 1024, 'release anti-rollback floor');
+  const floor = parse(floorBytes, 'release anti-rollback floor');
+  if (!exactKeys(floor, ['schema', 'version']) ||
+      floor.schema !== 1 ||
+      !/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(floor.version)) {
+    throw new Error('release anti-rollback floor has an invalid schema or version');
+  }
+  const compareSemver = (left, right) => {
+    const leftParts = left.split('.').map(BigInt);
+    const rightParts = right.split('.').map(BigInt);
+    for (let index = 0; index < 3; index += 1) {
+      if (leftParts[index] < rightParts[index]) return -1;
+      if (leftParts[index] > rightParts[index]) return 1;
+    }
+    return 0;
+  };
+  if (compareSemver(manifest.version, floor.version) < 0) {
+    throw new Error(
+      `signed release version ${manifest.version} is below protected anti-rollback floor ${floor.version}`,
+    );
+  }
+}
+const binaryName = manifest.target.includes('windows') ? 'mayhem.exe' : 'mayhem';
+const binaryPath = `bin/${binaryName}`;
+const binaries = Array.isArray(manifest.binaries)
+  ? manifest.binaries.filter((binary) =>
+      binary?.name === binaryName && binary?.path === binaryPath)
+  : [];
+const assets = Array.isArray(manifest.assets)
+  ? manifest.assets.filter((asset) => asset?.path === binaryPath)
+  : [];
+if (binaries.length !== 1 ||
+    assets.length !== 1 ||
+    !/^[0-9a-f]{64}$/.test(binaries[0].sha256) ||
+    binaries[0].sha256 !== assets[0].sha256) {
+  throw new Error('signed manifest does not bind exactly one bootstrap mayhem binary');
+}
+process.stdout.write([
+  manifest.version,
+  manifest.source_git_sha,
+  signature.key_id,
+  binaries[0].sha256,
+  binaryPath,
+].join('\t') + '\n');
+NODE
+}
+
+extract_authenticated_bootstrap() {
+  local archive="$1"
+  local target="$2"
+  local version="$3"
+  local binary_path="$4"
+  local expected_sha="$5"
+  local output="$6"
+  local archive_entry actual
+
+  archive_entry="mayhem-$version-$target/$binary_path"
+  case "$archive" in
+    *.tar.gz | *.tgz)
+      tar -xOf "$archive" "$archive_entry" >"$output" ||
+        die "could not extract the signed bootstrap binary from $archive"
+      ;;
+    *)
+      die "install.sh signed releases require a tar.gz archive for $target"
+      ;;
+  esac
+  actual="$(sha256_file "$output" | tr '[:upper:]' '[:lower:]')"
+  [[ "$actual" == "$expected_sha" ]] ||
+    die "signed bootstrap binary hash mismatch: expected $expected_sha, got $actual"
+  chmod 0755 "$output"
+  log "authenticated bootstrap mayhem binary $actual"
+}
+
+provision_release_key() {
+  local install_root="$1"
+  local key_id="$2"
+  local update_root="$install_root/.mayhem-update"
+  local trusted_root="$update_root/trusted-release-keys"
+  local destination="$trusted_root/$key_id.json"
+
+  [[ ! -L "$install_root" ]] || die "release install root must not be a symbolic link"
+  if [[ -e "$update_root" || -L "$update_root" ]]; then
+    [[ -d "$update_root" && ! -L "$update_root" ]] ||
+      die "release update root must be a real directory: $update_root"
+  else
+    mkdir -p "$update_root"
+  fi
+  if [[ -e "$trusted_root" || -L "$trusted_root" ]]; then
+    [[ -d "$trusted_root" && ! -L "$trusted_root" ]] ||
+      die "trusted release key root must be a real directory: $trusted_root"
+  else
+    mkdir "$trusted_root"
+  fi
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    [[ -f "$destination" && ! -L "$destination" ]] ||
+      die "provisioned release key must be a regular non-symlink file: $destination"
+    cmp "$RELEASE_KEY" "$destination" >/dev/null ||
+      die "provisioned release key $key_id differs from the trusted install state"
+  else
+    cp "$RELEASE_KEY" "$destination"
+    chmod 0644 "$destination"
+  fi
+  printf '%s\n' "$trusted_root"
+}
+
+install_signed_release() {
+  local archive="$1"
+  local target="$2"
+  local identity release_version source_git_sha key_id bootstrap_sha binary_path
+  local bootstrap_root bootstrap install_root expected_share trusted_keys stage_report apply_report
+
+  command -v node >/dev/null 2>&1 ||
+    die "Node.js is required to authenticate a signed release bootstrap"
+
+  install_root="$(dirname "$INSTALL_DIR")"
+  expected_share="$install_root/share/mayhem"
+  [[ "$INSTALL_DIR" == "$install_root/bin" ]] ||
+    die "signed installs require the binary directory to be <install-root>/bin"
+  [[ "$SHARE_DIR" == "$expected_share" ]] ||
+    die "signed installs require the asset directory to be <install-root>/share/mayhem"
+  validate_signed_install_state "$install_root"
+
+  snapshot_signed_release_inputs "$archive"
+  archive="$SIGNED_ARCHIVE"
+  identity="$(verify_bootstrap_release_identity \
+    "$target" \
+    "$install_root/.mayhem-update/release-floor.json")" ||
+    die "signed release bootstrap authentication or anti-rollback check failed"
+  IFS=$'\t' read -r release_version source_git_sha key_id bootstrap_sha binary_path <<<"$identity"
+  [[ -n "$release_version" && -n "$key_id" && -n "$bootstrap_sha" ]] ||
+    die "signed release bootstrap identity was incomplete"
+
+  if [[ -n "$ARTIFACT_SHA256" ]]; then
+    verify_archive "$archive"
+  fi
+  bootstrap_root="$(make_temp_dir)"
+  bootstrap="$bootstrap_root/mayhem"
+  extract_authenticated_bootstrap \
+    "$archive" \
+    "$target" \
+    "$release_version" \
+    "$binary_path" \
+    "$bootstrap_sha" \
+    "$bootstrap"
+  [[ "$("$bootstrap" --version)" == "mayhem $release_version" ]] ||
+    die "authenticated bootstrap binary version does not match signed release $release_version"
+
+  trusted_keys="$(provision_release_key "$install_root" "$key_id")"
+
+  stage_report="$bootstrap_root/stage.json"
+  log "staging and reauthenticating signed release $release_version ($source_git_sha)"
+  "$bootstrap" update \
+    --home "$install_root" \
+    --target "$target" \
+    --archive-path "$archive" \
+    --manifest-path "$MANIFEST" \
+    --signature-path "$SIGNATURE" \
+    --release-keys-dir "$trusted_keys" \
+    --key-id "$key_id" \
+    --json >"$stage_report"
+
+  apply_report="$bootstrap_root/apply.json"
+  log "activating signed release $release_version"
+  "$bootstrap" update \
+    --home "$install_root" \
+    --target "$target" \
+    --apply-staged \
+    --release-keys-dir "$trusted_keys" \
+    --key-id "$key_id" \
+    --bypass-apply-delay \
+    --post-upgrade-arg=--help \
+    --json >"$apply_report"
+  [[ -f "$install_root/.mayhem-update/release-floor.json" ]] ||
+    die "signed install did not provision the anti-rollback floor"
+  [[ -f "$trusted_keys/$key_id.json" ]] ||
+    die "signed install did not provision updater release trust"
+  log "verified and activated signed release $release_version from $source_git_sha"
 }
 
 extract_archive() {
@@ -597,15 +1177,23 @@ install_from_artifact() {
   local target archive extract_dir
 
   target="$(detect_target)"
+  if [[ "$UNSIGNED_LAYOUT" != "1" ]]; then
+    validate_signed_release_selection
+  fi
   archive="$(download_artifact_if_needed "$target")"
   [[ -f "$archive" ]] || die "artifact not found: $archive"
-  verify_archive "$archive"
-
-  extract_dir="$(make_temp_dir)"
-  extract_archive "$archive" "$extract_dir"
-  verify_extracted_checksums "$extract_dir"
-  copy_artifact_bins "$VERIFIED_PACKAGE_ROOT"
-  copy_artifact_assets "$VERIFIED_PACKAGE_ROOT"
+  if [[ "$UNSIGNED_LAYOUT" == "1" ]]; then
+    warn "installing an explicit unsigned test layout; updater trust will not be provisioned"
+    verify_archive "$archive"
+    extract_dir="$(make_temp_dir)"
+    extract_archive "$archive" "$extract_dir"
+    verify_extracted_checksums "$extract_dir"
+    copy_artifact_bins "$VERIFIED_PACKAGE_ROOT"
+    copy_artifact_assets "$VERIFIED_PACKAGE_ROOT"
+  else
+    resolve_signed_release_metadata "$archive"
+    install_signed_release "$archive" "$target"
+  fi
 }
 
 install_from_source() {
@@ -656,22 +1244,49 @@ ensure_node() {
 }
 
 ensure_pear() {
+  local package_json=""
+
   if [[ "$SKIP_PEAR" == "1" ]]; then
     log "skipping Pear bootstrap"
     return 0
   fi
 
-  if command -v pear >/dev/null 2>&1; then
-    log "found Pear at $(command -v pear)"
-    pear --help >/dev/null 2>&1 || true
-    return 0
-  fi
-
   ensure_node
   mkdir -p "$NPM_PREFIX"
-  log "installing Pear runtime with npm prefix $NPM_PREFIX"
-  npm install -g pear --prefix "$NPM_PREFIX"
   add_path_entry "$NPM_PREFIX/bin"
+
+  for package_json in \
+    "$NPM_PREFIX/lib/node_modules/pear/package.json" \
+    "$NPM_PREFIX/node_modules/pear/package.json"; do
+    if [[ -f "$package_json" && ! -L "$package_json" ]] &&
+      node -e '
+        const metadata = require(process.argv[1]);
+        process.exit(metadata.version === process.argv[2] ? 0 : 1);
+      ' "$package_json" "$PEAR_VERSION"; then
+      log "found pinned Pear $PEAR_VERSION in $NPM_PREFIX"
+      break
+    fi
+    package_json=""
+  done
+
+  if [[ -z "$package_json" ]]; then
+    log "installing pinned Pear $PEAR_VERSION with npm prefix $NPM_PREFIX"
+    npm install -g "pear@$PEAR_VERSION" --prefix "$NPM_PREFIX"
+    for package_json in \
+      "$NPM_PREFIX/lib/node_modules/pear/package.json" \
+      "$NPM_PREFIX/node_modules/pear/package.json"; do
+      if [[ -f "$package_json" && ! -L "$package_json" ]] &&
+        node -e '
+          const metadata = require(process.argv[1]);
+          process.exit(metadata.version === process.argv[2] ? 0 : 1);
+        ' "$package_json" "$PEAR_VERSION"; then
+        break
+      fi
+      package_json=""
+    done
+    [[ -n "$package_json" ]] ||
+      die "npm did not install the pinned Pear $PEAR_VERSION package"
+  fi
 
   if ! command -v pear >/dev/null 2>&1; then
     die "Pear was installed but is not on PATH"
@@ -775,6 +1390,41 @@ while [[ $# -gt 0 ]]; do
       ARTIFACT_SHA256="$2"
       shift 2
       ;;
+    --manifest)
+      [[ $# -ge 2 ]] || die "--manifest requires a value"
+      MANIFEST="$2"
+      shift 2
+      ;;
+    --manifest-url)
+      [[ $# -ge 2 ]] || die "--manifest-url requires a value"
+      MANIFEST_URL="$2"
+      shift 2
+      ;;
+    --signature)
+      [[ $# -ge 2 ]] || die "--signature requires a value"
+      SIGNATURE="$2"
+      shift 2
+      ;;
+    --signature-url)
+      [[ $# -ge 2 ]] || die "--signature-url requires a value"
+      SIGNATURE_URL="$2"
+      shift 2
+      ;;
+    --release-key)
+      [[ $# -ge 2 ]] || die "--release-key requires a value"
+      RELEASE_KEY="$2"
+      shift 2
+      ;;
+    --release-key-id)
+      [[ $# -ge 2 ]] || die "--release-key-id requires a value"
+      RELEASE_KEY_ID="$2"
+      shift 2
+      ;;
+    --source-git-sha)
+      [[ $# -ge 2 ]] || die "--source-git-sha requires a value"
+      EXPECTED_SOURCE_GIT_SHA="$2"
+      shift 2
+      ;;
     --release-base-url)
       [[ $# -ge 2 ]] || die "--release-base-url requires a value"
       RELEASE_BASE_URL="$2"
@@ -783,6 +1433,7 @@ while [[ $# -gt 0 ]]; do
     --version)
       [[ $# -ge 2 ]] || die "--version requires a value"
       VERSION="$2"
+      VERSION_EXPLICIT=1
       shift 2
       ;;
     --install-dir)
@@ -820,9 +1471,12 @@ while [[ $# -gt 0 ]]; do
       NO_PATH_UPDATE=1
       shift
       ;;
-    --allow-unverified)
-      ALLOW_UNVERIFIED=1
+    --unsigned-layout)
+      UNSIGNED_LAYOUT=1
       shift
+      ;;
+    --allow-unverified)
+      die "--allow-unverified has been removed; use --unsigned-layout only for explicit test fixtures"
       ;;
     -h | --help)
       usage
@@ -834,10 +1488,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+[[ "$ALLOW_UNVERIFIED" != "1" ]] ||
+  die "MAYHEM_ALLOW_UNVERIFIED has been removed; unsigned production installs are disabled"
+[[ "$UNSIGNED_LAYOUT" == "0" || "$UNSIGNED_LAYOUT" == "1" ]] ||
+  die "MAYHEM_UNSIGNED_LAYOUT must be 0 or 1"
+
 if [[ "$FROM_SOURCE" != "1" && -z "$ARTIFACT" && -z "$ARTIFACT_URL" && -z "$RELEASE_BASE_URL" ]]; then
   if [[ -f "$SOURCE_DIR/Cargo.toml" && -d "$SOURCE_DIR/crates/mayhem-cli" ]]; then
     FROM_SOURCE=1
   fi
+fi
+if [[ "$UNSIGNED_LAYOUT" == "1" && "$FROM_SOURCE" == "1" ]]; then
+  die "--unsigned-layout applies only to test release archives"
 fi
 
 if [[ -z "$SHARE_DIR" ]]; then
@@ -845,16 +1507,17 @@ if [[ -z "$SHARE_DIR" ]]; then
 fi
 
 add_path_entry "$INSTALL_DIR"
-ensure_pear
 
 if [[ "$FROM_SOURCE" == "1" ]]; then
+  ensure_pear
   install_from_source
+  hydrate_runtime_assets
 else
   install_from_artifact
+  ensure_pear
 fi
 
 configure_linux_user_namespace_sandbox
-hydrate_runtime_assets
 install_opencode
 update_shell_profile
 smoke_test

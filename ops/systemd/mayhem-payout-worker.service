@@ -1,0 +1,18 @@
+[Unit]
+Description=Mayhem automatic finalized-epoch fiat, TAP, and TNK payout worker
+Wants=network-online.target mayhem-paygate.service mayhem-tap-settlement.service mayhem-tap-rate.service mayhem-tnk-rate.service
+Requires=mayhem-stack.service
+After=network-online.target mayhem-stack.service mayhem-paygate.service mayhem-tap-rate.service mayhem-tnk-rate.service
+
+[Service]
+Type=oneshot
+User=mayhem
+Group=mayhem
+WorkingDirectory=/opt/mayhem/source
+EnvironmentFile=/opt/mayhem/.mayhem-local/secrets/GO-LIVE/mayhem-systemd.env
+UMask=0077
+ExecStartPre=/usr/bin/node /opt/mayhem/source/scripts/mainnet-proof.mjs --timeout-seconds 0 --json
+ExecStart=/opt/mayhem/source/scripts/ops-payout-settle.sh
+TimeoutStartSec=1h
+NoNewPrivileges=true
+PrivateTmp=true

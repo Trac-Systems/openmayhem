@@ -338,7 +338,8 @@ fn evaluate_github_update(
 }
 
 fn release_has_installable_assets(release: &GithubRelease, target: &str) -> bool {
-    let base = format!("mayhem-{}-{target}", release.tag_name);
+    let version = release.tag_name.trim_start_matches('v');
+    let base = format!("mayhem-{version}-{target}");
     let archive_tar = format!("{base}.tar.gz");
     let archive_zip = format!("{base}.zip");
     let manifest = format!("{base}.manifest.json");
@@ -476,6 +477,30 @@ mod tests {
             "0.2.0",
             None,
             Some(&release("0.3.0", &asset_refs)),
+            None,
+            target,
+            42,
+            true,
+        );
+        let update = status.update.expect("installable release");
+        assert_eq!(update.kind, "release");
+        assert!(update.installable);
+    }
+
+    #[test]
+    fn signed_assets_use_semver_without_the_git_tag_prefix() {
+        let target = "aarch64-apple-darwin";
+        let base = format!("mayhem-0.3.0-{target}");
+        let assets = [
+            format!("{base}.tar.gz"),
+            format!("{base}.manifest.json"),
+            format!("{base}.manifest.json.sig"),
+        ];
+        let asset_refs = assets.iter().map(String::as_str).collect::<Vec<_>>();
+        let status = evaluate_github_update(
+            "0.2.0",
+            None,
+            Some(&release("v0.3.0", &asset_refs)),
             None,
             target,
             42,

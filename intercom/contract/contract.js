@@ -5,13 +5,23 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 12;
+export const CONTRACT_VERSION = 13;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
 const PROVIDER_ACCEPTED_RAIL_ORDER = Object.freeze(['fiat', 'tap', 'tnk']);
 const PROVIDER_RAIL_SCHEMA_VERSION = 1;
-const PAYOUT_TARGET_METHODS = new Set(['tnk', 'stripe', 'tap']);
+const PROVIDER_PAYOUT_BINDING_RAILS = new Set(['fiat', 'tap', 'tnk']);
+const PROVIDER_PAYOUT_BINDING_RAIL_ORDER = Object.freeze(['fiat', 'tap', 'tnk']);
+const PROVIDER_PAYOUT_BINDING_CONTEXT_CURRENT_KEY = 'payout/context/current';
+export const PAYOUT_INTENT_MAX_EXPIRY_EPOCHS_DEFAULT = 10_000;
+const PAYOUT_PARAM_DEFINITIONS = Object.freeze({
+  payout_intent_max_expiry_epochs: {
+    default: PAYOUT_INTENT_MAX_EXPIRY_EPOCHS_DEFAULT,
+    min: 1,
+    max: 1_000_000,
+  },
+});
 const FIAT_DEPOSIT_RAILS = new Set(['stripe']);
 const FIAT_CURRENCIES = new Set(['usd', 'eur']);
 const PRICE_DENOMINATION = 'au_usd';
@@ -360,6 +370,50 @@ export const providerLifecycleIntentMessage = (intent, signingVersion = SIGNING_
     intent: stableValue(intent),
   });
 };
+export const providerPayoutTargetBindingEvidence = (intent) => ({
+  admin: intent.admin,
+  bootstrap: intent.bootstrap,
+  chain_id: intent.chain_id,
+  context_revision: intent.context_revision,
+  currency: intent.currency,
+  expires_after_epoch: intent.expires_after_epoch,
+  network: intent.network,
+  nonce: intent.nonce,
+  payment_config_version: intent.payment_config_version,
+  previous_revision: intent.previous_revision,
+  provider: intent.provider,
+  rail: intent.rail,
+  target: intent.target,
+  target_wallet: intent.target_wallet,
+});
+export const providerPayoutTargetBindingMessage = (intent) =>
+  `mayhem-provider-payout-target-binding-v1${stableJson(
+    providerPayoutTargetBindingEvidence(intent)
+  )}`;
+export const providerPayoutBindingMessage = (intent) =>
+  `mayhem-provider-payout-binding-v1${stableJson(intent)}`;
+export const stripePayoutProcessorEvidence = (value) => ({
+  account_id: value.account_id,
+  account_type: value.account_type,
+  country: value.country,
+  currency: value.currency,
+  mode: value.mode,
+  provider: value.provider,
+});
+export const stripePayoutProcessorRevision = async (value) => {
+  const digest = await blake3(b4a.from(stableJson({
+    domain: 'mayhem-stripe-payout-processor-evidence-v1',
+    evidence: stripePayoutProcessorEvidence(value),
+  })));
+  return b4a.toString(digest, 'hex');
+};
+export const stripePayoutVerificationFeatureKey = async (value) => {
+  const digest = await blake3(b4a.from(stableJson({
+    domain: 'mayhem-stripe-payout-verification-feature-v1',
+    value,
+  })));
+  return `payout/stripe-verified/${value.provider}/${b4a.toString(digest, 'hex')}`;
+};
 export const depositTnkIntentMessage = (intent) =>
   `mayhem-deposit-tnk-intent-v1${stableJson(intent)}`;
 export const tapAccountBindingEvidence = (value) => ({
@@ -486,6 +540,14 @@ export const spendReservationEvidence = (value) => {
 };
 export const spendReservationMessage = (value) =>
   `mayhem-spend-reservation-v1${stableJson(spendReservationEvidence(value))}`;
+export const targetedSpendReservationEvidence = (value) => ({
+  payout_revision: value.payout_revision,
+  reservation: spendReservationEvidence(value),
+});
+export const targetedSpendReservationMessage = (value) =>
+  `mayhem-targeted-spend-reservation-v1${stableJson(
+    targetedSpendReservationEvidence(value)
+  )}`;
 export const probeResultEvidence = (value, auditor) => ({
   auditor,
   probe_id: value.probe_id,
@@ -686,18 +748,6 @@ class MayhemContract extends Contract {
     });
 
     this.addFunction('registerProvider');
-
-    this.addSchema('setProviderPayout', {
-      value: {
-        $$strict: true,
-        $$type: 'object',
-        op: { type: 'string', min: 1, max: 64 },
-        provider: { type: 'string', min: 1, max: 128 },
-        payout_addr: { type: 'string', min: 1, max: 256 },
-        payout_method: { type: 'string', min: 1, max: 32 },
-        payout_currency: { type: 'string', min: 3, max: 3, optional: true },
-      },
-    });
 
     this.addSchema('setProviderRails', {
       value: {
@@ -1222,8 +1272,13 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
-    if (value.op === 'spend_reserve') {
-      const result = await this.applySpendReserveFeature(key, value);
+    if (value.op === 'bind_provider_payout') {
+      const result = await this.applyProviderPayoutBindingFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'spend_reserve_targeted') {
+      const result = await this.applyTargetedSpendReserveFeature(key, value);
       this._mayhemLastFeatureResult = result;
       return result;
     }
@@ -1241,8 +1296,23 @@ class MayhemContract extends Contract {
       return adminError;
     }
     if (isRateFeature) this._mayhemApplyStage = 'rate:admin-verified';
-    if (value.op === 'epoch_apply') {
-      const result = await this.applyEpochApplyFeature(key, value);
+    if (value.op === 'publish_payout_context') {
+      const result = await this.applyPublishPayoutContextFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'schedule_payout_parameter') {
+      const result = await this.applySchedulePayoutParameterFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'verify_stripe_payout') {
+      const result = await this.applyVerifyStripePayoutFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'apply_targeted_epoch') {
+      const result = await this.applyTargetedEpochFeature(key, value);
       this._mayhemLastFeatureResult = result;
       return result;
     }
@@ -1257,13 +1327,13 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
-    if (value.op === 'tnk_settlement') {
-      const result = await this.applyTnkSettlementFeature(key, value);
+    if (value.op === 'settle_targeted_tnk') {
+      const result = await this.applyTargetedTnkSettlementFeature(key, value);
       this._mayhemLastFeatureResult = result;
       return result;
     }
-    if (value.op === 'fiat_settlement') {
-      const result = await this.applyFiatSettlementFeature(key, value);
+    if (value.op === 'settle_targeted_fiat') {
+      const result = await this.applyTargetedFiatSettlementFeature(key, value);
       this._mayhemLastFeatureResult = result;
       return result;
     }
@@ -1459,6 +1529,601 @@ class MayhemContract extends Contract {
     }
   }
 
+  async applyProviderPayoutBindingFeature(key, value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      ['op', 'intent', 'provider_signature'],
+      'provider payout binding feature'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'bind_provider_payout') {
+      return new Error('Invalid provider payout binding feature op.');
+    }
+    const intentError = await this.validateProviderPayoutBindingIntent(
+      value.intent,
+      { currentState: false }
+    );
+    if (intentError) return intentError;
+    if (!this.isHexBytes(value.provider_signature, 64)) {
+      return new Error('Invalid provider payout binding signature.');
+    }
+
+    const revision = await this.providerPayoutBindingRevision(value.intent);
+    const expectedKey = this.providerPayoutBindingFeatureKey(
+      value.intent.rail,
+      value.intent.provider,
+      revision
+    );
+    if (key !== expectedKey) return new Error('Invalid provider payout binding key.');
+    if (!this.verifyProviderPayoutBindingSignature(
+      value.intent.provider,
+      value.intent,
+      value.provider_signature
+    )) {
+      return new Error('Invalid provider payout binding signature.');
+    }
+    if (!this.verifyProviderPayoutTargetBindingSignature(value.intent)) {
+      return new Error('Invalid provider payout target ownership signature.');
+    }
+    const adminError = await this.requireAdmin(this.address);
+    if (adminError) return adminError;
+
+    const nonceKey = this.providerPayoutBindingNonceKey(
+      value.intent.provider,
+      value.intent.nonce
+    );
+    const nonceRecord = await this.get(nonceKey);
+    if (nonceRecord) {
+      if (nonceRecord.revision !== revision) {
+        return new Error('Provider payout binding nonce already consumed.');
+      }
+      const existing = await this.get(expectedKey);
+      if (!existing ||
+          existing.type !== 'provider_payout_binding' ||
+          existing.revision !== revision ||
+          existing.provider !== value.intent.provider ||
+          existing.rail !== value.intent.rail ||
+          existing.nonce !== value.intent.nonce ||
+          existing.provider_signature !== value.provider_signature ||
+          existing.target_signature !== value.intent.target_signature) {
+        return new Error('Provider payout binding nonce record is inconsistent.');
+      }
+      return {
+        ok: true,
+        op: 'bindProviderPayout',
+        provider: value.intent.provider,
+        rail: value.intent.rail,
+        revision,
+        activation_epoch: existing.activation_epoch,
+        idempotent: true,
+      };
+    }
+
+    const currentIntentError = await this.validateProviderPayoutBindingIntent(value.intent);
+    if (currentIntentError) return currentIntentError;
+    const provider = await this.get(`prov/${value.intent.provider}`);
+    if (!provider || provider.status !== 'active') {
+      return new Error('Active provider registration required.');
+    }
+    if (!Array.isArray(provider.accepted_rails) ||
+        !provider.accepted_rails.includes(value.intent.rail)) {
+      return new Error('Provider does not accept payout rail.');
+    }
+
+    const applyState = await this.epochApplyStateRecord();
+    if ((applyState.pending_epoch ?? null) !== null) {
+      return new Error('Provider payout binding cannot rotate during a paged epoch apply.');
+    }
+    if (value.intent.expires_after_epoch <= applyState.updated_epoch) {
+      return new Error('Provider payout binding intent expired.');
+    }
+    const payoutParams = await this.activePayoutParamsAtEpoch(applyState.updated_epoch);
+    if (payoutParams instanceof Error) return payoutParams;
+    if (value.intent.expires_after_epoch - applyState.updated_epoch >
+        payoutParams.payout_intent_max_expiry_epochs) {
+      return new Error('Provider payout binding expiry is too far in the future.');
+    }
+
+    const context = await this.providerPayoutBindingContext(value.intent);
+    if (context instanceof Error) return context;
+    const currentContext = await this.get(PROVIDER_PAYOUT_BINDING_CONTEXT_CURRENT_KEY);
+    if (!currentContext) {
+      return new Error('Canonical provider payout context is not published.');
+    }
+    const immutableContext = await this.get(
+      this.providerPayoutContextRecordKey(
+        value.intent.payment_config_version,
+        value.intent.context_revision
+      )
+    );
+    if (!immutableContext || immutableContext.revision !== value.intent.context_revision) {
+      return new Error('Referenced immutable provider payout context is not published.');
+    }
+    if (
+      currentContext.revision !== context.context_revision ||
+      immutableContext.network !== context.network ||
+      immutableContext.admin !== context.admin ||
+      immutableContext.bootstrap !== context.bootstrap ||
+      immutableContext.payment_config_version !== context.payment_config_version
+    ) {
+      return new Error('Provider payout binding canonical context mismatch.');
+    }
+
+    const pointerKey = this.providerPayoutBindingPointerKey(
+      value.intent.provider,
+      value.intent.rail
+    );
+    const storedPointer = await this.get(pointerKey);
+    const activeBillingEpoch = applyState.updated_epoch + 1;
+    const pointer = storedPointer?.pending_revision !== null &&
+      storedPointer?.pending_revision !== undefined &&
+      storedPointer.pending_activation_epoch <= activeBillingEpoch
+      ? {
+          ...storedPointer,
+          current_revision: storedPointer.pending_revision,
+          pending_revision: null,
+          pending_activation_epoch: null,
+        }
+      : storedPointer;
+    const latestRevision = pointer?.latest_revision ?? null;
+    if (value.intent.previous_revision !== latestRevision) {
+      return new Error('Provider payout binding revision is stale.');
+    }
+    if ((await this.get(expectedKey)) !== null) {
+      return new Error('Provider payout binding revision already exists.');
+    }
+
+    let stripeVerification = null;
+    if (value.intent.rail === 'fiat') {
+      stripeVerification = await this.providerStripePayoutVerificationForTarget(
+        value.intent.provider,
+        value.intent.target
+      );
+      if (!stripeVerification ||
+          stripeVerification.target !== value.intent.target ||
+          stripeVerification.currency !== value.intent.currency ||
+          stripeVerification.ready !== true) {
+        return new Error('Current ready provider-scoped Stripe verification required.');
+      }
+    }
+
+    const firstBinding = latestRevision === null;
+    const activationEpoch = applyState.updated_epoch + (firstBinding ? 1 : 2);
+    const binding = {
+      type: 'provider_payout_binding',
+      revision,
+      provider: value.intent.provider,
+      rail: value.intent.rail,
+      target: value.intent.target,
+      target_wallet: value.intent.target_wallet,
+      currency: value.intent.currency,
+      chain_id: value.intent.chain_id,
+      stripe_processor_revision: stripeVerification?.processor_revision ?? null,
+      stripe_verification_revision: stripeVerification?.revision ?? null,
+      network: value.intent.network,
+      admin: value.intent.admin,
+      bootstrap: value.intent.bootstrap,
+      context_revision: value.intent.context_revision,
+      payment_config_version: value.intent.payment_config_version,
+      previous_revision: value.intent.previous_revision,
+      nonce: value.intent.nonce,
+      expires_after_epoch: value.intent.expires_after_epoch,
+      activation_epoch: activationEpoch,
+      target_signature: value.intent.target_signature,
+      provider_signature: value.provider_signature,
+      verified: true,
+      bound_at: key,
+      bound_by: this.address,
+      bound_by_role: 'admin',
+    };
+    const nextPointer = {
+      provider: value.intent.provider,
+      rail: value.intent.rail,
+      latest_revision: revision,
+      current_revision: firstBinding ? revision : pointer.current_revision,
+      pending_revision: firstBinding ? null : revision,
+      pending_activation_epoch: firstBinding ? null : activationEpoch,
+      updated_at: key,
+    };
+    await this.put(expectedKey, binding);
+    await this.put(pointerKey, nextPointer);
+    await this.put(nonceKey, {
+      provider: value.intent.provider,
+      rail: value.intent.rail,
+      nonce: value.intent.nonce,
+      revision,
+      expires_after_epoch: value.intent.expires_after_epoch,
+      consumed_at: key,
+    });
+    return {
+      ok: true,
+      op: 'bindProviderPayout',
+      provider: value.intent.provider,
+      rail: value.intent.rail,
+      revision,
+      activation_epoch: activationEpoch,
+      idempotent: false,
+    };
+  }
+
+  async applyPublishPayoutContextFeature(key, value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'network',
+        'admin',
+        'bootstrap',
+        'payment_config_version',
+        'payment_config_hash',
+      ],
+      'provider payout context feature'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'publish_payout_context') {
+      return new Error('Invalid provider payout context feature op.');
+    }
+    if (!this.isSafeKeyPart(value.network) ||
+        !this.isHexBytes(value.admin, 32) ||
+        value.admin !== value.admin.toLowerCase() ||
+        !this.isHexBytes(value.bootstrap, 32) ||
+        value.bootstrap !== value.bootstrap.toLowerCase() ||
+        !Number.isSafeInteger(value.payment_config_version) ||
+        value.payment_config_version < 1 ||
+        !this.isHexBytes(value.payment_config_hash, 32) ||
+        value.payment_config_hash !== value.payment_config_hash.toLowerCase()) {
+      return new Error('Invalid provider payout context.');
+    }
+    const admin = await this.get('admin');
+    if (value.admin !== admin || this.address !== admin) {
+      return new Error('Provider payout context requires canonical admin authority.');
+    }
+    const payments = await this.get('payments/current');
+    if (!payments || payments.set_by !== admin || payments.set_by_role !== 'admin') {
+      return new Error('Canonical payment configuration required.');
+    }
+    if (value.network !== payments.tnk?.network ||
+        value.payment_config_version !== payments.ver) {
+      return new Error('Provider payout context does not match canonical payment configuration.');
+    }
+    const paymentConfigHash = await this.providerPayoutPaymentConfigHash(payments);
+    if (value.payment_config_hash !== paymentConfigHash) {
+      return new Error('Provider payout context payment configuration hash mismatch.');
+    }
+    const expectedKey = await this.providerPayoutContextFeatureKey(value);
+    if (key !== expectedKey) return new Error('Invalid provider payout context feature key.');
+
+    const record = {
+      type: 'provider_payout_context',
+      revision: await this.providerPayoutContextRevision(value),
+      network: value.network,
+      admin: value.admin,
+      bootstrap: value.bootstrap,
+      payment_config_version: value.payment_config_version,
+      payment_config_hash: value.payment_config_hash,
+      published_at: key,
+      published_by: this.address,
+      published_by_role: 'admin',
+    };
+    const recordKey = this.providerPayoutContextRecordKey(
+      value.payment_config_version,
+      record.revision
+    );
+    if (key !== recordKey) return new Error('Invalid provider payout context record key.');
+    const existing = await this.get(recordKey);
+    if (existing) {
+      if (stableJson(existing) === stableJson(record)) {
+        const current = await this.get(PROVIDER_PAYOUT_BINDING_CONTEXT_CURRENT_KEY);
+        if (current?.revision !== record.revision) {
+          return new Error('Immutable provider payout context is not current.');
+        }
+        return {
+          ok: true,
+          op: 'publishPayoutContext',
+          context: existing,
+          idempotent: true,
+        };
+      }
+      return new Error('Immutable provider payout context record already exists.');
+    }
+    const current = await this.get(PROVIDER_PAYOUT_BINDING_CONTEXT_CURRENT_KEY);
+    if (current && current.payment_config_version >= value.payment_config_version) {
+      return new Error('Provider payout context payment config version must increase.');
+    }
+    await this.put(recordKey, record);
+    await this.put(PROVIDER_PAYOUT_BINDING_CONTEXT_CURRENT_KEY, {
+      type: 'provider_payout_context_pointer',
+      payment_config_version: value.payment_config_version,
+      revision: record.revision,
+      record_key: recordKey,
+      updated_at: key,
+      updated_by: this.address,
+      updated_by_role: 'admin',
+    });
+    return {
+      ok: true,
+      op: 'publishPayoutContext',
+      context: record,
+      idempotent: false,
+    };
+  }
+
+  async applySchedulePayoutParameterFeature(key, value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      ['op', 'key', 'value', 'effective_epoch'],
+      'payout parameter feature'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'schedule_payout_parameter' ||
+        !Object.hasOwn(PAYOUT_PARAM_DEFINITIONS, value.key)) {
+      return new Error('Invalid payout parameter feature.');
+    }
+    const definition = PAYOUT_PARAM_DEFINITIONS[value.key];
+    if (!Number.isSafeInteger(value.value) ||
+        value.value < definition.min ||
+        value.value > definition.max ||
+        !Number.isSafeInteger(value.effective_epoch) ||
+        value.effective_epoch < 1) {
+      return new Error('Invalid payout parameter value or activation epoch.');
+    }
+    const adminError = await this.requireAdmin(this.address);
+    if (adminError) return adminError;
+    const applyState = await this.epochApplyStateRecord();
+    if (value.effective_epoch <= applyState.updated_epoch) {
+      return new Error('Payout parameter activation epoch must be in the future.');
+    }
+    const expectedKey = await this.payoutParameterFeatureKey(value);
+    if (key !== expectedKey) return new Error('Invalid payout parameter feature key.');
+
+    const recordKey = this.payoutParameterKey(value.key);
+    const schedule = await this.payoutParameterRecord(value.key);
+    const current = schedule.pending &&
+      schedule.pending.effective_epoch <= applyState.updated_epoch
+      ? schedule.pending
+      : schedule.current;
+    const pending = schedule.pending &&
+      schedule.pending.effective_epoch > applyState.updated_epoch
+      ? schedule.pending
+      : null;
+    const nextEntry = {
+      key: value.key,
+      value: value.value,
+      effective_epoch: value.effective_epoch,
+      scheduled_at: key,
+      scheduled_by: this.address,
+      scheduled_by_role: 'admin',
+    };
+    if (pending) {
+      if (stableJson(pending) === stableJson(nextEntry)) {
+        return {
+          ok: true,
+          op: 'schedulePayoutParameter',
+          key: value.key,
+          value: value.value,
+          effective_epoch: value.effective_epoch,
+          idempotent: true,
+        };
+      }
+      return new Error('A payout parameter update is already pending.');
+    }
+    await this.put(recordKey, { key: value.key, current, pending: nextEntry });
+    return {
+      ok: true,
+      op: 'schedulePayoutParameter',
+      key: value.key,
+      value: value.value,
+      effective_epoch: value.effective_epoch,
+      idempotent: false,
+    };
+  }
+
+  async applyVerifyStripePayoutFeature(key, value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'provider',
+        'account_id',
+        'account_type',
+        'country',
+        'currency',
+        'mode',
+        'verification_kind',
+        'source_provider',
+        'processor_revision',
+        'previous_verification',
+        'details_submitted',
+        'payouts_enabled',
+        'transfers_enabled',
+        'network',
+        'admin',
+        'bootstrap',
+        'context_revision',
+        'payment_config_version',
+        'request_nonce',
+      ],
+      'Stripe payout verification feature'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'verify_stripe_payout' ||
+        !this.isHexBytes(value.provider, 32) ||
+        value.provider !== value.provider.toLowerCase() ||
+        typeof value.account_id !== 'string' ||
+        !/^acct_[A-Za-z0-9._-]+$/.test(value.account_id) ||
+        !['express', 'standard', 'custom'].includes(value.account_type) ||
+        typeof value.country !== 'string' ||
+        !/^[A-Z]{2}$/.test(value.country) ||
+        !['onboard', 'status', 'relink'].includes(value.verification_kind) ||
+        (value.source_provider !== null &&
+          (!this.isHexBytes(value.source_provider, 32) ||
+            value.source_provider !== value.source_provider.toLowerCase())) ||
+        (value.verification_kind === 'relink' &&
+          (value.source_provider === null || value.source_provider === value.provider)) ||
+        (value.verification_kind !== 'relink' && value.source_provider !== null) ||
+        !this.isHexBytes(value.processor_revision, 32) ||
+        value.processor_revision !== value.processor_revision.toLowerCase() ||
+        (value.previous_verification !== null &&
+          (!this.isHexBytes(value.previous_verification, 32) ||
+            value.previous_verification !== value.previous_verification.toLowerCase())) ||
+        !['live', 'test'].includes(value.mode) ||
+        typeof value.details_submitted !== 'boolean' ||
+        typeof value.payouts_enabled !== 'boolean' ||
+        typeof value.transfers_enabled !== 'boolean' ||
+        !this.isHexBytes(value.admin, 32) ||
+        value.admin !== value.admin.toLowerCase() ||
+        !this.isHexBytes(value.bootstrap, 32) ||
+        value.bootstrap !== value.bootstrap.toLowerCase() ||
+        !this.isHexBytes(value.context_revision, 32) ||
+        value.context_revision !== value.context_revision.toLowerCase() ||
+        !Number.isSafeInteger(value.payment_config_version) ||
+        value.payment_config_version < 1 ||
+        !this.isHexBytes(value.request_nonce, 32) ||
+        value.request_nonce !== value.request_nonce.toLowerCase()) {
+      return new Error('Invalid Stripe payout verification.');
+    }
+    const processorRevision = await stripePayoutProcessorRevision(value);
+    if (value.processor_revision !== processorRevision) {
+      return new Error('Stripe payout processor evidence revision mismatch.');
+    }
+    const adminError = await this.requireAdmin(this.address);
+    if (adminError) return adminError;
+    const admin = await this.get('admin');
+    if (value.admin !== admin) {
+      return new Error('Stripe payout verification admin is not canonical.');
+    }
+    const expectedKey = await stripePayoutVerificationFeatureKey(value);
+    if (key !== expectedKey) return new Error('Invalid Stripe payout verification key.');
+    const record = {
+      type: 'stripe_payout_verification',
+      revision: key.split('/').at(-1),
+      provider: value.provider,
+      target: value.account_id,
+      account_type: value.account_type,
+      country: value.country,
+      currency: value.currency,
+      mode: value.mode,
+      verification_kind: value.verification_kind,
+      source_provider: value.source_provider,
+      processor_revision: value.processor_revision,
+      previous_verification: value.previous_verification,
+      details_submitted: value.details_submitted,
+      payouts_enabled: value.payouts_enabled,
+      transfers_enabled: value.transfers_enabled,
+      ready: value.details_submitted &&
+        value.payouts_enabled &&
+        value.transfers_enabled,
+      network: value.network,
+      admin: value.admin,
+      bootstrap: value.bootstrap,
+      context_revision: value.context_revision,
+      payment_config_version: value.payment_config_version,
+      request_nonce: value.request_nonce,
+      verified_at: key,
+      verified_by: this.address,
+      verified_by_role: 'admin',
+    };
+    const existing = await this.get(key);
+    if (existing) {
+      if (stableJson(existing) !== stableJson(record)) {
+        return new Error('Stripe payout verification record already exists.');
+      }
+      return {
+        ok: true,
+        op: 'verifyStripePayout',
+        provider: value.provider,
+        revision: record.revision,
+        idempotent: true,
+      };
+    }
+    const nonceKey = `payout/stripe-verified/nonce/${value.provider}/${value.request_nonce}`;
+    const nonceRecord = await this.get(nonceKey);
+    if (nonceRecord) {
+      return new Error('Stripe payout verification request nonce already consumed.');
+    }
+    const currentPointer = await this.get(
+      `payout/stripe-verified/current/${value.provider}`
+    );
+    if ((currentPointer?.revision ?? null) !== value.previous_verification) {
+      return new Error('Stripe payout verification revision is stale.');
+    }
+
+    const contextPointer = await this.get(PROVIDER_PAYOUT_BINDING_CONTEXT_CURRENT_KEY);
+    const context = await this.get(
+      this.providerPayoutContextRecordKey(
+        value.payment_config_version,
+        value.context_revision
+      )
+    );
+    if (!contextPointer ||
+        contextPointer.revision !== value.context_revision ||
+        !context ||
+        context.network !== value.network ||
+        context.admin !== value.admin ||
+        context.bootstrap !== value.bootstrap ||
+        context.payment_config_version !== value.payment_config_version) {
+      return new Error('Stripe payout verification context is not current.');
+    }
+    if ((value.network === 'mainnet' && value.mode !== 'live') ||
+        (value.network !== 'mainnet' && value.mode !== 'test')) {
+      return new Error('Stripe payout verification mode does not match canonical network.');
+    }
+    const payments = await this.get('payments/current');
+    if (!payments ||
+        payments.ver !== value.payment_config_version ||
+        payments.set_by !== admin ||
+        payments.set_by_role !== 'admin' ||
+        payments.fiat?.processor !== 'stripe' ||
+        !Array.isArray(payments.fiat.currencies) ||
+        !payments.fiat.currencies.includes(value.currency)) {
+      return new Error('Stripe payout verification currency is not canonical.');
+    }
+    const provider = await this.get(`prov/${value.provider}`);
+    if (!provider || provider.status !== 'active' ||
+        !Array.isArray(provider.accepted_rails) ||
+        !provider.accepted_rails.includes('fiat')) {
+      return new Error('Stripe payout verification requires an active fiat provider.');
+    }
+    await this.put(key, record);
+    await this.put(nonceKey, {
+      provider: value.provider,
+      request_nonce: value.request_nonce,
+      processor_revision: value.processor_revision,
+      revision: record.revision,
+      record_key: key,
+      consumed_at: key,
+    });
+    const verificationPointer = {
+      provider: value.provider,
+      revision: record.revision,
+      record_key: key,
+      target: value.account_id,
+      currency: value.currency,
+      processor_revision: value.processor_revision,
+      ready: record.ready,
+      details_submitted: value.details_submitted,
+      payouts_enabled: value.payouts_enabled,
+      transfers_enabled: value.transfers_enabled,
+      context_revision: value.context_revision,
+      payment_config_version: value.payment_config_version,
+      updated_at: key,
+      updated_by: this.address,
+      updated_by_role: 'admin',
+    };
+    await this.put(`payout/stripe-verified/current/${value.provider}`, verificationPointer);
+    await this.put(
+      this.providerStripePayoutVerificationTargetKey(value.provider, value.account_id),
+      verificationPointer
+    );
+    return {
+      ok: true,
+      op: 'verifyStripePayout',
+      provider: value.provider,
+      revision: record.revision,
+      idempotent: false,
+    };
+  }
+
   async applySpendReserveFeature(key, value) {
     const normalized = await this.normalizeSpendReserveValue(value);
     if (normalized instanceof Error) return normalized;
@@ -1625,6 +2290,201 @@ class MayhemContract extends Contract {
     };
   }
 
+  async applyTargetedSpendReserveFeature(key, value) {
+    const normalized = await this.normalizeTargetedSpendReserveValue(value);
+    if (normalized instanceof Error) return normalized;
+    normalized.voucher_hash = await this.opaqueHash(
+      'mayhem-spend-voucher-record-v1',
+      normalized.voucher_body
+    );
+    const binding = await this.providerPayoutBindingForEpoch(
+      normalized.provider,
+      normalized.rail,
+      value.payout_revision,
+      normalized.epoch,
+      { requireCurrentReadiness: true }
+    );
+    if (binding instanceof Error) return binding;
+    const expectedKey = await this.targetedSpendReservationFeatureKey(value);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return new Error('Invalid targeted spend reservation key.');
+    if (!this.verifySpendVoucherSignature(
+      normalized.user,
+      normalized.voucher_body,
+      normalized.voucher.user_sig
+    )) {
+      return new Error('Invalid spend voucher signature.');
+    }
+    const verify = this.protocol?.peer?.wallet?.verify;
+    if (typeof verify !== 'function' ||
+        verify.call(
+          this.protocol.peer.wallet,
+          normalized.provider_sig,
+          targetedSpendReservationMessage({
+            ...normalized,
+            payout_revision: value.payout_revision,
+          }),
+          normalized.provider
+        ) !== true) {
+      return new Error('Invalid targeted spend reservation provider signature.');
+    }
+
+    const applyState = await this.epochApplyStateRecord();
+    const activeEpoch = applyState.updated_epoch + 1;
+    if (normalized.epoch !== activeEpoch) {
+      return new Error('Spend reservation epoch is not the active billing epoch.');
+    }
+
+    const provider = await this.get(`prov/${normalized.provider}`);
+    if (!provider || provider.status !== 'active') return new Error('Provider registration required.');
+    if (!Array.isArray(provider.accepted_rails) || !provider.accepted_rails.includes(normalized.rail)) {
+      return new Error('Provider does not accept payment rail.');
+    }
+    const enclave = await this.get(`enclave/${normalized.enclave_id}`);
+    if (!enclave || enclave.status !== 'active') return new Error('Admin enclave is not active.');
+    const enclaveError = this.requireAdminCreatedEnclave(enclave);
+    if (enclaveError) return enclaveError;
+    const serve = await this.get(`serve/${normalized.provider}/${normalized.enclave_id}`);
+    if (!serve || serve.status !== 'active') {
+      return new Error('Provider is not actively serving this admin enclave.');
+    }
+    const serveTermsError = this.validateCommittedServeTerms(serve, normalized);
+    if (serveTermsError) return serveTermsError;
+    const priceCtxBracket = normalized.ctx_bracket ?? null;
+    const priceError = await this.requireCurrentAdminPrice(normalized.enclave_id, priceCtxBracket);
+    if (priceError) return priceError;
+    const lockedPrice = await this.get(
+      this.priceRecordKey(normalized.enclave_id, normalized.price_ver, priceCtxBracket)
+    );
+    if (!lockedPrice || lockedPrice.denom !== PRICE_DENOMINATION) {
+      return new Error('Spend reservation locked price version is not known.');
+    }
+    if (lockedPrice.set_by_role !== 'admin') {
+      return new Error('Spend reservation locked price is not admin-set.');
+    }
+    if ((lockedPrice.ctx_bracket ?? null) !== priceCtxBracket) {
+      return new Error('Spend reservation locked price context bracket mismatch.');
+    }
+    if ((lockedPrice.ctx_bracket_table_ver ?? null) !== (normalized.ctx_bracket_table_ver ?? null)) {
+      return new Error('Spend reservation locked price context bracket table mismatch.');
+    }
+    if (stableJson(normalized.locked_rate_map) !== stableJson(lockedPrice.rate_map)) {
+      return new Error('Spend reservation locked rate_map does not match price version.');
+    }
+    if (this.compareAu(normalized.locked_per_req_au, lockedPrice.per_req_au ?? ZERO_AU) !== 0) {
+      return new Error('Spend reservation locked per_req_au does not match price version.');
+    }
+    if (this.compareAu(normalized.locked_min_session_au, lockedPrice.min_session_au ?? ZERO_AU) !== 0) {
+      return new Error('Spend reservation locked min_session_au does not match price version.');
+    }
+    const rules = await this.currentRules();
+    if (!rules || rules.ver !== normalized.rules_ver) {
+      return new Error('Spend reservation rules version is not current.');
+    }
+
+    const balance = await this.balanceRecord(normalized.user, normalized.rail);
+    if (balance instanceof Error) return balance;
+    const balanceError = this.guardianValidateBalanceRecord(balance, normalized.user, normalized.rail);
+    if (balanceError) return balanceError;
+
+    const holdKey = this.spendHoldKey(normalized.user, normalized.rail, normalized.epoch);
+    const hold = await this.normalizeSpendHoldRecord(
+      (await this.get(holdKey)) ?? null,
+      normalized.user,
+      normalized.rail,
+      normalized.epoch
+    );
+    if (hold instanceof Error) return hold;
+    const existing = hold.sessions.find((session) => session.session_id === normalized.session_id);
+    if (existing) {
+      if (
+        existing.provider !== normalized.provider ||
+        existing.enclave_id !== normalized.enclave_id ||
+        existing.price_ver !== normalized.price_ver ||
+        stableJson(existing.locked_rate_map) !== stableJson(normalized.locked_rate_map) ||
+        this.compareAu(existing.locked_per_req_au, normalized.locked_per_req_au) !== 0 ||
+        this.compareAu(existing.locked_min_session_au, normalized.locked_min_session_au) !== 0 ||
+        existing.served_ctx !== normalized.served_ctx ||
+        stableJson(existing.required_modalities) !== stableJson(normalized.required_modalities) ||
+        stableJson(existing.required_specialities) !== stableJson(normalized.required_specialities) ||
+        existing.ctx_bracket !== normalized.ctx_bracket ||
+        existing.ctx_bracket_table_ver !== normalized.ctx_bracket_table_ver ||
+        this.compareAu(existing.max_spend_au, normalized.max_spend_au) !== 0 ||
+        existing.voucher_hash !== normalized.voucher_hash ||
+        existing.payout_revision !== value.payout_revision
+      ) {
+        return new Error('Targeted spend reservation session already exists with different terms.');
+      }
+      const availableAu = this.compareAu(hold.reserved_au, balance.au) >= 0
+        ? ZERO_AU
+        : this.safeSubAu(balance.au, hold.reserved_au);
+      if (availableAu instanceof Error) return availableAu;
+      return {
+        ok: true,
+        op: 'spendReserveTargeted',
+        session_id: normalized.session_id,
+        epoch: normalized.epoch,
+        rail: normalized.rail,
+        user: normalized.user,
+        provider: normalized.provider,
+        payout_revision: value.payout_revision,
+        reserved_au: hold.reserved_au,
+        available_au: availableAu,
+        idempotent: true,
+      };
+    }
+
+    const nextReservedAu = this.safeAddAu(hold.reserved_au, normalized.max_spend_au);
+    if (nextReservedAu instanceof Error) return nextReservedAu;
+    if (this.compareAu(nextReservedAu, balance.au) > 0) {
+      return new Error('Insufficient unreserved credit balance.');
+    }
+    const session = {
+      session_id: normalized.session_id,
+      provider: normalized.provider,
+      payout_revision: value.payout_revision,
+      enclave_id: normalized.enclave_id,
+      price_ver: normalized.price_ver,
+      locked_rate_map: normalized.locked_rate_map,
+      locked_per_req_au: normalized.locked_per_req_au,
+      locked_min_session_au: normalized.locked_min_session_au,
+      served_ctx: normalized.served_ctx,
+      required_modalities: normalized.required_modalities.slice(),
+      required_specialities: cloneValue(normalized.required_specialities),
+      ctx_bracket: normalized.ctx_bracket,
+      ctx_bracket_table_ver: normalized.ctx_bracket_table_ver,
+      rules_ver: normalized.rules_ver,
+      max_spend_au: normalized.max_spend_au,
+      voucher_hash: normalized.voucher_hash,
+      feature_key: key,
+      reserved_at: normalized.at,
+      recorded_at: this.tx,
+    };
+    const nextHold = {
+      ...hold,
+      balance_au_at_last_reserve: balance.au,
+      reserved_au: nextReservedAu,
+      sessions: [...hold.sessions, session].sort((a, b) => compareCodepoint(a.session_id, b.session_id)),
+      updated_at: this.tx,
+    };
+    await this.put(holdKey, nextHold);
+    const availableAu = this.safeSubAu(balance.au, nextHold.reserved_au);
+    if (availableAu instanceof Error) return availableAu;
+    return {
+      ok: true,
+      op: 'spendReserveTargeted',
+      session_id: normalized.session_id,
+      epoch: normalized.epoch,
+      rail: normalized.rail,
+      user: normalized.user,
+      provider: normalized.provider,
+      payout_revision: value.payout_revision,
+      reserved_au: nextHold.reserved_au,
+      available_au: availableAu,
+      idempotent: false,
+    };
+  }
+
   async applyEpochApplyFeature(key, value) {
     const expectedKey = await this.epochApplyFeatureKey(value);
     if (expectedKey instanceof Error) return expectedKey;
@@ -1637,6 +2497,224 @@ class MayhemContract extends Contract {
     } finally {
       this.tx = previousTx;
     }
+  }
+
+  async applyTargetedEpochFeature(key, value) {
+    const normalized = await this.normalizeTargetedEpochFeatureValue(value);
+    if (normalized instanceof Error) return normalized;
+    const expectedKey = await this.targetedEpochFeatureKey(value);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return new Error('Invalid targeted epoch feature key.');
+
+    const applyState = await this.epochApplyStateRecord();
+    const page = this.epochApplyPage(value);
+    if (page instanceof Error) return page;
+    const params = await this.activeParamsAt(value.at, [
+      'fee_bps',
+      'probation_successful_sessions',
+      'new_provider_holdback_epochs',
+      'holdback_epochs',
+      'challenge_epochs',
+      'canary_probe_holdback_bps',
+      'canary_probe_release_min_passes',
+    ]);
+    const reservationError = await this.validateTargetedEpochReservationBindings(
+      value,
+      normalized.targeted_earnings
+    );
+    if (reservationError) return reservationError;
+    const allocationUpdates = normalized.allocations.map((allocation) => ({
+      key: `payout/allocation/${value.epoch}/${allocation.session_id}`,
+      value: {
+        type: 'provider_payout_session_allocation',
+        epoch: value.epoch,
+        page,
+        ...allocation,
+        feature_key: key,
+      },
+    }));
+    for (const update of allocationUpdates) {
+      const existing = await this.get(update.key);
+      if (existing !== null && stableJson(existing) !== stableJson(update.value)) {
+        return new Error('Targeted epoch session allocation already exists.');
+      }
+    }
+    const liabilityUpdates = [];
+    for (const earning of normalized.targeted_earnings) {
+      const binding = await this.providerPayoutBindingForEpoch(
+        earning.provider,
+        earning.rail,
+        earning.payout_revision,
+        value.epoch
+      );
+      if (binding instanceof Error) return binding;
+      const provider = await this.get(`prov/${earning.provider}`);
+      if (!provider || provider.status !== 'active') {
+        return new Error('Targeted epoch provider is not active.');
+      }
+      const feeAu = this.safeMulDivAu(earning.gross_au, params.fee_bps, 10_000);
+      if (feeAu instanceof Error) return feeAu;
+      const burnAu = earning.rail === 'tap'
+        ? this.safeMulDivAu(earning.gross_au, TAP_BURN_BPS, 10_000)
+        : ZERO_AU;
+      if (burnAu instanceof Error) return burnAu;
+      const providerAu = this.safeSubAu(
+        this.safeSubAu(earning.gross_au, feeAu),
+        burnAu
+      );
+      if (providerAu instanceof Error) return providerAu;
+
+      const liabilityKey = this.providerPayoutLiabilityKey(
+        earning.provider,
+        earning.rail,
+        earning.payout_revision
+      );
+      const existing = (await this.get(liabilityKey)) ?? {
+        type: 'provider_payout_liability',
+        provider: earning.provider,
+        rail: earning.rail,
+        revision: earning.payout_revision,
+        target: binding.target,
+        currency: binding.currency,
+        chain_id: binding.chain_id,
+        total_au: ZERO_AU,
+        held_au: ZERO_AU,
+        paid_cum_au: ZERO_AU,
+        holdbacks: [],
+        updated_epoch: 0,
+        updated_at: null,
+      };
+      if (
+        existing.provider !== earning.provider ||
+        existing.rail !== earning.rail ||
+        existing.revision !== earning.payout_revision ||
+        existing.target !== binding.target ||
+        (existing.currency ?? null) !== binding.currency ||
+        (existing.chain_id ?? null) !== binding.chain_id
+      ) {
+        return new Error('Provider payout liability binding mismatch.');
+      }
+      const aggregate = await this.earningRecord(earning.provider, earning.rail);
+      if (aggregate instanceof Error) return aggregate;
+      const probeGate = await this.probeGateForEarning(earning.provider, aggregate, params);
+      if (probeGate instanceof Error) return probeGate;
+      const lockedEarningEpochs = this.providerLockedEarningEpochs(provider, params);
+      if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
+      const disputeGate = await this.providerHasOpenDispute(earning.provider);
+      if (disputeGate instanceof Error) return disputeGate;
+      const refreshed = this.refreshEarningHoldback(
+        existing,
+        value.epoch,
+        lockedEarningEpochs,
+        probeGate,
+        disputeGate
+      );
+      if (refreshed instanceof Error) return refreshed;
+      const totalAu = this.safeAddAu(refreshed.total_au, providerAu);
+      if (totalAu instanceof Error) return totalAu;
+      const heldAu = this.safeAddAu(refreshed.held_au, providerAu);
+      if (heldAu instanceof Error) return heldAu;
+      const holdbacks = this.appendHoldbackBucket(
+        refreshed.holdbacks,
+        value.epoch,
+        providerAu,
+        lockedEarningEpochs
+      );
+      if (holdbacks instanceof Error) return holdbacks;
+      liabilityUpdates.push({
+        key: liabilityKey,
+        value: {
+          ...refreshed,
+          total_au: totalAu,
+          held_au: heldAu,
+          holdbacks,
+          updated_epoch: value.epoch,
+          updated_at: key,
+        },
+        snapshot_key: this.providerPayoutEpochSnapshotKey(
+          value.epoch,
+          page,
+          earning.provider,
+          earning.rail
+        ),
+        snapshot: {
+          type: 'provider_payout_epoch_binding',
+          epoch: value.epoch,
+          page,
+          provider: earning.provider,
+          rail: earning.rail,
+          revision: earning.payout_revision,
+          target: binding.target,
+          currency: binding.currency,
+          chain_id: binding.chain_id,
+          earned_au: providerAu,
+          feature_key: key,
+        },
+      });
+    }
+
+    const previousTx = this.tx;
+    this.tx = key;
+    let result;
+    try {
+      result = await this.targetedEpochApply(
+        normalized.ledger_value,
+        normalized.revision_bindings,
+        normalized.allocations
+      );
+    } finally {
+      this.tx = previousTx;
+    }
+    if (!result || result instanceof Error || result.ok !== true) return result;
+    if (result.idempotent === true) {
+      for (const update of allocationUpdates) {
+        const allocation = await this.get(update.key);
+        if (!allocation || stableJson(allocation) !== stableJson(update.value)) {
+          return new Error('Targeted epoch session allocation is missing.');
+        }
+      }
+      for (const update of liabilityUpdates) {
+        const snapshot = await this.get(update.snapshot_key);
+        if (!snapshot || stableJson(snapshot) !== stableJson(update.snapshot)) {
+          return new Error('Targeted epoch liability snapshot is missing.');
+        }
+      }
+      return { ...result, op: 'applyTargetedEpoch' };
+    }
+
+    for (const update of liabilityUpdates) {
+      if ((await this.get(update.snapshot_key)) !== null) {
+        return new Error('Targeted epoch payout snapshot already exists.');
+      }
+    }
+    for (const update of allocationUpdates) {
+      if ((await this.get(update.key)) !== null) {
+        return new Error('Targeted epoch session allocation already exists.');
+      }
+    }
+    for (const update of allocationUpdates) {
+      await this.put(update.key, update.value);
+    }
+    for (const update of liabilityUpdates) {
+      await this.put(update.key, update.value);
+      await this.put(update.snapshot_key, update.snapshot);
+      const pointerKey = this.providerPayoutBindingPointerKey(
+        update.value.provider,
+        update.value.rail
+      );
+      const pointer = await this.get(pointerKey);
+      if (pointer?.pending_revision === update.value.revision &&
+          pointer.pending_activation_epoch <= value.epoch) {
+        await this.put(pointerKey, {
+          ...pointer,
+          current_revision: update.value.revision,
+          pending_revision: null,
+          pending_activation_epoch: null,
+          updated_at: key,
+        });
+      }
+    }
+    return { ...result, op: 'applyTargetedEpoch' };
   }
 
   async applyDepositTnkFeature(key, value) {
@@ -1710,29 +2788,27 @@ class MayhemContract extends Contract {
     }
   }
 
-  async applyTnkSettlementFeature(key, value) {
-    const expectedKey = await this.tnkSettlementFeatureKey(value);
+  async applyTargetedTnkSettlementFeature(key, value) {
+    const expectedKey = await this.targetedTnkSettlementFeatureKey(value);
     if (expectedKey instanceof Error) return expectedKey;
-    if (key !== expectedKey) return;
-
+    if (key !== expectedKey) return new Error('Invalid targeted TNK settlement key.');
     const previousTx = this.tx;
     this.tx = key;
     try {
-      return await this.tnkSettlement();
+      return await this.targetedTnkSettlement(value);
     } finally {
       this.tx = previousTx;
     }
   }
 
-  async applyFiatSettlementFeature(key, value) {
-    const expectedKey = await this.fiatSettlementFeatureKey(value);
+  async applyTargetedFiatSettlementFeature(key, value) {
+    const expectedKey = await this.targetedFiatSettlementFeatureKey(value);
     if (expectedKey instanceof Error) return expectedKey;
-    if (key !== expectedKey) return;
-
+    if (key !== expectedKey) return new Error('Invalid targeted fiat settlement key.');
     const previousTx = this.tx;
     this.tx = key;
     try {
-      return await this.fiatSettlement();
+      return await this.targetedFiatSettlement(value);
     } finally {
       this.tx = previousTx;
     }
@@ -2105,7 +3181,6 @@ class MayhemContract extends Contract {
 
     const record = {
       provider: providerId,
-      payouts: {},
       accepted_rails: ['fiat'],
       accepted_rails_schema_version: PROVIDER_RAIL_SCHEMA_VERSION,
       accepted_rails_set_by: providerId,
@@ -2245,55 +3320,6 @@ class MayhemContract extends Contract {
     await this.put(`prov/${providerId}`, updated);
     console.log('mayhem setProviderRails', updated);
     return { ok: true, op: 'setProviderRails', provider: providerId, rails };
-  }
-
-  async setProviderPayout() {
-    const adminError = await this.requireAdmin();
-    if (adminError) return adminError;
-    if (!this.isSafeKeyPart(this.value.provider)) return new Error('Invalid provider id.');
-    if (!PAYOUT_TARGET_METHODS.has(this.value.payout_method)) {
-      return new Error('Unsupported payout method.');
-    }
-    let payoutCurrency = null;
-    if (this.value.payout_method === 'tnk' || this.value.payout_method === 'tap') {
-      if (this.value.payout_currency !== undefined) {
-        return new Error('Crypto payout target must not include fiat currency.');
-      }
-    } else {
-      if (this.value.payout_currency === undefined) {
-        return new Error('Fiat payout target requires payout_currency.');
-      }
-      payoutCurrency = this.normalizeFiatCurrency(this.value.payout_currency);
-      if (payoutCurrency instanceof Error) return payoutCurrency;
-    }
-
-    const key = `prov/${this.value.provider}`;
-    const record = await this.get(key);
-    if (!record) return new Error('Provider not found.');
-
-    const payoutTargets = record.payouts ?? {};
-    if (typeof payoutTargets !== 'object' || Array.isArray(payoutTargets)) {
-      return new Error('Invalid provider payout targets.');
-    }
-    const { payout: _discardedPayout, ...currentRecord } = record;
-    const updated = {
-      ...currentRecord,
-      payouts: {
-        ...payoutTargets,
-        [this.value.payout_method]: {
-          addr: this.value.payout_addr,
-          method: this.value.payout_method,
-          ...(payoutCurrency ? { currency: payoutCurrency } : {}),
-          set_by: this.address,
-          set_by_role: 'admin',
-          set_at: this.tx,
-        },
-      },
-      updated_at: this.tx,
-    };
-    await this.put(key, updated);
-    console.log('mayhem setProviderPayout', updated);
-    return { ok: true, op: 'setProviderPayout', provider: this.value.provider };
   }
 
   async setProviderKyb() {
@@ -4416,6 +5442,462 @@ class MayhemContract extends Contract {
     return result;
   }
 
+  async targetedEpochApply(value, revisionBindings, allocations) {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+
+    const shapeError = this.validateEpochApplyShape(value);
+    if (shapeError) return shapeError;
+    const roots = value.roots === undefined ? null : this.normalizeEpochRoots(value.roots);
+    if (roots instanceof Error) return roots;
+    const totals = value.totals === undefined ? null : this.normalizeEpochTotals(value.totals);
+    if (totals instanceof Error) return totals;
+    if ((roots && !totals) || (!roots && totals)) {
+      return new Error('Epoch apply roots and totals must be provided together.');
+    }
+    const page = this.epochApplyPage(value);
+    if (page instanceof Error) return page;
+    const lastPage = this.epochApplyLastPage(value);
+    if (lastPage instanceof Error) return lastPage;
+    const pagedApply = hasOwn(value, 'page');
+    if (pagedApply && (roots || totals)) {
+      return new Error('Paged epochApply pages must omit aggregate roots and totals.');
+    }
+
+    const params = await this.activeParamsAt(value.at, [
+      'epoch_seconds',
+      'fee_bps',
+      'max_apply_batch',
+      'max_market_usage_entries',
+      'probation_successful_sessions',
+      'new_provider_holdback_epochs',
+      'holdback_epochs',
+      'challenge_epochs',
+      'probation_successful_sessions',
+      'new_provider_holdback_epochs',
+      'canary_probe_holdback_bps',
+      'canary_probe_release_min_passes',
+    ]);
+    if (value.debits.length + value.earnings.length > params.max_apply_batch) {
+      return new Error('Epoch apply batch exceeds max_apply_batch.');
+    }
+    if ((value.market_usage?.length ?? 0) > params.max_market_usage_entries) {
+      return new Error('Epoch market usage batch exceeds max_market_usage_entries.');
+    }
+
+    const debitMap = this.aggregateRailLedgerEntries(value.debits, 'user', 'au', 'debit');
+    if (debitMap instanceof Error) return debitMap;
+    const grossEarningMap = this.aggregateRailLedgerEntries(
+      value.earnings,
+      'provider',
+      'gross_au',
+      'earning'
+    );
+    if (grossEarningMap instanceof Error) return grossEarningMap;
+
+    const debitTotal = this.sumRailAu(debitMap, 'au');
+    if (debitTotal instanceof Error) return debitTotal;
+    const grossTotal = this.sumRailAu(grossEarningMap, 'gross_au');
+    if (grossTotal instanceof Error) return grossTotal;
+    const debitRailTotals = this.railTotals(debitMap, 'au');
+    if (debitRailTotals instanceof Error) return debitRailTotals;
+    const grossRailTotals = this.railTotals(grossEarningMap, 'gross_au');
+    if (grossRailTotals instanceof Error) return grossRailTotals;
+    const railTotalError = this.assertMatchingRailTotals(debitRailTotals, grossRailTotals);
+    if (railTotalError) return railTotalError;
+    const marketUsageProvided = hasOwn(value, 'market_usage');
+    const marketUsageMap = marketUsageProvided
+      ? this.aggregateMarketUsageEntries(value.market_usage)
+      : new Map();
+    if (marketUsageMap instanceof Error) return marketUsageMap;
+    const marketUsageTotal = this.sumMarketDemandAu(marketUsageMap);
+    if (marketUsageTotal instanceof Error) return marketUsageTotal;
+    if (marketUsageProvided && this.compareAu(marketUsageTotal, grossTotal) !== 0) {
+      return new Error('Epoch market usage demand must equal gross provider earnings.');
+    }
+
+    const applyState = await this.epochApplyStateRecord();
+    const previousApplyHash = page === 0 ? null : applyState.last_apply_hash;
+    const normalized = {
+      epoch: value.epoch,
+      page,
+      last_page: lastPage,
+      at: value.at,
+      epoch_seconds: params.epoch_seconds,
+      fee_bps: params.fee_bps,
+      tap_burn_bps: TAP_BURN_BPS,
+      debits: this.mapRailEntriesForHash(debitMap, 'user', 'au'),
+      earnings: this.mapRailEntriesForHash(grossEarningMap, 'provider', 'gross_au'),
+      roots,
+      totals,
+    };
+    if (previousApplyHash !== null) {
+      normalized.previous_apply_hash = previousApplyHash;
+    }
+    if (marketUsageProvided) {
+      normalized.market_usage = this.mapMarketUsageEntriesForHash(marketUsageMap);
+    }
+    const applyHash = await this.opaqueHash(
+      'mayhem-targeted-epoch-apply-v1',
+      {
+        value: normalized,
+        payout_revisions: revisionBindings,
+        allocations,
+      }
+    );
+    if (this.isIdempotentEpochApplyPage(applyState, value.epoch, page, lastPage, applyHash)) {
+      const result = {
+        ok: true,
+        op: 'epochApply',
+        epoch: value.epoch,
+        idempotent: true,
+        debited_au: ZERO_AU,
+        earned_au: ZERO_AU,
+        fee_au: ZERO_AU,
+        burn_au: ZERO_AU,
+      };
+      if (pagedApply) {
+        result.page = page;
+        result.last_page = lastPage;
+      }
+      return result;
+    }
+    const pageOrderError = this.validateEpochApplyPageOrder(applyState, value.epoch, page);
+    if (pageOrderError) return pageOrderError;
+    const reservationDebitTotals = this.nextReservationDebitTotals(applyState, value.epoch, page, debitMap);
+    if (reservationDebitTotals instanceof Error) return reservationDebitTotals;
+    const reservationError = await this.validateEpochDebitReservations(value.epoch, reservationDebitTotals);
+    if (reservationError) return reservationError;
+
+    const balances = new Map();
+    for (const debit of debitMap.values()) {
+      const { rail, user, au: debitAu } = debit;
+      const balance = await this.balanceRecord(user, rail);
+      if (balance instanceof Error) return balance;
+      const balanceError = this.guardianValidateBalanceRecord(balance, user, rail);
+      if (balanceError) return balanceError;
+      if (this.compareAu(balance.au, debitAu) < 0) return new Error('Insufficient credit balance.');
+      const nextBalanceAu = this.safeSubAu(balance.au, debitAu);
+      if (nextBalanceAu instanceof Error) return nextBalanceAu;
+      balances.set(stableJson([rail, user]), {
+        ...balance,
+        rail,
+        au: nextBalanceAu,
+        updated_epoch: value.epoch,
+        updated_at: this.tx,
+      });
+    }
+
+    const earningDeltas = new Map();
+    const feeDeltaByRail = new Map(PROVIDER_ACCEPTED_RAIL_ORDER.map((rail) => [rail, ZERO_AU]));
+    const burnDeltaByRail = new Map(PROVIDER_ACCEPTED_RAIL_ORDER.map((rail) => [rail, ZERO_AU]));
+    let feeDeltaTotalAu = ZERO_AU;
+    let burnDeltaTotalAu = ZERO_AU;
+    for (const earning of grossEarningMap.values()) {
+      const { rail, provider, gross_au: grossAu } = earning;
+      const providerRecord = await this.get(`prov/${provider}`);
+      if (!providerRecord) return new Error('Provider not found.');
+      if (!Array.isArray(providerRecord.accepted_rails)) {
+        return new Error('Provider accepted rails are not set.');
+      }
+      if (!providerRecord.accepted_rails.includes(rail)) {
+        return new Error('Provider does not accept payment rail.');
+      }
+
+      const feeAu = this.safeMulDivAu(grossAu, params.fee_bps, 10_000);
+      if (feeAu instanceof Error) return feeAu;
+      const burnAu = rail === 'tap'
+        ? this.safeMulDivAu(grossAu, TAP_BURN_BPS, 10_000)
+        : ZERO_AU;
+      if (burnAu instanceof Error) return burnAu;
+      const afterFeeAu = this.safeSubAu(grossAu, feeAu);
+      if (afterFeeAu instanceof Error) return afterFeeAu;
+      const providerAu = this.safeSubAu(afterFeeAu, burnAu);
+      if (providerAu instanceof Error) return providerAu;
+      feeDeltaTotalAu = this.safeAddAu(feeDeltaTotalAu, feeAu);
+      if (feeDeltaTotalAu instanceof Error) return feeDeltaTotalAu;
+      const nextRailFee = this.safeAddAu(feeDeltaByRail.get(rail) ?? ZERO_AU, feeAu);
+      if (nextRailFee instanceof Error) return nextRailFee;
+      feeDeltaByRail.set(rail, nextRailFee);
+      burnDeltaTotalAu = this.safeAddAu(burnDeltaTotalAu, burnAu);
+      if (burnDeltaTotalAu instanceof Error) return burnDeltaTotalAu;
+      const nextRailBurn = this.safeAddAu(burnDeltaByRail.get(rail) ?? ZERO_AU, burnAu);
+      if (nextRailBurn instanceof Error) return nextRailBurn;
+      burnDeltaByRail.set(rail, nextRailBurn);
+      const key = stableJson([rail, provider]);
+      const current = earningDeltas.get(key) ?? { rail, provider, provider_record: providerRecord, au: ZERO_AU };
+      const next = this.safeAddAu(current.au, providerAu);
+      if (next instanceof Error) return next;
+      earningDeltas.set(key, { ...current, au: next });
+    }
+
+    const earnings = new Map();
+    let earnCumTotal = ZERO_AU;
+    for (const delta of earningDeltas.values()) {
+      const { rail, provider, provider_record: providerRecord, au: deltaAu } = delta;
+      const current = await this.earningRecord(provider, rail);
+      if (current instanceof Error) return current;
+      const currentError = this.guardianValidateEarningRecord(current, provider, rail);
+      if (currentError) return currentError;
+      const probeGate = await this.probeGateForEarning(provider, current, params);
+      if (probeGate instanceof Error) return probeGate;
+      const lockedEarningEpochs = this.providerLockedEarningEpochs(providerRecord, params);
+      if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
+      const disputeGate = await this.providerHasOpenDispute(provider);
+      if (disputeGate instanceof Error) return disputeGate;
+      const refreshed = this.refreshEarningHoldback(
+        current,
+        value.epoch,
+        lockedEarningEpochs,
+        probeGate,
+        disputeGate
+      );
+      if (refreshed instanceof Error) return refreshed;
+      const totalAu = this.safeAddAu(refreshed.total_au, deltaAu);
+      if (totalAu instanceof Error) return totalAu;
+      const heldAu = this.safeAddAu(refreshed.held_au, deltaAu);
+      if (heldAu instanceof Error) return heldAu;
+      const holdbacks = this.appendHoldbackBucket(
+        refreshed.holdbacks,
+        value.epoch,
+        deltaAu,
+        lockedEarningEpochs
+      );
+      if (holdbacks instanceof Error) return holdbacks;
+      earnings.set(stableJson([rail, provider]), {
+        ...refreshed,
+        rail,
+        total_au: totalAu,
+        held_au: heldAu,
+        holdbacks,
+        updated_epoch: value.epoch,
+        updated_at: this.tx,
+      });
+      earnCumTotal = this.safeAddAu(earnCumTotal, totalAu);
+      if (earnCumTotal instanceof Error) return earnCumTotal;
+    }
+
+    const feeRecords = new Map();
+    const nextFeeRecords = new Map();
+    const burnRecords = new Map();
+    const nextBurnRecords = new Map();
+    let nextFeeCumTotal = ZERO_AU;
+    let nextBurnCumTotal = ZERO_AU;
+    const touchedRails = new Set([
+      ...Array.from(debitRailTotals.entries()).filter(([, au]) => this.compareAu(au, ZERO_AU) > 0).map(([rail]) => rail),
+      ...Array.from(grossRailTotals.entries()).filter(([, au]) => this.compareAu(au, ZERO_AU) > 0).map(([rail]) => rail),
+    ]);
+    for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER) {
+      const fee = await this.feeCumRecord(rail);
+      if (fee instanceof Error) return fee;
+      const feeError = this.guardianValidateFeeRecord(fee, rail);
+      if (feeError) return feeError;
+      feeRecords.set(rail, fee);
+      const feeDeltaAu = feeDeltaByRail.get(rail) ?? ZERO_AU;
+      const nextFeeCum = this.safeAddAu(fee.cum_au, feeDeltaAu);
+      if (nextFeeCum instanceof Error) return nextFeeCum;
+      // settled_cum_au must advance with this epoch's settled rail debits in
+      // the SAME record that carries the new cum_au, otherwise
+      // guardianValidateFeeRecord rejects every fee-bearing epoch apply
+      // (settled < cum). This mirrors next_settled_cum_by_rail in
+      // guardianValidateEpochTotals, which is also what gets persisted.
+      const nextFeeSettledCum = this.safeAddAu(
+        fee.settled_cum_au ?? fee.cum_au,
+        debitRailTotals.get(rail) ?? ZERO_AU
+      );
+      if (nextFeeSettledCum instanceof Error) return nextFeeSettledCum;
+      const nextFee = touchedRails.has(rail)
+        ? {
+            ...fee,
+            cum_au: nextFeeCum,
+            settled_cum_au: nextFeeSettledCum,
+            updated_epoch: value.epoch,
+            updated_at: this.tx,
+            last_apply_hash: applyHash,
+            last_fee_bps: params.fee_bps,
+          }
+        : fee;
+      nextFeeRecords.set(rail, nextFee);
+      nextFeeCumTotal = this.safeAddAu(nextFeeCumTotal, nextFee.cum_au);
+      if (nextFeeCumTotal instanceof Error) return nextFeeCumTotal;
+
+      const burn = await this.burnCumRecord(rail);
+      if (burn instanceof Error) return burn;
+      const burnError = this.guardianValidateBurnRecord(burn, rail);
+      if (burnError) return burnError;
+      burnRecords.set(rail, burn);
+      const burnDeltaAu = burnDeltaByRail.get(rail) ?? ZERO_AU;
+      const nextBurnCum = this.safeAddAu(burn.cum_au, burnDeltaAu);
+      if (nextBurnCum instanceof Error) return nextBurnCum;
+      const nextBurn = touchedRails.has(rail)
+        ? {
+            ...burn,
+            cum_au: nextBurnCum,
+            updated_epoch: value.epoch,
+            updated_at: this.tx,
+            last_apply_hash: applyHash,
+            burn_bps: rail === 'tap' ? TAP_BURN_BPS : 0,
+          }
+        : burn;
+      nextBurnRecords.set(rail, nextBurn);
+      nextBurnCumTotal = this.safeAddAu(nextBurnCumTotal, nextBurn.cum_au);
+      if (nextBurnCumTotal instanceof Error) return nextBurnCumTotal;
+    }
+
+    const grossAfterFees = this.safeSubAu(grossTotal, feeDeltaTotalAu);
+    if (grossAfterFees instanceof Error) return grossAfterFees;
+    const providerDeltaTotal = this.safeSubAu(grossAfterFees, burnDeltaTotalAu);
+    if (providerDeltaTotal instanceof Error) return providerDeltaTotal;
+    const guardian = this.guardianCheckEpochApply({
+      epoch: value.epoch,
+      page,
+      applyState,
+      feeRecords,
+      burnRecords,
+      debitTotal,
+      debitRailTotals,
+      feeDeltaByRail,
+      burnDeltaByRail,
+      providerDeltaTotal,
+      nextFeeRecords,
+      nextBurnRecords,
+      balances,
+      earnings,
+    });
+    if (guardian instanceof Error) return guardian;
+
+    let marketPriceUpdates = [];
+    if (marketUsageProvided) {
+      marketPriceUpdates = await this.computeMarketPriceUpdates(marketUsageMap, {
+        epoch: value.epoch,
+        at: value.at,
+        epochSeconds: params.epoch_seconds,
+      });
+      if (marketPriceUpdates instanceof Error) return marketPriceUpdates;
+    }
+    const priceDerivations = await this.priceDerivationsFromMarketUpdates(marketPriceUpdates, {
+      epoch: value.epoch,
+      at: value.at,
+      epochSeconds: params.epoch_seconds,
+      usageRoot: roots?.use ?? null,
+    });
+    if (priceDerivations instanceof Error) return priceDerivations;
+
+    if (totals) {
+      const totalsError = await this.validateEpochApplyTotals({
+        epoch: value.epoch,
+        roots,
+        totals,
+        debitTotal,
+        feeDeltaAu: feeDeltaTotalAu,
+        nextFeeCum: nextFeeCumTotal,
+        burnDeltaAu: burnDeltaTotalAu,
+        nextBurnCum: nextBurnCumTotal,
+        providerCount: grossEarningMap.size,
+        earnCumTotal,
+        epochSeconds: params.epoch_seconds,
+        priceDerivations,
+      });
+      if (totalsError) return totalsError;
+    }
+
+    for (const balance of this.sortedRailRecords(balances, 'user')) {
+      await this.put(this.balanceKey(balance.user, balance.rail), balance);
+    }
+    for (const earning of this.sortedRailRecords(earnings, 'provider')) {
+      await this.put(this.earningKey(earning.provider, earning.rail), earning);
+    }
+    for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER.filter((rail) => touchedRails.has(rail))) {
+      const feeRecord = {
+        ...nextFeeRecords.get(rail),
+        settled_cum_au: guardian.next_settled_cum_by_rail.get(rail),
+      };
+      await this.put(this.feeCumKey(rail), feeRecord);
+      await this.put(this.burnCumKey(rail), nextBurnRecords.get(rail));
+    }
+    const nextApplyState = this.nextEpochApplyState({
+      applyState,
+      epoch: value.epoch,
+      page,
+      lastPage,
+      applyHash,
+      epochSeconds: params.epoch_seconds,
+      reservationDebitTotals,
+    });
+    const previousChallengeError = await this.rememberCanaryChallengeAnchor(applyState);
+    if (previousChallengeError) return previousChallengeError;
+    await this.put('epoch/apply/state', nextApplyState);
+    if (lastPage) {
+      const challengeError = await this.rememberCanaryChallengeAnchor(nextApplyState);
+      if (challengeError) return challengeError;
+    }
+    if (totals) {
+      await this.writeEpochEvidenceRoots({
+        epoch: value.epoch,
+        at: value.at,
+        epoch_seconds: params.epoch_seconds,
+        roots,
+        totals,
+        feeDeltaAu: feeDeltaTotalAu,
+        feeCumAu: nextFeeCumTotal,
+        burnDeltaAu: burnDeltaTotalAu,
+        burnCumAu: nextBurnCumTotal,
+        priceDerivations,
+      });
+    } else if (priceDerivations.length > 0) {
+      await this.writePriceDerivationEvidence({
+        epoch: value.epoch,
+        at: value.at,
+        epoch_seconds: params.epoch_seconds,
+        root: await this.priceDerivationRoot(priceDerivations),
+        count: priceDerivations.length,
+        derivations: priceDerivations,
+      });
+    }
+    for (const update of marketPriceUpdates) {
+      await this.put(update.schedule_key, update.schedule);
+      await this.put(update.record_key, update.record);
+    }
+
+    const result = {
+      ok: true,
+      op: 'epochApply',
+      epoch: value.epoch,
+      idempotent: false,
+      debited_au: debitTotal,
+      earned_au: providerDeltaTotal,
+      fee_au: feeDeltaTotalAu,
+      burn_au: burnDeltaTotalAu,
+      rails: Array.from(touchedRails).sort(
+        (left, right) => PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(left) - PROVIDER_ACCEPTED_RAIL_ORDER.indexOf(right)
+      ),
+    };
+    if (pagedApply) {
+      result.page = page;
+      result.last_page = lastPage;
+    }
+    if (marketPriceUpdates.length > 0) {
+      result.market_prices = marketPriceUpdates.map((update) => ({
+        enclave_id: update.enclave_id,
+        ...(update.ctx_bracket ? {
+          ctx_bracket: update.ctx_bracket,
+          ctx_bracket_table_ver: update.ctx_bracket_table_ver,
+        } : {}),
+        ver: update.ver,
+        utilization_bps: update.utilization_bps,
+        ema_utilization_bps: update.ema_utilization_bps,
+        active_supply: update.active_supply,
+        active_demand_au: update.active_demand_au,
+        frozen: update.frozen,
+        derivation_hash: update.derivation_hash,
+      }));
+      result.price_root = await this.priceDerivationRoot(priceDerivations);
+    }
+    console.log('mayhem epochApply', result);
+    return result;
+  }
+
+
   async epochSealEmpty() {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
@@ -5422,241 +6904,7 @@ class MayhemContract extends Contract {
       : null;
   }
 
-  async tnkSettlement() {
-    const adminError = await this.requireAdmin();
-    if (adminError) return adminError;
-    const shapeError = this.validateTnkSettlementValue(this.value);
-    if (shapeError) return shapeError;
-    const settlementParams = await this.activeParamsAt(this.value.at, ['max_tnk_settlement_outputs']);
-    if (this.value.outputs.length > settlementParams.max_tnk_settlement_outputs) {
-      return new Error('TNK settlement output count exceeds max_tnk_settlement_outputs.');
-    }
-
-    const outputs = this.normalizeTnkSettlementOutputs(this.value.outputs);
-    if (outputs instanceof Error) return outputs;
-    if (stableJson(outputs) !== stableJson(this.value.outputs)) {
-      return new Error('TNK settlement outputs must be canonical.');
-    }
-    const transfers = this.value.msb_transfers.map((entry) => (
-      this.normalizeMsbTransferEvidence(entry, 'TNK settlement MSB transfer evidence')
-    ));
-    const transferError = transfers.find((entry) => entry instanceof Error);
-    if (transferError) return transferError;
-    if (stableJson(transfers) !== stableJson(this.value.msb_transfers)) {
-      return new Error('TNK settlement MSB transfers must be canonical.');
-    }
-    const payment = await this.canonicalTnkPaymentConfig();
-    if (payment instanceof Error) return payment;
-    if (
-      this.value.network !== payment.network ||
-      this.value.treasury_from !== payment.treasury_address
-    ) {
-      return new Error('TNK settlement source does not match canonical payment config.');
-    }
-    for (const [index, output] of outputs.entries()) {
-      const transfer = transfers[index];
-      if (
-        transfer.network !== this.value.network ||
-        transfer.from !== this.value.treasury_from ||
-        transfer.to !== output.to ||
-        transfer.amount_e18 !== output.tnk_e18
-      ) {
-        return new Error('TNK settlement MSB transfer does not match output.');
-      }
-    }
-    const totals = this.tnkSettlementTotals(outputs, this.value.rate_tnk_usd_au);
-    if (totals instanceof Error) return totals;
-    if (totals.provider_count !== this.value.provider_count) {
-      return new Error('TNK settlement provider count does not match outputs.');
-    }
-    if (this.compareAu(totals.provider_au, this.value.provider_au) !== 0) {
-      return new Error('TNK settlement provider amount does not match outputs.');
-    }
-    if (this.compareAu(totals.operator_fee_au, this.value.operator_fee_au) !== 0) {
-      return new Error('TNK settlement operator fee does not match outputs.');
-    }
-    if (this.compareAu(totals.gross_au, this.value.gross_au) !== 0) {
-      return new Error('TNK settlement gross amount does not match outputs.');
-    }
-    if (totals.tnk_e18 !== this.value.tnk_e18) {
-      return new Error('TNK settlement TNK amount does not match outputs.');
-    }
-
-    const transferRoot = await this.tnkSettlementTransferRoot(outputs);
-    if (transferRoot !== this.value.transfer_root) {
-      return new Error('TNK settlement transfer root does not match outputs.');
-    }
-
-    const record = this.tnkSettlementRecord(outputs, transfers);
-    const key = `settle/tnk/${this.value.epoch}`;
-    const existing = await this.get(key);
-    if (existing) {
-      if (stableJson(existing) === stableJson(record)) {
-        return {
-          ok: true,
-          op: 'tnkSettlement',
-          epoch: this.value.epoch,
-          rail: 'tnk',
-          idempotent: true,
-          msb_transfers: transfers,
-        };
-      }
-      return new Error('TNK settlement already exists for epoch.');
-    }
-
-    const applyState = await this.epochApplyStateRecord();
-    if (
-      applyState.updated_epoch !== this.value.epoch ||
-      applyState.last_apply_hash !== this.value.epoch_apply_hash
-    ) {
-      return new Error('TNK settlement epoch apply hash does not match current state.');
-    }
-
-    for (const transfer of transfers) {
-      if ((await this.get(this.msbTransferSeenKey(transfer))) !== null) {
-        return new Error('TNK settlement MSB transfer was already consumed by Mayhem.');
-      }
-    }
-
-    const rate = await this.guardianRequireHistoricalTnkRate(this.value, this.value.at);
-    if (rate instanceof Error) return rate;
-
-    const params = await this.activeParamsAt(this.value.at, [
-      'holdback_epochs',
-      'challenge_epochs',
-      'canary_probe_holdback_bps',
-      'canary_probe_release_min_passes',
-    ]);
-    const earningUpdates = [];
-    for (const [outputIndex, output] of outputs.entries()) {
-      if (output.role !== 'provider') continue;
-      const provider = await this.get(`prov/${output.provider}`);
-      if (!provider) return new Error('Provider not found.');
-      if (provider.status !== 'active' && provider.status !== 'banned') {
-        return new Error('TNK settlement provider status is not payable.');
-      }
-      const payout = provider.payouts?.tnk;
-      const payoutError = await this.requireAdminSetPayoutTarget(provider, 'tnk');
-      if (payoutError) return payoutError;
-      if (payout.method !== 'tnk') {
-        return new Error('TNK settlement provider payout target must be TNK.');
-      }
-      if (payout.addr !== output.to) {
-        return new Error('TNK settlement provider payout target mismatch.');
-      }
-
-      const earning = await this.earningRecord(output.provider, 'tnk');
-      if (earning instanceof Error) return earning;
-      const earningError = this.guardianValidateEarningRecord(earning, output.provider, 'tnk');
-      if (earningError) return earningError;
-      const probeGate = await this.probeGateForEarning(output.provider, earning, params);
-      if (probeGate instanceof Error) return probeGate;
-      const lockedEarningEpochs = this.providerLockedEarningEpochs(provider, params);
-      if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
-      const disputeGate = await this.providerHasOpenDispute(output.provider);
-      if (disputeGate instanceof Error) return disputeGate;
-      const refreshed = this.refreshEarningHoldback(
-        earning,
-        this.value.epoch,
-        lockedEarningEpochs,
-        probeGate,
-        disputeGate
-      );
-      if (refreshed instanceof Error) return refreshed;
-      const payable = this.safeSubAu(
-        this.safeSubAu(refreshed.total_au, refreshed.held_au),
-        refreshed.paid_cum_au
-      );
-      if (payable instanceof Error) return payable;
-      if (this.isZeroAu(payable)) return new Error('TNK settlement provider has no payable earnings.');
-      if (this.compareAu(output.au, payable) !== 0) {
-        return new Error('TNK settlement provider amount does not match payable earnings.');
-      }
-      const paidCumAu = this.safeAddAu(refreshed.paid_cum_au, output.au);
-      if (paidCumAu instanceof Error) return paidCumAu;
-      const nextEarning = {
-        ...refreshed,
-        paid_cum_au: paidCumAu,
-        updated_epoch: Math.max(refreshed.updated_epoch, this.value.epoch),
-        last_settlement_epoch: this.value.epoch,
-        last_settlement_msb_tx_hash: transfers[outputIndex].tx_hash,
-      };
-      const nextError = this.guardianValidateEarningRecord(nextEarning, output.provider, 'tnk');
-      if (nextError) return nextError;
-      earningUpdates.push(nextEarning);
-    }
-
-    const fee = await this.feeCumRecord('tnk');
-    if (fee instanceof Error) return fee;
-    const feeError = this.guardianValidateFeeRecord(fee, 'tnk');
-    if (feeError) return feeError;
-    const payableFee = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
-    if (payableFee instanceof Error) return payableFee;
-    if (this.compareAu(payableFee, this.value.operator_fee_au) !== 0) {
-      return new Error('TNK settlement operator fee does not match fee state.');
-    }
-    const operatorOutputs = outputs.filter((entry) => entry.role === 'operator_fee');
-    if (this.isZeroAu(payableFee) && operatorOutputs.length !== 0) {
-      return new Error('TNK settlement has unexpected operator fee output.');
-    }
-    if (this.compareAu(payableFee, ZERO_AU) > 0) {
-      if (operatorOutputs.length !== 1) return new Error('TNK settlement missing operator fee output.');
-      if (operatorOutputs[0].to !== this.value.operator_to) {
-        return new Error('TNK settlement operator target mismatch.');
-      }
-    }
-    const operatorOutputIndex = outputs.findIndex((entry) => entry.role === 'operator_fee');
-    const sweptCumAu = this.safeAddAu(fee.swept_cum_au, this.value.operator_fee_au);
-    if (sweptCumAu instanceof Error) return sweptCumAu;
-    const nextFee = {
-      ...fee,
-      swept_cum_au: sweptCumAu,
-      updated_epoch: Math.max(fee.updated_epoch, this.value.epoch),
-      last_settlement_epoch: this.value.epoch,
-      last_settlement_msb_tx_hash: operatorOutputIndex >= 0
-        ? transfers[operatorOutputIndex].tx_hash
-        : (fee.last_settlement_msb_tx_hash ?? null),
-    };
-    const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'tnk');
-    if (nextFeeError) return nextFeeError;
-
-    for (const earning of earningUpdates) {
-      await this.put(this.earningKey(earning.provider, 'tnk'), earning);
-    }
-    for (const [index, transfer] of transfers.entries()) {
-      await this.put(this.msbTransferSeenKey(transfer), {
-        rail: 'tnk',
-        purpose: 'settlement',
-        epoch: this.value.epoch,
-        output_index: index,
-        transfer_root: this.value.transfer_root,
-        consumed_at: this.tx,
-      });
-    }
-    await this.put(this.feeCumKey('tnk'), nextFee);
-    await this.put(key, record);
-    console.log('mayhem tnkSettlement', {
-      epoch: this.value.epoch,
-      provider_au: this.value.provider_au,
-      operator_fee_au: this.value.operator_fee_au,
-      gross_au: this.value.gross_au,
-      msb_tx_hashes: transfers.map((entry) => entry.tx_hash),
-    });
-    return {
-      ok: true,
-      op: 'tnkSettlement',
-      epoch: this.value.epoch,
-      rail: 'tnk',
-      idempotent: false,
-      provider_au: this.value.provider_au,
-      operator_fee_au: this.value.operator_fee_au,
-      gross_au: this.value.gross_au,
-      msb_transfers: transfers,
-      transfer_root: this.value.transfer_root,
-    };
-  }
-
-  validateTnkSettlementValue(value) {
+  normalizeTargetedTnkSettlementValue(value) {
     const shapeError = this.validateExactObjectKeys(
       value,
       [
@@ -5680,108 +6928,714 @@ class MayhemContract extends Contract {
         'tnk_e18',
         'outputs',
       ],
-      'TNK settlement'
+      'targeted TNK settlement'
     );
     if (shapeError) return shapeError;
-    if (value.op !== 'tnk_settlement') return new Error('Invalid TNK settlement op.');
-    if (value.rail !== 'tnk') return new Error('TNK settlement rail must be tnk.');
-    if (!Number.isSafeInteger(value.epoch) || value.epoch < 1) return new Error('Invalid TNK settlement epoch.');
-    if (!Number.isSafeInteger(value.at) || value.at < 0) return new Error('Invalid TNK settlement timestamp.');
-    if (!this.isSafeKeyPart(value.network)) return new Error('Invalid TNK settlement network.');
-    if (!this.isSafeKeyPart(value.treasury_from)) return new Error('Invalid TNK treasury address.');
-    if (!this.isSafeKeyPart(value.operator_to)) return new Error('Invalid TNK operator address.');
-    if (!this.isHexBytes(value.epoch_apply_hash, 32)) return new Error('Invalid TNK settlement apply hash.');
-    if (!Array.isArray(value.msb_transfers) || value.msb_transfers.length === 0) {
-      return new Error('TNK settlement requires one confirmed MSB transfer per output.');
+    if (value.op !== 'settle_targeted_tnk' || value.rail !== 'tnk' ||
+        !Number.isSafeInteger(value.epoch) || value.epoch < 1 ||
+        !Number.isSafeInteger(value.at) || value.at < 0 ||
+        !this.isSafeKeyPart(value.network) ||
+        !this.isSafeKeyPart(value.treasury_from) ||
+        !this.isSafeKeyPart(value.operator_to) ||
+        !this.isHexBytes(value.epoch_apply_hash, 32) ||
+        !this.isHexBytes(value.transfer_root, 32) ||
+        !Number.isSafeInteger(value.provider_count) || value.provider_count < 0 ||
+        !Number.isSafeInteger(value.rate_ts) || value.rate_ts < 0 ||
+        !RATE_SOURCES.has(value.rate_source) ||
+        !Array.isArray(value.outputs) || value.outputs.length === 0 ||
+        !Array.isArray(value.msb_transfers) ||
+        value.msb_transfers.length !== value.outputs.length) {
+      return new Error('Invalid targeted TNK settlement.');
     }
-    const seenTxHashes = new Set();
+    if (this.normalizeAu(
+      value.rate_tnk_usd_au,
+      'targeted TNK settlement rate',
+      { allowZero: false }
+    ) instanceof Error || this.parseTnkE18(value.tnk_e18) instanceof Error) {
+      return new Error('Invalid targeted TNK settlement amount or rate.');
+    }
+    for (const field of ['provider_au', 'operator_fee_au', 'gross_au']) {
+      if (this.normalizeAu(
+        value[field],
+        `targeted TNK settlement ${field}`,
+        { allowZero: field !== 'gross_au' }
+      ) instanceof Error) {
+        return new Error('Invalid targeted TNK settlement total.');
+      }
+    }
+    const gross = this.safeAddAu(value.provider_au, value.operator_fee_au);
+    if (gross instanceof Error || this.compareAu(gross, value.gross_au) !== 0) {
+      return new Error('Targeted TNK settlement gross amount does not balance.');
+    }
+    const seenTransfers = new Set();
     for (const entry of value.msb_transfers) {
       const transfer = this.normalizeMsbTransferEvidence(
         entry,
-        'TNK settlement MSB transfer evidence'
+        'targeted TNK settlement transfer'
       );
       if (transfer instanceof Error) return transfer;
-      if (seenTxHashes.has(transfer.tx_hash)) {
-        return new Error('Duplicate TNK settlement MSB tx hash.');
+      if (seenTransfers.has(transfer.tx_hash)) {
+        return new Error('Duplicate targeted TNK settlement transfer.');
       }
-      seenTxHashes.add(transfer.tx_hash);
+      seenTransfers.add(transfer.tx_hash);
     }
-    if (!this.isHexBytes(value.transfer_root, 32)) return new Error('Invalid TNK settlement transfer root.');
-    const rateTnkUsdAu = this.normalizeAu(value.rate_tnk_usd_au, 'TNK settlement rate', { allowZero: false });
-    if (rateTnkUsdAu instanceof Error) {
-      return new Error('Invalid TNK settlement rate.');
-    }
-    if (!RATE_SOURCES.has(value.rate_source)) return new Error('Unsupported TNK settlement rate source.');
-    if (!Number.isSafeInteger(value.rate_ts) || value.rate_ts < 0) {
-      return new Error('Invalid TNK settlement rate timestamp.');
-    }
-    if (!Number.isSafeInteger(value.provider_count) || value.provider_count < 0) {
-      return new Error('Invalid TNK settlement total.');
-    }
-    for (const key of ['provider_au', 'operator_fee_au', 'gross_au']) {
-      const amount = this.normalizeAu(value[key], `TNK settlement ${key}`, { allowZero: key !== 'gross_au' });
-      if (amount instanceof Error) return new Error('Invalid TNK settlement total.');
-    }
-    const gross = this.safeAddAu(value.provider_au, value.operator_fee_au);
-    if (gross instanceof Error) return gross;
-    if (this.compareAu(gross, value.gross_au) !== 0) return new Error('TNK settlement gross amount does not balance.');
-    const tnkE18 = this.parseTnkE18(value.tnk_e18);
-    if (tnkE18 instanceof Error) return tnkE18;
-    if (!Array.isArray(value.outputs) || value.outputs.length === 0) {
-      return new Error('TNK settlement outputs are required.');
-    }
-    if (value.msb_transfers.length !== value.outputs.length) {
-      return new Error('TNK settlement MSB transfer count must match outputs.');
-    }
-    return null;
-  }
-
-  normalizeTnkSettlementOutputs(outputs) {
-    if (!Array.isArray(outputs) || outputs.length === 0) {
-      return new Error('TNK settlement outputs are required.');
-    }
-    const providers = new Set();
-    const providerOutputs = [];
-    const operatorOutputs = [];
-    for (const output of outputs) {
-      if (!output || typeof output !== 'object' || Array.isArray(output)) {
-        return new Error('Invalid TNK settlement output.');
-      }
-      if (output.role === 'provider') {
+    const outputs = [];
+    const seen = new Set();
+    let operatorSeen = false;
+    for (const output of value.outputs) {
+      if (output?.role === 'provider') {
         const shapeError = this.validateExactObjectKeys(
           output,
-          ['role', 'provider', 'to', 'au', 'tnk_e18'],
-          'TNK settlement provider output'
+          ['role', 'provider', 'payout_revision', 'to', 'au', 'tnk_e18'],
+          'targeted TNK provider output'
         );
         if (shapeError) return shapeError;
-        if (!this.isHexBytes(output.provider, 32) || output.provider !== output.provider.toLowerCase()) {
-          return new Error('Invalid TNK settlement provider id.');
+        if (!this.isHexBytes(output.payout_revision, 32) ||
+            output.payout_revision !== output.payout_revision.toLowerCase()) {
+          return new Error('Invalid targeted TNK payout revision.');
         }
-        if (providers.has(output.provider)) return new Error('Duplicate TNK settlement provider output.');
-        providers.add(output.provider);
-        const normalized = this.normalizeTnkSettlementOutput(output);
+        const identity = stableJson([output.provider, output.payout_revision]);
+        if (seen.has(identity)) return new Error('Duplicate targeted TNK payout liability.');
+        seen.add(identity);
+        const normalized = this.normalizeTargetedTnkSettlementOutput({
+          role: output.role,
+          provider: output.provider,
+          to: output.to,
+          au: output.au,
+          tnk_e18: output.tnk_e18,
+        });
         if (normalized instanceof Error) return normalized;
-        providerOutputs.push(normalized);
-      } else if (output.role === 'operator_fee') {
+        outputs.push({ ...normalized, payout_revision: output.payout_revision });
+      } else if (output?.role === 'operator_fee') {
         const shapeError = this.validateExactObjectKeys(
           output,
           ['role', 'to', 'au', 'tnk_e18'],
-          'TNK settlement operator output'
+          'targeted TNK operator output'
         );
         if (shapeError) return shapeError;
-        if (operatorOutputs.length > 0) return new Error('Duplicate TNK settlement operator output.');
-        const normalized = this.normalizeTnkSettlementOutput(output);
+        if (operatorSeen) return new Error('Duplicate targeted TNK operator output.');
+        operatorSeen = true;
+        const normalized = this.normalizeTargetedTnkSettlementOutput(output);
         if (normalized instanceof Error) return normalized;
-        operatorOutputs.push(normalized);
+        outputs.push(normalized);
       } else {
-        return new Error('Invalid TNK settlement output role.');
+        return new Error('Invalid targeted TNK settlement output role.');
       }
     }
-    providerOutputs.sort((left, right) => compareCodepoint(left.provider, right.provider));
-    return [...providerOutputs, ...operatorOutputs];
+    outputs.sort((left, right) => {
+      if (left.role !== right.role) return left.role === 'provider' ? -1 : 1;
+      if (left.role === 'operator_fee') return 0;
+      return compareCodepoint(left.provider, right.provider) ||
+        compareCodepoint(left.payout_revision, right.payout_revision);
+    });
+    if (stableJson(outputs) !== stableJson(value.outputs)) {
+      return new Error('Targeted TNK settlement outputs must be canonical.');
+    }
+    return { outputs };
   }
 
-  normalizeTnkSettlementOutput(output) {
+  normalizeTargetedFiatSettlementValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'epoch',
+        'at',
+        'rail',
+        'processor',
+        'operator_to',
+        'epoch_apply_hash',
+        'stripe_transfers',
+        'transfer_root',
+        'provider_count',
+        'provider_au',
+        'operator_fee_au',
+        'gross_au',
+        'outputs',
+      ],
+      'targeted fiat settlement'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'settle_targeted_fiat' ||
+        value.rail !== 'fiat' ||
+        value.processor !== 'stripe' ||
+        !Number.isSafeInteger(value.epoch) || value.epoch < 1 ||
+        !Number.isSafeInteger(value.at) || value.at < 0 ||
+        !this.isSafeKeyPart(value.operator_to) ||
+        !this.isHexBytes(value.epoch_apply_hash, 32) ||
+        !this.isHexBytes(value.transfer_root, 32) ||
+        !Number.isSafeInteger(value.provider_count) || value.provider_count < 0 ||
+        !Array.isArray(value.outputs) || value.outputs.length === 0 ||
+        !Array.isArray(value.stripe_transfers) ||
+        value.stripe_transfers.length !== value.outputs.length) {
+      return new Error('Invalid targeted fiat settlement.');
+    }
+    for (const field of ['provider_au', 'operator_fee_au', 'gross_au']) {
+      if (this.normalizeAu(
+        value[field],
+        `targeted fiat settlement ${field}`,
+        { allowZero: field !== 'gross_au' }
+      ) instanceof Error) {
+        return new Error('Invalid targeted fiat settlement total.');
+      }
+    }
+    const gross = this.safeAddAu(value.provider_au, value.operator_fee_au);
+    if (gross instanceof Error || this.compareAu(gross, value.gross_au) !== 0) {
+      return new Error('Targeted fiat settlement gross amount does not balance.');
+    }
+    const seenTransfers = new Set();
+    for (const entry of value.stripe_transfers) {
+      const transfer = this.normalizeStripeTransferEvidence(
+        entry,
+        'targeted fiat settlement transfer'
+      );
+      if (transfer instanceof Error) return transfer;
+      if (seenTransfers.has(transfer.ref)) {
+        return new Error('Duplicate targeted fiat settlement transfer.');
+      }
+      seenTransfers.add(transfer.ref);
+    }
+    const outputs = [];
+    const seen = new Set();
+    let operatorSeen = false;
+    for (const output of value.outputs) {
+      if (output?.role === 'provider') {
+        const shapeError = this.validateExactObjectKeys(
+          output,
+          ['role', 'provider', 'payout_revision', 'to', 'currency', 'amount_minor', 'au'],
+          'targeted fiat provider output'
+        );
+        if (shapeError) return shapeError;
+        if (!this.isHexBytes(output.payout_revision, 32) ||
+            output.payout_revision !== output.payout_revision.toLowerCase()) {
+          return new Error('Invalid targeted fiat payout revision.');
+        }
+        const identity = stableJson([output.provider, output.payout_revision]);
+        if (seen.has(identity)) return new Error('Duplicate targeted fiat payout liability.');
+        seen.add(identity);
+        const normalized = this.normalizeTargetedFiatSettlementOutput({
+          role: output.role,
+          provider: output.provider,
+          to: output.to,
+          currency: output.currency,
+          amount_minor: output.amount_minor,
+          au: output.au,
+        });
+        if (normalized instanceof Error) return normalized;
+        outputs.push({ ...normalized, payout_revision: output.payout_revision });
+      } else if (output?.role === 'operator_fee') {
+        const shapeError = this.validateExactObjectKeys(
+          output,
+          ['role', 'to', 'currency', 'amount_minor', 'au'],
+          'targeted fiat operator output'
+        );
+        if (shapeError) return shapeError;
+        if (operatorSeen) return new Error('Duplicate targeted fiat operator output.');
+        operatorSeen = true;
+        const normalized = this.normalizeTargetedFiatSettlementOutput(output);
+        if (normalized instanceof Error) return normalized;
+        outputs.push(normalized);
+      } else {
+        return new Error('Invalid targeted fiat settlement output role.');
+      }
+    }
+    outputs.sort((left, right) => {
+      if (left.role !== right.role) return left.role === 'provider' ? -1 : 1;
+      if (left.role === 'operator_fee') return 0;
+      return compareCodepoint(left.provider, right.provider) ||
+        compareCodepoint(left.payout_revision, right.payout_revision);
+    });
+    if (stableJson(outputs) !== stableJson(value.outputs)) {
+      return new Error('Targeted fiat settlement outputs must be canonical.');
+    }
+    return { outputs };
+  }
+
+  async targetedTnkSettlementTransferRoot(outputs) {
+    return await this.opaqueHash(
+      'mayhem-targeted-tnk-settlement-transfer-root-v1',
+      outputs
+    );
+  }
+
+  async targetedFiatSettlementTransferRoot(outputs) {
+    return await this.opaqueHash(
+      'mayhem-targeted-fiat-settlement-transfer-root-v1',
+      outputs
+    );
+  }
+
+  async targetedPayoutSettlementUpdates(outputs, rail, epoch, at, transferIds) {
+    const params = await this.activeParamsAt(at, [
+      'holdback_epochs',
+      'challenge_epochs',
+      'canary_probe_holdback_bps',
+      'canary_probe_release_min_passes',
+    ]);
+    const liabilityUpdates = [];
+    const paidByProvider = new Map();
+    for (const [outputIndex, output] of outputs.entries()) {
+      if (output.role !== 'provider') continue;
+      const provider = await this.get(`prov/${output.provider}`);
+      if (!provider) return new Error('Provider not found.');
+      if (provider.status !== 'active' && provider.status !== 'banned') {
+        return new Error('Targeted settlement provider status is not payable.');
+      }
+      const binding = await this.get(
+        this.providerPayoutBindingFeatureKey(
+          rail,
+          output.provider,
+          output.payout_revision
+        )
+      );
+      if (!binding ||
+          binding.verified !== true ||
+          binding.provider !== output.provider ||
+          binding.rail !== rail ||
+          binding.revision !== output.payout_revision ||
+          binding.activation_epoch > epoch) {
+        return new Error('Targeted settlement requires its immutable payout binding.');
+      }
+      if (binding.target !== output.to) {
+        return new Error('Targeted settlement payout target mismatch.');
+      }
+      if (rail === 'fiat' && binding.currency !== output.currency) {
+        return new Error('Targeted settlement payout currency mismatch.');
+      }
+      const liabilityKey = this.providerPayoutLiabilityKey(
+        output.provider,
+        rail,
+        output.payout_revision
+      );
+      const liability = await this.get(liabilityKey);
+      if (!liability ||
+          liability.provider !== output.provider ||
+          liability.rail !== rail ||
+          liability.revision !== output.payout_revision ||
+          liability.target !== binding.target ||
+          (liability.currency ?? null) !== binding.currency ||
+          (liability.chain_id ?? null) !== binding.chain_id) {
+        return new Error('Targeted settlement payout liability mismatch.');
+      }
+      const probeGate = await this.probeGateForEarning(output.provider, liability, params);
+      if (probeGate instanceof Error) return probeGate;
+      const lockedEarningEpochs = this.providerLockedEarningEpochs(provider, params);
+      if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
+      const disputeGate = await this.providerHasOpenDispute(output.provider);
+      if (disputeGate instanceof Error) return disputeGate;
+      const refreshed = this.refreshEarningHoldback(
+        liability,
+        epoch,
+        lockedEarningEpochs,
+        probeGate,
+        disputeGate
+      );
+      if (refreshed instanceof Error) return refreshed;
+      const payable = this.safeSubAu(
+        this.safeSubAu(refreshed.total_au, refreshed.held_au),
+        refreshed.paid_cum_au
+      );
+      if (payable instanceof Error) return payable;
+      const transferable = rail === 'fiat'
+        ? this.fiatWholeMinorTransferAu(payable)
+        : payable;
+      if (transferable instanceof Error) return transferable;
+      if (this.isZeroAu(transferable)) {
+        return new Error('Targeted settlement liability has no payable earnings.');
+      }
+      if (this.compareAu(output.au, transferable) !== 0) {
+        return new Error('Targeted settlement amount does not match revision liability.');
+      }
+      const paidCumAu = this.safeAddAu(refreshed.paid_cum_au, output.au);
+      if (paidCumAu instanceof Error) return paidCumAu;
+      liabilityUpdates.push({
+        key: liabilityKey,
+        value: {
+          ...refreshed,
+          paid_cum_au: paidCumAu,
+          updated_epoch: Math.max(refreshed.updated_epoch, epoch),
+          last_settlement_epoch: epoch,
+          last_settlement_transfer: transferIds[outputIndex],
+          updated_at: this.tx,
+        },
+      });
+      const nextProviderPaid = this.safeAddAu(
+        paidByProvider.get(output.provider) ?? ZERO_AU,
+        output.au
+      );
+      if (nextProviderPaid instanceof Error) return nextProviderPaid;
+      paidByProvider.set(output.provider, nextProviderPaid);
+    }
+
+    const earningUpdates = [];
+    for (const [providerId, paidAu] of paidByProvider) {
+      const provider = await this.get(`prov/${providerId}`);
+      const earning = await this.earningRecord(providerId, rail);
+      if (earning instanceof Error) return earning;
+      const earningError = this.guardianValidateEarningRecord(
+        earning,
+        providerId,
+        rail
+      );
+      if (earningError) return earningError;
+      const probeGate = await this.probeGateForEarning(providerId, earning, params);
+      if (probeGate instanceof Error) return probeGate;
+      const lockedEarningEpochs = this.providerLockedEarningEpochs(provider, params);
+      if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
+      const disputeGate = await this.providerHasOpenDispute(providerId);
+      if (disputeGate instanceof Error) return disputeGate;
+      const refreshed = this.refreshEarningHoldback(
+        earning,
+        epoch,
+        lockedEarningEpochs,
+        probeGate,
+        disputeGate
+      );
+      if (refreshed instanceof Error) return refreshed;
+      const payable = this.safeSubAu(
+        this.safeSubAu(refreshed.total_au, refreshed.held_au),
+        refreshed.paid_cum_au
+      );
+      if (payable instanceof Error) return payable;
+      if (this.compareAu(paidAu, payable) > 0) {
+        return new Error('Targeted settlement exceeds aggregate provider earnings.');
+      }
+      const paidCumAu = this.safeAddAu(refreshed.paid_cum_au, paidAu);
+      if (paidCumAu instanceof Error) return paidCumAu;
+      const nextEarning = {
+        ...refreshed,
+        paid_cum_au: paidCumAu,
+        updated_epoch: Math.max(refreshed.updated_epoch, epoch),
+        last_targeted_settlement_epoch: epoch,
+        updated_at: this.tx,
+      };
+      const nextError = this.guardianValidateEarningRecord(
+        nextEarning,
+        providerId,
+        rail
+      );
+      if (nextError) return nextError;
+      earningUpdates.push(nextEarning);
+    }
+    return { liabilityUpdates, earningUpdates };
+  }
+
+  async targetedTnkSettlement(value) {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const normalized = this.normalizeTargetedTnkSettlementValue(value);
+    if (normalized instanceof Error) return normalized;
+    const settlementParams = await this.activeParamsAt(
+      value.at,
+      ['max_tnk_settlement_outputs']
+    );
+    if (value.outputs.length > settlementParams.max_tnk_settlement_outputs) {
+      return new Error('Targeted TNK settlement output count exceeds limit.');
+    }
+    const outputs = normalized.outputs;
+    const transfers = value.msb_transfers.map((entry) => (
+      this.normalizeMsbTransferEvidence(
+        entry,
+        'Targeted TNK settlement MSB transfer evidence'
+      )
+    ));
+    const transferError = transfers.find((entry) => entry instanceof Error);
+    if (transferError) return transferError;
+    if (stableJson(transfers) !== stableJson(value.msb_transfers)) {
+      return new Error('Targeted TNK settlement transfers must be canonical.');
+    }
+    const payment = await this.canonicalTnkPaymentConfig();
+    if (payment instanceof Error) return payment;
+    if (value.network !== payment.network ||
+        value.treasury_from !== payment.treasury_address) {
+      return new Error('Targeted TNK settlement source does not match payment config.');
+    }
+    for (const [index, output] of outputs.entries()) {
+      const transfer = transfers[index];
+      if (transfer.network !== value.network ||
+          transfer.from !== value.treasury_from ||
+          transfer.to !== output.to ||
+          transfer.amount_e18 !== output.tnk_e18) {
+        return new Error('Targeted TNK transfer does not match output.');
+      }
+    }
+    const totals = this.targetedTnkSettlementTotals(outputs, value.rate_tnk_usd_au);
+    if (totals instanceof Error) return totals;
+    if (totals.provider_count !== value.provider_count ||
+        this.compareAu(totals.provider_au, value.provider_au) !== 0 ||
+        this.compareAu(totals.operator_fee_au, value.operator_fee_au) !== 0 ||
+        this.compareAu(totals.gross_au, value.gross_au) !== 0 ||
+        totals.tnk_e18 !== value.tnk_e18) {
+      return new Error('Targeted TNK settlement totals do not match outputs.');
+    }
+    const transferRoot = await this.targetedTnkSettlementTransferRoot(outputs);
+    if (transferRoot !== value.transfer_root) {
+      return new Error('Targeted TNK settlement transfer root mismatch.');
+    }
+    const record = {
+      type: 'targeted_tnk_settlement',
+      ...value,
+      outputs,
+      msb_transfers: transfers,
+      settled_by: this.address,
+      settled_by_role: 'admin',
+    };
+    const recordKey = `settle/targeted/tnk/${value.epoch}`;
+    const existing = await this.get(recordKey);
+    if (existing) {
+      if (stableJson(existing) === stableJson(record)) {
+        return {
+          ok: true,
+          op: 'targetedTnkSettlement',
+          epoch: value.epoch,
+          rail: 'tnk',
+          idempotent: true,
+          msb_transfers: transfers,
+        };
+      }
+      return new Error('Targeted TNK settlement already exists for epoch.');
+    }
+    const applyState = await this.epochApplyStateRecord();
+    if (applyState.updated_epoch !== value.epoch ||
+        applyState.last_apply_hash !== value.epoch_apply_hash) {
+      return new Error('Targeted TNK settlement apply hash mismatch.');
+    }
+    for (const transfer of transfers) {
+      if ((await this.get(this.msbTransferSeenKey(transfer))) !== null) {
+        return new Error('Targeted TNK transfer was already consumed.');
+      }
+    }
+    const rate = await this.guardianRequireHistoricalTnkRate(value, value.at);
+    if (rate instanceof Error) return rate;
+    const updates = await this.targetedPayoutSettlementUpdates(
+      outputs,
+      'tnk',
+      value.epoch,
+      value.at,
+      transfers.map((entry) => entry.tx_hash)
+    );
+    if (updates instanceof Error) return updates;
+
+    const fee = await this.feeCumRecord('tnk');
+    if (fee instanceof Error) return fee;
+    const feeError = this.guardianValidateFeeRecord(fee, 'tnk');
+    if (feeError) return feeError;
+    const payableFee = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
+    if (payableFee instanceof Error) return payableFee;
+    if (this.compareAu(payableFee, value.operator_fee_au) !== 0) {
+      return new Error('Targeted TNK operator fee does not match fee state.');
+    }
+    const operatorOutputs = outputs.filter((entry) => entry.role === 'operator_fee');
+    if ((this.isZeroAu(payableFee) && operatorOutputs.length !== 0) ||
+        (this.compareAu(payableFee, ZERO_AU) > 0 &&
+          (operatorOutputs.length !== 1 || operatorOutputs[0].to !== value.operator_to))) {
+      return new Error('Targeted TNK operator output mismatch.');
+    }
+    const sweptCumAu = this.safeAddAu(fee.swept_cum_au, value.operator_fee_au);
+    if (sweptCumAu instanceof Error) return sweptCumAu;
+    const operatorIndex = outputs.findIndex((entry) => entry.role === 'operator_fee');
+    const nextFee = {
+      ...fee,
+      swept_cum_au: sweptCumAu,
+      updated_epoch: Math.max(fee.updated_epoch, value.epoch),
+      last_targeted_settlement_epoch: value.epoch,
+      last_targeted_settlement_transfer: operatorIndex >= 0
+        ? transfers[operatorIndex].tx_hash
+        : null,
+    };
+    const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'tnk');
+    if (nextFeeError) return nextFeeError;
+    for (const update of updates.liabilityUpdates) await this.put(update.key, update.value);
+    for (const earning of updates.earningUpdates) {
+      await this.put(this.earningKey(earning.provider, 'tnk'), earning);
+    }
+    for (const [index, transfer] of transfers.entries()) {
+      await this.put(this.msbTransferSeenKey(transfer), {
+        rail: 'tnk',
+        purpose: 'targeted_settlement',
+        epoch: value.epoch,
+        output_index: index,
+        transfer_root: value.transfer_root,
+        consumed_at: this.tx,
+      });
+    }
+    await this.put(this.feeCumKey('tnk'), nextFee);
+    await this.put(recordKey, record);
+    return {
+      ok: true,
+      op: 'targetedTnkSettlement',
+      epoch: value.epoch,
+      rail: 'tnk',
+      idempotent: false,
+      provider_au: value.provider_au,
+      operator_fee_au: value.operator_fee_au,
+      gross_au: value.gross_au,
+      msb_transfers: transfers,
+      transfer_root: value.transfer_root,
+    };
+  }
+
+  async targetedFiatSettlement(value) {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const normalized = this.normalizeTargetedFiatSettlementValue(value);
+    if (normalized instanceof Error) return normalized;
+    const settlementParams = await this.activeParamsAt(
+      value.at,
+      ['max_fiat_settlement_outputs']
+    );
+    if (value.outputs.length > settlementParams.max_fiat_settlement_outputs) {
+      return new Error('Targeted fiat settlement output count exceeds limit.');
+    }
+    const outputs = normalized.outputs;
+    const transfers = value.stripe_transfers.map((entry) => (
+      this.normalizeStripeTransferEvidence(
+        entry,
+        'Targeted fiat settlement Stripe evidence'
+      )
+    ));
+    const transferError = transfers.find((entry) => entry instanceof Error);
+    if (transferError) return transferError;
+    if (stableJson(transfers) !== stableJson(value.stripe_transfers)) {
+      return new Error('Targeted fiat settlement transfers must be canonical.');
+    }
+    const expectedGroup =
+      `mayhem_fiat_epoch_${value.epoch}_${value.epoch_apply_hash.slice(0, 16)}`;
+    for (const [index, output] of outputs.entries()) {
+      const transfer = transfers[index];
+      const expectedKind = output.role === 'provider'
+        ? 'stripe_transfer'
+        : 'platform_balance';
+      if (transfer.kind !== expectedKind ||
+          transfer.destination !== output.to ||
+          transfer.currency !== output.currency ||
+          transfer.amount_minor !== output.amount_minor ||
+          (expectedKind === 'stripe_transfer' &&
+            transfer.transfer_group !== expectedGroup)) {
+        return new Error('Targeted fiat transfer does not match output.');
+      }
+    }
+    const totals = this.targetedFiatSettlementTotals(outputs);
+    if (totals instanceof Error) return totals;
+    if (totals.provider_count !== value.provider_count ||
+        this.compareAu(totals.provider_au, value.provider_au) !== 0 ||
+        this.compareAu(totals.operator_fee_au, value.operator_fee_au) !== 0 ||
+        this.compareAu(totals.gross_au, value.gross_au) !== 0) {
+      return new Error('Targeted fiat settlement totals do not match outputs.');
+    }
+    const transferRoot = await this.targetedFiatSettlementTransferRoot(outputs);
+    if (transferRoot !== value.transfer_root) {
+      return new Error('Targeted fiat settlement transfer root mismatch.');
+    }
+    const record = {
+      type: 'targeted_fiat_settlement',
+      ...value,
+      outputs,
+      stripe_transfers: transfers,
+      settled_by: this.address,
+      settled_by_role: 'admin',
+    };
+    const recordKey = `settle/targeted/fiat/${value.epoch}`;
+    const existing = await this.get(recordKey);
+    if (existing) {
+      if (stableJson(existing) === stableJson(record)) {
+        return {
+          ok: true,
+          op: 'targetedFiatSettlement',
+          epoch: value.epoch,
+          rail: 'fiat',
+          processor: 'stripe',
+          idempotent: true,
+          stripe_transfers: transfers,
+        };
+      }
+      return new Error('Targeted fiat settlement already exists for epoch.');
+    }
+    const applyState = await this.epochApplyStateRecord();
+    if (applyState.updated_epoch !== value.epoch ||
+        applyState.last_apply_hash !== value.epoch_apply_hash) {
+      return new Error('Targeted fiat settlement apply hash mismatch.');
+    }
+    for (const transfer of transfers) {
+      const seenKey = this.stripeTransferSeenKey(transfer);
+      if (seenKey && (await this.get(seenKey)) !== null) {
+        return new Error('Targeted Stripe transfer was already consumed.');
+      }
+    }
+    const updates = await this.targetedPayoutSettlementUpdates(
+      outputs,
+      'fiat',
+      value.epoch,
+      value.at,
+      transfers.map((entry) => entry.ref)
+    );
+    if (updates instanceof Error) return updates;
+
+    const fee = await this.feeCumRecord('fiat');
+    if (fee instanceof Error) return fee;
+    const feeError = this.guardianValidateFeeRecord(fee, 'fiat');
+    if (feeError) return feeError;
+    const payableFee = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
+    if (payableFee instanceof Error) return payableFee;
+    const transferableFee = this.fiatWholeMinorTransferAu(payableFee);
+    if (transferableFee instanceof Error) return transferableFee;
+    if (this.compareAu(transferableFee, value.operator_fee_au) !== 0) {
+      return new Error('Targeted fiat operator fee does not match fee state.');
+    }
+    const operatorOutputs = outputs.filter((entry) => entry.role === 'operator_fee');
+    if ((this.isZeroAu(transferableFee) && operatorOutputs.length !== 0) ||
+        (this.compareAu(transferableFee, ZERO_AU) > 0 &&
+          (operatorOutputs.length !== 1 || operatorOutputs[0].to !== value.operator_to))) {
+      return new Error('Targeted fiat operator output mismatch.');
+    }
+    const sweptCumAu = this.safeAddAu(fee.swept_cum_au, value.operator_fee_au);
+    if (sweptCumAu instanceof Error) return sweptCumAu;
+    const operatorIndex = outputs.findIndex((entry) => entry.role === 'operator_fee');
+    const nextFee = {
+      ...fee,
+      swept_cum_au: sweptCumAu,
+      updated_epoch: Math.max(fee.updated_epoch, value.epoch),
+      last_targeted_settlement_epoch: value.epoch,
+      last_targeted_settlement_transfer: operatorIndex >= 0
+        ? transfers[operatorIndex].ref
+        : null,
+    };
+    const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'fiat');
+    if (nextFeeError) return nextFeeError;
+    for (const update of updates.liabilityUpdates) await this.put(update.key, update.value);
+    for (const earning of updates.earningUpdates) {
+      await this.put(this.earningKey(earning.provider, 'fiat'), earning);
+    }
+    for (const [index, transfer] of transfers.entries()) {
+      const seenKey = this.stripeTransferSeenKey(transfer);
+      if (!seenKey) continue;
+      await this.put(seenKey, {
+        rail: 'fiat',
+        purpose: 'targeted_settlement',
+        epoch: value.epoch,
+        output_index: index,
+        transfer_root: value.transfer_root,
+        consumed_at: this.tx,
+      });
+    }
+    await this.put(this.feeCumKey('fiat'), nextFee);
+    await this.put(recordKey, record);
+    return {
+      ok: true,
+      op: 'targetedFiatSettlement',
+      epoch: value.epoch,
+      rail: 'fiat',
+      processor: 'stripe',
+      idempotent: false,
+      provider_au: value.provider_au,
+      operator_fee_au: value.operator_fee_au,
+      gross_au: value.gross_au,
+      stripe_transfers: transfers,
+      transfer_root: value.transfer_root,
+    };
+  }
+
+  normalizeTargetedTnkSettlementOutput(output) {
     if (!this.isSafeKeyPart(output.to)) return new Error('Invalid TNK settlement output address.');
     const au = this.normalizeAu(output.au, 'TNK settlement output amount', { allowZero: false });
     if (au instanceof Error) {
@@ -5805,7 +7659,7 @@ class MayhemContract extends Contract {
         };
   }
 
-  tnkSettlementTotals(outputs, rateTnkUsdAu) {
+  targetedTnkSettlementTotals(outputs, rateTnkUsdAu) {
     let providerAu = ZERO_AU;
     let operatorFeeAu = ZERO_AU;
     let tnkE18 = 0n;
@@ -5848,268 +7702,6 @@ class MayhemContract extends Contract {
     const denominator = rate;
     // Payout conversion rounds up so the provider is never underpaid in TNK atomic units.
     return (numerator + denominator - 1n) / denominator;
-  }
-
-  async tnkSettlementTransferRoot(outputs) {
-    return await this.opaqueHash('mayhem-tnk-settlement-transfer-root-v1', outputs);
-  }
-
-  tnkSettlementRecord(outputs, transfers) {
-    return {
-      type: 'tnk_settlement',
-      op: 'tnk_settlement',
-      idempotency_key: `mayhem:tnk:settle:v1:${this.value.network}:mayhem:${this.value.epoch}:${this.value.epoch_apply_hash}`,
-      epoch: this.value.epoch,
-      at: this.value.at,
-      rail: 'tnk',
-      network: this.value.network,
-      treasury_from: this.value.treasury_from,
-      operator_to: this.value.operator_to,
-      epoch_apply_hash: this.value.epoch_apply_hash,
-      rate_tnk_usd_au: this.value.rate_tnk_usd_au,
-      rate_source: this.value.rate_source,
-      rate_ts: this.value.rate_ts,
-      msb_transfers: transfers,
-      transfer_root: this.value.transfer_root,
-      provider_count: this.value.provider_count,
-      provider_au: this.value.provider_au,
-      operator_fee_au: this.value.operator_fee_au,
-      gross_au: this.value.gross_au,
-      tnk_e18: this.value.tnk_e18,
-      outputs,
-    };
-  }
-
-  async fiatSettlement() {
-    const adminError = await this.requireAdmin();
-    if (adminError) return adminError;
-    const shapeError = this.validateFiatSettlementValue(this.value);
-    if (shapeError) return shapeError;
-    const settlementParams = await this.activeParamsAt(this.value.at, ['max_fiat_settlement_outputs']);
-    if (this.value.outputs.length > settlementParams.max_fiat_settlement_outputs) {
-      return new Error('Fiat settlement output count exceeds max_fiat_settlement_outputs.');
-    }
-
-    const outputs = this.normalizeFiatSettlementOutputs(this.value.outputs);
-    if (outputs instanceof Error) return outputs;
-    if (stableJson(outputs) !== stableJson(this.value.outputs)) {
-      return new Error('Fiat settlement outputs must be canonical.');
-    }
-    const transfers = this.value.stripe_transfers.map((entry) => (
-      this.normalizeStripeTransferEvidence(entry, 'Fiat settlement Stripe evidence')
-    ));
-    const transferError = transfers.find((entry) => entry instanceof Error);
-    if (transferError) return transferError;
-    if (stableJson(transfers) !== stableJson(this.value.stripe_transfers)) {
-      return new Error('Fiat settlement Stripe evidence must be canonical.');
-    }
-    const expectedTransferGroup = `mayhem_fiat_epoch_${this.value.epoch}_${this.value.epoch_apply_hash.slice(0, 16)}`;
-    for (const [index, output] of outputs.entries()) {
-      const transfer = transfers[index];
-      const expectedKind = output.role === 'provider' ? 'stripe_transfer' : 'platform_balance';
-      if (
-        transfer.kind !== expectedKind ||
-        transfer.destination !== output.to ||
-        transfer.currency !== output.currency ||
-        transfer.amount_minor !== output.amount_minor ||
-        (expectedKind === 'stripe_transfer' && transfer.transfer_group !== expectedTransferGroup)
-      ) {
-        return new Error('Fiat settlement Stripe evidence does not match output.');
-      }
-    }
-    const totals = this.fiatSettlementTotals(outputs);
-    if (totals instanceof Error) return totals;
-    if (totals.provider_count !== this.value.provider_count) {
-      return new Error('Fiat settlement provider count does not match outputs.');
-    }
-    if (this.compareAu(totals.provider_au, this.value.provider_au) !== 0) {
-      return new Error('Fiat settlement provider amount does not match outputs.');
-    }
-    if (this.compareAu(totals.operator_fee_au, this.value.operator_fee_au) !== 0) {
-      return new Error('Fiat settlement operator fee does not match outputs.');
-    }
-    if (this.compareAu(totals.gross_au, this.value.gross_au) !== 0) {
-      return new Error('Fiat settlement gross amount does not match outputs.');
-    }
-
-    const transferRoot = await this.fiatSettlementTransferRoot(outputs);
-    if (transferRoot !== this.value.transfer_root) {
-      return new Error('Fiat settlement transfer root does not match outputs.');
-    }
-
-    const record = this.fiatSettlementRecord(outputs, transfers);
-    const key = `settle/fiat/${this.value.epoch}`;
-    const existing = await this.get(key);
-    if (existing) {
-      if (stableJson(existing) === stableJson(record)) {
-        return {
-          ok: true,
-          op: 'fiatSettlement',
-          epoch: this.value.epoch,
-          rail: 'fiat',
-          idempotent: true,
-          stripe_transfers: transfers,
-        };
-      }
-      return new Error('Fiat settlement already exists for epoch.');
-    }
-
-    const applyState = await this.epochApplyStateRecord();
-    if (
-      applyState.updated_epoch !== this.value.epoch ||
-      applyState.last_apply_hash !== this.value.epoch_apply_hash
-    ) {
-      return new Error('Fiat settlement epoch apply hash does not match current state.');
-    }
-
-    for (const transfer of transfers) {
-      const seenKey = this.stripeTransferSeenKey(transfer);
-      if (seenKey && (await this.get(seenKey)) !== null) {
-        return new Error('Stripe transfer was already consumed by Mayhem.');
-      }
-    }
-
-    const params = await this.activeParamsAt(this.value.at, [
-      'holdback_epochs',
-      'challenge_epochs',
-      'canary_probe_holdback_bps',
-      'canary_probe_release_min_passes',
-    ]);
-    const earningUpdates = [];
-    for (const [outputIndex, output] of outputs.entries()) {
-      if (output.role !== 'provider') continue;
-      const stripeRef = transfers[outputIndex].ref;
-      const provider = await this.get(`prov/${output.provider}`);
-      if (!provider) return new Error('Provider not found.');
-      const payout = provider.payouts?.stripe;
-      const payoutError = await this.requireAdminSetPayoutTarget(provider, 'stripe');
-      if (payoutError) return payoutError;
-      if (payout.method !== 'stripe') {
-        return new Error('Fiat settlement provider payout target must be Stripe.');
-      }
-      if (payout.addr !== output.to) {
-        return new Error('Fiat settlement provider payout target mismatch.');
-      }
-      if (payout.currency !== output.currency) {
-        return new Error('Fiat settlement provider payout currency mismatch.');
-      }
-
-      const earning = await this.earningRecord(output.provider, 'fiat');
-      if (earning instanceof Error) return earning;
-      const earningError = this.guardianValidateEarningRecord(earning, output.provider, 'fiat');
-      if (earningError) return earningError;
-      const probeGate = await this.probeGateForEarning(output.provider, earning, params);
-      if (probeGate instanceof Error) return probeGate;
-      const lockedEarningEpochs = this.providerLockedEarningEpochs(provider, params);
-      if (lockedEarningEpochs instanceof Error) return lockedEarningEpochs;
-      const disputeGate = await this.providerHasOpenDispute(output.provider);
-      if (disputeGate instanceof Error) return disputeGate;
-      const refreshed = this.refreshEarningHoldback(
-        earning,
-        this.value.epoch,
-        lockedEarningEpochs,
-        probeGate,
-        disputeGate
-      );
-      if (refreshed instanceof Error) return refreshed;
-      const payable = this.safeSubAu(
-        this.safeSubAu(refreshed.total_au, refreshed.held_au),
-        refreshed.paid_cum_au
-      );
-      if (payable instanceof Error) return payable;
-      const transferable = this.fiatWholeMinorTransferAu(payable);
-      if (transferable instanceof Error) return transferable;
-      if (this.isZeroAu(transferable)) return new Error('Fiat settlement provider has no whole-cent payable earnings.');
-      if (this.compareAu(output.au, transferable) !== 0) {
-        return new Error('Fiat settlement provider amount does not match payable whole-cent earnings.');
-      }
-      const paidCumAu = this.safeAddAu(refreshed.paid_cum_au, output.au);
-      if (paidCumAu instanceof Error) return paidCumAu;
-      const nextEarning = {
-        ...refreshed,
-        paid_cum_au: paidCumAu,
-        updated_epoch: Math.max(refreshed.updated_epoch, this.value.epoch),
-        last_settlement_epoch: this.value.epoch,
-        last_settlement_stripe_ref: stripeRef,
-      };
-      const nextError = this.guardianValidateEarningRecord(nextEarning, output.provider, 'fiat');
-      if (nextError) return nextError;
-      earningUpdates.push(nextEarning);
-    }
-
-    const fee = await this.feeCumRecord('fiat');
-    if (fee instanceof Error) return fee;
-    const feeError = this.guardianValidateFeeRecord(fee, 'fiat');
-    if (feeError) return feeError;
-    const payableFee = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
-    if (payableFee instanceof Error) return payableFee;
-    const transferableFee = this.fiatWholeMinorTransferAu(payableFee);
-    if (transferableFee instanceof Error) return transferableFee;
-    if (this.compareAu(transferableFee, this.value.operator_fee_au) !== 0) {
-      return new Error('Fiat settlement operator fee does not match fee state.');
-    }
-    const operatorOutputs = outputs.filter((entry) => entry.role === 'operator_fee');
-    if (this.isZeroAu(transferableFee) && operatorOutputs.length !== 0) {
-      return new Error('Fiat settlement has unexpected operator fee output.');
-    }
-    if (this.compareAu(transferableFee, ZERO_AU) > 0) {
-      if (operatorOutputs.length !== 1) return new Error('Fiat settlement missing operator fee output.');
-      if (operatorOutputs[0].to !== this.value.operator_to) {
-        return new Error('Fiat settlement operator target mismatch.');
-      }
-    }
-    const operatorOutputIndex = outputs.findIndex((entry) => entry.role === 'operator_fee');
-    const sweptCumAu = this.safeAddAu(fee.swept_cum_au, this.value.operator_fee_au);
-    if (sweptCumAu instanceof Error) return sweptCumAu;
-    const nextFee = {
-      ...fee,
-      swept_cum_au: sweptCumAu,
-      updated_epoch: Math.max(fee.updated_epoch, this.value.epoch),
-      last_settlement_epoch: this.value.epoch,
-      last_settlement_stripe_ref: operatorOutputIndex >= 0
-        ? transfers[operatorOutputIndex].ref
-        : (fee.last_settlement_stripe_ref ?? null),
-    };
-    const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'fiat');
-    if (nextFeeError) return nextFeeError;
-
-    for (const earning of earningUpdates) {
-      await this.put(this.earningKey(earning.provider, 'fiat'), earning);
-    }
-    for (const [index, transfer] of transfers.entries()) {
-      const seenKey = this.stripeTransferSeenKey(transfer);
-      if (!seenKey) continue;
-      await this.put(seenKey, {
-        rail: 'fiat',
-        purpose: 'settlement',
-        epoch: this.value.epoch,
-        output_index: index,
-        transfer_root: this.value.transfer_root,
-        consumed_at: this.tx,
-      });
-    }
-    await this.put(this.feeCumKey('fiat'), nextFee);
-    await this.put(key, record);
-    console.log('mayhem fiatSettlement', {
-      epoch: this.value.epoch,
-      provider_au: this.value.provider_au,
-      operator_fee_au: this.value.operator_fee_au,
-      gross_au: this.value.gross_au,
-      stripe_refs: transfers.map((entry) => entry.ref),
-    });
-    return {
-      ok: true,
-      op: 'fiatSettlement',
-      epoch: this.value.epoch,
-      rail: 'fiat',
-      processor: 'stripe',
-      idempotent: false,
-      provider_au: this.value.provider_au,
-      operator_fee_au: this.value.operator_fee_au,
-      gross_au: this.value.gross_au,
-      stripe_transfers: transfers,
-      transfer_root: this.value.transfer_root,
-    };
   }
 
   async fiatDustSweep() {
@@ -6262,114 +7854,7 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  validateFiatSettlementValue(value) {
-    const shapeError = this.validateExactObjectKeys(
-      value,
-      [
-        'op',
-        'epoch',
-        'at',
-        'rail',
-        'processor',
-        'operator_to',
-        'epoch_apply_hash',
-        'stripe_transfers',
-        'transfer_root',
-        'provider_count',
-        'provider_au',
-        'operator_fee_au',
-        'gross_au',
-        'outputs',
-      ],
-      'Fiat settlement'
-    );
-    if (shapeError) return shapeError;
-    if (value.op !== 'fiat_settlement') return new Error('Invalid fiat settlement op.');
-    if (value.rail !== 'fiat') return new Error('Fiat settlement rail must be fiat.');
-    if (value.processor !== 'stripe') return new Error('Fiat settlement processor must be stripe.');
-    if (!Number.isSafeInteger(value.epoch) || value.epoch < 1) return new Error('Invalid fiat settlement epoch.');
-    if (!Number.isSafeInteger(value.at) || value.at < 0) return new Error('Invalid fiat settlement timestamp.');
-    if (!this.isSafeKeyPart(value.operator_to)) return new Error('Invalid fiat operator target.');
-    if (!this.isHexBytes(value.epoch_apply_hash, 32)) return new Error('Invalid fiat settlement apply hash.');
-    if (!Array.isArray(value.stripe_transfers) || value.stripe_transfers.length === 0) {
-      return new Error('Fiat settlement requires one confirmed Stripe evidence record per output.');
-    }
-    const seenRefs = new Set();
-    for (const entry of value.stripe_transfers) {
-      const transfer = this.normalizeStripeTransferEvidence(
-        entry,
-        'Fiat settlement Stripe evidence'
-      );
-      if (transfer instanceof Error) return transfer;
-      if (seenRefs.has(transfer.ref)) return new Error('Duplicate fiat settlement Stripe reference.');
-      seenRefs.add(transfer.ref);
-    }
-    if (!this.isHexBytes(value.transfer_root, 32)) return new Error('Invalid fiat settlement transfer root.');
-    if (!Number.isSafeInteger(value.provider_count) || value.provider_count < 0) {
-      return new Error('Invalid fiat settlement total.');
-    }
-    for (const key of ['provider_au', 'operator_fee_au', 'gross_au']) {
-      const amount = this.normalizeAu(value[key], `Fiat settlement ${key}`, { allowZero: key !== 'gross_au' });
-      if (amount instanceof Error) return new Error('Invalid fiat settlement total.');
-    }
-    const gross = this.safeAddAu(value.provider_au, value.operator_fee_au);
-    if (gross instanceof Error) return gross;
-    if (this.compareAu(gross, value.gross_au) !== 0) return new Error('Fiat settlement gross amount does not balance.');
-    if (!Array.isArray(value.outputs) || value.outputs.length === 0) {
-      return new Error('Fiat settlement outputs are required.');
-    }
-    if (value.stripe_transfers.length !== value.outputs.length) {
-      return new Error('Fiat settlement Stripe evidence count must match outputs.');
-    }
-    return null;
-  }
-
-  normalizeFiatSettlementOutputs(outputs) {
-    if (!Array.isArray(outputs) || outputs.length === 0) {
-      return new Error('Fiat settlement outputs are required.');
-    }
-    const providers = new Set();
-    const providerOutputs = [];
-    const operatorOutputs = [];
-    for (const output of outputs) {
-      if (!output || typeof output !== 'object' || Array.isArray(output)) {
-        return new Error('Invalid fiat settlement output.');
-      }
-      if (output.role === 'provider') {
-        const shapeError = this.validateExactObjectKeys(
-          output,
-          ['role', 'provider', 'to', 'currency', 'amount_minor', 'au'],
-          'Fiat settlement provider output'
-        );
-        if (shapeError) return shapeError;
-        if (!this.isHexBytes(output.provider, 32) || output.provider !== output.provider.toLowerCase()) {
-          return new Error('Invalid fiat settlement provider id.');
-        }
-        if (providers.has(output.provider)) return new Error('Duplicate fiat settlement provider output.');
-        providers.add(output.provider);
-        const normalized = this.normalizeFiatSettlementOutput(output);
-        if (normalized instanceof Error) return normalized;
-        providerOutputs.push(normalized);
-      } else if (output.role === 'operator_fee') {
-        const shapeError = this.validateExactObjectKeys(
-          output,
-          ['role', 'to', 'currency', 'amount_minor', 'au'],
-          'Fiat settlement operator output'
-        );
-        if (shapeError) return shapeError;
-        if (operatorOutputs.length > 0) return new Error('Duplicate fiat settlement operator output.');
-        const normalized = this.normalizeFiatSettlementOutput(output);
-        if (normalized instanceof Error) return normalized;
-        operatorOutputs.push(normalized);
-      } else {
-        return new Error('Invalid fiat settlement output role.');
-      }
-    }
-    providerOutputs.sort((left, right) => compareCodepoint(left.provider, right.provider));
-    return [...providerOutputs, ...operatorOutputs];
-  }
-
-  normalizeFiatSettlementOutput(output) {
+  normalizeTargetedFiatSettlementOutput(output) {
     if (!this.isSafeKeyPart(output.to)) return new Error('Invalid fiat settlement output target.');
     const currency = this.normalizeFiatCurrency(output.currency);
     if (currency instanceof Error) return currency;
@@ -6400,7 +7885,7 @@ class MayhemContract extends Contract {
         };
   }
 
-  fiatSettlementTotals(outputs) {
+  targetedFiatSettlementTotals(outputs) {
     let providerAu = ZERO_AU;
     let operatorFeeAu = ZERO_AU;
     let providerCount = 0;
@@ -6443,31 +7928,6 @@ class MayhemContract extends Contract {
     const parsed = this.parseAu(au, 'Fiat payable amount');
     if (parsed instanceof Error) return parsed;
     return this.canonicalAu((parsed / FIAT_MINOR_AU) * FIAT_MINOR_AU);
-  }
-
-  async fiatSettlementTransferRoot(outputs) {
-    return await this.opaqueHash('mayhem-fiat-settlement-transfer-root-v1', outputs);
-  }
-
-  fiatSettlementRecord(outputs, transfers) {
-    return {
-      type: 'fiat_settlement',
-      op: 'fiat_settlement',
-      idempotency_key: `mayhem:fiat:settle:v1:stripe:mayhem:${this.value.epoch}:${this.value.epoch_apply_hash}`,
-      epoch: this.value.epoch,
-      at: this.value.at,
-      rail: 'fiat',
-      processor: 'stripe',
-      operator_to: this.value.operator_to,
-      epoch_apply_hash: this.value.epoch_apply_hash,
-      stripe_transfers: transfers,
-      transfer_root: this.value.transfer_root,
-      provider_count: this.value.provider_count,
-      provider_au: this.value.provider_au,
-      operator_fee_au: this.value.operator_fee_au,
-      gross_au: this.value.gross_au,
-      outputs,
-    };
   }
 
   async depositTnk() {
@@ -7486,27 +8946,6 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  async requireAdminSetPayoutTarget(provider, method) {
-    const payout = provider?.payouts?.[method];
-    if (!payout || typeof payout !== 'object') {
-      return new Error('Provider payout target is not set.');
-    }
-    if (!payout.set_by || typeof payout.set_by !== 'string') {
-      return new Error('Provider payout target must be admin-set.');
-    }
-    const admin = await this.get('admin');
-    if (admin === null) {
-      return new Error('Provider payout target requires a current admin key.');
-    }
-    if (payout.set_by !== admin) {
-      return new Error('Provider payout target was not set by the current admin.');
-    }
-    if (payout.set_by_role !== 'admin') {
-      return new Error('Provider payout target must be admin-set.');
-    }
-    return null;
-  }
-
   async requireCurrentAdminPrice(enclaveId, ctxBracket = null) {
     const enclave = await this.get(`enclave/${enclaveId}`);
     const resolvedCtxBracket =
@@ -8110,6 +9549,313 @@ class MayhemContract extends Contract {
 
   async providerLifecycleFeatureKeys(intent) {
     return [await this.providerLifecycleFeatureKey(intent)];
+  }
+
+  async providerPayoutBindingRevision(intent) {
+    const digest = await blake3(b4a.from(providerPayoutBindingMessage(intent)));
+    return b4a.toString(digest, 'hex');
+  }
+
+  async targetedSpendReservationFeatureKey(value) {
+    const normalized = await this.normalizeTargetedSpendReserveValue(value);
+    if (normalized instanceof Error) return normalized;
+    const digest = await blake3(b4a.from(stableJson({
+      domain: 'mayhem-targeted-spend-reservation-feature-v1',
+      value: targetedSpendReservationEvidence({
+        ...normalized,
+        payout_revision: value.payout_revision,
+      }),
+    })));
+    return `hold/targeted/${normalized.rail}/${normalized.user}/${normalized.epoch}/${normalized.session_id}/${b4a.toString(digest, 'hex')}`;
+  }
+
+  async providerPayoutPaymentConfigHash(payments) {
+    return await this.opaqueHash('mayhem-payout-payment-config-v1', payments);
+  }
+
+  async providerPayoutContextFeatureKey(value) {
+    const revision = await this.providerPayoutContextRevision(value);
+    return this.providerPayoutContextRecordKey(value.payment_config_version, revision);
+  }
+
+  async providerPayoutContextRevision(value) {
+    const digest = await blake3(b4a.from(stableJson({
+      domain: 'mayhem-payout-context-feature-v1',
+      value,
+    })));
+    return b4a.toString(digest, 'hex');
+  }
+
+  providerPayoutContextRecordKey(paymentConfigVersion, revision) {
+    return `payout/context/${paymentConfigVersion}/${revision}`;
+  }
+
+  payoutParameterKey(key) {
+    return `payout/params/${key}`;
+  }
+
+  async payoutParameterFeatureKey(value) {
+    const digest = await blake3(b4a.from(stableJson({
+      domain: 'mayhem-payout-parameter-feature-v1',
+      value,
+    })));
+    return `payout/params/${value.key}/${b4a.toString(digest, 'hex')}`;
+  }
+
+  async payoutParameterRecord(key) {
+    const definition = PAYOUT_PARAM_DEFINITIONS[key];
+    if (!definition) return new Error('Unknown payout parameter.');
+    return (await this.get(this.payoutParameterKey(key))) ?? {
+      key,
+      current: {
+        key,
+        value: definition.default,
+        effective_epoch: 0,
+        scheduled_at: null,
+        scheduled_by: null,
+        scheduled_by_role: 'default',
+      },
+      pending: null,
+    };
+  }
+
+  async activePayoutParamsAtEpoch(epoch) {
+    if (!Number.isSafeInteger(epoch) || epoch < 0) {
+      return new Error('Invalid payout parameter epoch.');
+    }
+    const values = {};
+    for (const key of Object.keys(PAYOUT_PARAM_DEFINITIONS)) {
+      const schedule = await this.payoutParameterRecord(key);
+      if (schedule instanceof Error) return schedule;
+      const active = schedule.pending && schedule.pending.effective_epoch <= epoch
+        ? schedule.pending
+        : schedule.current;
+      values[key] = active.value;
+    }
+    return values;
+  }
+
+  providerPayoutBindingFeatureKey(rail, provider, revision) {
+    return `payout/binding/${rail}/${provider}/${revision}`;
+  }
+
+  providerPayoutBindingPointerKey(provider, rail) {
+    return `payout/current/${rail}/${provider}`;
+  }
+
+  providerPayoutBindingNonceKey(provider, nonce) {
+    return `payout/nonce/${provider}/${nonce}`;
+  }
+
+  providerPayoutLiabilityKey(provider, rail, revision) {
+    return `payout/liability/${rail}/${provider}/${revision}`;
+  }
+
+  providerStripePayoutVerificationTargetKey(provider, target) {
+    return `payout/stripe-verified/target/${provider}/${target}`;
+  }
+
+  async providerStripePayoutVerificationForTarget(provider, target) {
+    const pointer = await this.get(
+      this.providerStripePayoutVerificationTargetKey(provider, target)
+    );
+    const verification = pointer?.record_key
+      ? await this.get(pointer.record_key)
+      : null;
+    if (!verification ||
+        pointer.provider !== provider ||
+        pointer.target !== target ||
+        pointer.revision !== verification.revision ||
+        pointer.processor_revision !== verification.processor_revision ||
+        verification.type !== 'stripe_payout_verification' ||
+        verification.provider !== provider ||
+        verification.target !== target) {
+      return null;
+    }
+    return verification;
+  }
+
+  providerPayoutEpochSnapshotKey(epoch, page, provider, rail) {
+    return `payout/epoch/${epoch}/${page}/${rail}/${provider}`;
+  }
+
+  async targetedEpochFeatureKey(value) {
+    const normalized = await this.normalizeTargetedEpochFeatureValue(value);
+    if (normalized instanceof Error) return normalized;
+    const digest = await blake3(b4a.from(stableJson({
+      domain: 'mayhem-targeted-epoch-feature-v1',
+      value,
+    })));
+    return `epoch/targeted/${value.epoch}/${b4a.toString(digest, 'hex')}`;
+  }
+
+  async providerPayoutBindingContext(intent) {
+    const context = {
+      network: intent.network,
+      admin: intent.admin,
+      bootstrap: intent.bootstrap,
+      context_revision: intent.context_revision,
+      payment_config_version: intent.payment_config_version,
+    };
+    if (!this.isSafeKeyPart(context.network) ||
+        !this.isHexBytes(context.admin, 32) ||
+        !this.isHexBytes(context.bootstrap, 32) ||
+        !this.isHexBytes(context.context_revision, 32) ||
+        !Number.isSafeInteger(context.payment_config_version) ||
+        context.payment_config_version < 1) {
+      return new Error('Invalid provider payout binding canonical context.');
+    }
+    return context;
+  }
+
+  async providerPayoutBindingForEpoch(
+    provider,
+    rail,
+    revision,
+    epoch,
+    { requireCurrentReadiness = false } = {}
+  ) {
+    if (!PROVIDER_PAYOUT_BINDING_RAILS.has(rail)) {
+      return new Error('Targeted payout rail is not supported.');
+    }
+    if (!this.isHexBytes(provider, 32) ||
+        !this.isHexBytes(revision, 32) ||
+        !Number.isSafeInteger(epoch) ||
+        epoch < 1) {
+      return new Error('Invalid targeted payout binding reference.');
+    }
+    const binding = await this.get(
+      this.providerPayoutBindingFeatureKey(rail, provider, revision)
+    );
+    if (!binding || binding.verified !== true ||
+        binding.provider !== provider ||
+        binding.rail !== rail ||
+        binding.revision !== revision) {
+      return new Error('Active verified provider payout binding required.');
+    }
+    if (binding.activation_epoch > epoch) {
+      return new Error('Provider payout binding is not active for targeted epoch.');
+    }
+    const pointer = await this.get(this.providerPayoutBindingPointerKey(provider, rail));
+    if (!pointer) return new Error('Provider payout binding pointer required.');
+    const activeRevision = pointer.pending_revision !== null &&
+      pointer.pending_activation_epoch <= epoch
+      ? pointer.pending_revision
+      : pointer.current_revision;
+    if (activeRevision !== revision) {
+      return new Error('Provider payout binding revision is not active for targeted epoch.');
+    }
+    if (requireCurrentReadiness && rail === 'fiat') {
+      const verification = await this.providerStripePayoutVerificationForTarget(
+        provider,
+        binding.target
+      );
+      if (!verification ||
+          verification.ready !== true ||
+          verification.target !== binding.target ||
+          verification.processor_revision !== binding.stripe_processor_revision) {
+        return new Error('Provider Stripe payout binding is not currently ready.');
+      }
+    }
+    return binding;
+  }
+
+  async validateTargetedEpochReservationBindings(value, earnings) {
+    const debitTotals = new Map();
+    for (const debit of value.debits) {
+      const rail = this.normalizeLedgerRail(debit.rail, 'targeted epoch debit rail');
+      if (rail instanceof Error) return rail;
+      const key = stableJson([rail, debit.user]);
+      const next = this.safeAddAu(debitTotals.get(key) ?? ZERO_AU, debit.au);
+      if (next instanceof Error) return next;
+      debitTotals.set(key, next);
+    }
+    const earningTotals = new Map(
+      earnings.map((earning) => [
+        stableJson([earning.rail, earning.provider, earning.payout_revision]),
+        earning.gross_au,
+      ])
+    );
+    const allocatedDebits = new Map();
+    const allocatedEarnings = new Map();
+    const allocatedHolds = new Map();
+    const holds = new Map();
+    const sessions = new Set();
+    for (const allocation of value.allocations) {
+      if (sessions.has(allocation.session_id)) {
+        return new Error('Targeted epoch session allocation is duplicated.');
+      }
+      sessions.add(allocation.session_id);
+      const holdIdentity = stableJson([allocation.rail, allocation.user]);
+      let hold = holds.get(holdIdentity);
+      if (!hold) {
+        hold = await this.normalizeSpendHoldRecord(
+          (
+            await this.get(
+              this.spendHoldKey(allocation.user, allocation.rail, value.epoch)
+            )
+          ) ?? null,
+          allocation.user,
+          allocation.rail,
+          value.epoch
+        );
+        if (hold instanceof Error) return hold;
+        holds.set(holdIdentity, hold);
+      }
+      const session = hold.sessions.find(
+        (entry) => entry.session_id === allocation.session_id
+      );
+      if (!session ||
+          session.provider !== allocation.provider ||
+          session.payout_revision !== allocation.payout_revision) {
+        return new Error('Targeted epoch allocation does not match its reserved session.');
+      }
+      if (this.compareAu(allocation.au, session.max_spend_au) > 0) {
+        return new Error('Targeted epoch allocation exceeds its session reservation.');
+      }
+      const debitKey = stableJson([allocation.rail, allocation.user]);
+      const nextDebit = this.safeAddAu(
+        allocatedDebits.get(debitKey) ?? ZERO_AU,
+        allocation.au
+      );
+      if (nextDebit instanceof Error) return nextDebit;
+      allocatedDebits.set(debitKey, nextDebit);
+      allocatedHolds.set(holdIdentity, nextDebit);
+      const earningKey = stableJson([
+        allocation.rail,
+        allocation.provider,
+        allocation.payout_revision,
+      ]);
+      const nextEarning = this.safeAddAu(
+        allocatedEarnings.get(earningKey) ?? ZERO_AU,
+        allocation.au
+      );
+      if (nextEarning instanceof Error) return nextEarning;
+      allocatedEarnings.set(earningKey, nextEarning);
+    }
+    for (const [key, total] of debitTotals) {
+      if (allocatedDebits.get(key) !== total) {
+        return new Error('Targeted epoch debit does not equal session allocations.');
+      }
+    }
+    if (allocatedDebits.size !== debitTotals.size) {
+      return new Error('Targeted epoch allocation has no matching debit.');
+    }
+    for (const [key, total] of earningTotals) {
+      if (allocatedEarnings.get(key) !== total) {
+        return new Error('Targeted epoch earning does not equal session allocations.');
+      }
+    }
+    if (allocatedEarnings.size !== earningTotals.size) {
+      return new Error('Targeted epoch allocation has no matching earning.');
+    }
+    for (const [key, total] of allocatedHolds) {
+      const hold = holds.get(key);
+      if (!hold || this.compareAu(total, hold.reserved_au) > 0) {
+        return new Error('Targeted epoch allocations exceed reserved user credit.');
+      }
+    }
+    return null;
   }
 
   async spendReservationFeatureKey(value) {
@@ -9771,6 +11517,175 @@ class MayhemContract extends Contract {
     };
   }
 
+  async normalizeTargetedSpendReserveValue(value) {
+    const reserveFields = [
+      'op',
+      'payout_revision',
+      'contract_version',
+      'session_id',
+      'epoch',
+      'at',
+      'rail',
+      'user',
+      'provider',
+      'enclave_id',
+      'price_ver',
+      'rules_ver',
+      'served_ctx',
+      'required_modalities',
+      'ctx_bracket',
+      'ctx_bracket_table_ver',
+      'max_spend_au',
+      'voucher',
+      'provider_sig',
+    ];
+    if (hasOwn(value, 'required_specialities')) reserveFields.push('required_specialities');
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      reserveFields,
+      'spend reservation feature'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'spend_reserve_targeted') return new Error('Invalid targeted spend reservation op.');
+    if (!this.isHexBytes(value.payout_revision, 32) ||
+        value.payout_revision !== value.payout_revision.toLowerCase()) {
+      return new Error('Invalid targeted spend reservation payout revision.');
+    }
+    if (value.contract_version !== CONTRACT_VERSION) return new Error('Invalid spend reservation contract version.');
+    if (!this.isHexBytes(value.session_id, 32)) return new Error('Invalid spend reservation session id.');
+    if (!Number.isSafeInteger(value.epoch) || value.epoch < 1) return new Error('Invalid spend reservation epoch.');
+    if (!Number.isSafeInteger(value.at) || value.at < 0) return new Error('Invalid spend reservation timestamp.');
+    const rail = this.normalizeLedgerRail(value.rail, 'spend reservation rail');
+    if (rail instanceof Error) return rail;
+    if (!this.isHexBytes(value.user, 32)) return new Error('Invalid spend reservation user.');
+    if (!this.isHexBytes(value.provider, 32)) return new Error('Invalid spend reservation provider.');
+    if (!this.isHexBytes(value.enclave_id, 32)) return new Error('Invalid spend reservation enclave.');
+    if (!Number.isSafeInteger(value.price_ver) || value.price_ver < 1) {
+      return new Error('Invalid spend reservation price version.');
+    }
+    if (!Number.isSafeInteger(value.rules_ver) || value.rules_ver < 1) {
+      return new Error('Invalid spend reservation rules version.');
+    }
+    if (!Number.isSafeInteger(value.served_ctx) || value.served_ctx < 0) {
+      return new Error('Invalid spend reservation served context.');
+    }
+    const modalityError = this.validateModalitySet(
+      value.required_modalities,
+      'spend reservation required_modalities'
+    );
+    if (modalityError) return modalityError;
+    const requiredSpecialities = value.required_specialities ?? {};
+    const specialitiesError = this.validateSpecialitySelection(
+      requiredSpecialities,
+      'spend reservation required_specialities'
+    );
+    if (specialitiesError) return specialitiesError;
+    const normalizedSpecialities = Object.fromEntries(
+      Object.entries(requiredSpecialities).sort(([left], [right]) => compareCodepoint(left, right))
+    );
+    const activeTable = value.ctx_bracket_table_ver === null || value.ctx_bracket_table_ver === undefined
+      ? null
+      : await this.ctxBracketTableAt(value.at);
+    if (activeTable instanceof Error) return activeTable;
+    if (activeTable && value.ctx_bracket_table_ver !== activeTable.ver) {
+      return new Error('Spend reservation context bracket table is not active.');
+    }
+    const ctxMeta = await this.normalizeCtxBracketEvidenceForEnclave(
+      value.enclave_id.toLowerCase(),
+      value.served_ctx,
+      value.ctx_bracket,
+      value.ctx_bracket_table_ver,
+      activeTable,
+      'spend reservation'
+    );
+    if (ctxMeta instanceof Error) return ctxMeta;
+    const maxSpendAu = this.normalizeAu(value.max_spend_au, 'spend reservation max spend', { allowZero: false });
+    if (maxSpendAu instanceof Error) {
+      return new Error('Invalid spend reservation max spend.');
+    }
+    if (!this.isHexBytes(value.provider_sig, 64)) {
+      return new Error('Invalid spend reservation provider signature.');
+    }
+    const voucher = await this.normalizeSpendVoucherForReserve(value.voucher);
+    if (voucher instanceof Error) return voucher;
+    if (voucher.session_id !== value.session_id.toLowerCase()) {
+      return new Error('Spend reservation voucher session mismatch.');
+    }
+    if (voucher.rail !== rail) return new Error('Spend reservation voucher rail mismatch.');
+    if (voucher.enclave_id !== value.enclave_id.toLowerCase()) {
+      return new Error('Spend reservation voucher enclave mismatch.');
+    }
+    if (voucher.price_ver !== value.price_ver) {
+      return new Error('Spend reservation voucher price mismatch.');
+    }
+    if (voucher.body.served_ctx !== value.served_ctx) {
+      return new Error('Spend reservation voucher served context mismatch.');
+    }
+    if (stableJson(voucher.body.required_modalities) !== stableJson(value.required_modalities)) {
+      return new Error('Spend reservation voucher required modalities mismatch.');
+    }
+    if (stableJson(voucher.body.required_specialities) !== stableJson(normalizedSpecialities)) {
+      return new Error('Spend reservation voucher required specialities mismatch.');
+    }
+    if (voucher.body.ctx_bracket !== value.ctx_bracket) {
+      return new Error('Spend reservation voucher context bracket mismatch.');
+    }
+    if (voucher.body.ctx_bracket_table_ver !== value.ctx_bracket_table_ver) {
+      return new Error('Spend reservation voucher context bracket table version mismatch.');
+    }
+    if (this.compareAu(voucher.max_spend_au, maxSpendAu) !== 0) {
+      return new Error('Spend reservation voucher max spend mismatch.');
+    }
+    return {
+      op: 'spend_reserve_targeted',
+      payout_revision: value.payout_revision,
+      contract_version: CONTRACT_VERSION,
+      session_id: value.session_id.toLowerCase(),
+      epoch: value.epoch,
+      at: value.at,
+      rail,
+      user: value.user.toLowerCase(),
+      provider: value.provider.toLowerCase(),
+      enclave_id: value.enclave_id.toLowerCase(),
+      price_ver: value.price_ver,
+      locked_rate_map: voucher.body.locked_rate_map,
+      locked_per_req_au: voucher.body.locked_per_req_au,
+      locked_min_session_au: voucher.body.locked_min_session_au,
+      served_ctx: value.served_ctx,
+      required_modalities: value.required_modalities.slice(),
+      required_specialities: normalizedSpecialities,
+      ctx_bracket: ctxMeta.ctx_bracket,
+      ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
+      rules_ver: value.rules_ver,
+      max_spend_au: maxSpendAu,
+      voucher: {
+        session_id: voucher.body.session_id,
+        billing_id: voucher.body.billing_id,
+        billing_attempt: voucher.body.billing_attempt,
+        billing_prior_usage: voucher.body.billing_prior_usage,
+        billing_prior_au_owed_cum: voucher.body.billing_prior_au_owed_cum,
+        rail: voucher.body.rail,
+        enclave_id: voucher.body.enclave_id,
+        price_ver: voucher.body.price_ver,
+        locked_rate_map: voucher.body.locked_rate_map,
+        locked_per_req_au: voucher.body.locked_per_req_au,
+        locked_min_session_au: voucher.body.locked_min_session_au,
+        served_ctx: voucher.body.served_ctx,
+        required_modalities: voucher.body.required_modalities,
+        required_specialities: voucher.body.required_specialities,
+        ctx_bracket: voucher.body.ctx_bracket,
+        ctx_bracket_table_ver: voucher.body.ctx_bracket_table_ver,
+        max_spend_au: voucher.body.max_spend_au,
+        checkpoint_every: voucher.body.checkpoint_every,
+        user_sig: voucher.user_sig,
+      },
+      voucher_body: voucher.body,
+      provider_sig: value.provider_sig.toLowerCase(),
+    };
+  }
+
+
+
   async normalizeSpendReserveValue(value) {
     const reserveFields = [
       'op',
@@ -10297,6 +12212,320 @@ class MayhemContract extends Contract {
     const lastPage = this.epochApplyLastPage(value);
     if (lastPage instanceof Error) return lastPage;
     return this.validateEpochApplyShape(value);
+  }
+
+  async normalizeTargetedEpochFeatureValue(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return new Error('Targeted epoch feature value must be an object.');
+    }
+    const required = ['op', 'epoch', 'at', 'debits', 'earnings', 'allocations'];
+    const allowed = new Set([...required, 'market_usage', 'roots', 'totals', 'page', 'last_page']);
+    const unknown = Object.keys(value).filter((key) => !allowed.has(key)).sort();
+    if (unknown.length > 0) {
+      return new Error(`Targeted epoch feature does not accept fields: ${unknown.join(', ')}.`);
+    }
+    for (const key of required) {
+      if (!hasOwn(value, key)) return new Error(`Targeted epoch feature is missing ${key}.`);
+    }
+    if (value.op !== 'apply_targeted_epoch') {
+      return new Error('Invalid targeted epoch feature op.');
+    }
+    if (!Array.isArray(value.earnings)) {
+      return new Error('Targeted epoch earnings must be an array.');
+    }
+    if (!Array.isArray(value.allocations) || value.allocations.length === 0) {
+      return new Error('Targeted epoch allocations must be a non-empty array.');
+    }
+    const allocations = [];
+    const allocationSessions = new Set();
+    for (const entry of value.allocations) {
+      const entryError = this.validateExactObjectKeys(
+        entry,
+        ['session_id', 'user', 'rail', 'provider', 'payout_revision', 'au'],
+        'targeted epoch allocation'
+      );
+      if (entryError) return entryError;
+      const rail = this.normalizeLedgerRail(entry.rail, 'targeted epoch allocation rail');
+      if (rail instanceof Error) return rail;
+      if (!this.isHexBytes(entry.session_id, 32) ||
+          !this.isHexBytes(entry.user, 32) ||
+          !this.isHexBytes(entry.provider, 32) ||
+          !this.isHexBytes(entry.payout_revision, 32)) {
+        return new Error('Invalid targeted epoch allocation identity.');
+      }
+      if (allocationSessions.has(entry.session_id)) {
+        return new Error('Duplicate targeted epoch session allocation.');
+      }
+      allocationSessions.add(entry.session_id);
+      const au = this.normalizeAu(
+        entry.au,
+        'targeted epoch allocation amount',
+        { allowZero: false }
+      );
+      if (au instanceof Error) return au;
+      allocations.push({
+        session_id: entry.session_id,
+        user: entry.user,
+        rail,
+        provider: entry.provider,
+        payout_revision: entry.payout_revision,
+        au,
+      });
+    }
+    allocations.sort((left, right) => (
+      PROVIDER_PAYOUT_BINDING_RAIL_ORDER.indexOf(left.rail) -
+        PROVIDER_PAYOUT_BINDING_RAIL_ORDER.indexOf(right.rail) ||
+      compareCodepoint(left.user, right.user) ||
+      compareCodepoint(left.session_id, right.session_id)
+    ));
+    if (stableJson(allocations) !== stableJson(value.allocations)) {
+      return new Error('Targeted epoch allocations must be canonical.');
+    }
+    const aggregated = new Map();
+    const providerRails = new Map();
+    for (const entry of value.earnings) {
+      const entryError = this.validateExactObjectKeys(
+        entry,
+        ['rail', 'provider', 'gross_au', 'payout_revision'],
+        'targeted epoch earning'
+      );
+      if (entryError) return entryError;
+      const rail = this.normalizeLedgerRail(entry.rail, 'targeted epoch earning rail');
+      if (rail instanceof Error) return rail;
+      if (!PROVIDER_PAYOUT_BINDING_RAILS.has(rail)) {
+        return new Error('Targeted epoch earning rail has no payout binding path.');
+      }
+      if (!this.isHexBytes(entry.provider, 32) ||
+          entry.provider !== entry.provider.toLowerCase()) {
+        return new Error('Invalid targeted epoch earning provider.');
+      }
+      if (!this.isHexBytes(entry.payout_revision, 32) ||
+          entry.payout_revision !== entry.payout_revision.toLowerCase()) {
+        return new Error('Invalid targeted epoch payout revision.');
+      }
+      const grossAu = this.normalizeAu(
+        entry.gross_au,
+        'targeted epoch gross earning',
+        { allowZero: false }
+      );
+      if (grossAu instanceof Error) return grossAu;
+      const providerRailKey = stableJson([rail, entry.provider]);
+      const selected = providerRails.get(providerRailKey);
+      if (selected && selected !== entry.payout_revision) {
+        return new Error('Targeted epoch provider rail cannot substitute payout revisions.');
+      }
+      providerRails.set(providerRailKey, entry.payout_revision);
+      const key = stableJson([rail, entry.provider, entry.payout_revision]);
+      const current = aggregated.get(key) ?? {
+        rail,
+        provider: entry.provider,
+        gross_au: ZERO_AU,
+        payout_revision: entry.payout_revision,
+      };
+      const next = this.safeAddAu(current.gross_au, grossAu);
+      if (next instanceof Error) return next;
+      aggregated.set(key, { ...current, gross_au: next });
+    }
+    const targetedEarnings = Array.from(aggregated.values()).sort((left, right) => (
+      PROVIDER_PAYOUT_BINDING_RAIL_ORDER.indexOf(left.rail) -
+        PROVIDER_PAYOUT_BINDING_RAIL_ORDER.indexOf(right.rail) ||
+      compareCodepoint(left.provider, right.provider) ||
+      compareCodepoint(left.payout_revision, right.payout_revision)
+    ));
+    const {
+      allocations: _allocations,
+      op: _op,
+      earnings: _earnings,
+      ...ledgerFields
+    } = value;
+    const ledgerValue = {
+      ...ledgerFields,
+      earnings: targetedEarnings.map(({ payout_revision: _revision, ...earning }) => earning),
+    };
+    if (!Number.isSafeInteger(ledgerValue.epoch) || ledgerValue.epoch < 1) {
+      return new Error('Invalid targeted epoch.');
+    }
+    if (!Number.isSafeInteger(ledgerValue.at) || ledgerValue.at < 0) {
+      return new Error('Invalid targeted epoch timestamp.');
+    }
+    const page = this.epochApplyPage(ledgerValue);
+    if (page instanceof Error) return page;
+    const lastPage = this.epochApplyLastPage(ledgerValue);
+    if (lastPage instanceof Error) return lastPage;
+    const ledgerError = this.validateEpochApplyShape(ledgerValue);
+    if (ledgerError) return ledgerError;
+    return {
+      ledger_value: ledgerValue,
+      allocations,
+      targeted_earnings: targetedEarnings,
+      revision_bindings: targetedEarnings.map((earning) => ({
+        provider: earning.provider,
+        rail: earning.rail,
+        revision: earning.payout_revision,
+      })),
+    };
+  }
+
+  async validateProviderPayoutBindingIntent(intent, { currentState = true } = {}) {
+    const shapeError = this.validateExactObjectKeys(
+      intent,
+      [
+        'op',
+        'network',
+        'admin',
+        'bootstrap',
+        'context_revision',
+        'provider',
+        'rail',
+        'currency',
+        'chain_id',
+        'target',
+        'target_wallet',
+        'target_signature',
+        'previous_revision',
+        'payment_config_version',
+        'nonce',
+        'expires_after_epoch',
+      ],
+      'provider payout binding intent'
+    );
+    if (shapeError) return shapeError;
+    if (intent.op !== 'bind_provider_payout') {
+      return new Error('Invalid provider payout binding intent op.');
+    }
+    for (const field of ['admin', 'bootstrap', 'provider', 'nonce']) {
+      if (!this.isHexBytes(intent[field], 32) || intent[field] !== intent[field].toLowerCase()) {
+        return new Error(`Invalid provider payout binding ${field}.`);
+      }
+    }
+    if (!this.isHexBytes(intent.context_revision, 32) ||
+        intent.context_revision !== intent.context_revision.toLowerCase()) {
+      return new Error('Invalid provider payout binding context revision.');
+    }
+    if (!this.isSafeKeyPart(intent.network)) {
+      return new Error('Invalid provider payout binding network.');
+    }
+    if (!PROVIDER_PAYOUT_BINDING_RAILS.has(intent.rail)) {
+      return new Error('Invalid provider payout binding rail.');
+    }
+    if (intent.rail !== 'fiat' && intent.currency !== null) {
+      return new Error('TAP/TNK payout binding currency must be null.');
+    }
+    if (
+      intent.previous_revision !== null &&
+      (!this.isHexBytes(intent.previous_revision, 32) ||
+        intent.previous_revision !== intent.previous_revision.toLowerCase())
+    ) {
+      return new Error('Invalid previous provider payout binding revision.');
+    }
+    if (!Number.isSafeInteger(intent.payment_config_version) ||
+        intent.payment_config_version < 1) {
+      return new Error('Invalid provider payout payment config version.');
+    }
+    if (!Number.isSafeInteger(intent.expires_after_epoch) ||
+        intent.expires_after_epoch < 1) {
+      return new Error('Invalid provider payout binding expiry epoch.');
+    }
+
+    if (intent.rail === 'fiat') {
+      const currency = this.normalizeFiatCurrency(intent.currency);
+      if (currency instanceof Error ||
+          currency !== intent.currency ||
+          intent.chain_id !== null ||
+          intent.target_wallet !== null ||
+          intent.target_signature !== null ||
+          typeof intent.target !== 'string' ||
+          !/^acct_[A-Za-z0-9._-]+$/.test(intent.target)) {
+        return new Error('Invalid verified Stripe payout target.');
+      }
+    } else if (intent.rail === 'tap') {
+      if (!Number.isSafeInteger(intent.chain_id) || intent.chain_id < 1) {
+        return new Error('Invalid TAP payout binding chain id.');
+      }
+      if (!this.isEthHexBytes(intent.target, 20) ||
+          intent.target !== intent.target.toLowerCase()) {
+        return new Error('Invalid TAP payout target.');
+      }
+      if (intent.target_wallet !== null) {
+        return new Error('TAP payout binding target_wallet must be null.');
+      }
+      if (!this.isEthHexBytes(intent.target_signature, 65) ||
+          intent.target_signature !== intent.target_signature.toLowerCase()) {
+        return new Error('Invalid TAP payout target ownership signature.');
+      }
+    } else {
+      if (intent.chain_id !== null) {
+        return new Error('TNK payout binding chain_id must be null.');
+      }
+      if (!this.isSafeKeyPart(intent.target) || intent.target !== intent.target.toLowerCase()) {
+        return new Error('Invalid TNK payout target.');
+      }
+      if (!this.isHexBytes(intent.target_wallet, 32) ||
+          intent.target_wallet !== intent.target_wallet.toLowerCase()) {
+        return new Error('Invalid TNK payout target wallet.');
+      }
+      if (!this.isHexBytes(intent.target_signature, 64) ||
+          intent.target_signature !== intent.target_signature.toLowerCase()) {
+        return new Error('Invalid TNK payout target ownership signature.');
+      }
+      const address = this.msbAddressForPublicKey(intent.target_wallet, intent.network);
+      if (address instanceof Error) return address;
+      if (intent.target !== address) {
+        return new Error('TNK payout target does not match target wallet.');
+      }
+    }
+    if (!currentState) return null;
+
+    const admin = await this.get('admin');
+    if (intent.admin !== admin) {
+      return new Error('Provider payout binding admin does not match canonical admin.');
+    }
+    const payments = await this.get('payments/current');
+    if (!payments || payments.set_by !== admin || payments.set_by_role !== 'admin') {
+      return new Error('Canonical payment configuration required.');
+    }
+    if (intent.payment_config_version !== payments.ver) {
+      return new Error('Provider payout binding payment config version is stale.');
+    }
+    if (!Array.isArray(payments.rails) || !payments.rails.includes(intent.rail)) {
+      return new Error('Provider payout binding rail is not enabled.');
+    }
+    if (intent.network !== payments.tnk?.network) {
+      return new Error('Provider payout binding network is not canonical.');
+    }
+
+    if (intent.rail === 'fiat') {
+      if (!payments.fiat?.currencies?.includes(intent.currency)) {
+        return new Error('Invalid verified Stripe payout target.');
+      }
+      const verification = await this.providerStripePayoutVerificationForTarget(
+        intent.provider,
+        intent.target
+      );
+      if (!verification ||
+          verification.type !== 'stripe_payout_verification' ||
+          verification.provider !== intent.provider ||
+          verification.target !== intent.target ||
+          verification.currency !== intent.currency ||
+          verification.context_revision !== intent.context_revision ||
+          verification.payment_config_version !== intent.payment_config_version ||
+          verification.details_submitted !== true ||
+          verification.payouts_enabled !== true ||
+          verification.transfers_enabled !== true ||
+          verification.verified_by !== admin ||
+          verification.verified_by_role !== 'admin') {
+        return new Error('Current ready provider-scoped Stripe verification required.');
+      }
+      return null;
+    }
+
+    if (intent.rail === 'tap') {
+      if (intent.chain_id !== payments.tap?.chain_id) {
+        return new Error('TAP payout binding chain id is not canonical.');
+      }
+      return null;
+    }
+    return null;
   }
 
   validateDepositTnkIntent(intent) {
@@ -12890,30 +15119,30 @@ class MayhemContract extends Contract {
     return `rate/${kind}/${value.ts}/${digest}`;
   }
 
-  async tnkSettlementFeatureKey(value) {
-    const shapeError = this.validateTnkSettlementValue(value);
-    if (shapeError) return shapeError;
+  async targetedTnkSettlementFeatureKey(value) {
+    const normalized = this.normalizeTargetedTnkSettlementValue(value);
+    if (normalized instanceof Error) return normalized;
     const digest = b4a.toString(
       await blake3(b4a.from(stableJson({
-        domain: 'mayhem-tnk-settlement-feature-v1',
+        domain: 'mayhem-targeted-tnk-settlement-feature-v1',
         value,
       }))),
       'hex'
     );
-    return `settle/tnk/${value.epoch}/${digest}`;
+    return `settle/targeted/tnk/${value.epoch}/${digest}`;
   }
 
-  async fiatSettlementFeatureKey(value) {
-    const shapeError = this.validateFiatSettlementValue(value);
-    if (shapeError) return shapeError;
+  async targetedFiatSettlementFeatureKey(value) {
+    const normalized = this.normalizeTargetedFiatSettlementValue(value);
+    if (normalized instanceof Error) return normalized;
     const digest = b4a.toString(
       await blake3(b4a.from(stableJson({
-        domain: 'mayhem-fiat-settlement-feature-v1',
+        domain: 'mayhem-targeted-fiat-settlement-feature-v1',
         value,
       }))),
       'hex'
     );
-    return `settle/fiat/${value.epoch}/${digest}`;
+    return `settle/targeted/fiat/${value.epoch}/${digest}`;
   }
 
   async fiatDustSweepFeatureKey(value) {
@@ -13332,6 +15561,50 @@ class MayhemContract extends Contract {
     const verify = this.protocol?.peer?.wallet?.verify;
     if (typeof verify !== 'function') return false;
     return verify.call(this.protocol.peer.wallet, sig, providerLifecycleIntentMessage(intent), provider) === true;
+  }
+
+  verifyProviderPayoutBindingSignature(provider, intent, signature) {
+    const verify = this.protocol?.peer?.wallet?.verify;
+    if (typeof verify !== 'function') return false;
+    return verify.call(
+      this.protocol.peer.wallet,
+      signature,
+      providerPayoutBindingMessage(intent),
+      provider
+    ) === true;
+  }
+
+  verifyProviderPayoutTargetBindingSignature(intent) {
+    if (intent.rail === 'fiat') return intent.target_signature === null;
+    if (intent.rail === 'tnk') {
+      const verify = this.protocol?.peer?.wallet?.verify;
+      if (typeof verify !== 'function') return false;
+      return verify.call(
+        this.protocol.peer.wallet,
+        intent.target_signature,
+        providerPayoutTargetBindingMessage(intent),
+        intent.target_wallet
+      ) === true;
+    }
+    if (intent.rail !== 'tap') return false;
+    try {
+      const bytes = b4a.from(intent.target_signature.slice(2), 'hex');
+      let recovery = bytes[64];
+      if (recovery === 27 || recovery === 28) recovery -= 27;
+      if (recovery !== 0 && recovery !== 1) return false;
+      const signature = secp256k1.Signature
+        .fromCompact(bytes.subarray(0, 64))
+        .addRecoveryBit(recovery);
+      if (signature.hasHighS()) return false;
+      const publicKey = signature
+        .recoverPublicKey(
+          ethereumPersonalMessageHash(providerPayoutTargetBindingMessage(intent))
+        )
+        .toRawBytes(false);
+      return ethereumAddressFromPublicKey(publicKey) === intent.target;
+    } catch {
+      return false;
+    }
   }
 
   verifyDepositTnkSignature(sender, intent, sig) {

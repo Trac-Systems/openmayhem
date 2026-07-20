@@ -5,6 +5,9 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { blake3 } from '../intercom/node_modules/@tracsystems/blake3/dist/wasm/blake3.mjs';
+import { keccak256 } from '../intercom/node_modules/ethereum-cryptography/keccak.js';
+import { secp256k1 } from '../intercom/node_modules/ethereum-cryptography/secp256k1.js';
+import PeerWallet from '../intercom/node_modules/trac-wallet/index.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const defaultOut = 'config/beta/canonical-service-audit.json';
@@ -15,7 +18,7 @@ const pubkey64 = /^[0-9a-fA-F]{64}$/;
 const hex64 = /^[0-9a-fA-F]{64}$/;
 const hex40 = /^[0-9a-fA-F]{40}$/;
 const roomIdHex = /^[0-9a-fA-F]{32}$/;
-const payoutMethods = new Set(['tnk', 'tap', 'stripe']);
+const payoutRails = new Set(['fiat', 'tap', 'tnk']);
 const ed25519SpkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
 
 function usage() {
@@ -28,7 +31,7 @@ Accepted snapshot shapes:
 - sorted [key, value] arrays from tests or exported state
 - single RPC state responses: { key, value }
 - RPC prefix responses: { prefix, values: [{ key, value }] }
-- grouped exports: { admin, enclaves, rooms, serves, roomserve, providers, prices }
+- grouped service exports plus direct payments/current and payout/* records
 - direct maps: { "enclave/<id>": {...}, "room/<id>": {...}, ... }`);
 }
 
@@ -302,12 +305,135 @@ function relativePosix(filePath) {
 
 function ed25519PublicKeyFromRawHex(publicKeyHex) {
   const raw = Buffer.from(publicKeyHex, 'hex');
-  if (raw.length !== 32) throw new Error('catalog signature public_key must be a 32-byte hex Ed25519 key');
+  if (raw.length !== 32) throw new Error('public key must be a 32-byte hex Ed25519 key');
   return crypto.createPublicKey({
     key: Buffer.concat([ed25519SpkiPrefix, raw]),
     format: 'der',
     type: 'spki',
   });
+}
+
+function isLowerHex(value, chars) {
+  return typeof value === 'string'
+    && value.length === chars
+    && /^[0-9a-f]+$/.test(value);
+}
+
+function parsePayoutPointerKey(key) {
+  const parts = key.split('/');
+  if (parts.length !== 4 || parts[0] !== 'payout' || parts[1] !== 'current') {
+    return null;
+  }
+  return { rail: parts[2], provider: parts[3] };
+}
+
+function providerPayoutTargetBindingEvidence(intent) {
+  return {
+    admin: intent.admin,
+    bootstrap: intent.bootstrap,
+    chain_id: intent.chain_id,
+    context_revision: intent.context_revision,
+    currency: intent.currency,
+    expires_after_epoch: intent.expires_after_epoch,
+    network: intent.network,
+    nonce: intent.nonce,
+    payment_config_version: intent.payment_config_version,
+    previous_revision: intent.previous_revision,
+    provider: intent.provider,
+    rail: intent.rail,
+    target: intent.target,
+    target_wallet: intent.target_wallet,
+  };
+}
+
+function providerPayoutTargetBindingMessage(intent) {
+  return `mayhem-provider-payout-target-binding-v1${stableJson(
+    providerPayoutTargetBindingEvidence(intent),
+  )}`;
+}
+
+function providerPayoutBindingMessage(intent) {
+  return `mayhem-provider-payout-binding-v1${stableJson(intent)}`;
+}
+
+async function opaqueHash(domain, value) {
+  const digest = await blake3(Buffer.from(stableJson({ domain, value })));
+  return Buffer.from(digest).toString('hex');
+}
+
+function verifyEd25519(publicKeyHex, message, signatureHex) {
+  if (!isLowerHex(publicKeyHex, 64) || !isLowerHex(signatureHex, 128)) {
+    return false;
+  }
+  try {
+    return crypto.verify(
+      null,
+      Buffer.from(message),
+      ed25519PublicKeyFromRawHex(publicKeyHex),
+      Buffer.from(signatureHex, 'hex'),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function ethereumPersonalMessageHash(message) {
+  const body = Buffer.from(message, 'utf8');
+  const prefix = Buffer.from(`\x19Ethereum Signed Message:\n${body.length}`, 'utf8');
+  return keccak256(Buffer.concat([prefix, body]));
+}
+
+function verifyTapTargetSignature(intent) {
+  if (
+    typeof intent.target !== 'string'
+    || !/^0x[0-9a-f]{40}$/.test(intent.target)
+    || typeof intent.target_signature !== 'string'
+    || !/^0x[0-9a-f]{130}$/.test(intent.target_signature)
+  ) {
+    return false;
+  }
+  try {
+    const bytes = Buffer.from(intent.target_signature.slice(2), 'hex');
+    let recovery = bytes[64];
+    if (recovery === 27 || recovery === 28) recovery -= 27;
+    if (recovery !== 0 && recovery !== 1) return false;
+    const signature = secp256k1.Signature
+      .fromCompact(bytes.subarray(0, 64))
+      .addRecoveryBit(recovery);
+    if (signature.hasHighS()) return false;
+    const publicKey = signature
+      .recoverPublicKey(ethereumPersonalMessageHash(
+        providerPayoutTargetBindingMessage(intent),
+      ))
+      .toRawBytes(false);
+    const address = `0x${Buffer.from(
+      keccak256(publicKey.subarray(1)).subarray(12),
+    ).toString('hex')}`;
+    return address === intent.target;
+  } catch {
+    return false;
+  }
+}
+
+function payoutBindingIntent(binding) {
+  return {
+    op: 'bind_provider_payout',
+    network: binding.network,
+    admin: binding.admin,
+    bootstrap: binding.bootstrap,
+    context_revision: binding.context_revision,
+    provider: binding.provider,
+    rail: binding.rail,
+    currency: binding.currency,
+    chain_id: binding.chain_id,
+    target: binding.target,
+    target_wallet: binding.target_wallet,
+    target_signature: binding.target_signature,
+    previous_revision: binding.previous_revision,
+    payment_config_version: binding.payment_config_version,
+    nonce: binding.nonce,
+    expires_after_epoch: binding.expires_after_epoch,
+  };
 }
 
 async function readCatalogProof(args) {
@@ -613,6 +739,267 @@ function verifyPriceSchedule(schedule, enclaveId, enclave, admin, fail) {
   return ok;
 }
 
+async function verifyStripePayoutReadiness(records, binding, admin, fail, prefix) {
+  const pointerKey =
+    `payout/stripe-verified/target/${binding.provider}/${binding.target}`;
+  const pointer = records.get(pointerKey);
+  let ok = true;
+  if (!isRecord(pointer)) {
+    fail(`${prefix} has no account-scoped Stripe readiness pointer`);
+    return false;
+  }
+  const expectedRecordKey = `payout/stripe-verified/${binding.provider}/${pointer.revision}`;
+  if (
+    pointer.provider !== binding.provider
+    || !isLowerHex(pointer.revision, 64)
+    || pointer.record_key !== expectedRecordKey
+    || pointer.target !== binding.target
+    || pointer.currency !== binding.currency
+    || pointer.processor_revision !== binding.stripe_processor_revision
+    || pointer.ready !== true
+    || pointer.details_submitted !== true
+    || pointer.payouts_enabled !== true
+    || pointer.transfers_enabled !== true
+  ) {
+    fail(`${pointerKey} does not prove current ready Stripe ownership for ${prefix}`);
+    ok = false;
+  }
+  const verification = records.get(pointer.record_key);
+  if (
+    !isRecord(verification)
+    || verification.type !== 'stripe_payout_verification'
+    || verification.revision !== pointer.revision
+    || verification.provider !== binding.provider
+    || verification.target !== binding.target
+    || verification.currency !== binding.currency
+    || verification.processor_revision !== binding.stripe_processor_revision
+    || verification.revision !== binding.stripe_verification_revision
+    || verification.context_revision !== binding.context_revision
+    || verification.payment_config_version !== binding.payment_config_version
+    || verification.ready !== true
+    || verification.details_submitted !== true
+    || verification.payouts_enabled !== true
+    || verification.transfers_enabled !== true
+    || verification.verified_by !== admin
+    || verification.verified_by_role !== 'admin'
+  ) {
+    fail(`${prefix} has no matching admin-appended ready Stripe verification record`);
+    ok = false;
+  } else {
+    const expectedProcessorRevision = await opaqueHash(
+      'mayhem-stripe-payout-processor-evidence-v1',
+      {
+        account_id: verification.target,
+        account_type: verification.account_type,
+        country: verification.country,
+        currency: verification.currency,
+        mode: verification.mode,
+        provider: verification.provider,
+      },
+    );
+    const verificationValue = {
+      op: 'verify_stripe_payout',
+      provider: verification.provider,
+      account_id: verification.target,
+      account_type: verification.account_type,
+      country: verification.country,
+      currency: verification.currency,
+      mode: verification.mode,
+      verification_kind: verification.verification_kind,
+      source_provider: verification.source_provider,
+      processor_revision: verification.processor_revision,
+      previous_verification: verification.previous_verification,
+      details_submitted: verification.details_submitted,
+      payouts_enabled: verification.payouts_enabled,
+      transfers_enabled: verification.transfers_enabled,
+      network: verification.network,
+      admin: verification.admin,
+      bootstrap: verification.bootstrap,
+      context_revision: verification.context_revision,
+      payment_config_version: verification.payment_config_version,
+      request_nonce: verification.request_nonce,
+    };
+    const expectedVerificationRevision = await opaqueHash(
+      'mayhem-stripe-payout-verification-feature-v1',
+      verificationValue,
+    );
+    if (
+      verification.processor_revision !== expectedProcessorRevision
+      || verification.revision !== expectedVerificationRevision
+      || pointer.record_key !==
+        `payout/stripe-verified/${binding.provider}/${expectedVerificationRevision}`
+    ) {
+      fail(`${prefix} Stripe processor or readiness revision is not content-addressed`);
+      ok = false;
+    }
+  }
+  return ok;
+}
+
+async function verifyProviderPayoutBinding({
+  records,
+  key,
+  binding,
+  provider,
+  rail,
+  admin,
+  verifyContext,
+  fail,
+}) {
+  const prefix = key;
+  if (!isRecord(binding)) {
+    fail(`${prefix} payout binding is missing`);
+    return false;
+  }
+  let ok = true;
+  if (
+    binding.type !== 'provider_payout_binding'
+    || binding.provider !== provider
+    || binding.rail !== rail
+    || binding.verified !== true
+  ) {
+    fail(`${prefix} is not an immutable verified ${rail} binding for provider ${provider}`);
+    ok = false;
+  }
+  if (binding.bound_at !== key) {
+    fail(`${prefix}.bound_at must match its immutable state key`);
+    ok = false;
+  }
+  if (binding.bound_by !== admin || binding.bound_by_role !== 'admin') {
+    fail(`${prefix} was not appended by the sole admin writer ${admin}`);
+    ok = false;
+  }
+  if (
+    !isLowerHex(binding.admin, 64)
+    || binding.admin !== admin
+    || !isLowerHex(binding.bootstrap, 64)
+    || !isLowerHex(binding.context_revision, 64)
+    || !isLowerHex(binding.nonce, 64)
+    || !Number.isSafeInteger(binding.payment_config_version)
+    || binding.payment_config_version < 1
+    || !Number.isSafeInteger(binding.expires_after_epoch)
+    || binding.expires_after_epoch < 1
+    || !Number.isSafeInteger(binding.activation_epoch)
+    || binding.activation_epoch < 1
+    || binding.activation_epoch > binding.expires_after_epoch
+  ) {
+    fail(`${prefix} has invalid canonical context, nonce, activation, or expiry evidence`);
+    ok = false;
+  }
+  if (
+    binding.previous_revision !== null
+    && !isLowerHex(binding.previous_revision, 64)
+  ) {
+    fail(`${prefix}.previous_revision must be null or 64 lowercase hex chars`);
+    ok = false;
+  }
+  if (typeof binding.target !== 'string' || binding.target.length === 0) {
+    fail(`${prefix}.target is missing`);
+    ok = false;
+  }
+
+  const intent = payoutBindingIntent(binding);
+  const revisionDigest = await blake3(Buffer.from(providerPayoutBindingMessage(intent)));
+  const expectedRevision = Buffer.from(revisionDigest).toString('hex');
+  if (
+    !isLowerHex(binding.revision, 64)
+    || binding.revision !== expectedRevision
+    || key !== `payout/binding/${rail}/${provider}/${expectedRevision}`
+  ) {
+    fail(`${prefix} revision or immutable key does not match the provider-signed intent`);
+    ok = false;
+  }
+  if (!verifyEd25519(
+    provider,
+    providerPayoutBindingMessage(intent),
+    binding.provider_signature,
+  )) {
+    fail(`${prefix}.provider_signature does not verify for provider ${provider}`);
+    ok = false;
+  }
+
+  if (rail === 'tnk') {
+    const addressPrefix = binding.network === 'mainnet'
+      ? 'trac'
+      : binding.network === 'testnet1'
+        ? 'testtrac'
+        : null;
+    const expectedTarget = addressPrefix && isLowerHex(binding.target_wallet, 64)
+      ? PeerWallet.encodeBech32mSafe(
+          addressPrefix,
+          Buffer.from(binding.target_wallet, 'hex'),
+        )
+      : null;
+    if (
+      binding.currency !== null
+      || binding.chain_id !== null
+      || !expectedTarget
+      || binding.target !== expectedTarget
+      || !verifyEd25519(
+        binding.target_wallet,
+        providerPayoutTargetBindingMessage(intent),
+        binding.target_signature,
+      )
+    ) {
+      fail(`${prefix} has invalid TNK target-wallet ownership evidence`);
+      ok = false;
+    }
+    if (
+      binding.stripe_processor_revision !== null
+      || binding.stripe_verification_revision !== null
+    ) {
+      fail(`${prefix} TNK binding must not carry Stripe verification revisions`);
+      ok = false;
+    }
+  } else if (rail === 'tap') {
+    if (
+      binding.currency !== null
+      || !Number.isSafeInteger(binding.chain_id)
+      || binding.chain_id < 1
+      || binding.target_wallet !== null
+      || !verifyTapTargetSignature(intent)
+    ) {
+      fail(`${prefix} has invalid TAP target-wallet ownership evidence`);
+      ok = false;
+    }
+    if (
+      binding.stripe_processor_revision !== null
+      || binding.stripe_verification_revision !== null
+    ) {
+      fail(`${prefix} TAP binding must not carry Stripe verification revisions`);
+      ok = false;
+    }
+  } else if (rail === 'fiat') {
+    if (
+      typeof binding.currency !== 'string'
+      || !/^[a-z]{3}$/.test(binding.currency)
+      || binding.chain_id !== null
+      || binding.target_wallet !== null
+      || binding.target_signature !== null
+      || !/^acct_[A-Za-z0-9._-]+$/.test(binding.target)
+      || !isLowerHex(binding.stripe_processor_revision, 64)
+      || !isLowerHex(binding.stripe_verification_revision, 64)
+    ) {
+      fail(`${prefix} has invalid Stripe payout binding evidence`);
+      ok = false;
+    } else if (!(await verifyStripePayoutReadiness(
+      records,
+      binding,
+      admin,
+      fail,
+      prefix,
+    ))) {
+      ok = false;
+    }
+  } else {
+    fail(`${prefix} uses unsupported payout rail ${rail}`);
+    ok = false;
+  }
+
+  if (!(await verifyContext(binding, prefix))) ok = false;
+  return ok;
+}
+
 async function auditCanonicalService({ records, sourceEvidence, adminOverride, catalogProof }) {
   const errors = [];
   const warnings = [];
@@ -621,7 +1008,9 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
   for (const error of catalogProof?.errors || []) fail(error);
 
   const admin = adminFromRecords(records, adminOverride);
-  if (!admin || !pubkey64.test(admin)) fail('admin pubkey is missing or invalid; include state key admin or pass --admin-pubkey');
+  if (!isLowerHex(admin, 64)) {
+    fail('admin pubkey is missing or invalid; include a lowercase state key admin or pass --admin-pubkey');
+  }
 
   const providers = indexByTail(records, 'prov/');
   const enclaves = indexByTail(records, 'enclave/');
@@ -649,7 +1038,6 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
     return verified;
   };
 
-  let adminSetPayoutTargets = 0;
   let providerBanRecordsVerified = true;
   for (const [providerId, provider] of bannedProviders.entries()) {
     providerBanRecordsVerified =
@@ -657,34 +1045,177 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
       && providerBanRecordsVerified;
   }
 
-  for (const [providerId, provider] of activeProviders.entries()) {
-    const payouts = provider?.payouts;
-    if (!payouts || typeof payouts !== 'object' || Array.isArray(payouts) ||
-        Object.keys(payouts).length === 0) {
-      fail(`prov/${providerId} is missing admin-set payout targets`);
-      continue;
+  const contextVerification = new Map();
+  const verifyPayoutContext = async (binding, bindingKey) => {
+    const contextKey =
+      `payout/context/${binding.payment_config_version}/${binding.context_revision}`;
+    const cacheKey = stableJson({
+      contextKey,
+      network: binding.network,
+      admin: binding.admin,
+      bootstrap: binding.bootstrap,
+      rail: binding.rail,
+    });
+    if (contextVerification.has(cacheKey)) {
+      return contextVerification.get(cacheKey);
     }
     let verified = true;
-    for (const [method, payout] of Object.entries(payouts)) {
-      const prefix = `prov/${providerId}.payouts.${method}`;
-      if (!payoutMethods.has(method) || payout?.method !== method) {
-        fail(`${prefix}.method must match tnk, tap, or stripe`);
-        verified = false;
+    const context = records.get(contextKey);
+    if (
+      !isRecord(context)
+      || context.type !== 'provider_payout_context'
+      || context.revision !== binding.context_revision
+      || context.network !== binding.network
+      || context.admin !== admin
+      || context.bootstrap !== binding.bootstrap
+      || context.payment_config_version !== binding.payment_config_version
+      || !isLowerHex(context.payment_config_hash, 64)
+      || context.published_at !== contextKey
+      || context.published_by !== admin
+      || context.published_by_role !== 'admin'
+    ) {
+      fail(`${bindingKey} does not reference a valid immutable admin-published payout context`);
+      verified = false;
+    }
+
+    const current = records.get('payout/context/current');
+    if (
+      !isRecord(current)
+      || current.type !== 'provider_payout_context_pointer'
+      || !isLowerHex(current.revision, 64)
+      || current.record_key !==
+        `payout/context/${current.payment_config_version}/${current.revision}`
+      || current.updated_by !== admin
+      || current.updated_by_role !== 'admin'
+      || !records.has(current.record_key)
+    ) {
+      fail('payout/context/current is not a valid sole-admin-appended context pointer');
+      verified = false;
+    }
+
+    const payments = records.get('payments/current');
+    if (
+      !isRecord(payments)
+      || payments.ver !== binding.payment_config_version
+      || payments.set_by !== admin
+      || payments.set_by_role !== 'admin'
+      || payments.tnk?.network !== binding.network
+      || !Array.isArray(payments.rails)
+      || !payments.rails.includes(binding.rail)
+    ) {
+      fail(`${bindingKey} does not match canonical admin payment policy`);
+      verified = false;
+    } else if (
+      isRecord(context)
+      && context.payment_config_hash !==
+        await opaqueHash('mayhem-payout-payment-config-v1', payments)
+    ) {
+      fail(`${contextKey}.payment_config_hash does not bind payments/current`);
+      verified = false;
+    }
+    contextVerification.set(cacheKey, verified);
+    return verified;
+  };
+
+  const payoutErrorStart = errors.length;
+  const verifiedPayoutBindingKeys = new Set();
+  let providersWithVerifiedPayoutBindings = 0;
+  for (const [providerId, provider] of activeProviders.entries()) {
+    let providerVerified = true;
+    if (!isLowerHex(providerId, 64)) {
+      fail(`prov/${providerId} provider id must be 64 lowercase hex chars`);
+      providerVerified = false;
+    }
+    if (hasOwn(provider, 'payouts')) {
+      fail(`prov/${providerId}.payouts is a retired admin-set payout-target shape`);
+      providerVerified = false;
+    }
+    if (
+      !Array.isArray(provider.accepted_rails)
+      || provider.accepted_rails.length === 0
+      || new Set(provider.accepted_rails).size !== provider.accepted_rails.length
+      || provider.accepted_rails.some((rail) => !payoutRails.has(rail))
+    ) {
+      fail(`prov/${providerId}.accepted_rails must contain unique fiat, tap, or tnk rails`);
+      continue;
+    }
+
+    for (const rail of provider.accepted_rails) {
+      const pointerKey = `payout/current/${rail}/${providerId}`;
+      const pointer = records.get(pointerKey);
+      if (
+        !isRecord(pointer)
+        || pointer.provider !== providerId
+        || pointer.rail !== rail
+        || !isLowerHex(pointer.current_revision, 64)
+        || !isLowerHex(pointer.latest_revision, 64)
+      ) {
+        fail(`${pointerKey} is missing or invalid for an accepted provider rail`);
+        providerVerified = false;
+        continue;
       }
-      if (typeof payout?.addr !== 'string' || payout.addr.length === 0) {
-        fail(`${prefix}.addr is missing`);
-        verified = false;
+      const hasPending = pointer.pending_revision !== null;
+      if (
+        (hasPending && (
+          !isLowerHex(pointer.pending_revision, 64)
+          || !Number.isSafeInteger(pointer.pending_activation_epoch)
+          || pointer.pending_activation_epoch < 1
+          || pointer.latest_revision !== pointer.pending_revision
+        ))
+        || (!hasPending && (
+          pointer.pending_activation_epoch !== null
+          || pointer.latest_revision !== pointer.current_revision
+        ))
+      ) {
+        fail(`${pointerKey} has inconsistent current/latest/pending revisions`);
+        providerVerified = false;
       }
-      if (payout?.set_by !== admin) {
-        fail(`${prefix} was not set by admin ${admin}`);
-        verified = false;
-      } else if (payout.set_by_role !== 'admin') {
-        fail(`${prefix}.set_by_role must be admin`);
-        verified = false;
+
+      const revisions = [
+        pointer.current_revision,
+        ...(hasPending ? [pointer.pending_revision] : []),
+      ];
+      for (const revision of revisions) {
+        const bindingKey = `payout/binding/${rail}/${providerId}/${revision}`;
+        const binding = records.get(bindingKey);
+        const bindingVerified = await verifyProviderPayoutBinding({
+          records,
+          key: bindingKey,
+          binding,
+          provider: providerId,
+          rail,
+          admin,
+          verifyContext: verifyPayoutContext,
+          fail,
+        });
+        if (bindingVerified) {
+          verifiedPayoutBindingKeys.add(bindingKey);
+        } else {
+          providerVerified = false;
+        }
+        if (
+          hasPending
+          && revision === pointer.pending_revision
+          && isRecord(binding)
+          && binding.activation_epoch !== pointer.pending_activation_epoch
+        ) {
+          fail(`${pointerKey}.pending_activation_epoch does not match ${bindingKey}`);
+          providerVerified = false;
+        }
+      }
+      const latestKey =
+        `payout/binding/${rail}/${providerId}/${pointer.latest_revision}`;
+      if (pointer.updated_at !== latestKey) {
+        fail(`${pointerKey}.updated_at must reference its latest immutable binding`);
+        providerVerified = false;
       }
     }
-    if (verified) adminSetPayoutTargets += 1;
+    if (providerVerified) providersWithVerifiedPayoutBindings += 1;
   }
+  const providerPayoutBindingsVerified =
+    errors.length === payoutErrorStart
+    && activeProviders.size > 0
+    && providersWithVerifiedPayoutBindings === activeProviders.size;
 
   for (const [enclaveId, enclave] of activeEnclaves.entries()) {
     if (enclave.enclave_id !== enclaveId) fail(`enclave/${enclaveId} value.enclave_id mismatch`);
@@ -878,7 +1409,8 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
     open_rooms: openRooms.size,
     active_serves: activeServes.length,
     active_room_joins: activeRoomServes.length,
-    admin_set_payout_targets: adminSetPayoutTargets,
+    provider_payout_bindings: verifiedPayoutBindingKeys.size,
+    providers_with_verified_payout_bindings: providersWithVerifiedPayoutBindings,
     banned_providers: bannedProviders.size,
     catalog_models: catalogProof?.modelIds?.size ?? 0,
     catalog_artifacts: catalogProof?.artifactCount ?? 0,
@@ -910,7 +1442,7 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
       admin_created_rooms_verified: ok,
       provider_join_records_verified: ok,
       admin_price_records_verified: ok,
-      admin_payout_records_verified: ok,
+      provider_payout_bindings_verified: ok && providerPayoutBindingsVerified,
       admin_rules_records_verified: ok && adminRulesRecordsVerified,
       admin_params_records_verified: ok && adminParamsRecordsVerified,
       admin_provider_ban_records_verified: ok && providerBanRecordsVerified,
@@ -926,8 +1458,6 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
       admin_sets_prices: ok,
       admin_sets_rules: ok && adminRulesRecordsVerified,
       admin_sets_params: ok && adminParamsRecordsVerified,
-      admin_sets_provider_payout_targets:
-        ok && activeProviders.size > 0 && adminSetPayoutTargets === activeProviders.size,
       admin_can_ban_providers: ok,
       providers_set_prices: false,
       providers_set_rules: false,
@@ -936,7 +1466,8 @@ async function auditCanonicalService({ records, sourceEvidence, adminOverride, c
       providers_submit_models: false,
       providers_create_canonical_rooms: false,
       providers_only_join_admin_rooms: ok,
-      provider_payout_targets_admin_verified: ok,
+      provider_payout_bindings_permissionless: ok && providerPayoutBindingsVerified,
+      provider_payout_bindings_ownership_verified: ok && providerPayoutBindingsVerified,
       admin_rules_params_verified: ok && adminRulesRecordsVerified && adminParamsRecordsVerified,
       evidence: [
         sourceEvidence,

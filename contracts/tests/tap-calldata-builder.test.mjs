@@ -18,7 +18,11 @@ import {
   providerShareWei,
   rollTapSettlement,
 } from '../scripts/tap-settlement-roller.mjs';
-import { makeReceiptIdentity, signedTapReceipt } from './helpers/signed-receipt.mjs';
+import {
+  makeReceiptIdentity,
+  signedTapReceipt,
+  targetedTapBindingsFor,
+} from './helpers/signed-receipt.mjs';
 
 const TAP_USD_AU = '1000000000000000000';
 const usdAu = (value) => (BigInt(value) * 1_000_000_000_000_000_000n).toString();
@@ -172,12 +176,15 @@ test('claim calldata executes MayhemInferencePool.claim from provider wallet', a
   await (await pool.connect(buyer).deposit(U('3'))).wait();
 
   const providerId = makeReceiptIdentity();
+  const providerAccounts = { [providerId.publicKeyHex]: providerAccount };
+  const bundle = {
+    epoch: 1,
+    receipts: [receipt({ session: 's1', provider: providerId, au: usdAu(2) })],
+  };
   const rolled = await rollTapSettlement({
-    bundle: {
-      epoch: 1,
-      receipts: [receipt({ session: 's1', provider: providerId, au: usdAu(2) })],
-    },
-    providerAccounts: { [providerId.publicKeyHex]: providerAccount },
+    bundle,
+    providerAccounts,
+    targetedSessionBindings: targetedTapBindingsFor(bundle, providerAccounts),
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     settleThroughEpoch: 7,
@@ -221,12 +228,15 @@ test('local wallet TAP claim simulates, then confirms from the provider wallet',
   await (await pool.connect(operator).deposit(U('3'))).wait();
 
   const providerId = makeReceiptIdentity();
+  const providerAccounts = { [providerId.publicKeyHex]: providerAccount };
+  const bundle = {
+    epoch: 1,
+    receipts: [receipt({ session: 'local-claim', provider: providerId, au: usdAu(2) })],
+  };
   const rolled = await rollTapSettlement({
-    bundle: {
-      epoch: 1,
-      receipts: [receipt({ session: 'local-claim', provider: providerId, au: usdAu(2) })],
-    },
-    providerAccounts: { [providerId.publicKeyHex]: providerAccount },
+    bundle,
+    providerAccounts,
+    targetedSessionBindings: targetedTapBindingsFor(bundle, providerAccounts),
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     settleThroughEpoch: 7,

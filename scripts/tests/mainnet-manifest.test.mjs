@@ -31,3 +31,17 @@ test('mainnet manifest requires unique inference relay public keys', () => {
   const malformed = validateMainnetManifest(invalid, { allowPlaceholders: true });
   assert.match(malformed.errors.join('\n'), /inference_relays\[0\] has invalid format/);
 });
+
+test('mainnet manifest rejects retired admin payout-target controls', () => {
+  const manifest = structuredClone(template);
+  delete manifest.controls.provider_payout_bindings_permissionless;
+  delete manifest.controls.provider_payout_bindings_ownership_verified;
+  manifest.controls.admin_sets_provider_payout_targets = true;
+  manifest.controls.provider_payout_targets_admin_verified = true;
+
+  const result = validateMainnetManifest(manifest, { allowPlaceholders: true });
+  const errors = result.errors.join('\n');
+  assert.match(errors, /unsupported field\(s\): .*admin_sets_provider_payout_targets/);
+  assert.match(errors, /provider_payout_bindings_permissionless must be true/);
+  assert.match(errors, /provider_payout_bindings_ownership_verified must be true/);
+});

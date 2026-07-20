@@ -63,10 +63,11 @@ and earn with this machine. Detect my OS and hardware, install the missing
 prerequisites FIRST (including the GPU/backend-specific ones the checklist
 names for my hardware), install the software, run `mayhem doctor` and tell
 me which models fit, run `mayhem up --provider`, help me choose which
-payment rails to accept with `mayhem provider rails set`, set sensible
-self-protection limits with `mayhem provider limits set`, and confirm I am
-serving with `mayhem provider health`. Explain what my expected earnings
-depend on, and show me the provider dashboard URL.
+payment rails to accept with `mayhem provider rails set`, bind my own verified
+payout destinations with `mayhem provider payout` or `mayhem provider stripe`,
+set sensible self-protection limits with `mayhem provider limits set`, and
+confirm I am serving with `mayhem provider health`. Explain what my expected
+earnings depend on, and show me the provider dashboard URL.
 ```
 
 No coding agent yet? Any of the ones above installs in a minute, or drive it yourself with the manual steps below.
@@ -80,11 +81,68 @@ git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
 ```
 
-Or skip the checkout and install the latest release artifact, verified against its SHA-256 sidecar (both values are on the [releases page](https://github.com/Trac-Systems/openmayhem/releases/latest)):
+Or, when the [releases page](https://github.com/Trac-Systems/openmayhem/releases)
+publishes a native archive for your host, use the authenticated release
+bootstrap. A detached manifest, its detached Ed25519 signature, and a trusted
+public-key record obtained through an independent authenticated project channel
+are required. Never use a key extracted from the archive or copied from the
+signature as the trust anchor. The canonical record is tracked at
+[`release/keys/openmayhem-release-v1.json`](release/keys/openmayhem-release-v1.json)
+with key ID `openmayhem-release-v1`. Replace the archive placeholder only when
+the matching target artifact is published.
+
+macOS/Linux:
 
 ```bash
-./install.sh --artifact-url <archive-url> --sha256 <archive-sha256>
+mkdir -p "$HOME/Downloads/openmayhem-install"
+cd "$HOME/Downloads/openmayhem-install"
+curl -fL 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/install.sh' -o install.sh
+curl -fL 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/release/keys/openmayhem-release-v1.json' -o openmayhem-release-v1.json
+chmod 0755 install.sh
+./install.sh \
+  --artifact-url '<0.2.23-macos-or-linux-release-archive-url>' \
+  --version 0.2.23 \
+  --release-key './openmayhem-release-v1.json' \
+  --release-key-id 'openmayhem-release-v1'
 ```
+
+Windows PowerShell:
+
+```powershell
+$workDir = Join-Path $HOME 'Downloads\openmayhem-install'
+New-Item -ItemType Directory -Force -Path $workDir | Out-Null
+Set-Location $workDir
+Invoke-WebRequest `
+  -Uri 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/install.ps1' `
+  -OutFile '.\install.ps1'
+Invoke-WebRequest `
+  -Uri 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/release/keys/openmayhem-release-v1.json' `
+  -OutFile '.\openmayhem-release-v1.json'
+.\install.ps1 `
+  -ArtifactUrl '<0.2.23-windows-release-archive-url>' `
+  -Version 0.2.23 `
+  -ReleaseKey '.\openmayhem-release-v1.json' `
+  -ReleaseKeyId 'openmayhem-release-v1'
+```
+
+For a macOS/Linux archive URL ending in `.tar.gz` or `.tgz`, or a Windows
+archive URL ending in `.zip`, the installers derive the required
+`<archive-stem>.manifest.json` and
+`<archive-stem>.manifest.json.sig` URLs. Pass `--manifest-url` and
+`--signature-url` on macOS/Linux, or `-ManifestUrl` and `-SignatureUrl` in
+PowerShell, when the detached files use different published URLs. Every
+authenticated artifact install must select an exact identity: the examples pin
+`0.2.23`; alternatively, replace the version option with
+`--source-git-sha '<exact-40-lowercase-hex-source-sha>'` on macOS/Linux or
+`-ExpectedSourceGitSha '<exact-40-lowercase-hex-source-sha>'` in PowerShell. Do
+not omit both selectors. An archive SHA-256 is an optional additional pin.
+
+The installer snapshots the release inputs and authenticates the detached
+signature, manifest, target, requested identity, and anti-rollback state before
+candidate extraction. It checks the extracted bootstrap against the signed hash
+before execution. Pinned Pear `2.0.4` provisioning happens only after the
+authenticated artifact install. It does not hydrate or mutate the signed
+runtime inventory; do not run `npm install` or `npm ci` there afterward.
 
 Every command below assumes you are in the repository directory (or have `mayhem` on your `PATH` after installing).
 
@@ -98,7 +156,7 @@ curl http://127.0.0.1:11435/v1/models
 
 Point any OpenAI client at `http://127.0.0.1:11435/v1` and go.
 
-`mainnet` is the default and is fail-closed. The release embeds the official
+`mainnet` is the default and is fail-closed. Installed builds embed the official
 Trac MSB and DHT bootstrap set, the canonical Mayhem subnet/admin identity, and
 the mainnet TAP, TNK, and Stripe directory identities. `mayhem up` refuses a
 conflicting bootstrap or deployment and does not report ready until the signed
@@ -106,14 +164,26 @@ rules, payment directory, catalog, and at least one live model route have
 synchronized. Users and providers do not paste network addresses or Ethereum
 contract addresses into normal setup commands.
 
+For Tier-2 and Tier-3 routes, a fresh buyer also needs no TPM, provider helper,
+Administrator/root action, or verifier flag. `mayhem up` authenticates the
+active catalog policy and shared public trust data. When that policy requires a
+managed verifier, it fetches only the executable and manifest for the buyer
+binary's own native target and wires the verified sibling executable
+automatically. It does not fetch the other five platform builds or accept
+verifier code, roots, policy, or golden measurements from a provider.
+
 The selected rail is persisted for later starts. Rails never borrow, convert,
 or settle across one another. To switch a running gateway, restart it with the
 new rail:
 
 ```bash
-mayhem down
+mayhem down --restart
 mayhem up --rail tap --yes
 ```
+
+`--restart` preserves provider registrations when the same supervised stack is
+also serving. Ordinary `mayhem down` deliberately drains provider workers,
+leaves their canonical routes, and stops the stack.
 
 **Provide to the network** (earn on your hardware):
 
@@ -123,7 +193,7 @@ mayhem up --provider --yes
 mayhem provider health
 ```
 
-`mayhem up` starts everything supervised (peer, bridge, gateway, and the serving worker with `--provider`), health-checks each part, and prints endpoint and dashboard URLs you can copy. No browser required. `mayhem down` stops everything.
+`mayhem up` starts everything supervised (peer, bridge, gateway, and the serving worker with `--provider`), health-checks each part, and prints endpoint and dashboard URLs you can copy. No browser required. For an update or temporary restart, `mayhem down --restart` preserves provider registrations so the next `mayhem up` resumes without re-onboarding. Ordinary `mayhem down` drains and leaves before stopping.
 
 ### Wire your coding agent to the gateway
 
@@ -155,9 +225,14 @@ No GPU? CPU-only machines still serve. Embeddings, small text models, and speech
 
 ### What you need installed first
 
-The installer checks for these and tells you what's missing, but it does not install OS packages for you. Set them up before running `install.sh` and the from-source build goes through in one pass. The build compiles native code (llama.cpp via cmake, Rust bindings via bindgen), which is why a C/C++ toolchain and libclang are on the list — `libclang` missing is the single most common build failure.
+For an authenticated release install, set up Node.js 20+ with npm and the
+platform's download/archive tools first. Rust and a native compiler toolchain
+are not required for that path. The source build compiles native code
+(llama.cpp via cmake, Rust bindings via bindgen), so set up the additional
+prerequisites below before running `install.sh`; `libclang` missing is the
+single most common source-build failure.
 
-**Every OS:**
+**Every OS for a source build:**
 - Rust (stable, via [rustup](https://rustup.rs)) — `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
 - Node.js 20+ with npm — carries the P2P runtime (Pear bootstrap)
 - git, curl, unzip
@@ -237,8 +312,14 @@ mayhem price show <model-id> --tier 1   # live market price + its derivation
 
 `mayhem models --gateway` also lists an admin-created, priced tier market before a provider has
 joined it. Its market row says `routes=0 status=no_eligible_provider_yet`; it is discoverable for
-provider onboarding but cannot receive a request. `/v1/models` exposes the same distinction under
-`mayhem.markets[]`. Only entries in `mayhem.route_candidates[]` are routable capacity.
+provider onboarding but cannot receive a request. `/v1/models` exposes durable registration as
+`registered_route_count`, while `route_count`, `providers_online`, `availability=routable`, and
+`mayhem.route_candidates[]` come only from fresh heartbeats that pass the same capacity,
+capability, context, tier, rail, attestation, and circuit-breaker checks used for dispatch. A crash
+or `mayhem down --restart` ages out of live counts but keeps durable registration, so the same
+provider resumes without re-onboarding. A deliberate remove, enclave-changing switch,
+drain-to-stop, provider stop, or ordinary `mayhem down` signs the corresponding leave before
+retiring the worker.
 
 ### Pay — card first, one price everywhere
 
@@ -390,7 +471,8 @@ mayhem tokens revoke laptop      # immediate
 
 | Command | What it does |
 |---|---|
-| `mayhem up` / `mayhem down` | start/stop the supervised stack; prints endpoint + dashboard URLs |
+| `mayhem up` / `mayhem down` | start the stack / deliberately drain, leave provider routes, and stop |
+| `mayhem down --restart` | stop for an update or temporary restart while preserving provider registrations |
 | `mayhem status` | live component state, ports, sync, balances |
 | `mayhem models --gateway` | canonical priced markets, capabilities, tiers, quant, route counts, and availability |
 | `mayhem opencode` | wire the bundled opencode agent to the gateway; re-run to re-sync models |
@@ -443,6 +525,11 @@ mayhem up --provider --yes \
 ```
 
 Windows uses `scripts/hardware/mayhem-tpm2-quote-windows.ps1` from the same normal account that runs `mayhem`; it obtains a fresh nonce-bound quote through Windows TBS and binds the TPM EK through PCP/NCrypt and the manufacturer certificate chain. It does not need Administrator privileges or a privileged helper. Tier-3 operators pass the matching confidential-compute quote kind/helper. A valid Tier-2 or Tier-3 proof joins the existing canonical tier market automatically. Tier 4 is different: it is the admin's KYB identity overlay.
+
+Those explicit quote commands are provider-side evidence collection. Buyers do
+not install or select them: the signed policy and the buyer's authenticated
+native release select the verifier automatically, and only routes verifiable
+under that exact active policy become locally routable.
 
 To add a higher-tier worker without restarting an already running stack, pass the same explicit proof options to `mayhem provider serve add <enclave-id> --hardware-quote-kind <kind> --hardware-quote-command <path>`.
 
@@ -516,25 +603,59 @@ mayhem provider stripe status
 
 The onboarding command always prints the exact `https://connect.stripe.com/...`
 URL before attempting to open a browser. On a remote terminal, pass `--no-open`
-and open that copy/paste URL anywhere; rerunning `status` completes the
-admin-approved payout binding without giving the provider ledger write access.
-For TNK and TAP, `mayhem wallet show --json` prints the provider public key plus
-the Trac and Ethereum addresses that the operator verifies and binds. Providers
-choose which rails they accept, but cannot write canonical payout destinations.
-An absent payout binding does not block registration or serving; earnings remain
-accounted until the corresponding destination is bound.
+and open that copy/paste URL anywhere. Once Stripe reports
+`details_submitted`, payouts enabled, and transfers enabled, `onboard` or
+`status` signs and submits the verified fiat payout binding automatically.
+There is no Mayhem-admin approval step. The same provider identity reuses that
+Stripe account across every model and room. To reuse a ready account under a
+different provider identity, run `mayhem provider stripe relink --help`; the
+source and destination provider identities must both consent, and entering an
+`acct_...` value is never enough.
 
-Earnings settle **automatically at the end of every epoch (hourly)** on each rail you earned in. You keep 85%; the network fee funds gas sponsorship and operations.
+To replace this provider identity's current Connect account, run
+`mayhem provider stripe rotate --country DE` (using the provider's actual
+country). The command requires the current account as a signed compare-and-swap,
+prints a fresh hosted onboarding URL, and leaves existing liabilities bound to
+the previous payout revision until the replacement is verified and reaches its
+recorded activation epoch. Readiness is retained per provider and account, so
+verifying the replacement cannot make the still-active account ineligible.
+
+For TAP and TNK, bind the local provider wallet directly:
+
+```bash
+mayhem provider payout set --rail tap --submit
+mayhem provider payout set --rail tnk --submit
+mayhem provider payout get
+```
+
+These commands sign both the provider intent and the target-wallet ownership
+proof. A separate or shared target wallet is also supported through
+`--target-wallet-key-file`; that target wallet co-signs each provider binding.
+Use `mayhem provider payout rotate --rail tap --submit` or the corresponding
+`tnk` command to replace a target. If `E` is the latest fully applied epoch, a
+first Stripe/TAP/TNK binding activates at `E+1` and a rotation activates at
+`E+2`; `mayhem provider payout get` reports the exact activation epoch. The old
+revision remains current until that boundary, and reservations and earnings
+already tied to it continue to settle there afterward.
+
+All payout submissions travel through the provider's local read-only peer. The
+sole canonical indexer verifies the signatures and appends valid bindings
+automatically; providers receive no writer capability, and no operator SSH or
+per-provider admin transaction is involved. Bindings belong to the provider
+identity, not a model, enclave, room, or machine. Registration can complete
+without one, but paid sessions on a rail require its active verified binding.
+
+Earnings settle **automatically after every finalized epoch (hourly)** on each rail you earned in. The operator's bounded, idempotent payout worker reconciles Stripe transfers, TNK transfers, and TAP root/fee/burn work from the same canonical epoch/apply hash; providers never run an admin settlement command. You keep 85%; the network fee funds gas sponsorship and operations.
 
 Two rails push the money to you. One is a pull, for a reason:
 
 | Rail you accepted | How you receive it | Push or pull |
 |---|---|---|
-| `fiat` | Stripe pays your bank account every epoch. Onboarding happens once: the CLI prints a Stripe Connect link, you finish it in the browser, and payouts flow on their own from then on. Until you onboard, earnings simply accrue, and `mayhem provider earnings` tells you what's left to do. | Push, automatic |
-| `tnk` | The epoch settlement sends real TNK transfers straight to your Trac address every epoch, fees sponsored. Nothing to run, nothing to sign. | Push, automatic |
+| `fiat` | Onboarding happens once: the CLI prints a Stripe Connect link, you finish it in the browser, and the verified binding makes fiat sessions eligible. Stripe then pays your bank account from settled earnings. | Push, automatic |
+| `tnk` | After the one-time wallet ownership binding, epoch settlement sends real TNK transfers straight to your verified Trac address, with fees sponsored. | Push, automatic |
 | `tap` | The epoch settlement publishes a settlement root on Ethereum and your earnings accumulate under it. `mayhem claim` runs a Merkle claim that transfers everything owed to your Ethereum address in one transaction. | Pull, you claim |
 
-TAP is a pull because paying every provider on Ethereum every hour would burn gas per provider per epoch. The settlement root is cumulative instead: unclaimed earnings pile up losslessly, and you claim when it's worth a transaction — after a day, a month, whenever. Nothing expires, claiming late costs nothing, and one claim sweeps everything since your last one. The claim is signed by your in-app Ethereum key, with gas from the ETH in your own wallet.
+TAP is a pull because paying every provider on Ethereum every hour would burn gas per provider per epoch. The settlement root is cumulative instead: unclaimed earnings pile up losslessly, and you claim when it's worth a transaction — after a day, a month, whenever. Nothing expires, claiming late costs nothing, and one claim sweeps everything since your last one. The verified target wallet authorizes the claim and pays its Ethereum gas.
 
 ```bash
 mayhem provider earnings          # earnings, holdback, claimable per rail
@@ -569,7 +690,8 @@ mayhem provider rails get
 | `mayhem up --provider` | start serving with everything supervised |
 | `mayhem provider list / health` | joins, ledger state, heartbeats, visibility |
 | `mayhem provider rails set/get` | which payment rails you accept |
-| `mayhem provider stripe onboard/status` | create or resume Stripe Connect onboarding and verify payout readiness |
+| `mayhem provider payout set/get/rotate` | bind or rotate a provider-signed TAP/TNK destination |
+| `mayhem provider stripe onboard/rotate/relink/status` | create, replace, reuse, or inspect a verified Stripe Connect payout binding |
 | `mayhem provider min-ask set/get` | your price floor per market |
 | `mayhem provider limits set` | concurrency / accept-rate / daily budget caps |
 | `mayhem provider drain` | graceful sign-off |
@@ -590,7 +712,36 @@ Every epoch's price is published with its derivation: the seed, the measured uti
 
 Context is part of the deal too. Providers advertise the context window they serve; the network verifies it with targeted probes and it's guaranteed for the duration of your session. Larger context brackets clear at their own prices, and a `min-ctx` filter routes you only to providers with the headroom you need. When every provider is busy, an opt-in `--max-wait` holds your request for the next free slot instead of failing it.
 
-## The four trust tiers
+## Pricing
+
+Every market has one price at a time, and everyone active in the same epoch pays that same number. Nobody types the price in. Not providers, not users, and after seeding the starting price once, not us either.
+
+The clock behind it is the epoch: the network's settlement window, one hour by default. At the end of each hour, all the signed receipts from that hour are settled, and that settlement doubles as the price input for the next hour.
+
+Here is the loop. Each epoch the network measures how busy a market was: paid work that actually settled, divided by the capacity of the providers taking part. Above roughly 85% utilization the price steps up for the next epoch. Below it, the price steps down. A single step is capped at 10%, but steps compound, so a market that stays hot climbs hour after hour until enough supply shows up or demand cools.
+
+Providers steer it with a min-ask, the lowest price they are willing to serve at. When the market price is under your ask, you sit out. That shrinks supply, the market runs hotter, and the price climbs until it crosses your number and you flow back in. An ask does not name the price. It decides when you work, and who is working is what moves the price.
+
+Users steer it from the other side with a max-bid. If the price is above your bid, you get a clear "no provider at your price" and pay nothing. Enough buyers stepping back cools the market, and the price sinks toward where the buyers actually are.
+
+Your session keeps its price. The rate at the moment a session opens is locked into the spend voucher and the provider receipt, and settlement uses that locked rate no matter where the market moves afterwards. Nobody can reprice work you already agreed to.
+
+Two guardrails hold it steady. A market with fewer than two active providers stays pinned at its seed price, so a lone machine cannot steer the controller. And utilization counts only receipt-verified settled work, so posted intent, fake demand, and phantom supply move nothing.
+
+### What a machine can earn
+
+Worked example: `qwen3.6-35b-a3b` at its reference price of $0.05 per million input tokens and $0.35 per million output tokens. The table assumes the market sits at the seed price, demand keeps the machine busy around the clock, input runs at three tokens for every output token, and the 15% network fee is already deducted. Throughput for the GB10 row is measured; the other rows are estimates from memory bandwidth.
+
+| Machine | Concurrent sessions | Sustained output | Net per month |
+|---------|--------------------|------------------|---------------|
+| Mac mini M4 Pro, 64 GB | 2–4 | ~80–110 tok/s | ~$80–120 |
+| GB10-class box, 128 GB (DGX Spark and similar) | 2 | ~115 tok/s | ~$105–135 |
+| Mac Studio M4 Max | 4–6 | ~160–220 tok/s | ~$150–240 |
+| GB10-class box, 128 GB | 6 | ~230 tok/s | ~$210–260 |
+| Mac Studio M3 Ultra | 6–8 | ~250–350 tok/s | ~$230–380 |
+| RTX 4090 desktop, 24 GB | 8 | ~300–500 tok/s | ~$280–550 |
+
+Three things move these numbers. Concurrency is the cheapest lever: this model batches well, so serving six sessions instead of two roughly doubles the take on the same hardware. The market price is the biggest one: the table uses the frozen seed, and a market that runs hot walks the price up toward 4× the reference, which multiplies every row with it. And the numbers assume saturation; a machine only earns while sessions are actually flowing. For cost context, a box drawing 150 W runs about €16 a month in electricity at typical European rates.
 
 Attestation tiers describe what trust evidence a provider has. They don't all mean the same thing, and a higher number isn't simply "everything below it plus more."
 
@@ -681,6 +832,10 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 - **Balance-backed authorization.** Spending is bounded by real on-ledger balance, enforced on the provider side where a modified client can't reach it.
 - **Challengeable everything.** Over-credited commits and fabricated prices can be fraud-proven by anyone holding the evidence. Bad commits are voided and their submitters penalized, and a running challenger watches every window.
 - **Deposits are oracle evidence.** Credits come from verified payment events — Stripe webhooks are signature-checked and replay-deduplicated, chain deposits are watched and confirmed — never from self-asserted writes.
+- **Direct first, bounded relay fallback.** An official relay forwards bounded Noise-authenticated
+  session bytes without gaining plaintext, receipt, provider, payment, or writer authority.
+  Fragmented and transport-coalesced frames keep their order across relay-to-direct recovery;
+  replay is rejected, and sustained over-budget traffic closes only the offending link/session.
 
 ## Install
 
@@ -691,17 +846,126 @@ From a source checkout:
 .\install.ps1 -FromSource         # Windows PowerShell
 ```
 
-From release artifacts (verified against a SHA-256 sidecar):
+When a native release artifact is published, first obtain its public-key record
+through an independent authenticated project channel. The key record is
+mandatory and must not come from the archive or detached signature. The
+canonical record is
+[`release/keys/openmayhem-release-v1.json`](release/keys/openmayhem-release-v1.json),
+published from the repository at the URL used below, and its key ID is
+`openmayhem-release-v1`.
+
+macOS/Linux:
 
 ```bash
-./install.sh --artifact-url <archive-url> --sha256 <archive-sha256>
+curl -fL 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/release/keys/openmayhem-release-v1.json' -o './openmayhem-release-v1.json'
+./install.sh \
+  --artifact-url '<0.2.23-macos-or-linux-release-archive-url>' \
+  --version 0.2.23 \
+  --release-key './openmayhem-release-v1.json' \
+  --release-key-id 'openmayhem-release-v1'
 ```
+
+Windows PowerShell:
+
+```powershell
+Invoke-WebRequest `
+  -Uri 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/release/keys/openmayhem-release-v1.json' `
+  -OutFile '.\openmayhem-release-v1.json'
+.\install.ps1 `
+  -ArtifactUrl '<0.2.23-windows-release-archive-url>' `
+  -Version 0.2.23 `
+  -ReleaseKey '.\openmayhem-release-v1.json' `
+  -ReleaseKeyId 'openmayhem-release-v1'
+```
+
+Both installers require a detached signed manifest and detached signature.
+macOS/Linux release archives use `.tar.gz` or `.tgz`; Windows release archives
+use `.zip`. For an archive URL, the installer derives the metadata URLs by
+appending `.manifest.json` and `.manifest.json.sig` to the archive stem. If the
+release publishes different locations, provide every URL explicitly.
+
+An exact release identity is mandatory. The commands above select version
+`0.2.23`. To select by the signed source commit instead, omit the version option
+and use one of these exact 40-lowercase-hex alternatives:
+
+```bash
+./install.sh \
+  --artifact-url '<release-archive-url-for-this-source-commit-and-target>' \
+  --source-git-sha '<exact-40-lowercase-hex-source-sha>' \
+  --release-key './openmayhem-release-v1.json' \
+  --release-key-id 'openmayhem-release-v1'
+```
+
+```powershell
+.\install.ps1 `
+  -ArtifactUrl '<release-archive-url-for-this-source-commit-and-target>' `
+  -ExpectedSourceGitSha '<exact-40-lowercase-hex-source-sha>' `
+  -ReleaseKey '.\openmayhem-release-v1.json' `
+  -ReleaseKeyId 'openmayhem-release-v1'
+```
+
+You may pass both selectors to require both matches. The archive SHA-256 remains
+an optional additional pin. When detached metadata URLs differ from the derived
+release URLs, use the complete form:
+
+```bash
+./install.sh \
+  --artifact-url '<0.2.23-macos-or-linux-release-archive-url>' \
+  --manifest-url '<0.2.23-target-detached-manifest-url>' \
+  --signature-url '<0.2.23-target-detached-signature-url>' \
+  --version 0.2.23 \
+  --release-key './openmayhem-release-v1.json' \
+  --release-key-id 'openmayhem-release-v1' \
+  --sha256 '<optional-archive-sha256>'
+```
+
+```powershell
+.\install.ps1 `
+  -ArtifactUrl '<0.2.23-windows-release-archive-url>' `
+  -ManifestUrl '<0.2.23-windows-detached-manifest-url>' `
+  -SignatureUrl '<0.2.23-windows-detached-signature-url>' `
+  -Version 0.2.23 `
+  -ReleaseKey '.\openmayhem-release-v1.json' `
+  -ReleaseKeyId 'openmayhem-release-v1' `
+  -Sha256 '<optional-archive-sha256>'
+```
+
+Use an optional archive hash only when its exact value is published; never
+guess it. Before candidate extraction, the installer snapshots the release
+inputs and authenticates the detached signature, manifest, trusted key,
+requested identity, target, and anti-rollback state. It checks the extracted
+bootstrap against the signed hash before execution. Only after the authenticated
+artifact install does it check or provision pinned Pear `2.0.4`. That npm step
+is limited to Pear and does not hydrate the signed package inventory. Do not run
+`npm install` or `npm ci` in the installed runtime.
+
+A signed release must bind every package and staged update to one exact
+lowercase 40-hex `source_git_sha` derived from the clean RC commit. The
+supported native target matrix is `aarch64-apple-darwin`, `x86_64-apple-darwin`,
+`aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`,
+`aarch64-pc-windows-msvc`, and `x86_64-pc-windows-msvc`. The embedded Intercom
+runtime is authenticated from its physical packaged tree: Pear disk launches
+use the physical app directory and link-only `pear://` launches are rejected.
+Package/update authentication verifies the complete runtime inventory; Pear
+startup verifies the declared contract version and contract-code digests before
+opening a store or reporting a release identity.
 
 Installers print a copy/paste `PATH` command even when they update your shell profile, and anything that would open a browser prints the URL first. The whole system works from a terminal alone.
 
 `mayhem update` keeps you current. It stages releases only after verifying the signed manifest, hashes, and signing key, applies with a delay window and a health check, and rolls back if the update misbehaves. Contract-changing releases version-gate explicitly: out-of-date nodes get a clear `UPGRADE_REQUIRED` instead of silent divergence.
 
+When a temporary stop is needed around an update, use `mayhem down --restart`;
+the next `mayhem up` reuses durable provider registrations. Ordinary
+`mayhem down` deliberately drains and leaves those registrations.
+
 ## Development
+
+The combined `0.2.23` PAYOUTFREE, ATTAUTO, FLOWRATE, and LIVEROUTE work in this
+repository is an integration candidate until its clean six-target native signed
+package matrix, canary/live acceptance, and exact-revision fleet deployment
+pass. Version strings or locally passing focused tests alone do not make it the
+latest live release; the releases page and the live signed catalog remain the
+user-facing truth.
 
 ```bash
 scripts/dev-net.sh --cleanup

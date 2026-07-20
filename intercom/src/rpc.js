@@ -8,6 +8,33 @@ import { readJsonBody } from '../trac/trac-peer/rpc/utils/body.js';
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const normalizeKey = (value) => String(value ?? '').trim().toLowerCase();
 
+export const loadPrivateInternalAuthSecret = ({
+  fsModule,
+  pathModule,
+  secretPath,
+  platform = typeof process !== 'undefined' ? process.platform : '',
+}) => {
+  const configuredPath = String(secretPath ?? '').trim();
+  if (!configuredPath) {
+    throw new Error('MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE is required.');
+  }
+  const resolved = pathModule.resolve(configuredPath);
+  const stat = fsModule.lstatSync(resolved);
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error('Stripe internal auth secret must be a regular non-symlink file.');
+  }
+  if (platform !== 'win32' &&
+      typeof stat.mode === 'number' &&
+      (stat.mode & 0o077) !== 0) {
+    throw new Error('Stripe internal auth secret file must not be group/world accessible.');
+  }
+  const secret = String(fsModule.readFileSync(resolved, 'utf8')).trim();
+  if (secret.length < 32 || secret.length > 256 || /[\u0000-\u001f\u007f]/.test(secret)) {
+    throw new Error('Stripe internal auth secret must contain 32-256 printable bytes.');
+  }
+  return secret;
+};
+
 const safeBooleanCall = (target, method) => {
   try {
     return typeof target?.[method] === 'function' ? target[method]() === true : null;
@@ -167,7 +194,11 @@ export async function requestStripeConnect(peer, service, body) {
       typeof body.payload.provider !== 'string' || !body.payload.provider.trim()) {
     throw new Error('Missing provider.');
   }
-  if (!['stripe_connect_onboard', 'stripe_connect_status'].includes(service)) {
+  if (![
+    'stripe_connect_onboard',
+    'stripe_connect_status',
+    'stripe_connect_relink',
+  ].includes(service)) {
     throw new Error('Invalid Stripe Connect service.');
   }
   const registered = peer.protocol?.instance?.features?.mayhem;
@@ -190,7 +221,11 @@ const errorResponse = (error) => {
 
 export const createServer = (
   peer,
-  { maxBodyBytes = DEFAULT_MAX_BODY_BYTES, allowOrigin = '*' } = {}
+  {
+    maxBodyBytes = DEFAULT_MAX_BODY_BYTES,
+    allowOrigin = '*',
+    releaseIdentity,
+  } = {}
 ) => {
   const sortedRoutes = [...routes].sort((a, b) => b.path.length - a.path.length);
   return http.createServer({}, async (req, res) => {
@@ -208,6 +243,17 @@ export const createServer = (
 
     const requestPath = (req.url || '/').split('?')[0];
     try {
+      if (req.method === 'GET' && requestPath === '/v1/health') {
+        if (!Number.isSafeInteger(releaseIdentity?.contractVersion) ||
+            !/^[0-9a-f]{64}$/.test(releaseIdentity?.contractCodeSha256 ?? '')) {
+          throw new Error('Intercom release identity is unavailable.');
+        }
+        return respond(200, {
+          ok: true,
+          contract_version: releaseIdentity.contractVersion,
+          contract_code_sha256: releaseIdentity.contractCodeSha256,
+        });
+      }
       if (req.method === 'POST' && requestPath === '/v1/contract/feature') {
         const body = await readJsonBody(req, { maxBytes: maxBodyBytes });
         return respond(200, await submitMayhemFeature(peer, body));
@@ -223,6 +269,10 @@ export const createServer = (
       if (req.method === 'POST' && requestPath === '/v1/payment/stripe/connect/status') {
         const body = await readJsonBody(req, { maxBytes: maxBodyBytes });
         return respond(200, await requestStripeConnect(peer, 'stripe_connect_status', body));
+      }
+      if (req.method === 'POST' && requestPath === '/v1/payment/stripe/connect/relink') {
+        const body = await readJsonBody(req, { maxBytes: maxBodyBytes });
+        return respond(200, await requestStripeConnect(peer, 'stripe_connect_relink', body));
       }
       for (const route of sortedRoutes) {
         if (req.method !== route.method || requestPath !== route.path) continue;

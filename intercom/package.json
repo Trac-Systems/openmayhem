@@ -1,6 +1,6 @@
 {
   "name": "mayhem-intercom",
-  "version": "0.2.0",
+  "version": "0.2.23",
   "type": "module",
   "main": "src/main.js",
   "scripts": {

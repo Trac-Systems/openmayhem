@@ -262,6 +262,31 @@ fn sandboxed_child_allows_nested_writes_in_worker_cache() {
     assert!(output.contains("\"denied\": false"), "{output}");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn sandboxed_child_can_name_its_own_threads() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = sandbox_config(&temp);
+    let binary = env!("CARGO_BIN_EXE_mayhem-enclave");
+    let mut command = SandboxedCommand::new("/bin/sh");
+    command
+        .sandbox_helper(binary)
+        .args(["-c", "printf mayhem-worker > /proc/self/task/$$/comm"])
+        .stderr(SandboxedStderr::Piped);
+
+    let mut child = command.spawn(&config).expect("spawn thread-name probe");
+    child.take_stdin();
+    let mut stderr = String::new();
+    child
+        .take_stderr()
+        .expect("sandboxed stderr")
+        .read_to_string(&mut stderr)
+        .expect("read thread-name probe stderr");
+    let status = child.wait().expect("wait for thread-name probe");
+
+    assert!(status.success(), "status={status}\nstderr={stderr}");
+}
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
 fn sandboxed_child_denies_writes_outside_explicit_writable_trees() {

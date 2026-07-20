@@ -2,33 +2,27 @@
 import fs from 'fs';
 import http from 'http';
 import path from 'path';
+import crypto from 'crypto';
 import b4a from 'b4a';
 import PeerWallet from 'trac-wallet';
 import { Peer, createConfig as createPeerConfig, ENV as PEER_ENV } from 'trac-peer';
-import { createServer as createRpcServer } from './rpc.js';
+import {
+  createServer as createRpcServer,
+  loadPrivateInternalAuthSecret,
+} from './rpc.js';
 import { hydrateAdminWriterViews, joinCanonicalPeers } from './admin-view-hydration.js';
 import { installFatalRuntimeErrorPolicy } from './runtime-errors.js';
+import { verifyStartupReleaseIdentity } from './release-identity.js';
 import { MainSettlementBus } from 'trac-msb/src/index.js';
 import { createConfig as createMsbConfig, ENV as MSB_ENV } from 'trac-msb/src/config/env.js';
 import { ensureTextCodecs } from 'trac-peer/src/textCodec.js';
 import { getPearRuntime, ensureTrailingSlash } from 'trac-peer/src/runnerArgs.js';
 import { Terminal } from 'trac-peer/src/terminal/index.js';
-import {
-  contractGenerateNonce,
-  contractPrepareTx,
-  contractTx,
-} from '../trac/trac-peer/rpc/services.js';
-import MayhemProtocol from '../contract/protocol.js';
-import MayhemContract from '../contract/contract.js';
 import Sidechannel from '../features/sidechannel/index.js';
 import DirectSession from '../features/direct-session/index.js';
 import InferenceRelay from '../features/inference-relay/index.js';
 import ScBridge from '../features/sc-bridge/index.js';
 import { resolveScBridgeToken } from '../features/sc-bridge/token.js';
-import MayhemFeature, {
-  MAYHEM_RELAY_CHANNEL,
-  MAYHEM_RELAY_MAX_MESSAGE_BYTES,
-} from '../features/mayhem/index.js';
 
 const fatalRuntimeError = installFatalRuntimeErrorPolicy(
   typeof Bare !== 'undefined' ? Bare : null
@@ -36,18 +30,71 @@ const fatalRuntimeError = installFatalRuntimeErrorPolicy(
 
 const { argv, env, storeLabel, flags } = getPearRuntime();
 
+const releaseIdentity = verifyStartupReleaseIdentity();
+const [
+  { default: MayhemProtocol },
+  {
+    default: MayhemContract,
+    stripePayoutProcessorRevision,
+    stripePayoutVerificationFeatureKey,
+  },
+  {
+    default: MayhemFeature,
+    MAYHEM_RELAY_CHANNEL,
+    MAYHEM_RELAY_MAX_MESSAGE_BYTES,
+  },
+] = await Promise.all([
+  import('../contract/protocol.js'),
+  import('../contract/contract.js'),
+  import('../features/mayhem/index.js'),
+]);
+
 const stripeWorkerEndpoint = (raw = 'http://127.0.0.1:11436', endpointPath) => {
   const parsed = new URL(String(raw));
   const loopback = parsed.hostname === '127.0.0.1' ||
     parsed.hostname === 'localhost' ||
     parsed.hostname === '[::1]';
   if (parsed.protocol !== 'http:' || !loopback || parsed.username || parsed.password) {
-    throw new Error('MAYHEM_STRIPE_WORKER_URL must be an unauthenticated loopback HTTP URL.');
+    throw new Error('MAYHEM_STRIPE_WORKER_URL must be a credential-free loopback HTTP URL.');
   }
   parsed.pathname = `${parsed.pathname.replace(/\/$/, '')}/${String(endpointPath).replace(/^\//, '')}`;
   parsed.search = '';
   parsed.hash = '';
   return parsed;
+};
+
+const stripePayoutTargetPointerKey = (provider, accountId) =>
+  `payout/stripe-verified/target/${provider}/${accountId}`;
+
+const stripeInternalAuthSecret = () => {
+  return loadPrivateInternalAuthSecret({
+    fsModule: fs,
+    pathModule: path,
+    secretPath: env.MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE,
+  });
+};
+
+const internalStripeAuthHeaders = (endpoint, body) => {
+  const timestamp = String(Math.floor(Date.now() / 1_000));
+  const nonce = crypto.randomBytes(32).toString('hex');
+  const bodyDigest = crypto.createHash('sha256').update(body).digest('hex');
+  const message = [
+    'mayhem-paygate-internal-request-v1',
+    timestamp,
+    nonce,
+    'POST',
+    endpoint.pathname,
+    bodyDigest,
+  ].join('\n');
+  const signature = crypto
+    .createHmac('sha256', stripeInternalAuthSecret())
+    .update(message)
+    .digest('hex');
+  return {
+    'x-mayhem-paygate-timestamp': timestamp,
+    'x-mayhem-paygate-nonce': nonce,
+    'x-mayhem-paygate-signature': signature,
+  };
 };
 
 const postInternalStripeRequest = (
@@ -56,11 +103,13 @@ const postInternalStripeRequest = (
   timeoutMs = 120_000
 ) => new Promise((resolve, reject) => {
   const body = JSON.stringify(value);
+  const authHeaders = internalStripeAuthHeaders(endpoint, body);
   const request = http.request(endpoint, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
       'content-length': String(b4a.byteLength(body, 'utf8')),
+      ...authHeaders,
     },
   }, (response) => {
     const chunks = [];
@@ -175,17 +224,37 @@ const validateStripeConnectRequest = async (peer, service, value) => {
     throw new Error('Invalid Stripe Connect request.');
   }
   const allowedKeys = service === 'stripe_connect_onboard'
-    ? new Set(['provider', 'country', 'request_nonce'])
-    : new Set(['provider', 'request_nonce']);
+    ? new Set([
+        'provider',
+        'country',
+        'request_nonce',
+        'rotate',
+        'previous_account_id',
+      ])
+    : service === 'stripe_connect_relink'
+      ? new Set([
+          'provider',
+          'source_provider',
+          'account_id',
+          'context_revision',
+          'country',
+          'request_nonce',
+          'consent_expires_at',
+          'source_consent_signature',
+        ])
+      : new Set(['provider', 'request_nonce']);
   const unknownKeys = Object.keys(value).filter((key) => !allowedKeys.has(key));
   if (unknownKeys.length > 0) {
     throw new Error(`Stripe Connect request does not accept fields: ${unknownKeys.join(', ')}.`);
   }
-  const provider = String(value.provider || '').toLowerCase();
-  if (!/^[0-9a-f]{64}$/.test(provider)) {
+  const rawProvider = String(value.provider || '');
+  const provider = rawProvider.toLowerCase();
+  if (rawProvider !== provider || !/^[0-9a-f]{64}$/.test(provider)) {
     throw new Error('Invalid Stripe Connect provider.');
   }
-  if (!/^[0-9a-f]{64}$/.test(String(value.request_nonce || '').toLowerCase())) {
+  const requestNonce = String(value.request_nonce || '');
+  if (requestNonce !== requestNonce.toLowerCase() ||
+      !/^[0-9a-f]{64}$/.test(requestNonce)) {
     throw new Error('Invalid Stripe Connect request nonce.');
   }
   const providerRecord = (await peer.base.view.get(`prov/${provider}`))?.value;
@@ -196,38 +265,141 @@ const validateStripeConnectRequest = async (peer, service, value) => {
       !providerRecord.accepted_rails.includes('fiat')) {
     throw new Error('Stripe Connect onboarding requires the provider to accept fiat.');
   }
-  if (service === 'stripe_connect_onboard') {
+  if (service === 'stripe_connect_onboard' || service === 'stripe_connect_relink') {
     const country = String(value.country || '').toUpperCase();
     if (!/^[A-Z]{2}$/.test(country)) {
       throw new Error('Stripe Connect country must be a two-letter ISO country code.');
+    }
+    if (service === 'stripe_connect_onboard') {
+      const rotate = value.rotate === true;
+      const previousAccountId = value.previous_account_id == null
+        ? null
+        : String(value.previous_account_id);
+      if ((value.rotate !== undefined && typeof value.rotate !== 'boolean') ||
+          (rotate && !/^acct_[A-Za-z0-9._-]+$/.test(previousAccountId || '')) ||
+          (!rotate && previousAccountId !== null)) {
+        throw new Error('Stripe Connect rotation is not canonical.');
+      }
+      return {
+        ...value,
+        provider,
+        country,
+        rotate,
+        previous_account_id: previousAccountId,
+      };
+    }
+    if (service === 'stripe_connect_relink') {
+      const rawSourceProvider = String(value.source_provider || '');
+      const sourceProvider = rawSourceProvider.toLowerCase();
+      if (rawSourceProvider !== sourceProvider ||
+          !/^[0-9a-f]{64}$/.test(sourceProvider) ||
+          sourceProvider === provider) {
+        throw new Error('Stripe Connect relink requires a different source provider identity.');
+      }
+      const accountId = String(value.account_id || '');
+      const contextRevision = String(value.context_revision || '');
+      const sourceConsentSignature = String(value.source_consent_signature || '');
+      if (!/^acct_[A-Za-z0-9._-]+$/.test(accountId) ||
+          !/^[0-9a-f]{64}$/.test(contextRevision) ||
+          !/^[0-9a-f]{128}$/.test(sourceConsentSignature) ||
+          !Number.isSafeInteger(value.consent_expires_at)) {
+        throw new Error('Stripe Connect relink consent is not canonical.');
+      }
+      const now = Math.floor(Date.now() / 1_000);
+      if (value.consent_expires_at <= now ||
+          value.consent_expires_at > now + 600) {
+        throw new Error('Stripe Connect relink consent is stale or exceeds its bounded lifetime.');
+      }
+      const sourceProviderRecord = (
+        await peer.base.view.get(`prov/${sourceProvider}`)
+      )?.value;
+      if (!sourceProviderRecord ||
+          sourceProviderRecord.status !== 'active' ||
+          !Array.isArray(sourceProviderRecord.accepted_rails) ||
+          !sourceProviderRecord.accepted_rails.includes('fiat')) {
+        throw new Error('Stripe Connect relink source must be an active fiat provider.');
+      }
+      const contextPointer = (await peer.base.view.get('payout/context/current'))?.value;
+      const context = contextPointer?.record_key
+        ? (await peer.base.view.get(contextPointer.record_key))?.value
+        : null;
+      if (!context ||
+          context.type !== 'provider_payout_context' ||
+          context.revision !== contextRevision ||
+          contextPointer.revision !== contextRevision ||
+          context.admin !== peer.wallet.publicKey ||
+          context.published_by !== peer.wallet.publicKey ||
+          context.published_by_role !== 'admin') {
+        throw new Error('Stripe Connect relink consent does not bind the current payout context.');
+      }
+      const sourceVerificationPointer = (
+        await peer.base.view.get(stripePayoutTargetPointerKey(sourceProvider, accountId))
+      )?.value;
+      const sourceVerification = sourceVerificationPointer?.record_key
+        ? (await peer.base.view.get(sourceVerificationPointer.record_key))?.value
+        : null;
+      if (!sourceVerification ||
+          sourceVerification.type !== 'stripe_payout_verification' ||
+          sourceVerification.provider !== sourceProvider ||
+          sourceVerification.target !== accountId ||
+          sourceVerification.context_revision !== contextRevision ||
+          sourceVerification.ready !== true ||
+          sourceVerification.details_submitted !== true ||
+          sourceVerification.payouts_enabled !== true ||
+          sourceVerification.transfers_enabled !== true ||
+          sourceVerification.verified_by !== peer.wallet.publicKey ||
+          sourceVerification.verified_by_role !== 'admin') {
+        throw new Error('Stripe Connect relink source account is not currently verified and ready.');
+      }
+      return {
+        ...value,
+        provider,
+        source_provider: sourceProvider,
+        account_id: accountId,
+        context_revision: contextRevision,
+        country,
+        source_consent_signature: sourceConsentSignature,
+      };
     }
     return { ...value, provider, country };
   }
   return { ...value, provider };
 };
 
-const contractResultAccepted = (response) => {
-  const result = response?.result ?? response;
-  return result?.ok === true || (result?.local === true && result?.txo != null);
-};
-
-const waitForProviderPayout = async (peer, provider, accountId, currency) => {
+const waitForStripePayoutVerification = async (
+  peer,
+  provider,
+  accountId,
+  recordKey
+) => {
   for (let attempt = 0; attempt < 120; attempt += 1) {
-    const record = (await peer.base.view.get(`prov/${provider}`))?.value;
-    const payout = record?.payouts?.stripe;
-    if (payout?.addr === accountId &&
-        payout?.method === 'stripe' &&
-        payout?.currency === currency &&
-        payout?.set_by === peer.wallet.publicKey &&
-        payout?.set_by_role === 'admin') {
-      return payout;
+    const pointer = (
+      await peer.base.view.get(stripePayoutTargetPointerKey(provider, accountId))
+    )?.value;
+    const record = pointer?.record_key === recordKey
+      ? (await peer.base.view.get(recordKey))?.value
+      : null;
+    if (record?.type === 'stripe_payout_verification' &&
+        record.provider === provider &&
+        record.verified_by === peer.wallet.publicKey &&
+        record.verified_by_role === 'admin') {
+      return record;
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  throw new Error('Timed out waiting for the admin-approved Stripe payout target.');
+  throw new Error('Timed out waiting for provider-scoped Stripe payout verification.');
 };
 
-const bindStripePayoutTarget = async (peer, provider, account) => {
+const verifyStripePayoutTarget = async (
+  peer,
+  provider,
+  account,
+  mode,
+  requestNonce,
+  verificationKind,
+  sourceProvider,
+  previousVerification
+) => {
   const accountId = String(account?.id || '');
   const currency = String(account?.default_currency || '').toLowerCase();
   if (!/^acct_[A-Za-z0-9._-]+$/.test(accountId)) {
@@ -238,89 +410,152 @@ const bindStripePayoutTarget = async (peer, provider, account) => {
       !payments.fiat.currencies.includes(currency)) {
     throw new Error(`Stripe payout currency ${currency || '(missing)'} is not enabled by the admin.`);
   }
-  const current = (await peer.base.view.get(`prov/${provider}`))?.value;
-  const payout = current?.payouts?.stripe;
-  if (payout?.addr === accountId && payout?.method === 'stripe' &&
-      payout?.currency === currency && payout?.set_by_role === 'admin') {
-    return { ok: true, changed: false, payout };
+  if (!['express', 'standard', 'custom'].includes(account?.account_type) ||
+      typeof account?.details_submitted !== 'boolean' ||
+      typeof account?.payouts_enabled !== 'boolean' ||
+      typeof account?.transfers_enabled !== 'boolean' ||
+      account.ready !== (
+        account.details_submitted &&
+        account.payouts_enabled &&
+        account.transfers_enabled
+      )) {
+    throw new Error('Stripe Connect account returned invalid payout readiness.');
   }
-  if (payout != null) {
-    throw new Error('Provider already has a different admin-approved payout target.');
+  if (!['live', 'test'].includes(mode)) {
+    throw new Error('Stripe Connect worker returned an invalid mode.');
   }
-
-  const preparedCommand = {
-    type: 'setProviderPayout',
-    value: {
-      op: 'set_provider_payout',
-      provider,
-      payout_addr: accountId,
-      payout_method: 'stripe',
-      payout_currency: currency,
-    },
+  const contextPointer = (await peer.base.view.get('payout/context/current'))?.value;
+  const context = contextPointer?.record_key
+    ? (await peer.base.view.get(contextPointer.record_key))?.value
+    : null;
+  if (!context ||
+      context.type !== 'provider_payout_context' ||
+      context.revision !== contextPointer.revision ||
+      context.payment_config_version !== payments?.ver ||
+      context.admin !== peer.wallet.publicKey ||
+      context.published_by !== peer.wallet.publicKey ||
+      context.published_by_role !== 'admin') {
+    throw new Error('Current admin-published payout context is unavailable.');
+  }
+  const value = {
+    op: 'verify_stripe_payout',
+    provider,
+    account_id: accountId,
+    account_type: account.account_type,
+    country: account.country,
+    currency,
+    mode,
+    verification_kind: verificationKind,
+    source_provider: sourceProvider,
+    processor_revision: null,
+    previous_verification: previousVerification,
+    details_submitted: account.details_submitted,
+    payouts_enabled: account.payouts_enabled,
+    transfers_enabled: account.transfers_enabled,
+    network: context.network,
+    admin: context.admin,
+    bootstrap: context.bootstrap,
+    context_revision: context.revision,
+    payment_config_version: context.payment_config_version,
+    request_nonce: String(requestNonce).toLowerCase(),
   };
-  const nonce = await contractGenerateNonce(peer);
-  const prepared = await contractPrepareTx(peer, {
-    prepared_command: preparedCommand,
-    address: peer.wallet.publicKey,
-    nonce,
-  });
-  const signature = peer.wallet.sign(b4a.from(prepared.tx, 'hex'));
-  const txBody = {
-    tx: prepared.tx,
-    prepared_command: preparedCommand,
-    address: peer.wallet.publicKey,
-    signature,
-    nonce,
-  };
-  const simulated = await contractTx(peer, { ...txBody, sim: true });
-  if (!contractResultAccepted(simulated)) {
-    throw new Error('Admin payout-target simulation was rejected.');
+  value.processor_revision = await stripePayoutProcessorRevision(value);
+  const key = await stripePayoutVerificationFeatureKey(value);
+  const currentPointer = (
+    await peer.base.view.get(stripePayoutTargetPointerKey(provider, accountId))
+  )?.value;
+  const currentRecord = currentPointer?.record_key
+    ? (await peer.base.view.get(currentPointer.record_key))?.value
+    : null;
+  if (currentRecord?.target === accountId &&
+      currentRecord.currency === currency &&
+      currentRecord.context_revision === context.revision &&
+      currentRecord.payment_config_version === context.payment_config_version &&
+      currentRecord.details_submitted === account.details_submitted &&
+      currentRecord.payouts_enabled === account.payouts_enabled &&
+      currentRecord.transfers_enabled === account.transfers_enabled) {
+    return { ok: true, changed: false, verification: currentRecord };
   }
-  const submitted = await contractTx(peer, { ...txBody, sim: false });
-  if (!contractResultAccepted(submitted)) {
-    throw new Error('Admin payout-target transaction was rejected.');
-  }
+  await peer.mayhemFeature.record(key, value);
   return {
     ok: true,
     changed: true,
-    payout: await waitForProviderPayout(peer, provider, accountId, currency),
-    tx: prepared.tx,
+    verification: await waitForStripePayoutVerification(
+      peer,
+      provider,
+      accountId,
+      key
+    ),
   };
 };
 
-const stripeConnectService = async (peer, service, value) => {
+const stripeConnectService = async (peer, service, value, authorization) => {
   const request = await validateStripeConnectRequest(peer, service, value);
+  const verificationPointer = (
+    await peer.base.view.get(`payout/stripe-verified/current/${request.provider}`)
+  )?.value;
+  const previousVerification = verificationPointer?.revision ?? null;
   const workerPath = service === 'stripe_connect_onboard'
     ? '/v1/stripe/connect/onboard'
-    : '/v1/stripe/connect/status';
+    : service === 'stripe_connect_relink'
+      ? '/v1/stripe/connect/relink'
+      : '/v1/stripe/connect/status';
   const endpoint = stripeWorkerEndpoint(env.MAYHEM_STRIPE_WORKER_URL, workerPath);
+  const workerRequest = service === 'stripe_connect_relink'
+    ? {
+        ...request,
+        target_service_signature: authorization?.signature,
+      }
+    : request;
+  if (service === 'stripe_connect_relink' &&
+      (authorization?.actor !== request.provider ||
+        !/^[0-9a-f]{128}$/.test(String(authorization?.signature || '')))) {
+    throw new Error('Stripe Connect relink target authorization is unavailable.');
+  }
   const response = await postInternalStripeRequest(
     endpoint,
-    request,
+    workerRequest,
     stripeWorkerRequestTimeoutMs
   );
   if (response?.ok !== true || response?.rail !== 'fiat' ||
       response?.processor_rail !== 'stripe' || response?.provider !== request.provider) {
     throw new Error('Stripe Connect worker returned an invalid response.');
   }
-  const payoutBinding = response.account?.ready === true
-    ? await bindStripePayoutTarget(peer, request.provider, response.account)
+  if (service === 'stripe_connect_relink' &&
+      response.source_provider !== request.source_provider) {
+    throw new Error('Stripe Connect relink worker returned the wrong source provider.');
+  }
+  const payoutVerification = response.account
+    ? await verifyStripePayoutTarget(
+        peer,
+        request.provider,
+        response.account,
+        response.mode,
+        request.request_nonce,
+        service.slice('stripe_connect_'.length),
+        service === 'stripe_connect_relink' ? request.source_provider : null,
+        previousVerification
+      )
     : { ok: true, changed: false, pending: true };
-  return { ...response, payout_binding: payoutBinding };
+  return { ...response, payout_verification: payoutVerification };
 };
 
 const stripeAdminService = (peer) => {
   const payoutBindings = new Map();
-  return async (service, value) => {
+  return async (service, value, authorization) => {
     if (service === 'stripe_checkout') return await stripeCheckoutRequest(peer, value);
-    if (!['stripe_connect_onboard', 'stripe_connect_status'].includes(service)) {
+    if (![
+      'stripe_connect_onboard',
+      'stripe_connect_status',
+      'stripe_connect_relink',
+    ].includes(service)) {
       throw new Error('Unsupported Mayhem admin service.');
     }
     const provider = String(value?.provider || '').toLowerCase();
     const previous = payoutBindings.get(provider) || Promise.resolve();
     const current = previous
       .catch(() => {})
-      .then(() => stripeConnectService(peer, service, value));
+      .then(() => stripeConnectService(peer, service, value, authorization));
     payoutBindings.set(provider, current);
     try {
       return await current;
@@ -1142,6 +1377,8 @@ const peerWriterKey = peer.writerLocalKey ?? peer.base?.local?.key?.toString('he
 console.log('');
 console.log('==================== MAYHEM INTERCOM ====================');
 console.log('Network:', networkEnv);
+console.log('Contract version:', releaseIdentity.contractVersion);
+console.log('Contract code SHA-256:', releaseIdentity.contractCodeSha256);
 console.log('MSB address prefix:', msbConfig.addressPrefix);
 console.log('MSB network id:', msbConfig.networkId);
 console.log('MSB network bootstrap:', msbBootstrapHex);
@@ -1348,6 +1585,7 @@ if (rpcEnabled) {
   rpcServer = createRpcServer(peer, {
     maxBodyBytes: rpcMaxBodyBytes,
     allowOrigin: rpcAllowOrigin,
+    releaseIdentity,
   });
   rpcServer.listen(rpcPort, rpcHost, () => {
     console.log('RPC: ready', `http://${rpcHost}:${rpcPort}/v1`);

@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,9 +27,17 @@ pub use validated_audio::{
 };
 
 pub const CRATE_NAME: &str = "mayhem-proto";
-pub const CONTRACT_VERSION: u32 = 12;
+pub const CONTRACT_VERSION: u32 = 13;
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 2;
 pub const ATTESTATION_ALG: &str = "ed25519";
+pub const ATTESTATION_POLICY_SCHEMA_VERSION: u32 = 1;
+pub const ATTESTATION_EVIDENCE_BINDING_VERSION: u32 = 1;
+pub const TPM_ACTIVATE_CREDENTIAL_SCHEMA_VERSION: u32 = 1;
+pub const TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION: u32 = 1;
+pub const TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE: &str = "tpm.activate.challenge";
+pub const TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE: &str = "tpm.activate.response";
+pub const TPM_PCR_POLICY_SCHEMA_VERSION: u32 = 1;
+pub const TPM_QUOTE_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 9;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
 pub const CTX_BRACKET_TABLE_VERSION: u32 = 1;
@@ -468,7 +479,7 @@ pub fn default_model_class() -> String {
     DEFAULT_MODEL_CLASS.to_owned()
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HardwareQuoteKind {
     AppleAppAttestJwt,
@@ -481,6 +492,16 @@ pub enum HardwareQuoteKind {
 }
 
 impl HardwareQuoteKind {
+    pub const ALL: [Self; 7] = [
+        Self::AppleAppAttestJwt,
+        Self::AmdSevSnpVcek,
+        Self::IntelTdxDcap,
+        Self::NvidiaGb10DeviceJwt,
+        Self::NvidiaNrasJwt,
+        Self::NvidiaNvtrustOfflineJwt,
+        Self::Tpm2QuoteEk,
+    ];
+
     pub fn attestation_tier(&self) -> u8 {
         match self {
             Self::AppleAppAttestJwt | Self::NvidiaGb10DeviceJwt | Self::Tpm2QuoteEk => {
@@ -492,9 +513,274 @@ impl HardwareQuoteKind {
             | Self::NvidiaNvtrustOfflineJwt => TIER3_CONFIDENTIAL_COMPUTE_TIER,
         }
     }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AppleAppAttestJwt => "apple_app_attest_jwt",
+            Self::AmdSevSnpVcek => "amd_sev_snp_vcek",
+            Self::IntelTdxDcap => "intel_tdx_dcap",
+            Self::NvidiaGb10DeviceJwt => "nvidia_gb10_device_jwt",
+            Self::NvidiaNrasJwt => "nvidia_nras_jwt",
+            Self::NvidiaNvtrustOfflineJwt => "nvidia_nvtrust_offline_jwt",
+            Self::Tpm2QuoteEk => "tpm2_quote_ek",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationVerifierProfile {
+    AppleAppAttestNativeV1,
+    AmdSevSnpVcekV1,
+    IntelTdxDcapV1,
+    NvidiaGb10DeviceV1,
+    NvidiaNrasCompositeV1,
+    NvidiaNvtrustOfflineCompositeV1,
+    Tpm2EkActivateCredentialV1,
+}
+
+impl AttestationVerifierProfile {
+    pub const fn quote_kind(self) -> HardwareQuoteKind {
+        match self {
+            Self::AppleAppAttestNativeV1 => HardwareQuoteKind::AppleAppAttestJwt,
+            Self::AmdSevSnpVcekV1 => HardwareQuoteKind::AmdSevSnpVcek,
+            Self::IntelTdxDcapV1 => HardwareQuoteKind::IntelTdxDcap,
+            Self::NvidiaGb10DeviceV1 => HardwareQuoteKind::NvidiaGb10DeviceJwt,
+            Self::NvidiaNrasCompositeV1 => HardwareQuoteKind::NvidiaNrasJwt,
+            Self::NvidiaNvtrustOfflineCompositeV1 => HardwareQuoteKind::NvidiaNvtrustOfflineJwt,
+            Self::Tpm2EkActivateCredentialV1 => HardwareQuoteKind::Tpm2QuoteEk,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationMeasurementLayer {
+    Cpu,
+    Gpu,
+    Workload,
+}
+
+/// An exact admin approval for one canonical enclave, quote kind, and platform.
+///
+/// The runtime binary hash is intentionally absent: it is quote evidence, not
+/// part of catalog enclave identity or admin approval.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminEnclaveAttestationBinding {
+    pub enclave_id: String,
+    pub kind: HardwareQuoteKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub measurement_trust_data: BTreeMap<AttestationMeasurementLayer, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminAttestationPolicy {
+    pub schema_version: u32,
+    pub sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_policy_digest: Option<String>,
+    pub issued_epoch: u64,
+    pub effective_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_epoch: Option<u64>,
+    pub min_verifier_version: u32,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub emergency_disabled_quote_kinds: BTreeSet<HardwareQuoteKind>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub origin_pins: Vec<AttestationOriginPin>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trust_data: Vec<AttestationTrustDataRef>,
+    pub quote_kinds: Vec<AttestationQuoteKindPolicy>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationOriginPin {
+    pub id: String,
+    pub https_origin: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationTrustDataRef {
+    pub id: String,
+    pub kind: AttestationTrustDataKind,
+    pub sha256: String,
+    pub media_type: String,
+    pub max_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<AttestationTrustDataSource>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttestationTrustDataKind {
+    TrustAnchor,
+    VerificationKey,
+    Revocation,
+    Measurement,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationTrustDataSource {
+    pub origin_pin: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttestationQuoteKindPolicy {
+    pub kind: HardwareQuoteKind,
+    pub enabled: bool,
+    pub verifier_profile: AttestationVerifierProfile,
+    pub evidence_schema_version: u32,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub required_trust_data: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub measurement_trust_data: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub platforms: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub required_measurement_layers: BTreeSet<AttestationMeasurementLayer>,
+}
+
+/// Provider-advertised routing data. `declared_platform` is only a hint until
+/// it is matched against an active admin policy and verified evidence.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareQuoteRouteAdvertisement {
+    pub kind: HardwareQuoteKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_platform: Option<String>,
+}
+
+/// Buyer-side commitment captured when a route is selected.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareQuoteRoutePolicyBinding {
+    pub enclave_id: String,
+    pub device_id: String,
+    pub kind: HardwareQuoteKind,
+    pub evidence_schema_version: u32,
+    pub policy_sequence: u64,
+    pub policy_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TpmEkProfile {
+    RsaSha256Aes128Cfb,
+    EccP256Sha256Aes128Cfb,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TpmActivateCredentialHello {
+    pub schema_version: u32,
+    pub ek_profile: TpmEkProfile,
+    pub ek_public_spki_der_b64: String,
+    pub ak_name_b64: String,
+    pub quote_binding: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TpmActivateCredentialChallenge {
+    pub schema_version: u32,
+    pub challenge_id: String,
+    pub ek_public_sha256: String,
+    pub ak_name_b64: String,
+    pub quote_binding: String,
+    pub credential_blob_b64: String,
+    pub encrypted_secret_b64: String,
+    pub issued_at_unix: u64,
+    pub expires_at_unix: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TpmActivateCredentialResponse {
+    pub schema_version: u32,
+    pub challenge_id: String,
+    pub ak_name_b64: String,
+    pub quote_binding: String,
+    pub activated_secret_b64: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TpmActivateCredentialChallengeFrame {
+    #[serde(rename = "t")]
+    pub frame_type: String,
+    #[serde(rename = "v")]
+    pub version: u32,
+    pub session_id: String,
+    pub provider: String,
+    pub enclave_id: String,
+    pub room_id: String,
+    pub challenge: TpmActivateCredentialChallenge,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TpmActivateCredentialResponseFrame {
+    #[serde(rename = "t")]
+    pub frame_type: String,
+    #[serde(rename = "v")]
+    pub version: u32,
+    pub session_id: String,
+    pub provider: String,
+    pub enclave_id: String,
+    pub room_id: String,
+    pub response: TpmActivateCredentialResponse,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TpmHashAlgorithm {
+    Sha256,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TpmPcrPolicy {
+    pub schema_version: u32,
+    pub hash_algorithm: TpmHashAlgorithm,
+    pub pcrs: BTreeMap<u8, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TpmPcrValue {
+    pub hash_algorithm: TpmHashAlgorithm,
+    pub index: u8,
+    pub digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TpmQuoteEvidence {
+    pub schema_version: u32,
+    pub ak_public_b64: String,
+    pub ak_name_b64: String,
+    pub quote_attest_b64: String,
+    pub quote_signature_b64: String,
+    pub pcr_values: Vec<TpmPcrValue>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HardwareQuote {
     pub kind: HardwareQuoteKind,
     pub evidence: String,
@@ -506,6 +792,7 @@ pub struct HardwareQuote {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AttestationReport {
     pub schema_version: u32,
     pub alg: String,
@@ -2144,6 +2431,280 @@ mod tests {
         assert_eq!(encoded, "\"tpm2_quote_ek\"");
         let decoded: HardwareQuoteKind = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, HardwareQuoteKind::Tpm2QuoteEk);
+    }
+
+    #[test]
+    fn attestation_verifier_profiles_are_fixed_to_quote_kinds() {
+        let profiles = [
+            AttestationVerifierProfile::AppleAppAttestNativeV1,
+            AttestationVerifierProfile::AmdSevSnpVcekV1,
+            AttestationVerifierProfile::IntelTdxDcapV1,
+            AttestationVerifierProfile::NvidiaGb10DeviceV1,
+            AttestationVerifierProfile::NvidiaNrasCompositeV1,
+            AttestationVerifierProfile::NvidiaNvtrustOfflineCompositeV1,
+            AttestationVerifierProfile::Tpm2EkActivateCredentialV1,
+        ];
+
+        assert_eq!(
+            profiles.map(AttestationVerifierProfile::quote_kind),
+            HardwareQuoteKind::ALL
+        );
+    }
+
+    #[test]
+    fn enclave_attestation_binding_is_exact_and_excludes_runtime_release_identity() {
+        let binding = AdminEnclaveAttestationBinding {
+            enclave_id: "11".repeat(32),
+            kind: HardwareQuoteKind::NvidiaNrasJwt,
+            platform: Some("nvidia-h100-cc".to_owned()),
+            measurement_trust_data: BTreeMap::from([
+                (
+                    AttestationMeasurementLayer::Cpu,
+                    "cpu-measurement".to_owned(),
+                ),
+                (
+                    AttestationMeasurementLayer::Gpu,
+                    "gpu-measurement".to_owned(),
+                ),
+                (
+                    AttestationMeasurementLayer::Workload,
+                    "workload-measurement".to_owned(),
+                ),
+            ]),
+        };
+        let value = serde_json::to_value(&binding).unwrap();
+        assert_eq!(
+            value["measurement_trust_data"],
+            json!({
+                "cpu": "cpu-measurement",
+                "gpu": "gpu-measurement",
+                "workload": "workload-measurement"
+            })
+        );
+        assert!(value.get("binary_hash").is_none());
+
+        let mut with_binary_approval = value.as_object().unwrap().clone();
+        with_binary_approval.insert("binary_hash".to_owned(), json!("22".repeat(32)));
+        assert!(
+            serde_json::from_value::<AdminEnclaveAttestationBinding>(Value::Object(
+                with_binary_approval
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn hardware_quote_route_wire_has_no_provider_trust_source_fields() {
+        let route = HardwareQuoteRouteAdvertisement {
+            kind: HardwareQuoteKind::Tpm2QuoteEk,
+            declared_platform: Some("windows-11-tpm2".to_owned()),
+        };
+        let value = serde_json::to_value(&route).unwrap();
+        assert_eq!(value["kind"], "tpm2_quote_ek");
+        assert!(value.get("url").is_none());
+        assert!(value.get("jku").is_none());
+
+        for (field, value) in [
+            ("jku", json!("https://provider.invalid/keys")),
+            ("trust_roots", json!(["provider-root"])),
+            ("attestation_policy", json!({"enabled": true})),
+            ("attestation_policy_chain", json!([])),
+        ] {
+            let mut advertised = serde_json::to_value(&route)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .clone();
+            advertised.insert(field.to_owned(), value);
+            assert!(
+                serde_json::from_value::<HardwareQuoteRouteAdvertisement>(Value::Object(
+                    advertised
+                ))
+                .is_err(),
+                "provider route accepted forbidden field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn hardware_quote_rejects_provider_supplied_trust_authority() {
+        let quote = HardwareQuote {
+            kind: HardwareQuoteKind::Tpm2QuoteEk,
+            evidence: "provider-evidence".to_owned(),
+            binding: "11".repeat(32),
+            endorsements: Vec::new(),
+            metadata: Value::Null,
+        };
+        let encoded = serde_json::to_value(&quote).unwrap();
+
+        for forbidden in [
+            "verifier",
+            "verifier_code",
+            "trust_roots",
+            "jwks",
+            "policy",
+            "golden_values",
+        ] {
+            let mut object = encoded.as_object().unwrap().clone();
+            object.insert(forbidden.to_owned(), json!("provider-controlled"));
+            assert!(
+                serde_json::from_value::<HardwareQuote>(Value::Object(object)).is_err(),
+                "accepted forbidden provider field {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_attestation_policy_rejects_unknown_executable_fields() {
+        let policy = json!({
+            "schema_version": ATTESTATION_POLICY_SCHEMA_VERSION,
+            "sequence": 1,
+            "issued_epoch": 10,
+            "effective_epoch": 11,
+            "min_verifier_version": 1,
+            "quote_kinds": [],
+            "hardware_quote_verifier_command": "provider-controlled-verifier"
+        });
+
+        assert!(serde_json::from_value::<AdminAttestationPolicy>(policy).is_err());
+    }
+
+    #[test]
+    fn tpm_activate_credential_wire_round_trips_and_rejects_jku() {
+        let challenge = TpmActivateCredentialChallenge {
+            schema_version: TPM_ACTIVATE_CREDENTIAL_SCHEMA_VERSION,
+            challenge_id: "11".repeat(32),
+            ek_public_sha256: "22".repeat(32),
+            ak_name_b64: "AAs=".to_owned(),
+            quote_binding: "33".repeat(32),
+            credential_blob_b64: "AAE=".to_owned(),
+            encrypted_secret_b64: "AAI=".to_owned(),
+            issued_at_unix: 100,
+            expires_at_unix: 130,
+        };
+        let encoded = serde_json::to_value(&challenge).unwrap();
+        assert_eq!(
+            serde_json::from_value::<TpmActivateCredentialChallenge>(encoded.clone()).unwrap(),
+            challenge
+        );
+
+        let mut object = encoded.as_object().unwrap().clone();
+        object.insert("jku".to_owned(), json!("https://provider.invalid/tpm-keys"));
+        assert!(
+            serde_json::from_value::<TpmActivateCredentialChallenge>(Value::Object(object))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn tpm_activation_frames_reject_unknown_fields() {
+        let challenge = TpmActivateCredentialChallenge {
+            schema_version: TPM_ACTIVATE_CREDENTIAL_SCHEMA_VERSION,
+            challenge_id: "11".repeat(32),
+            ek_public_sha256: "22".repeat(32),
+            ak_name_b64: "AAs=".to_owned(),
+            quote_binding: "33".repeat(32),
+            credential_blob_b64: "AAE=".to_owned(),
+            encrypted_secret_b64: "AAI=".to_owned(),
+            issued_at_unix: 100,
+            expires_at_unix: 130,
+        };
+        let response = TpmActivateCredentialResponse {
+            schema_version: TPM_ACTIVATE_CREDENTIAL_SCHEMA_VERSION,
+            challenge_id: challenge.challenge_id.clone(),
+            ak_name_b64: challenge.ak_name_b64.clone(),
+            quote_binding: challenge.quote_binding.clone(),
+            activated_secret_b64: "AAM=".to_owned(),
+        };
+        let challenge_frame = TpmActivateCredentialChallengeFrame {
+            frame_type: TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE.to_owned(),
+            version: TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
+            session_id: challenge.challenge_id.clone(),
+            provider: "provider".to_owned(),
+            enclave_id: "enclave".to_owned(),
+            room_id: "room".to_owned(),
+            challenge,
+        };
+        let response_frame = TpmActivateCredentialResponseFrame {
+            frame_type: TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE.to_owned(),
+            version: TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
+            session_id: response.challenge_id.clone(),
+            provider: challenge_frame.provider.clone(),
+            enclave_id: challenge_frame.enclave_id.clone(),
+            room_id: challenge_frame.room_id.clone(),
+            response,
+        };
+
+        let mut encoded_challenge = serde_json::to_value(&challenge_frame)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        encoded_challenge.insert("admin_override".to_owned(), json!(true));
+        assert!(
+            serde_json::from_value::<TpmActivateCredentialChallengeFrame>(Value::Object(
+                encoded_challenge
+            ))
+            .is_err()
+        );
+
+        let mut encoded_response = serde_json::to_value(&response_frame)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone();
+        encoded_response.insert("admin_override".to_owned(), json!(true));
+        assert!(
+            serde_json::from_value::<TpmActivateCredentialResponseFrame>(Value::Object(
+                encoded_response
+            ))
+            .is_err()
+        );
+
+        assert_eq!(
+            serde_json::from_value::<TpmActivateCredentialChallengeFrame>(
+                serde_json::to_value(&challenge_frame).unwrap()
+            )
+            .unwrap(),
+            challenge_frame
+        );
+        assert_eq!(
+            serde_json::from_value::<TpmActivateCredentialResponseFrame>(
+                serde_json::to_value(&response_frame).unwrap()
+            )
+            .unwrap(),
+            response_frame
+        );
+    }
+
+    #[test]
+    fn tpm_quote_evidence_rejects_provider_policy_and_root_fields() {
+        let evidence = TpmQuoteEvidence {
+            schema_version: TPM_QUOTE_EVIDENCE_SCHEMA_VERSION,
+            ak_public_b64: "AAE=".to_owned(),
+            ak_name_b64: "AAs=".to_owned(),
+            quote_attest_b64: "AAI=".to_owned(),
+            quote_signature_b64: "AAM=".to_owned(),
+            pcr_values: vec![TpmPcrValue {
+                hash_algorithm: TpmHashAlgorithm::Sha256,
+                index: 7,
+                digest: "11".repeat(32),
+            }],
+        };
+        let encoded = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(
+            serde_json::from_value::<TpmQuoteEvidence>(encoded.clone()).unwrap(),
+            evidence
+        );
+
+        for forbidden in ["trust_roots", "policy", "verifier", "jku", "golden_values"] {
+            let mut object = encoded.as_object().unwrap().clone();
+            object.insert(forbidden.to_owned(), json!("provider-controlled"));
+            assert!(
+                serde_json::from_value::<TpmQuoteEvidence>(Value::Object(object)).is_err(),
+                "accepted forbidden provider field {forbidden}"
+            );
+        }
     }
 
     #[test]

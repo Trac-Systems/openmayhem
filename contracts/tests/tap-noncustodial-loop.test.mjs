@@ -15,7 +15,11 @@ import {
   providerShareWei,
   rollTapSettlement,
 } from '../scripts/tap-settlement-roller.mjs';
-import { makeReceiptIdentity, signedTapReceipt } from './helpers/signed-receipt.mjs';
+import {
+  makeReceiptIdentity,
+  signedTapReceipt,
+  targetedTapBindingsFor,
+} from './helpers/signed-receipt.mjs';
 
 const TAP_USD_AU = '1000000000000000000';
 const usdAu = (value) => (BigInt(value) * 1_000_000_000_000_000_000n).toString();
@@ -54,9 +58,12 @@ test('TAP loop holds immature earnings, then provider self-claims without a cust
     epoch: 1,
     receipts: [receipt({ session: 's1', provider: providerId, epoch: 1, au: usdAu(2) })],
   };
+  const providerAccounts = { [providerId.publicKeyHex]: providerAccount };
+  const targetedSessionBindings = targetedTapBindingsFor(bundle, providerAccounts);
   const immature = await rollTapSettlement({
     bundle,
-    providerAccounts: { [providerId.publicKeyHex]: providerAccount },
+    providerAccounts,
+    targetedSessionBindings,
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     settleThroughEpoch: 1,
@@ -76,7 +83,8 @@ test('TAP loop holds immature earnings, then provider self-claims without a cust
 
   const matured = await rollTapSettlement({
     bundle,
-    providerAccounts: { [providerId.publicKeyHex]: providerAccount },
+    providerAccounts,
+    targetedSessionBindings,
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,
     settleThroughEpoch: 2,

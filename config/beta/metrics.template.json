@@ -43,7 +43,6 @@
     "admin_sets_prices": true,
     "admin_sets_rules": true,
     "admin_sets_params": true,
-    "admin_sets_provider_payout_targets": true,
     "admin_can_ban_providers": true,
     "providers_set_prices": false,
     "providers_set_rules": false,
@@ -52,7 +51,8 @@
     "providers_submit_models": false,
     "providers_create_canonical_rooms": false,
     "providers_only_join_admin_rooms": true,
-    "provider_payout_targets_admin_verified": true,
+    "provider_payout_bindings_permissionless": true,
+    "provider_payout_bindings_ownership_verified": true,
     "admin_rules_params_verified": true,
     "evidence": [
       "<file:admin-control-plane.json#sha256:64-hex>"
@@ -64,7 +64,7 @@
     "admin_created_rooms_verified": true,
     "provider_join_records_verified": true,
     "admin_price_records_verified": true,
-    "admin_payout_records_verified": true,
+    "provider_payout_bindings_verified": true,
     "admin_rules_records_verified": true,
     "admin_params_records_verified": true,
     "admin_provider_ban_records_verified": true,

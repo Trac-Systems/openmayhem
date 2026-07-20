@@ -6,12 +6,14 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 use ed25519_dalek::{Signature, VerifyingKey};
+use mayhem_attestation::AttestationPolicyChain;
 use mayhem_gateway::MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS;
 use mayhem_proto::{
-    default_model_class, EndpointFamilyContract, EndpointSpecialityTarget, EndpointValueType,
-    ModelSpecialityDescriptor, MoneyAu, DEFAULT_MODEL_CLASS, ENDPOINT_OPENAI_CHAT_COMPLETIONS,
-    USAGE_AUDIO_SECOND, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN,
-    USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
+    default_model_class, AdminAttestationPolicy, AdminEnclaveAttestationBinding,
+    EndpointFamilyContract, EndpointSpecialityTarget, EndpointValueType, ModelSpecialityDescriptor,
+    MoneyAu, DEFAULT_MODEL_CLASS, ENDPOINT_OPENAI_CHAT_COMPLETIONS, USAGE_AUDIO_SECOND,
+    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
+    USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -56,6 +58,16 @@ pub struct CatalogVerifyReport {
     pub download_checks: Vec<DownloadCheckReport>,
     pub source_checks: Vec<SourceCheckReport>,
     pub errors: Vec<String>,
+    pub attestation_policy_errors: Vec<String>,
+    #[serde(skip_serializing)]
+    attestation_authority: CatalogAttestationAuthority,
+}
+
+impl CatalogVerifyReport {
+    pub(crate) fn verified_attestation_authority(&self) -> Option<&CatalogAttestationAuthority> {
+        (self.ok && self.attestation_policy_errors.is_empty())
+            .then_some(&self.attestation_authority)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +102,26 @@ pub(crate) struct CatalogDocument {
     pub(crate) catalog_id: String,
     pub(crate) generated_at: String,
     pub(crate) models: Vec<CatalogModel>,
+}
+
+/// The optional attestation authority carried inside the signed catalog bytes.
+///
+/// This is decoded separately from `CatalogDocument` so existing catalog
+/// construction tools cannot accidentally synthesize or preserve authority
+/// fields without an explicit signed-catalog workflow.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct CatalogAttestationAuthority {
+    #[serde(default)]
+    pub(crate) attestation_policy_chain: Option<Vec<AdminAttestationPolicy>>,
+    #[serde(default)]
+    pub(crate) enclave_attestation_bindings: Vec<AdminEnclaveAttestationBinding>,
+}
+
+impl CatalogAttestationAuthority {
+    #[cfg(test)]
+    pub(crate) fn is_tier1_only(&self) -> bool {
+        self.attestation_policy_chain.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -481,6 +513,8 @@ pub fn verify(options: VerifyOptions) -> Result<CatalogVerifyReport> {
             return Ok(failed_report(options, signature, catalog_hash, errors));
         }
     };
+    let (attestation_authority, attestation_policy_errors) =
+        validated_catalog_attestation_authority(&catalog_bytes);
 
     let mut model_ids = BTreeSet::new();
     let mut canary_sets = BTreeSet::new();
@@ -526,6 +560,7 @@ pub fn verify(options: VerifyOptions) -> Result<CatalogVerifyReport> {
 
     Ok(CatalogVerifyReport {
         ok: errors.is_empty()
+            && attestation_policy_errors.is_empty()
             && download_checks.iter().all(|check| check.ok)
             && source_checks.iter().all(|check| check.ok),
         catalog_path: options.catalog_path,
@@ -540,6 +575,8 @@ pub fn verify(options: VerifyOptions) -> Result<CatalogVerifyReport> {
         download_checks,
         source_checks,
         errors,
+        attestation_policy_errors,
+        attestation_authority,
     })
 }
 
@@ -568,6 +605,8 @@ fn failed_report(
         download_checks: Vec::new(),
         source_checks: Vec::new(),
         errors,
+        attestation_policy_errors: Vec::new(),
+        attestation_authority: CatalogAttestationAuthority::default(),
     }
 }
 
@@ -658,6 +697,65 @@ fn validate_catalog(catalog: &CatalogDocument, errors: &mut Vec<String>) {
     if catalog.generated_at.trim().is_empty() {
         errors.push("generated_at is required".to_owned());
     }
+}
+
+fn validate_catalog_attestation_authority(
+    authority: &CatalogAttestationAuthority,
+    errors: &mut Vec<String>,
+) {
+    if let Err(err) = validate_catalog_attestation_authority_canonical(authority) {
+        errors.push(format!("{err:#}"));
+    }
+}
+
+pub(crate) fn validate_catalog_attestation_authority_canonical(
+    authority: &CatalogAttestationAuthority,
+) -> Result<()> {
+    AttestationPolicyChain::from_catalog_records(
+        authority.attestation_policy_chain.clone(),
+        authority.enclave_attestation_bindings.clone(),
+    )
+    .map_err(anyhow::Error::msg)
+    .context("invalid catalog attestation authority")?;
+
+    if let Some(policies) = authority.attestation_policy_chain.as_ref() {
+        for (policy_index, policy) in policies.iter().enumerate() {
+            for reference in &policy.trust_data {
+                if reference.source.is_none() {
+                    bail!(
+                        "catalog attestation_policy_chain[{policy_index}] trust data {} has no canonical HTTPS source",
+                        reference.id
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validated_catalog_attestation_authority(
+    catalog_bytes: &[u8],
+) -> (CatalogAttestationAuthority, Vec<String>) {
+    let mut errors = Vec::new();
+    let authority = match serde_json::from_slice::<CatalogAttestationAuthority>(catalog_bytes) {
+        Ok(authority) => authority,
+        Err(err) => {
+            errors.push(format!("invalid catalog attestation authority: {err}"));
+            return (CatalogAttestationAuthority::default(), errors);
+        }
+    };
+    validate_catalog_attestation_authority(&authority, &mut errors);
+    if errors.is_empty() {
+        (authority, errors)
+    } else {
+        (CatalogAttestationAuthority::default(), errors)
+    }
+}
+
+pub(crate) fn validate_catalog_attestation_authority_bytes(catalog_bytes: &[u8]) -> Result<()> {
+    let authority = serde_json::from_slice::<CatalogAttestationAuthority>(catalog_bytes)
+        .context("invalid catalog attestation authority")?;
+    validate_catalog_attestation_authority_canonical(&authority)
 }
 
 fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
@@ -3857,6 +3955,53 @@ mod tests {
         assert_eq!(hex_to_vec("00ff").unwrap(), vec![0, 255]);
         assert!(hex_to_vec("0").is_err());
         assert!(hex_to_vec("zz").is_err());
+    }
+
+    #[test]
+    fn absent_catalog_attestation_authority_is_tier1_only() {
+        let authority: CatalogAttestationAuthority =
+            serde_json::from_value(serde_json::json!({ "models": [] })).unwrap();
+        let mut errors = Vec::new();
+        validate_catalog_attestation_authority(&authority, &mut errors);
+
+        assert!(authority.is_tier1_only());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn invalid_catalog_attestation_authority_degrades_to_tier1_only() {
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "attestation_policy_chain": [],
+            "enclave_attestation_bindings": []
+        }))
+        .unwrap();
+        let (authority, errors) = validated_catalog_attestation_authority(&bytes);
+
+        assert!(authority.is_tier1_only());
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("must not be present but empty")));
+    }
+
+    #[test]
+    fn catalog_attestation_authority_uses_canonical_chain_validator() {
+        let binding = AdminEnclaveAttestationBinding {
+            enclave_id: "11".repeat(32),
+            kind: mayhem_proto::HardwareQuoteKind::Tpm2QuoteEk,
+            platform: Some("windows-tpm2".to_owned()),
+            measurement_trust_data: BTreeMap::new(),
+        };
+        let mut errors = Vec::new();
+        validate_catalog_attestation_authority(
+            &CatalogAttestationAuthority {
+                attestation_policy_chain: None,
+                enclave_attestation_bindings: vec![binding],
+            },
+            &mut errors,
+        );
+
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("require an attestation policy chain"));
     }
 
     #[test]

@@ -115,8 +115,6 @@ Environment:
   MAYHEM_E11_PROVIDER_HW_QUOTE_KIND      Provider hardware quote kind for Tier-2/3 smokes
   MAYHEM_E11_PROVIDER_HW_QUOTE_COMMAND   Remote provider hardware quote command path
   MAYHEM_E11_PROVIDER_HW_QUOTE_TIMEOUT_SECONDS  Provider hardware quote timeout (default: 120)
-  MAYHEM_E11_GATEWAY_HW_VERIFIER_COMMAND Local gateway hardware quote verifier command path
-  MAYHEM_E11_GATEWAY_HW_VERIFIER_TIMEOUT_SECONDS Gateway verifier timeout (default: 120)
   MAYHEM_E11_SKIP_MAC_FALLBACK     Skip the local Apple GGUF fallback assertion (default: 0)
   MAYHEM_E11_SKIP_TOOL_CALL        Skip the vLLM guided tool-call smoke (default: 0)
   MAYHEM_E11_KEEP_REMOTE_RUN       Keep Spark run home/logs after cleanup (default: 0; token is always removed)
@@ -1469,12 +1467,11 @@ async function main() {
   }
   const providerHwQuoteKind = process.env.MAYHEM_E11_PROVIDER_HW_QUOTE_KIND || '';
   const providerHwQuoteCommand = process.env.MAYHEM_E11_PROVIDER_HW_QUOTE_COMMAND || '';
-  const gatewayHwVerifierCommand = process.env.MAYHEM_E11_GATEWAY_HW_VERIFIER_COMMAND || '';
   if (Boolean(providerHwQuoteKind) !== Boolean(providerHwQuoteCommand)) {
     fail('MAYHEM_E11_PROVIDER_HW_QUOTE_KIND and MAYHEM_E11_PROVIDER_HW_QUOTE_COMMAND must be supplied together');
   }
-  if (accelAttTier >= 3 && (!providerHwQuoteKind || !gatewayHwVerifierCommand)) {
-    fail('Tier-3 smoke requires MAYHEM_E11_PROVIDER_HW_QUOTE_* and MAYHEM_E11_GATEWAY_HW_VERIFIER_COMMAND');
+  if (accelAttTier >= 3 && !providerHwQuoteKind) {
+    fail('Tier-3 smoke requires MAYHEM_E11_PROVIDER_HW_QUOTE_*');
   }
   const rateMapJson = textRateMapJson(model);
   const accelRateMapJson = process.env.MAYHEM_E11_ACCEL_RATE_MAP_JSON
@@ -1944,10 +1941,6 @@ async function main() {
       '--canary-probe-min-interval-sessions', '1',
       '--canary-probe-max-interval-sessions', '1',
       '--canary-probe-epoch', '1',
-      ...(gatewayHwVerifierCommand ? [
-        '--hardware-quote-verifier-command', gatewayHwVerifierCommand,
-        '--hardware-quote-verifier-timeout-seconds', String(envPositiveInt('MAYHEM_E11_GATEWAY_HW_VERIFIER_TIMEOUT_SECONDS', 120)),
-      ] : []),
       '--bind', `127.0.0.1:${gatewayPort}`,
       '--json',
     ],
@@ -2120,7 +2113,6 @@ async function main() {
       guided_tool_call: toolCall,
       concurrent_heartbeat: concurrentHeartbeat,
       canary_probe: canaryProbe,
-      hardware_quote_verifier_command: gatewayHwVerifierCommand || null,
       latest_receipt: receiptBody,
       receipts: path.relative(ROOT, receiptsPath),
       epoch_settlement: epochSettlement,

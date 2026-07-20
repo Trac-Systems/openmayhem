@@ -54,6 +54,11 @@ test('DirectSession exposes raised mx/s rate limits without relay semantics', ()
   assert.equal(stats.rateBytesPerSecond, 1_000_000);
   assert.equal(stats.rateBurstBytes, 1_000_000);
   assert.equal(stats.receiveRateBurstBytes, 1_000_000 + (256 * 1024));
+  assert.equal(stats.receiveBatchHeadroomBytes, 64 * 1024 * 1024);
+  assert.equal(
+    stats.receiveRateCapacityBytes,
+    1_000_000 + (256 * 1024) + (64 * 1024 * 1024)
+  );
   assert.equal(stats.sendDrainTimeoutMs, 0);
   assert.equal(stats.connectMaxWaitMs, 120_000);
   assert.equal(stats.connectPollMs, 100);
@@ -99,6 +104,7 @@ test('DirectSession accepts explicit mx/s limiter config and ignores unsafe valu
     maxStringBytes: 2048,
     rateBytesPerSecond: 2_000_000,
     rateBurstBytes: 3_000_000,
+    receiveBatchHeadroomBytes: 8192,
     sendDrainTimeoutMs: 12_000,
     connectMaxWaitMs: 600_000,
     connectPollMs: 250,
@@ -110,6 +116,8 @@ test('DirectSession accepts explicit mx/s limiter config and ignores unsafe valu
   assert.equal(configured.stats().rateBytesPerSecond, 2_000_000);
   assert.equal(configured.stats().rateBurstBytes, 3_000_000);
   assert.equal(configured.stats().receiveRateBurstBytes, 3_004_096);
+  assert.equal(configured.stats().receiveBatchHeadroomBytes, 8192);
+  assert.equal(configured.stats().receiveRateCapacityBytes, 3_012_288);
   assert.equal(configured.stats().sendDrainTimeoutMs, 12_000);
   assert.equal(configured.stats().connectMaxWaitMs, 600_000);
   assert.equal(configured.stats().connectPollMs, 250);
@@ -118,13 +126,20 @@ test('DirectSession accepts explicit mx/s limiter config and ignores unsafe valu
     maxFrameBytes: -1,
     rateBytesPerSecond: -1,
     rateBurstBytes: -1,
+    receiveBatchHeadroomBytes: -1,
     sendDrainTimeoutMs: -1,
   });
 
   assert.equal(fallback.maxFrameBytes, 256 * 1024);
   assert.equal(fallback.stats().rateBytesPerSecond, 1_000_000);
   assert.equal(fallback.stats().rateBurstBytes, 1_000_000);
+  assert.equal(fallback.stats().receiveBatchHeadroomBytes, 64 * 1024 * 1024);
   assert.equal(fallback.stats().sendDrainTimeoutMs, 0);
+
+  const clamped = new DirectSession({}, {
+    receiveBatchHeadroomBytes: Number.MAX_SAFE_INTEGER,
+  });
+  assert.equal(clamped.stats().receiveBatchHeadroomBytes, 64 * 1024 * 1024);
 });
 
 test('DirectSession default drain wait ends on transport progress without a wall-clock cutoff', async () => {
@@ -160,7 +175,9 @@ test('DirectSession rejects oversized frames before transport send', () => {
   );
 });
 
-test('DirectSession receive bucket closes an offender instead of silently losing a frame', () => {
+test('DirectSession receive bucket closes an offender instead of silently losing a frame', (t) => {
+  let now = 10_000;
+  t.mock.method(Date, 'now', () => now);
   const frames = [];
   const frame = { t: 's.delta', d: 'token'.repeat(8) };
   const frameBytes = new DirectSession({}, {})._frameBytes(frame);
@@ -171,15 +188,18 @@ test('DirectSession receive bucket closes an offender instead of silently losing
       maxFrameBytes: frameBytes + 1,
       rateBytesPerSecond: 1,
       rateBurstBytes: frameBytes + 1,
+      receiveBatchHeadroomBytes: frameBytes * 4,
       onFrame: (event) => frames.push(event),
     }
   );
-  const receiveLimiter = directSession._newLimiter();
+  const connection = {};
 
   const session = {
     sessionId,
     remote,
-    receiveLimiter,
+    connection,
+    receiveLimiter: directSession._newReceiveLimiter(),
+    connectionReceiveLimiter: directSession._registerConnectionReceiveLimiter(connection),
     drainWaiters: new Set(),
     channel: { close: () => { closed += 1; } },
     closed: false,
@@ -188,7 +208,7 @@ test('DirectSession receive bucket closes an offender instead of silently losing
   directSession._handleFrame(session, frame);
   directSession._handleFrame(session, frame);
 
-  assert.equal(frames.length, 1);
+  assert.equal(frames.length, 2);
   assert.equal(closed, 1);
   assert.equal(session.closed, true);
   assert.equal(frames[0].session_id, sessionId);
@@ -215,18 +235,340 @@ test('DirectSession sender throttles a valid multi-frame payload instead of reje
   await assert.doesNotReject(directSession._acquireSendRate(session, 100));
 });
 
-test('DirectSession receiver tolerates one frame of transport jitter without weakening sustained rate', () => {
+test('DirectSession receiver starts small and earns only finite batching headroom', (t) => {
+  let now = 10_000;
+  t.mock.method(Date, 'now', () => now);
   const directSession = new DirectSession({}, {
     maxFrameBytes: 64,
-    rateBytesPerSecond: 1,
+    rateBytesPerSecond: 128,
     rateBurstBytes: 128,
+    receiveBatchHeadroomBytes: 256,
   });
   const receiveLimiter = directSession._newReceiveLimiter();
 
-  assert.equal(receiveLimiter.capacity, 192);
-  assert.equal(directSession._checkRate(receiveLimiter, 128), true);
-  assert.equal(directSession._checkRate(receiveLimiter, 64), true);
-  assert.equal(directSession._checkRate(receiveLimiter, 1), false);
+  assert.equal(receiveLimiter.capacity, 448);
+  assert.equal(receiveLimiter.tokens, 192);
+  assert.equal(directSession._checkRate(receiveLimiter, 193), false);
+
+  now += 2_000;
+  assert.equal(directSession._checkRate(receiveLimiter, 448), true);
+
+  now += 60_000;
+  assert.equal(directSession._checkRate(receiveLimiter, 449), false);
+  assert.equal(receiveLimiter.tokens, 448);
+});
+
+test('DirectSession earned receive credit still fails closed on a sustained flood', (t) => {
+  let now = 20_000;
+  t.mock.method(Date, 'now', () => now);
+  const frame = { t: 's.delta', d: 'bounded-rate-frame' };
+  const frameBytes = new DirectSession({}, {})._frameBytes(frame);
+  const frames = [];
+  let closed = 0;
+  const directSession = new DirectSession({}, {
+    maxFrameBytes: frameBytes,
+    rateBytesPerSecond: frameBytes,
+    rateBurstBytes: frameBytes,
+    receiveBatchHeadroomBytes: frameBytes * 2,
+    onFrame: (event) => frames.push(event),
+  });
+  const connection = {};
+  const session = {
+    sessionId,
+    remote,
+    connection,
+    receiveLimiter: directSession._newReceiveLimiter(),
+    connectionReceiveLimiter: directSession._registerConnectionReceiveLimiter(connection),
+    drainWaiters: new Set(),
+    channel: { close: () => { closed += 1; } },
+    closed: false,
+  };
+
+  now += 2_000;
+  for (let second = 0; second < 4 && !session.closed; second += 1) {
+    now += 1_000;
+    directSession._handleFrame(session, frame);
+    directSession._handleFrame(session, frame);
+  }
+
+  assert.equal(frames.length, 7);
+  assert.equal(closed, 1);
+  assert.equal(session.closed, true);
+});
+
+test('DirectSession shares earned batching headroom across sessions on one connection', (t) => {
+  let now = 30_000;
+  t.mock.method(Date, 'now', () => now);
+  const directSession = new DirectSession({}, {
+    maxFrameBytes: 100,
+    rateBytesPerSecond: 100,
+    rateBurstBytes: 100,
+    receiveBatchHeadroomBytes: 200,
+  });
+  const connection = {};
+  const makeSession = () => ({
+    connection,
+    receiveLimiter: directSession._newReceiveLimiter(),
+    connectionReceiveLimiter: directSession._registerConnectionReceiveLimiter(connection),
+  });
+  const first = makeSession();
+  const second = makeSession();
+
+  assert.equal(first.connectionReceiveLimiter, second.connectionReceiveLimiter);
+  assert.equal(first.connectionReceiveLimiter.tokens, 400);
+  assert.equal(first.connectionReceiveLimiter.capacity, 600);
+
+  now += 2_000;
+  for (let frame = 0; frame < 4; frame += 1) {
+    assert.equal(directSession._checkReceiveRate(first, 100), true);
+  }
+  for (let frame = 0; frame < 2; frame += 1) {
+    assert.equal(directSession._checkReceiveRate(second, 100), true);
+  }
+  assert.equal(second.receiveLimiter.tokens, 200);
+  assert.equal(directSession._checkReceiveRate(second, 1), false);
+
+  directSession._unregisterConnectionReceiveLimiter(first);
+  directSession._unregisterConnectionReceiveLimiter(second);
+});
+
+test('DirectSession accepts an idle-earned coalesced Protomux frame batch in order', async () => {
+  const [leftConnection, rightConnection] = memoryDuplexPair();
+  const leftKey = '31'.repeat(32);
+  const rightKey = '32'.repeat(32);
+  leftConnection.remotePublicKey = b4a.from(rightKey, 'hex');
+  rightConnection.remotePublicKey = b4a.from(leftKey, 'hex');
+  const received = [];
+  const receiver = new DirectSession({
+    swarm: { connections: new Set([leftConnection]), joinPeer: () => {} },
+  }, {
+    maxFrameBytes: 256,
+    rateBytesPerSecond: 1024,
+    rateBurstBytes: 256,
+    receiveBatchHeadroomBytes: 2048,
+    onFrame: ({ frame }) => received.push(frame),
+  });
+  const sender = new DirectSession({
+    swarm: { connections: new Set([rightConnection]), joinPeer: () => {} },
+  }, {
+    maxFrameBytes: 256,
+    rateBytesPerSecond: 0,
+    rateBurstBytes: 256,
+    receiveBatchHeadroomBytes: 2048,
+  });
+
+  try {
+    receiver._prepareConnection(leftConnection);
+    sender._prepareConnection(rightConnection);
+    await receiver.open(rightKey, sessionId);
+    const receiverRecord = receiver.sessions.get(`${rightKey}:${sessionId}`);
+    const senderRecord = sender.sessions.get(`${leftKey}:${sessionId}`);
+    assert.ok(receiverRecord);
+    assert.ok(senderRecord);
+
+    const frames = Array.from({ length: 8 }, (_, index) => ({
+      t: 's.delta',
+      i: index,
+      d: 'x'.repeat(100),
+    }));
+    const batchBytes = frames.reduce(
+      (total, frame) => total + receiver._frameBytes(frame),
+      0
+    );
+    assert.ok(batchBytes > receiver._receiveRateBurstBytes());
+    assert.ok(batchBytes < receiver._receiveRateCapacityBytes());
+
+    const idleMs = Math.ceil(
+      (receiver.receiveBatchHeadroomBytes * 1000) / receiver.rateBytesPerSecond
+    ) + 100;
+    receiverRecord.receiveLimiter.lastRefill -= idleMs;
+    receiverRecord.connectionReceiveLimiter.lastRefill -= idleMs;
+
+    const mux = rightConnection.userData;
+    mux.cork();
+    for (const frame of frames) {
+      assert.equal(senderRecord.message.send(frame), true);
+    }
+    mux.uncork();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(receiverRecord.closed, false);
+    assert.deepEqual(received.map((frame) => frame.i), frames.map((frame) => frame.i));
+  } finally {
+    receiver._dropHealthConnection(leftConnection);
+    sender._dropHealthConnection(rightConnection);
+    leftConnection.destroy();
+    rightConnection.destroy();
+  }
+});
+
+test('DirectSession preserves every model class across fragmented and coalesced direct delivery', async () => {
+  const requestId = 'request-flowrate-matrix';
+  const payloads = [
+    {
+      modelClass: 'text',
+      body: { d: 'large text output '.repeat(100) },
+    },
+    {
+      modelClass: 'embeddings',
+      body: { embeddings: [Array.from({ length: 128 }, (_, index) => index / 128)] },
+    },
+    {
+      modelClass: 'image',
+      body: {
+        artifact: {
+          id: 'image-1',
+          content_type: 'image/png',
+          encoding: 'hex',
+          data: '89'.repeat(900),
+        },
+      },
+    },
+    {
+      modelClass: 'speech',
+      body: {
+        artifact: {
+          id: 'speech-1',
+          content_type: 'audio/wav',
+          encoding: 'hex',
+          data: '52'.repeat(900),
+        },
+      },
+    },
+    {
+      modelClass: 'music',
+      body: {
+        artifact: {
+          id: 'music-1',
+          content_type: 'audio/wav',
+          encoding: 'hex',
+          data: '57'.repeat(900),
+        },
+      },
+    },
+    {
+      modelClass: 'transcription',
+      body: {
+        transcription: {
+          text: 'recognized speech '.repeat(100),
+          language: 'en',
+        },
+      },
+    },
+    {
+      modelClass: 'video',
+      body: {
+        artifact: {
+          id: 'video-1',
+          content_type: 'video/mp4',
+          encoding: 'hex',
+          data: '00'.repeat(900),
+        },
+      },
+    },
+  ];
+  const deliveries = [
+    { name: 'fragmented-direct', coalesced: false },
+    { name: 'coalesced-direct', coalesced: true },
+  ];
+
+  for (const [deliveryIndex, delivery] of deliveries.entries()) {
+    const [leftConnection, rightConnection] = memoryDuplexPair();
+    const leftKey = (40 + deliveryIndex).toString(16).padStart(2, '0').repeat(32);
+    const rightKey = (50 + deliveryIndex).toString(16).padStart(2, '0').repeat(32);
+    const matrixSessionId = (60 + deliveryIndex).toString(16).padStart(2, '0').repeat(32);
+    leftConnection.remotePublicKey = b4a.from(rightKey, 'hex');
+    rightConnection.remotePublicKey = b4a.from(leftKey, 'hex');
+    const received = [];
+    const closes = [];
+    const receiver = new DirectSession({
+      swarm: { connections: new Set([leftConnection]), joinPeer: () => {} },
+    }, {
+      maxFrameBytes: 4096,
+      rateBytesPerSecond: 4096,
+      rateBurstBytes: 1024,
+      receiveBatchHeadroomBytes: 64 * 1024,
+      onFrame: (event) => received.push(event),
+      onClose: (event) => closes.push(event),
+    });
+    const sender = new DirectSession({
+      swarm: { connections: new Set([rightConnection]), joinPeer: () => {} },
+    }, {
+      maxFrameBytes: 4096,
+      rateBytesPerSecond: 0,
+      rateBurstBytes: 4096,
+      receiveBatchHeadroomBytes: 64 * 1024,
+    });
+
+    try {
+      receiver._prepareConnection(leftConnection);
+      sender._prepareConnection(rightConnection);
+      await receiver.open(rightKey, matrixSessionId);
+      const receiverRecord = receiver.sessions.get(`${rightKey}:${matrixSessionId}`);
+      const senderRecord = sender.sessions.get(`${leftKey}:${matrixSessionId}`);
+      assert.ok(receiverRecord, `${delivery.name} receiver session`);
+      assert.ok(senderRecord, `${delivery.name} sender session`);
+
+      const frames = payloads.flatMap(({ modelClass, body }, classIndex) => (
+        [0, 1].map((part) => ({
+          t: 's.delta',
+          rid: requestId,
+          i: (classIndex * 2) + part,
+          d: '',
+          model_class: modelClass,
+          wire_part: part,
+          ...body,
+        }))
+      ));
+      const batchBytes = frames.reduce(
+        (total, frame) => total + receiver._frameBytes(frame),
+        0
+      );
+      assert.ok(batchBytes > receiver._receiveRateBurstBytes(), delivery.name);
+      assert.ok(batchBytes < receiver._receiveRateCapacityBytes(), delivery.name);
+      const idleMs = Math.ceil(
+        (receiver.receiveBatchHeadroomBytes * 1000) / receiver.rateBytesPerSecond
+      ) + 100;
+      receiverRecord.receiveLimiter.lastRefill -= idleMs;
+      receiverRecord.connectionReceiveLimiter.lastRefill -= idleMs;
+
+      const mux = rightConnection.userData;
+      if (delivery.coalesced) mux.cork();
+      for (const frame of frames) {
+        assert.equal(senderRecord.message.send(frame), true, delivery.name);
+      }
+      if (delivery.coalesced) mux.uncork();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      assert.equal(
+        receiverRecord.closed,
+        false,
+        `${delivery.name}: ${JSON.stringify(closes)}`
+      );
+      assert.deepEqual(
+        received.map(({ frame }) => frame),
+        frames,
+        delivery.name
+      );
+      assert.ok(
+        received.every(({ direct }) => direct === true),
+        delivery.name
+      );
+      assert.ok(
+        received.every(({ relayed }) => relayed === false),
+        delivery.name
+      );
+      assert.ok(
+        received.every(({ relay }) => relay === null),
+        delivery.name
+      );
+    } finally {
+      receiver._dropHealthConnection(leftConnection);
+      sender._dropHealthConnection(rightConnection);
+      leftConnection.destroy();
+      rightConnection.destroy();
+    }
+  }
 });
 
 test('DirectSession send failure closes and reclaims only the failed session', async () => {
@@ -371,7 +713,7 @@ test('bounded JSON rejects an individually oversized string before dispatch', ()
   );
 });
 
-test('DirectSession dispatches identical authenticated transport frames on direct and relayed routes', () => {
+test('DirectSession dispatch preserves frames while adding route metadata', () => {
   const directConnection = { remotePublicKey: b4a.from(remote, 'hex') };
   const relayConnection = { remotePublicKey: b4a.from(remote, 'hex') };
   const frames = [];

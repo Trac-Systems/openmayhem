@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${MAYHEM_MACOS_OPENCODE_VERSION:-macos-opencode-role-check}"
+VERSION="${MAYHEM_MACOS_OPENCODE_VERSION:-0.2.23}"
 DIST_REL="${MAYHEM_MACOS_OPENCODE_DIST_REL:-dist/macos-opencode-role-check}"
 DIST_DIR="${MAYHEM_MACOS_OPENCODE_DIST_DIR:-$ROOT_DIR/$DIST_REL}"
 SKIP_BUILD="${MAYHEM_MACOS_OPENCODE_SKIP_BUILD:-0}"
@@ -33,7 +33,7 @@ provider/user reference-machine acceptance gate.
 
 Environment:
   MAYHEM_MACOS_OPENCODE_VERSION       Artifact version string
-                                      (default: macos-opencode-role-check)
+                                      (default: 0.2.23; canonical semver is required)
   MAYHEM_MACOS_OPENCODE_DIST_DIR      Dist output directory
                                       (default: dist/macos-opencode-role-check)
   MAYHEM_MACOS_OPENCODE_SKIP_BUILD    Use existing target/release binaries when set to 1
@@ -193,11 +193,14 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
+[[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+  die "MAYHEM_MACOS_OPENCODE_VERSION must be canonical semver"
 [[ "$(uname -s)" == "Darwin" ]] || die "macOS opencode role check must run on Darwin"
 command -v node >/dev/null 2>&1 || die "node is required for JSON validation"
 command -v curl >/dev/null 2>&1 || die "curl is required"
 
 package_args=(--version "$VERSION" --out-dir "$DIST_DIR")
+package_args+=(--unsigned-layout)
 if [[ "$SKIP_BUILD" == "1" ]]; then
   package_args+=(--skip-build)
 fi
@@ -227,6 +230,7 @@ HOME="$home_dir" \
 MAYHEM_NPM_PREFIX="$npm_prefix" \
 "$ROOT_DIR/install.sh" \
   --artifact "$archive" \
+  --unsigned-layout \
   --install-dir "$install_dir" \
   --force-opencode \
   --no-path-update \

@@ -273,7 +273,6 @@ test('MayhemContract registry op log replays to byte-identical state', async () 
   const providerEntry = await first.storage.get(`prov/${provider.publicKey}`);
   assert.deepEqual(providerEntry.value, {
     provider: provider.publicKey,
-    payouts: {},
     accepted_rails: ['fiat'],
     accepted_rails_schema_version: 1,
     accepted_rails_set_by: provider.publicKey,
@@ -1863,7 +1862,7 @@ test('MayhemContract schedules enclave min-tier notice without stranding active 
   assert.equal((await storage.get(`prov/${provider.publicKey}`)).value.status, 'active');
 });
 
-test('MayhemContract rejects provider-authored payout and probation hints', async () => {
+test('MayhemContract rejects provider-authored payout hints and exposes no mutable payout op', async () => {
   const admin = await makeIdentity();
   const provider = await makeIdentity();
   const storage = new MemoryStorage({ admin: admin.publicKey });
@@ -1920,69 +1919,16 @@ test('MayhemContract rejects provider-authored payout and probation hints', asyn
   assert.equal(registered.ok, true, registered.message);
 
   const providerEntry = await storage.get(`prov/${provider.publicKey}`);
-  assert.deepEqual(providerEntry.value.payouts, {});
+  assert.equal(Object.hasOwn(providerEntry.value, 'payouts'), false);
   assert.equal(providerEntry.value.probation.since_seconds, 0);
-
-  const providerPayout = await execute(
-    contract,
-    storage,
-    'setProviderPayout',
-    {
-      op: 'set_provider_payout',
-      provider: provider.publicKey,
-      payout_addr: 'provider-picked-target',
-      payout_method: 'tnk',
-    },
-    provider.publicKey,
-    5
-  );
-  assert.match(providerPayout.message, /admin required/i);
-
-  const unsupported = await execute(
-    contract,
-    storage,
-    'setProviderPayout',
-    {
-      op: 'set_provider_payout',
-      provider: provider.publicKey,
-      payout_addr: 'admin-approved-target',
-      payout_method: 'wire',
-    },
-    admin.publicKey,
-    6
-  );
-  assert.match(unsupported.message, /unsupported payout method/i);
-
-  const adminPayout = await execute(
-    contract,
-    storage,
-    'setProviderPayout',
-    {
-      op: 'set_provider_payout',
-      provider: provider.publicKey,
-      payout_addr: 'admin-approved-target',
-      payout_method: 'tnk',
-    },
-    admin.publicKey,
-    8
-  );
-  assert.deepEqual(adminPayout, {
-    ok: true,
-    op: 'setProviderPayout',
-    provider: provider.publicKey,
-  });
-
-  const updated = await storage.get(`prov/${provider.publicKey}`);
-  assert.deepEqual(updated.value.payouts, {
-    tnk: {
-      addr: 'admin-approved-target',
-      method: 'tnk',
-      set_by: admin.publicKey,
-      set_by_role: 'admin',
-      set_at: makeTxKey(8),
-    },
-  });
-  assert.equal(updated.value.updated_at, makeTxKey(8));
+  assert.equal(typeof contract.setProviderPayout, 'undefined');
+  assert.equal(contract.schemas?.has?.('setProviderPayout') ?? false, false);
+  assert.equal(typeof contract.tnkSettlement, 'undefined');
+  assert.equal(typeof contract.fiatSettlement, 'undefined');
+  assert.equal(typeof contract.requireAdminSetPayoutTarget, 'undefined');
+  assert.equal(contract.schemas?.has?.('tnkSettlement') ?? false, false);
+  assert.equal(contract.schemas?.has?.('fiatSettlement') ?? false, false);
+  assert.equal(providerEntry.value.updated_at, makeTxKey(4));
 });
 
 test('MayhemContract lets providers declare accepted payment rails without stale rail compatibility', async () => {

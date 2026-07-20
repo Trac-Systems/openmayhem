@@ -360,16 +360,18 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
   }
 
   if (requireObject(add, metrics.controls, 'controls')) {
+    for (const retired of [
+      'admin_sets_provider_payout_targets',
+      'provider_payout_targets_admin_verified',
+    ]) {
+      if (Object.prototype.hasOwnProperty.call(metrics.controls, retired)) {
+        add('error', `controls.${retired} is retired; payout destinations are provider-bound`);
+      }
+    }
     requireBoolean(add, metrics.controls.admin_controls_economy, true, 'controls.admin_controls_economy');
     requireBoolean(add, metrics.controls.admin_sets_prices, true, 'controls.admin_sets_prices');
     requireBoolean(add, metrics.controls.admin_sets_rules, true, 'controls.admin_sets_rules');
     requireBoolean(add, metrics.controls.admin_sets_params, true, 'controls.admin_sets_params');
-    requireBoolean(
-      add,
-      metrics.controls.admin_sets_provider_payout_targets,
-      true,
-      'controls.admin_sets_provider_payout_targets',
-    );
     requireBoolean(add, metrics.controls.admin_can_ban_providers, true, 'controls.admin_can_ban_providers');
     requireBoolean(add, metrics.controls.providers_set_prices, false, 'controls.providers_set_prices');
     requireBoolean(add, metrics.controls.providers_set_rules, false, 'controls.providers_set_rules');
@@ -380,9 +382,15 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
     requireBoolean(add, metrics.controls.providers_only_join_admin_rooms, true, 'controls.providers_only_join_admin_rooms');
     requireBoolean(
       add,
-      metrics.controls.provider_payout_targets_admin_verified,
+      metrics.controls.provider_payout_bindings_permissionless,
       true,
-      'controls.provider_payout_targets_admin_verified',
+      'controls.provider_payout_bindings_permissionless',
+    );
+    requireBoolean(
+      add,
+      metrics.controls.provider_payout_bindings_ownership_verified,
+      true,
+      'controls.provider_payout_bindings_ownership_verified',
     );
     requireBoolean(
       add,
@@ -394,6 +402,15 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
   }
 
   if (requireObject(add, metrics.canonical_service, 'canonical_service')) {
+    if (Object.prototype.hasOwnProperty.call(
+      metrics.canonical_service,
+      'admin_payout_records_verified',
+    )) {
+      add(
+        'error',
+        'canonical_service.admin_payout_records_verified is retired; use provider_payout_bindings_verified',
+      );
+    }
     requireBoolean(
       add,
       metrics.canonical_service.admin_created_enclaves_verified,
@@ -426,9 +443,9 @@ function validateMetrics(metrics, { metricsPath, allowPlaceholders }) {
     );
     requireBoolean(
       add,
-      metrics.canonical_service.admin_payout_records_verified,
+      metrics.canonical_service.provider_payout_bindings_verified,
       true,
-      'canonical_service.admin_payout_records_verified',
+      'canonical_service.provider_payout_bindings_verified',
     );
     requireBoolean(
       add,

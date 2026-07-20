@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_IMAGE="${MAYHEM_DOCKER_BUILD_IMAGE:-rust:1.89-bookworm}"
 INSTALL_IMAGE="${MAYHEM_DOCKER_INSTALL_IMAGE:-debian:bookworm-slim}"
-VERSION="${MAYHEM_DOCKER_VERSION:-docker-opencode-role-check}"
+VERSION="${MAYHEM_DOCKER_VERSION:-0.2.23}"
 DIST_REL="${MAYHEM_DOCKER_DIST_REL:-dist/docker-opencode-role-check}"
 DIST_DIR="${MAYHEM_DOCKER_DIST_DIR:-$ROOT_DIR/$DIST_REL}"
 CARGO_CACHE="${MAYHEM_DOCKER_CARGO_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/mayhem/docker-cargo}"
@@ -36,7 +36,8 @@ provider/user reference-machine acceptance gate.
 Environment:
   MAYHEM_DOCKER_BUILD_IMAGE    Rust image (default: rust:1.89-bookworm)
   MAYHEM_DOCKER_INSTALL_IMAGE  Clean install image (default: debian:bookworm-slim)
-  MAYHEM_DOCKER_VERSION        Artifact version string (default: docker-opencode-role-check)
+  MAYHEM_DOCKER_VERSION        Artifact version string
+                               (default: 0.2.23; canonical semver is required)
   MAYHEM_DOCKER_DIST_DIR       Dist output directory (default: dist/docker-opencode-role-check)
   MAYHEM_DOCKER_CARGO_CACHE    Cargo cache mount (default: ~/.cache/mayhem/docker-cargo)
   MAYHEM_DOCKER_BUILD_APT_PACKAGES
@@ -58,6 +59,8 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
+[[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+  die "MAYHEM_DOCKER_VERSION must be canonical semver"
 command -v docker >/dev/null 2>&1 || die "docker is required"
 
 WORK_ROOT="$ROOT_DIR"
@@ -109,7 +112,10 @@ docker run --rm \
       apt-get install -y --no-install-recommends $MAYHEM_DOCKER_BUILD_APT_PACKAGES >/dev/null
       rm -rf /var/lib/apt/lists/*
     fi
-    scripts/package-release.sh --version "$MAYHEM_VERSION" --out-dir "$MAYHEM_DIST_DIR"
+    scripts/package-release.sh \
+      --version "$MAYHEM_VERSION" \
+      --out-dir "$MAYHEM_DIST_DIR" \
+      --unsigned-layout
   '
 
 archive="$(
@@ -137,6 +143,7 @@ docker run --rm \
     install_dir=/tmp/mayhem-install/bin
     /work/install.sh \
       --artifact "/dist/$ARCHIVE_BASENAME" \
+      --unsigned-layout \
       --install-dir "$install_dir" \
       --skip-pear \
       --no-path-update \

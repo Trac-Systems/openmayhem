@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_IMAGE="${MAYHEM_DOCKER_BUILD_IMAGE:-rust:1.89-bookworm}"
 INSTALL_IMAGE="${MAYHEM_DOCKER_INSTALL_IMAGE:-debian:bookworm-slim}"
-VERSION="${MAYHEM_DOCKER_VERSION:-docker-linux-check}"
+VERSION="${MAYHEM_DOCKER_VERSION:-0.2.23}"
 DIST_REL="${MAYHEM_DOCKER_DIST_REL:-dist/docker-linux-install-check}"
 DIST_DIR="${MAYHEM_DOCKER_DIST_DIR:-$ROOT_DIR/$DIST_REL}"
 CARGO_CACHE="${MAYHEM_DOCKER_CARGO_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/mayhem/docker-cargo}"
@@ -15,6 +15,7 @@ STAGED_ROOT=""
 BINS=(
   mayhem
   mayhem-gateway
+  mayhem-attestation-verifier
   mayhem-pay
   mayhemd
   mayhem-enclave
@@ -35,8 +36,8 @@ usage() {
 Usage: scripts/docker-linux-install-check.sh
 
 Build a Linux release archive in a Rust Docker container, then install that
-archive in a separate clean Debian container using the generated .sha256
-sidecar. The check verifies:
+explicit updater-ineligible unsigned layout in a separate clean Debian
+container using the generated .sha256 sidecar. The check verifies:
   - archive packaging completes
   - install.sh accepts the sidecar checksum without --sha256
   - install.sh prints a copy/paste PATH command
@@ -49,7 +50,7 @@ sidecar. The check verifies:
 Environment:
   MAYHEM_DOCKER_BUILD_IMAGE    Rust image (default: rust:1.89-bookworm)
   MAYHEM_DOCKER_INSTALL_IMAGE  Clean install image (default: debian:bookworm-slim)
-  MAYHEM_DOCKER_VERSION        Artifact version string (default: docker-linux-check)
+  MAYHEM_DOCKER_VERSION        Artifact version string (default: 0.2.23)
   MAYHEM_DOCKER_DIST_DIR       Dist output directory (default: dist/docker-linux-install-check)
   MAYHEM_DOCKER_CARGO_CACHE    Cargo cache mount (default: ~/.cache/mayhem/docker-cargo)
   MAYHEM_DOCKER_BUILD_APT_PACKAGES
@@ -122,7 +123,10 @@ docker run --rm \
       apt-get install -y --no-install-recommends $MAYHEM_DOCKER_BUILD_APT_PACKAGES >/dev/null
       rm -rf /var/lib/apt/lists/*
     fi
-    scripts/package-release.sh --version "$MAYHEM_VERSION" --out-dir "$MAYHEM_DIST_DIR"
+    scripts/package-release.sh \
+      --version "$MAYHEM_VERSION" \
+      --out-dir "$MAYHEM_DIST_DIR" \
+      --unsigned-layout
   '
 
 archive="$(
@@ -157,6 +161,7 @@ docker run --rm \
 
     /work/install.sh \
       --artifact "/dist/$ARCHIVE_BASENAME" \
+      --unsigned-layout \
       --install-dir "$install_dir" \
       --skip-pear \
       --skip-opencode \
@@ -183,7 +188,7 @@ docker run --rm \
   bash -s <<'BASH'
     set -euo pipefail
 
-    bins="mayhem mayhem-gateway mayhem-pay mayhemd mayhem-enclave mayhem-paygate"
+    bins="mayhem mayhem-gateway mayhem-attestation-verifier mayhem-pay mayhemd mayhem-enclave mayhem-paygate"
 
     hash_file() {
       sha256sum "$1" | awk '{print $1}'
@@ -212,7 +217,8 @@ SH
       local package="$root/mayhem-linux-installer-synthetic"
       local archive="$root/mayhem-linux-installer-synthetic.tar.gz"
       local entries="mayhem-linux-installer-synthetic"
-      mkdir -p "$package/bin"
+      mkdir -p "$package/bin" "$package/share/mayhem"
+      printf '%s\n' "unsigned synthetic rules" >"$package/share/mayhem/RULES.md"
 
       for bin in $bins; do
         make_executable "$package/bin/$bin" "$bin"
@@ -222,6 +228,8 @@ SH
       for bin in $bins; do
         printf '%s  bin/%s\n' "$(hash_file "$package/bin/$bin")" "$bin" >> "$package/SHA256SUMS"
       done
+      printf '%s  share/mayhem/RULES.md\n' \
+        "$(hash_file "$package/share/mayhem/RULES.md")" >>"$package/SHA256SUMS"
 
       case "$mode" in
         shadow)
@@ -257,6 +265,7 @@ SH
       out="$root/install.out"
       if /work/install.sh \
         --artifact "$archive" \
+        --unsigned-layout \
         --sha256 "$(hash_file "$archive")" \
         --install-dir "$root/install/bin" \
         --skip-pear \
@@ -276,6 +285,7 @@ SH
     install_dir="$root/install/bin"
     /work/install.sh \
       --artifact "$archive" \
+      --unsigned-layout \
       --sha256 "$(hash_file "$archive")" \
       --install-dir "$install_dir" \
       --skip-pear \

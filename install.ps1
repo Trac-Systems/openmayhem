@@ -6,6 +6,13 @@ param(
     [string]$Artifact = $env:MAYHEM_ARTIFACT,
     [string]$ArtifactUrl = $env:MAYHEM_ARTIFACT_URL,
     [string]$Sha256 = $env:MAYHEM_ARTIFACT_SHA256,
+    [string]$Manifest = $env:MAYHEM_RELEASE_MANIFEST,
+    [string]$ManifestUrl = $env:MAYHEM_RELEASE_MANIFEST_URL,
+    [string]$Signature = $env:MAYHEM_RELEASE_SIGNATURE,
+    [string]$SignatureUrl = $env:MAYHEM_RELEASE_SIGNATURE_URL,
+    [string]$ReleaseKey = $env:MAYHEM_RELEASE_KEY,
+    [string]$ReleaseKeyId = $env:MAYHEM_RELEASE_KEY_ID,
+    [string]$ExpectedSourceGitSha = $env:MAYHEM_SOURCE_GIT_SHA,
     [string]$ReleaseBaseUrl = $env:MAYHEM_RELEASE_BASE_URL,
     [string]$Version = $(if ($env:MAYHEM_VERSION) { $env:MAYHEM_VERSION } else { "latest" }),
     [string]$InstallDir = $(if ($env:MAYHEM_INSTALL_DIR) { $env:MAYHEM_INSTALL_DIR } else { Join-Path (Join-Path $HOME ".mayhem") "bin" }),
@@ -16,12 +23,17 @@ param(
     [string]$OpencodeVersion = $(if ($env:MAYHEM_OPENCODE_VERSION) { $env:MAYHEM_OPENCODE_VERSION } else { "1.17.13" }),
     [switch]$ForceOpencode,
     [switch]$NoPathUpdate,
+    [switch]$UnsignedLayout,
     [switch]$AllowUnverified,
     [string]$LlamaCppFeatures = $env:MAYHEM_LLAMA_CPP_FEATURES,
     [string]$NpmPrefix = $(if ($env:MAYHEM_NPM_PREFIX) { $env:MAYHEM_NPM_PREFIX } else { Join-Path (Join-Path $HOME ".mayhem") "node" })
 )
 
 $ErrorActionPreference = "Stop"
+$script:VersionExplicit = $PSBoundParameters.ContainsKey("Version") -or
+    $null -ne [Environment]::GetEnvironmentVariable("MAYHEM_VERSION", "Process")
+$PearVersion = "2.0.4"
+$script:ReleaseFloorPresent = $false
 
 if ($env:MAYHEM_FROM_SOURCE -eq "1") { $FromSource = $true }
 if ($env:MAYHEM_SKIP_NODE -eq "1") { $SkipNode = $true }
@@ -29,11 +41,13 @@ if ($env:MAYHEM_SKIP_PEAR -eq "1") { $SkipPear = $true }
 if ($env:MAYHEM_SKIP_OPENCODE -eq "1") { $SkipOpencode = $true }
 if ($env:MAYHEM_FORCE_OPENCODE -eq "1") { $ForceOpencode = $true }
 if ($env:MAYHEM_NO_PATH_UPDATE -eq "1") { $NoPathUpdate = $true }
+if ($env:MAYHEM_UNSIGNED_LAYOUT -eq "1") { $UnsignedLayout = $true }
 if ($env:MAYHEM_ALLOW_UNVERIFIED -eq "1") { $AllowUnverified = $true }
 
 $Bins = @(
     "mayhem",
     "mayhem-gateway",
+    "mayhem-attestation-verifier",
     "mayhem-pay",
     "mayhemd",
     "mayhem-enclave",
@@ -65,6 +79,21 @@ function Fail {
 function Test-Command {
     param([string]$Name)
     return $null -ne (Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function Assert-RealFile {
+    param(
+        [string]$Path,
+        [string]$Label
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Fail "$Label is missing or not a regular file: $Path"
+    }
+    $item = Get-Item -LiteralPath $Path -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Fail "$Label must not be a reparse point: $Path"
+    }
 }
 
 function Get-LlamaCppFeatureName {
@@ -146,7 +175,41 @@ function Get-LlamaCppFeatureArgs {
 
 function New-TempDir {
     $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("mayhem-install-" + [System.Guid]::NewGuid().ToString("N"))
-    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    New-Item -ItemType Directory -Path $dir | Out-Null
+    try {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $acl.SetOwner($identity.User)
+        $acl.SetAccessRuleProtection($true, $false)
+        $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+            [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+        $propagation = [System.Security.AccessControl.PropagationFlags]::None
+        $allow = [System.Security.AccessControl.AccessControlType]::Allow
+        $userRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $identity.User,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritance,
+            $propagation,
+            $allow
+        )
+        $systemSid = [System.Security.Principal.SecurityIdentifier]::new(
+            [System.Security.Principal.WellKnownSidType]::LocalSystemSid,
+            $null
+        )
+        $systemRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $systemSid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritance,
+            $propagation,
+            $allow
+        )
+        $acl.AddAccessRule($userRule) | Out-Null
+        $acl.AddAccessRule($systemRule) | Out-Null
+        Set-Acl -LiteralPath $dir -AclObject $acl
+    } catch {
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        Fail "could not create a private installer temp directory: $($_.Exception.Message)"
+    }
     $script:TempDirs += $dir
     return $dir
 }
@@ -183,7 +246,8 @@ function Get-TargetTriple {
 
 function Get-ArchiveName {
     param([string]$Target)
-    return "mayhem-$Version-$Target.zip"
+    $artifactVersion = $Version -replace "^v", ""
+    return "mayhem-$artifactVersion-$Target.zip"
 }
 
 function Test-WindowsAvx2 {
@@ -282,11 +346,7 @@ function Verify-Archive {
 
     $expected = Get-ExpectedHash -ArchivePath $ArchivePath
     if ([string]::IsNullOrWhiteSpace($expected)) {
-        if ($AllowUnverified) {
-            Write-Warn "installing unverified archive because -AllowUnverified was set"
-            return
-        }
-        Fail "missing checksum for $ArchivePath; pass -Sha256 or place a .sha256 sidecar next to it"
+        Fail "unsigned test layout is missing a checksum; pass -Sha256 or place a .sha256 sidecar next to it"
     }
 
     $actual = (Get-FileHash -Algorithm SHA256 -Path $ArchivePath).Hash.ToLowerInvariant()
@@ -320,7 +380,7 @@ function Get-ArtifactPath {
     Write-Log "downloading $script:ArtifactUrl"
     Invoke-Download -Uri $script:ArtifactUrl -OutFile $archive
 
-    if ([string]::IsNullOrWhiteSpace($Sha256)) {
+    if ($UnsignedLayout -and [string]::IsNullOrWhiteSpace($Sha256)) {
         try {
             Invoke-Download -Uri ($script:ArtifactUrl + ".sha256") -OutFile ($archive + ".sha256")
             Write-Log "downloaded checksum sidecar"
@@ -330,6 +390,681 @@ function Get-ArtifactPath {
     }
 
     return $archive
+}
+
+function Get-ReleaseArtifactStem {
+    param([string]$Value)
+
+    if ($Value.EndsWith(".tar.gz", [StringComparison]::OrdinalIgnoreCase)) {
+        return $Value.Substring(0, $Value.Length - ".tar.gz".Length)
+    }
+    if ($Value.EndsWith(".tgz", [StringComparison]::OrdinalIgnoreCase)) {
+        return $Value.Substring(0, $Value.Length - ".tgz".Length)
+    }
+    if ($Value.EndsWith(".zip", [StringComparison]::OrdinalIgnoreCase)) {
+        return $Value.Substring(0, $Value.Length - ".zip".Length)
+    }
+    Fail "signed release archive must end in .tar.gz, .tgz, or .zip: $Value"
+}
+
+function Assert-SignedReleaseSelection {
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedSourceGitSha) -and
+        $ExpectedSourceGitSha -cnotmatch "^[0-9a-f]{40}$") {
+        Fail "-ExpectedSourceGitSha must be exactly 40 lowercase hexadecimal characters"
+    }
+    if ($Version -ceq "latest") {
+        if ([string]::IsNullOrWhiteSpace($ExpectedSourceGitSha)) {
+            Fail "signed installs cannot use unpinned latest; pass an exact -Version or -ExpectedSourceGitSha"
+        }
+        return
+    }
+    if ($Version -cnotmatch "^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$") {
+        Fail "-Version must be an exact canonical semantic version for signed installs"
+    }
+    if (-not $script:VersionExplicit) {
+        Fail "signed installs require an explicitly requested version or source_git_sha"
+    }
+}
+
+function Resolve-SignedReleaseMetadata {
+    param([string]$ArchivePath)
+
+    $tmp = New-TempDir
+    if ([string]::IsNullOrWhiteSpace($script:Manifest)) {
+        if (-not [string]::IsNullOrWhiteSpace($script:ManifestUrl)) {
+            $script:Manifest = Join-Path $tmp "manifest.json"
+            Write-Log "downloading $script:ManifestUrl"
+            Invoke-Download -Uri $script:ManifestUrl -OutFile $script:Manifest
+        } elseif (-not [string]::IsNullOrWhiteSpace($script:ArtifactUrl)) {
+            $remotePath = ([System.Uri]$script:ArtifactUrl).GetLeftPart([System.UriPartial]::Path)
+            $script:ManifestUrl = (Get-ReleaseArtifactStem -Value $remotePath) + ".manifest.json"
+            $script:Manifest = Join-Path $tmp "manifest.json"
+            Write-Log "downloading $script:ManifestUrl"
+            Invoke-Download -Uri $script:ManifestUrl -OutFile $script:Manifest
+        } else {
+            $script:Manifest = (Get-ReleaseArtifactStem -Value $ArchivePath) + ".manifest.json"
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($script:Signature)) {
+        if (-not [string]::IsNullOrWhiteSpace($script:SignatureUrl)) {
+            $script:Signature = Join-Path $tmp "manifest.json.sig"
+            Write-Log "downloading $script:SignatureUrl"
+            Invoke-Download -Uri $script:SignatureUrl -OutFile $script:Signature
+        } elseif (-not [string]::IsNullOrWhiteSpace($script:ArtifactUrl)) {
+            $remotePath = ([System.Uri]$script:ArtifactUrl).GetLeftPart([System.UriPartial]::Path)
+            $script:SignatureUrl = (Get-ReleaseArtifactStem -Value $remotePath) + ".manifest.json.sig"
+            $script:Signature = Join-Path $tmp "manifest.json.sig"
+            Write-Log "downloading $script:SignatureUrl"
+            Invoke-Download -Uri $script:SignatureUrl -OutFile $script:Signature
+        } else {
+            $script:Signature = (Get-ReleaseArtifactStem -Value $ArchivePath) + ".manifest.json.sig"
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($ReleaseKey)) {
+        Fail "signed installs require -ReleaseKey with an independently trusted public key record"
+    }
+}
+
+function Initialize-ReleaseSnapshotCopy {
+    if ("MayhemReleaseSnapshot" -as [type]) {
+        return
+    }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class MayhemReleaseSnapshot {
+    private const uint GENERIC_READ = 0x80000000;
+    private const uint FILE_SHARE_READ = 0x00000001;
+    private const uint OPEN_EXISTING = 3;
+    private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+    private const uint FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000;
+    private const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+    private const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
+    private const uint FILE_TYPE_DISK = 0x0001;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ByHandleFileInformation {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(
+        string fileName,
+        uint desiredAccess,
+        uint shareMode,
+        IntPtr securityAttributes,
+        uint creationDisposition,
+        uint flagsAndAttributes,
+        IntPtr templateFile);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+        SafeFileHandle handle,
+        out ByHandleFileInformation information);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint GetFileType(SafeFileHandle handle);
+
+    public static void CopyBoundedRegularFile(
+        string source,
+        string destination,
+        long maximum,
+        string label) {
+        SafeFileHandle handle = CreateFile(
+            source,
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            IntPtr.Zero,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN,
+            IntPtr.Zero);
+        if (handle.IsInvalid) {
+            throw new Win32Exception(
+                Marshal.GetLastWin32Error(),
+                label + " could not be opened for a private snapshot");
+        }
+        try {
+            ByHandleFileInformation information;
+            if (!GetFileInformationByHandle(handle, out information)) {
+                throw new Win32Exception(
+                    Marshal.GetLastWin32Error(),
+                    label + " could not be inspected");
+            }
+            if (GetFileType(handle) != FILE_TYPE_DISK ||
+                (information.FileAttributes &
+                    (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
+                throw new InvalidDataException(
+                    label + " must be a regular non-reparse-point disk file");
+            }
+            ulong unsignedLength =
+                ((ulong)information.FileSizeHigh << 32) | information.FileSizeLow;
+            if (unsignedLength == 0 || unsignedLength > (ulong)maximum) {
+                throw new InvalidDataException(label + " exceeds its bounded size");
+            }
+            long expectedLength = checked((long)unsignedLength);
+            using (FileStream input = new FileStream(handle, FileAccess.Read, 131072, false))
+            using (FileStream output = new FileStream(
+                destination,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                131072,
+                FileOptions.WriteThrough)) {
+                byte[] buffer = new byte[131072];
+                long total = 0;
+                while (true) {
+                    int read = input.Read(buffer, 0, buffer.Length);
+                    if (read == 0) {
+                        break;
+                    }
+                    total = checked(total + read);
+                    if (total > maximum) {
+                        throw new InvalidDataException(label + " exceeded its snapshot limit");
+                    }
+                    output.Write(buffer, 0, read);
+                }
+                if (total != expectedLength) {
+                    throw new InvalidDataException(label + " changed while it was snapshotted");
+                }
+                output.Flush(true);
+            }
+        } finally {
+            handle.Dispose();
+        }
+    }
+}
+'@
+}
+
+function Snapshot-SignedReleaseInputs {
+    param([string]$ArchivePath)
+
+    if (-not $ArchivePath.EndsWith(".zip", [StringComparison]::OrdinalIgnoreCase)) {
+        Fail "install.ps1 signed releases require a canonical .zip archive"
+    }
+    Initialize-ReleaseSnapshotCopy
+    $snapshotRoot = New-TempDir
+    $archiveSnapshot = Join-Path $snapshotRoot "release.zip"
+    $manifestSnapshot = Join-Path $snapshotRoot "manifest.json"
+    $signatureSnapshot = Join-Path $snapshotRoot "manifest.json.sig"
+    $keySnapshot = Join-Path $snapshotRoot "release-key.json"
+    try {
+        [MayhemReleaseSnapshot]::CopyBoundedRegularFile(
+            $ArchivePath, $archiveSnapshot, 2147483648, "release archive")
+        [MayhemReleaseSnapshot]::CopyBoundedRegularFile(
+            $script:Manifest, $manifestSnapshot, 67108864, "release manifest")
+        [MayhemReleaseSnapshot]::CopyBoundedRegularFile(
+            $script:Signature, $signatureSnapshot, 65536, "release signature")
+        [MayhemReleaseSnapshot]::CopyBoundedRegularFile(
+            $ReleaseKey, $keySnapshot, 65536, "trusted release key")
+    } catch {
+        Fail "could not snapshot signed release inputs: $($_.Exception.Message)"
+    }
+    $script:Manifest = $manifestSnapshot
+    $script:Signature = $signatureSnapshot
+    $script:ReleaseKey = $keySnapshot
+    Write-Log "snapshotted signed release inputs into private installer state"
+    return $archiveSnapshot
+}
+
+function Get-SignedInstallState {
+    $installRoot = Split-Path -Parent $InstallDir
+    $expectedBin = Join-Path $installRoot "bin"
+    $expectedShare = Join-Path (Join-Path $installRoot "share") "mayhem"
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals(
+        [IO.Path]::GetFullPath($InstallDir),
+        [IO.Path]::GetFullPath($expectedBin))) {
+        Fail "signed installs require the binary directory to be <install-root>\bin"
+    }
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals(
+        [IO.Path]::GetFullPath($ShareDir),
+        [IO.Path]::GetFullPath($expectedShare))) {
+        Fail "signed installs require the asset directory to be <install-root>\share\mayhem"
+    }
+    if (Test-Path -LiteralPath $installRoot) {
+        $installItem = Get-Item -LiteralPath $installRoot -Force
+        if (-not $installItem.PSIsContainer -or
+            ($installItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail "release install root must be a real directory: $installRoot"
+        }
+    }
+    $updateRoot = Join-Path $installRoot ".mayhem-update"
+    if (Test-Path -LiteralPath $updateRoot) {
+        $updateItem = Get-Item -LiteralPath $updateRoot -Force
+        if (-not $updateItem.PSIsContainer -or
+            ($updateItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail "release update root must be a real directory: $updateRoot"
+        }
+    }
+    $floor = Join-Path $updateRoot "release-floor.json"
+    $script:ReleaseFloorPresent = Test-Path -LiteralPath $floor
+    if ($script:ReleaseFloorPresent) {
+        Assert-RealFile -Path $floor -Label "release anti-rollback floor"
+    }
+    return [pscustomobject]@{
+        InstallRoot = $installRoot
+        Floor = $floor
+    }
+}
+
+function Get-BootstrapReleaseIdentity {
+    param(
+        [string]$Target,
+        [string]$FloorPath
+    )
+
+    if (-not (Test-Command "node")) {
+        Fail "Node.js is required to authenticate a signed release bootstrap"
+    }
+    $env:RELEASE_BOOTSTRAP_MANIFEST = $script:Manifest
+    $env:RELEASE_BOOTSTRAP_SIGNATURE = $script:Signature
+    $env:RELEASE_BOOTSTRAP_KEY = $ReleaseKey
+    $env:RELEASE_BOOTSTRAP_TARGET = $Target
+    $env:RELEASE_BOOTSTRAP_KEY_ID = $ReleaseKeyId
+    $env:RELEASE_BOOTSTRAP_SOURCE_GIT_SHA = $ExpectedSourceGitSha
+    $env:RELEASE_BOOTSTRAP_REQUESTED_VERSION = $(if ($Version -ceq "latest") { "" } else { $Version })
+    $env:RELEASE_BOOTSTRAP_FLOOR = $FloorPath
+    $env:RELEASE_BOOTSTRAP_FLOOR_PRESENT = $(if ($script:ReleaseFloorPresent) { "1" } else { "0" })
+    $program = @'
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+
+const readBounded = (input, maximum, label) => {
+  const resolved = path.resolve(input);
+  const stat = fs.lstatSync(resolved);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size === 0 || stat.size > maximum) {
+    throw new Error(`${label} must be a bounded regular non-symlink file`);
+  }
+  return fs.readFileSync(resolved);
+};
+const manifestBytes = readBounded(
+  process.env.RELEASE_BOOTSTRAP_MANIFEST, 64 * 1024 * 1024, "release manifest");
+const signatureBytes = readBounded(
+  process.env.RELEASE_BOOTSTRAP_SIGNATURE, 64 * 1024, "release signature");
+const keyBytes = readBounded(
+  process.env.RELEASE_BOOTSTRAP_KEY, 64 * 1024, "trusted release key");
+const parse = (bytes, label) => {
+  try {
+    return JSON.parse(bytes.toString("utf8"));
+  } catch (error) {
+    throw new Error(`${label} is invalid JSON: ${error.message}`);
+  }
+};
+const manifest = parse(manifestBytes, "release manifest");
+const signature = parse(signatureBytes, "release signature");
+const key = parse(keyBytes, "trusted release key");
+const exactKeys = (value, expected) =>
+  value !== null &&
+  typeof value === "object" &&
+  !Array.isArray(value) &&
+  JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort());
+if (!exactKeys(signature, [
+  "schema_version", "alg", "signed_path", "key_id",
+  "public_key", "sha256", "sig",
+])) {
+  throw new Error("release signature has an unexpected schema");
+}
+if (!exactKeys(key, ["key_id", "alg", "public_key", "status", "created_at"])) {
+  throw new Error("trusted release key has an unexpected schema");
+}
+const validKeyId = (value) =>
+  typeof value === "string" &&
+  value.length > 0 &&
+  value.length <= 128 &&
+  /^[A-Za-z0-9._-]+$/.test(value);
+if (!validKeyId(key.key_id) ||
+    key.alg !== "ed25519" ||
+    key.status !== "active" ||
+    !/^[0-9a-f]{64}$/.test(key.public_key) ||
+    signature.schema_version !== 1 ||
+    signature.alg !== "ed25519" ||
+    signature.key_id !== key.key_id ||
+    signature.public_key !== key.public_key ||
+    !/^[0-9a-f]{64}$/.test(signature.sha256) ||
+    !/^[0-9a-f]{128}$/.test(signature.sig)) {
+  throw new Error("release signature does not match the trusted active Ed25519 key");
+}
+const expectedKeyId = process.env.RELEASE_BOOTSTRAP_KEY_ID;
+if (expectedKeyId && signature.key_id !== expectedKeyId) {
+  throw new Error(`release signature key id ${signature.key_id} does not match ${expectedKeyId}`);
+}
+if (manifest?.schema !== 1 ||
+    manifest.name !== "mayhem" ||
+    !/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(manifest.version) ||
+    manifest.target !== process.env.RELEASE_BOOTSTRAP_TARGET ||
+    !/^[0-9a-f]{40}$/.test(manifest.source_git_sha)) {
+  throw new Error("signed release identity, target, version, or source_git_sha is invalid");
+}
+const expectedSource = process.env.RELEASE_BOOTSTRAP_SOURCE_GIT_SHA;
+if (expectedSource && !/^[0-9a-f]{40}$/.test(expectedSource)) {
+  throw new Error("expected source_git_sha must be exactly 40 lowercase hexadecimal characters");
+}
+if (expectedSource && manifest.source_git_sha !== expectedSource) {
+  throw new Error(
+    `signed release source_git_sha ${manifest.source_git_sha} does not match ${expectedSource}`);
+}
+const expectedSignedPath = `mayhem-${manifest.version}-${manifest.target}.manifest.json`;
+if (signature.signed_path !== expectedSignedPath) {
+  throw new Error("release signature signed_path does not match the release identity");
+}
+const digest = crypto.createHash("sha256").update(manifestBytes).digest("hex");
+if (signature.sha256 !== digest) {
+  throw new Error("release signature manifest hash does not match");
+}
+const publicKey = crypto.createPublicKey({
+  key: Buffer.concat([
+    Buffer.from("302a300506032b6570032100", "hex"),
+    Buffer.from(key.public_key, "hex"),
+  ]),
+  format: "der",
+  type: "spki",
+});
+const signingBytes = Buffer.concat([
+  Buffer.from("mayhem.release-manifest.v1\n", "ascii"),
+  manifestBytes,
+]);
+if (!crypto.verify(null, signingBytes, publicKey, Buffer.from(signature.sig, "hex"))) {
+  throw new Error("release manifest Ed25519 signature verification failed");
+}
+const requestedVersion = process.env.RELEASE_BOOTSTRAP_REQUESTED_VERSION;
+if (requestedVersion &&
+    (!/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(requestedVersion) ||
+     manifest.version !== requestedVersion)) {
+  throw new Error(
+    `signed release version ${manifest.version} does not match requested version ${requestedVersion}`);
+}
+if (!requestedVersion && !expectedSource) {
+  throw new Error("signed release is not bound to an exact version or source_git_sha");
+}
+if (process.env.RELEASE_BOOTSTRAP_FLOOR_PRESENT === "1") {
+  const floor = parse(
+    readBounded(process.env.RELEASE_BOOTSTRAP_FLOOR, 4 * 1024, "release anti-rollback floor"),
+    "release anti-rollback floor");
+  if (!exactKeys(floor, ["schema", "version"]) ||
+      floor.schema !== 1 ||
+      !/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/.test(floor.version)) {
+    throw new Error("release anti-rollback floor has an invalid schema or version");
+  }
+  const compareSemver = (left, right) => {
+    const leftParts = left.split(".").map(BigInt);
+    const rightParts = right.split(".").map(BigInt);
+    for (let index = 0; index < 3; index += 1) {
+      if (leftParts[index] < rightParts[index]) return -1;
+      if (leftParts[index] > rightParts[index]) return 1;
+    }
+    return 0;
+  };
+  if (compareSemver(manifest.version, floor.version) < 0) {
+    throw new Error(
+      `signed release version ${manifest.version} is below protected anti-rollback floor ${floor.version}`);
+  }
+}
+const binaryName = manifest.target.includes("windows") ? "mayhem.exe" : "mayhem";
+const binaryPath = `bin/${binaryName}`;
+const binaries = Array.isArray(manifest.binaries)
+  ? manifest.binaries.filter((binary) =>
+      binary?.name === binaryName && binary?.path === binaryPath)
+  : [];
+const assets = Array.isArray(manifest.assets)
+  ? manifest.assets.filter((asset) => asset?.path === binaryPath)
+  : [];
+if (binaries.length !== 1 ||
+    assets.length !== 1 ||
+    !/^[0-9a-f]{64}$/.test(binaries[0].sha256) ||
+    binaries[0].sha256 !== assets[0].sha256) {
+  throw new Error("signed manifest does not bind exactly one bootstrap mayhem binary");
+}
+process.stdout.write([
+  manifest.version,
+  manifest.source_git_sha,
+  signature.key_id,
+  binaries[0].sha256,
+  binaryPath,
+].join("\t") + "\n");
+'@
+    $identity = & node "--input-type=module" "-e" $program
+    if ($LASTEXITCODE -ne 0) {
+        Fail "signed release bootstrap authentication failed"
+    }
+    return $identity
+}
+
+function Expand-AuthenticatedBootstrap {
+    param(
+        [string]$ArchivePath,
+        [string]$Target,
+        [string]$ReleaseVersion,
+        [string]$BinaryPath,
+        [string]$ExpectedSha256,
+        [string]$Output
+    )
+
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $entryName = "mayhem-$ReleaseVersion-$Target/$BinaryPath"
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        if ($archive.Entries.Count -gt 250000) {
+            Fail "release ZIP exceeds the bounded entry count"
+        }
+        $seen = [System.Collections.Generic.HashSet[string]]::new(
+            [StringComparer]::Ordinal)
+        $seenPortable = [System.Collections.Generic.HashSet[string]]::new(
+            [StringComparer]::OrdinalIgnoreCase)
+        $entries = @()
+        [UInt64]$totalLength = 0
+        foreach ($entry in $archive.Entries) {
+            $rawName = $entry.FullName
+            $nameBytes = [Text.Encoding]::UTF8.GetByteCount($rawName)
+            $isDirectory = $rawName.EndsWith("/", [StringComparison]::Ordinal)
+            $normalizedName = $(if ($isDirectory) {
+                $rawName.Substring(0, $rawName.Length - 1)
+            } else {
+                $rawName
+            })
+            if ($nameBytes -eq 0 -or $nameBytes -gt 1024 -or
+                $normalizedName.Contains("\") -or
+                $normalizedName.StartsWith("/", [StringComparison]::Ordinal) -or
+                $normalizedName -cmatch '[<>:"|?*]' -or
+                [IO.Path]::IsPathRooted($normalizedName)) {
+                Fail "release ZIP contains an unsafe entry path: $rawName"
+            }
+            $parts = @($normalizedName.Split([char]"/"))
+            if ($parts.Count -eq 0 -or
+                @($parts | Where-Object {
+                    [string]::IsNullOrEmpty($_) -or $_ -ceq "." -or $_ -ceq ".." -or
+                    $_.EndsWith(".", [StringComparison]::Ordinal) -or
+                    $_.EndsWith(" ", [StringComparison]::Ordinal)
+                }).Count -ne 0) {
+                Fail "release ZIP contains traversal or a non-portable entry path: $rawName"
+            }
+            if (-not $seen.Add($normalizedName) -or
+                -not $seenPortable.Add($normalizedName)) {
+                Fail "release ZIP contains a duplicate or case-colliding entry: $rawName"
+            }
+            $external = [BitConverter]::ToUInt32(
+                [BitConverter]::GetBytes([Int32]$entry.ExternalAttributes),
+                0
+            )
+            $unixType = ($external -shr 16) -band 0xF000
+            $dosDirectory = ($external -band 0x10) -ne 0
+            if ($unixType -notin @(0, 0x4000, 0x8000) -or
+                ($unixType -eq 0x4000 -and -not $isDirectory) -or
+                ($unixType -eq 0x8000 -and $isDirectory) -or
+                ($dosDirectory -ne $isDirectory)) {
+                Fail "release ZIP contains a link, special file, or ambiguous file type: $rawName"
+            }
+            if (-not $isDirectory) {
+                if ($entry.Length -lt 0 -or $entry.Length -gt 2147483648) {
+                    Fail "release ZIP contains an oversized file: $rawName"
+                }
+                $totalLength += [UInt64]$entry.Length
+                if ($totalLength -gt 8589934592) {
+                    Fail "release ZIP exceeds its total expanded size limit"
+                }
+            }
+            if ($rawName -ceq $entryName) {
+                $entries += $entry
+            }
+        }
+        if ($entries.Count -ne 1 -or $entries[0].Length -le 0 -or $entries[0].Length -gt 2147483648) {
+            Fail "release archive does not contain exactly one bounded signed bootstrap binary"
+        }
+        $input = $entries[0].Open()
+        $outputStream = [System.IO.File]::Open(
+            $Output,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        try {
+            $input.CopyTo($outputStream)
+        } finally {
+            $outputStream.Dispose()
+            $input.Dispose()
+        }
+    } finally {
+        $archive.Dispose()
+    }
+    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Output).Hash.ToLowerInvariant()
+    if ($actual -cne $ExpectedSha256) {
+        Fail "signed bootstrap binary hash mismatch: expected $ExpectedSha256, got $actual"
+    }
+    Write-Log "authenticated bootstrap mayhem binary $actual"
+}
+
+function Install-TrustedReleaseKey {
+    param(
+        [string]$InstallRoot,
+        [string]$KeyId
+    )
+
+    if (Test-Path -LiteralPath $InstallRoot) {
+        $installItem = Get-Item -LiteralPath $InstallRoot -Force
+        if (-not $installItem.PSIsContainer -or
+            ($installItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Fail "release install root must be a real directory: $InstallRoot"
+        }
+    } else {
+        New-Item -ItemType Directory -Path $InstallRoot | Out-Null
+    }
+    $updateRoot = Join-Path $InstallRoot ".mayhem-update"
+    foreach ($directory in @($updateRoot, (Join-Path $updateRoot "trusted-release-keys"))) {
+        if (Test-Path -LiteralPath $directory) {
+            $item = Get-Item -LiteralPath $directory -Force
+            if (-not $item.PSIsContainer -or
+                ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Fail "release trust path must be a real directory: $directory"
+            }
+        } else {
+            New-Item -ItemType Directory -Path $directory | Out-Null
+        }
+    }
+    $trustedRoot = Join-Path $updateRoot "trusted-release-keys"
+    $destination = Join-Path $trustedRoot "$KeyId.json"
+    if (Test-Path -LiteralPath $destination) {
+        Assert-RealFile -Path $destination -Label "provisioned release key"
+        $left = (Get-FileHash -Algorithm SHA256 -LiteralPath $ReleaseKey).Hash
+        $right = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash
+        if ($left -cne $right) {
+            Fail "provisioned release key $KeyId differs from the trusted install state"
+        }
+    } else {
+        Copy-Item -LiteralPath $ReleaseKey -Destination $destination
+    }
+    return $trustedRoot
+}
+
+function Install-SignedRelease {
+    param(
+        [string]$ArchivePath,
+        [string]$Target
+    )
+
+    $state = Get-SignedInstallState
+    $ArchivePath = Snapshot-SignedReleaseInputs -ArchivePath $ArchivePath
+    $identity = Get-BootstrapReleaseIdentity -Target $Target -FloorPath $state.Floor
+    $parts = $identity -split "`t"
+    if ($parts.Count -ne 5) {
+        Fail "signed release bootstrap identity was incomplete"
+    }
+    $releaseVersion = $parts[0]
+    $sourceGitSha = $parts[1]
+    $keyId = $parts[2]
+    $bootstrapSha = $parts[3]
+    $binaryPath = $parts[4]
+    if (-not [string]::IsNullOrWhiteSpace($Sha256)) {
+        Verify-Archive -ArchivePath $ArchivePath
+    }
+
+    $bootstrapRoot = New-TempDir
+    $bootstrap = Join-Path $bootstrapRoot "mayhem.exe"
+    Expand-AuthenticatedBootstrap `
+        -ArchivePath $ArchivePath `
+        -Target $Target `
+        -ReleaseVersion $releaseVersion `
+        -BinaryPath $binaryPath `
+        -ExpectedSha256 $bootstrapSha `
+        -Output $bootstrap
+    $reportedVersion = & $bootstrap "--version"
+    if ($LASTEXITCODE -ne 0 -or $reportedVersion -cne "mayhem $releaseVersion") {
+        Fail "authenticated bootstrap binary version does not match signed release $releaseVersion"
+    }
+
+    $installRoot = $state.InstallRoot
+    $trustedKeys = Install-TrustedReleaseKey -InstallRoot $installRoot -KeyId $keyId
+
+    Write-Log "staging and reauthenticating signed release $releaseVersion ($sourceGitSha)"
+    $stageReport = Join-Path $bootstrapRoot "stage.json"
+    & $bootstrap update `
+        --home $installRoot `
+        --target $Target `
+        --archive-path $ArchivePath `
+        --manifest-path $script:Manifest `
+        --signature-path $script:Signature `
+        --release-keys-dir $trustedKeys `
+        --key-id $keyId `
+        --json *> $stageReport
+    if ($LASTEXITCODE -ne 0) {
+        Fail "signed release staging or reauthentication failed"
+    }
+
+    Write-Log "activating signed release $releaseVersion"
+    $applyReport = Join-Path $bootstrapRoot "apply.json"
+    & $bootstrap update `
+        --home $installRoot `
+        --target $Target `
+        --apply-staged `
+        --release-keys-dir $trustedKeys `
+        --key-id $keyId `
+        --bypass-apply-delay `
+        --post-upgrade-arg=--help `
+        --json *> $applyReport
+    if ($LASTEXITCODE -ne 0) {
+        Fail "signed release activation failed"
+    }
+    $floor = Join-Path (Join-Path $installRoot ".mayhem-update") "release-floor.json"
+    if (-not (Test-Path -LiteralPath $floor -PathType Leaf)) {
+        Fail "signed install did not provision the anti-rollback floor"
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $trustedKeys "$KeyId.json") -PathType Leaf)) {
+        Fail "signed install did not provision updater release trust"
+    }
+    Write-Log "verified and activated signed release $releaseVersion from $sourceGitSha"
 }
 
 function Expand-MayhemArchive {
@@ -576,17 +1311,26 @@ function Verify-ExtractedChecksums {
 
 function Install-FromArtifact {
     $target = Get-TargetTriple
+    if (-not $UnsignedLayout) {
+        Assert-SignedReleaseSelection
+    }
     $archive = Get-ArtifactPath -Target $target
     if (-not (Test-Path $archive)) {
         Fail "artifact not found: $archive"
     }
 
-    Verify-Archive -ArchivePath $archive
-    $extractDir = New-TempDir
-    Expand-MayhemArchive -ArchivePath $archive -Destination $extractDir
-    $verifiedPackage = Verify-ExtractedChecksums -ExtractDir $extractDir
-    Copy-ArtifactBins -PackageRoot $verifiedPackage.Root -VerifiedFiles $verifiedPackage.Files
-    Copy-PackageAssets -PackageRoot $verifiedPackage.Root -VerifiedFiles $verifiedPackage.Files
+    if ($UnsignedLayout) {
+        Write-Warn "installing an explicit unsigned test layout; updater trust will not be provisioned"
+        Verify-Archive -ArchivePath $archive
+        $extractDir = New-TempDir
+        Expand-MayhemArchive -ArchivePath $archive -Destination $extractDir
+        $verifiedPackage = Verify-ExtractedChecksums -ExtractDir $extractDir
+        Copy-ArtifactBins -PackageRoot $verifiedPackage.Root -VerifiedFiles $verifiedPackage.Files
+        Copy-PackageAssets -PackageRoot $verifiedPackage.Root -VerifiedFiles $verifiedPackage.Files
+    } else {
+        Resolve-SignedReleaseMetadata -ArchivePath $archive
+        Install-SignedRelease -ArchivePath $archive -Target $target
+    }
 }
 
 function Install-FromSource {
@@ -640,24 +1384,57 @@ function Ensure-Pear {
         return
     }
 
-    if (Test-Command "pear") {
-        Write-Log ("found Pear at " + (Get-Command pear).Source)
-        & pear --help *> $null
-        return
-    }
-
     Ensure-Node
     New-Item -ItemType Directory -Path $NpmPrefix -Force | Out-Null
-    Write-Log "installing Pear runtime with npm prefix $NpmPrefix"
-    & npm install -g pear --prefix $NpmPrefix
-    if ($LASTEXITCODE -ne 0) {
-        Fail "npm failed to install Pear"
-    }
-
     Add-PathEntry -Entry $NpmPrefix
     $npmBin = Join-Path $NpmPrefix "bin"
     if (Test-Path $npmBin) {
         Add-PathEntry -Entry $npmBin
+    }
+
+    $packageJson = $null
+    $versionCheck = @'
+const fs = require("node:fs");
+const metadata = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+process.exit(metadata.version === process.argv[2] ? 0 : 1);
+'@
+    foreach ($candidate in @(
+        (Join-Path (Join-Path $NpmPrefix "node_modules") "pear\package.json"),
+        (Join-Path (Join-Path (Join-Path $NpmPrefix "lib") "node_modules") "pear\package.json")
+    )) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            Assert-RealFile -Path $candidate -Label "Pear package metadata"
+            & node "-e" $versionCheck $candidate $PearVersion
+            if ($LASTEXITCODE -eq 0) {
+                $packageJson = $candidate
+                break
+            }
+        }
+    }
+    if ($null -eq $packageJson) {
+        Write-Log "installing pinned Pear $PearVersion with npm prefix $NpmPrefix"
+        & npm install -g "pear@$PearVersion" --prefix $NpmPrefix
+        if ($LASTEXITCODE -ne 0) {
+            Fail "npm failed to install pinned Pear $PearVersion"
+        }
+        foreach ($candidate in @(
+            (Join-Path (Join-Path $NpmPrefix "node_modules") "pear\package.json"),
+            (Join-Path (Join-Path (Join-Path $NpmPrefix "lib") "node_modules") "pear\package.json")
+        )) {
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                Assert-RealFile -Path $candidate -Label "Pear package metadata"
+                & node "-e" $versionCheck $candidate $PearVersion
+                if ($LASTEXITCODE -eq 0) {
+                    $packageJson = $candidate
+                    break
+                }
+            }
+        }
+        if ($null -eq $packageJson) {
+            Fail "npm did not install the pinned Pear $PearVersion package"
+        }
+    } else {
+        Write-Log "found pinned Pear $PearVersion in $NpmPrefix"
     }
 
     if (-not (Test-Command "pear")) {
@@ -752,6 +1529,9 @@ function Smoke-Test {
 }
 
 function Main {
+    if ($AllowUnverified) {
+        Fail "-AllowUnverified and MAYHEM_ALLOW_UNVERIFIED have been removed; unsigned production installs are disabled"
+    }
     if (-not $FromSource -and
         [string]::IsNullOrWhiteSpace($Artifact) -and
         [string]::IsNullOrWhiteSpace($ArtifactUrl) -and
@@ -761,17 +1541,21 @@ function Main {
             $FromSource = $true
         }
     }
-
-    Add-PathEntry -Entry $InstallDir
-    Ensure-Pear
-
-    if ($FromSource) {
-        Install-FromSource
-    } else {
-        Install-FromArtifact
+    if ($UnsignedLayout -and $FromSource) {
+        Fail "-UnsignedLayout applies only to test release archives"
     }
 
-    Hydrate-RuntimeAssets
+    Add-PathEntry -Entry $InstallDir
+
+    if ($FromSource) {
+        Ensure-Pear
+        Install-FromSource
+        Hydrate-RuntimeAssets
+    } else {
+        Install-FromArtifact
+        Ensure-Pear
+    }
+
     Install-Opencode
     Update-UserPath
     Smoke-Test

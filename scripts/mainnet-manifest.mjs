@@ -158,7 +158,6 @@ function validateControls(add, controls) {
     'admin_sets_prices',
     'admin_sets_rules',
     'admin_sets_params',
-    'admin_sets_provider_payout_targets',
     'admin_can_ban_providers',
     'providers_set_prices',
     'providers_set_rules',
@@ -167,7 +166,8 @@ function validateControls(add, controls) {
     'providers_submit_models',
     'providers_create_canonical_rooms',
     'providers_only_join_admin_rooms',
-    'provider_payout_targets_admin_verified',
+    'provider_payout_bindings_permissionless',
+    'provider_payout_bindings_ownership_verified',
     'browser_handoffs_print_copy_paste_url',
   ]);
   for (const key of [
@@ -175,10 +175,10 @@ function validateControls(add, controls) {
     'admin_sets_prices',
     'admin_sets_rules',
     'admin_sets_params',
-    'admin_sets_provider_payout_targets',
     'admin_can_ban_providers',
     'providers_only_join_admin_rooms',
-    'provider_payout_targets_admin_verified',
+    'provider_payout_bindings_permissionless',
+    'provider_payout_bindings_ownership_verified',
     'browser_handoffs_print_copy_paste_url',
   ]) {
     requireBooleanLiteral(add, controls[key], true, `controls.${key}`);

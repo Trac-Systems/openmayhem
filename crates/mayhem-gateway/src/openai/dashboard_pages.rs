@@ -90,6 +90,9 @@ struct DashboardData {
     generated_at_millis: u64,
     history_persistent: bool,
     provider_heartbeat_ttl_millis: u64,
+    baseline_route_requirements: BaselineRouteRequirements,
+    live_route_keys: BTreeSet<ProviderKey>,
+    ctx_bracket_schedule: Arc<CtxBracketSchedule>,
     models: Arc<Vec<GatewayModel>>,
     entries: Vec<ProviderTableEntry>,
     receipts: Vec<StoredReceipt>,
@@ -110,16 +113,23 @@ struct DashboardData {
 impl DashboardData {
     fn from_state(state: &GatewayState) -> Self {
         let generated_at_millis = now_millis_u64();
+        let models = state.models_snapshot();
         let entries = state
             .provider_table
             .lock_recover("provider table")
             .entries(generated_at_millis);
+        let baseline_route_requirements = state.baseline_route_requirements(generated_at_millis);
+        let live_route_keys =
+            gateway_live_route_keys(state, &models, &entries, generated_at_millis);
         let all_receipts = state.receipts();
         Self {
             generated_at_millis,
             history_persistent: state.dashboard_history_path.as_ref().is_some(),
             provider_heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
-            models: state.models_snapshot(),
+            baseline_route_requirements,
+            live_route_keys,
+            ctx_bracket_schedule: state.ctx_bracket_schedule.clone(),
+            models,
             entries,
             receipts: dashboard_latest_receipts(&all_receipts),
             receipt_checkpoint_count: all_receipts.len(),
@@ -140,7 +150,7 @@ impl DashboardData {
     fn accepting_routes(&self) -> usize {
         self.entries
             .iter()
-            .filter(|entry| route_operational_state(entry).kind == RouteStateKind::Accepting)
+            .filter(|entry| route_operational_state(self, entry).kind == RouteStateKind::Accepting)
             .count()
     }
 
@@ -157,7 +167,7 @@ impl DashboardData {
             .filter(|model| {
                 model.mayhem.route_candidates.iter().any(|candidate| {
                     dashboard_entry_for_route(&self.entries, candidate).is_some_and(|entry| {
-                        route_operational_state(entry).kind == RouteStateKind::Accepting
+                        route_operational_state(self, entry).kind == RouteStateKind::Accepting
                     })
                 })
             })
@@ -499,56 +509,128 @@ fn data_now_age_millis(observed_at_millis: u64) -> u64 {
     now_millis_u64().saturating_sub(observed_at_millis)
 }
 
-fn route_operational_state(entry: &ProviderTableEntry) -> RouteState {
-    let Some(heartbeat) = entry.heartbeat.as_ref() else {
-        return if let Some(age) = entry.heartbeat_age_millis {
-            RouteState {
-                kind: RouteStateKind::Stale,
-                label: "Telemetry delayed",
-                tone: "warn",
-                explanation: format!("Last heartbeat received {} ago", format_millis_age(age)),
-            }
-        } else {
-            RouteState {
-                kind: RouteStateKind::Waiting,
-                label: "Waiting for heartbeat",
-                tone: "",
-                explanation: "No heartbeat has been received for this route".to_owned(),
-            }
-        };
-    };
+fn route_operational_state(data: &DashboardData, entry: &ProviderTableEntry) -> RouteState {
     let age = entry
         .heartbeat_age_millis
         .map(format_millis_age)
         .unwrap_or_else(|| "just now".to_owned());
-    if !heartbeat.accepting_new {
+    let baseline_state = baseline_route_state(entry, &data.baseline_route_requirements);
+    if baseline_state == BaselineRouteState::Live && !data.live_route_keys.contains(&entry.key) {
         return RouteState {
+            kind: RouteStateKind::Waiting,
+            label: "Not currently routable",
+            tone: "warn",
+            explanation: "Fresh capacity is present, but the current rail, route capabilities, context floor, or gateway cooloff excludes this route".to_owned(),
+        };
+    }
+    match baseline_state {
+        BaselineRouteState::HeartbeatMissing => RouteState {
+            kind: RouteStateKind::Waiting,
+            label: "Waiting for heartbeat",
+            tone: "",
+            explanation: "No heartbeat has been received for this route".to_owned(),
+        },
+        BaselineRouteState::HeartbeatStale => RouteState {
+            kind: RouteStateKind::Stale,
+            label: "Telemetry delayed",
+            tone: "warn",
+            explanation: format!("Last heartbeat was signed {age} ago"),
+        },
+        BaselineRouteState::Draining => RouteState {
             kind: RouteStateKind::Draining,
             label: "Draining",
             tone: "warn",
             explanation: format!("Fresh heartbeat {age}; new work is not being accepted"),
-        };
-    }
-    if heartbeat.slots.active >= heartbeat.slots.max || heartbeat.q.free_slots == 0 {
-        return RouteState {
+        },
+        BaselineRouteState::Saturated => RouteState {
             kind: RouteStateKind::Capacity,
             label: "At capacity",
             tone: "warn",
-            explanation: format!(
-                "Fresh heartbeat {age}; {} of {} slots active, queue {}",
-                heartbeat.slots.active, heartbeat.slots.max, heartbeat.q.engine_backlog
-            ),
-        };
-    }
-    RouteState {
-        kind: RouteStateKind::Accepting,
-        label: "Capacity advertised",
-        tone: "good",
-        explanation: format!(
-            "Fresh heartbeat {age}; {} free slot{}",
-            heartbeat.q.free_slots,
-            if heartbeat.q.free_slots == 1 { "" } else { "s" }
-        ),
+            explanation: format!("Fresh heartbeat {age}; saturation is above the routing cutoff"),
+        },
+        BaselineRouteState::AtCapacity => {
+            let Some(heartbeat) = entry.heartbeat.as_ref() else {
+                return RouteState {
+                    kind: RouteStateKind::Waiting,
+                    label: "Route unavailable",
+                    tone: "warn",
+                    explanation: "Live-route evidence is incomplete".to_owned(),
+                };
+            };
+            RouteState {
+                kind: RouteStateKind::Capacity,
+                label: "At capacity",
+                tone: "warn",
+                explanation: format!(
+                    "Fresh heartbeat {age}; {} of {} slots active, queue {}",
+                    heartbeat.slots.active, heartbeat.slots.max, heartbeat.q.engine_backlog
+                ),
+            }
+        }
+        BaselineRouteState::ConsentVersion => RouteState {
+            kind: RouteStateKind::Waiting,
+            label: "Registration update required",
+            tone: "warn",
+            explanation: "The route consent version does not match the current rules".to_owned(),
+        },
+        BaselineRouteState::CircuitOpen => RouteState {
+            kind: RouteStateKind::Waiting,
+            label: "Temporarily unavailable",
+            tone: "warn",
+            explanation: "The gateway circuit breaker is cooling this route down".to_owned(),
+        },
+        BaselineRouteState::AttestationPolicyNotReady => RouteState {
+            kind: RouteStateKind::Waiting,
+            label: "Verification policy unavailable",
+            tone: "warn",
+            explanation: entry
+                .contract
+                .attestation_policy
+                .reason
+                .clone()
+                .unwrap_or_else(|| {
+                    "The exact authenticated attestation policy is not locally ready".to_owned()
+                }),
+        },
+        BaselineRouteState::TransportPeerMissing => RouteState {
+            kind: RouteStateKind::Waiting,
+            label: "Transport unavailable",
+            tone: "warn",
+            explanation: "The fresh heartbeat does not advertise a direct transport peer"
+                .to_owned(),
+        },
+        BaselineRouteState::AttestationMissing => RouteState {
+            kind: RouteStateKind::Waiting,
+            label: "Evidence unavailable",
+            tone: "warn",
+            explanation: "No attestation head is cached for this live route".to_owned(),
+        },
+        BaselineRouteState::AttestationStale => RouteState {
+            kind: RouteStateKind::Stale,
+            label: "Evidence delayed",
+            tone: "warn",
+            explanation: "The cached attestation head is outside the freshness window".to_owned(),
+        },
+        BaselineRouteState::Live => {
+            let Some(heartbeat) = entry.heartbeat.as_ref() else {
+                return RouteState {
+                    kind: RouteStateKind::Waiting,
+                    label: "Route unavailable",
+                    tone: "warn",
+                    explanation: "Live-route evidence is incomplete".to_owned(),
+                };
+            };
+            RouteState {
+                kind: RouteStateKind::Accepting,
+                label: "Capacity advertised",
+                tone: "good",
+                explanation: format!(
+                    "Fresh heartbeat {age}; {} free slot{}",
+                    heartbeat.q.free_slots,
+                    if heartbeat.q.free_slots == 1 { "" } else { "s" }
+                ),
+            }
+        }
     }
 }
 
@@ -875,13 +957,16 @@ pub(super) fn dashboard_evidence_payload(
                 .map(|(model, _)| model.id.as_str())
                 .or_else(|| entry.map(|entry| entry.contract.model_id.as_str()))
                 .unwrap_or("Unknown model");
-            let state = entry.map(route_operational_state).unwrap_or(RouteState {
-                kind: RouteStateKind::Waiting,
-                label: "No provider-table entry",
-                tone: "",
-                explanation: "The canonical route is not present in the current provider table."
-                    .to_owned(),
-            });
+            let state = entry
+                .map(|entry| route_operational_state(&data, entry))
+                .unwrap_or(RouteState {
+                    kind: RouteStateKind::Waiting,
+                    label: "No provider-table entry",
+                    tone: "",
+                    explanation:
+                        "The canonical route is not present in the current provider table."
+                            .to_owned(),
+                });
             let source_snapshot = match (catalog_route, entry) {
                 (Some((_, candidate)), Some(entry)) => {
                     json!({"catalog_route": candidate, "provider_table_entry": entry})
@@ -895,13 +980,62 @@ pub(super) fn dashboard_evidence_payload(
                 (None, None) => unreachable!(),
             };
             let freshness = entry.and_then(|entry| heartbeat_freshness_window(&data, entry));
+            let attestation = entry.map(|entry| &entry.contract.attestation_policy);
             let raw = json!({
                 "generated_at_millis": data.generated_at_millis,
                 "heartbeat_ttl_millis": data.provider_heartbeat_ttl_millis,
                 "heartbeat_observed_at_millis": freshness.map(|window| window.observed_at_millis),
                 "heartbeat_expires_at_millis": freshness.map(|window| window.expires_at_millis),
+                "local_attestation_verification": attestation,
                 "sources": source_snapshot,
             });
+            let attestation_tier = attestation
+                .map(|status| format!("Tier {}", status.attestation_tier))
+                .unwrap_or_else(|| "Unavailable".to_owned());
+            let quote_kind = attestation
+                .and_then(|status| status.quote_kind)
+                .map(|kind| kind.as_str().to_owned())
+                .unwrap_or_else(|| "Not applicable".to_owned());
+            let policy_version = attestation
+                .and_then(|status| status.policy_sequence)
+                .map(|sequence| sequence.to_string())
+                .unwrap_or_else(|| "Not active".to_owned());
+            let policy_digest = attestation
+                .and_then(|status| status.policy_digest.clone())
+                .unwrap_or_else(|| "Not active".to_owned());
+            let verifier = attestation
+                .and_then(|status| {
+                    status.verifier_profile.map(|profile| {
+                        format!(
+                            "{profile:?} / schema {}",
+                            status.evidence_schema_version.unwrap_or_default()
+                        )
+                    })
+                })
+                .unwrap_or_else(|| "Not applicable".to_owned());
+            let required_layers = attestation
+                .map(|status| {
+                    status
+                        .required_measurement_layers
+                        .iter()
+                        .map(|layer| format!("{layer:?}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|layers| !layers.is_empty())
+                .unwrap_or_else(|| "None".to_owned());
+            let local_readiness = attestation
+                .map(|status| {
+                    if status.locally_ready {
+                        "Ready".to_owned()
+                    } else {
+                        status
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "Not ready".to_owned())
+                    }
+                })
+                .unwrap_or_else(|| "Not ready".to_owned());
             Some(evidence_payload(
                 data.generated_at_millis,
                 "Provider route evidence",
@@ -927,6 +1061,41 @@ pub(super) fn dashboard_evidence_payload(
                         "Advertised state",
                         state.label.to_owned(),
                         "Derived from heartbeat freshness, acceptance, and capacity",
+                    ),
+                    (
+                        "Attestation tier",
+                        attestation_tier,
+                        "Canonical route plus local gateway policy resolution",
+                    ),
+                    (
+                        "Quote kind",
+                        quote_kind,
+                        "Authenticated route advertisement resolved by this gateway",
+                    ),
+                    (
+                        "Policy version",
+                        policy_version,
+                        "Active admin-signed attestation policy sequence",
+                    ),
+                    (
+                        "Policy digest",
+                        policy_digest,
+                        "Exact active admin-signed attestation policy digest",
+                    ),
+                    (
+                        "Verifier profile",
+                        verifier,
+                        "Locally authenticated verifier profile and evidence schema",
+                    ),
+                    (
+                        "Required layers",
+                        required_layers,
+                        "CPU, GPU, and workload layers required by the active policy",
+                    ),
+                    (
+                        "Local verification",
+                        local_readiness,
+                        "Gateway-local readiness; runtime binary hashes remain evidence only",
                     ),
                 ],
                 raw,
@@ -4243,7 +4412,7 @@ fn earn_reliability_page(
             rows
         }
     );
-    let state = aggregate_provider_state(&entries);
+    let state = aggregate_provider_state(data, &entries);
     shell_wide(
         data,
         expires,
@@ -4512,7 +4681,42 @@ fn network_markets_page(
                 break;
             }
             if index >= page.start {
-                rows.push_str(&format!(r##"<tr data-filter-row data-filter-text="{} {} T{} {} {}"><td data-export-value="{} / enclave {}" data-sort-value="{} / {}"><span class="table-primary mono">{}</span><span class="table-secondary">{}</span></td><td>T{} &middot; {}</td><td>{} &middot; {}</td><td>{}</td><td>{}</td></tr>"##, html_escape(&model.id), html_escape(&market.enclave_id), market.att_tier, html_escape(&market.quant), html_escape(&market.availability), html_escape(&model.id), html_escape(&market.enclave_id), html_escape(&model.id), html_escape(&market.enclave_id), html_escape(&model.id), html_escape(short_text(&market.enclave_id, 18).as_ref()), market.att_tier, html_escape(&market.quant), count_noun(market.providers_online as u64, "provider"), count_noun(market.route_count as u64, "route"), html_escape(&market.availability), money_html(&dashboard_price(&market.price_ref_au))));
+                let summary = gateway_market_route_summary(
+                    model,
+                    market,
+                    &data.entries,
+                    &data.live_route_keys,
+                    &data.rail,
+                    &data.ctx_bracket_schedule,
+                    data.generated_at_millis / 1_000,
+                );
+                let availability = summary.availability();
+                rows.push_str(&format!(
+                    r##"<tr data-filter-row data-filter-text="{} {} T{} {} {}" data-live-route-count="{}" data-live-provider-count="{}" data-registered-route-count="{}" data-registered-provider-count="{}"><td data-export-value="{} / enclave {}" data-sort-value="{} / {}"><span class="table-primary mono">{}</span><span class="table-secondary">{}</span></td><td>T{} &middot; {}</td><td>{} &middot; {}</td><td>{} &middot; {}</td><td>{}</td><td>{}</td></tr>"##,
+                    html_escape(&model.id),
+                    html_escape(&market.enclave_id),
+                    market.att_tier,
+                    html_escape(&market.quant),
+                    html_escape(availability),
+                    summary.route_count,
+                    summary.providers_online,
+                    summary.registered_route_count,
+                    summary.registered_provider_count,
+                    html_escape(&model.id),
+                    html_escape(&market.enclave_id),
+                    html_escape(&model.id),
+                    html_escape(&market.enclave_id),
+                    html_escape(&model.id),
+                    html_escape(short_text(&market.enclave_id, 18).as_ref()),
+                    market.att_tier,
+                    html_escape(&market.quant),
+                    count_noun(summary.providers_online as u64, "provider"),
+                    count_noun(summary.route_count as u64, "route"),
+                    count_noun(summary.registered_provider_count as u64, "provider"),
+                    count_noun(summary.registered_route_count as u64, "route"),
+                    html_escape(availability),
+                    money_html(&dashboard_price(&market.price_ref_au)),
+                ));
             }
             index += 1;
         }
@@ -4522,7 +4726,7 @@ fn network_markets_page(
     }
     if rows.is_empty() {
         rows = format!(
-            r##"<tr><td colspan="5">{}</td></tr>"##,
+            r##"<tr><td colspan="6">{}</td></tr>"##,
             empty_block(
                 "No catalog markets",
                 "No market records are loaded in this catalog snapshot.",
@@ -4545,7 +4749,7 @@ fn network_markets_page(
         "markets",
     );
     let content = format!(
-        r##"{}<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Catalog markets</h2><p>Market structure is contractual; current acceptance still belongs to heartbeat evidence.</p></div>{filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="market-table"><caption class="sr-only">Catalog markets and reference prices</caption><thead><tr><th>Model / enclave</th><th>Tier / quant</th><th>Catalog supply</th><th>Availability label</th><th>Reference price</th></tr></thead><tbody>{rows}</tbody></table></div>{filter_empty}</div><footer class="panel-footer"><span>{market_summary}</span>{pagination}</footer></section>"##,
+        r##"{}<section class="panel"><header class="panel-head"><div class="panel-title"><h2>Catalog markets</h2><p>Market structure is contractual; current acceptance still belongs to heartbeat evidence.</p></div>{filter_controls}</header><div class="panel-body flush"><div class="data-table-wrap"><table class="data-table" id="market-table"><caption class="sr-only">Catalog markets and reference prices</caption><thead><tr><th>Model / enclave</th><th>Tier / quant</th><th>Live supply</th><th>Registered supply</th><th>Availability label</th><th>Reference price</th></tr></thead><tbody>{rows}</tbody></table></div>{filter_empty}</div><footer class="panel-footer"><span>{market_summary}</span>{pagination}</footer></section>"##,
         network_subnav(DashboardProductPage::NetworkMarkets),
     );
     shell_wide(
@@ -4578,7 +4782,7 @@ fn network_activity_page(
         "route observations",
     );
     let rows = entries.into_iter().skip(page.start).take(page.len()).map(|entry| {
-        let state = route_operational_state(entry);
+        let state = route_operational_state(data, entry);
         let queue = heartbeat_value(
             data,
             entry,
@@ -4644,9 +4848,29 @@ fn network_evidence_page(
         ),
     };
     let route_rows = data.entries.iter().skip(route_page.start).take(route_page.len()).map(|entry| {
-        let state = route_operational_state(entry);
+        let state = route_operational_state(data, entry);
         let evidence = evidence_link(&evidence_href("route", &[("provider", entry.key.provider.as_str()), ("enclave", entry.key.enclave_id.as_str()), ("room", entry.key.room_id.as_str()), ("model", entry.contract.model_id.as_str())]), "Verify", &entry.contract.model_id);
-        format!(r##"<tr data-filter-row><td data-export-value="{} / enclave {}"><span class="table-primary mono">{}</span><span class="table-secondary">{}</span></td><td data-export-value="{}">{}</td><td><span class="status-badge {}">{}</span></td><td>{}</td><td>{}</td></tr>"##, html_escape(&entry.key.provider), html_escape(&entry.key.enclave_id), html_escape(short_text(&entry.key.provider, 16).as_ref()), html_escape(short_text(&entry.key.enclave_id, 18).as_ref()), html_escape(&entry.contract.model_id), html_escape(&entry.contract.model_id), state.tone, html_escape(state.label), if entry.attestation_head.is_some() { "Attestation cached" } else { "No cached attestation" }, evidence)
+        let policy = &entry.contract.attestation_policy;
+        let verification = if policy.policy_required {
+            let quote = policy
+                .quote_kind
+                .map(|kind| kind.as_str())
+                .unwrap_or("quote unknown");
+            let sequence = policy
+                .policy_sequence
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_owned());
+            format!(
+                "Tier {} · {} · policy {} · {}",
+                policy.attestation_tier,
+                quote,
+                sequence,
+                if policy.locally_ready { "ready" } else { "not ready" }
+            )
+        } else {
+            format!("Tier {} · policy not required", policy.attestation_tier)
+        };
+        format!(r##"<tr data-filter-row><td data-export-value="{} / enclave {}"><span class="table-primary mono">{}</span><span class="table-secondary">{}</span></td><td data-export-value="{}">{}</td><td><span class="status-badge {}">{}</span></td><td>{}</td><td>{}</td></tr>"##, html_escape(&entry.key.provider), html_escape(&entry.key.enclave_id), html_escape(short_text(&entry.key.provider, 16).as_ref()), html_escape(short_text(&entry.key.enclave_id, 18).as_ref()), html_escape(&entry.contract.model_id), html_escape(&entry.contract.model_id), state.tone, html_escape(state.label), html_escape(&verification), evidence)
     }).collect::<String>();
     let (route_filter_controls, route_filter_empty) = shown_rows_filter(
         "network-evidence",
@@ -4902,7 +5126,7 @@ fn model_availability(data: &DashboardData, model: &GatewayModel) -> ModelAvaila
         let Some(entry) = dashboard_entry_for_route(&data.entries, candidate) else {
             continue;
         };
-        match route_operational_state(entry).kind {
+        match route_operational_state(data, entry).kind {
             RouteStateKind::Accepting => {
                 accepting += 1;
                 fresh += 1;
@@ -5111,7 +5335,7 @@ fn provider_coverage_notice(
     }
 }
 
-fn aggregate_provider_state(entries: &[&ProviderTableEntry]) -> RouteState {
+fn aggregate_provider_state(data: &DashboardData, entries: &[&ProviderTableEntry]) -> RouteState {
     if entries.is_empty() {
         return RouteState {
             kind: RouteStateKind::Waiting,
@@ -5124,7 +5348,7 @@ fn aggregate_provider_state(entries: &[&ProviderTableEntry]) -> RouteState {
     }
     let states = entries
         .iter()
-        .map(|entry| route_operational_state(entry))
+        .map(|entry| route_operational_state(data, entry))
         .collect::<Vec<_>>();
     let accepting = states
         .iter()
@@ -5270,7 +5494,9 @@ fn provider_page_state(
                 .count();
             let accepting_routes = entries
                 .iter()
-                .filter(|entry| route_operational_state(entry).kind == RouteStateKind::Accepting)
+                .filter(|entry| {
+                    route_operational_state(data, entry).kind == RouteStateKind::Accepting
+                })
                 .count();
             return provider_load_failure_state(progress, live_routes, accepting_routes);
         }
@@ -5306,7 +5532,7 @@ fn provider_page_state(
             };
         }
     }
-    aggregate_provider_state(entries)
+    aggregate_provider_state(data, entries)
 }
 
 fn latest_provider_progress<'a>(
@@ -5770,7 +5996,7 @@ fn provider_route_rows(
         );
     }
     entries.iter().skip(page.start).take(page.len()).map(|entry| {
-        let state = route_operational_state(entry);
+        let state = route_operational_state(data, entry);
         let heartbeat = entry.heartbeat.as_ref();
         let slots = heartbeat_value(data, entry, heartbeat.map(|value| format!("{} / {} active · {} free", value.slots.active, value.slots.max, value.q.free_slots)));
         let queue = heartbeat_value(data, entry, heartbeat.map(|value| format!("{} queued · {}ms wait", value.q.engine_backlog, value.q.est_wait_ms)));
@@ -5796,7 +6022,7 @@ fn provider_machine_rows(
         );
     }
     entries.iter().skip(page.start).take(page.len()).map(|entry| {
-        let state = route_operational_state(entry);
+        let state = route_operational_state(data, entry);
         let heartbeat = entry.heartbeat.as_ref();
         let capacity = heartbeat_value(data, entry, heartbeat.map(|value| format!("{} / {} active · {} free", value.slots.active, value.slots.max, value.q.free_slots)));
         let freshness = heartbeat_age(data, entry);
@@ -5819,13 +6045,16 @@ fn network_provider_rows(data: &DashboardData, page: PageWindow) -> String {
                 continue;
             }
             let entry = dashboard_entry_for_route(&data.entries, candidate);
-            let state = entry.map(route_operational_state).unwrap_or(RouteState {
-                kind: RouteStateKind::Waiting,
-                label: "No provider-table entry",
-                tone: "",
-                explanation: "The canonical route is not present in the current provider table."
-                    .to_owned(),
-            });
+            let state = entry
+                .map(|entry| route_operational_state(data, entry))
+                .unwrap_or(RouteState {
+                    kind: RouteStateKind::Waiting,
+                    label: "No provider-table entry",
+                    tone: "",
+                    explanation:
+                        "The canonical route is not present in the current provider table."
+                            .to_owned(),
+                });
             let capacity = entry.map_or_else(
                 || "Unavailable".to_owned(),
                 |entry| {

@@ -24,11 +24,12 @@ gateway is loopback-only; a public ledger records prices, receipts, settlements.
 
 ## 2. PRIME DIRECTIVES (read before doing anything)
 
-1. **NEVER modify the core to make something work.** Do not edit, bump, swap, or re-vendor
-   dependencies, and do not patch `intercom/` or the Trac core (`intercom/trac/*`,
-   `trac-msb`/`trac-peer`/`trac-wallet`). Those are canonically pinned. If something fails, fix the
-   *environment* (missing prerequisite, config, connectivity) — never hack the pinned code. If a
-   real bug seems to require a core change, STOP and tell the human; do not work around it.
+1. **NEVER modify the base protocol to make something work.** Do not edit, bump, swap, or
+   re-vendor the pinned Trac/Intercom dependencies or `intercom/trac/*`
+   (`trac-msb`/`trac-peer`/`trac-wallet`). Mayhem-owned contract, feature, SC-Bridge, and RPC
+   specialization under `intercom/` may evolve through an authenticated Mayhem release, but it must
+   not change Autobase writer rules or the upstream peer protocol. If a real bug requires changing
+   that pinned core, STOP and tell the human; do not work around it.
 2. **Relay LIVE values, never hardcode.** Funding addresses, deposit amounts, Stripe links, model
    IDs, and prices come from the command OUTPUT and the live catalog. Run the command and relay what
    it prints. Do not invent or memorize an address or URL. `mainnet` is the fail-closed default;
@@ -41,28 +42,110 @@ gateway is loopback-only; a public ledger records prices, receipts, settlements.
    feature reacting to a command handed over by a chat app. Tell the user to run the installer in a
    Terminal they opened themselves and update macOS/XProtect (`softwareupdate --background`). The
    installer is clean and installs only under `$HOME`.
+7. **Preserve release and store identity.** Never run a dirty or mixed-revision release, add a
+   migration/compatibility shim, change the sole writer, or delete/rebuild/convert/promote a
+   canonical indexer store. Authenticated Intercom must run from the physical packaged tree; a
+   link-only Pear launch is not a release.
 
 ---
 
 ## 3. Install
 
 ### 3.1 Get the code — release-first, main-tree fallback (MANDATORY rule)
-- **If a released version exists**, always install the **latest release artifact**, verified against
-  its SHA-256 sidecar (both on the [releases page](https://github.com/Trac-Systems/openmayhem/releases/latest)):
+- Check the [releases page](https://github.com/Trac-Systems/openmayhem/releases). Use a release
+  artifact only when a native archive for the host, its detached manifest, and its detached
+  signature are published. The independently trusted canonical public-key record is
+  [`release/keys/openmayhem-release-v1.json`](release/keys/openmayhem-release-v1.json), published at
+  the raw GitHub URL below with key ID `openmayhem-release-v1`. The independent record is mandatory.
+  Never trust a key from inside the archive or signature, and never invent a missing artifact URL,
+  source commit, hash, or release.
+- For a complete published `0.2.23` release, use terminal-friendly user paths and replace only the
+  target-specific artifact placeholder.
+
+  **macOS/Linux:**
+  ```bash
+  mkdir -p "$HOME/Downloads/openmayhem-install"
+  cd "$HOME/Downloads/openmayhem-install"
+  curl -fL 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/install.sh' -o install.sh
+  curl -fL 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/release/keys/openmayhem-release-v1.json' -o openmayhem-release-v1.json
+  chmod 0755 install.sh
+  ./install.sh \
+    --artifact-url '<0.2.23-macos-or-linux-release-archive-url>' \
+    --version 0.2.23 \
+    --release-key './openmayhem-release-v1.json' \
+    --release-key-id 'openmayhem-release-v1'
   ```
-  ./install.sh --artifact-url <archive-url> --sha256 <archive-sha256>
+
+  **Windows PowerShell:**
+  ```powershell
+  $workDir = Join-Path $HOME 'Downloads\openmayhem-install'
+  New-Item -ItemType Directory -Force -Path $workDir | Out-Null
+  Set-Location $workDir
+  Invoke-WebRequest `
+    -Uri 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/install.ps1' `
+    -OutFile '.\install.ps1'
+  Invoke-WebRequest `
+    -Uri 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/release/keys/openmayhem-release-v1.json' `
+    -OutFile '.\openmayhem-release-v1.json'
+  .\install.ps1 `
+    -ArtifactUrl '<0.2.23-windows-release-archive-url>' `
+    -Version 0.2.23 `
+    -ReleaseKey '.\openmayhem-release-v1.json' `
+    -ReleaseKeyId 'openmayhem-release-v1'
   ```
-- **If there is NO release version yet**, build from the **main tree** by cloning:
+
+  The installers derive the required `<archive-stem>.manifest.json` and
+  `<archive-stem>.manifest.json.sig` URLs from a macOS/Linux archive ending in `.tar.gz` or `.tgz`,
+  or a Windows archive ending in `.zip`. If the release publishes different detached URLs, provide
+  them explicitly. An exact release identity is mandatory: use `--version 0.2.23` or
+  `-Version 0.2.23` as shown. To select by commit instead, replace that option with
+  `--source-git-sha '<exact-40-lowercase-hex-source-sha>'` or
+  `-ExpectedSourceGitSha '<exact-40-lowercase-hex-source-sha>'`. Never omit both. An archive SHA-256
+  is optional:
+
+  ```bash
+  ./install.sh \
+    --artifact-url '<0.2.23-macos-or-linux-release-archive-url>' \
+    --manifest-url '<0.2.23-target-detached-manifest-url>' \
+    --signature-url '<0.2.23-target-detached-signature-url>' \
+    --version 0.2.23 \
+    --release-key './openmayhem-release-v1.json' \
+    --release-key-id 'openmayhem-release-v1' \
+    --sha256 '<optional-archive-sha256>'
+  ```
+
+  ```powershell
+  .\install.ps1 `
+    -ArtifactUrl '<0.2.23-windows-release-archive-url>' `
+    -ManifestUrl '<0.2.23-windows-detached-manifest-url>' `
+    -SignatureUrl '<0.2.23-windows-detached-signature-url>' `
+    -Version 0.2.23 `
+    -ReleaseKey '.\openmayhem-release-v1.json' `
+    -ReleaseKeyId 'openmayhem-release-v1' `
+    -Sha256 '<optional-archive-sha256>'
+  ```
+
+  Use an optional archive hash only when its exact value is published. The installer snapshots the
+  release inputs and authenticates the detached signature, manifest, trusted key, requested
+  identity, target, and anti-rollback state before candidate extraction. It checks the extracted
+  bootstrap against the signed hash before execution. Only after the authenticated artifact install
+  does it check or provision pinned Pear `2.0.4`. That npm action is limited to Pear and never
+  hydrates the signed runtime; never run `npm install` or `npm ci` there.
+- **If there is no complete native release for the host**, build from the **main tree** by cloning:
   ```
   git clone https://github.com/Trac-Systems/openmayhem.git
   cd openmayhem
   ./install.sh --from-source            # Windows: .\install.ps1 -FromSource
   ```
-Check the releases page first. Prefer a release; fall back to main-tree source only when no release
-exists. Everything installs under `~/.mayhem/` — no `sudo`, no system directories.
+Everything installs under `~/.mayhem/` — no `sudo`, no system directories.
 
-### 3.2 Prerequisites (install these FIRST, verify each — the build fails mid-way otherwise)
-**Every OS:** Rust stable (rustup), Node.js 20+ with npm, git, curl, unzip.
+### 3.2 Prerequisites (install these FIRST and verify each)
+**Authenticated release, every OS:** Node.js 20+ with npm and the platform's download/archive
+tools. Rust and a native compiler toolchain are not required. After artifact authentication,
+anti-rollback enforcement, and installation, npm may provision only pinned Pear `2.0.4`; it must
+never hydrate or modify the authenticated installed runtime.
+
+**From source, every OS:** Rust stable (rustup), Node.js 20+ with npm, git, curl, unzip.
 
 **macOS (Apple Silicon):**
 ```
@@ -111,7 +194,17 @@ mayhem up --yes            # starts supervised peer + gateway; health-checks eac
 curl http://127.0.0.1:11435/v1/models
 ```
 `mayhem up` does not report ready until the signed rules, payment directory, catalog, and at least
-one live model route have synced (fail-closed on mainnet). `mayhem down` stops everything.
+one live model route has synced (fail-closed on mainnet). Ordinary `mayhem down` drains provider
+workers, leaves their canonical registrations, and stops everything. Use `mayhem down --restart`
+for an update or temporary restart; it preserves durable registrations so the next `mayhem up`
+resumes without provider re-onboarding.
+
+For a Tier-2/Tier-3 candidate, a fresh buyer needs no TPM, provider quote helper, root/admin action,
+manual verifier flag, or machine-wide setup. `mayhem up` authenticates the active policy and shared
+public collateral. When that policy requires a managed verifier, it fetches only the
+executable/manifest pair for the buyer binary's compiled target, verifies both, and wires the
+sibling automatically. Never fetch another target "just in case" or accept verifier code, roots,
+policy, JWKS, or golden measurements from a provider.
 
 ---
 
@@ -157,13 +250,17 @@ intentionally return `401`. For a remote terminal, print
 the dashboard token, and an operational service on another port must not be presented as the
 canonical dashboard.
 
-**To switch rail later:** `mayhem down` then `mayhem up --rail <other> --yes`. Rails never convert
-into each other.
+**To switch rail later:** `mayhem down --restart` then `mayhem up --rail <other> --yes`. Restart
+mode preserves provider registrations if this stack also serves. Rails never convert into each
+other.
 
 ### 4.2 Provider — earn on this machine
 **Ask first:**
 - **Which payment rails to ACCEPT?** (any subset of `fiat,tap,tnk`; default at registration is
   `fiat` — a provider that wants on-chain MUST set rails or it silently rejects those users).
+- **Which payout destination for each accepted rail?** TAP/TNK may use the provider wallet by
+  default or a separate wallet that co-signs the binding. Fiat uses hosted Stripe Connect; ask for
+  the provider's actual two-letter country code and always relay the printed copy/paste URL.
 - **Min-ask floor?** (the lowest price the provider will serve at; "market" = accept the protocol
   price).
 - **Self-protection limits?** (`--max-concurrent`, `--accept-rate`, `--budget` as USD/day|month|total).
@@ -181,10 +278,44 @@ into each other.
 mayhem doctor                                  # what fits + expected tok/s + memory
 mayhem up --provider --yes                      # start serving the first feasible enclave
 mayhem provider rails set --rails <fiat,tap,tnk> --submit
+mayhem provider payout set --rail tap --submit  # when TAP is accepted; local wallet by default
+mayhem provider payout set --rail tnk --submit  # when TNK is accepted; local wallet by default
 mayhem provider min-ask set <...>               # participation floor (per market)
 mayhem provider limits set [--max-concurrent N] [--accept-rate R] [--budget <USD/day|month|total>]
 mayhem provider health                          # green AND the model appears in /v1/models
 ```
+
+For fiat, run `mayhem provider stripe onboard` with the provider's actual
+two-letter country code. It always prints the hosted `connect.stripe.com` URL
+before attempting a browser open; use `--no-open` on a remote terminal and then
+run `mayhem provider stripe status`. Readiness automatically creates the
+provider-signed fiat binding. For a ready Stripe account owned by another
+provider identity, inspect `mayhem provider stripe relink --help`: both provider
+identities must consent, and an account id alone is rejected.
+For a German provider, `mayhem provider stripe rotate --country DE` replaces
+the current Connect account; use the actual country code the provider answered
+with. It signs the current account as a compare-and-swap, always prints the new
+hosted URL, and keeps provider/account-specific readiness for the current
+account until the verified replacement's exact activation epoch. If `E` is the
+latest fully applied epoch, a first binding activates at `E+1` and a rotation
+at `E+2`; existing liabilities never move to the new revision.
+
+TAP/TNK `payout set` signs with both the provider wallet and the selected target
+wallet. Use `--target-wallet-key-file` only when the target differs from the
+provider wallet; deliberate reuse by several provider identities requires that
+same target wallet to co-sign every binding. Use `payout rotate` for a later
+change and `payout get` to inspect current/pending revisions. Payout bindings
+follow the provider identity across all models and rooms. The local peer remains
+read-only: it relays the signed intent, and the sole indexer verifies and
+appends it automatically without Mayhem-admin approval or SSH.
+
+After each finalized epoch, the operator payout worker automatically and
+idempotently reconciles Stripe transfers, TNK transfers, and TAP root/fee/burn
+work from the canonical epoch/apply hash. Providers do not run admin settlement
+commands. Stripe and TNK are pushed; TAP remains a non-custodial cumulative
+claim, so use `mayhem withdraw` (visible alias: `mayhem claim`) when the provider
+chooses to sweep it.
+
 #### 4.2.1 Canonical model provider matrix
 
 Use the exact catalog `model_id` as `--provider-enclave`; do not normalize case or substitute an
@@ -378,9 +509,9 @@ a valid proof automatically joins the existing admin-created Tier-2 market.
 **Relay:** the provider dashboard URL, health status, and (later) `mayhem provider earnings`.
 **Pitfall:** green health with the route missing from `/v1/models` = the model failed to load —
 re-run `mayhem doctor` and check the backend extras (§3.2). **Claiming earnings:** TAP payouts are
-claimed non-custodially (`mayhem withdraw`/collect); TNK gas is sponsored; explain earnings depend on
-uptime, price, saturation, and reputation. Use `mayhem provider drain` to stop taking new sessions
-without a hard stop.
+claimed non-custodially with `mayhem withdraw` (`mayhem claim` is its visible alias); TNK gas is
+sponsored; explain earnings depend on uptime, price, saturation, and reputation. Use
+`mayhem provider drain` to stop taking new sessions without a hard stop.
 
 ### 4.3 Wire a coding agent (opencode)
 ```
@@ -398,6 +529,11 @@ forwarded as-is.
   routing to a chosen provider set for privacy; still respects price/ctx/tier gates.
 - **Inspect:** `mayhem status`, `mayhem balance`, `mayhem models [--gateway]`, `mayhem price show`,
   `mayhem history` / `mayhem sessions`, `mayhem payments`.
+- **Route truth:** in `/v1/models`, `registered_route_count` is durable registration evidence;
+  `route_count`, `providers_online`, `availability=routable`, and `route_candidates` are fresh
+  dispatch-eligible capacity. Crashes and `mayhem down --restart` age out and resume from durable
+  registration without re-onboarding. Deliberate remove, enclave-changing switch, drain-to-stop,
+  provider stop, and ordinary `mayhem down` submit leave records.
 - **Provider ops:** `mayhem provider health|earnings|list|drain|stop`, `mayhem earnings`,
   `mayhem payouts`, `mayhem reputation`, `mayhem withdraw` (TAP claim).
 - **Wallet:** `mayhem wallet show|backup|import|passwd`. Back up the mnemonic on request; never print
@@ -409,11 +545,13 @@ forwarded as-is.
 
 | Goal | Command |
 |---|---|
-| Install (release) | `./install.sh --artifact-url <url> --sha256 <hash>` |
+| Install release (macOS/Linux) | `./install.sh --artifact-url '<0.2.23-target-archive-url>' --version 0.2.23 --release-key './openmayhem-release-v1.json' --release-key-id openmayhem-release-v1` |
+| Install release (PowerShell) | `.\install.ps1 -ArtifactUrl '<0.2.23-windows-archive-url>' -Version 0.2.23 -ReleaseKey '.\openmayhem-release-v1.json' -ReleaseKeyId openmayhem-release-v1` |
 | Install (no release → main) | `git clone …/openmayhem.git && cd openmayhem && ./install.sh --from-source` |
 | Start user gateway | `mayhem up --rail <fiat\|tap\|tnk> --yes` |
 | Start provider | `mayhem up --provider --yes` |
-| Stop everything | `mayhem down` |
+| Stop and leave provider registrations | `mayhem down` |
+| Temporary restart/update | `mayhem down --restart` |
 | Fund (card) | `mayhem pay stripe …` → relay Stripe URL |
 | Fund (Ethereum) | `mayhem pay tap …` → relay address+token+chain+amount |
 | Fund (Trac) | `mayhem pay tnk …` → relay treasury address+amount |
@@ -423,6 +561,12 @@ forwarded as-is.
 | Max price ceiling | `mayhem config max-price <v\|--clear>` |
 | What fits (provider) | `mayhem doctor` |
 | Accept rails | `mayhem provider rails set --rails fiat,tap,tnk --submit` |
+| Bind TAP payout | `mayhem provider payout set --rail tap --submit` |
+| Bind TNK payout | `mayhem provider payout set --rail tnk --submit` |
+| Inspect payout bindings | `mayhem provider payout get` |
+| Stripe payout setup | `mayhem provider stripe onboard --help` |
+| Stripe account replacement | `mayhem provider stripe rotate --help` |
+| Stripe account reuse | `mayhem provider stripe relink --help` |
 | Min-ask floor | `mayhem provider min-ask set <…>` |
 | Limits | `mayhem provider limits set --max-concurrent N --accept-rate R --budget <USD/day>` |
 | Provider health | `mayhem provider health` |
@@ -447,6 +591,9 @@ forwarded as-is.
   time; check `mayhem status`. Do not bypass the fail-closed check.
 - **Provider can't reach the network / stuck** → connectivity/bootstrap issue; solve it via config
   (retry, direct peers if the CLI offers it), NEVER by changing the pinned Trac core.
+- **Buffered media output trips a receive-rate error** → do not add an unbounded limit or blame the
+  provider. Current FLOWRATE accepts bounded fragmented/coalesced direct and real official-relay
+  frames while sustained floods still fail closed; verify both peers run the same accepted release.
 - **Anything that looks like it needs a code/dependency change** → STOP, report to the human. Core is
   canonically pinned and off-limits.
 
@@ -461,3 +608,10 @@ forwarded as-is.
 - Never choose the user's rail, model, or limits for them — ask.
 - Never paste a wallet mnemonic or secret into a shared, logged, or remote channel.
 - Never bypass the mainnet fail-closed checks or the signed-catalog verification.
+- Never present version metadata or focused local tests as a native/live release. A release requires
+  one clean RC commit, six fresh native signed packages carrying that exact `source_git_sha`,
+  physical-root Intercom identity verification, canary/live acceptance, and deployment of those
+  exact artifacts. The matrix is exactly `aarch64-apple-darwin`,
+  `x86_64-apple-darwin`, `aarch64-unknown-linux-gnu`,
+  `x86_64-unknown-linux-gnu`, `aarch64-pc-windows-msvc`, and
+  `x86_64-pc-windows-msvc`. Any source change restarts the package matrix.

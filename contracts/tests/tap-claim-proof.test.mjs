@@ -11,7 +11,11 @@ import {
   providerShareWei,
   rollTapSettlement,
 } from '../scripts/tap-settlement-roller.mjs';
-import { makeReceiptIdentity, signedTapReceipt } from './helpers/signed-receipt.mjs';
+import {
+  makeReceiptIdentity,
+  signedTapReceipt,
+  targetedTapBindingsFor,
+} from './helpers/signed-receipt.mjs';
 
 const TAP_USD_AU = '1000000000000000000';
 const usdAu = (value) => (BigInt(value) * 1_000_000_000_000_000_000n).toString();
@@ -43,9 +47,11 @@ test('claim-proof returns provider proof that submits to MayhemInferencePool.cla
     receipts: [receipt({ session: 's1', user: userId, provider: providerId, au: usdAu(2) })],
     buyer_refunds: [{ user: userId.publicKeyHex, refund_au: usdAu(1) }],
   };
+  const providerAccounts = { [providerId.publicKeyHex]: providerAccount };
   const rolled = await rollTapSettlement({
     bundle,
-    providerAccounts: { [providerId.publicKeyHex]: providerAccount },
+    providerAccounts,
+    targetedSessionBindings: targetedTapBindingsFor(bundle, providerAccounts),
     buyerAccounts: { [userId.publicKeyHex]: await buyer.getAddress() },
     tapUsdAu: TAP_USD_AU,
     ledgerFeeBps: 1500,

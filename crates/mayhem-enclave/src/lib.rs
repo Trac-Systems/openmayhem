@@ -32,7 +32,7 @@ const DEFAULT_COPY_BUFFER_SIZE: usize = 1024 * 1024;
 pub const MERKLE_KIND: &str = "blake3_merkle_v1";
 pub const SEALED_STORE_MANIFEST: &str = "sealed-manifest.json";
 pub const RUNTIME_KEYPAIR_STORE: &str = "runtime-keypair.json";
-pub const SANDBOX_SCHEMA_VERSION: u32 = 2;
+pub const SANDBOX_SCHEMA_VERSION: u32 = 3;
 pub const DEFAULT_TCP_PROBE_TIMEOUT_MS: u64 = 2_000;
 pub const SATURATION_SHED_THRESHOLD: f64 = 0.9;
 #[cfg(not(target_os = "windows"))]
@@ -2381,7 +2381,8 @@ fn macos_sandbox_exec_profile(config: &SandboxConfig) -> String {
 fn linux_seccomp_policy_document(config: &SandboxConfig) -> String {
     serde_json::json!({
         "schema_version": SANDBOX_SCHEMA_VERSION,
-        "kind": "seccomp-bpf",
+        "kind": "landlock-seccomp-bpf",
+        "landlock_abi": 3,
         "default_action": "allow",
         "match_action": "errno(EPERM)",
         "blocked_syscalls": [
@@ -2395,16 +2396,16 @@ fn linux_seccomp_policy_document(config: &SandboxConfig) -> String {
             { "syscall": "fsmount", "reason": "new mounts must not be created after sandbox entry" },
             { "syscall": "fspick", "reason": "mount graph must not be rearranged after sandbox entry" },
             { "syscall": "mount_setattr", "reason": "configured read-only mount attributes must remain stable" },
-            { "syscall": "pivot_root", "reason": "the configured mount namespace must remain stable" }
+            { "syscall": "pivot_root", "reason": "the configured filesystem boundary must remain stable" }
         ],
         "fs": {
             "read_only_dirs": {
                 "paths": &config.read_only_dirs,
-                "policy": "each tree is bind-mounted and remounted read-only in a private mount namespace; direct apply requires pre-existing read-only mounts"
+                "policy": "Landlock handles all filesystem mutation rights and grants none beneath these trees"
             },
             "writable_dirs": {
                 "paths": &config.writable_dirs,
-                "policy": "left writable and verified not to be covered by a read-only mount"
+                "policy": "Landlock grants filesystem mutation rights only beneath these private worker trees and required runtime device/temp paths"
             }
         }
     })
@@ -2552,11 +2553,22 @@ fn spawn_and_confirm_ready(mut process: Command, setup: &str) -> Result<Child> {
     let mut ready = vec![0_u8; SANDBOX_READY_LINE.len()];
     if let Err(read_err) = stdout.read_exact(&mut ready) {
         child.stdin.take();
+        let mut stderr_detail = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = (&mut stderr)
+                .take(8 * 1024)
+                .read_to_string(&mut stderr_detail);
+        }
         let status = child.wait().map_err(EnclaveError::Io)?;
-        return Err(EnclaveError::SandboxSetupExited {
-            status,
-            detail: format!("{setup} did not signal policy readiness: {read_err}"),
-        });
+        let stderr_detail = stderr_detail.trim();
+        let detail = if stderr_detail.is_empty() {
+            format!("{setup} did not signal policy readiness: {read_err}")
+        } else {
+            format!(
+                "{setup} did not signal policy readiness: {read_err}; helper stderr: {stderr_detail}"
+            )
+        };
+        return Err(EnclaveError::SandboxSetupExited { status, detail });
     }
     if ready != SANDBOX_READY_LINE {
         let _ = child.kill();
@@ -2611,33 +2623,8 @@ fn spawn_linux_sandbox_attempt(
     command: &SandboxedCommand,
     helper: &Path,
 ) -> Result<Child> {
-    let mut process = Command::new("unshare");
-    process
-        .arg("--user")
-        .arg("--map-root-user")
-        .arg("--mount")
-        .arg("--propagation")
-        .arg("private")
-        .arg("--")
-        .arg("sh")
-        .arg("-eu")
-        .arg("-c")
-        .arg(
-            r#"while [ "$1" != "--" ]; do
-    store=$1
-    shift
-    mount --bind "$store" "$store" || exit 125
-    mount -o remount,bind,ro "$store" || exit 125
-done
-shift
-exec "$@"
-"#,
-        )
-        .arg("mayhem-sandbox-mount")
-        .args(&config.read_only_dirs)
-        .arg("--")
-        .arg(helper)
-        .arg("sandbox-exec-child");
+    let mut process = Command::new(helper);
+    process.arg("sandbox-exec-child");
     append_linux_sandbox_config_args(&mut process, config);
     process
         .arg("--ready")
@@ -2645,7 +2632,7 @@ exec "$@"
         .arg(&command.program)
         .args(&command.args);
     configure_std_spawn(&mut process, command);
-    spawn_and_confirm_ready(process, "Linux mount namespace and seccomp-bpf")
+    spawn_and_confirm_ready(process, "Linux Landlock and seccomp-bpf")
 }
 
 #[cfg(target_os = "linux")]
@@ -2672,7 +2659,7 @@ fn run_platform_sandbox(config: &SandboxConfig, command: &[String]) -> Result<Ex
 
     #[cfg(target_os = "linux")]
     {
-        run_linux_mount_namespace_sandbox(config, command)
+        run_linux_landlock_sandbox(config, command)
     }
 
     #[cfg(target_os = "windows")]
@@ -2701,59 +2688,17 @@ fn run_platform_sandbox(config: &SandboxConfig, command: &[String]) -> Result<Ex
 }
 
 #[cfg(target_os = "linux")]
-fn run_linux_mount_namespace_sandbox(
-    config: &SandboxConfig,
-    command: &[String],
-) -> Result<ExitStatus> {
+fn run_linux_landlock_sandbox(config: &SandboxConfig, command: &[String]) -> Result<ExitStatus> {
     let current_exe = std::env::current_exe().map_err(EnclaveError::Io)?;
-    let mut helper = vec![
-        current_exe.to_string_lossy().to_string(),
-        "sandbox-exec-child".to_owned(),
-    ];
+    let mut process = Command::new(current_exe);
+    process.arg("sandbox-exec-child");
     for path in &config.read_only_dirs {
-        helper.push("--read-only-dir".to_owned());
-        helper.push(path.to_string_lossy().to_string());
+        process.arg("--read-only-dir").arg(path);
     }
     for path in &config.writable_dirs {
-        helper.push("--writable-dir".to_owned());
-        helper.push(path.to_string_lossy().to_string());
+        process.arg("--writable-dir").arg(path);
     }
-    helper.push("--".to_owned());
-    helper.extend_from_slice(command);
-
-    run_linux_mount_namespace_attempt(&config.read_only_dirs, &helper)
-}
-
-#[cfg(target_os = "linux")]
-fn run_linux_mount_namespace_attempt(
-    read_only_dirs: &[PathBuf],
-    command: &[String],
-) -> Result<ExitStatus> {
-    let mut process = Command::new("unshare");
     process
-        .arg("--user")
-        .arg("--map-root-user")
-        .arg("--mount")
-        .arg("--fork")
-        .arg("--propagation")
-        .arg("private")
-        .arg("--")
-        .arg("sh")
-        .arg("-eu")
-        .arg("-c")
-        .arg(
-            r#"while [ "$1" != "--" ]; do
-    store=$1
-    shift
-    mount --bind "$store" "$store" || exit 125
-    mount -o remount,bind,ro "$store" || exit 125
-done
-shift
-exec "$@"
-"#,
-        )
-        .arg("mayhem-sandbox-mount")
-        .args(read_only_dirs)
         .arg("--")
         .args(command)
         .status()
@@ -2763,12 +2708,7 @@ exec "$@"
 fn apply_platform_sandbox(config: &SandboxConfig) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        for path in &config.read_only_dirs {
-            linux_sandbox_fs::ensure_read_only_dir(path)?;
-        }
-        for path in &config.writable_dirs {
-            linux_sandbox_fs::ensure_writable_dir(path)?;
-        }
+        linux::apply_landlock_write_policy(config)?;
         linux::apply_network_deny_seccomp()
     }
 
@@ -2803,151 +2743,6 @@ fn is_tcp_denied_error(err: &std::io::Error) -> bool {
     }
     matches!(err.raw_os_error(), Some(1 | 13))
 }
-
-#[cfg(target_os = "linux")]
-mod linux_sandbox_fs {
-    use super::{EnclaveError, Result};
-    use std::fs;
-    use std::path::{Path, PathBuf};
-
-    pub fn ensure_read_only_dir(path: &Path) -> Result<()> {
-        let canonical = fs::canonicalize(path).map_err(EnclaveError::Io)?;
-        let mounts = read_mountinfo()?;
-        let covering_mount = mounts
-            .iter()
-            .filter(|mount| canonical.starts_with(&mount.mount_point))
-            .max_by_key(|mount| mount.mount_point.as_os_str().len())
-            .ok_or_else(|| {
-                EnclaveError::InvalidInput(format!(
-                    "read-only path {} is not covered by a Linux mount",
-                    canonical.display()
-                ))
-            })?;
-        if !covering_mount.read_only {
-            return Err(EnclaveError::InvalidInput(format!(
-                "read-only path {} is covered by writable Linux mount {}",
-                canonical.display(),
-                covering_mount.mount_point.display()
-            )));
-        }
-        for mount in mounts.iter().filter(|mount| {
-            mount.mount_point != canonical && mount.mount_point.starts_with(&canonical)
-        }) {
-            if !mount.read_only {
-                return Err(EnclaveError::InvalidInput(format!(
-                    "read-only path {} contains writable nested mount {}",
-                    canonical.display(),
-                    mount.mount_point.display()
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn ensure_writable_dir(path: &Path) -> Result<()> {
-        let canonical = fs::canonicalize(path).map_err(EnclaveError::Io)?;
-        let mounts = read_mountinfo()?;
-        let covering_mount = mounts
-            .iter()
-            .filter(|mount| canonical.starts_with(&mount.mount_point))
-            .max_by_key(|mount| mount.mount_point.as_os_str().len())
-            .ok_or_else(|| {
-                EnclaveError::InvalidInput(format!(
-                    "writable path {} is not covered by a Linux mount",
-                    canonical.display()
-                ))
-            })?;
-        if covering_mount.read_only {
-            return Err(EnclaveError::InvalidInput(format!(
-                "writable path {} is covered by read-only Linux mount {}",
-                canonical.display(),
-                covering_mount.mount_point.display()
-            )));
-        }
-        for mount in mounts.iter().filter(|mount| {
-            mount.mount_point != canonical && mount.mount_point.starts_with(&canonical)
-        }) {
-            if mount.read_only {
-                return Err(EnclaveError::InvalidInput(format!(
-                    "writable path {} contains read-only nested mount {}",
-                    canonical.display(),
-                    mount.mount_point.display()
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    #[derive(Debug)]
-    struct MountInfo {
-        mount_point: PathBuf,
-        read_only: bool,
-    }
-
-    fn read_mountinfo() -> Result<Vec<MountInfo>> {
-        fs::read_to_string("/proc/self/mountinfo")
-            .map_err(EnclaveError::Io)?
-            .lines()
-            .map(parse_mountinfo_line)
-            .collect()
-    }
-
-    fn parse_mountinfo_line(line: &str) -> Result<MountInfo> {
-        let mut parts = line.split_whitespace();
-        let mount_point = parts.nth(4).ok_or_else(|| {
-            EnclaveError::InvalidInput("malformed /proc/self/mountinfo line".to_owned())
-        })?;
-        let options = parts.next().ok_or_else(|| {
-            EnclaveError::InvalidInput("malformed /proc/self/mountinfo options".to_owned())
-        })?;
-        Ok(MountInfo {
-            mount_point: decode_mountinfo_path(mount_point)?,
-            read_only: options.split(',').any(|option| option == "ro"),
-        })
-    }
-
-    fn decode_mountinfo_path(value: &str) -> Result<PathBuf> {
-        let bytes = value.as_bytes();
-        let mut decoded = Vec::with_capacity(bytes.len());
-        let mut index = 0;
-        while index < bytes.len() {
-            if bytes[index] == b'\\' && index + 3 < bytes.len() {
-                let octal = &value[index + 1..index + 4];
-                if octal.bytes().all(|byte| (b'0'..=b'7').contains(&byte)) {
-                    let byte = u8::from_str_radix(octal, 8).map_err(|err| {
-                        EnclaveError::InvalidInput(format!("invalid mountinfo escape: {err}"))
-                    })?;
-                    decoded.push(byte);
-                    index += 4;
-                    continue;
-                }
-            }
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-        Ok(PathBuf::from(
-            String::from_utf8_lossy(&decoded).into_owned(),
-        ))
-    }
-
-    #[cfg(test)]
-    pub(super) fn mountinfo_read_only_for_test(line: &str) -> Result<bool> {
-        Ok(parse_mountinfo_line(line)?.read_only)
-    }
-
-    #[cfg(test)]
-    pub(super) fn mountinfo_path_for_test(line: &str) -> Result<PathBuf> {
-        Ok(parse_mountinfo_line(line)?.mount_point)
-    }
-
-    #[cfg(test)]
-    pub(super) fn decode_mountinfo_path_for_test(value: &str) -> Result<PathBuf> {
-        decode_mountinfo_path(value)
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-mod linux_sandbox_fs {}
 
 fn validate_manifest_context(expected: &KeyContext, actual: &KeyContext) -> Result<()> {
     compare_context_field("provider_id", &expected.provider_id, &actual.provider_id)?;
@@ -3145,13 +2940,87 @@ fn merkle_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{EnclaveError, Result};
+    use super::{EnclaveError, Result, SandboxConfig};
+    use landlock::{
+        path_beneath_rules, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr,
+        RulesetCreatedAttr, RulesetStatus, ABI,
+    };
     use seccompiler::{
         BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
         SeccompRule,
     };
     use std::collections::BTreeMap;
     use std::convert::TryInto;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    const LANDLOCK_ABI: ABI = ABI::V3;
+
+    pub fn apply_landlock_write_policy(config: &SandboxConfig) -> Result<()> {
+        let write_access = AccessFs::from_write(LANDLOCK_ABI);
+        let mut ruleset = Ruleset::default()
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(write_access)
+            .map_err(landlock_error)?
+            .create()
+            .map_err(landlock_error)?;
+
+        let writable_paths = writable_paths(config);
+        ruleset = ruleset
+            .add_rules(path_beneath_rules(&writable_paths, write_access))
+            .map_err(landlock_error)?;
+        let status = ruleset.restrict_self().map_err(landlock_error)?;
+        if status.ruleset != RulesetStatus::FullyEnforced || !status.no_new_privs {
+            return Err(EnclaveError::SandboxUnsupported(format!(
+                "Landlock write policy was not fully enforced: {:?}",
+                status.ruleset
+            )));
+        }
+        Ok(())
+    }
+
+    fn writable_paths(config: &SandboxConfig) -> Vec<PathBuf> {
+        let mut paths = config.writable_dirs.clone();
+        for path in [
+            "/dev/shm",
+            "/dev/null",
+            "/dev/zero",
+            "/dev/random",
+            "/dev/urandom",
+            "/dev/dri",
+            "/proc/self/task",
+        ] {
+            push_existing_unique(&mut paths, Path::new(path));
+        }
+        if let Ok(entries) = fs::read_dir("/dev") {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("nvidia"))
+                {
+                    push_existing_unique(&mut paths, &entry.path());
+                }
+            }
+        }
+        paths
+    }
+
+    fn push_existing_unique(paths: &mut Vec<PathBuf>, path: &Path) {
+        if !path.exists() {
+            return;
+        }
+        let Ok(path) = fs::canonicalize(path) else {
+            return;
+        };
+        if !paths.iter().any(|candidate| candidate == &path) {
+            paths.push(path);
+        }
+    }
+
+    fn landlock_error<E: std::fmt::Display>(err: E) -> EnclaveError {
+        EnclaveError::SandboxUnsupported(format!("Landlock ABI 3 write-policy setup failed: {err}"))
+    }
 
     pub fn apply_network_deny_seccomp() -> Result<()> {
         let forbidden_domains = [
@@ -3665,10 +3534,11 @@ mod tests {
         let config = sandbox_config(&temp)?;
         let profile = build_sandbox_profile(&config, SandboxPlatform::LinuxSeccompBpf)?;
 
-        assert!(profile.policy.contains("seccomp-bpf"));
+        assert!(profile.policy.contains("landlock-seccomp-bpf"));
+        assert!(profile.policy.contains("\"landlock_abi\":3"));
         assert!(profile.policy.contains("AF_INET"));
         assert!(profile.policy.contains("AF_INET6"));
-        assert!(profile.policy.contains("bind-mounted"));
+        assert!(profile.policy.contains("filesystem mutation rights"));
         assert!(profile.policy.contains("worker-cache"));
         Ok(())
     }

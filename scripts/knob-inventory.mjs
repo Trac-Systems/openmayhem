@@ -108,6 +108,7 @@ function gitFiles() {
 
 function sourceFiles() {
   return gitFiles().filter((file) => {
+    if (!fs.existsSync(path.join(repoRoot, file))) return false;
     if (file.includes('/node_modules/') || file.endsWith('package-lock.json')) return false;
     if (file.startsWith('target/') || file.startsWith('docs/')) return false;
     return sourceExtensions.has(path.extname(file));

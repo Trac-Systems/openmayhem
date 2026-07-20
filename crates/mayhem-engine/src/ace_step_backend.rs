@@ -19,6 +19,7 @@ use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -34,6 +35,8 @@ const SOURCE_ARCHIVE: &[u8] = include_bytes!("../resources/ace-step-v0.1.8.tar.g
 const SOURCE_TOP_LEVEL: &str = "ACE-Step-1.5-v0.1.8";
 const SOURCE_CACHE_NAMESPACE: &str = "ace-step-source";
 const SOURCE_COMPLETE_MARKER: &str = ".mayhem-complete";
+const MAX_SOURCE_STAGING_ATTEMPTS: usize = 1_024;
+static SOURCE_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const PYTHON_ENV: &str = "MAYHEM_ACE_STEP_PYTHON";
 const MAX_ARCHIVE_ENTRIES: usize = 20_000;
 const MAX_EXTRACTED_BYTES: u64 = 256 * 1024 * 1024;
@@ -82,21 +85,7 @@ pub fn ensure_ace_step_source(cache_root: &Path) -> Result<PathBuf> {
         return validate_cached_source(&destination);
     }
 
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let staging = namespace.join(format!(
-        ".{ACE_STEP_SOURCE_SHA256}.{}.{}.tmp",
-        std::process::id(),
-        nonce
-    ));
-    fs::create_dir(&staging).map_err(|error| {
-        EngineError::AceStep(format!(
-            "creating ACE-Step source staging directory {} failed: {error}",
-            staging.display()
-        ))
-    })?;
+    let staging = create_source_staging_directory(&namespace)?;
 
     let extraction = extract_source_archive(SOURCE_ARCHIVE, &staging).and_then(|()| {
         fs::write(
@@ -126,6 +115,47 @@ pub fn ensure_ace_step_source(cache_root: &Path) -> Result<PathBuf> {
         )));
     }
     validate_cached_source(&destination)
+}
+
+fn create_source_staging_directory(namespace: &Path) -> Result<PathBuf> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    create_source_staging_directory_with(
+        namespace,
+        std::process::id(),
+        nonce,
+        &SOURCE_STAGING_SEQUENCE,
+    )
+}
+
+fn create_source_staging_directory_with(
+    namespace: &Path,
+    process_id: u32,
+    nonce: u128,
+    sequence: &AtomicU64,
+) -> Result<PathBuf> {
+    for _ in 0..MAX_SOURCE_STAGING_ATTEMPTS {
+        let sequence = sequence.fetch_add(1, Ordering::Relaxed);
+        let staging = namespace.join(format!(
+            ".{ACE_STEP_SOURCE_SHA256}.{process_id}.{nonce}.{sequence}.tmp"
+        ));
+        match fs::create_dir(&staging) {
+            Ok(()) => return Ok(staging),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(EngineError::AceStep(format!(
+                    "creating ACE-Step source staging directory {} failed: {error}",
+                    staging.display()
+                )));
+            }
+        }
+    }
+    Err(EngineError::AceStep(format!(
+        "creating a unique ACE-Step source staging directory under {} failed after {MAX_SOURCE_STAGING_ATTEMPTS} collisions",
+        namespace.display()
+    )))
 }
 
 fn validate_cached_source(destination: &Path) -> Result<PathBuf> {
@@ -3428,6 +3458,26 @@ mod tests {
             "mayhem-engine-ace-step-{label}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn source_staging_directory_retries_an_atomic_name_collision() {
+        let tree = TestTree::new("source-staging-collision");
+        let namespace = tree.root.join("source");
+        fs::create_dir_all(&namespace).expect("create source namespace");
+        let sequence = AtomicU64::new(7);
+        let collision = namespace.join(format!(".{ACE_STEP_SOURCE_SHA256}.42.99.7.tmp"));
+        fs::create_dir(&collision).expect("create colliding staging directory");
+
+        let staging = create_source_staging_directory_with(&namespace, 42, 99, &sequence)
+            .expect("allocate staging directory after collision");
+
+        assert_eq!(
+            staging.file_name().and_then(|name| name.to_str()),
+            Some(format!(".{ACE_STEP_SOURCE_SHA256}.42.99.8.tmp").as_str())
+        );
+        assert!(staging.is_dir());
+        assert!(collision.is_dir());
     }
 
     fn shared_cache() -> &'static Path {

@@ -1,12 +1,69 @@
+use std::process::{Command, Output};
+
 use axum::{
     body::{to_bytes, Body},
     http::{Method, Request, StatusCode},
 };
 use mayhem_paygate::{
-    paygate_router, OracleKeypair, PaygateConfig, PaygateState, CREDIT_DENOM, SERVICE_NAME,
+    paygate_router, OracleKeypair, PaygateConfig, PaygateState, StripeMode, CREDIT_DENOM,
+    SERVICE_NAME,
 };
 use serde_json::Value;
 use tower::ServiceExt;
+
+fn run_paygate_with_enabled_stripe(mode: Option<&str>) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_mayhem-paygate"));
+    command
+        .env_clear()
+        .env("MAYHEM_PAYGATE_STRIPE_ENABLED", "true")
+        .env("MAYHEM_STRIPE_SECRET_KEY", "sk_test_placeholder")
+        .env("MAYHEM_STRIPE_WEBHOOK_SECRET", "whsec_placeholder");
+    if let Some(mode) = mode {
+        command.env("MAYHEM_STRIPE_MODE", mode);
+    }
+    command.output().expect("paygate process must run")
+}
+
+#[test]
+fn enabled_stripe_rejects_omitted_mode() {
+    let output = run_paygate_with_enabled_stripe(None);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("mode must be explicitly set to test or live"));
+    assert!(!stderr.contains("listening on"));
+}
+
+#[test]
+fn enabled_stripe_rejects_empty_mode() {
+    let output = run_paygate_with_enabled_stripe(Some(""));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("MAYHEM_STRIPE_MODE must be test or live"));
+    assert!(!stderr.contains("listening on"));
+}
+
+#[test]
+fn enabled_stripe_accepts_explicit_test_and_live_modes() {
+    for (mode, secret_key, expected) in [
+        ("test", "sk_test_placeholder", StripeMode::Test),
+        ("live", "sk_live_placeholder", StripeMode::Live),
+    ] {
+        let config = PaygateConfig::from_toml_str(&format!(
+            r#"
+            [stripe]
+            enabled = true
+            mode = "{mode}"
+            secret_key = "{secret_key}"
+            webhook_secret = "whsec_placeholder"
+            "#
+        ))
+        .expect("explicit Stripe mode must remain valid");
+
+        assert_eq!(config.rails.stripe.mode, expected);
+    }
+}
 
 #[tokio::test]
 async fn health_reports_oracle_public_key_and_redacts_seed() {
@@ -54,7 +111,6 @@ async fn health_reports_oracle_public_key_and_redacts_seed() {
     assert_eq!(body["controls"]["admin_sets_prices"], true);
     assert_eq!(body["controls"]["admin_sets_rules"], true);
     assert_eq!(body["controls"]["admin_sets_params"], true);
-    assert_eq!(body["controls"]["admin_sets_provider_payout_targets"], true);
     assert_eq!(body["controls"]["admin_can_ban_providers"], true);
     assert_eq!(body["controls"]["providers_set_prices"], false);
     assert_eq!(body["controls"]["providers_set_rules"], false);
@@ -64,8 +120,13 @@ async fn health_reports_oracle_public_key_and_redacts_seed() {
     assert_eq!(body["controls"]["providers_create_canonical_rooms"], false);
     assert_eq!(body["controls"]["providers_only_join_admin_rooms"], true);
     assert_eq!(
-        body["controls"]["provider_payout_targets_admin_verified"],
+        body["controls"]["providers_bind_verified_payout_targets"],
         true
+    );
+    assert_eq!(body["controls"]["payout_liabilities_revision_bound"], true);
+    assert_eq!(
+        body["controls"].as_object().map(|controls| controls.len()),
+        Some(15)
     );
     assert!(!String::from_utf8_lossy(&bytes).contains(&seed_hex));
 }

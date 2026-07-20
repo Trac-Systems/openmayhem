@@ -1,6 +1,16 @@
 import Feature from 'trac-peer/src/artifacts/feature.js';
 import crypto from 'crypto';
 import b4a from 'b4a';
+import { blake3 } from '@tracsystems/blake3';
+import { keccak256 } from 'ethereum-cryptography/keccak';
+import { secp256k1 } from 'ethereum-cryptography/secp256k1';
+import PeerWallet from 'trac-wallet';
+import { contractTx } from '../../trac/trac-peer/rpc/services.js';
+import {
+  PAYOUT_INTENT_MAX_EXPIRY_EPOCHS_DEFAULT,
+  providerPayoutBindingMessage,
+  providerPayoutTargetBindingMessage,
+} from '../../contract/contract.js';
 
 const RELAY_CONTROL_REQUEST = 'mayhem_feature_request';
 const RELAY_CONTROL_RESULT = 'mayhem_feature_result';
@@ -19,7 +29,9 @@ const DEFAULT_CACHE_TTL_MS = 300_000;
 const DEFAULT_CACHE_MAX = 2_048;
 const DEFAULT_PENDING_MAX = 256;
 const DEFAULT_PROCESSED_IN_FLIGHT_MAX = 256;
-
+const PROVIDER_PAYOUT_RAILS = new Set(['fiat', 'tap', 'tnk']);
+const STRIPE_CONNECT_RELINK_CONSENT_VERSION = 1;
+const STRIPE_CONNECT_RELINK_CONSENT_MAX_SECONDS = 600;
 const normalizeKey = (value) => String(value ?? '').trim().toLowerCase();
 
 const stableValue = (value) => {
@@ -35,6 +47,23 @@ const stableValue = (value) => {
 };
 
 const stableJson = (value) => JSON.stringify(stableValue(value));
+
+const exactKeys = (value, keys) => (
+  value &&
+  typeof value === 'object' &&
+  !Array.isArray(value) &&
+  Object.keys(value).length === keys.length &&
+  keys.every((key) => Object.hasOwn(value, key))
+);
+
+const ethereumPersonalMessageHash = (message) => {
+  const body = b4a.from(message, 'utf8');
+  const prefix = b4a.from(`\x19Ethereum Signed Message:\n${body.length}`, 'utf8');
+  return keccak256(b4a.concat([prefix, body]));
+};
+
+const ethereumAddressFromPublicKey = (publicKey) =>
+  `0x${b4a.toString(keccak256(publicKey.subarray(1)).subarray(12), 'hex')}`;
 
 const requestIdFor = (feature, key, value) =>
   crypto
@@ -71,12 +100,74 @@ const serviceSigningMessage = (service, value) => stableJson({
   transport: normalizeKey(value?.transport),
 });
 
+const stripeConnectRelinkConsentMessage = (value) => stableJson({
+  account_id: String(value?.account_id ?? ''),
+  consent_expires_at: value?.consent_expires_at,
+  context_revision: normalizeKey(value?.context_revision),
+  country: String(value?.country ?? ''),
+  domain: 'mayhem-stripe-connect-relink-consent-v1',
+  request_nonce: normalizeKey(value?.request_nonce),
+  signing_version: STRIPE_CONNECT_RELINK_CONSENT_VERSION,
+  source_provider: normalizeKey(value?.source_provider),
+  target_provider: normalizeKey(value?.provider),
+});
+
+const validStripeConnectRelinkConsent = (wallet, value) => {
+  if (!exactKeys(value, [
+    'provider',
+    'source_provider',
+    'account_id',
+    'context_revision',
+    'country',
+    'request_nonce',
+    'consent_expires_at',
+    'source_consent_signature',
+  ])) return false;
+  const provider = String(value.provider ?? '');
+  const sourceProvider = String(value.source_provider ?? '');
+  const contextRevision = String(value.context_revision ?? '');
+  const requestNonce = String(value.request_nonce ?? '');
+  const signature = String(value.source_consent_signature ?? '');
+  if (!/^[0-9a-f]{64}$/.test(provider) ||
+      !/^[0-9a-f]{64}$/.test(sourceProvider) ||
+      provider === sourceProvider ||
+      !/^acct_[A-Za-z0-9._-]+$/.test(String(value.account_id ?? '')) ||
+      !/^[0-9a-f]{64}$/.test(contextRevision) ||
+      !/^[A-Z]{2}$/.test(String(value.country ?? '')) ||
+      !/^[0-9a-f]{64}$/.test(requestNonce) ||
+      !/^[0-9a-f]{128}$/.test(signature) ||
+      !Number.isSafeInteger(value.consent_expires_at)) return false;
+  const now = Math.floor(Date.now() / 1_000);
+  if (value.consent_expires_at <= now ||
+      value.consent_expires_at > now + STRIPE_CONNECT_RELINK_CONSENT_MAX_SECONDS) {
+    return false;
+  }
+  try {
+    return wallet?.verify?.(
+      signature,
+      b4a.from(stripeConnectRelinkConsentMessage(value)),
+      sourceProvider
+    ) === true;
+  } catch (_error) {
+    return false;
+  }
+};
+
 const participantFor = (value) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (value.op === 'admin_contract_tx') return normalizeKey(value.address);
   if (value.op === 'consent' || value.op === 'deposit_tnk') return normalizeKey(value.sender);
   if (value.op === 'tap_account_bind') return normalizeKey(value.user);
-  if (value.op === 'provider_lifecycle') return normalizeKey(value.intent?.provider);
-  if (value.op === 'spend_reserve') return normalizeKey(value.provider);
+  if (value.op === 'provider_lifecycle') {
+    return normalizeKey(value.intent?.provider);
+  }
+  if (value.op === 'bind_provider_payout' &&
+      PROVIDER_PAYOUT_RAILS.has(value.intent?.rail)) {
+    return normalizeKey(value.intent?.provider);
+  }
+  if (value.op === 'spend_reserve_targeted') {
+    return normalizeKey(value.provider);
+  }
   return null;
 };
 
@@ -85,7 +176,11 @@ const serviceParticipantFor = (service, value) => {
     return null;
   }
   if (service === 'stripe_checkout') return normalizeKey(value.who);
-  if (service === 'stripe_connect_onboard' || service === 'stripe_connect_status') {
+  if ([
+    'stripe_connect_onboard',
+    'stripe_connect_status',
+    'stripe_connect_relink',
+  ].includes(service)) {
     return normalizeKey(value.provider);
   }
   return null;
@@ -138,6 +233,9 @@ class MayhemFeature extends Feature {
       ? config.processedInFlightMax
       : DEFAULT_PROCESSED_IN_FLIGHT_MAX;
     this.serviceHandler = typeof config.serviceHandler === 'function' ? config.serviceHandler : null;
+    this.adminTxHandler = typeof config.adminTxHandler === 'function'
+      ? config.adminTxHandler
+      : async (value) => await contractTx(this.peer, value);
     this.pending = new Map();
     this.processed = new Map();
     this.servicePending = new Map();
@@ -168,6 +266,12 @@ class MayhemFeature extends Feature {
     if (!actor) throw new Error('Invalid relayed feature operation.');
     if (!self) throw new Error('Invalid relay transport identity.');
     const admin = await this._adminKey();
+    if (
+      value?.op === 'admin_contract_tx' &&
+      actor !== admin
+    ) {
+      throw new Error('Admin-signed contract relay requires the current admin authority.');
+    }
     if (this.peer.base?.writable && self === admin) {
       throw new Error('Invalid relay request from the admin writer.');
     }
@@ -176,8 +280,8 @@ class MayhemFeature extends Feature {
       throw new Error('Mayhem feature relay is not ready.');
     }
 
-    const canonicalValue = stableValue(value);
-    const requestId = requestIdFor(feature, key, canonicalValue);
+    const relayedValue = value?.op === 'admin_contract_tx' ? value : stableValue(value);
+    const requestId = requestIdFor(feature, key, relayedValue);
     const existing = this.pending.get(requestId);
     if (existing) return await existing.promise;
     if (this.pending.size >= this.pendingMax) {
@@ -190,7 +294,7 @@ class MayhemFeature extends Feature {
       request_id: requestId,
       feature,
       key,
-      value: canonicalValue,
+      value: relayedValue,
     };
     if (this.relayMessageBytes(message) > this.maxMessageBytes) {
       throw new Error(`Mayhem feature relay payload exceeds ${this.maxMessageBytes} bytes.`);
@@ -219,7 +323,7 @@ class MayhemFeature extends Feature {
     }
     if (this.peer.base?.writable && self === admin) {
       if (!this.serviceHandler) throw new Error('Mayhem admin service is not configured.');
-      return await this.serviceHandler(service, envelope.payload);
+      return await this.serviceHandler(service, envelope.payload, envelope);
     }
     const sidechannel = this.peer?.sidechannel;
     if (!sidechannel?.started || typeof sidechannel.broadcast !== 'function') {
@@ -387,6 +491,8 @@ class MayhemFeature extends Feature {
     }
     if (serviceParticipantFor(service, payload) !== actor) return null;
     if (typeof this.peer?.wallet?.verify !== 'function') return null;
+    if (service === 'stripe_connect_relink' &&
+        !validStripeConnectRelinkConsent(this.peer.wallet, payload)) return null;
     try {
       if (!this.peer.wallet.verify(
         signature,
@@ -437,10 +543,29 @@ class MayhemFeature extends Feature {
     const actor = participantFor(message.value);
     const transport = normalizeKey(payload.from);
     if (!actor || !transport || !this._verifyEnvelope(payload, transport)) return;
+    if (
+      message.value?.op === 'admin_contract_tx' &&
+      actor !== admin
+    ) {
+      return;
+    }
     if (message.version !== RELAY_VERSION || message.feature !== (this.key || 'mayhem')) return;
     if (typeof message.key !== 'string' || message.key.length < 1 || message.key.length > 256) return;
     const expectedId = requestIdFor(message.feature, message.key, message.value);
     if (message.request_id !== expectedId) return;
+    if (
+      message.value?.op === 'bind_provider_payout' &&
+      !(await this._validateProviderPayoutBinding(message.key, message.value, admin))
+    ) {
+      this.peer.sidechannel.broadcast(this.channel, {
+        control: RELAY_CONTROL_RESULT,
+        version: RELAY_VERSION,
+        request_id: expectedId,
+        to: transport,
+        response: relayError('Provider payout binding failed relay verification.', expectedId),
+      });
+      return;
+    }
 
     this._pruneProcessed();
     let cached = this.processed.get(expectedId);
@@ -455,7 +580,10 @@ class MayhemFeature extends Feature {
       return;
     }
     if (!cached) {
-      const promise = this._applyRelayed(message.key, stableValue(message.value), expectedId).catch((error) =>
+      const relayedValue = message.value?.op === 'admin_contract_tx'
+        ? message.value
+        : stableValue(message.value);
+      const promise = this._applyRelayed(message.key, relayedValue, expectedId).catch((error) =>
         relayError(error?.message || 'Admin writer failed to apply relayed feature.', expectedId)
       );
       cached = { at: Date.now(), pending: true, promise };
@@ -472,6 +600,227 @@ class MayhemFeature extends Feature {
       to: transport,
       response,
     });
+  }
+
+  async _validateProviderPayoutBinding(key, value, admin) {
+    if (!exactKeys(value, ['op', 'intent', 'provider_signature']) ||
+        value.op !== 'bind_provider_payout') return false;
+    const intent = value.intent;
+    const intentKeys = [
+      'op',
+      'network',
+      'admin',
+      'bootstrap',
+      'context_revision',
+      'provider',
+      'rail',
+      'currency',
+      'chain_id',
+      'target',
+      'target_wallet',
+      'target_signature',
+      'previous_revision',
+      'payment_config_version',
+      'nonce',
+      'expires_after_epoch',
+    ];
+    if (!exactKeys(intent, intentKeys) ||
+        intent.op !== 'bind_provider_payout' ||
+        !PROVIDER_PAYOUT_RAILS.has(intent.rail) ||
+        intent.admin !== admin ||
+        !/^[0-9a-f]{64}$/.test(intent.bootstrap) ||
+        !/^[0-9a-f]{64}$/.test(intent.context_revision) ||
+        !/^[0-9a-f]{64}$/.test(intent.provider) ||
+        !/^[0-9a-f]{64}$/.test(intent.nonce) ||
+        !/^[0-9a-f]{128}$/.test(value.provider_signature) ||
+        (intent.previous_revision !== null &&
+          !/^[0-9a-f]{64}$/.test(intent.previous_revision)) ||
+        !Number.isSafeInteger(intent.payment_config_version) ||
+        intent.payment_config_version < 1 ||
+        !Number.isSafeInteger(intent.expires_after_epoch) ||
+        intent.expires_after_epoch < 1) {
+      return false;
+    }
+    if (!this.peer.wallet.verify(
+      value.provider_signature,
+      b4a.from(providerPayoutBindingMessage(intent)),
+      intent.provider
+    )) {
+      return false;
+    }
+    if (intent.rail === 'fiat') {
+      if (!/^acct_[A-Za-z0-9._-]+$/.test(intent.target) ||
+          !['usd', 'eur'].includes(intent.currency) ||
+          intent.chain_id !== null ||
+          intent.target_wallet !== null ||
+          intent.target_signature !== null) {
+        return false;
+      }
+    } else if (intent.rail === 'tnk') {
+      if (intent.currency !== null ||
+          intent.chain_id !== null ||
+          !/^[0-9a-f]{64}$/.test(intent.target_wallet) ||
+          !/^[0-9a-f]{128}$/.test(intent.target_signature) ||
+          !this.peer.wallet.verify(
+            intent.target_signature,
+            b4a.from(providerPayoutTargetBindingMessage(intent)),
+            intent.target_wallet
+          )) {
+        return false;
+      }
+      const prefix = intent.network === 'mainnet'
+        ? 'trac'
+        : intent.network === 'testnet1'
+          ? 'testtrac'
+          : null;
+      if (!prefix) return false;
+      const target = PeerWallet.encodeBech32mSafe(
+        prefix,
+        b4a.from(intent.target_wallet, 'hex')
+      );
+      if (target !== intent.target) return false;
+    } else {
+      if (intent.currency !== null ||
+          !Number.isSafeInteger(intent.chain_id) ||
+          intent.chain_id < 1 ||
+          intent.target_wallet !== null ||
+          !/^0x[0-9a-f]{40}$/.test(intent.target) ||
+          !/^0x[0-9a-f]{130}$/.test(intent.target_signature)) {
+        return false;
+      }
+      try {
+        const bytes = b4a.from(intent.target_signature.slice(2), 'hex');
+        let recovery = bytes[64];
+        if (recovery === 27 || recovery === 28) recovery -= 27;
+        if (recovery !== 0 && recovery !== 1) return false;
+        const signature = secp256k1.Signature
+          .fromCompact(bytes.subarray(0, 64))
+          .addRecoveryBit(recovery);
+        if (signature.hasHighS()) return false;
+        const publicKey = signature
+          .recoverPublicKey(
+            ethereumPersonalMessageHash(providerPayoutTargetBindingMessage(intent))
+          )
+          .toRawBytes(false);
+        if (ethereumAddressFromPublicKey(publicKey) !== intent.target) return false;
+      } catch {
+        return false;
+      }
+    }
+    const revision = b4a.toString(
+      await blake3(b4a.from(providerPayoutBindingMessage(intent))),
+      'hex'
+    );
+    const expectedKey = `payout/binding/${intent.rail}/${intent.provider}/${revision}`;
+    if (key !== expectedKey) return false;
+    const nonceRecord = (
+      await this.peer.base.view.get(`payout/nonce/${intent.provider}/${intent.nonce}`)
+    )?.value;
+    if (nonceRecord) {
+      const binding = (await this.peer.base.view.get(expectedKey))?.value;
+      return nonceRecord.revision === revision &&
+        binding?.type === 'provider_payout_binding' &&
+        binding.revision === revision &&
+        binding.provider === intent.provider &&
+        binding.rail === intent.rail &&
+        binding.nonce === intent.nonce &&
+        binding.provider_signature === value.provider_signature &&
+        binding.target_signature === intent.target_signature;
+    }
+
+    const contextPointer = (
+      await this.peer.base.view.get('payout/context/current')
+    )?.value;
+    const context = (
+      await this.peer.base.view.get(
+        `payout/context/${intent.payment_config_version}/${intent.context_revision}`
+      )
+    )?.value;
+    if (!contextPointer ||
+        contextPointer.revision !== intent.context_revision ||
+        contextPointer.payment_config_version !== intent.payment_config_version ||
+        !context ||
+        context.revision !== intent.context_revision ||
+        context.network !== intent.network ||
+        context.admin !== intent.admin ||
+        context.bootstrap !== intent.bootstrap ||
+        context.payment_config_version !== intent.payment_config_version ||
+        context.published_by !== admin ||
+        context.published_by_role !== 'admin') {
+      return false;
+    }
+    const payments = (await this.peer.base.view.get('payments/current'))?.value;
+    if (!payments ||
+        payments.set_by !== admin ||
+        payments.set_by_role !== 'admin' ||
+        payments.ver !== intent.payment_config_version ||
+        payments.tnk?.network !== intent.network ||
+        !Array.isArray(payments.rails) ||
+        !payments.rails.includes(intent.rail)) {
+      return false;
+    }
+    const provider = (await this.peer.base.view.get(`prov/${intent.provider}`))?.value;
+    if (!provider ||
+        provider.status !== 'active' ||
+        !Array.isArray(provider.accepted_rails) ||
+        !provider.accepted_rails.includes(intent.rail)) {
+      return false;
+    }
+    const applyState = (await this.peer.base.view.get('epoch/apply/state'))?.value ?? {
+      updated_epoch: 0,
+      pending_epoch: null,
+    };
+    const expirySchedule = (
+      await this.peer.base.view.get('payout/params/payout_intent_max_expiry_epochs')
+    )?.value;
+    const activeExpiryEntry = expirySchedule?.pending &&
+      expirySchedule.pending.effective_epoch <= applyState.updated_epoch
+      ? expirySchedule.pending
+      : expirySchedule?.current;
+    const maxExpiryEpochs = activeExpiryEntry?.value ??
+      PAYOUT_INTENT_MAX_EXPIRY_EPOCHS_DEFAULT;
+    if (!Number.isSafeInteger(applyState.updated_epoch) ||
+        (applyState.pending_epoch ?? null) !== null ||
+        intent.expires_after_epoch <= applyState.updated_epoch ||
+        intent.expires_after_epoch - applyState.updated_epoch >
+          maxExpiryEpochs) {
+      return false;
+    }
+    const pointer = (
+      await this.peer.base.view.get(`payout/current/${intent.rail}/${intent.provider}`)
+    )?.value;
+    if (intent.previous_revision !== (pointer?.latest_revision ?? null)) return false;
+    if (intent.rail === 'fiat') {
+      const verifiedPointer = (
+        await this.peer.base.view.get(
+          `payout/stripe-verified/target/${intent.provider}/${intent.target}`
+        )
+      )?.value;
+      const verification = verifiedPointer?.record_key
+        ? (await this.peer.base.view.get(verifiedPointer.record_key))?.value
+        : null;
+      if (!verifiedPointer ||
+          verifiedPointer.provider !== intent.provider ||
+          verifiedPointer.target !== intent.target ||
+          verifiedPointer.revision !== verification?.revision ||
+          verifiedPointer.processor_revision !== verification?.processor_revision ||
+          verification?.type !== 'stripe_payout_verification' ||
+          verification.provider !== intent.provider ||
+          verification.target !== intent.target ||
+          verification.currency !== intent.currency ||
+          verification.context_revision !== intent.context_revision ||
+          verification.payment_config_version !== intent.payment_config_version ||
+          verification.details_submitted !== true ||
+          verification.payouts_enabled !== true ||
+          verification.transfers_enabled !== true ||
+          verification.verified_by !== admin ||
+          verification.verified_by_role !== 'admin') {
+        return false;
+      }
+    } else if (intent.rail === 'tap' && intent.chain_id !== payments.tap?.chain_id) {
+      return false;
+    }
+    return true;
   }
 
   async _handleResult(payload) {
@@ -522,7 +871,7 @@ class MayhemFeature extends Feature {
     }
     if (!cached) {
       const promise = Promise.resolve()
-        .then(() => this.serviceHandler(message.service, envelope.payload))
+        .then(() => this.serviceHandler(message.service, envelope.payload, envelope))
         .catch((error) => relayError(error?.message || 'Mayhem admin service request failed.', expectedId));
       cached = { at: Date.now(), pending: true, promise };
       this.serviceProcessed.set(expectedId, cached);
@@ -560,6 +909,9 @@ class MayhemFeature extends Feature {
   }
 
   async _applyRelayed(key, value, requestId) {
+    if (value?.op === 'admin_contract_tx') {
+      return await this._applyRelayedAdminTx(key, value, requestId);
+    }
     const nonce = requestId;
     const hash = this.peer.wallet.sign(`${JSON.stringify(value)}${nonce}`);
     const resultKey = `fr/${hash}`;
@@ -597,6 +949,69 @@ class MayhemFeature extends Feature {
       };
     }
     return this._featureResponse(key, hash, resultKey, featureResult);
+  }
+
+  async _applyRelayedAdminTx(key, value, requestId) {
+    const allowed = new Set([
+      'op',
+      'tx',
+      'prepared_command',
+      'address',
+      'signature',
+      'nonce',
+      'sim',
+    ]);
+    if (
+      !value ||
+      typeof value !== 'object' ||
+      Array.isArray(value) ||
+      Object.keys(value).some((field) => !allowed.has(field)) ||
+      [...allowed].some((field) => !Object.hasOwn(value, field))
+    ) {
+      return relayError('Invalid relayed admin contract transaction.', requestId);
+    }
+    const admin = await this._adminKey();
+    if (
+      normalizeKey(value.address) !== admin ||
+      !/^[0-9a-f]{64}$/.test(value.tx) ||
+      !/^[0-9a-f]{128}$/.test(value.signature) ||
+      !/^[0-9a-f]{64}$/.test(value.nonce) ||
+      typeof value.sim !== 'boolean' ||
+      !value.prepared_command ||
+      typeof value.prepared_command !== 'object' ||
+      Array.isArray(value.prepared_command) ||
+      typeof value.prepared_command.type !== 'string' ||
+      !Object.hasOwn(value.prepared_command, 'value') ||
+      key !== `admin/contract-tx/${value.tx}`
+    ) {
+      return relayError('Invalid relayed admin contract transaction.', requestId);
+    }
+    const submitted = await this.adminTxHandler({
+      tx: value.tx,
+      prepared_command: value.prepared_command,
+      address: admin,
+      signature: value.signature,
+      nonce: value.nonce,
+      sim: value.sim,
+    });
+    const result = submitted?.result ?? submitted;
+    const explicitSuccess = result?.ok === true ||
+      (result?.local === true && result?.txo !== undefined);
+    if (!explicitSuccess || result?.error) {
+      return relayError(
+        result?.error?.message ?? 'Admin contract transaction was rejected.',
+        requestId
+      );
+    }
+    return {
+      ok: true,
+      accepted: true,
+      status: value.sim ? 'simulated' : 'submitted',
+      relayed: true,
+      request_id: requestId,
+      tx: value.tx,
+      result,
+    };
   }
 
   _featureResponse(key, hash, resultKey, featureResult) {
@@ -653,5 +1068,6 @@ export {
   requestIdFor,
   serviceRequestIdFor,
   serviceSigningMessage,
+  stripeConnectRelinkConsentMessage,
 };
 export default MayhemFeature;

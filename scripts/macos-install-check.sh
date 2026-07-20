@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${MAYHEM_MACOS_VERSION:-macos-local-install-check}"
+VERSION="${MAYHEM_MACOS_VERSION:-0.2.23}"
 DIST_REL="${MAYHEM_MACOS_DIST_REL:-dist/macos-local-install-check}"
 DIST_DIR="${MAYHEM_MACOS_DIST_DIR:-$ROOT_DIR/$DIST_REL}"
 SKIP_BUILD="${MAYHEM_MACOS_SKIP_BUILD:-0}"
@@ -11,6 +11,7 @@ WORK_ROOT=""
 BINS=(
   mayhem
   mayhem-gateway
+  mayhem-attestation-verifier
   mayhem-pay
   mayhemd
   mayhem-enclave
@@ -33,7 +34,7 @@ Usage: scripts/macos-install-check.sh
 Build a macOS release archive, then install it into a temporary clean HOME with
 install.sh. The check verifies:
   - archive packaging completes for the local macOS target
-  - install.sh accepts the generated sidecar checksum
+  - the explicit unsigned compatibility layout accepts its sidecar checksum
   - packaged SHA256SUMS entries are verified
   - Pear is found or bootstrapped through the installer path
   - pinned opencode is installed with checksum verification
@@ -43,7 +44,7 @@ install.sh. The check verifies:
 
 Environment:
   MAYHEM_MACOS_VERSION       Artifact version string
-                             (default: macos-local-install-check)
+                             (default: 0.2.23; canonical semver is required)
   MAYHEM_MACOS_DIST_DIR      Dist output directory
                              (default: dist/macos-local-install-check)
   MAYHEM_MACOS_SKIP_BUILD    Use existing target/release binaries when set to 1
@@ -66,8 +67,13 @@ fi
 [[ "$(uname -s)" == "Darwin" ]] || die "macOS install check must run on Darwin"
 
 package_args=(--version "$VERSION" --out-dir "$DIST_DIR")
+package_args+=(--unsigned-layout)
 if [[ "$SKIP_BUILD" == "1" ]]; then
   package_args+=(--skip-build)
+fi
+
+if [[ "$(sysctl -n sysctl.proc_translated 2>/dev/null || printf '0\n')" == "1" ]]; then
+  log "Rosetta detected: this run is compatibility coverage, not native Intel release evidence"
 fi
 
 mkdir -p "$DIST_DIR"
@@ -94,6 +100,7 @@ HOME="$home_dir" \
 MAYHEM_NPM_PREFIX="$npm_prefix" \
 "$ROOT_DIR/install.sh" \
   --artifact "$archive" \
+  --unsigned-layout \
   --install-dir "$install_dir" \
   --force-opencode \
   --no-path-update \
@@ -102,7 +109,7 @@ MAYHEM_NPM_PREFIX="$npm_prefix" \
 cat "$out"
 grep -F "verified archive SHA-256" "$out" >/dev/null
 grep -F "packaged file checksum(s)" "$out" >/dev/null
-grep -E "(found Pear at|installing Pear runtime)" "$out" >/dev/null
+grep -E "(found pinned Pear 2\.0\.4|installing pinned Pear 2\.0\.4)" "$out" >/dev/null
 grep -F "installed opencode v1.17.13" "$out" >/dev/null
 grep -F "Copy/paste PATH for this shell session:" "$out" >/dev/null
 grep -F "export PATH=\"$install_dir:" "$out" >/dev/null

@@ -6,6 +6,9 @@ import process from 'node:process';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { blake3 } from '../intercom/node_modules/@tracsystems/blake3/dist/wasm/blake3.mjs';
+import { keccak256 } from '../intercom/node_modules/ethereum-cryptography/keccak.js';
+import { secp256k1 } from '../intercom/node_modules/ethereum-cryptography/secp256k1.js';
+import PeerWallet from '../intercom/node_modules/trac-wallet/index.js';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const defaultOutDir = '.mayhem-local/p8.5-synthetic';
@@ -30,6 +33,7 @@ const dhtBootstrap = [
 ];
 const syntheticWindowStart = '2026-07-04T00:00:00Z';
 const syntheticWindowEnd = '2026-07-11T00:00:00Z';
+const payoutRails = ['fiat', 'tap', 'tnk'];
 const ed25519Pkcs8SeedPrefix = Buffer.from('302e020100300506032b657004220420', 'hex');
 const ed25519SpkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
 
@@ -114,6 +118,67 @@ async function blake3Hex(text) {
 async function blake3HexBytes(bytes) {
   const digest = await blake3(bytes);
   return Buffer.from(digest).toString('hex');
+}
+
+async function opaqueHash(domain, value) {
+  return blake3Hex(stableJson({ domain, value }));
+}
+
+function signEd25519(key, message) {
+  return crypto.sign(null, Buffer.from(message), key.privateKey).toString('hex');
+}
+
+function providerPayoutTargetBindingEvidence(intent) {
+  return {
+    admin: intent.admin,
+    bootstrap: intent.bootstrap,
+    chain_id: intent.chain_id,
+    context_revision: intent.context_revision,
+    currency: intent.currency,
+    expires_after_epoch: intent.expires_after_epoch,
+    network: intent.network,
+    nonce: intent.nonce,
+    payment_config_version: intent.payment_config_version,
+    previous_revision: intent.previous_revision,
+    provider: intent.provider,
+    rail: intent.rail,
+    target: intent.target,
+    target_wallet: intent.target_wallet,
+  };
+}
+
+function providerPayoutTargetBindingMessage(intent) {
+  return `mayhem-provider-payout-target-binding-v1${stableJson(
+    providerPayoutTargetBindingEvidence(intent),
+  )}`;
+}
+
+function providerPayoutBindingMessage(intent) {
+  return `mayhem-provider-payout-binding-v1${stableJson(intent)}`;
+}
+
+function ethereumPersonalMessageHash(message) {
+  const body = Buffer.from(message, 'utf8');
+  const prefix = Buffer.from(`\x19Ethereum Signed Message:\n${body.length}`, 'utf8');
+  return keccak256(Buffer.concat([prefix, body]));
+}
+
+function deterministicEthereumKey(label) {
+  const privateKey = crypto.createHash('sha256').update(`mayhem-p8.5:${label}`).digest();
+  if (!secp256k1.utils.isValidPrivateKey(privateKey)) {
+    throw new Error(`invalid deterministic Ethereum key: ${label}`);
+  }
+  const publicKey = secp256k1.getPublicKey(privateKey, false);
+  const address = `0x${Buffer.from(keccak256(publicKey.subarray(1)).subarray(12)).toString('hex')}`;
+  return { privateKey, address };
+}
+
+function signEthereumPersonalMessage(key, message) {
+  const signature = secp256k1.sign(ethereumPersonalMessageHash(message), key.privateKey);
+  const bytes = Buffer.alloc(65);
+  bytes.set(signature.toCompactRawBytes(), 0);
+  bytes[64] = signature.recovery + 27;
+  return `0x${bytes.toString('hex')}`;
 }
 
 async function deriveCatalogEnclaveId(adminPubkey, enclave) {
@@ -237,10 +302,6 @@ function normalizeCanonicalAudit(filePath) {
   const audit = JSON.parse(fs.readFileSync(filePath, 'utf8'));
   audit.generated_at = syntheticWindowStart;
   writeJson(filePath, audit);
-}
-
-function providerPubkey(index) {
-  return hex(`provider:${String(index).padStart(2, '0')}`);
 }
 
 function userPubkey(index) {
@@ -469,7 +530,6 @@ async function buildLaunchManifest(outDir, adminKey, providerIds, syntheticCatal
       admin_sets_prices: true,
       admin_sets_rules: true,
       admin_sets_params: true,
-      admin_sets_provider_payout_targets: true,
       admin_can_ban_providers: true,
       providers_set_prices: false,
       providers_set_rules: false,
@@ -478,7 +538,8 @@ async function buildLaunchManifest(outDir, adminKey, providerIds, syntheticCatal
       providers_submit_models: false,
       providers_create_canonical_rooms: false,
       providers_only_join_admin_rooms: true,
-      provider_payout_targets_admin_verified: true,
+      provider_payout_bindings_permissionless: true,
+      provider_payout_bindings_ownership_verified: true,
       browser_handoffs_print_copy_paste_url: true,
     },
     admin: {
@@ -574,34 +635,96 @@ async function buildLaunchManifest(outDir, adminKey, providerIds, syntheticCatal
         ],
       },
     ],
-    seed_providers: providerIds.map((provider) => ({
-      provider_pubkey: provider,
-      payouts: {
-        tnk: {
-          admin_approved: true,
-          addr: testtracAddress,
-        },
-      },
-      joins: [
-        {
-          enclave_id: enclave.enclave_id,
-          rooms: ['launch-us-east'],
-        },
-      ],
-    })),
+    seed_providers: providerIds.map((provider, index) => {
+      const rail = payoutRails[index % payoutRails.length];
+      return {
+        provider_pubkey: provider,
+        accepted_rails: [rail],
+        ...(rail === 'fiat' ? { stripe_country: 'DE' } : {}),
+        joins: [
+          {
+            enclave_id: enclave.enclave_id,
+            rooms: ['launch-us-east'],
+          },
+        ],
+      };
+    }),
   };
 
   const manifestPath = writeJson(path.join(outDir, 'testnet.json'), manifest);
   return { manifestPath, enclave, roomId, roomNonce };
 }
 
-function buildCanonicalSnapshot(outDir, adminPubkey, providerIds, enclave, roomId) {
+async function buildCanonicalSnapshot(outDir, adminPubkey, providerKeys, enclave, roomId) {
+  const providerIds = providerKeys.map((provider) => provider.publicKeyHex);
   const roomServeIndex = providerIds.map((provider) => ({
     provider,
     enclave_id: enclave.enclave_id,
   }));
+  const payments = {
+    denom: 'au_usd',
+    rails: [...payoutRails],
+    fiat: {
+      processor: 'stripe',
+      currencies: ['usd', 'eur'],
+      locale: 'en',
+    },
+    tap: {
+      chain_id: 1,
+      token_address: `0x${'11'.repeat(20)}`,
+      pool_address: `0x${'22'.repeat(20)}`,
+    },
+    tnk: {
+      network: 'testnet1',
+      treasury_address: testtracAddress,
+    },
+    ver: 1,
+    updated_at: 'tx/synthetic-payments',
+    set_by: adminPubkey,
+    set_by_role: 'admin',
+  };
+  const bootstrap = hex('subnet-bootstrap');
+  const contextValue = {
+    op: 'publish_payout_context',
+    network: payments.tnk.network,
+    admin: adminPubkey,
+    bootstrap,
+    payment_config_version: payments.ver,
+    payment_config_hash: await opaqueHash('mayhem-payout-payment-config-v1', payments),
+  };
+  const contextRevision = await opaqueHash('mayhem-payout-context-feature-v1', contextValue);
+  const contextKey = `payout/context/${payments.ver}/${contextRevision}`;
+  const tnkTarget = deterministicEd25519Key('synthetic-tnk-payout-target');
+  const tnkAddress = PeerWallet.encodeBech32mSafe(
+    'testtrac',
+    Buffer.from(tnkTarget.publicKeyHex, 'hex'),
+  );
+  if (!tnkAddress) throw new Error('could not derive synthetic TNK payout target');
+  const tapTarget = deterministicEthereumKey('synthetic-tap-payout-target');
   const snapshot = {
     admin: adminPubkey,
+    'payments/current': payments,
+    'payout/context/current': {
+      type: 'provider_payout_context_pointer',
+      payment_config_version: payments.ver,
+      revision: contextRevision,
+      record_key: contextKey,
+      updated_at: contextKey,
+      updated_by: adminPubkey,
+      updated_by_role: 'admin',
+    },
+    [contextKey]: {
+      type: 'provider_payout_context',
+      revision: contextRevision,
+      network: payments.tnk.network,
+      admin: adminPubkey,
+      bootstrap,
+      payment_config_version: payments.ver,
+      payment_config_hash: contextValue.payment_config_hash,
+      published_at: contextKey,
+      published_by: adminPubkey,
+      published_by_role: 'admin',
+    },
     'rules/current': {
       ver: 1,
       hash: hex('rules:v1'),
@@ -613,19 +736,12 @@ function buildCanonicalSnapshot(outDir, adminPubkey, providerIds, enclave, roomI
       set_by: adminPubkey,
       set_by_role: 'admin',
     },
-    providers: providerIds.map((provider) => ({
+    providers: providerIds.map((provider, index) => ({
       provider,
       status: 'active',
       registered_by: provider,
+      accepted_rails: [payoutRails[index % payoutRails.length]],
       enclaves: [enclave.enclave_id],
-      payouts: {
-        tnk: {
-          method: 'tnk',
-          addr: testtracAddress,
-          set_by: adminPubkey,
-          set_by_role: 'admin',
-        },
-      },
     })),
     enclaves: [
       {
@@ -693,6 +809,179 @@ function buildCanonicalSnapshot(outDir, adminPubkey, providerIds, enclave, roomI
       },
     ],
   };
+
+  for (const [index, providerKey] of providerKeys.entries()) {
+    const provider = providerKey.publicKeyHex;
+    const rail = payoutRails[index % payoutRails.length];
+    const stripeTarget = `acct_synthetic_${String(index).padStart(2, '0')}`;
+    let stripeVerification = null;
+    if (rail === 'fiat') {
+      const verificationValue = {
+        op: 'verify_stripe_payout',
+        provider,
+        account_id: stripeTarget,
+        account_type: 'express',
+        country: 'DE',
+        currency: 'usd',
+        mode: 'test',
+        verification_kind: 'status',
+        source_provider: null,
+        processor_revision: null,
+        previous_verification: null,
+        details_submitted: true,
+        payouts_enabled: true,
+        transfers_enabled: true,
+        network: payments.tnk.network,
+        admin: adminPubkey,
+        bootstrap,
+        context_revision: contextRevision,
+        payment_config_version: payments.ver,
+        request_nonce: hex(`stripe-verification:${provider}`),
+      };
+      verificationValue.processor_revision = await opaqueHash(
+        'mayhem-stripe-payout-processor-evidence-v1',
+        {
+          account_id: verificationValue.account_id,
+          account_type: verificationValue.account_type,
+          country: verificationValue.country,
+          currency: verificationValue.currency,
+          mode: verificationValue.mode,
+          provider: verificationValue.provider,
+        },
+      );
+      const verificationRevision = await opaqueHash(
+        'mayhem-stripe-payout-verification-feature-v1',
+        verificationValue,
+      );
+      const verificationKey = `payout/stripe-verified/${provider}/${verificationRevision}`;
+      stripeVerification = {
+        type: 'stripe_payout_verification',
+        revision: verificationRevision,
+        provider,
+        target: stripeTarget,
+        account_type: verificationValue.account_type,
+        country: verificationValue.country,
+        currency: verificationValue.currency,
+        mode: verificationValue.mode,
+        verification_kind: verificationValue.verification_kind,
+        source_provider: null,
+        processor_revision: verificationValue.processor_revision,
+        previous_verification: null,
+        details_submitted: true,
+        payouts_enabled: true,
+        transfers_enabled: true,
+        ready: true,
+        network: payments.tnk.network,
+        admin: adminPubkey,
+        bootstrap,
+        context_revision: contextRevision,
+        payment_config_version: payments.ver,
+        request_nonce: verificationValue.request_nonce,
+        verified_at: verificationKey,
+        verified_by: adminPubkey,
+        verified_by_role: 'admin',
+      };
+      snapshot[verificationKey] = stripeVerification;
+      const verificationPointer = {
+        provider,
+        revision: verificationRevision,
+        record_key: verificationKey,
+        target: stripeTarget,
+        currency: 'usd',
+        processor_revision: verificationValue.processor_revision,
+        ready: true,
+        details_submitted: true,
+        payouts_enabled: true,
+        transfers_enabled: true,
+        context_revision: contextRevision,
+        payment_config_version: payments.ver,
+        updated_at: verificationKey,
+        updated_by: adminPubkey,
+        updated_by_role: 'admin',
+      };
+      snapshot[`payout/stripe-verified/current/${provider}`] =
+        verificationPointer;
+      snapshot[
+        `payout/stripe-verified/target/${provider}/${stripeTarget}`
+      ] = verificationPointer;
+    }
+
+    const intent = {
+      op: 'bind_provider_payout',
+      network: payments.tnk.network,
+      admin: adminPubkey,
+      bootstrap,
+      context_revision: contextRevision,
+      provider,
+      rail,
+      currency: rail === 'fiat' ? 'usd' : null,
+      chain_id: rail === 'tap' ? payments.tap.chain_id : null,
+      target: rail === 'fiat'
+        ? stripeTarget
+        : rail === 'tap'
+          ? tapTarget.address
+          : tnkAddress,
+      target_wallet: rail === 'tnk' ? tnkTarget.publicKeyHex : null,
+      target_signature: null,
+      previous_revision: null,
+      payment_config_version: payments.ver,
+      nonce: hex(`payout-binding:${provider}`),
+      expires_after_epoch: 100,
+    };
+    if (rail === 'tnk') {
+      intent.target_signature = signEd25519(
+        tnkTarget,
+        providerPayoutTargetBindingMessage(intent),
+      );
+    } else if (rail === 'tap') {
+      intent.target_signature = signEthereumPersonalMessage(
+        tapTarget,
+        providerPayoutTargetBindingMessage(intent),
+      );
+    }
+    const revision = await blake3Hex(providerPayoutBindingMessage(intent));
+    const bindingKey = `payout/binding/${rail}/${provider}/${revision}`;
+    snapshot[bindingKey] = {
+      type: 'provider_payout_binding',
+      revision,
+      provider,
+      rail,
+      target: intent.target,
+      target_wallet: intent.target_wallet,
+      currency: intent.currency,
+      chain_id: intent.chain_id,
+      stripe_processor_revision: stripeVerification?.processor_revision ?? null,
+      stripe_verification_revision: stripeVerification?.revision ?? null,
+      network: intent.network,
+      admin: intent.admin,
+      bootstrap: intent.bootstrap,
+      context_revision: intent.context_revision,
+      payment_config_version: intent.payment_config_version,
+      previous_revision: intent.previous_revision,
+      nonce: intent.nonce,
+      expires_after_epoch: intent.expires_after_epoch,
+      activation_epoch: 1,
+      target_signature: intent.target_signature,
+      provider_signature: signEd25519(
+        providerKey,
+        providerPayoutBindingMessage(intent),
+      ),
+      verified: true,
+      bound_at: bindingKey,
+      bound_by: adminPubkey,
+      bound_by_role: 'admin',
+    };
+    snapshot[`payout/current/${rail}/${provider}`] = {
+      provider,
+      rail,
+      latest_revision: revision,
+      current_revision: revision,
+      pending_revision: null,
+      pending_activation_epoch: null,
+      updated_at: bindingKey,
+    };
+  }
+
   return writeJson(path.join(outDir, 'contract-state.json'), snapshot);
 }
 
@@ -702,7 +991,11 @@ async function buildSyntheticBundle(args) {
 
   const adminKey = deterministicEd25519Key('synthetic-admin');
   const adminPubkey = adminKey.publicKeyHex;
-  const providerIds = Array.from({ length: 20 }, (_, index) => providerPubkey(index));
+  const providerKeys = Array.from(
+    { length: 20 },
+    (_, index) => deterministicEd25519Key(`provider:${String(index).padStart(2, '0')}`),
+  );
+  const providerIds = providerKeys.map((provider) => provider.publicKeyHex);
   const syntheticCatalog = await buildSyntheticCatalog(outDir);
   const { manifestPath, enclave, roomId } = await buildLaunchManifest(
     outDir,
@@ -710,7 +1003,13 @@ async function buildSyntheticBundle(args) {
     providerIds,
     syntheticCatalog
   );
-  const snapshotPath = buildCanonicalSnapshot(outDir, adminPubkey, providerIds, enclave, roomId);
+  const snapshotPath = await buildCanonicalSnapshot(
+    outDir,
+    adminPubkey,
+    providerKeys,
+    enclave,
+    roomId,
+  );
   const participantPaths = buildParticipants(outDir, providerIds);
   const paymentRailsPath = buildPaymentRailEvidence(outDir);
   const epochPath = buildEpochEvidence(outDir);

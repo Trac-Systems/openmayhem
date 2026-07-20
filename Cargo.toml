@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/mayhem-attestation",
+    "crates/mayhem-attestation-verifier",
     "crates/mayhem-bridge",
     "crates/mayhem-cli",
     "crates/mayhem-enclave",
@@ -16,7 +18,7 @@ members = [
 exclude = ["third_party/xet-core"]
 
 [workspace.package]
-version = "0.2.22"
+version = "0.2.23"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
