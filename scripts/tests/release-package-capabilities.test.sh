@@ -92,6 +92,12 @@ grep -F 'materialize-local-dependencies.mjs' <<<"$release_hydration" >/dev/null 
   fail "release packaging does not restore exact pinned runtime files after npm packing"
 grep -F 'native_host="$(native_host_target)"' <<<"$release_hydration" >/dev/null ||
   fail "Intercom native dependency checks trust emulated shell architecture"
+grep -F '[[ "$TARGET" == "$(native_host_target)" ]]' \
+  "$ROOT_DIR/scripts/package-release.sh" >/dev/null ||
+  fail "managed verifier staging trusts emulated shell architecture"
+grep -F 'TARGET="$(native_host_target)"' \
+  "$ROOT_DIR/scripts/package-release.sh" >/dev/null ||
+  fail "default release target trusts emulated shell architecture"
 if grep -E 'trac-(msb|peer).*(npm ci)|local_package' \
   <<<"$release_hydration" >/dev/null; then
   fail "release packaging retains separate local-package hydration"

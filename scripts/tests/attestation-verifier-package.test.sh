@@ -366,7 +366,7 @@ test_provenance_guards() {
   expect_failure "untracked dirty source was accepted" \
     clean_source_git_sha "$untracked_repo"
 
-  TARGET="$(host_target)"
+  TARGET="$(native_host_target)"
   UNSIGNED_LAYOUT=0
   SKIP_BUILD=1
   VERIFIER_IDENTITY_FILE=""
@@ -380,14 +380,14 @@ test_provenance_guards() {
   expect_failure "unsigned release mode omitted explicit --unsigned-layout" \
     validate_release_mode 0
   for candidate in "${MANAGED_VERIFIER_TARGETS[@]}"; do
-    if [[ "$candidate" != "$(host_target)" ]]; then
+    if [[ "$candidate" != "$(native_host_target)" ]]; then
       TARGET="$candidate"
       break
     fi
   done
   expect_failure "signed release mode accepted a cross target" \
     validate_release_mode 1
-  TARGET="$(host_target)"
+  TARGET="$(native_host_target)"
   VERIFIER_IDENTITY_FILE="$clean_repo/tracked.txt"
   expect_failure "signed release mode accepted an identity fixture" \
     validate_release_mode 1
@@ -417,7 +417,7 @@ test_identity_rejection() {
   local candidate stage
 
   for candidate in "${MANAGED_VERIFIER_TARGETS[@]}"; do
-    if [[ "$candidate" != "$(host_target)" ]]; then
+    if [[ "$candidate" != "$(native_host_target)" ]]; then
       target="$candidate"
       break
     fi
@@ -502,7 +502,7 @@ test_target() {
     chmod 0777 "$stage/share/mayhem/runtime/layout.txt"
     write_intercom_metadata_fixture "$metadata"
 
-    if [[ "$target" == "$(host_target)" ]]; then
+    if [[ "$target" == "$(native_host_target)" ]]; then
       stage_managed_verifier_artifacts "$stage"
     else
       "$release_dir/$MANAGED_VERIFIER_ID$extension" --identity >"$identity_file"

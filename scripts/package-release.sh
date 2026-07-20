@@ -276,7 +276,7 @@ stage_managed_verifier_artifacts() {
     [[ -f "$identity_file" && ! -L "$identity_file" ]] ||
       die "explicit verifier identity must be a regular non-symlink file: $identity_file"
   else
-    [[ "$TARGET" == "$(host_target)" ]] ||
+    [[ "$TARGET" == "$(native_host_target)" ]] ||
       die "cross-target managed verifier layout requires an explicit identity fixture"
     [[ -x "$source" ]] ||
       die "native staged managed verifier is not executable: $source"
@@ -2115,7 +2115,7 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 if [[ -z "$TARGET" ]]; then
-  TARGET="$(host_target)"
+  TARGET="$(native_host_target)"
 fi
 validate_release_artifact_identity "$VERSION" "$TARGET"
 SIGNED_RELEASE=0
