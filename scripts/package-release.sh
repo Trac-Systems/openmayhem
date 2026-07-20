@@ -1754,7 +1754,7 @@ hydrate_intercom_runtime_tree() {
   rm -rf "$hydrate_root"
   copy_tracked_allowlist "$hydrate_root" "${INTERCOM_SOURCE_ALLOWLIST[@]}"
   verify_intercom_release_identity "$intercom_root"
-  native_host="$(host_target)"
+  native_host="$(native_host_target)"
 
   if lockfile_hints_at_native_runtime_dependencies "$intercom_root/package-lock.json"; then
     [[ "$target" == "$native_host" ]] ||
