@@ -216,7 +216,6 @@ async fn mock_connect_account(capture: &StripeCapture, ready: bool) -> Value {
         "type": account_type,
         "country": "DE",
         "default_currency": "eur",
-        "livemode": livemode,
         "metadata": {
             "mayhem_provider": owner_provider,
             "mayhem_mode": if livemode { "live" } else { "test" }

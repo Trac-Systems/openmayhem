@@ -143,6 +143,16 @@ if grep -E '^hydrate_npm_package "\$repo/intercom(/trac/[^"]*)?"' \
   "$ROOT_DIR/scripts/install-mainnet-systemd.sh" >/dev/null; then
   fail "mainnet source install retains separate Intercom npm hydration"
 fi
+grep -Fq \
+  'append_default MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE "$root/.mayhem-local/live-home/paygate/internal-auth.secret"' \
+  "$ROOT_DIR/scripts/install-mainnet-systemd.sh" ||
+  fail "mainnet install does not share one private paygate authentication secret with the admin peer"
+grep -Fq 'ensure_private_random_secret_file \' \
+  "$ROOT_DIR/scripts/install-mainnet-systemd.sh" ||
+  fail "mainnet install does not initialize the private paygate authentication secret"
+grep -Fq '"$root/.mayhem-local/settlement/tap" \' \
+  "$ROOT_DIR/scripts/install-mainnet-systemd.sh" ||
+  fail "mainnet install does not explicitly own the TAP settlement spool root"
 
 shell_signed="$(
   sed -n '/^install_signed_release() {/,/^}/p' "$ROOT_DIR/install.sh"
@@ -174,7 +184,7 @@ grep -F "MAYHEM_ALLOW_UNVERIFIED have been removed" "$ROOT_DIR/install.ps1" >/de
 for harness in \
   "$ROOT_DIR/scripts/macos-opencode-role-check.sh" \
   "$ROOT_DIR/scripts/docker-opencode-role-check.sh"; do
-  grep -F ':-0.2.23}' "$harness" >/dev/null ||
+  grep -F ':-0.2.24}' "$harness" >/dev/null ||
     fail "$harness does not default to canonical release semver"
   grep -F -- '--unsigned-layout' "$harness" >/dev/null ||
     fail "$harness does not explicitly request the unsigned test layout"

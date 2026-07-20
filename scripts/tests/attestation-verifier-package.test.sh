@@ -64,7 +64,7 @@ write_intercom_metadata_fixture() {
   local output="$1"
 
   printf '%s\n' \
-    '{"schema":1,"release_version":"0.2.23","contract_version":1,"contract_code_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","assets":[]}' \
+    '{"schema":1,"release_version":"0.2.24","contract_version":1,"contract_code_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","assets":[]}' \
     >"$output"
 }
 
@@ -75,7 +75,7 @@ assert_layout() {
   local extension="$4"
   local executable_name="$5"
   local managed_manifest_name="$6"
-  local archive_basename="mayhem-0.2.23-$target"
+  local archive_basename="mayhem-0.2.24-$target"
   local archive_name="$archive_basename.tar.gz"
 
   [[ "$target" == *-windows-* ]] && archive_name="$archive_basename.zip"
@@ -122,7 +122,7 @@ const genericManifestPath = path.join(stage, 'manifest.json');
 const genericManifest = JSON.parse(fs.readFileSync(genericManifestPath, 'utf8'));
 if (genericManifest.schema !== 1 ||
     genericManifest.name !== 'mayhem' ||
-    genericManifest.version !== '0.2.23' ||
+    genericManifest.version !== '0.2.24' ||
     genericManifest.target !== target ||
     genericManifest.built_at_utc !== expectedBuiltAt ||
     genericManifest.source_git_sha !== sourceGitSha ||
@@ -425,7 +425,7 @@ test_identity_rejection() {
   [[ -n "$target" ]] || fail "identity test could not select a cross target"
   [[ "$target" == *-windows-* ]] && extension=".exe"
 
-  VERSION="0.2.23"
+  VERSION="0.2.24"
   TARGET="$target"
   BIN_EXT="$extension"
   write_release_binary_fixtures "$release_dir" "$target" "$extension"
@@ -460,7 +460,7 @@ test_target() {
   local executable_name managed_manifest_name archive_basename run
   local work stage output release_dir metadata identity_file archive_name invalid_stage
 
-  VERSION="0.2.23"
+  VERSION="0.2.24"
   TARGET="$target"
   BIN_EXT="$extension"
   SOURCE_GIT_SHA="$SOURCE_SHA"
@@ -472,10 +472,10 @@ test_target() {
   [[ "$target" == *-windows-* ]] && archive_name="$archive_basename.zip"
 
   [[ "$executable_name" == \
-    "mayhem-attestation-verifier-0.2.23-$target$extension" ]] ||
+    "mayhem-attestation-verifier-0.2.24-$target$extension" ]] ||
     fail "managed verifier executable name is not canonical for $target"
   [[ "$managed_manifest_name" == \
-    "mayhem-attestation-verifier-0.2.23-$target.manifest.json" ]] ||
+    "mayhem-attestation-verifier-0.2.24-$target.manifest.json" ]] ||
     fail "managed verifier manifest name is not canonical for $target"
   [[ "$managed_manifest_name" != *".exe.manifest.json" ]] ||
     fail "managed verifier manifest name depends on .exe for $target"

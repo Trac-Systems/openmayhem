@@ -668,7 +668,7 @@ struct StripeConnectConsentRecord {
 struct VerifiedStripeConnectAccount {
     summary: StripeConnectAccountSummary,
     owner_provider: String,
-    livemode: bool,
+    livemode: Option<bool>,
     metadata_mode: StripeMode,
 }
 
@@ -2831,10 +2831,7 @@ fn stripe_connect_account_summary(value: Value) -> Result<VerifiedStripeConnectA
             "connected account has invalid Mayhem provider ownership metadata".to_owned(),
         )
     })?;
-    let livemode = value
-        .get("livemode")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| PaygateError::Stripe("connected account is missing livemode".to_owned()))?;
+    let livemode = value.get("livemode").and_then(Value::as_bool);
     let metadata_mode = match value
         .pointer("/metadata/mayhem_mode")
         .and_then(Value::as_str)
@@ -2920,7 +2917,10 @@ fn verify_connect_account_mode(
     account: &VerifiedStripeConnectAccount,
     stripe: &StripeSettings,
 ) -> Result<()> {
-    if account.livemode != (stripe.mode == StripeMode::Live) {
+    if account
+        .livemode
+        .is_some_and(|livemode| livemode != (stripe.mode == StripeMode::Live))
+    {
         return Err(PaygateError::Stripe(
             "connected account mode did not match paygate mode".to_owned(),
         ));

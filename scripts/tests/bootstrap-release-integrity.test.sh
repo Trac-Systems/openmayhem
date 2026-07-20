@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MAYHEM_BIN="${MAYHEM_TEST_MAYHEM_BIN:-$ROOT_DIR/target/debug/mayhem}"
-VERSION="${MAYHEM_TEST_VERSION:-0.2.23}"
+VERSION="${MAYHEM_TEST_VERSION:-0.2.24}"
 SOURCE_GIT_SHA="0123456789abcdef0123456789abcdef01234567"
 
 fail() {
@@ -351,7 +351,7 @@ if ! run_installer "$source_pin" --version latest >"$source_pin/output.log" 2>&1
 fi
 
 expect_failure unpinned-latest --version latest --source-git-sha ""
-expect_failure wrong-requested-version --version 0.2.24
+expect_failure wrong-requested-version --version 0.2.25
 
 snapshot_root="$tmp/snapshot"
 mkdir -p "$snapshot_root"
@@ -484,7 +484,7 @@ mkdir -p "$rollback/install/.mayhem-update"
 cat >"$rollback/install/.mayhem-update/release-floor.json" <<EOF
 {
   "schema": 1,
-  "version": "0.2.24"
+  "version": "0.2.25"
 }
 EOF
 rollback_output="$rollback/output.log"

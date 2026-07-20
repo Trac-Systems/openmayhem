@@ -161,20 +161,39 @@ function Assert-LlamaCppFeaturePrereqs {
 }
 
 function Get-LlamaCppFeatureArgs {
-    $features = @(Get-LlamaCppFeatures)
-    Assert-LlamaCppFeaturePrereqs -Features $features
+    param([string[]]$Features = $(Get-LlamaCppFeatures))
 
-    if ($features.Count -eq 0) {
+    Assert-LlamaCppFeaturePrereqs -Features $Features
+
+    if ($Features.Count -eq 0) {
         Write-Log "building llama.cpp CPU fallback; set MAYHEM_LLAMA_CPP_FEATURES=cuda or vulkan for GPU source builds"
         return @()
     }
 
-    Write-Log ("building llama.cpp provider feature(s): " + ($features -join ", "))
-    return @("--features", ($features -join ","))
+    Write-Log ("building llama.cpp provider feature(s): " + ($Features -join ", "))
+    return @("--features", ($Features -join ","))
+}
+
+function Get-WindowsSourceBuildCargoArgs {
+    param([string[]]$LlamaCppFeatures)
+
+    if ($LlamaCppFeatures -contains "mayhem-cli/llama-cpp-vulkan") {
+        return @("--jobs", "1")
+    }
+    return @()
 }
 
 function New-TempDir {
-    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("mayhem-install-" + [System.Guid]::NewGuid().ToString("N"))
+    param(
+        [string]$BasePath = $([System.IO.Path]::GetTempPath()),
+        [string]$Prefix = "mayhem-install-"
+    )
+
+    if ([string]::IsNullOrWhiteSpace($BasePath)) {
+        Fail "could not determine a base directory for private installer state"
+    }
+    New-Item -ItemType Directory -Path $BasePath -Force | Out-Null
+    $dir = Join-Path $BasePath ($Prefix + [System.Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $dir | Out-Null
     try {
         $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
@@ -242,6 +261,312 @@ function Get-TargetTriple {
         "^(ARM64|Arm64|AARCH64|aarch64)$" { return "aarch64-pc-windows-msvc" }
         default { Fail "unsupported Windows architecture: $arch" }
     }
+}
+
+function Get-WindowsSourceBuildArchitecture {
+    param([string]$TargetTriple = $(Get-TargetTriple))
+
+    switch ($TargetTriple) {
+        "x86_64-pc-windows-msvc" {
+            return [pscustomobject]@{
+                TargetTriple = $TargetTriple
+                VsTarget = "amd64"
+                VsHost = "amd64"
+                RequiredComponent = "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+            }
+        }
+        "aarch64-pc-windows-msvc" {
+            return [pscustomobject]@{
+                TargetTriple = $TargetTriple
+                VsTarget = "arm64"
+                VsHost = "arm64"
+                RequiredComponent = "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
+            }
+        }
+        default {
+            Fail "unsupported Windows source-build target: $TargetTriple"
+        }
+    }
+}
+
+function Get-VsWherePath {
+    $command = Get-Command "vswhere.exe" -CommandType Application -ErrorAction SilentlyContinue
+    if ($null -ne $command -and (Test-Path -LiteralPath $command.Path -PathType Leaf)) {
+        return $command.Path
+    }
+
+    $roots = @()
+    foreach ($name in @("ProgramFiles(x86)", "ProgramFiles")) {
+        $root = [Environment]::GetEnvironmentVariable($name, "Process")
+        if (-not [string]::IsNullOrWhiteSpace($root) -and $roots -notcontains $root) {
+            $roots += $root
+        }
+    }
+    foreach ($root in $roots) {
+        $candidate = Join-Path $root "Microsoft Visual Studio\Installer\vswhere.exe"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return $candidate
+        }
+    }
+
+    Fail "Visual Studio Locator (vswhere.exe) was not found; install Visual Studio Build Tools with the C++ tools required for this architecture"
+}
+
+function Find-VisualStudioSourceBuildTools {
+    param(
+        [pscustomobject]$Architecture,
+        [string]$VsWherePath = $(Get-VsWherePath)
+    )
+
+    $arguments = @(
+        "-latest",
+        "-products",
+        "*",
+        "-requires",
+        "Microsoft.Component.MSBuild",
+        $Architecture.RequiredComponent,
+        "-property",
+        "installationPath"
+    )
+    $installPaths = @(& $VsWherePath @arguments)
+    if ($LASTEXITCODE -ne 0) {
+        Fail "vswhere.exe failed while locating Visual Studio C++ Build Tools"
+    }
+    $installPath = $installPaths |
+        ForEach-Object { "$_".Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -First 1
+    if ([string]::IsNullOrWhiteSpace($installPath)) {
+        Fail "Visual Studio C++ Build Tools for $($Architecture.TargetTriple) were not found (missing $($Architecture.RequiredComponent))"
+    }
+
+    $vsDevCmd = Join-Path $installPath "Common7\Tools\VsDevCmd.bat"
+    if (-not (Test-Path -LiteralPath $vsDevCmd -PathType Leaf)) {
+        Fail "Visual Studio developer environment script was not found: $vsDevCmd"
+    }
+    return [pscustomobject]@{
+        InstallationPath = $installPath
+        VsDevCmd = $vsDevCmd
+    }
+}
+
+function Get-VsDevCmdBatchContent {
+    param([pscustomobject]$Architecture)
+
+    return @(
+        "@echo off",
+        "call `"%_MAYHEM_VSDEVCMD_PATH%`" -no_logo -arch=$($Architecture.VsTarget) -host_arch=$($Architecture.VsHost)",
+        "if errorlevel 1 exit /b %errorlevel%",
+        "`"%_MAYHEM_POWERSHELL_EXE%`" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"%_MAYHEM_VSENV_DUMP_SCRIPT%`"",
+        "exit /b %errorlevel%"
+    ) -join "`r`n"
+}
+
+function Set-ProcessEnvironmentFromSnapshot {
+    param([pscustomobject]$Snapshot)
+
+    foreach ($property in $Snapshot.PSObject.Properties) {
+        $name = [string]$property.Name
+        if ($name.StartsWith("=") -or $name.StartsWith("_MAYHEM_VS")) {
+            continue
+        }
+        [Environment]::SetEnvironmentVariable(
+            $name,
+            [string]$property.Value,
+            "Process")
+    }
+}
+
+function Import-VisualStudioDeveloperEnvironment {
+    param(
+        [string]$VsDevCmd,
+        [pscustomobject]$Architecture
+    )
+
+    $tempDir = New-TempDir
+    $batchPath = Join-Path $tempDir "initialize-vs.cmd"
+    $dumpScript = Join-Path $tempDir "export-environment.ps1"
+    $snapshotPath = Join-Path $tempDir "environment.json"
+    $powerShellExe = if ($PSVersionTable.PSEdition -eq "Core") {
+        Join-Path $PSHOME "pwsh.exe"
+    } else {
+        Join-Path $PSHOME "powershell.exe"
+    }
+    if (-not (Test-Path -LiteralPath $powerShellExe -PathType Leaf)) {
+        Fail "could not locate the current PowerShell executable: $powerShellExe"
+    }
+
+    Set-Content -LiteralPath $batchPath `
+        -Value (Get-VsDevCmdBatchContent -Architecture $Architecture) `
+        -Encoding Ascii
+    Set-Content -LiteralPath $dumpScript -Encoding UTF8 -Value @'
+$ErrorActionPreference = "Stop"
+$snapshot = [ordered]@{}
+foreach ($entry in [Environment]::GetEnvironmentVariables("Process").GetEnumerator()) {
+    $snapshot[[string]$entry.Key] = [string]$entry.Value
+}
+$snapshot |
+    ConvertTo-Json -Compress |
+    Set-Content -LiteralPath $env:_MAYHEM_VSENV_OUTPUT -Encoding UTF8
+'@
+
+    $helperVariables = @{
+        "_MAYHEM_VSDEVCMD_PATH" = $VsDevCmd
+        "_MAYHEM_POWERSHELL_EXE" = $powerShellExe
+        "_MAYHEM_VSENV_DUMP_SCRIPT" = $dumpScript
+        "_MAYHEM_VSENV_OUTPUT" = $snapshotPath
+    }
+    $previousValues = @{}
+    foreach ($entry in $helperVariables.GetEnumerator()) {
+        $previousValues[$entry.Key] = [Environment]::GetEnvironmentVariable(
+            $entry.Key,
+            "Process")
+        [Environment]::SetEnvironmentVariable(
+            $entry.Key,
+            $entry.Value,
+            "Process")
+    }
+
+    try {
+        & $batchPath
+        if ($LASTEXITCODE -ne 0) {
+            Fail "Visual Studio developer environment initialization failed for $($Architecture.TargetTriple)"
+        }
+        if (-not (Test-Path -LiteralPath $snapshotPath -PathType Leaf)) {
+            Fail "Visual Studio developer environment did not produce an environment snapshot"
+        }
+        try {
+            $snapshot = Get-Content -LiteralPath $snapshotPath -Raw |
+                ConvertFrom-Json
+        } catch {
+            Fail "Visual Studio developer environment snapshot is invalid: $($_.Exception.Message)"
+        }
+        Set-ProcessEnvironmentFromSnapshot -Snapshot $snapshot
+    } finally {
+        foreach ($entry in $previousValues.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable(
+                $entry.Key,
+                $entry.Value,
+                "Process")
+        }
+    }
+}
+
+function Test-VsArchitectureValue {
+    param(
+        [string]$Actual,
+        [string]$Expected
+    )
+
+    if ($Expected -eq "amd64") {
+        return $Actual -in @("amd64", "x64")
+    }
+    return $Actual -eq $Expected
+}
+
+function Assert-WindowsSourceBuildEnvironment {
+    param([pscustomobject]$Architecture)
+
+    if (-not (Test-VsArchitectureValue -Actual $env:VSCMD_ARG_TGT_ARCH -Expected $Architecture.VsTarget)) {
+        Fail "Visual Studio developer environment selected target '$env:VSCMD_ARG_TGT_ARCH' instead of '$($Architecture.VsTarget)'"
+    }
+    if (-not (Test-VsArchitectureValue -Actual $env:VSCMD_ARG_HOST_ARCH -Expected $Architecture.VsHost)) {
+        Fail "Visual Studio developer environment selected host '$env:VSCMD_ARG_HOST_ARCH' instead of '$($Architecture.VsHost)'"
+    }
+    foreach ($name in @("VSINSTALLDIR", "VCINSTALLDIR", "VCToolsInstallDir", "WindowsSdkDir")) {
+        if ([string]::IsNullOrWhiteSpace(
+            [Environment]::GetEnvironmentVariable($name, "Process"))) {
+            Fail "Visual Studio developer environment did not set $name"
+        }
+    }
+    foreach ($command in @("cl.exe", "msbuild.exe", "cmake.exe")) {
+        if (-not (Test-Command $command)) {
+            Fail "Visual Studio developer environment did not expose $command"
+        }
+    }
+}
+
+function Initialize-WindowsSourceBuildEnvironment {
+    param([string]$TargetTriple = $(Get-TargetTriple))
+
+    $architecture = Get-WindowsSourceBuildArchitecture -TargetTriple $TargetTriple
+    $tools = Find-VisualStudioSourceBuildTools -Architecture $architecture
+    Import-VisualStudioDeveloperEnvironment `
+        -VsDevCmd $tools.VsDevCmd `
+        -Architecture $architecture
+    Assert-WindowsSourceBuildEnvironment -Architecture $architecture
+    Write-Log "initialized Visual Studio native build environment for $TargetTriple from $($tools.InstallationPath)"
+}
+
+function Get-WindowsLocalAppDataPath {
+    if (-not ("MayhemWindowsUserProfile" -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class MayhemWindowsUserProfile {
+    [DllImport(
+        "userenv.dll",
+        CharSet = CharSet.Unicode,
+        ExactSpelling = true,
+        SetLastError = true)]
+    private static extern bool GetUserProfileDirectoryW(
+        IntPtr token,
+        StringBuilder profileDirectory,
+        ref uint size);
+
+    public static string GetPath(IntPtr token) {
+        uint size = 0;
+        GetUserProfileDirectoryW(token, null, ref size);
+        if (size == 0) {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+        var profileDirectory = new StringBuilder((int)size);
+        if (!GetUserProfileDirectoryW(token, profileDirectory, ref size)) {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+        return profileDirectory.ToString();
+    }
+}
+"@ | Out-Null
+    }
+
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        $profilePath = [MayhemWindowsUserProfile]::GetPath($identity.Token)
+    } finally {
+        $identity.Dispose()
+    }
+    if ([string]::IsNullOrWhiteSpace($profilePath)) {
+        Fail "could not determine the current Windows user's profile directory"
+    }
+    return Join-Path $profilePath "AppData\Local"
+}
+
+function New-WindowsSourceBuildTargetDir {
+    $candidates = @()
+    $localAppData = Get-WindowsLocalAppDataPath
+    if (-not [string]::IsNullOrWhiteSpace($localAppData)) {
+        $candidates += Join-Path $localAppData "Temp"
+    }
+    $processTemp = [IO.Path]::GetTempPath()
+    if (-not [string]::IsNullOrWhiteSpace($processTemp) -and
+        $candidates -notcontains $processTemp) {
+        $candidates += $processTemp
+    }
+
+    $failures = @()
+    foreach ($basePath in ($candidates | Sort-Object { $_.Length })) {
+        try {
+            return New-TempDir `
+                -BasePath $basePath `
+                -Prefix "mayhem-source-build-"
+        } catch {
+            $failures += $_.Exception.Message
+        }
+    }
+    Fail "could not create a short private Windows source-build directory: $($failures -join '; ')"
 }
 
 function Get-ArchiveName {
@@ -1376,11 +1701,23 @@ function Install-FromSource {
         Fail "Rust/Cargo is required for -FromSource installs"
     }
 
-    Write-Log "building release binaries from $SourceDir"
+    $targetDir = New-WindowsSourceBuildTargetDir
+    Initialize-WindowsSourceBuildEnvironment
+    Write-Log "building release binaries from $SourceDir in private target directory $targetDir"
     Push-Location $SourceDir
     try {
-        $featureArgs = @(Get-LlamaCppFeatureArgs)
-        & cargo build --release --workspace --bins @featureArgs
+        $features = @(Get-LlamaCppFeatures)
+        $featureArgs = @(Get-LlamaCppFeatureArgs -Features $features)
+        $cargoBuildArgs = @(
+            Get-WindowsSourceBuildCargoArgs -LlamaCppFeatures $features
+        )
+        if ($cargoBuildArgs.Count -gt 0) {
+            Write-Log "serializing Cargo jobs for the Windows Vulkan CMake/MSBuild external project"
+        }
+        & cargo build --release --workspace --bins `
+            --target-dir $targetDir `
+            @cargoBuildArgs `
+            @featureArgs
         if ($LASTEXITCODE -ne 0) {
             Fail "cargo build failed"
         }
@@ -1390,7 +1727,7 @@ function Install-FromSource {
 
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     foreach ($bin in $Bins) {
-        $src = Join-Path (Join-Path (Join-Path $SourceDir "target") "release") "$bin.exe"
+        $src = Join-Path (Join-Path $targetDir "release") "$bin.exe"
         if (-not (Test-Path $src)) {
             Fail "missing built binary: $src"
         }

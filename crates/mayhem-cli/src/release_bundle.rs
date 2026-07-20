@@ -3847,7 +3847,7 @@ mod tests {
     }
 
     fn intercom_manifest_for(files: &[(&str, &[u8])]) -> IntercomBundleManifest {
-        intercom_manifest_for_version(files, "0.2.23")
+        intercom_manifest_for_version(files, "0.2.24")
     }
 
     fn stage_release_for(version: &str, target: &str) -> (TestDir, ReleaseBundleManifest, Vec<u8>) {
@@ -3915,7 +3915,7 @@ mod tests {
     }
 
     fn stage_release() -> (TestDir, ReleaseBundleManifest, Vec<u8>) {
-        stage_release_for("v0.2.23", "aarch64-apple-darwin")
+        stage_release_for("v0.2.24", "aarch64-apple-darwin")
     }
 
     fn write_test_checksums(root: &Path) {
@@ -4471,7 +4471,7 @@ mod tests {
         let floor_path = work.path().join("install/release-floor.json");
         fs::create_dir_all(floor_path.parent().expect("floor parent"))
             .expect("create floor parent");
-        initialize_release_anti_rollback_floor(&floor_path, "0.2.23")
+        initialize_release_anti_rollback_floor(&floor_path, "0.2.24")
             .expect("initialize release floor");
         let (stage_root, trusted_key) = prepare_signed_test_stage(
             release.path(),
@@ -4591,7 +4591,7 @@ mod tests {
         let floor_path = work.path().join("install/release-floor.json");
         fs::create_dir_all(floor_path.parent().expect("floor parent"))
             .expect("create floor parent");
-        initialize_release_anti_rollback_floor(&floor_path, "0.2.23")
+        initialize_release_anti_rollback_floor(&floor_path, "0.2.24")
             .expect("initialize release floor");
 
         let prepared = stage_release_archive(
@@ -4642,7 +4642,7 @@ mod tests {
         let higher_floor_path = work.path().join("higher/release-floor.json");
         fs::create_dir_all(higher_floor_path.parent().expect("higher floor parent"))
             .expect("create higher floor parent");
-        initialize_release_anti_rollback_floor(&higher_floor_path, "0.2.24")
+        initialize_release_anti_rollback_floor(&higher_floor_path, "0.2.25")
             .expect("initialize higher release floor");
         assert!(reauthenticate_release_stage(
             &stage_root,
@@ -4693,7 +4693,7 @@ mod tests {
     #[test]
     fn windows_zip_release_is_safely_staged_and_reauthenticated() {
         let (release, manifest, manifest_bytes) =
-            stage_release_for("v0.2.23", "x86_64-pc-windows-msvc");
+            stage_release_for("v0.2.24", "x86_64-pc-windows-msvc");
         let work = TestDir::new("zip-stage");
         let archive_path = work.path().join("release.zip");
         write_release_zip(release.path(), &manifest, &archive_path);
@@ -4702,7 +4702,7 @@ mod tests {
         let floor_path = work.path().join("install/release-floor.json");
         fs::create_dir_all(floor_path.parent().expect("floor parent"))
             .expect("create floor parent");
-        initialize_release_anti_rollback_floor(&floor_path, "0.2.23")
+        initialize_release_anti_rollback_floor(&floor_path, "0.2.24")
             .expect("initialize release floor");
 
         stage_release_archive(
@@ -4807,7 +4807,7 @@ mod tests {
     #[test]
     fn zip_extraction_rejects_escape_links_duplicates_extras_and_limits() {
         let (_release, manifest, _manifest_bytes) =
-            stage_release_for("v0.2.23", "x86_64-pc-windows-msvc");
+            stage_release_for("v0.2.24", "x86_64-pc-windows-msvc");
         let work = TestDir::new("negative-zip");
         let archive_root = format!("mayhem-{}-{}", manifest.version, manifest.target);
         let expected = format!("{archive_root}/README.md");
@@ -4975,13 +4975,13 @@ mod tests {
     #[test]
     fn release_version_binding_accepts_optional_v_and_rejects_drift() {
         let intercom = intercom_manifest_for(&[("src/main.js", b"main")]);
-        verify_release_version_binding("0.2.23", &intercom).expect("bind plain version");
-        verify_release_version_binding("v0.2.23", &intercom).expect("bind tagged version");
-        assert!(verify_release_version_binding("v0.2.24", &intercom)
+        verify_release_version_binding("0.2.24", &intercom).expect("bind plain version");
+        verify_release_version_binding("v0.2.24", &intercom).expect("bind tagged version");
+        assert!(verify_release_version_binding("v0.2.25", &intercom)
             .expect_err("version drift must fail")
             .to_string()
             .contains("does not bind"));
-        assert!(verify_release_version_binding("release-0.2.23", &intercom)
+        assert!(verify_release_version_binding("release-0.2.24", &intercom)
             .expect_err("implicit version must fail")
             .to_string()
             .contains("explicit semantic version"));
@@ -5047,7 +5047,7 @@ mod tests {
         );
         assert_eq!(
             read_release_anti_rollback_floor(&floor_path).expect("read activated floor"),
-            "0.2.23"
+            "0.2.24"
         );
         assert_eq!(
             activation.backup_path(0).expect("bin backup").parent(),
@@ -5110,7 +5110,7 @@ mod tests {
         );
         assert_eq!(
             read_release_anti_rollback_floor(&floor_path).expect("read committed floor"),
-            "0.2.23"
+            "0.2.24"
         );
     }
 
@@ -5204,7 +5204,7 @@ mod tests {
             schema: ACTIVATION_JOURNAL_SCHEMA,
             id: "123-456-0".to_owned(),
             manifest_sha256: "a".repeat(64),
-            release_version: "0.2.23".to_owned(),
+            release_version: "0.2.24".to_owned(),
             previous_floor_version: "0.2.22".to_owned(),
             entries: vec![ActivationJournalEntry {
                 role: ActivationTargetRole::BinRoot,
@@ -5319,7 +5319,7 @@ mod tests {
             schema: ACTIVATION_JOURNAL_SCHEMA,
             id: "123-456-0".to_owned(),
             manifest_sha256: "a".repeat(64),
-            release_version: "0.2.23".to_owned(),
+            release_version: "0.2.24".to_owned(),
             previous_floor_version: "0.2.22".to_owned(),
             entries: vec![
                 ActivationJournalEntry {
@@ -5347,7 +5347,7 @@ mod tests {
         let incoming_floor = activation_scratch_path(&journal.id, 2, &journal.entries[2], "new");
         write_file(&incoming_bin, "mayhem", b"new-bin");
         write_file(&incoming_share, "RULES.md", b"new-share");
-        write_release_anti_rollback_floor(&incoming_floor, "0.2.23")
+        write_release_anti_rollback_floor(&incoming_floor, "0.2.24")
             .expect("write incoming release floor");
         let journal_path = activation_journal_path(transaction_dir);
         create_test_activation_journal(
@@ -5470,7 +5470,7 @@ mod tests {
             );
             assert_eq!(
                 read_release_anti_rollback_floor(&floor_path).expect("read committed floor"),
-                "0.2.23"
+                "0.2.24"
             );
             assert_eq!(
                 fs::read(stores.join("main/db")).expect("read protected store"),

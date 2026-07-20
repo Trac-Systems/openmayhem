@@ -74,6 +74,7 @@ append_default MAYHEM_SOURCE_DIR "$repo"
 append_default MAYHEM_TAP_SETTLEMENT_SPOOL "$root/.mayhem-local/settlement/tap"
 append_default MAYHEM_PAYGATE_BIND '127.0.0.1:11436'
 append_default MAYHEM_PAYGATE_CONTRACT_DRY_RUN '0'
+append_default MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE "$root/.mayhem-local/live-home/paygate/internal-auth.secret"
 append_default MAYHEM_PAYGATE_STRIPE_EVENTS_PATH "$root/.mayhem-local/paygate/stripe-events.jsonl"
 append_default MAYHEM_STRIPE_CONNECT_ACCOUNT_TYPE 'express'
 append_default MAYHEM_STRIPE_CONNECT_ACCOUNTS_PATH "$root/.mayhem-local/paygate/stripe-connect-accounts.jsonl"
@@ -160,6 +161,36 @@ require_file_env() {
   }
 }
 
+ensure_private_random_secret_file() {
+  local key="$1" expected_path="$2" path parent temporary value
+  path="$(env_value "$key")"
+  [[ "$path" == "$expected_path" ]] || {
+    echo "Refusing live install: $key must use the canonical private runtime path." >&2
+    exit 1
+  }
+  parent="$(dirname "$path")"
+  install -d -m 700 -o mayhem -g mayhem "$parent"
+  if [[ ! -e "$path" ]]; then
+    temporary="$(mktemp "$parent/.internal-auth.secret.XXXXXX")"
+    value="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+    printf '%s\n' "$value" >"$temporary"
+    chmod 600 "$temporary"
+    chown mayhem:mayhem "$temporary"
+    mv "$temporary" "$path"
+  fi
+  [[ -f "$path" && ! -L "$path" ]] || {
+    echo "Refusing live install: $key must name a regular non-symlink file." >&2
+    exit 1
+  }
+  value="$(tr -d '\r\n' <"$path")"
+  [[ "$value" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "Refusing live install: $key contains an invalid internal authentication secret." >&2
+    exit 1
+  }
+  chmod 600 "$path"
+  chown mayhem:mayhem "$path"
+}
+
 require_live_rpc() {
   local key="$1" value
   value="$(env_value "$key")"
@@ -195,6 +226,14 @@ require_equal MAYHEM_PAYGATE_STRIPE_ENABLED '1'
 require_equal MAYHEM_STRIPE_MODE 'live'
 require_equal MAYHEM_STRIPE_API_BASE_URL 'https://api.stripe.com'
 require_prefix MAYHEM_STRIPE_SECRET_KEY 'sk_live_'
+command -v python3 >/dev/null 2>&1 || {
+  echo "python3 is required to initialize private mainnet runtime authentication." >&2
+  exit 1
+}
+ensure_private_random_secret_file \
+  MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE \
+  "$root/.mayhem-local/live-home/paygate/internal-auth.secret"
+require_file_env MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE
 require_equal MAYHEM_FIAT_SETTLEMENT_ENABLED '1'
 require_equal MAYHEM_TAP_SETTLEMENT_ENABLED '1'
 require_equal MAYHEM_TNK_SETTLEMENT_ENABLED '1'
@@ -300,6 +339,7 @@ install -d -m 700 -o mayhem -g mayhem \
   "$root/.mayhem-local/watchers" \
   "$root/.mayhem-local/settlement/epochs" \
   "$root/.mayhem-local/settlement/payout" \
+  "$root/.mayhem-local/settlement/tap" \
   "$root/.mayhem-local/settlement/tap/ready" \
   "$root/.mayhem-local/settlement/tap/working" \
   "$root/.mayhem-local/settlement/tap/processed" \

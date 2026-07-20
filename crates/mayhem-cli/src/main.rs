@@ -46770,6 +46770,14 @@ async fn request_provider_stripe_status(ctx: &ProviderStripeContext) -> Result<V
 }
 
 fn validate_provider_stripe_response(value: &Value, provider: &str) -> Result<()> {
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        let message = value
+            .get("message")
+            .or_else(|| value.get("error"))
+            .and_then(Value::as_str)
+            .unwrap_or("Stripe Connect request was rejected");
+        bail!("{message}");
+    }
     if value.get("ok").and_then(Value::as_bool) != Some(true)
         || value.get("rail").and_then(Value::as_str) != Some("fiat")
         || value.get("processor_rail").and_then(Value::as_str) != Some("stripe")
@@ -84978,6 +84986,16 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             }
         });
         validate_provider_stripe_response(&valid, &"aa".repeat(32)).unwrap();
+        let rejected = json!({
+            "ok": false,
+            "message": "connected account mode did not match paygate mode"
+        });
+        assert_eq!(
+            validate_provider_stripe_response(&rejected, &"aa".repeat(32))
+                .unwrap_err()
+                .to_string(),
+            "connected account mode did not match paygate mode"
+        );
         assert_eq!(
             provider_stripe_onboarding_url(&valid).unwrap().as_deref(),
             Some("https://connect.stripe.com/setup/test")
@@ -89243,11 +89261,11 @@ State initialization...
             "--mode",
             "final-release",
             "--release-version",
-            "0.2.23",
+            "0.2.24",
             "--public-origin",
             "https://downloads.example",
             "--public-path",
-            "/mayhem/0.2.23",
+            "/mayhem/0.2.24",
             "--output",
             "draft.json",
             "--json",
@@ -89270,9 +89288,9 @@ State initialization...
             args.mode,
             CatalogAttestationAuthorityApplyMode::FinalRelease
         );
-        assert_eq!(args.release_version, "0.2.23");
+        assert_eq!(args.release_version, "0.2.24");
         assert_eq!(args.public_origin, "https://downloads.example");
-        assert_eq!(args.public_path, "/mayhem/0.2.23");
+        assert_eq!(args.public_path, "/mayhem/0.2.24");
         assert!(args.json);
     }
 
@@ -89303,7 +89321,7 @@ State initialization...
             "--public-origin",
             "https://downloads.example",
             "--public-path",
-            "/mayhem/0.2.23",
+            "/mayhem/0.2.24",
             "--output",
             "draft.json",
         ];
@@ -89989,12 +90007,12 @@ State initialization...
             "test release manifest",
         )
         .unwrap();
-        manifest.version = "0.2.24".to_owned();
-        manifest.intercom.release_version = "0.2.24".to_owned();
+        manifest.version = "0.2.25".to_owned();
+        manifest.intercom.release_version = "0.2.25".to_owned();
         wrong_version.install_signed_manifest(target, &manifest);
         assert_catalog_authority_rejected(
             &wrong_version,
-            "does not match requested version 0.2.23",
+            "does not match requested version 0.2.24",
         );
         let _ = fs::remove_dir_all(&wrong_version.temp);
 
@@ -91535,7 +91553,7 @@ State initialization...
         dir
     }
 
-    const TEST_CATALOG_AUTHORITY_VERSION: &str = "0.2.23";
+    const TEST_CATALOG_AUTHORITY_VERSION: &str = "0.2.24";
     const TEST_CATALOG_AUTHORITY_SOURCE_GIT_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
     struct CatalogAuthorityTestFixture {
@@ -92035,7 +92053,7 @@ State initialization...
     }
 
     fn write_test_release(temp: &Path, primary_binary: &str) -> Result<TestRelease> {
-        let version = "0.2.23".to_owned();
+        let version = "0.2.24".to_owned();
         let target = release_host_target();
         let base_name = format!("mayhem-{version}-{target}");
         let release_root = temp.join(&base_name);
