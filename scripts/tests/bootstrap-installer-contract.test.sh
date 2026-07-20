@@ -87,6 +87,20 @@ grep -F 'npm install -g "pear@$PEAR_VERSION"' "$ROOT_DIR/install.sh" >/dev/null 
 if grep -E 'npm install -g ("?pear"?)([[:space:]]|$)' "$ROOT_DIR/install.sh" >/dev/null; then
   fail "Unix Pear bootstrap retains an unversioned npm install"
 fi
+shell_source_binary="$(
+  sed -n '/^install_source_binary() {/,/^}/p' "$ROOT_DIR/install.sh"
+)"
+grep -F 'install -m 0755 "$src" "$tmp"' <<<"$shell_source_binary" >/dev/null ||
+  fail "Unix source install does not create a fresh executable file"
+grep -F 'xattr -d com.apple.quarantine "$tmp"' <<<"$shell_source_binary" >/dev/null ||
+  fail "macOS source install does not remove inherited quarantine metadata"
+grep -F 'xattr -p com.apple.quarantine "$tmp"' <<<"$shell_source_binary" >/dev/null ||
+  fail "macOS source install does not reject retained quarantine metadata"
+if grep -F 'spctl' "$ROOT_DIR/install.sh" >/dev/null; then
+  fail "Unix source install incorrectly requires Gatekeeper distribution approval"
+fi
+grep -F '"$INSTALL_DIR/mayhem" --version' "$ROOT_DIR/install.sh" >/dev/null ||
+  fail "Unix installer does not execute the installed binary version check"
 
 powershell_main="$(
   sed -n '/^[[:space:]]*if (\$FromSource) {/,/^[[:space:]]*Install-Opencode$/p' \
@@ -123,6 +137,18 @@ grep -F '& npm install -g "pear@$PearVersion"' "$ROOT_DIR/install.ps1" >/dev/nul
 if grep -E '& npm install -g "?pear"?([[:space:]]|$)' "$ROOT_DIR/install.ps1" >/dev/null; then
   fail "PowerShell Pear bootstrap retains an unversioned npm install"
 fi
+powershell_source_binary="$(
+  sed -n '/^function Install-SourceBinary {/,/^}/p' "$ROOT_DIR/install.ps1"
+)"
+grep -F '[System.IO.FileMode]::CreateNew' <<<"$powershell_source_binary" >/dev/null ||
+  fail "PowerShell source install does not create a fresh executable file"
+grep -F -- '-Stream "Zone.Identifier"' <<<"$powershell_source_binary" >/dev/null ||
+  fail "PowerShell source install does not reject inherited Zone.Identifier metadata"
+if grep -F 'Unblock-File' "$ROOT_DIR/install.ps1" >/dev/null; then
+  fail "PowerShell source install retains a manual unblock dependency"
+fi
+grep -F '& $mayhem --version' "$ROOT_DIR/install.ps1" >/dev/null ||
+  fail "PowerShell installer does not execute the installed binary version check"
 
 mainnet_intercom_hydration="$(
   sed -n '/^hydrate_intercom_package() {/,/^}/p' \
@@ -184,7 +210,7 @@ grep -F "MAYHEM_ALLOW_UNVERIFIED have been removed" "$ROOT_DIR/install.ps1" >/de
 for harness in \
   "$ROOT_DIR/scripts/macos-opencode-role-check.sh" \
   "$ROOT_DIR/scripts/docker-opencode-role-check.sh"; do
-  grep -F ':-0.2.24}' "$harness" >/dev/null ||
+  grep -F ':-0.2.25}' "$harness" >/dev/null ||
     fail "$harness does not default to canonical release semver"
   grep -F -- '--unsigned-layout' "$harness" >/dev/null ||
     fail "$harness does not explicitly request the unsigned test layout"

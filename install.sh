@@ -1211,6 +1211,32 @@ install_from_artifact() {
   fi
 }
 
+install_source_binary() {
+  local src="$1"
+  local dest="$2"
+  local tmp
+
+  tmp="$(mktemp "$INSTALL_DIR/.$(basename "$dest").install.XXXXXX")" ||
+    die "could not create temporary source-install file in $INSTALL_DIR"
+  if ! install -m 0755 "$src" "$tmp"; then
+    rm -f "$tmp"
+    die "could not install locally built binary: $src"
+  fi
+
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v xattr >/dev/null 2>&1; then
+    xattr -d com.apple.quarantine "$tmp" >/dev/null 2>&1 || true
+    if xattr -p com.apple.quarantine "$tmp" >/dev/null 2>&1; then
+      rm -f "$tmp"
+      die "locally built binary retained macOS quarantine metadata: $src"
+    fi
+  fi
+
+  if ! mv -f "$tmp" "$dest"; then
+    rm -f "$tmp"
+    die "could not activate locally built binary: $dest"
+  fi
+}
+
 install_from_source() {
   local bin src target_root
   local -a cargo_args
@@ -1233,8 +1259,7 @@ install_from_source() {
   for bin in "${BINS[@]}"; do
     src="$target_root/release/$bin"
     [[ -f "$src" ]] || die "missing built binary: $src"
-    cp "$src" "$INSTALL_DIR/$bin"
-    chmod 0755 "$INSTALL_DIR/$bin"
+    install_source_binary "$src" "$INSTALL_DIR/$bin"
   done
   copy_source_assets
 }
@@ -1372,7 +1397,8 @@ update_shell_profile() {
 }
 
 smoke_test() {
-  if "$INSTALL_DIR/mayhem" --help >/dev/null; then
+  if "$INSTALL_DIR/mayhem" --version >/dev/null &&
+    "$INSTALL_DIR/mayhem" --help >/dev/null; then
     log "mayhem CLI smoke test passed"
   else
     die "installed mayhem binary did not run"

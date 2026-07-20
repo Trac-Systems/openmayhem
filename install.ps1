@@ -1693,6 +1693,51 @@ function Install-FromArtifact {
     }
 }
 
+function Install-SourceBinary {
+    param(
+        [string]$Source,
+        [string]$Destination
+    )
+
+    Assert-RealFile -Path $Source -Label "locally built binary"
+    $temporary = Join-Path $InstallDir (
+        "." + [System.IO.Path]::GetFileName($Destination) +
+        ".install." + [System.Guid]::NewGuid().ToString("N")
+    )
+    try {
+        $input = [System.IO.File]::Open(
+            $Source,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::Read
+        )
+        try {
+            $output = [System.IO.File]::Open(
+                $temporary,
+                [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::None
+            )
+            try {
+                $input.CopyTo($output)
+                $output.Flush($true)
+            } finally {
+                $output.Dispose()
+            }
+        } finally {
+            $input.Dispose()
+        }
+
+        $zone = @(Get-Item -LiteralPath $temporary -Stream "Zone.Identifier" -ErrorAction SilentlyContinue)
+        if ($zone.Count -ne 0) {
+            Fail "locally built binary retained Windows Zone.Identifier metadata: $Source"
+        }
+        Move-Item -LiteralPath $temporary -Destination $Destination -Force
+    } finally {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Install-FromSource {
     if (-not (Test-Path (Join-Path $SourceDir "Cargo.toml"))) {
         Fail "source dir does not contain Cargo.toml: $SourceDir"
@@ -1731,7 +1776,9 @@ function Install-FromSource {
         if (-not (Test-Path $src)) {
             Fail "missing built binary: $src"
         }
-        Copy-Item -Path $src -Destination (Join-Path $InstallDir "$bin.exe") -Force
+        Install-SourceBinary `
+            -Source $src `
+            -Destination (Join-Path $InstallDir "$bin.exe")
     }
     Copy-SourceAssets
 }
@@ -1893,6 +1940,10 @@ function Update-UserPath {
 
 function Smoke-Test {
     $mayhem = Join-Path $InstallDir "mayhem.exe"
+    & $mayhem --version *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Fail "installed mayhem binary did not report its version"
+    }
     & $mayhem --help *> $null
     if ($LASTEXITCODE -ne 0) {
         Fail "installed mayhem binary did not run"

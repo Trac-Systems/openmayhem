@@ -235,7 +235,7 @@ fi
 mv "$topology/trac-peer-installed" "$topology/node_modules/trac-peer"
 
 work="$tmp/work"
-archive_root="mayhem-0.2.24-x86_64-pc-windows-msvc"
+archive_root="mayhem-0.2.25-x86_64-pc-windows-msvc"
 mkdir -p "$work/$archive_root/bin"
 printf 'deterministic windows payload\n' >"$work/$archive_root/bin/mayhem.exe"
 touch -t 202311142213.20 \
@@ -367,7 +367,7 @@ POWERSHELL
     -ExpectedList "$tmp/files.txt"
 fi
 
-manifest_name="mayhem-0.2.24-x86_64-pc-windows-msvc.manifest.json"
+manifest_name="mayhem-0.2.25-x86_64-pc-windows-msvc.manifest.json"
 manifest_path="$tmp/$manifest_name"
 signature_path="$tmp/$manifest_name.sig"
 key_path="$tmp/test-key.json"
@@ -383,7 +383,7 @@ const manifestPath = path.resolve(process.env.TEST_MANIFEST);
 const manifest = {
   schema: 1,
   name: 'mayhem',
-  version: '0.2.24',
+  version: '0.2.25',
   target: 'x86_64-pc-windows-msvc',
   built_at_utc: '2026-07-20T00:00:00Z',
   source_git_sha: '0123456789abcdef0123456789abcdef01234567',
@@ -473,11 +473,11 @@ expect_failure "independent verifier trusted signer JSON without valid Ed25519 b
 publish_release_key_record \
   "$signature_path" \
   "$trusted_key_path" \
-  "$tmp/mayhem-0.2.24-x86_64-pc-windows-msvc.release-key.json" \
+  "$tmp/mayhem-0.2.25-x86_64-pc-windows-msvc.release-key.json" \
   1700000000
 cmp \
   "$trusted_key_path" \
-  "$tmp/mayhem-0.2.24-x86_64-pc-windows-msvc.release-key.json" >/dev/null ||
+  "$tmp/mayhem-0.2.25-x86_64-pc-windows-msvc.release-key.json" >/dev/null ||
   fail "published public release-key record changed bytes"
 
 sed 's/"public_key":"[^"]*"/"public_key":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"/' \

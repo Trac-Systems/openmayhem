@@ -1,10 +1,10 @@
-name: Release 0.2.24 native tail
+name: Release 0.2.25 native tail
 
 on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Release tag (v0.2.24-rc.N or v0.2.24); dispatch from this tag
+        description: Release tag (v0.2.25-rc.N or v0.2.25); dispatch from this tag
         required: true
         type: string
       source_sha:
@@ -20,8 +20,8 @@ permissions:
 #   only as an environment secret (no repository- or organization-secret copy).
 # - Do not configure required reviewers or self-review gates; protected-tag
 #   provenance and the environment-held signing secret must run autonomously.
-# - Select deployment branches and tags with tag rules exactly v0.2.24 and
-#   v0.2.24-rc.* and no branch rules.
+# - Select deployment branches and tags with tag rules exactly v0.2.25 and
+#   v0.2.25-rc.* and no branch rules.
 # - Protect those two tag patterns with an active repository tag ruleset that
 #   restricts tag creation, update, and deletion to release maintainers.
 jobs:
@@ -42,7 +42,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ ! "$RELEASE_TAG" =~ ^v0\.2\.23(-rc\.[1-9][0-9]*)?$ ]]; then
-            printf '%s\n' "release_tag must be v0.2.24-rc.N or v0.2.24" >&2
+            printf '%s\n' "release_tag must be v0.2.25-rc.N or v0.2.25" >&2
             exit 1
           fi
           if [[ ! "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
@@ -430,7 +430,7 @@ jobs:
 
           rm -rf dist
           bash scripts/package-release.sh \
-            --version 0.2.24 \
+            --version 0.2.25 \
             --target "$TARGET" \
             --out-dir "$PWD/dist" \
             --release-key-id "$MAYHEM_RELEASE_KEY_ID" \
@@ -439,7 +439,7 @@ jobs:
             --release-created-at "$release_created_at"
           cmp "$keys_dir/$MAYHEM_RELEASE_KEY_ID.json" "$trusted_key"
           cmp \
-            "dist/mayhem-0.2.24-$TARGET.release-key.json" \
+            "dist/mayhem-0.2.25-$TARGET.release-key.json" \
             "$trusted_key"
 
       - name: Validate release output inventory
@@ -452,8 +452,8 @@ jobs:
             printf '%s\n' "release output root is not a real directory" >&2
             exit 1
           }
-          base="mayhem-0.2.24-$TARGET"
-          verifier_base="mayhem-attestation-verifier-0.2.24-$TARGET"
+          base="mayhem-0.2.25-$TARGET"
+          verifier_base="mayhem-attestation-verifier-0.2.25-$TARGET"
           case "$TARGET" in
             *-windows-*)
               archive="$base.zip"
@@ -499,15 +499,15 @@ jobs:
       - name: Upload native release artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: mayhem-0.2.24-${{ matrix.target }}
+          name: mayhem-0.2.25-${{ matrix.target }}
           path: |
-            dist/mayhem-0.2.24-${{ matrix.target }}${{ matrix.archive_suffix }}
-            dist/mayhem-0.2.24-${{ matrix.target }}${{ matrix.archive_suffix }}.sha256
-            dist/mayhem-0.2.24-${{ matrix.target }}.SHA256SUMS
-            dist/mayhem-0.2.24-${{ matrix.target }}.manifest.json
-            dist/mayhem-0.2.24-${{ matrix.target }}.manifest.json.sig
-            dist/mayhem-0.2.24-${{ matrix.target }}.release-key.json
-            dist/mayhem-attestation-verifier-0.2.24-${{ matrix.target }}${{ matrix.executable_suffix }}
-            dist/mayhem-attestation-verifier-0.2.24-${{ matrix.target }}.manifest.json
+            dist/mayhem-0.2.25-${{ matrix.target }}${{ matrix.archive_suffix }}
+            dist/mayhem-0.2.25-${{ matrix.target }}${{ matrix.archive_suffix }}.sha256
+            dist/mayhem-0.2.25-${{ matrix.target }}.SHA256SUMS
+            dist/mayhem-0.2.25-${{ matrix.target }}.manifest.json
+            dist/mayhem-0.2.25-${{ matrix.target }}.manifest.json.sig
+            dist/mayhem-0.2.25-${{ matrix.target }}.release-key.json
+            dist/mayhem-attestation-verifier-0.2.25-${{ matrix.target }}${{ matrix.executable_suffix }}
+            dist/mayhem-attestation-verifier-0.2.25-${{ matrix.target }}.manifest.json
           if-no-files-found: error
           compression-level: 0

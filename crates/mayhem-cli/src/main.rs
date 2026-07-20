@@ -89367,11 +89367,11 @@ State initialization...
             "--mode",
             "final-release",
             "--release-version",
-            "0.2.24",
+            "0.2.25",
             "--public-origin",
             "https://downloads.example",
             "--public-path",
-            "/mayhem/0.2.24",
+            "/mayhem/0.2.25",
             "--output",
             "draft.json",
             "--json",
@@ -89394,9 +89394,9 @@ State initialization...
             args.mode,
             CatalogAttestationAuthorityApplyMode::FinalRelease
         );
-        assert_eq!(args.release_version, "0.2.24");
+        assert_eq!(args.release_version, "0.2.25");
         assert_eq!(args.public_origin, "https://downloads.example");
-        assert_eq!(args.public_path, "/mayhem/0.2.24");
+        assert_eq!(args.public_path, "/mayhem/0.2.25");
         assert!(args.json);
     }
 
@@ -89427,7 +89427,7 @@ State initialization...
             "--public-origin",
             "https://downloads.example",
             "--public-path",
-            "/mayhem/0.2.24",
+            "/mayhem/0.2.25",
             "--output",
             "draft.json",
         ];
@@ -90113,12 +90113,12 @@ State initialization...
             "test release manifest",
         )
         .unwrap();
-        manifest.version = "0.2.25".to_owned();
-        manifest.intercom.release_version = "0.2.25".to_owned();
+        manifest.version = "0.2.26".to_owned();
+        manifest.intercom.release_version = "0.2.26".to_owned();
         wrong_version.install_signed_manifest(target, &manifest);
         assert_catalog_authority_rejected(
             &wrong_version,
-            "does not match requested version 0.2.24",
+            "does not match requested version 0.2.25",
         );
         let _ = fs::remove_dir_all(&wrong_version.temp);
 
@@ -91661,7 +91661,7 @@ State initialization...
         dir
     }
 
-    const TEST_CATALOG_AUTHORITY_VERSION: &str = "0.2.24";
+    const TEST_CATALOG_AUTHORITY_VERSION: &str = "0.2.25";
     const TEST_CATALOG_AUTHORITY_SOURCE_GIT_SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
     struct CatalogAuthorityTestFixture {
@@ -92161,7 +92161,7 @@ State initialization...
     }
 
     fn write_test_release(temp: &Path, primary_binary: &str) -> Result<TestRelease> {
-        let version = "0.2.24".to_owned();
+        let version = "0.2.25".to_owned();
         let target = release_host_target();
         let base_name = format!("mayhem-{version}-{target}");
         let release_root = temp.join(&base_name);

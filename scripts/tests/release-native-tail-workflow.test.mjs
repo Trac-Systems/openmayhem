@@ -108,8 +108,8 @@ requireLiteral(
   'autonomous release execution must be documented',
 );
 requireLiteral(
-  '# - Select deployment branches and tags with tag rules exactly v0.2.24 and\n'
-    + '#   v0.2.24-rc.* and no branch rules.',
+  '# - Select deployment branches and tags with tag rules exactly v0.2.25 and\n'
+    + '#   v0.2.25-rc.* and no branch rules.',
   'environment deployment tag allowlist must be documented exactly',
 );
 requireLiteral(
@@ -135,7 +135,7 @@ requireAbsent(
 );
 requireLiteral(
   '^v0\\.2\\.23(-rc\\.[1-9][0-9]*)?$',
-  'release_tag must allow only v0.2.24-rc.N or v0.2.24',
+  'release_tag must allow only v0.2.25-rc.N or v0.2.25',
   verifySource,
 );
 requireLiteral(
@@ -404,7 +404,7 @@ requireLiteral(
   '--release-seed-file "$seed_file"',
   'packager must use canonical signed mode',
 );
-requireLiteral('--version 0.2.24', 'packager version must be exactly 0.2.24');
+requireLiteral('--version 0.2.25', 'packager version must be exactly 0.2.25');
 requireLiteral(
   '--release-key-id "$MAYHEM_RELEASE_KEY_ID"',
   'packager must use the canonical release key id',
@@ -422,7 +422,7 @@ requireLiteral(
   'packager must retain canonical release-key metadata',
 );
 requireLiteral(
-  '"dist/mayhem-0.2.24-$TARGET.release-key.json" \\\n            "$trusted_key"',
+  '"dist/mayhem-0.2.25-$TARGET.release-key.json" \\\n            "$trusted_key"',
   'published key record must exactly match the committed trust anchor',
 );
 requireAbsent(
@@ -489,15 +489,15 @@ if (!uploadMatch) fail('artifact upload step or exact path block is missing');
 const uploadPaths = uploadMatch.groups.paths.trim().split('\n')
   .map((line) => line.trim());
 const expectedUploadPaths = [
-  'dist/mayhem-0.2.24-${{ matrix.target }}${{ matrix.archive_suffix }}',
-  'dist/mayhem-0.2.24-${{ matrix.target }}${{ matrix.archive_suffix }}.sha256',
-  'dist/mayhem-0.2.24-${{ matrix.target }}.SHA256SUMS',
-  'dist/mayhem-0.2.24-${{ matrix.target }}.manifest.json',
-  'dist/mayhem-0.2.24-${{ matrix.target }}.manifest.json.sig',
-  'dist/mayhem-0.2.24-${{ matrix.target }}.release-key.json',
-  'dist/mayhem-attestation-verifier-0.2.24-${{ matrix.target }}'
+  'dist/mayhem-0.2.25-${{ matrix.target }}${{ matrix.archive_suffix }}',
+  'dist/mayhem-0.2.25-${{ matrix.target }}${{ matrix.archive_suffix }}.sha256',
+  'dist/mayhem-0.2.25-${{ matrix.target }}.SHA256SUMS',
+  'dist/mayhem-0.2.25-${{ matrix.target }}.manifest.json',
+  'dist/mayhem-0.2.25-${{ matrix.target }}.manifest.json.sig',
+  'dist/mayhem-0.2.25-${{ matrix.target }}.release-key.json',
+  'dist/mayhem-attestation-verifier-0.2.25-${{ matrix.target }}'
     + '${{ matrix.executable_suffix }}',
-  'dist/mayhem-attestation-verifier-0.2.24-${{ matrix.target }}.manifest.json',
+  'dist/mayhem-attestation-verifier-0.2.25-${{ matrix.target }}.manifest.json',
 ];
 if (JSON.stringify(uploadPaths) !== JSON.stringify(expectedUploadPaths)) {
   fail('artifact upload must contain only the exact eight-file release inventory');
