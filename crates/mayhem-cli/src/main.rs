@@ -30141,6 +30141,8 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         sc_bridge_port_from_url(&plan.sc_bridge_url)?.to_string(),
         "--sc-bridge-token-file".to_owned(),
         sc_bridge_token_file_path(&plan.home).display().to_string(),
+        "--paygate-internal-auth-secret-file".to_owned(),
+        paygate_auth_secret_path.clone(),
         "--sc-bridge-cli".to_owned(),
         "1".to_owned(),
         "--rpc".to_owned(),
@@ -46043,31 +46045,10 @@ async fn provider_payout_get(args: ProviderPayoutGetArgs) -> Result<()> {
     print_provider_payout_report(&report, args.read.json)
 }
 
-async fn provider_payout_previous_revision(
-    rpc: &PeerRpcClient,
-    provider: &str,
-    rail: &str,
-) -> Result<Option<String>> {
-    let key = format!("payout/current/{rail}/{provider}");
-    let Some(current) = read_state_value(rpc, &key).await? else {
-        return Ok(None);
-    };
-    let revision = current
-        .get("latest_revision")
-        .and_then(Value::as_str)
-        .context("provider payout pointer has no latest CAS revision")?
-        .to_ascii_lowercase();
-    ensure!(
-        is_hex_len(&revision, 64),
-        "current provider payout target has an invalid CAS revision"
-    );
-    Ok(Some(revision))
-}
-
 fn normalize_provider_payout_address(
     rail: ProviderPayoutRail,
     address: &str,
-    payments: &CanonicalPayments,
+    tnk_network: &str,
 ) -> Result<String> {
     let address = address.trim();
     ensure!(
@@ -46083,7 +46064,7 @@ fn normalize_provider_payout_address(
             Ok(address.to_ascii_lowercase())
         }
         ProviderPayoutRail::Tnk => {
-            let expected_prefix = match payments.tnk.network.as_str() {
+            let expected_prefix = match tnk_network {
                 "mainnet" => "trac1",
                 "testnet1" => "testtrac1",
                 _ => bail!("canonical TNK payment network must be mainnet or testnet1"),
@@ -46091,7 +46072,7 @@ fn normalize_provider_payout_address(
             ensure!(
                 address.starts_with(expected_prefix),
                 "TNK payout address does not match canonical {} network",
-                payments.tnk.network
+                tnk_network
             );
             ensure!(
                 address.len() <= 256
@@ -46117,44 +46098,70 @@ struct ProviderPayoutIntentContext {
     updated_epoch: u64,
 }
 
-async fn provider_payout_intent_context(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderPayoutAuthoritativeSnapshot {
+    binding: Option<Value>,
+    context: ProviderPayoutIntentContext,
+    current_revision: Option<String>,
+    max_expiry_epochs: u64,
+    pending_epoch: Option<u64>,
+    pending_revision: Option<String>,
+    previous_revision: Option<String>,
+}
+
+async fn provider_payout_authoritative_snapshot(
     rpc: &PeerRpcClient,
-    payments: &CanonicalPayments,
+    wallet: &WalletInfo,
+    wallet_password: &str,
     rail: &str,
-) -> Result<ProviderPayoutIntentContext> {
+) -> Result<ProviderPayoutAuthoritativeSnapshot> {
     ensure!(
-        payments.rails.iter().any(|configured| configured == rail),
-        "canonical payments do not enable the {} payout rail",
-        rail
+        matches!(rail, "fiat" | "tap" | "tnk"),
+        "unsupported provider payout rail"
     );
-    let pointer = read_state_value(rpc, "payout/context/current")
-        .await?
-        .context("admin-published payout context is required")?;
-    let context_revision = pointer
+    let request_nonce = service_request_nonce()?;
+    let signed = signed_service_request(
+        "provider_payout_context",
+        rpc,
+        wallet,
+        wallet_password,
+        json!({
+            "provider": wallet.public_key,
+            "rail": rail,
+            "request_nonce": request_nonce,
+        }),
+    )
+    .await?;
+    let response = rpc
+        .post("provider/payout/context", &signed)
+        .await
+        .context("requesting current provider payout context from the canonical writer")?;
+    if response.get("ok").and_then(Value::as_bool) != Some(true) {
+        let message = response
+            .get("message")
+            .or_else(|| response.get("error"))
+            .and_then(Value::as_str)
+            .unwrap_or("canonical provider payout context request was rejected");
+        bail!("{message}");
+    }
+    ensure!(
+        response.get("provider").and_then(Value::as_str) == Some(wallet.public_key.as_str())
+            && response.get("rail").and_then(Value::as_str) == Some(rail)
+            && response.get("request_nonce").and_then(Value::as_str)
+                == Some(request_nonce.as_str()),
+        "canonical provider payout context response does not match its signed request"
+    );
+    let context_revision = response
         .get("revision")
+        .or_else(|| response.get("context_revision"))
         .and_then(Value::as_str)
         .map(str::to_ascii_lowercase)
-        .context("payout context pointer is missing revision")?;
+        .context("canonical provider payout context is missing its revision")?;
     ensure!(
         is_hex_len(&context_revision, 64),
         "payout context revision must be 32-byte hexadecimal"
     );
-    let record_key = pointer
-        .get("record_key")
-        .and_then(Value::as_str)
-        .context("payout context pointer is missing immutable record key")?;
-    let context = read_state_value(rpc, record_key)
-        .await?
-        .context("immutable payout context record is missing")?;
-    ensure!(
-        context.get("revision").and_then(Value::as_str) == Some(context_revision.as_str())
-            && context
-                .get("payment_config_version")
-                .and_then(Value::as_u64)
-                == Some(payments.ver),
-        "payout context pointer does not match canonical payments"
-    );
-    let network = context
+    let network = response
         .get("network")
         .and_then(Value::as_str)
         .map(str::to_owned)
@@ -46163,12 +46170,12 @@ async fn provider_payout_intent_context(
         is_safe_key_part(&network),
         "canonical payout network is invalid"
     );
-    let admin = context
+    let admin = response
         .get("admin")
         .and_then(Value::as_str)
         .map(str::to_ascii_lowercase)
         .context("payout context is missing admin")?;
-    let bootstrap = context
+    let bootstrap = response
         .get("bootstrap")
         .and_then(Value::as_str)
         .map(str::to_ascii_lowercase)
@@ -46177,31 +46184,95 @@ async fn provider_payout_intent_context(
         is_hex_len(&admin, 64) && is_hex_len(&bootstrap, 64),
         "payout context admin/bootstrap must be 32-byte hexadecimal"
     );
+    let payment_config_version = response
+        .get("payment_config_version")
+        .and_then(Value::as_u64)
+        .context("payout context is missing its payment configuration version")?;
+    let updated_epoch = response
+        .get("updated_epoch")
+        .and_then(Value::as_u64)
+        .context("payout context is missing its current epoch")?;
+    let pending_epoch = match response.get("pending_epoch") {
+        Some(Value::Null) | None => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .context("payout context pending epoch is invalid")?,
+        ),
+    };
+    let max_expiry_epochs = response
+        .get("max_expiry_epochs")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .context("payout context expiry cap is invalid")?;
+    let parse_optional_revision = |key: &str| -> Result<Option<String>> {
+        match response.get(key) {
+            Some(Value::Null) | None => Ok(None),
+            Some(value) => {
+                let revision = value
+                    .as_str()
+                    .map(str::to_ascii_lowercase)
+                    .with_context(|| format!("payout context {key} is invalid"))?;
+                ensure!(
+                    is_hex_len(&revision, 64),
+                    "payout context {key} must be 32-byte hexadecimal"
+                );
+                Ok(Some(revision))
+            }
+        }
+    };
+    let previous_revision = parse_optional_revision("previous_revision")?;
+    let current_revision = parse_optional_revision("current_revision")?;
+    let pending_revision = parse_optional_revision("pending_revision")?;
+    let binding = response
+        .get("binding")
+        .cloned()
+        .filter(|value| !value.is_null());
     ensure!(
-        network == payments.tnk.network && admin == payments.set_by.to_ascii_lowercase(),
-        "payout context does not match canonical payment/admin state"
+        previous_revision.is_some() == binding.is_some(),
+        "canonical payout context binding does not match its latest revision"
     );
-    let updated_epoch = read_state_value(rpc, "epoch/apply/state")
-        .await?
-        .map(|state| {
-            state
-                .get("updated_epoch")
+    if let (Some(revision), Some(binding)) = (previous_revision.as_deref(), binding.as_ref()) {
+        ensure!(
+            binding.get("provider").and_then(Value::as_str) == Some(wallet.public_key.as_str())
+                && binding.get("rail").and_then(Value::as_str) == Some(rail)
+                && binding.get("revision").and_then(Value::as_str) == Some(revision),
+            "canonical payout context returned the wrong immutable binding"
+        );
+    }
+    let chain_id = match rail {
+        "tap" => Some(
+            response
+                .get("chain_id")
                 .and_then(Value::as_u64)
-                .context("epoch/apply/state is missing updated_epoch")
-        })
-        .transpose()?
-        .unwrap_or(0);
-    Ok(ProviderPayoutIntentContext {
-        network,
-        admin,
-        bootstrap,
-        context_revision,
-        chain_id: match rail {
-            "tap" => Some(payments.tap.chain_id),
-            _ => None,
+                .filter(|value| *value > 0)
+                .context("canonical TAP payout chain is invalid")?,
+        ),
+        "fiat" | "tnk" => {
+            ensure!(
+                response.get("chain_id").is_none_or(Value::is_null),
+                "canonical non-TAP payout context must not contain an Ethereum chain"
+            );
+            None
+        }
+        _ => bail!("unsupported provider payout rail"),
+    };
+    Ok(ProviderPayoutAuthoritativeSnapshot {
+        binding,
+        context: ProviderPayoutIntentContext {
+            network,
+            admin,
+            bootstrap,
+            context_revision,
+            chain_id,
+            payment_config_version,
+            updated_epoch,
         },
-        payment_config_version: payments.ver,
-        updated_epoch,
+        current_revision,
+        max_expiry_epochs,
+        pending_epoch,
+        pending_revision,
+        previous_revision,
     })
 }
 
@@ -46363,28 +46434,23 @@ async fn provider_payout_set(args: ProviderPayoutSetArgs, rotate: bool) -> Resul
 
     if args.tx.submit {
         let ctx = provider_contract_tx_context(&args.tx).await?;
-        let payments = read_canonical_payments(&ctx.rpc).await?;
-        let provider_key = format!("prov/{}", ctx.wallet.public_key);
-        let provider = read_state_value(&ctx.rpc, &provider_key)
-            .await?
-            .context("active provider registration required before setting a payout destination")?;
+        let snapshot = provider_payout_authoritative_snapshot(
+            &ctx.rpc,
+            &ctx.wallet,
+            &ctx.password,
+            args.rail.as_str(),
+        )
+        .await?;
         ensure!(
-            provider.get("status").and_then(Value::as_str) == Some("active")
-                && provider.get("provider").and_then(Value::as_str)
-                    == Some(ctx.wallet.public_key.as_str()),
-            "active provider registration ownership required"
+            snapshot.pending_epoch.is_none(),
+            "provider payout binding is temporarily unavailable while epoch {} is applying",
+            snapshot.pending_epoch.unwrap_or_default()
         );
         ensure!(
-            provider
-                .get("accepted_rails")
-                .and_then(Value::as_array)
-                .is_some_and(|rails| {
-                    rails
-                        .iter()
-                        .any(|rail| rail.as_str() == Some(args.rail.as_str()))
-                }),
-            "provider must accept the {} rail before selecting its payout destination",
-            args.rail.as_str()
+            args.valid_for_epochs <= snapshot.max_expiry_epochs,
+            "--valid-for-epochs {} exceeds the current admin cap of {}",
+            args.valid_for_epochs,
+            snapshot.max_expiry_epochs
         );
         let target_keypair_path = match args.target_wallet_key_file.as_ref() {
             Some(path) => absolutize(path.clone())?,
@@ -46403,7 +46469,7 @@ async fn provider_payout_set(args: ProviderPayoutSetArgs, rotate: bool) -> Resul
                 inspect_wallet_for_network_prefix(
                     &target_keypair_path,
                     &target_password,
-                    msb_network_address_prefix(&payments.tnk.network)?,
+                    msb_network_address_prefix(&snapshot.context.network)?,
                 )
                 .await?
             }
@@ -46418,12 +46484,15 @@ async fn provider_payout_set(args: ProviderPayoutSetArgs, rotate: bool) -> Resul
                 .clone()
                 .context("target wallet has no Trac address for TNK payouts")?,
         };
-        let wallet_target =
-            normalize_provider_payout_address(args.rail, &wallet_target, &payments)?;
+        let wallet_target = normalize_provider_payout_address(
+            args.rail,
+            &wallet_target,
+            &snapshot.context.network,
+        )?;
         let target = normalize_provider_payout_address(
             args.rail,
             args.address.as_deref().unwrap_or(&wallet_target),
-            &payments,
+            &snapshot.context.network,
         )?;
         ensure!(
             target == wallet_target,
@@ -46441,9 +46510,7 @@ async fn provider_payout_set(args: ProviderPayoutSetArgs, rotate: bool) -> Resul
                 Some(identity)
             }
         };
-        let previous_revision =
-            provider_payout_previous_revision(&ctx.rpc, &ctx.wallet.public_key, args.rail.as_str())
-                .await?;
+        let previous_revision = snapshot.previous_revision.clone();
         if rotate {
             ensure!(
                 previous_revision.is_some(),
@@ -46457,8 +46524,7 @@ async fn provider_payout_set(args: ProviderPayoutSetArgs, rotate: bool) -> Resul
                 args.rail.as_str()
             );
         }
-        let intent_context =
-            provider_payout_intent_context(&ctx.rpc, &payments, args.rail.as_str()).await?;
+        let intent_context = snapshot.context;
         const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
         let expires_after_epoch = intent_context
             .updated_epoch
@@ -46572,18 +46638,24 @@ async fn provider_payout_set(args: ProviderPayoutSetArgs, rotate: bool) -> Resul
                 .context("payout feature key did not contain a revision")?
                 .to_owned();
             report["revision"] = json!(revision);
-            let pointer_key = format!(
-                "payout/current/{}/{}",
+            let confirmed = provider_payout_authoritative_snapshot(
+                &ctx.rpc,
+                &ctx.wallet,
+                &ctx.password,
                 args.rail.as_str(),
-                ctx.wallet.public_key
-            );
-            report["payout_pointer"] = wait_for_state(&ctx.rpc, &pointer_key, |value| {
-                value.get("latest_revision").and_then(Value::as_str) == Some(revision.as_str())
-            })
+            )
             .await?;
-            report["binding"] = read_state_value(&ctx.rpc, &feature_key)
-                .await?
-                .context("accepted provider payout binding is missing from contract state")?;
+            ensure!(
+                confirmed.previous_revision.as_deref() == Some(revision.as_str()),
+                "canonical writer accepted the payout request but did not publish revision {}",
+                revision
+            );
+            report["payout_pointer"] = json!({
+                "latest_revision": confirmed.previous_revision,
+                "current_revision": confirmed.current_revision,
+                "pending_revision": confirmed.pending_revision,
+            });
+            report["binding"] = report["feature_submission"]["feature"]["value"].clone();
         }
     }
 
@@ -46871,8 +46943,15 @@ async fn ensure_provider_stripe_payout_binding(
         .get("currency")
         .and_then(Value::as_str)
         .context("Stripe payout verification is missing currency")?;
-    let payments = read_canonical_payments(&ctx.rpc).await?;
-    let context = provider_payout_intent_context(&ctx.rpc, &payments, "fiat").await?;
+    let snapshot =
+        provider_payout_authoritative_snapshot(&ctx.rpc, &ctx.wallet, &ctx.wallet_password, "fiat")
+            .await?;
+    ensure!(
+        snapshot.pending_epoch.is_none(),
+        "Stripe payout binding is temporarily unavailable while epoch {} is applying",
+        snapshot.pending_epoch.unwrap_or_default()
+    );
+    let context = snapshot.context;
     ensure!(
         verification.get("provider").and_then(Value::as_str)
             == Some(ctx.wallet.public_key.as_str())
@@ -46889,41 +46968,29 @@ async fn ensure_provider_stripe_payout_binding(
                 == Some(context.payment_config_version),
         "Stripe payout verification does not match the current immutable context"
     );
-    let pointer_key = format!("payout/current/fiat/{}", ctx.wallet.public_key);
-    let pointer = read_state_value(&ctx.rpc, &pointer_key).await?;
-    let previous_revision = pointer
-        .as_ref()
-        .and_then(|value| value.get("latest_revision"))
-        .and_then(Value::as_str)
-        .map(str::to_ascii_lowercase);
-    if let Some(revision) = previous_revision.as_deref() {
-        let binding_key = format!("payout/binding/fiat/{}/{revision}", ctx.wallet.public_key);
-        if let Some(binding) = read_state_value(&ctx.rpc, &binding_key).await? {
-            if binding.get("verified").and_then(Value::as_bool) == Some(true)
-                && binding.get("target").and_then(Value::as_str) == Some(target)
-                && binding.get("currency").and_then(Value::as_str) == Some(currency)
-                && binding.get("context_revision").and_then(Value::as_str)
-                    == Some(context.context_revision.as_str())
-            {
-                let pending = pointer
-                    .as_ref()
-                    .and_then(|value| value.get("pending_revision"))
-                    .and_then(Value::as_str)
-                    == Some(revision);
-                return Ok(json!({
-                    "ok": true,
-                    "changed": false,
-                    "pending": pending,
-                    "revision": revision,
-                    "binding": binding,
-                }));
-            }
+    let previous_revision = snapshot.previous_revision;
+    if let (Some(revision), Some(binding)) =
+        (previous_revision.as_deref(), snapshot.binding.as_ref())
+    {
+        if binding.get("verified").and_then(Value::as_bool) == Some(true)
+            && binding.get("target").and_then(Value::as_str) == Some(target)
+            && binding.get("currency").and_then(Value::as_str) == Some(currency)
+            && binding.get("context_revision").and_then(Value::as_str)
+                == Some(context.context_revision.as_str())
+        {
+            return Ok(json!({
+                "ok": true,
+                "changed": false,
+                "pending": snapshot.pending_revision.as_deref() == Some(revision),
+                "revision": revision,
+                "binding": binding,
+            }));
         }
     }
     let nonce = service_request_nonce()?;
     let expires_after_epoch = context
         .updated_epoch
-        .checked_add(10)
+        .checked_add(snapshot.max_expiry_epochs.min(10))
         .context("Stripe payout binding expiry overflow")?;
     let intent = json!({
         "op": "bind_provider_payout",
@@ -46965,10 +47032,19 @@ async fn ensure_provider_stripe_payout_binding(
         submitted.get("ok").and_then(Value::as_bool) == Some(true),
         "Stripe payout binding was not accepted: {submitted}"
     );
-    let pointer = wait_for_state(&ctx.rpc, &pointer_key, |value| {
-        value.get("latest_revision").and_then(Value::as_str) == Some(revision.as_str())
-    })
-    .await?;
+    let confirmed =
+        provider_payout_authoritative_snapshot(&ctx.rpc, &ctx.wallet, &ctx.wallet_password, "fiat")
+            .await?;
+    ensure!(
+        confirmed.previous_revision.as_deref() == Some(revision.as_str()),
+        "canonical writer accepted the Stripe payout request but did not publish revision {}",
+        revision
+    );
+    let pointer = json!({
+        "latest_revision": confirmed.previous_revision,
+        "current_revision": confirmed.current_revision,
+        "pending_revision": confirmed.pending_revision,
+    });
     Ok(json!({
         "ok": true,
         "changed": true,
@@ -92527,6 +92603,19 @@ State initialization...
             peer_args[token_file_index + 1].as_str(),
             Some(
                 sc_bridge_token_file_path(&home)
+                    .display()
+                    .to_string()
+                    .as_str()
+            )
+        );
+        let paygate_secret_file_index = peer_args
+            .iter()
+            .position(|arg| arg.as_str() == Some("--paygate-internal-auth-secret-file"))
+            .unwrap();
+        assert_eq!(
+            peer_args[paygate_secret_file_index + 1].as_str(),
+            Some(
+                paygate_internal_auth_secret_path(&home)
                     .display()
                     .to_string()
                     .as_str()

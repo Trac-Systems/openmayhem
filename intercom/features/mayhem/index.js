@@ -194,6 +194,7 @@ const serviceParticipantFor = (service, value) => {
   }
   if (service === 'stripe_checkout') return normalizeKey(value.who);
   if ([
+    'provider_payout_context',
     'stripe_connect_onboard',
     'stripe_connect_status',
     'stripe_connect_relink',
@@ -419,8 +420,7 @@ class MayhemFeature extends Feature {
       throw new Error('Invalid Mayhem service request signature.');
     }
     if (this.peer.base?.writable && self === admin) {
-      if (!this.serviceHandler) throw new Error('Mayhem admin service is not configured.');
-      return await this.serviceHandler(service, envelope.payload, envelope);
+      return await this._handleService(service, envelope.payload, envelope);
     }
     const sidechannel = this.peer?.sidechannel;
     if (!sidechannel?.started || typeof sidechannel.broadcast !== 'function') {
@@ -604,6 +604,139 @@ class MayhemFeature extends Feature {
       signing_version: SERVICE_SIGNING_VERSION,
       transport,
     };
+  }
+
+  async _providerPayoutContext(value) {
+    if (!exactKeys(value, ['provider', 'rail', 'request_nonce'])) {
+      throw new Error('Invalid provider payout context request.');
+    }
+    const provider = normalizeKey(value.provider);
+    const rail = String(value.rail ?? '').toLowerCase();
+    const requestNonce = normalizeKey(value.request_nonce);
+    if (!/^[0-9a-f]{64}$/.test(provider) ||
+        !PROVIDER_PAYOUT_RAILS.has(rail) ||
+        !/^[0-9a-f]{64}$/.test(requestNonce)) {
+      throw new Error('Invalid provider payout context request.');
+    }
+
+    const admin = await this._adminKey();
+    const providerRecord = (await this.peer.base.view.get(`prov/${provider}`))?.value;
+    if (!providerRecord ||
+        providerRecord.status !== 'active' ||
+        !Array.isArray(providerRecord.accepted_rails) ||
+        !providerRecord.accepted_rails.includes(rail)) {
+      throw new Error(`Provider must be active and accept the ${rail} rail.`);
+    }
+    const payments = (await this.peer.base.view.get('payments/current'))?.value;
+    const contextPointer = (await this.peer.base.view.get('payout/context/current'))?.value;
+    const contextRevision = normalizeKey(contextPointer?.revision);
+    const paymentConfigVersion = contextPointer?.payment_config_version;
+    const context = Number.isSafeInteger(paymentConfigVersion) &&
+      /^[0-9a-f]{64}$/.test(contextRevision)
+      ? (
+          await this.peer.base.view.get(
+            `payout/context/${paymentConfigVersion}/${contextRevision}`
+          )
+        )?.value
+      : null;
+    if (!admin ||
+        !payments ||
+        payments.set_by !== admin ||
+        payments.set_by_role !== 'admin' ||
+        payments.ver !== paymentConfigVersion ||
+        !Array.isArray(payments.rails) ||
+        !payments.rails.includes(rail) ||
+        !context ||
+        context.revision !== contextRevision ||
+        context.payment_config_version !== paymentConfigVersion ||
+        context.admin !== admin ||
+        context.network !== payments.tnk?.network ||
+        context.published_by !== admin ||
+        context.published_by_role !== 'admin' ||
+        !/^[0-9a-f]{64}$/.test(String(context.bootstrap ?? ''))) {
+      throw new Error('Canonical provider payout context is unavailable.');
+    }
+
+    const applyState = (await this.peer.base.view.get('epoch/apply/state'))?.value ?? {
+      updated_epoch: 0,
+      pending_epoch: null,
+    };
+    const updatedEpoch = applyState.updated_epoch;
+    const pendingEpoch = applyState.pending_epoch ?? null;
+    const expirySchedule = (
+      await this.peer.base.view.get('payout/params/payout_intent_max_expiry_epochs')
+    )?.value;
+    const activeExpiryEntry = expirySchedule?.pending &&
+      expirySchedule.pending.effective_epoch <= updatedEpoch
+      ? expirySchedule.pending
+      : expirySchedule?.current;
+    const maxExpiryEpochs = activeExpiryEntry?.value ??
+      PAYOUT_INTENT_MAX_EXPIRY_EPOCHS_DEFAULT;
+    if (!Number.isSafeInteger(updatedEpoch) ||
+        updatedEpoch < 0 ||
+        (pendingEpoch !== null &&
+          (!Number.isSafeInteger(pendingEpoch) || pendingEpoch < updatedEpoch)) ||
+        !Number.isSafeInteger(maxExpiryEpochs) ||
+        maxExpiryEpochs < 1) {
+      throw new Error('Canonical provider payout epoch state is invalid.');
+    }
+
+    const payoutPointer = (
+      await this.peer.base.view.get(`payout/current/${rail}/${provider}`)
+    )?.value;
+    const previousRevision = payoutPointer?.latest_revision ?? null;
+    if (previousRevision !== null &&
+        !/^[0-9a-f]{64}$/.test(String(previousRevision))) {
+      throw new Error('Canonical provider payout revision is invalid.');
+    }
+    const binding = previousRevision === null
+      ? null
+      : (
+          await this.peer.base.view.get(
+            `payout/binding/${rail}/${provider}/${previousRevision}`
+          )
+        )?.value ?? null;
+    if (previousRevision !== null &&
+        (!binding ||
+          binding.provider !== provider ||
+          binding.rail !== rail ||
+          binding.revision !== previousRevision)) {
+      throw new Error('Canonical provider payout binding is unavailable.');
+    }
+    const chainId = rail === 'tap' ? payments.tap?.chain_id : null;
+    if (rail === 'tap' && (!Number.isSafeInteger(chainId) || chainId < 1)) {
+      throw new Error('Canonical TAP payout chain is invalid.');
+    }
+
+    return {
+      ok: true,
+      provider,
+      rail,
+      request_nonce: requestNonce,
+      network: context.network,
+      admin,
+      bootstrap: context.bootstrap,
+      context_revision: contextRevision,
+      payment_config_version: paymentConfigVersion,
+      chain_id: chainId,
+      updated_epoch: updatedEpoch,
+      pending_epoch: pendingEpoch,
+      max_expiry_epochs: maxExpiryEpochs,
+      previous_revision: previousRevision,
+      current_revision: payoutPointer?.current_revision ?? null,
+      pending_revision: payoutPointer?.pending_revision ?? null,
+      binding,
+    };
+  }
+
+  async _handleService(service, value, authorization) {
+    if (service === 'provider_payout_context') {
+      return await this._providerPayoutContext(value);
+    }
+    if (!this.serviceHandler) {
+      throw new Error('Mayhem admin service is not configured.');
+    }
+    return await this.serviceHandler(service, value, authorization);
   }
 
   _pruneProcessed() {
@@ -939,7 +1072,7 @@ class MayhemFeature extends Feature {
   }
 
   async _handleServiceRequest(payload) {
-    if (!this.peer.base?.writable || !this.serviceHandler) return;
+    if (!this.peer.base?.writable) return;
     const admin = await this._adminKey();
     const self = normalizeKey(this.peer?.wallet?.publicKey);
     if (!admin || self !== admin) return;
@@ -967,7 +1100,7 @@ class MayhemFeature extends Feature {
     }
     if (!cached) {
       const promise = Promise.resolve()
-        .then(() => this.serviceHandler(message.service, envelope.payload, envelope))
+        .then(() => this._handleService(message.service, envelope.payload, envelope))
         .catch((error) => relayError(error?.message || 'Mayhem admin service request failed.', expectedId));
       cached = { at: Date.now(), pending: true, promise };
       this.serviceProcessed.set(expectedId, cached);

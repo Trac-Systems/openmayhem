@@ -88,7 +88,11 @@ export const loadPrivateInternalAuthSecret = ({
   fsModule,
   pathModule,
   secretPath,
-  platform = typeof process !== 'undefined' ? process.platform : '',
+  platform = typeof process !== 'undefined'
+    ? process.platform
+    : typeof Bare !== 'undefined'
+      ? Bare.platform
+      : '',
 }) => {
   const configuredPath = String(secretPath ?? '').trim();
   if (!configuredPath) {
@@ -109,6 +113,27 @@ export const loadPrivateInternalAuthSecret = ({
     throw new Error('Stripe internal auth secret must contain 32-256 printable bytes.');
   }
   return secret;
+};
+
+export const resolvePrivateInternalAuthSecretPath = ({
+  pathModule,
+  flagPath,
+  envPath,
+  peerStoresDirectory,
+}) => {
+  const configured = [flagPath, envPath]
+    .map((value) => String(value ?? '').trim())
+    .find((value) => value.length > 0);
+  if (configured) return configured;
+
+  const storesDirectory = String(peerStoresDirectory ?? '').trim();
+  if (!storesDirectory) return '';
+  return pathModule.resolve(
+    storesDirectory,
+    '..',
+    'paygate',
+    'internal-auth.secret'
+  );
 };
 
 const safeBooleanCall = (target, method) => {
@@ -283,6 +308,20 @@ export async function requestStripeConnect(peer, service, body) {
   return await registered.requestService(service, body);
 }
 
+export async function requestProviderPayoutContext(peer, body) {
+  if (!isObject(body)) throw new Error('Missing JSON body.');
+  if (!isObject(body.payload) ||
+      typeof body.payload.provider !== 'string' ||
+      !body.payload.provider.trim()) {
+    throw new Error('Missing provider.');
+  }
+  const registered = peer.protocol?.instance?.features?.mayhem;
+  if (!registered || typeof registered.requestService !== 'function') {
+    throw new Error('Mayhem service relay is not ready.');
+  }
+  return await registered.requestService('provider_payout_context', body);
+}
+
 const errorResponse = (error) => {
   if (error?.code === 'BODY_TOO_LARGE') return [413, error.message];
   if (error?.code === 'BAD_JSON') return [400, error.message];
@@ -351,6 +390,10 @@ export const createServer = (
       if (req.method === 'POST' && requestPath === '/v1/contract/feature') {
         const body = await readJsonBody(req, { maxBytes: maxBodyBytes });
         return respond(200, await submitMayhemFeature(peer, body));
+      }
+      if (req.method === 'POST' && requestPath === '/v1/provider/payout/context') {
+        const body = await readJsonBody(req, { maxBytes: maxBodyBytes });
+        return respond(200, await requestProviderPayoutContext(peer, body));
       }
       if (req.method === 'POST' && requestPath === '/v1/payment/stripe/checkout') {
         const body = await readJsonBody(req, { maxBytes: maxBodyBytes });

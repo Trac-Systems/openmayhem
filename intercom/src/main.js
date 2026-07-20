@@ -9,6 +9,7 @@ import { Peer } from 'trac-peer';
 import {
   createServer as createRpcServer,
   loadPrivateInternalAuthSecret,
+  resolvePrivateInternalAuthSecretPath,
 } from './rpc.js';
 import { hydrateAdminWriterViews, joinCanonicalPeers } from './admin-view-hydration.js';
 import { installFatalRuntimeErrorPolicy } from './runtime-errors.js';
@@ -74,7 +75,12 @@ const stripeInternalAuthSecret = () => {
   return loadPrivateInternalAuthSecret({
     fsModule: fs,
     pathModule: path,
-    secretPath: env.MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE,
+    secretPath: resolvePrivateInternalAuthSecretPath({
+      pathModule: path,
+      flagPath: flagValue('paygate-internal-auth-secret-file'),
+      envPath: env.MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE,
+      peerStoresDirectory,
+    }),
   });
 };
 
@@ -208,7 +214,7 @@ const stripeCheckoutRequest = async (peer, value) => {
   }
 
   const endpoint = stripeWorkerEndpoint(
-    env.MAYHEM_STRIPE_WORKER_URL,
+    stripeWorkerUrl,
     '/v1/stripe/checkout-sessions'
   );
   const workerValue = { ...value };
@@ -504,7 +510,7 @@ const stripeConnectService = async (peer, service, value, authorization) => {
     : service === 'stripe_connect_relink'
       ? '/v1/stripe/connect/relink'
       : '/v1/stripe/connect/status';
-  const endpoint = stripeWorkerEndpoint(env.MAYHEM_STRIPE_WORKER_URL, workerPath);
+  const endpoint = stripeWorkerEndpoint(stripeWorkerUrl, workerPath);
   const workerRequest = service === 'stripe_connect_relink'
     ? {
         ...request,
@@ -884,6 +890,10 @@ const stripeWorkerRequestTimeoutMs = parseInteger(
 if (stripeWorkerRequestTimeoutMs <= 0) {
   throw new Error('Stripe worker request timeout must be positive.');
 }
+const stripeWorkerUrl = flagValue(
+  'stripe-worker-url',
+  env.MAYHEM_STRIPE_WORKER_URL || ''
+);
 const directSessionDebug = parseBool(
   (flags['session-debug'] && String(flags['session-debug'])) || env.SESSION_DEBUG || '',
   false

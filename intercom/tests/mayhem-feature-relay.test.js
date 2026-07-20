@@ -26,6 +26,8 @@ import {
   getMayhemStatus,
   getStatePrefix,
   loadPrivateInternalAuthSecret,
+  requestProviderPayoutContext,
+  resolvePrivateInternalAuthSecretPath,
   requestStripeCheckout,
   requestStripeConnect,
   submitMayhemFeature,
@@ -77,6 +79,30 @@ test('private Stripe auth secret loader uses Windows ACLs and rejects symlinks',
     secretPath: 'auth.secret',
     platform: 'win32',
   }), /non-symlink/);
+});
+
+test('private Stripe auth secret path survives Pear without process.env', () => {
+  const pathModule = {
+    resolve: (...parts) => parts.join('/'),
+  };
+  assert.equal(resolvePrivateInternalAuthSecretPath({
+    pathModule,
+    flagPath: '/operator/secret',
+    envPath: '/ignored/env-secret',
+    peerStoresDirectory: '/ignored/stores',
+  }), '/operator/secret');
+  assert.equal(resolvePrivateInternalAuthSecretPath({
+    pathModule,
+    flagPath: '',
+    envPath: '/operator/env-secret',
+    peerStoresDirectory: '/ignored/stores',
+  }), '/operator/env-secret');
+  assert.equal(resolvePrivateInternalAuthSecretPath({
+    pathModule,
+    flagPath: undefined,
+    envPath: undefined,
+    peerStoresDirectory: '/mayhem/home/stores/',
+  }), '/mayhem/home/stores//../paygate/internal-auth.secret');
 });
 
 const fakeSignature = (publicKey, message) => {
@@ -964,6 +990,98 @@ test('read-only provider relays a verified payout binding only to the sole admin
   assert.equal(rejected.ok, false);
   assert.match(rejected.message, /failed relay verification/);
   assert.equal(writer.appended.length, 1);
+});
+
+test('provider signs payout state from the current writer without hydrating a stale sparse view', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  connect(participant.peer, participantFeature, writer.peer, writerFeature);
+  connect(writer.peer, writerFeature, participant.peer, participantFeature);
+
+  const contextRevision = '22'.repeat(32);
+  const previousRevision = '33'.repeat(32);
+  writer.state.set('payments/current', {
+    rails: ['fiat', 'tap', 'tnk'],
+    tap: { chain_id: 1 },
+    tnk: { network: 'mainnet' },
+    ver: 7,
+    set_by: adminKey,
+    set_by_role: 'admin',
+  });
+  writer.state.set('payout/context/current', {
+    payment_config_version: 7,
+    revision: contextRevision,
+  });
+  writer.state.set(`payout/context/7/${contextRevision}`, {
+    revision: contextRevision,
+    network: 'mainnet',
+    admin: adminKey,
+    bootstrap: '11'.repeat(32),
+    payment_config_version: 7,
+    published_by: adminKey,
+    published_by_role: 'admin',
+  });
+  writer.state.set('epoch/apply/state', {
+    updated_epoch: 41,
+    pending_epoch: null,
+  });
+  writer.state.set('payout/params/payout_intent_max_expiry_epochs', {
+    current: { value: 8, effective_epoch: 1 },
+    pending: null,
+  });
+  writer.state.set(`prov/${providerKey}`, {
+    provider: providerKey,
+    status: 'active',
+    accepted_rails: ['tap'],
+  });
+  writer.state.set(`payout/current/tap/${providerKey}`, {
+    latest_revision: previousRevision,
+  });
+  writer.state.set(`payout/binding/tap/${providerKey}/${previousRevision}`, {
+    type: 'provider_payout_binding',
+    provider: providerKey,
+    rail: 'tap',
+    revision: previousRevision,
+    target: `0x${'55'.repeat(20)}`,
+  });
+
+  const value = {
+    provider: providerKey,
+    rail: 'tap',
+    request_nonce: '44'.repeat(32),
+  };
+  const result = await requestProviderPayoutContext(
+    participant.peer,
+    signedServiceValue(
+      participant.peer,
+      'provider_payout_context',
+      value,
+      providerKey
+    )
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.relayed, true);
+  assert.equal(result.updated_epoch, 41);
+  assert.equal(result.max_expiry_epochs, 8);
+  assert.equal(result.previous_revision, previousRevision);
+  assert.equal(result.context_revision, contextRevision);
+  assert.equal(result.binding.revision, previousRevision);
+  assert.equal(participant.state.has('payout/context/current'), false);
+  assert.equal(participant.appended.length, 0);
+  assert.equal(writer.appended.length, 0);
 });
 
 test('fiat payout relay keeps the active account admissible during verified rotation', async () => {
