@@ -247,7 +247,9 @@ jobs:
             $toolVariables += @(
               "CMAKE_GENERATOR=Ninja",
               "CMAKE_C_COMPILER=$clangCmake",
-              "CMAKE_CXX_COMPILER=$clangCmake"
+              "CMAKE_CXX_COMPILER=$clangCmake",
+              "CMAKE_CXX_FLAGS=/EHsc",
+              "CXXFLAGS_aarch64_pc_windows_msvc=/EHsc"
             )
           }
           foreach ($variable in $toolVariables) {

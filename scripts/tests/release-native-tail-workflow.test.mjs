@@ -354,6 +354,16 @@ requireLiteral(
   packageSource,
 );
 requireLiteral(
+  '"CMAKE_CXX_FLAGS=/EHsc"',
+  'Windows ARM CMake compilation must enable standard C++ exception semantics',
+  packageSource,
+);
+requireLiteral(
+  '"CXXFLAGS_aarch64_pc_windows_msvc=/EHsc"',
+  'Windows ARM direct C++ compilation must enable standard exception semantics',
+  packageSource,
+);
+requireLiteral(
   'grep -Fq "Target: aarch64-pc-windows-msvc"',
   'Windows identity must prove clang-cl targets native ARM64',
   packageSource,
