@@ -8,6 +8,7 @@ import { dispatchContainedClientRequest } from '../features/sc-bridge/containmen
 import {
   addBoundedSubscriptions,
   messageByteLength,
+  sidechannelSubscriptionMatches,
   writeBoundedClientPayload,
 } from '../features/sc-bridge/bounded-client.js';
 import {
@@ -134,6 +135,15 @@ test('SC-Bridge disconnects one stalled consumer when its bounded queue fills', 
 test('SC-Bridge rejects oversized local websocket messages and caps subscriptions', () => {
   assert.equal(addBoundedSubscriptions(new Set(), ['one', 'two', 'three'], 2), false);
   assert.equal(messageByteLength('x'.repeat(65)) > 64, true);
+});
+
+test('SC-Bridge explicit empty subscription receives no unrelated sidechannel traffic', () => {
+  assert.equal(sidechannelSubscriptionMatches(null, 'mx/room/one'), true);
+  assert.equal(sidechannelSubscriptionMatches(new Set(), 'mx/room/one'), false);
+  assert.equal(
+    sidechannelSubscriptionMatches(new Set(['mx/room/two']), 'mx/room/two'),
+    true,
+  );
 });
 
 test('SC-Bridge bounds and reclaims every direct session owned by a disconnected client', () => {

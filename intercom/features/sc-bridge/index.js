@@ -5,6 +5,7 @@ import { dispatchContainedClientRequest } from './containment.js';
 import {
   addBoundedSubscriptions,
   messageByteLength,
+  sidechannelSubscriptionMatches,
   writeBoundedClientPayload,
 } from './bounded-client.js';
 import {
@@ -210,7 +211,7 @@ class ScBridge extends Feature {
 
   _shouldEmit(client, channel, messageText) {
     if (client.sidechannelMuted === true) return false;
-    if (client.channels && client.channels.size > 0 && !client.channels.has(channel)) {
+    if (!sidechannelSubscriptionMatches(client.channels, channel)) {
       return false;
     }
     const filterApplies = this.filterChannels ? this.filterChannels.has(channel) : true;
@@ -728,9 +729,15 @@ class ScBridge extends Feature {
           sendError('Sidechannel not ready.');
           return;
         }
-        const channel = String(message.channel || '').trim();
-        if (!channel) {
-          sendError('Missing channel.');
+        const channels = Array.isArray(message.channels)
+          ? [...new Set(
+              message.channels
+                .map((channel) => String(channel || '').trim())
+                .filter(Boolean)
+            )]
+          : [String(message.channel || '').trim()].filter(Boolean);
+        if (channels.length === 0) {
+          sendError('Missing channel(s).');
           return;
         }
         const invite = parseJsonOrBase64(message.invite);
@@ -743,17 +750,26 @@ class ScBridge extends Feature {
           sendError('Invalid welcome (expected JSON or base64).');
           return;
         }
+        if (channels.length > 1 && (invite || welcome)) {
+          sendError('Batch joins do not accept one shared invite or welcome.');
+          return;
+        }
+        const channel = channels[0];
         if (invite || welcome) {
           this.sidechannel.acceptInvite(channel, invite, welcome);
         }
         this.sidechannel
-          .addChannel(channel)
-          .then((ok) => {
-            if (!ok) {
+          .addChannels(channels)
+          .then((joined) => {
+            if (!joined || joined.length !== channels.length) {
               sendError('Join denied (invite required or invalid).');
               return;
             }
-            reply({ type: 'joined', channel });
+            reply({
+              type: 'joined',
+              ...(channels.length === 1 ? { channel } : {}),
+              channels,
+            });
           })
           .catch((err) => {
             sendError(err?.message ? `Join failed: ${err.message}` : 'Join failed.');

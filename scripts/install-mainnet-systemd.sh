@@ -75,6 +75,7 @@ append_default MAYHEM_TAP_SETTLEMENT_SPOOL "$root/.mayhem-local/settlement/tap"
 append_default MAYHEM_PAYGATE_BIND '127.0.0.1:11436'
 append_default MAYHEM_PAYGATE_CONTRACT_DRY_RUN '0'
 append_default MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE "$root/.mayhem-local/live-home/paygate/internal-auth.secret"
+append_default MAYHEM_STRIPE_WORKER_URL 'http://127.0.0.1:11436'
 append_default MAYHEM_PAYGATE_STRIPE_EVENTS_PATH "$root/.mayhem-local/paygate/stripe-events.jsonl"
 append_default MAYHEM_STRIPE_CONNECT_ACCOUNT_TYPE 'express'
 append_default MAYHEM_STRIPE_CONNECT_ACCOUNTS_PATH "$root/.mayhem-local/paygate/stripe-connect-accounts.jsonl"

@@ -1381,16 +1381,23 @@ class Sidechannel extends Feature {
       });
   }
 
-  async addChannel(name) {
-    const entry = this._registerChannel(name);
-    if (!entry) return false;
+  async addChannels(names) {
+    const entries = [...new Set(
+      Array.from(names || [], (name) => normalizeChannel(name)).filter(Boolean)
+    )].map((name) => this._registerChannel(name));
+    if (entries.length === 0 || entries.some((entry) => !entry)) return null;
     if (this.started && this.peer?.swarm) {
-      this.peer.swarm.join(entry.topic, { server: true, client: true });
+      for (const entry of entries) {
+        this.peer.swarm.join(entry.topic, { server: true, client: true });
+      }
       {
         const flushP = Promise.resolve()
           .then(() => this.peer.swarm.flush())
           .catch((error) => {
-            this._reportEventError(`flush after joining ${entry.name}`, error);
+            this._reportEventError(
+              `flush after joining ${entries.length} sidechannel(s)`,
+              error
+            );
           });
         await Promise.race([
           flushP,
@@ -1398,13 +1405,19 @@ class Sidechannel extends Feature {
         ]);
       }
 
-      if (this.channels.get(entry.name) !== entry) return false;
-
-      for (const connection of this.connections.keys()) {
-        this._openChannelForConnection(connection, entry);
+      for (const entry of entries) {
+        if (this.channels.get(entry.name) !== entry) return null;
+        for (const connection of this.connections.keys()) {
+          this._openChannelForConnection(connection, entry);
+        }
       }
     }
-    return true;
+    return entries.map((entry) => entry.name);
+  }
+
+  async addChannel(name) {
+    const joined = await this.addChannels([name]);
+    return joined?.length === 1;
   }
 
   _directPeerChannelReady(remote, channel) {

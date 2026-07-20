@@ -237,6 +237,18 @@ impl ScBridgeClient {
         .await
     }
 
+    pub async fn join_many(
+        &mut self,
+        channels: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<Value> {
+        let channels = channels
+            .into_iter()
+            .map(|channel| channel.as_ref().to_owned())
+            .collect::<Vec<_>>();
+        self.request(json!({ "type": "join", "channels": channels }), "joined")
+            .await
+    }
+
     pub async fn open(&mut self, channel: impl AsRef<str>, via: Option<&str>) -> Result<Value> {
         let mut request = json!({ "type": "open", "channel": channel.as_ref() });
         if let Some(via) = via {

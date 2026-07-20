@@ -295,6 +295,32 @@ test('required DHT bootstrap failure rejects sidechannel startup for supervisor 
   assert.equal(sidechannel.started, false);
 });
 
+test('batch room join performs one swarm flush for every registered room', async () => {
+  const joined = [];
+  let flushes = 0;
+  const batchPeer = {
+    ...peer,
+    swarm: {
+      join: (topic) => joined.push(b4a.toString(topic, 'hex')),
+      flush: async () => { flushes += 1; },
+    },
+  };
+  const sidechannel = new Sidechannel(batchPeer, {
+    channels: [entryChannel],
+    entryChannel,
+  });
+  sidechannel.started = true;
+  const rooms = Array.from(
+    { length: 256 },
+    (_, index) => `mx/room/${index.toString(16).padStart(32, '0')}`,
+  );
+
+  assert.deepEqual(await sidechannel.addChannels(rooms), rooms);
+  assert.equal(joined.length, rooms.length);
+  assert.equal(flushes, 1);
+  assert.ok(rooms.every((room) => sidechannel.channels.has(room)));
+});
+
 test('sidechannel decoder drops oversized JSON before parsing it', () => {
   let encoding = null;
   const channel = {

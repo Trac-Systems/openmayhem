@@ -54,8 +54,11 @@ const [
   import('../features/mayhem/index.js'),
 ]);
 
-const stripeWorkerEndpoint = (raw = 'http://127.0.0.1:11436', endpointPath) => {
-  const parsed = new URL(String(raw));
+const DEFAULT_STRIPE_WORKER_URL = 'http://127.0.0.1:11436';
+
+const stripeWorkerEndpoint = (raw, endpointPath) => {
+  const configured = String(raw ?? '').trim();
+  const parsed = new URL(configured || DEFAULT_STRIPE_WORKER_URL);
   const loopback = parsed.hostname === '127.0.0.1' ||
     parsed.hostname === 'localhost' ||
     parsed.hostname === '[::1]';
@@ -892,7 +895,7 @@ if (stripeWorkerRequestTimeoutMs <= 0) {
 }
 const stripeWorkerUrl = flagValue(
   'stripe-worker-url',
-  env.MAYHEM_STRIPE_WORKER_URL || ''
+  env.MAYHEM_STRIPE_WORKER_URL || DEFAULT_STRIPE_WORKER_URL
 );
 const directSessionDebug = parseBool(
   (flags['session-debug'] && String(flags['session-debug'])) || env.SESSION_DEBUG || '',

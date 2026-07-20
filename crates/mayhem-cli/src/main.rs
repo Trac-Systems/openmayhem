@@ -30143,6 +30143,8 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         sc_bridge_token_file_path(&plan.home).display().to_string(),
         "--paygate-internal-auth-secret-file".to_owned(),
         paygate_auth_secret_path.clone(),
+        "--stripe-worker-url".to_owned(),
+        "http://127.0.0.1:11436".to_owned(),
         "--sc-bridge-cli".to_owned(),
         "1".to_owned(),
         "--rpc".to_owned(),
@@ -31708,12 +31710,10 @@ async fn reconcile_gateway_provider_heartbeat_channels(
             .subscribe(added.iter().map(String::as_str))
             .await
             .context("subscribing to new provider heartbeat sidechannels")?;
-        for channel in &added {
-            bridge
-                .join(channel)
-                .await
-                .with_context(|| format!("joining provider heartbeat sidechannel {channel}"))?;
-        }
+        bridge
+            .join_many(added.iter().map(String::as_str))
+            .await
+            .context("batch-joining provider heartbeat sidechannels")?;
     }
     if !removed.is_empty() {
         bridge
@@ -31763,6 +31763,10 @@ async fn run_gateway_provider_heartbeat_watcher(
     )?)
     .await
     .context("connecting to SC-Bridge for gateway provider heartbeat watcher")?;
+    bridge
+        .subscribe(std::iter::empty::<&str>())
+        .await
+        .context("initializing provider heartbeat subscription filter")?;
     let mut subscribed = BTreeSet::new();
     let mut receiver =
         HeartbeatReceiver::with_limits(config.max_age_millis, config.max_clock_skew_millis);
@@ -92620,6 +92624,14 @@ State initialization...
                     .to_string()
                     .as_str()
             )
+        );
+        let stripe_worker_url_index = peer_args
+            .iter()
+            .position(|arg| arg.as_str() == Some("--stripe-worker-url"))
+            .unwrap();
+        assert_eq!(
+            peer_args[stripe_worker_url_index + 1].as_str(),
+            Some("http://127.0.0.1:11436")
         );
         assert_eq!(
             children[2]["env"]["MAYHEM_SC_BRIDGE_TOKEN"].as_str(),

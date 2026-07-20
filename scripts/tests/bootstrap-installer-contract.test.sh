@@ -173,6 +173,10 @@ grep -Fq \
   'append_default MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE "$root/.mayhem-local/live-home/paygate/internal-auth.secret"' \
   "$ROOT_DIR/scripts/install-mainnet-systemd.sh" ||
   fail "mainnet install does not share one private paygate authentication secret with the admin peer"
+grep -Fq \
+  "append_default MAYHEM_STRIPE_WORKER_URL 'http://127.0.0.1:11436'" \
+  "$ROOT_DIR/scripts/install-mainnet-systemd.sh" ||
+  fail "mainnet install does not pin the canonical peer to its loopback Stripe worker"
 grep -Fq 'ensure_private_random_secret_file \' \
   "$ROOT_DIR/scripts/install-mainnet-systemd.sh" ||
   fail "mainnet install does not initialize the private paygate authentication secret"
@@ -210,7 +214,7 @@ grep -F "MAYHEM_ALLOW_UNVERIFIED have been removed" "$ROOT_DIR/install.ps1" >/de
 for harness in \
   "$ROOT_DIR/scripts/macos-opencode-role-check.sh" \
   "$ROOT_DIR/scripts/docker-opencode-role-check.sh"; do
-  grep -F ':-0.2.25}' "$harness" >/dev/null ||
+  grep -F ':-0.2.27}' "$harness" >/dev/null ||
     fail "$harness does not default to canonical release semver"
   grep -F -- '--unsigned-layout' "$harness" >/dev/null ||
     fail "$harness does not explicitly request the unsigned test layout"

@@ -17,6 +17,9 @@ const addBoundedSubscriptions = (target, values, maxSubscriptions) => {
   return true;
 };
 
+const sidechannelSubscriptionMatches = (subscriptions, channel) =>
+  !(subscriptions instanceof Set) || subscriptions.has(channel);
+
 const flushBoundedClient = (client, onDrop) => {
   if (!client || client.closed || client.writing || client.outboundQueue.length === 0) return;
   const entry = client.outboundQueue[0];
@@ -76,5 +79,6 @@ export {
   addBoundedSubscriptions,
   flushBoundedClient,
   messageByteLength,
+  sidechannelSubscriptionMatches,
   writeBoundedClientPayload,
 };
