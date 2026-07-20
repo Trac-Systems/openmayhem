@@ -7,7 +7,6 @@ import { OperationType } from '../../../../src/utils/constants.js';
 import { config } from '../../../helpers/config.js';
 import { testKeyPair1, testKeyPair2 } from '../../../fixtures/apply.fixtures.js';
 import { addressToBuffer } from '../../../../src/core/state/utils/address.js';
-import { encodeTransferBatchOutputs } from '../../../../src/utils/transferBatch.js';
 
 const hex = (value, bytes) => value.repeat(bytes);
 const toBuf = value => b4a.from(value, 'hex');
@@ -517,52 +516,6 @@ test('ApplyStateMessageBuilder complete transfer operation (tro)', async t => {
     t.ok(b4a.equals(payload.tro.txv, txValidity));
     t.ok(b4a.equals(payload.tro.to, addressToBuffer(otherWallet.address, config.addressPrefix)));
     t.ok(b4a.equals(payload.tro.am, amount));
-    t.ok(b4a.equals(payload.tro.in, incomingNonce));
-    t.ok(b4a.equals(payload.tro.is, incomingSignature));
-});
-
-test('ApplyStateMessageBuilder complete batch transfer operation (tro)', async t => {
-    const wallet = await createWallet(testKeyPair1.mnemonic);
-    const otherWallet = await createWallet(testKeyPair2.mnemonic);
-    const txHash = toBuf(hex('15', 32));
-    const txValidity = toBuf(hex('16', 32));
-    const incomingNonce = toBuf(hex('17', 32));
-    const incomingSignature = toBuf(hex('18', 64));
-    const batch = encodeTransferBatchOutputs([{ to: otherWallet.address, amount: '1.25' }], config);
-
-    const builder = new ApplyStateMessageBuilder(wallet, config);
-    await builder
-        .setPhase('complete')
-        .setOutput('buffer')
-        .setOperationType(OperationType.TRANSFER)
-        .setAddress(wallet.address)
-        .setTxHash(txHash)
-        .setTxValidity(txValidity)
-        .setIncomingNonce(incomingNonce)
-        .setBatchOutputs(batch.buffer)
-        .setBatchAmount(batch.totalAmount)
-        .setIncomingSignature(incomingSignature)
-        .build();
-
-    const payload = builder.getPayload();
-    t.is(payload.type, OperationType.TRANSFER);
-    expectAddressBuffer(t, payload.address, 'address');
-    t.ok(b4a.equals(payload.address, addressToBuffer(wallet.address, config.addressPrefix)));
-    expectPayloadKeys(t, payload, 'tro');
-    expectKeys(t, payload.tro, ['tx', 'txv', 'bo', 'ba', 'in', 'is', 'va', 'vn', 'vs'], 'tro');
-    expectBufferField(t, payload.tro.tx, 32, 'tro.tx');
-    expectBufferField(t, payload.tro.txv, 32, 'tro.txv');
-    expectBufferField(t, payload.tro.bo, batch.buffer.length, 'tro.bo');
-    expectBufferField(t, payload.tro.ba, 16, 'tro.ba');
-    expectBufferField(t, payload.tro.in, 32, 'tro.in');
-    expectBufferField(t, payload.tro.is, 64, 'tro.is');
-    expectAddressBuffer(t, payload.tro.va, 'tro.va');
-    expectBufferField(t, payload.tro.vn, 32, 'tro.vn');
-    expectBufferField(t, payload.tro.vs, 64, 'tro.vs');
-    t.ok(b4a.equals(payload.tro.tx, txHash));
-    t.ok(b4a.equals(payload.tro.txv, txValidity));
-    t.ok(b4a.equals(payload.tro.bo, batch.buffer));
-    t.ok(b4a.equals(payload.tro.ba, batch.totalAmount));
     t.ok(b4a.equals(payload.tro.in, incomingNonce));
     t.ok(b4a.equals(payload.tro.is, incomingSignature));
 });

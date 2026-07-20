@@ -30111,8 +30111,6 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         rpc_port_from_url(&plan.rpc_url)?.to_string(),
         "--api-tx-exposed".to_owned(),
         "1".to_owned(),
-        "--api-tx-local-apply".to_owned(),
-        "1".to_owned(),
     ]);
     write_supervisor_child(
         &mut out,
@@ -56785,6 +56783,7 @@ fn admin_contract_tx_feature(
     signature: &str,
     nonce: &str,
     sim: bool,
+    context: &Value,
 ) -> Result<Value> {
     ensure!(
         is_hex_len(tx, 64),
@@ -56821,7 +56820,25 @@ fn admin_contract_tx_feature(
             "signature": signature,
             "nonce": nonce,
             "sim": sim,
+            "context": context,
         },
+    }))
+}
+
+fn admin_contract_tx_digest(
+    prepared_command: &Value,
+    address: &str,
+    nonce: &str,
+    sim: bool,
+    context: &Value,
+) -> String {
+    stable_value_hash(&json!({
+        "address": address.to_ascii_lowercase(),
+        "context": context,
+        "domain": "mayhem-admin-contract-tx-v1",
+        "nonce": nonce.to_ascii_lowercase(),
+        "prepared_command": prepared_command,
+        "sim": sim,
     }))
 }
 
@@ -56880,6 +56897,46 @@ async fn submit_contract_command(
         .get("baseWritable")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let subnet_bootstrap = peer
+        .get("subnetBootstrapHex")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .context("local Intercom status is missing the canonical subnet bootstrap")?;
+    ensure!(
+        is_hex_len(&subnet_bootstrap, 64),
+        "canonical subnet bootstrap must be 32-byte hexadecimal"
+    );
+    let msb = status
+        .get("msb")
+        .and_then(Value::as_object)
+        .context("local Intercom status is missing MSB network identity")?;
+    let msb_bootstrap = msb
+        .get("bootstrapHex")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .context("local Intercom status is missing the MSB bootstrap")?;
+    ensure!(
+        is_hex_len(&msb_bootstrap, 64),
+        "MSB bootstrap must be 32-byte hexadecimal"
+    );
+    let network_id = msb
+        .get("networkId")
+        .and_then(Value::as_u64)
+        .context("local Intercom status is missing the MSB network id")?;
+    let health = rpc
+        .health()
+        .await
+        .context("reading verified Intercom contract identity")?;
+    let contract_version = health
+        .get("contract_version")
+        .and_then(Value::as_u64)
+        .context("Intercom health is missing the verified contract version")?;
+    let context = json!({
+        "contract_version": contract_version,
+        "msb_bootstrap": msb_bootstrap,
+        "network_id": network_id,
+        "subnet_bootstrap": subnet_bootstrap,
+    });
     let nonce_response = rpc
         .contract_nonce()
         .await
@@ -56888,23 +56945,12 @@ async fn submit_contract_command(
         .get("nonce")
         .and_then(Value::as_str)
         .context("RPC nonce response did not include nonce")?;
-    let prepared = rpc
-        .prepare_tx(json!({
-            "prepared_command": prepared_command.clone(),
-            "address": admin,
-            "nonce": nonce,
-        }))
-        .await
-        .with_context(|| format!("preparing {tx_type} tx"))?;
-    let tx = prepared
-        .get("tx")
-        .and_then(Value::as_str)
-        .context("RPC prepare response did not include tx")?
-        .to_owned();
-    let command_hash = prepared
-        .get("command_hash")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    ensure!(
+        is_hex_len(nonce, 64),
+        "RPC nonce response must contain a 32-byte hexadecimal nonce"
+    );
+    let tx = admin_contract_tx_digest(&prepared_command, &admin, nonce, sim, &context);
+    let command_hash = stable_value_hash(&prepared_command);
     let signature = sign_hex(keypair_path, password, &tx).await?;
     let signed_tx = json!({
         "tx": tx,
@@ -56914,28 +56960,23 @@ async fn submit_contract_command(
         "nonce": nonce,
         "sim": sim,
     });
-    let (submitted, submission_transport) = if base_writable {
-        (
-            rpc.submit_tx(signed_tx.clone())
-                .await
-                .with_context(|| format!("submitting {tx_type} tx"))?,
-            "contract_tx",
-        )
+    let feature = admin_contract_tx_feature(
+        signed_tx["tx"].as_str().unwrap_or_default(),
+        &signed_tx["prepared_command"],
+        signed_tx["address"].as_str().unwrap_or_default(),
+        signed_tx["signature"].as_str().unwrap_or_default(),
+        signed_tx["nonce"].as_str().unwrap_or_default(),
+        sim,
+        &context,
+    )?;
+    let submitted = rpc
+        .submit_feature(&feature)
+        .await
+        .with_context(|| format!("submitting signed {tx_type} through the Mayhem admin feature"))?;
+    let submission_transport = if base_writable && transport == admin {
+        "admin_feature_direct"
     } else {
-        let feature = admin_contract_tx_feature(
-            signed_tx["tx"].as_str().unwrap_or_default(),
-            &signed_tx["prepared_command"],
-            signed_tx["address"].as_str().unwrap_or_default(),
-            signed_tx["signature"].as_str().unwrap_or_default(),
-            signed_tx["nonce"].as_str().unwrap_or_default(),
-            sim,
-        )?;
-        (
-            rpc.submit_feature(&feature)
-                .await
-                .with_context(|| format!("relaying signed {tx_type} tx through PF.5"))?,
-            "admin_feature_relay",
-        )
+        "admin_feature_relay"
     };
     if submitted.get("ok").and_then(Value::as_bool) == Some(false) {
         bail!("contract {tx_type} rejected command: {submitted}");
@@ -73943,8 +73984,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_contract_tx_feature_matches_pf5_rpc_shape_and_preserves_admin_capabilities() {
-        let tx = "11".repeat(32);
+    fn admin_contract_tx_feature_matches_pf5_rpc_shape_and_network_context() {
         let admin = "22".repeat(32);
         let signature = "33".repeat(64);
         let nonce = "44".repeat(32);
@@ -73957,9 +73997,28 @@ mod tests {
                 "values": { "fee_bps": 1_500 },
             },
         });
+        let context = json!({
+            "contract_version": 13,
+            "msb_bootstrap": "55".repeat(32),
+            "network_id": 918,
+            "subnet_bootstrap": "66".repeat(32),
+        });
+        let tx = admin_contract_tx_digest(&prepared_command, &admin, &nonce, false, &context);
         assert_eq!(
-            admin_contract_tx_feature(&tx, &prepared_command, &admin, &signature, &nonce, false,)
-                .unwrap(),
+            tx,
+            "1b1de56991947fedabb8385ed47d759174265f1063169d7fd7e0f92ca6df2e35"
+        );
+        assert_eq!(
+            admin_contract_tx_feature(
+                &tx,
+                &prepared_command,
+                &admin,
+                &signature,
+                &nonce,
+                false,
+                &context,
+            )
+            .unwrap(),
             json!({
                 "feature": "mayhem",
                 "key": format!("admin/contract-tx/{tx}"),
@@ -73971,24 +74030,10 @@ mod tests {
                     "signature": signature,
                     "nonce": nonce,
                     "sim": false,
+                    "context": context,
                 },
             })
         );
-
-        let capability = json!({
-            "type": "addWriter",
-            "value": { "key": "55".repeat(32) },
-        });
-        let relayed = admin_contract_tx_feature(
-            &"66".repeat(32),
-            &capability,
-            &"22".repeat(32),
-            &"33".repeat(64),
-            &"44".repeat(32),
-            false,
-        )
-        .expect("base-protocol admin capabilities must remain relayable");
-        assert_eq!(relayed["value"]["prepared_command"], capability);
     }
 
     #[test]

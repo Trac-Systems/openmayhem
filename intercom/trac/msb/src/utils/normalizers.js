@@ -19,14 +19,11 @@ export function normalizeTransferOperation(payload, config) {
         throw new Error('Invalid payload for transfer operation normalization.');
     }
     const { type, address, tro } = payload;
-    const isSingle = tro.to && tro.am && !tro.bo && !tro.ba;
-    const isBatch = tro.bo && tro.ba && !tro.to && !tro.am;
     if (
         type !== OperationType.TRANSFER ||
         !address ||
         !tro.tx || !tro.txv || !tro.in ||
-        !tro.is ||
-        (!isSingle && !isBatch)
+        !tro.to || !tro.am || !tro.is
     ) {
         throw new Error('Missing required fields in transfer operation payload.');
     }
@@ -35,15 +32,10 @@ export function normalizeTransferOperation(payload, config) {
         tx: normalizeHex(tro.tx),     // Transaction hash
         txv: normalizeHex(tro.txv),   // Transaction validity
         in: normalizeHex(tro.in),     // Nonce
+        to: addressToBuffer(tro.to, config.addressPrefix),   // Recipient address
+        am: normalizeHex(tro.am),     // Amount
         is: normalizeHex(tro.is)      // Signature
     };
-    if (isSingle) {
-        normalizedTro.to = addressToBuffer(tro.to, config.addressPrefix);   // Recipient address
-        normalizedTro.am = normalizeHex(tro.am);     // Amount
-    } else {
-        normalizedTro.bo = normalizeHex(tro.bo);     // Batch outputs
-        normalizedTro.ba = normalizeHex(tro.ba);     // Batch total amount
-    }
 
     return {
         type,

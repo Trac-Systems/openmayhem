@@ -1,6 +1,5 @@
 import b4a from 'b4a';
 import PeerWallet from 'trac-wallet';
-import tracCryptoApi from 'trac-crypto-api';
 import ReadyResource from 'ready-resource';
 
 export const MSB_OPERATION_TYPE = Object.freeze({
@@ -46,35 +45,17 @@ export class MsbClient extends ReadyResource {
         return b4a.isBuffer(buf) ? buf.toString('hex') : null;
     }
 
-    get channelUtf8() {
-        const channel = this.#msb.config.channel
-        if (b4a.isBuffer(channel)) return b4a.toString(channel, 'utf8');
-        return channel == null ? null : String(channel);
-    }
-
-    get dhtBootstrap() {
-        return Array.isArray(this.#msb.config.dhtBootstrap)
-            ? [...this.#msb.config.dhtBootstrap]
-            : [];
-    }
-
     async getTxvHex() {
         const txv = await this.#msb.state.getIndexerSequenceState();
         return txv.toString('hex');
     }
 
     pubKeyHexToAddress(pubKeyHex) {
-        const pubKey = b4a.from(pubKeyHex, 'hex');
-        if (typeof PeerWallet.encodeBech32mSafe === 'function') {
-            return PeerWallet.encodeBech32mSafe(this.addressPrefix, pubKey);
-        }
-        return tracCryptoApi.address.encode(this.addressPrefix, pubKey);
+        return PeerWallet.encodeBech32mSafe(this.addressPrefix, b4a.from(pubKeyHex, 'hex'));
     }
 
     addressToPubKeyHex(address) {
-        const decoded = typeof PeerWallet.decodeBech32mSafe === 'function'
-            ? PeerWallet.decodeBech32mSafe(address)
-            : tracCryptoApi.address.decode(address);
+        const decoded = PeerWallet.decodeBech32mSafe(address);
         return b4a.toString(decoded, 'hex');
     }
 

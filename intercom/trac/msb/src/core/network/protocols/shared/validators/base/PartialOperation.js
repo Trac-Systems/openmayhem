@@ -118,16 +118,6 @@ class PartialOperation {
                     OperationType.TX
                 ];
             case OperationType.TRANSFER:
-                if (operation.bo) {
-                    return [
-                        this.#config.networkId,
-                        operation.txv,
-                        operation.bo,
-                        operation.ba,
-                        operation.in,
-                        OperationType.TRANSFER
-                    ];
-                }
                 return [
                     this.#config.networkId,
                     operation.txv,

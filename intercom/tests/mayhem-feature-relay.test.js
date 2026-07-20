@@ -7,6 +7,8 @@ import { keccak256 } from 'ethereum-cryptography/keccak';
 import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import PeerWallet from 'trac-wallet';
 import {
+  CONTRACT_VERSION,
+  adminContractTxDigest,
   providerPayoutBindingMessage,
   providerPayoutTargetBindingMessage,
 } from '../contract/contract.js';
@@ -21,6 +23,8 @@ import MayhemFeature, {
 import {
   adminWriterDiagnostics,
   createServer,
+  getMayhemStatus,
+  getStatePrefix,
   loadPrivateInternalAuthSecret,
   requestStripeCheckout,
   requestStripeConnect,
@@ -30,6 +34,12 @@ import {
 const adminKey = 'aa'.repeat(32);
 const providerKey = 'bb'.repeat(32);
 const otherKey = 'cc'.repeat(32);
+const adminTxContext = Object.freeze({
+  contract_version: CONTRACT_VERSION,
+  msb_bootstrap: '22'.repeat(32),
+  network_id: 918,
+  subnet_bootstrap: '11'.repeat(32),
+});
 
 test('private Stripe auth secret loader uses Windows ACLs and rejects symlinks', () => {
   const secret = '11'.repeat(32);
@@ -127,6 +137,13 @@ const peerFor = (publicKey, { writable = false, bootstrap = '11'.repeat(32) } = 
         });
       },
     },
+    config: {
+      bootstrap: b4a.from(bootstrap, 'hex'),
+    },
+    msbClient: {
+      bootstrapHex: adminTxContext.msb_bootstrap,
+      networkId: adminTxContext.network_id,
+    },
     protocol: { instance: { features: {} } },
   };
   return { peer, state, appended, flushes };
@@ -208,6 +225,26 @@ const signedServiceValue = (signer, service, payload, transport = signer.wallet.
   return {
     ...envelope,
     signature: signer.wallet.sign(serviceSigningMessage(service, envelope)),
+  };
+};
+
+const signedAdminTxValue = async (
+  preparedCommand,
+  { nonce = '56'.repeat(32), sim = false, context = adminTxContext } = {}
+) => {
+  const unsigned = {
+    op: 'admin_contract_tx',
+    prepared_command: preparedCommand,
+    address: adminKey,
+    context,
+    nonce,
+    sim,
+  };
+  const tx = await adminContractTxDigest(unsigned);
+  return {
+    ...unsigned,
+    tx,
+    signature: fakeSignature(adminKey, b4a.from(tx, 'hex')),
   };
 };
 
@@ -1123,7 +1160,6 @@ test('read-only provider relay verifies an exact TAP wallet co-signature', async
 test('non-admin read-only transport relays a valid admin-signed tx without gaining writer authority', async () => {
   const workstation = peerFor(otherKey);
   const writer = peerFor(adminKey, { writable: true });
-  const submitted = [];
   const workstationFeature = new MayhemFeature(workstation.peer, {
     timeoutMs: 1_000,
     retryMs: 100,
@@ -1131,13 +1167,6 @@ test('non-admin read-only transport relays a valid admin-signed tx without gaini
   const writerFeature = new MayhemFeature(writer.peer, {
     timeoutMs: 1_000,
     retryMs: 100,
-    async adminTxHandler(value) {
-      if (!writer.peer.wallet.verify(value.signature, value.tx, value.address)) {
-        return { result: { error: { message: 'Invalid admin signature.' } } };
-      }
-      submitted.push(value);
-      return { result: { ok: true, accepted: true } };
-    },
   });
   workstationFeature.key = 'mayhem';
   writerFeature.key = 'mayhem';
@@ -1146,26 +1175,19 @@ test('non-admin read-only transport relays a valid admin-signed tx without gaini
   connect(workstation.peer, workstationFeature, writer.peer, writerFeature);
   connect(writer.peer, writerFeature, workstation.peer, workstationFeature);
 
-  const tx = '12'.repeat(32);
-  const value = {
-    op: 'admin_contract_tx',
-    tx,
-    prepared_command: {
-      type: 'setParams',
-      value: {
-        zeta: 'preserve-first',
-        op: 'set_params',
-        submitted_at: 90_000,
-        effective_at: 93_600,
-        values: { fee_bps: 1_500 },
-        alpha: 'preserve-last',
-      },
+  const preparedCommand = {
+    type: 'setParams',
+    value: {
+      zeta: 'preserve-first',
+      op: 'set_params',
+      submitted_at: 90_000,
+      effective_at: 93_600,
+      values: { fee_bps: 1_500 },
+      alpha: 'preserve-last',
     },
-    address: adminKey,
-    signature: fakeSignature(adminKey, tx),
-    nonce: '56'.repeat(32),
-    sim: false,
   };
+  const value = await signedAdminTxValue(preparedCommand);
+  const tx = value.tx;
   const key = `admin/contract-tx/${tx}`;
   const server = createServer(workstation.peer);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -1189,61 +1211,50 @@ test('non-admin read-only transport relays a valid admin-signed tx without gaini
   });
 
   assert.equal(first.ok, true);
-  assert.equal(first.status, 'submitted');
+  assert.equal(first.status, 'applied');
   assert.equal(first.relayed, true);
   assert.deepEqual(replay.result, first.result);
-  assert.equal(submitted.length, 1);
-  assert.deepEqual(submitted[0], {
-    tx,
-    prepared_command: value.prepared_command,
-    address: adminKey,
-    signature: value.signature,
-    nonce: value.nonce,
-    sim: false,
-  });
   assert.equal(
-    JSON.stringify(submitted[0].prepared_command),
+    JSON.stringify(writer.appended[0].value.dispatch.value.prepared_command),
     JSON.stringify(value.prepared_command),
     'prepared admin command key order must survive the relay unchanged'
   );
   assert.equal(workstation.appended.length, 0);
-  assert.equal(writer.appended.length, 0);
+  assert.equal(writer.appended.length, 1);
   assert.equal(workstation.peer.base.writable, false);
 
-  const capabilityTx = '78'.repeat(32);
-  const capability = await submitMayhemFeature(workstation.peer, {
-    feature: 'mayhem',
-    key: `admin/contract-tx/${capabilityTx}`,
-    value: {
-      ...value,
-      tx: capabilityTx,
-      prepared_command: { type: 'addWriter', value: { key: otherKey } },
-      signature: fakeSignature(adminKey, capabilityTx),
-      nonce: 'bc'.repeat(32),
-    },
-  });
-  assert.equal(capability.ok, true);
-  assert.equal(submitted.length, 2);
-  assert.deepEqual(submitted[1].prepared_command, {
-    type: 'addWriter',
-    value: { key: otherKey },
-  });
-  assert.equal(workstation.peer.base.writable, false);
-
-  const forgedTx = '9a'.repeat(32);
+  const forgedValue = await signedAdminTxValue(
+    preparedCommand,
+    { nonce: 'de'.repeat(32) }
+  );
   const forged = await submitMayhemFeature(workstation.peer, {
     feature: 'mayhem',
-    key: `admin/contract-tx/${forgedTx}`,
+    key: `admin/contract-tx/${forgedValue.tx}`,
     value: {
-      ...value,
-      tx: forgedTx,
-      signature: fakeSignature(otherKey, forgedTx),
-      nonce: 'de'.repeat(32),
+      ...forgedValue,
+      signature: fakeSignature(otherKey, b4a.from(forgedValue.tx, 'hex')),
     },
   });
   assert.equal(forged.ok, false);
-  assert.match(forged.message, /invalid admin signature/i);
-  assert.equal(submitted.length, 2);
+  assert.match(forged.message, /invalid admin contract transaction signature/i);
+  assert.equal(writer.appended.length, 1);
+  assert.equal(workstation.peer.base.writable, false);
+
+  const wrongNetwork = await signedAdminTxValue(preparedCommand, {
+    nonce: 'df'.repeat(32),
+    context: {
+      ...adminTxContext,
+      subnet_bootstrap: '99'.repeat(32),
+    },
+  });
+  const crossStoreReplay = await submitMayhemFeature(workstation.peer, {
+    feature: 'mayhem',
+    key: `admin/contract-tx/${wrongNetwork.tx}`,
+    value: wrongNetwork,
+  });
+  assert.equal(crossStoreReplay.ok, false);
+  assert.match(crossStoreReplay.message, /context does not match/i);
+  assert.equal(writer.appended.length, 1);
   assert.equal(workstation.peer.base.writable, false);
 });
 
@@ -1644,13 +1655,11 @@ test('poisoned relay service request is rejected locally and a retry still runs'
 
 test('admin-writer RPC keeps the local append path', async () => {
   const writer = peerFor(adminKey, { writable: true });
-  let appendCalls = 0;
+  let submitCalls = 0;
   writer.peer.protocol.instance.features.mayhem = {
-    async append() {
-      appendCalls += 1;
-      const hash = 'ef'.repeat(64);
-      writer.state.set(`fr/${hash}`, { status: 'applied', ok: true, result: { ok: true } });
-      return { hash };
+    async submit() {
+      submitCalls += 1;
+      return { status: 'applied', ok: true, result: { ok: true } };
     },
   };
 
@@ -1662,8 +1671,8 @@ test('admin-writer RPC keeps the local append path', async () => {
 
   assert.equal(result.ok, true);
   assert.equal(result.relayed, undefined);
-  assert.equal(appendCalls, 1);
-  assert.equal(writer.flushes.length, 1);
+  assert.equal(submitCalls, 1);
+  assert.equal(writer.flushes.length, 0);
 });
 
 test('admin writer diagnostics expose transition state without key material', () => {
@@ -1753,6 +1762,71 @@ test('admin writer diagnostics expose transition state without key material', ()
   assert.equal(report.local_writer.active_indexer, true);
   assert.deepEqual(report.apply_state.indexer_lengths, [4]);
   assert.doesNotMatch(JSON.stringify(report), new RegExp(adminKey));
+});
+
+test('Mayhem-owned RPC adapters expose canonical status and bounded prefix reads', async () => {
+  const entries = [
+    { key: 'price/a', value: { current: 1 } },
+    { key: 'price/b', value: { current: 2 } },
+  ];
+  const peer = {
+    wallet: { publicKey: adminKey },
+    writerLocalKey: otherKey,
+    config: {},
+    base: {
+      writable: true,
+      isIndexer: true,
+      key: b4a.from('11'.repeat(32), 'hex'),
+      view: {
+        core: { signedLength: 12, length: 13 },
+        async get(key) {
+          if (key === 'admin') return { value: adminKey };
+          if (key === 'chat_status') return { value: 'enabled' };
+          return null;
+        },
+        createReadStream({ gte, lt, limit }) {
+          assert.equal(gte, 'price/');
+          assert.equal(lt, 'price/\xff');
+          assert.equal(limit, 2);
+          return (async function* () {
+            yield* entries;
+          })();
+        },
+      },
+    },
+    msbClient: {
+      bootstrapHex: '22'.repeat(32),
+      networkId: 918,
+      pubKeyHexToAddress: () => 'trac1admin',
+      getSignedLength: () => 99,
+      getConnectedValidatorsCount: () => 2,
+    },
+  };
+  const status = await getMayhemStatus(peer, {
+    subnetBootstrapHex: '33'.repeat(32),
+    subnetChannelUtf8: '0000mayhem',
+    peerDhtBootstrap: ['peer.example:1'],
+    msbChannel: '0000msb',
+    msbDhtBootstrap: ['msb.example:2'],
+  });
+  assert.equal(status.peer.subnetBootstrapHex, '33'.repeat(32));
+  assert.equal(status.peer.subnetChannelUtf8, '0000mayhem');
+  assert.equal(status.peer.admin, adminKey);
+  assert.equal(status.msb.connectedValidators, 2);
+  assert.deepEqual(status.msb.dhtBootstrap, ['msb.example:2']);
+
+  assert.deepEqual(
+    await getStatePrefix(peer, 'price/', { confirmed: false, limit: 2 }),
+    {
+      prefix: 'price/',
+      confirmed: false,
+      values: entries,
+    }
+  );
+  await assert.rejects(
+    getStatePrefix(peer, 'price/', { confirmed: false, limit: 1001 }),
+    /integer from 1 to 1000/
+  );
 });
 
 test('an admin-added cross-signing writer still relays participant features to the admin appender', async () => {

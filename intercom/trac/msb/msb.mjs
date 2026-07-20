@@ -5,20 +5,6 @@ import { createConfig, ENV } from './src/config/env.js';
 const pearApp = typeof Pear !== 'undefined' ? (Pear.app ?? Pear.config) : undefined;
 const runtimeArgs = typeof process !== 'undefined' ? process.argv.slice(2) : [];
 const args = pearApp?.args ?? runtimeArgs;
-if (args[0] === '--transfer-helper') {
-    const { runTransferHelper } = await import('./src/transferHelper.js');
-    try {
-        const result = await runTransferHelper(args.slice(1));
-        console.log(JSON.stringify(result, null, 2));
-    } catch (error) {
-        console.error(error?.message ?? String(error));
-        if (typeof process !== 'undefined') {
-            process.exitCode = 1;
-        } else {
-            throw error;
-        }
-    }
-} else {
 const runRpc = args.includes('--rpc');
 const storeName = pearApp?.args?.[0] ?? runtimeArgs[0]
 
@@ -45,4 +31,3 @@ msb.ready().then(async () => {
         msb.interactiveMode();
     }
 });
-}

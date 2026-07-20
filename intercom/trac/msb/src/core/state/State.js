@@ -38,8 +38,6 @@ import {
     toTerm,
 } from './utils/balance.js';
 import { safeWriteUInt32BE } from '../../utils/buffer.js';
-import { bigIntTo16ByteBuffer, bufferToBigInt } from '../../utils/amountSerialization.js';
-import { decodeTransferBatchOutputs } from '../../utils/transferBatch.js';
 import deploymentEntryUtils from './utils/deploymentEntry.js';
 import { deepCopyBuffer } from '../../utils/buffer.js';
 import { Status } from './utils/transaction.js';
@@ -3011,24 +3009,14 @@ class State extends ReadyResource {
         };
 
         // recreate requester message
-        const isBatchTransfer = op.tro.bo !== undefined && op.tro.bo !== null;
-        const requesterMessage = isBatchTransfer
-            ? createMessage(
-                this.#config.networkId,
-                op.tro.txv,
-                op.tro.bo,
-                op.tro.ba,
-                op.tro.in,
-                OperationType.TRANSFER
-            )
-            : createMessage(
-                this.#config.networkId,
-                op.tro.txv,
-                op.tro.to,
-                op.tro.am,
-                op.tro.in,
-                OperationType.TRANSFER
-            );
+        const requesterMessage = createMessage(
+            this.#config.networkId,
+            op.tro.txv,
+            op.tro.to,
+            op.tro.am,
+            op.tro.in,
+            OperationType.TRANSFER
+        );
 
         if (requesterMessage.length === 0) {
             this.#safeLogApply(OperationType.TRANSFER, "Invalid requester message.", node.from.key)
@@ -3110,40 +3098,6 @@ class State extends ReadyResource {
             return Status.IGNORE;
         };
 
-        if (isBatchTransfer) {
-            const batchResult = await this.#batchTransfer(
-                requesterAddressString,
-                requesterAddressBuffer,
-                validatorAddressString,
-                validatorAddressBuffer,
-                validatorEntryBuffer,
-                op.tro.bo,
-                op.tro.ba,
-                batch,
-                node
-            );
-
-            if (batchResult === null) {
-                this.#safeLogApply(OperationType.TRANSFER, "Invalid batch transfer result.", node.from.key);
-                return Status.FAILURE;
-            }
-
-            if (batchResult === Status.IGNORE) {
-                this.#safeLogApply(OperationType.TRANSFER, "Batch transfer operation skipped.", node.from.key);
-                return Status.IGNORE;
-            };
-
-            for (const [address, entry] of batchResult.entries) {
-                await batch.put(address, entry);
-            }
-            await batch.put(hashHexString, node.value);
-
-            if (this.#config.enableTxApplyLogs) {
-                console.info(`Batch transfer operation: ${hashHexString} has been appended.`);
-            }
-            return Status.SUCCESS;
-        }
-
         // Check if recipient address is valid.
         const recipientAddressBuffer = op.tro.to;
         const recipientAddressString = addressUtils.bufferToAddress(recipientAddressBuffer, this.#config.addressPrefix);
@@ -3216,129 +3170,6 @@ class State extends ReadyResource {
             console.info(`Transfer operation: ${hashHexString} has been appended.`);
         }
         return Status.SUCCESS;
-    }
-
-    async #batchTransfer(senderAddressString, senderAddressBuffer, validatorAddressString, validatorAddressBuffer, validatorEntryBuffer, outputsBuffer, totalAmountBuffer, batch, node) {
-        if (!senderAddressString ||
-            !senderAddressBuffer ||
-            !validatorAddressString ||
-            !validatorAddressBuffer ||
-            !validatorEntryBuffer ||
-            !outputsBuffer ||
-            !totalAmountBuffer ||
-            !batch ||
-            !node
-        ) {
-            this.#safeLogApply(OperationType.TRANSFER, "Invalid batch transfer incoming data.", node.from.key)
-            return null;
-        }
-
-        let decoded;
-        try {
-            decoded = decodeTransferBatchOutputs(outputsBuffer, this.#config);
-        } catch (error) {
-            this.#safeLogApply(OperationType.TRANSFER, `Invalid batch transfer outputs: ${error.message}`, node.from.key)
-            return null;
-        }
-        if (!b4a.equals(decoded.totalAmount, totalAmountBuffer)) {
-            this.#safeLogApply(OperationType.TRANSFER, "Batch transfer total does not match outputs.", node.from.key)
-            return null;
-        }
-
-        const maxAmount = BigInt('0xffffffffffffffffffffffffffffffff');
-        const feeAmount = bufferToBigInt(transactionUtils.FEE);
-        const totalDeductedAmount = decoded.total + feeAmount;
-        if (totalDeductedAmount > maxAmount) {
-            this.#safeLogApply(OperationType.TRANSFER, "Invalid batch transfer total deducted amount.", node.from.key)
-            return null;
-        }
-
-        const senderEntryBuffer = await this.#getEntryApply(senderAddressString, batch);
-        if (senderEntryBuffer === null) {
-            this.#safeLogApply(OperationType.TRANSFER, "Invalid sender node entry buffer.", node.from.key)
-            return null;
-        }
-        const senderEntry = nodeEntryUtils.decode(senderEntryBuffer, this.#config.addressPrefix);
-        if (senderEntry === null) {
-            this.#safeLogApply(OperationType.TRANSFER, "Invalid sender node entry.", node.from.key)
-            return null;
-        }
-        const senderBalance = bufferToBigInt(senderEntry.balance);
-        if (senderBalance < totalDeductedAmount) {
-            this.#safeLogApply(OperationType.TRANSFER, "Insufficient sender balance.", node.from.key)
-            return Status.IGNORE;
-        }
-
-        const entries = new Map();
-        const setEntryBalance = (entryBuffer, amount) => {
-            if (amount < 0n || amount > maxAmount) return null;
-            return nodeEntryUtils.setBalance(b4a.from(entryBuffer), bigIntTo16ByteBuffer(amount));
-        };
-        const senderUpdated = setEntryBalance(senderEntryBuffer, senderBalance - totalDeductedAmount);
-        if (senderUpdated === null) {
-            this.#safeLogApply(OperationType.TRANSFER, "Failed to update sender node balance.", node.from.key)
-            return null;
-        }
-        entries.set(senderAddressString, senderUpdated);
-
-        const seenRecipients = new Set();
-        for (const output of decoded.outputs) {
-            if (output.to === senderAddressString) {
-                this.#safeLogApply(OperationType.TRANSFER, "Batch transfer self-recipient is not allowed.", node.from.key)
-                return null;
-            }
-            if (seenRecipients.has(output.to)) {
-                this.#safeLogApply(OperationType.TRANSFER, "Duplicate batch transfer recipient.", node.from.key)
-                return null;
-            }
-            seenRecipients.add(output.to);
-
-            const currentEntryBuffer = entries.get(output.to) ?? await this.#getEntryApply(output.to, batch);
-            if (currentEntryBuffer === null) {
-                const newRecipientEntry = nodeEntryUtils.init(
-                    ZERO_WK,
-                    nodeRoleUtils.NodeRole.READER,
-                    output.amountBuffer
-                );
-                if (newRecipientEntry.length === 0) {
-                    this.#safeLogApply(OperationType.TRANSFER, "Invalid recipient entry.", node.from.key)
-                    return null;
-                }
-                entries.set(output.to, newRecipientEntry);
-                continue;
-            }
-
-            const recipientEntry = nodeEntryUtils.decode(currentEntryBuffer, this.#config.addressPrefix);
-            if (recipientEntry === null) {
-                this.#safeLogApply(OperationType.TRANSFER, "Invalid recipient entry.", node.from.key)
-                return null;
-            }
-            const recipientBalance = bufferToBigInt(recipientEntry.balance);
-            const nextRecipientBalance = recipientBalance + output.amount;
-            const updatedRecipientEntry = setEntryBalance(currentEntryBuffer, nextRecipientBalance);
-            if (updatedRecipientEntry === null) {
-                this.#safeLogApply(OperationType.TRANSFER, "Failed to update recipient node balance.", node.from.key)
-                return null;
-            }
-            entries.set(output.to, updatedRecipientEntry);
-        }
-
-        const validatorReward = (feeAmount * 7_500n) / 10_000n;
-        const validatorCurrentEntryBuffer = entries.get(validatorAddressString) ?? validatorEntryBuffer;
-        const validatorEntry = nodeEntryUtils.decode(validatorCurrentEntryBuffer, this.#config.addressPrefix);
-        if (validatorEntry === null) {
-            this.#safeLogApply(OperationType.TRANSFER, "Invalid validator entry.", node.from.key)
-            return null;
-        }
-        const validatorBalance = bufferToBigInt(validatorEntry.balance);
-        const validatorUpdated = setEntryBalance(validatorCurrentEntryBuffer, validatorBalance + validatorReward);
-        if (validatorUpdated === null) {
-            this.#safeLogApply(OperationType.TRANSFER, "Failed to transfer fee to validator balance.", node.from.key)
-            return null;
-        }
-        entries.set(validatorAddressString, validatorUpdated);
-
-        return { entries };
     }
 
     async #transfer(senderAddressString, recipientAddressString, validatorAddressString, validatorEntryBuffer, transferAmountBuffer, feeAmountBuffer, isSelfTransfer, isRecipientValidator, batch, node) {

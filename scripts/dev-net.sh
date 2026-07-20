@@ -171,7 +171,6 @@ start_peer() {
     --headless 1
     --peer-interactive 0
     --peer-replicate 1
-    --peer-replicate-flush-timeout-ms "${MAYHEM_DEVNET_REPLICATE_FLUSH_TIMEOUT_MS:-5000}"
     --sidechannel-quiet 1
     --sc-bridge 1
     --sc-bridge-host 127.0.0.1
@@ -182,7 +181,6 @@ start_peer() {
     --rpc-host 127.0.0.1
     --rpc-port "$rpc_port"
     --api-tx-exposed 1
-    --api-tx-local-apply 1
   )
   if [[ "${SC_BRIDGE_DEBUG:-}" == "1" || "${SC_BRIDGE_DEBUG:-}" == "true" ]]; then
     args+=(--sc-bridge-debug 1)

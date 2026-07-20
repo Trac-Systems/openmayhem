@@ -23,28 +23,19 @@ class Feature {
         if(this.peer.base.writable){
             const nonce = this.peer.protocol.instance.generateNonce();
             const hash = this.peer.wallet.sign(JSON.stringify(value) + nonce);
-            const dispatch = {
-                type : this.key + '_feature',
-                key : key,
-                hash : hash,
-                value : value,
-                nonce : nonce,
-                address : this.peer.wallet.publicKey
-            };
             await this.peer.base.append({ type: 'feature', key: this.key + '_' + key, value : {
-                    dispatch
+                    dispatch : {
+                        type : this.key + '_feature',
+                        key : key,
+                        hash : hash,
+                        value : value,
+                        nonce : nonce,
+                        address : this.peer.wallet.publicKey
+                    }
                 }});
-            return {
-                feature : this.key,
-                key,
-                hash,
-                nonce,
-                address : this.peer.wallet.publicKey
-            };
         } else {
             console.log('Peer running features not writable.');
         }
-        return null;
     }
 
     async start(options = {}) {

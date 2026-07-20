@@ -23,6 +23,194 @@ expect_failure() {
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/mayhem-release-capabilities.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
+node - "$ROOT_DIR/intercom" <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+
+const root = path.resolve(process.argv[2]);
+const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
+const npmrc = fs.readFileSync(path.join(root, '.npmrc'), 'utf8');
+if (!/^\s*install-links\s*=\s*true\s*$/m.test(npmrc)) {
+  throw new Error('Intercom root npm config does not enable install-links');
+}
+if (manifest.dependencies?.['trac-wallet'] !== '1.0.1' ||
+    manifest.overrides?.['trac-wallet'] !== '1.0.1') {
+  throw new Error('Intercom root does not pin and override trac-wallet 1.0.1');
+}
+for (const [name, source] of [
+  ['trac-msb', 'trac/msb'],
+  ['trac-peer', 'trac/trac-peer'],
+]) {
+  const locked = lock.packages?.[`node_modules/${name}`];
+  if (manifest.dependencies?.[name] !== `file:${source}` ||
+      !locked ||
+      locked.link === true ||
+      locked.resolved !== `file:${source}`) {
+    throw new Error(`${name} is not a physical root-lock file dependency`);
+  }
+  if (Object.keys(lock.packages).some(
+    (entry) => entry === source || entry.startsWith(`${source}/`),
+  )) {
+    throw new Error(`${name} retains a source-owned lock subtree`);
+  }
+}
+const wallets = Object.entries(lock.packages)
+  .filter(([entry]) => entry === 'node_modules/trac-wallet' ||
+    entry.endsWith('/node_modules/trac-wallet'));
+if (wallets.length !== 1 ||
+    wallets[0][0] !== 'node_modules/trac-wallet' ||
+    wallets[0][1].version !== '1.0.1') {
+  throw new Error('root lock does not contain exactly one top-level trac-wallet 1.0.1');
+}
+NODE
+
+release_hydration="$(
+  sed -n '/^hydrate_intercom_runtime_tree() {/,/^}/p' \
+    "$ROOT_DIR/scripts/package-release.sh"
+)"
+[[ "$(grep -c 'npm ci' <<<"$release_hydration")" -eq 1 ]] ||
+  fail "release packaging does not use exactly one root Intercom npm ci"
+grep -F -- '--install-links=true' <<<"$release_hydration" >/dev/null ||
+  fail "release packaging does not force physical file dependencies"
+grep -F 'verify-intercom-dependency-topology.mjs' <<<"$release_hydration" >/dev/null ||
+  fail "release packaging does not verify the hydrated Intercom topology"
+grep -F 'materialize-local-dependencies.mjs' <<<"$release_hydration" >/dev/null ||
+  fail "release packaging does not restore exact pinned runtime files after npm packing"
+if grep -E 'trac-(msb|peer).*(npm ci)|local_package' \
+  <<<"$release_hydration" >/dev/null; then
+  fail "release packaging retains separate local-package hydration"
+fi
+
+topology="$tmp/intercom-topology"
+mkdir -p \
+  "$topology/trac/msb" \
+  "$topology/trac/trac-peer" \
+  "$topology/scripts" \
+  "$topology/node_modules/trac-msb" \
+  "$topology/node_modules/trac-peer" \
+  "$topology/node_modules/trac-wallet" \
+  "$topology/node_modules/wallet-consumer"
+printf 'install-links=true\n' >"$topology/.npmrc"
+cp \
+  "$ROOT_DIR/intercom/scripts/materialize-local-dependencies.mjs" \
+  "$topology/scripts/materialize-local-dependencies.mjs"
+cat >"$topology/package.json" <<'JSON'
+{
+  "name": "topology-root",
+  "version": "1.0.0",
+  "dependencies": {
+    "trac-msb": "file:trac/msb",
+    "trac-peer": "file:trac/trac-peer",
+    "trac-wallet": "1.0.1"
+  },
+  "overrides": {
+    "trac-wallet": "1.0.1"
+  }
+}
+JSON
+cat >"$topology/package-lock.json" <<'JSON'
+{
+  "name": "topology-root",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "packages": {
+    "": {
+      "name": "topology-root",
+      "version": "1.0.0"
+    },
+    "node_modules/trac-msb": {
+      "name": "trac-msb",
+      "version": "0.2.9",
+      "resolved": "file:trac/msb"
+    },
+    "node_modules/trac-peer": {
+      "name": "trac-peer",
+      "version": "0.4.0",
+      "resolved": "file:trac/trac-peer"
+    },
+    "node_modules/trac-wallet": {
+      "name": "trac-wallet",
+      "version": "1.0.1"
+    },
+    "node_modules/wallet-consumer": {
+      "name": "wallet-consumer",
+      "version": "1.0.0"
+    }
+  }
+}
+JSON
+cat >"$topology/trac/msb/package.json" <<'JSON'
+{"name":"trac-msb","version":"0.2.9","dependencies":{"trac-wallet":"1.0.1"}}
+JSON
+cat >"$topology/trac/trac-peer/package.json" <<'JSON'
+{"name":"trac-peer","version":"0.4.0","dependencies":{"trac-wallet":"^0.0.43"}}
+JSON
+cp "$topology/trac/msb/package.json" "$topology/node_modules/trac-msb/package.json"
+cp "$topology/trac/trac-peer/package.json" "$topology/node_modules/trac-peer/package.json"
+for relative in migration proto rpc src whitelist; do
+  mkdir -p \
+    "$topology/trac/msb/$relative" \
+    "$topology/node_modules/trac-msb/$relative"
+done
+printf 'fixture migration\n' >"$topology/trac/msb/migration/initial_balances.csv"
+cp \
+  "$topology/trac/msb/migration/initial_balances.csv" \
+  "$topology/node_modules/trac-msb/migration/initial_balances.csv"
+printf 'export {};\n' >"$topology/trac/msb/msb.mjs"
+cp "$topology/trac/msb/msb.mjs" "$topology/node_modules/trac-msb/msb.mjs"
+for relative in rpc src; do
+  mkdir -p \
+    "$topology/trac/trac-peer/$relative" \
+    "$topology/node_modules/trac-peer/$relative"
+done
+mkdir -p \
+  "$topology/trac/trac-peer/scripts" \
+  "$topology/node_modules/trac-peer/scripts"
+printf 'export {};\n' >"$topology/trac/trac-peer/scripts/run-peer.mjs"
+cp \
+  "$topology/trac/trac-peer/scripts/run-peer.mjs" \
+  "$topology/node_modules/trac-peer/scripts/run-peer.mjs"
+cat >"$topology/node_modules/trac-wallet/package.json" <<'JSON'
+{"name":"trac-wallet","version":"1.0.1","main":"index.js"}
+JSON
+printf 'module.exports = {};\n' >"$topology/node_modules/trac-wallet/index.js"
+cat >"$topology/node_modules/wallet-consumer/package.json" <<'JSON'
+{"name":"wallet-consumer","version":"1.0.0","optionalDependencies":{"trac-wallet":"*"}}
+JSON
+
+topology_output="$(
+  node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$topology"
+)"
+grep -F '4 wallet resolution contexts' <<<"$topology_output" >/dev/null ||
+  fail "topology verifier did not inspect every installed wallet declarer"
+
+rm "$topology/node_modules/trac-msb/migration/initial_balances.csv"
+expect_failure "topology verifier accepted an npm-omitted pinned MSB runtime file" \
+  node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$topology"
+node "$topology/scripts/materialize-local-dependencies.mjs" "$topology" >/dev/null
+
+mkdir "$topology/trac/msb/node_modules"
+expect_failure "topology verifier accepted source-owned dependencies" \
+  node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$topology"
+rmdir "$topology/trac/msb/node_modules"
+
+mkdir -p "$topology/node_modules/trac-peer/node_modules"
+cp -R \
+  "$topology/node_modules/trac-wallet" \
+  "$topology/node_modules/trac-peer/node_modules/trac-wallet"
+expect_failure "topology verifier accepted a nested trac-wallet" \
+  node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$topology"
+rm -rf "$topology/node_modules/trac-peer/node_modules"
+
+mv "$topology/node_modules/trac-peer" "$topology/trac-peer-installed"
+if ln -s ../trac-peer-installed "$topology/node_modules/trac-peer" 2>/dev/null; then
+  expect_failure "topology verifier accepted linked trac-peer" \
+    node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$topology"
+  rm "$topology/node_modules/trac-peer"
+fi
+mv "$topology/trac-peer-installed" "$topology/node_modules/trac-peer"
+
 work="$tmp/work"
 archive_root="mayhem-0.2.23-x86_64-pc-windows-msvc"
 mkdir -p "$work/$archive_root/bin"

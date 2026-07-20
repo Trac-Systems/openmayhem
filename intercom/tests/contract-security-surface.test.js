@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import test from 'node:test';
-import MayhemContract, { deriveRoomId } from '../contract/contract.js';
+import b4a from 'b4a';
+import MayhemContract, {
+  CONTRACT_VERSION,
+  adminContractTxDigest,
+  deriveRoomId,
+} from '../contract/contract.js';
 import {
   MemoryStorage,
   execute,
@@ -20,6 +25,21 @@ const rulesHash = '1'.repeat(64);
 const modelId = 'mayhem/security-review-model@q4';
 const enclaveId = '2'.repeat(64);
 const roomNonce = 'security-review-room';
+
+const adminFeatureOperation = (key, value, address, hash) => ({
+  type: 'feature',
+  key: `mayhem_${key}`,
+  value: {
+    dispatch: {
+      type: 'mayhem_feature',
+      key,
+      hash,
+      value,
+      nonce: '99'.repeat(32),
+      address,
+    },
+  },
+});
 
 const enclaveRegistration = {
   op: 'register_enclave',
@@ -513,4 +533,188 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
   assert.equal(price.value.current.set_by_role, 'admin');
   assert.equal(price.value.current.ver, 1);
   assert.equal((await storage.get(`serve/${provider.publicKey}/${enclaveId}`)).value.joined_at, makeTxKey(txNo));
+});
+
+test('admin feature transactions are deterministic, signed, replay-safe, and Mayhem-scoped', async () => {
+  const admin = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const context = {
+    contract_version: CONTRACT_VERSION,
+    msb_bootstrap: '77'.repeat(32),
+    network_id: 918,
+    subnet_bootstrap: '66'.repeat(32),
+  };
+  const contract = new MayhemContract(
+    {
+      peer: {
+        wallet: makeVerifier(admin.wallet),
+        base: { key: b4a.from(context.subnet_bootstrap, 'hex') },
+        config: { bootstrap: b4a.from(context.subnet_bootstrap, 'hex') },
+        msbClient: {
+          bootstrapHex: context.msb_bootstrap,
+          networkId: context.network_id,
+        },
+      },
+    },
+    {}
+  );
+  const preparedCommand = {
+    type: 'setRules',
+    value: {
+      op: 'set_rules',
+      ver: 1,
+      hash: rulesHash,
+    },
+  };
+  const nonce = '88'.repeat(32);
+  const unsigned = {
+    op: 'admin_contract_tx',
+    prepared_command: preparedCommand,
+    address: admin.publicKey,
+    context,
+    nonce,
+    sim: false,
+  };
+  const tx = await adminContractTxDigest(unsigned);
+  const value = {
+    ...unsigned,
+    tx,
+    signature: b4a.toString(admin.wallet.sign(b4a.from(tx, 'hex')), 'hex'),
+  };
+  const key = `admin/contract-tx/${tx}`;
+  const hash = 'ab'.repeat(64);
+
+  await contract.execute(
+    adminFeatureOperation(key, value, admin.publicKey, hash),
+    storage
+  );
+  const first = contract._mayhemLastFeatureResult;
+  assert.equal(first.ok, true);
+  assert.equal((await storage.get('rules/current')).value.ver, 1);
+  assert.equal((await storage.get(key)).value.tx, tx);
+  assert.equal((await storage.get(`fr/${hash}`)).value.status, 'applied');
+
+  await contract.execute(
+    adminFeatureOperation(key, value, admin.publicKey, hash),
+    storage
+  );
+  const replay = contract._mayhemLastFeatureResult;
+  assert.deepEqual(replay, first);
+
+  const tamperedHash = 'ac'.repeat(64);
+  await contract.execute(
+    adminFeatureOperation(
+      key,
+      {
+        ...value,
+        prepared_command: {
+          ...preparedCommand,
+          value: { ...preparedCommand.value, ver: 2 },
+        },
+      },
+      admin.publicKey,
+      tamperedHash
+    ),
+    storage
+  );
+  const tampered = contract._mayhemLastFeatureResult;
+  assert.match(tampered.message, /digest/i);
+  assert.equal((await storage.get(`fr/${tamperedHash}`)).value.status, 'rejected');
+  assert.equal(await storage.get('rules/2'), null);
+
+  const protocolCommand = {
+    type: 'addWriter',
+    value: { key: 'cd'.repeat(32) },
+  };
+  const protocolUnsigned = {
+    ...unsigned,
+    prepared_command: protocolCommand,
+    nonce: '89'.repeat(32),
+  };
+  const protocolTx = await adminContractTxDigest(protocolUnsigned);
+  await contract.execute(
+    adminFeatureOperation(
+      `admin/contract-tx/${protocolTx}`,
+      {
+        ...protocolUnsigned,
+        tx: protocolTx,
+        signature: b4a.toString(
+          admin.wallet.sign(b4a.from(protocolTx, 'hex')),
+          'hex'
+        ),
+      },
+      admin.publicKey,
+      'ad'.repeat(64)
+    ),
+    storage
+  );
+  const protocolResult = contract._mayhemLastFeatureResult;
+  assert.match(protocolResult.message, /registered Mayhem command/i);
+});
+
+test('rejected admin feature transactions cannot replay partial contract writes', async () => {
+  const admin = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const context = {
+    contract_version: CONTRACT_VERSION,
+    msb_bootstrap: '77'.repeat(32),
+    network_id: 918,
+    subnet_bootstrap: '66'.repeat(32),
+  };
+  const contract = new MayhemContract(
+    {
+      peer: {
+        wallet: makeVerifier(admin.wallet),
+        base: { key: b4a.from(context.subnet_bootstrap, 'hex') },
+        config: { bootstrap: b4a.from(context.subnet_bootstrap, 'hex') },
+        msbClient: {
+          bootstrapHex: context.msb_bootstrap,
+          networkId: context.network_id,
+        },
+      },
+    },
+    {}
+  );
+  let executions = 0;
+  contract.addFunction('partialAdminTest');
+  contract.partialAdminTest = async function () {
+    executions += 1;
+    await this.put('test/partial-admin-write', { executions });
+    return new Error('deliberate rejection after write');
+  };
+
+  const unsigned = {
+    op: 'admin_contract_tx',
+    prepared_command: {
+      type: 'partialAdminTest',
+      value: { test: true },
+    },
+    address: admin.publicKey,
+    context,
+    nonce: '91'.repeat(32),
+    sim: false,
+  };
+  const tx = await adminContractTxDigest(unsigned);
+  const value = {
+    ...unsigned,
+    tx,
+    signature: b4a.toString(admin.wallet.sign(b4a.from(tx, 'hex')), 'hex'),
+  };
+  const key = `admin/contract-tx/${tx}`;
+
+  await contract.execute(
+    adminFeatureOperation(key, value, admin.publicKey, 'ba'.repeat(64)),
+    storage
+  );
+  assert.equal(executions, 1);
+  assert.equal((await storage.get('test/partial-admin-write')).value.executions, 1);
+  assert.equal((await storage.get(key)).value.status, 'rejected');
+
+  await contract.execute(
+    adminFeatureOperation(key, value, admin.publicKey, 'bb'.repeat(64)),
+    storage
+  );
+  assert.equal(executions, 1);
+  assert.equal((await storage.get('test/partial-admin-write')).value.executions, 1);
+  assert.equal((await storage.get(`fr/${'bb'.repeat(64)}`)).value.status, 'rejected');
 });

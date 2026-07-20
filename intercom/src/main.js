@@ -5,7 +5,7 @@ import path from 'path';
 import crypto from 'crypto';
 import b4a from 'b4a';
 import PeerWallet from 'trac-wallet';
-import { Peer, createConfig as createPeerConfig, ENV as PEER_ENV } from 'trac-peer';
+import { Peer } from 'trac-peer';
 import {
   createServer as createRpcServer,
   loadPrivateInternalAuthSecret,
@@ -14,10 +14,14 @@ import { hydrateAdminWriterViews, joinCanonicalPeers } from './admin-view-hydrat
 import { installFatalRuntimeErrorPolicy } from './runtime-errors.js';
 import { verifyStartupReleaseIdentity } from './release-identity.js';
 import { MainSettlementBus } from 'trac-msb/src/index.js';
-import { createConfig as createMsbConfig, ENV as MSB_ENV } from 'trac-msb/src/config/env.js';
 import { ensureTextCodecs } from 'trac-peer/src/textCodec.js';
 import { getPearRuntime, ensureTrailingSlash } from 'trac-peer/src/runnerArgs.js';
 import { Terminal } from 'trac-peer/src/terminal/index.js';
+import {
+  createMayhemMsbConfig,
+  createMayhemPeerConfig,
+  MAYHEM_NETWORK_ENV,
+} from './network-config.js';
 import Sidechannel from '../features/sidechannel/index.js';
 import DirectSession from '../features/direct-session/index.js';
 import InferenceRelay from '../features/inference-relay/index.js';
@@ -669,18 +673,11 @@ const networkEnv = normalizeNetworkEnv(
     ''
 );
 
-const msbEnvironment = {
-  mainnet: MSB_ENV.MAINNET,
-  local: MSB_ENV.DEVELOPMENT,
-  development: MSB_ENV.DEVELOPMENT,
-  testnet1: MSB_ENV.TESTNET1,
-}[networkEnv];
-const peerEnvironment = {
-  mainnet: PEER_ENV.MAINNET,
-  local: PEER_ENV.DEVELOPMENT,
-  development: PEER_ENV.DEVELOPMENT,
-  testnet1: PEER_ENV.TESTNET1,
-}[networkEnv];
+const contractNetworkEnvironment = networkEnv === 'mainnet'
+  ? MAYHEM_NETWORK_ENV.MAINNET
+  : networkEnv === 'testnet1'
+    ? MAYHEM_NETWORK_ENV.TESTNET1
+    : MAYHEM_NETWORK_ENV.DEVELOPMENT;
 
 const headless = parseBool(flagValue('headless', env.MAYHEM_HEADLESS || ''), false);
 const peerInteractive = parseBool(
@@ -698,10 +695,6 @@ const peerUpdater = parseBool(
 const peerReplicate = parseBool(
   flagValue('peer-replicate', env.PEER_REPLICATE || ''),
   true
-);
-const peerReplicateFlushTimeoutMs = parseInteger(
-  flagValue('peer-replicate-flush-timeout-ms', env.PEER_REPLICATE_FLUSH_TIMEOUT_MS || ''),
-  headless ? 5_000 : 0
 );
 const peerDirectPeers = parseCsvList(
   flagValue('peer-direct-peer', env.PEER_DIRECT_PEERS || '')
@@ -1147,13 +1140,6 @@ const apiTxExposed = parseBool(
     '',
   false
 );
-const apiTxLocalApply = parseBool(
-  (flags['api-tx-local-apply'] && String(flags['api-tx-local-apply'])) ||
-    env.PEER_API_TX_LOCAL_APPLY ||
-    '',
-  false
-);
-
 if (scBridgeEnabled && !scBridgeToken) {
   throw new Error(
     'SC-Bridge requires --sc-bridge-token or --sc-bridge-token-file (auth is mandatory).'
@@ -1252,7 +1238,7 @@ if (subnetBootstrap) {
   subnetBootstrap = readHexFile(subnetBootstrapFile, 32);
 }
 
-const msbConfig = createMsbConfig(msbEnvironment, {
+const msbConfig = createMayhemMsbConfig(contractNetworkEnvironment, {
   storeName: msbStoreName,
   storesDirectory: msbStoresDirectory,
   enableInteractiveMode: false,
@@ -1267,7 +1253,7 @@ if (subnetBootstrap && subnetBootstrap === msbBootstrapHex) {
   throw new Error('Subnet bootstrap cannot equal MSB bootstrap.');
 }
 
-const peerConfig = createPeerConfig(peerEnvironment, {
+const peerConfig = createMayhemPeerConfig(contractNetworkEnvironment, {
   storesDirectory: peerStoresDirectory,
   storeName: peerStoreName,
   bootstrap: subnetBootstrap || null,
@@ -1276,9 +1262,7 @@ const peerConfig = createPeerConfig(peerEnvironment, {
   enableBackgroundTasks: peerBackgroundTasks,
   enableUpdater: peerUpdater,
   replicate: peerReplicate,
-  replicateFlushTimeoutMs: peerReplicateFlushTimeoutMs,
   apiTxExposed,
-  apiTxLocalApply,
   ...(peerDhtBootstrap ? { dhtBootstrap: peerDhtBootstrap } : {}),
 });
 
@@ -1406,7 +1390,6 @@ console.log('Mayhem relay max bytes:', mayhemRelayMaxMessageBytes);
 console.log('Headless:', headless);
 console.log('Peer interactive:', peerInteractive);
 console.log('Peer replicate:', peerReplicate);
-console.log('Peer replicate flush timeout ms:', peerReplicateFlushTimeoutMs);
 if (sidechannelExtras.length > 0) {
   console.log('Sidechannel extras:', sidechannelExtras.join(', '));
 }
@@ -1586,6 +1569,13 @@ if (rpcEnabled) {
     maxBodyBytes: rpcMaxBodyBytes,
     allowOrigin: rpcAllowOrigin,
     releaseIdentity,
+    statusMetadata: {
+      subnetBootstrapHex: effectiveSubnetBootstrapHex,
+      subnetChannelUtf8: subnetChannel,
+      peerDhtBootstrap: peerConfig.dhtBootstrap,
+      msbChannel,
+      msbDhtBootstrap: msbConfig.dhtBootstrap,
+    },
   });
   rpcServer.listen(rpcPort, rpcHost, () => {
     console.log('RPC: ready', `http://${rpcHost}:${rpcPort}/v1`);

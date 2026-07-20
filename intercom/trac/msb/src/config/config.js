@@ -10,16 +10,7 @@ export class Config {
         this.#validate(options, config)
         this.#options = options
         this.#config = config
-        const bootstrap = this.#options.bootstrap || this.#config.bootstrap
-        if (b4a.isBuffer(bootstrap) && bootstrap.length === 32) {
-            this.#bootstrap = bootstrap
-        } else if (typeof bootstrap === 'string' && /^[0-9a-fA-F]{64}$/.test(bootstrap)) {
-            this.#bootstrap = b4a.from(bootstrap, 'hex')
-        } else {
-            throw new Error(
-                "MainSettlementBus: Bootstrap is required. Provide a 32-byte hex --msb-bootstrap for networks without a compiled default."
-            );
-        }
+        this.#bootstrap = b4a.from(this.#options.bootstrap || this.#config.bootstrap, 'hex')
         // Ensure a 32-byte channel buffer (repeat-fill from string/Buffer if provided)
         this.#channel = b4a.alloc(32).fill(this.#options.channel || this.#config.channel)
     }

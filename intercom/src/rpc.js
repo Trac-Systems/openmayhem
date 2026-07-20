@@ -1,12 +1,88 @@
 import http from 'http';
+import b4a from 'b4a';
 import { applyCors } from '../trac/trac-peer/rpc/cors.js';
 import { DEFAULT_MAX_BODY_BYTES } from '../trac/trac-peer/rpc/constants.js';
 import { routes } from '../trac/trac-peer/rpc/routes/index.js';
-import { contractFeature } from '../trac/trac-peer/rpc/services.js';
 import { readJsonBody } from '../trac/trac-peer/rpc/utils/body.js';
 
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const normalizeKey = (value) => String(value ?? '').trim().toLowerCase();
+
+const stateView = (peer, confirmed) => {
+  if (!peer.base?.view) throw new Error('Peer view not ready.');
+  if (!confirmed) return { view: peer.base.view, close: async () => {} };
+  const view = peer.base.view.checkout(peer.base.view.core.signedLength);
+  return { view, close: async () => view.close() };
+};
+
+export async function getStatePrefix(peer, prefix, { confirmed = true, limit = 500 } = {}) {
+  const normalizedPrefix = String(prefix ?? '');
+  if (!normalizedPrefix) throw new Error('Missing prefix.');
+  if (normalizedPrefix.length > 256) throw new Error('Prefix is too long.');
+  const normalizedLimit = Number(limit);
+  if (!Number.isInteger(normalizedLimit) || normalizedLimit < 1 || normalizedLimit > 1000) {
+    throw new Error('Invalid limit. Expected an integer from 1 to 1000.');
+  }
+
+  const session = stateView(peer, confirmed);
+  const values = [];
+  try {
+    const stream = session.view.createReadStream({
+      gte: normalizedPrefix,
+      lt: `${normalizedPrefix}\xff`,
+      limit: normalizedLimit,
+    });
+    for await (const entry of stream) {
+      values.push({ key: entry.key, value: entry.value });
+    }
+  } finally {
+    await session.close();
+  }
+  return { prefix: normalizedPrefix, confirmed, values };
+}
+
+export async function getMayhemStatus(peer, metadata = {}) {
+  const peerMsbAddress = peer.msbClient.pubKeyHexToAddress(peer.wallet.publicKey);
+  const admin = peer.base?.view ? await peer.base.view.get('admin') : null;
+  const chatStatus = peer.base?.view ? await peer.base.view.get('chat_status') : null;
+  const fallbackBootstrap = peer.base?.key ?? peer.config?.bootstrap ?? peer.bootstrap;
+  const subnetBootstrapHex = metadata.subnetBootstrapHex ??
+    (b4a.isBuffer(fallbackBootstrap)
+      ? b4a.toString(fallbackBootstrap, 'hex')
+      : fallbackBootstrap != null
+        ? String(fallbackBootstrap)
+        : null);
+  return {
+    peer: {
+      pubKeyHex: peer.wallet?.publicKey ?? null,
+      writerKeyHex: peer.writerLocalKey ?? null,
+      msbAddress: peerMsbAddress,
+      baseWritable: peer.base?.writable === true,
+      isIndexer: peer.base?.isIndexer === true,
+      isWriter: peer.base?.writable === true,
+      subnetBootstrapHex,
+      subnetChannelUtf8: metadata.subnetChannelUtf8 ?? peer.config?.channelName ?? null,
+      dhtBootstrap: Array.isArray(metadata.peerDhtBootstrap)
+        ? metadata.peerDhtBootstrap
+        : Array.isArray(peer.config?.dhtBootstrap)
+          ? peer.config.dhtBootstrap
+          : [],
+      subnetSignedLength: peer.base?.view?.core?.signedLength ?? null,
+      subnetUnsignedLength: peer.base?.view?.core?.length ?? null,
+      admin: admin?.value ?? null,
+      chatStatus: chatStatus?.value ?? null,
+    },
+    msb: {
+      ready: true,
+      bootstrapHex: peer.msbClient.bootstrapHex,
+      channel: metadata.msbChannel ?? null,
+      networkId: peer.msbClient.networkId,
+      signedLength: peer.msbClient.getSignedLength(),
+      connectedValidators: peer.msbClient.getConnectedValidatorsCount?.() ?? 0,
+      dhtBootstrap: Array.isArray(metadata.msbDhtBootstrap) ? metadata.msbDhtBootstrap : [],
+    },
+  };
+}
 
 export const loadPrivateInternalAuthSecret = ({
   fsModule,
@@ -147,15 +223,16 @@ export async function submitMayhemFeature(peer, body) {
   if (!isObject(body.value)) throw new Error('Invalid value. Expected an object.');
 
   const registered = peer.protocol?.instance?.features?.[feature];
-  if (!registered || typeof registered.append !== 'function') {
-    throw new Error(`Invalid feature ${feature}.`);
-  }
+  if (!registered) throw new Error(`Invalid feature ${feature}.`);
 
   const admin = await peer.base?.view?.get('admin');
   const adminKey = normalizeKey(admin?.value);
   const selfKey = normalizeKey(peer.wallet?.publicKey);
   const isAdminWriter = peer.base?.writable === true && (!adminKey || adminKey === selfKey);
   if (isAdminWriter) {
+    if (typeof registered.submit !== 'function') {
+      throw new Error(`Invalid feature ${feature}.`);
+    }
     const watchdog = setTimeout(() => {
       console.error(
         'Mayhem admin feature append stalled:',
@@ -163,9 +240,7 @@ export async function submitMayhemFeature(peer, body) {
       );
     }, 5_000);
     try {
-      const result = await contractFeature(peer, { feature, key, value: body.value });
-      await peer.base.append(null);
-      return result;
+      return await registered.submit(key, body.value);
     } finally {
       clearTimeout(watchdog);
     }
@@ -225,6 +300,7 @@ export const createServer = (
     maxBodyBytes = DEFAULT_MAX_BODY_BYTES,
     allowOrigin = '*',
     releaseIdentity,
+    statusMetadata = {},
   } = {}
 ) => {
   const sortedRoutes = [...routes].sort((a, b) => b.path.length - a.path.length);
@@ -253,6 +329,24 @@ export const createServer = (
           contract_version: releaseIdentity.contractVersion,
           contract_code_sha256: releaseIdentity.contractCodeSha256,
         });
+      }
+      if (req.method === 'GET' && requestPath === '/v1/status') {
+        return respond(200, await getMayhemStatus(peer, statusMetadata));
+      }
+      if (req.method === 'GET' && requestPath === '/v1/state') {
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.searchParams.has('prefix')) {
+          const confirmed = url.searchParams.get('confirmed');
+          const confirmedBool = confirmed == null ? true : confirmed === 'true';
+          const limit = url.searchParams.get('limit') ?? 500;
+          return respond(
+            200,
+            await getStatePrefix(peer, url.searchParams.get('prefix'), {
+              confirmed: confirmedBool,
+              limit,
+            })
+          );
+        }
       }
       if (req.method === 'POST' && requestPath === '/v1/contract/feature') {
         const body = await readJsonBody(req, { maxBytes: maxBodyBytes });

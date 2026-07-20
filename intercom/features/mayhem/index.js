@@ -5,9 +5,10 @@ import { blake3 } from '@tracsystems/blake3';
 import { keccak256 } from 'ethereum-cryptography/keccak';
 import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import PeerWallet from 'trac-wallet';
-import { contractTx } from '../../trac/trac-peer/rpc/services.js';
 import {
+  CONTRACT_VERSION,
   PAYOUT_INTENT_MAX_EXPIRY_EPOCHS_DEFAULT,
+  adminContractTxDigest,
   providerPayoutBindingMessage,
   providerPayoutTargetBindingMessage,
 } from '../../contract/contract.js';
@@ -235,7 +236,14 @@ class MayhemFeature extends Feature {
     this.serviceHandler = typeof config.serviceHandler === 'function' ? config.serviceHandler : null;
     this.adminTxHandler = typeof config.adminTxHandler === 'function'
       ? config.adminTxHandler
-      : async (value) => await contractTx(this.peer, value);
+      : async (value) => {
+          const result = await this.peer.protocol.instance.simulateTransaction(
+            '0'.repeat(64),
+            value.prepared_command,
+            { address: value.address }
+          );
+          return { result };
+        };
     this.pending = new Map();
     this.processed = new Map();
     this.servicePending = new Map();
@@ -244,7 +252,67 @@ class MayhemFeature extends Feature {
   }
 
   async record(key, value) {
-    return await this.append(key, value);
+    return await this.submit(key, value);
+  }
+
+  async submit(key, value, { nonce = null } = {}) {
+    const admin = await this._adminKey();
+    const self = normalizeKey(this.peer?.wallet?.publicKey);
+    if (!this.peer.base?.writable || !admin || self !== admin) {
+      throw new Error('Peer subnet is not the canonical writable admin.');
+    }
+    if (value?.op === 'admin_contract_tx') {
+      const validationError = await this._validateAdminTx(key, value);
+      if (validationError) {
+        return {
+          ok: false,
+          accepted: false,
+          status: 'rejected',
+          message: validationError,
+        };
+      }
+      if (value.sim) return await this._simulateAdminTx(value);
+    }
+
+    const featureNonce = nonce ??
+      this.peer.protocol.instance.generateNonce?.() ??
+      crypto.randomBytes(32).toString('hex');
+    const hash = this.peer.wallet.sign(`${JSON.stringify(value)}${featureNonce}`);
+    const resultKey = `fr/${hash}`;
+    const previousResult = (await this.peer.base.view.get(resultKey))?.value ?? null;
+    if (previousResult?.ok === true) {
+      return this._featureResponse(key, hash, resultKey, previousResult);
+    }
+    await this.peer.base.append({
+      type: 'feature',
+      key: `${this.key}_${key}`,
+      value: {
+        dispatch: {
+          type: `${this.key}_feature`,
+          key,
+          hash,
+          value,
+          nonce: featureNonce,
+          address: this.peer.wallet.publicKey,
+        },
+      },
+    });
+    await this.peer.base.append(null);
+    const featureResult =
+      (await this._waitForResult(resultKey, this.resultTimeoutMs, previousResult)) ?? previousResult;
+    if (!featureResult) {
+      return {
+        ok: false,
+        accepted: true,
+        status: 'pending',
+        feature: this.key,
+        key,
+        hash,
+        message: 'Feature append was accepted but no applied result appeared before timeout.',
+        result_key: resultKey,
+      };
+    }
+    return this._featureResponse(key, hash, resultKey, featureResult);
   }
 
   isRelayMessage(payload) {
@@ -912,46 +980,22 @@ class MayhemFeature extends Feature {
     if (value?.op === 'admin_contract_tx') {
       return await this._applyRelayedAdminTx(key, value, requestId);
     }
-    const nonce = requestId;
-    const hash = this.peer.wallet.sign(`${JSON.stringify(value)}${nonce}`);
-    const resultKey = `fr/${hash}`;
-    const previousResult = (await this.peer.base.view.get(resultKey))?.value ?? null;
-    if (previousResult?.ok === true) {
-      return this._featureResponse(key, hash, resultKey, previousResult);
-    }
-    await this.peer.base.append({
-      type: 'feature',
-      key: `${this.key}_${key}`,
-      value: {
-        dispatch: {
-          type: `${this.key}_feature`,
-          key,
-          hash,
-          value,
-          nonce,
-          address: this.peer.wallet.publicKey,
-        },
-      },
-    });
-    await this.peer.base.append(null);
-    const featureResult =
-      (await this._waitForResult(resultKey, this.resultTimeoutMs, previousResult)) ?? previousResult;
-    if (!featureResult) {
-      return {
-        ok: false,
-        accepted: true,
-        status: 'pending',
-        feature: this.key,
-        key,
-        hash,
-        message: 'Feature append was accepted but no applied result appeared before timeout.',
-        result_key: resultKey,
-      };
-    }
-    return this._featureResponse(key, hash, resultKey, featureResult);
+    return await this.submit(key, value, { nonce: requestId });
   }
 
   async _applyRelayedAdminTx(key, value, requestId) {
+    const validationError = await this._validateAdminTx(key, value);
+    if (validationError) return relayError(validationError, requestId);
+    if (!value.sim) return await this.submit(key, value, { nonce: requestId });
+    const response = await this._simulateAdminTx(value);
+    return {
+      ...response,
+      relayed: true,
+      request_id: requestId,
+    };
+  }
+
+  async _validateAdminTx(key, value) {
     const allowed = new Set([
       'op',
       'tx',
@@ -960,6 +1004,7 @@ class MayhemFeature extends Feature {
       'signature',
       'nonce',
       'sim',
+      'context',
     ]);
     if (
       !value ||
@@ -968,7 +1013,7 @@ class MayhemFeature extends Feature {
       Object.keys(value).some((field) => !allowed.has(field)) ||
       [...allowed].some((field) => !Object.hasOwn(value, field))
     ) {
-      return relayError('Invalid relayed admin contract transaction.', requestId);
+      return 'Invalid relayed admin contract transaction.';
     }
     const admin = await this._adminKey();
     if (
@@ -982,33 +1027,71 @@ class MayhemFeature extends Feature {
       Array.isArray(value.prepared_command) ||
       typeof value.prepared_command.type !== 'string' ||
       !Object.hasOwn(value.prepared_command, 'value') ||
+      !value.context ||
+      typeof value.context !== 'object' ||
+      Array.isArray(value.context) ||
+      JSON.stringify(Object.keys(value.context).sort()) !== JSON.stringify([
+        'contract_version',
+        'msb_bootstrap',
+        'network_id',
+        'subnet_bootstrap',
+      ]) ||
       key !== `admin/contract-tx/${value.tx}`
     ) {
-      return relayError('Invalid relayed admin contract transaction.', requestId);
+      return 'Invalid relayed admin contract transaction.';
     }
+    const configuredBootstrap = this.peer?.config?.bootstrap;
+    const subnetBootstrap = b4a.isBuffer(configuredBootstrap)
+      ? b4a.toString(configuredBootstrap, 'hex')
+      : typeof configuredBootstrap === 'string' && configuredBootstrap
+        ? configuredBootstrap.toLowerCase()
+        : b4a.isBuffer(this.peer?.base?.key)
+          ? b4a.toString(this.peer.base.key, 'hex')
+          : '';
+    const runtimeContext = {
+      contract_version: CONTRACT_VERSION,
+      msb_bootstrap: String(this.peer?.msbClient?.bootstrapHex ?? '').toLowerCase(),
+      network_id: this.peer?.msbClient?.networkId,
+      subnet_bootstrap: subnetBootstrap,
+    };
+    if (stableJson(value.context) !== stableJson(runtimeContext)) {
+      return 'Admin contract transaction context does not match this contract network.';
+    }
+    const expectedTx = await adminContractTxDigest(value);
+    if (expectedTx !== value.tx) {
+      return 'Invalid admin contract transaction digest.';
+    }
+    if (!this.peer.wallet.verify(
+      value.signature,
+      b4a.from(value.tx, 'hex'),
+      value.address
+    )) {
+      return 'Invalid admin contract transaction signature.';
+    }
+    return null;
+  }
+
+  async _simulateAdminTx(value) {
     const submitted = await this.adminTxHandler({
       tx: value.tx,
       prepared_command: value.prepared_command,
-      address: admin,
+      address: value.address,
       signature: value.signature,
       nonce: value.nonce,
-      sim: value.sim,
+      sim: true,
     });
     const result = submitted?.result ?? submitted;
     const explicitSuccess = result?.ok === true ||
       (result?.local === true && result?.txo !== undefined);
     if (!explicitSuccess || result?.error) {
       return relayError(
-        result?.error?.message ?? 'Admin contract transaction was rejected.',
-        requestId
+        result?.error?.message ?? 'Admin contract transaction was rejected.'
       );
     }
     return {
       ok: true,
       accepted: true,
-      status: value.sim ? 'simulated' : 'submitted',
-      relayed: true,
-      request_id: requestId,
+      status: 'simulated',
       tx: value.tx,
       result,
     };

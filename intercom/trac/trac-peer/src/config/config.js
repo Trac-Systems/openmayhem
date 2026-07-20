@@ -78,23 +78,10 @@ export class Config {
         }
         this.replicate = replicateRaw !== false;
 
-        const replicateFlushTimeoutMsRaw = this.#select("replicateFlushTimeoutMs", options, defaults);
-        if (replicateFlushTimeoutMsRaw === undefined || replicateFlushTimeoutMsRaw === null) {
-            this.replicateFlushTimeoutMs = 0;
-        } else if (
-            !Number.isSafeInteger(replicateFlushTimeoutMsRaw) ||
-            replicateFlushTimeoutMsRaw < 0
-        ) {
-            throw new Error("Peer: replicateFlushTimeoutMs must be a non-negative safe integer.");
-        } else {
-            this.replicateFlushTimeoutMs = replicateFlushTimeoutMsRaw;
-        }
-
         const channelRaw = this.#select("channel", options, defaults);
         if (channelRaw === null || channelRaw === undefined || channelRaw === "") {
             throw new Error("Peer: channel is required.");
         }
-        this.channelName = String(channelRaw);
         this.channel = b4a.alloc(32).fill(channelRaw);
 
         const dhtBootstrap = this.#select("dhtBootstrap", options, defaults);
@@ -115,9 +102,6 @@ export class Config {
             throw new Error("Peer: apiTxExposed must be set.");
         }
         this.apiTxExposed = apiTxExposedRaw === true;
-
-        const apiTxLocalApplyRaw = this.#select("apiTxLocalApply", options, defaults);
-        this.apiTxLocalApply = apiTxLocalApplyRaw === true;
 
         const apiMsgExposedRaw = this.#select("apiMsgExposed", options, defaults);
         if (apiMsgExposedRaw === undefined) {

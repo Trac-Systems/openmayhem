@@ -36,7 +36,6 @@ class Check {
             messages: {
                 buffer: "The '{field}' field must be a Buffer! Actual: {actual}",
                 bufferLength: "The '{field}' field must be a Buffer with length {expected}! Actual: {actual}",
-                bufferMinLength: "The '{field}' field must be a Buffer with length at least {expected}! Actual: {actual}",
                 nonZeroBuffer: "The '{field}' field must not be an empty or zero-filled Buffer!",
                 emptyBuffer: "The '{field}' field must not be an empty Buffer!",
             },
@@ -68,26 +67,6 @@ class Check {
                                 ${this.makeError({ type: "emptyBuffer", actual: "value", messages })}
                             }
                             return value;
-                    `
-            };
-        });
-
-        this.#validator.add("buffer_min", function ({ schema, messages }, path, context) {
-            return {
-                source:
-                    `
-                        if (!${isBuffer}(value)) {
-                            ${this.makeError({ type: "buffer", actual: "value", messages })}
-                        }
-                        if (value.length < ${schema.min}) {
-                            ${this.makeError({
-                        type: "bufferMinLength",
-                        expected: schema.min,
-                        actual: "value.length",
-                        messages
-                    })}
-                        }
-                        return value;
                     `
             };
         });
@@ -498,34 +477,21 @@ class Check {
                 props: {
                     tx: { type: 'buffer', length: HASH_BYTE_LENGTH, required: true }, // tx hash
                     txv: { type: 'buffer', length: HASH_BYTE_LENGTH, required: true }, // tx validity
-                    to: { type: 'buffer', length: this.#config.addressLength, optional: true }, // recipient address
-                    am: { type: 'buffer_amount', length: AMOUNT_BYTE_LENGTH, optional: true }, // amount to transfer
+                    to: { type: 'buffer', length: this.#config.addressLength, required: true }, // recipient address
+                    am: { type: 'buffer_amount', length: AMOUNT_BYTE_LENGTH, required: true }, // amount to transfer
                     in: { type: 'buffer', length: NONCE_BYTE_LENGTH, required: true }, // nonce of the invoker
                     is: { type: 'buffer', length: SIGNATURE_BYTE_LENGTH, required: true }, // signature of the invoker
                     va: { type: 'buffer', length: this.#config.addressLength, optional: true },  // validator address
                     vn: { type: 'buffer', length: NONCE_BYTE_LENGTH, optional: true },  // validator nonce
-                    vs: { type: 'buffer', length: SIGNATURE_BYTE_LENGTH, optional: true }, // validator signature
-                    bo: { type: 'buffer_min', min: 1, optional: true }, // batch outputs
-                    ba: { type: 'buffer_amount', length: AMOUNT_BYTE_LENGTH, optional: true } // batch total amount
+                    vs: { type: 'buffer', length: SIGNATURE_BYTE_LENGTH, optional: true } // validator signature
 
                 },
                 custom: (value, errors) => {
                     if (!value || typeof value !== 'object') return value;
-                    const { vn, vs, va, to, am, bo, ba } = value;
-                    const isPresent = (field) => field !== undefined && field !== null;
-                    const vnPresent = isPresent(vn)
-                    const vsPresent = isPresent(vs)
-                    const vaPresent = isPresent(va)
-                    const singleFields = [isPresent(to), isPresent(am)].filter(Boolean).length;
-                    const batchFields = [isPresent(bo), isPresent(ba)].filter(Boolean).length;
-
-                    if (!((singleFields === 2 && batchFields === 0) || (singleFields === 0 && batchFields === 2))) {
-                        errors.push({
-                            type: 'conditionalDependency',
-                            field: 'tro',
-                            message: 'Transfer must include either "to" + "am" or "bo" + "ba"'
-                        });
-                    }
+                    const { vn, vs, va } = value;
+                    const vnPresent = vn !== undefined
+                    const vsPresent = vs !== undefined
+                    const vaPresent = va !== undefined
 
                     const fieldsPresent = [vnPresent, vsPresent, vaPresent].filter(Boolean).length;
 
@@ -557,3 +523,4 @@ class Check {
 }
 
 export default Check;
+

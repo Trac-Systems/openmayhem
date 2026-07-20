@@ -158,29 +158,6 @@ class ApplyStateMessageDirector {
     }
 
     /**
-     * Build a partial batch transfer payload.
-     * @param {string|Buffer} invokerAddress
-     * @param {string|Buffer} batchOutputs
-     * @param {string|Buffer} batchAmount
-     * @param {string|Buffer} txValidity
-     * @param {'json'|'buffer'} output
-     * @returns {Promise<object>}
-     */
-    async buildPartialBatchTransferOperationMessage(invokerAddress, batchOutputs, batchAmount, txValidity, output) {
-        if (!this.#builder) throw new Error('Builder has not been set.');
-        await this.#builder
-            .setPhase('partial')
-            .setOutput(output)
-            .setOperationType(OperationType.TRANSFER)
-            .setAddress(invokerAddress)
-            .setTxValidity(txValidity)
-            .setBatchOutputs(batchOutputs)
-            .setBatchAmount(batchAmount)
-            .build();
-        return this.#builder.getPayload();
-    }
-
-    /**
      * Build a complete add admin payload.
      * @param {string|Buffer} invokerAddress
      * @param {string|Buffer} writingKey
@@ -530,42 +507,6 @@ class ApplyStateMessageDirector {
             .setIncomingNonce(incomingNonce)
             .setIncomingAddress(recipientAddress)
             .setAmount(amount)
-            .setIncomingSignature(incomingSignature)
-            .build();
-        return this.#builder.getPayload();
-    }
-
-    /**
-     * Build a complete batch transfer payload.
-     * @param {string|Buffer} invokerAddress
-     * @param {string|Buffer} transactionHash
-     * @param {string|Buffer} txValidity
-     * @param {string|Buffer} incomingNonce
-     * @param {string|Buffer} batchOutputs
-     * @param {string|Buffer} batchAmount
-     * @param {string|Buffer} incomingSignature
-     * @returns {Promise<object>}
-     */
-    async buildCompleteBatchTransferOperationMessage(
-        invokerAddress,
-        transactionHash,
-        txValidity,
-        incomingNonce,
-        batchOutputs,
-        batchAmount,
-        incomingSignature
-    ) {
-        if (!this.#builder) throw new Error('Builder has not been set.');
-        await this.#builder
-            .setPhase('complete')
-            .setOutput('buffer')
-            .setOperationType(OperationType.TRANSFER)
-            .setAddress(invokerAddress)
-            .setTxHash(transactionHash)
-            .setTxValidity(txValidity)
-            .setIncomingNonce(incomingNonce)
-            .setBatchOutputs(batchOutputs)
-            .setBatchAmount(batchAmount)
             .setIncomingSignature(incomingSignature)
             .build();
         return this.#builder.getPayload();

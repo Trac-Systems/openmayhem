@@ -25,43 +25,6 @@ export class TxOperation {
         this.#msbClient = msbClient
         this.#config = config
     }
-
-    async #validateLocalApply(op) {
-        if(this.#config.apiTxLocalApply !== true) return false;
-
-        const value = op.value ?? {};
-        const requiredHex = ['sig', 'nonce', 'txv', 'iw', 'bs', 'mbs'];
-        for (const key of requiredHex) {
-            if(typeof value[key] !== 'string' || value[key].length === 0) return false;
-            if(b4a.toString(b4a.from(value[key], 'hex'), 'hex') !== value[key]) return false;
-        }
-        if(value.sig.length !== 128 || value.nonce.length !== 64) return false;
-        if(value.iw.length !== 64 || value.bs.length !== 64 || value.mbs.length !== 64) return false;
-        if(value.ipk.length !== 64 || op.key.length !== 64) return false;
-
-        const subnetBootstrapHex = (b4a.isBuffer(this.#config.bootstrap) ? this.#config.bootstrap.toString('hex') : `${this.#config.bootstrap}`).toLowerCase();
-        if(value.bs !== subnetBootstrapHex) return false;
-        if(value.mbs !== this.#msbClient.bootstrapHex) return false;
-
-        const contentHash = await createHash(jsonStringify(value.dispatch));
-        const expectedTx = await this.#protocolInstance.generateTx(
-            this.#msbClient.networkId,
-            value.txv,
-            value.iw,
-            contentHash,
-            value.bs,
-            value.mbs,
-            value.nonce
-        );
-        if(expectedTx !== op.key) return false;
-
-        return this.#wallet.verify(
-            b4a.from(value.sig, 'hex'),
-            b4a.from(op.key, 'hex'),
-            b4a.from(value.ipk, 'hex')
-        ) === true;
-    }
-
     async handle(op, batch, base, node) {
         if(false === this.#validator.validateNode(node)) return;
         // TX apply: only accept subnet TXs that are confirmed on MSB, then execute contract logic
@@ -71,40 +34,36 @@ export class TxOperation {
         if(b4a.byteLength(jsonStringify(op)) > this.#protocolInstance.txMaxBytes()) return;
         // Schema validation (required fields / types)
         if(false === this.#validator.validate(op)) return;
-        if(op.value.local === true) {
-            if(false === await this.#validateLocalApply(op)) return;
-        } else {
-            // Stall guard: don't allow a writer to pin apply waiting on an absurd MSB height
-            if (op.value.msbsl > this.#config.maxMsbSignedLength) return;
-            // Wait for local MSB view to reach the referenced signed length
-            await this.#msbClient.waitForSignedLengthAtLeast(op.value.msbsl);
-            // Fetch MSB apply-op at msbsl by tx key (op.key = tx hash)
-            const msbTxEntry = await this.#msbClient.getSignedAtLength(op.key, op.value.msbsl);
-            // MSB entry shape/size guards (protect protobuf decode + keep apply bounded)
-            if (null === msbTxEntry || false === b4a.isBuffer(msbTxEntry.value)) return;
-            if (msbTxEntry.value.byteLength > this.#config.maxMsbApplyOperationBytes) return;
-            // Decode MSB operation and ensure it's a TX (type 12) with required fields
-            const decoded = safeDecodeApplyOperation(msbTxEntry.value);
-            if (null === decoded || decoded.txo === undefined) return;
-            if (decoded.type !== 12) return;
-            // Cross-check: tx hash matches op.key
-            if (null === decoded.txo.tx || decoded.txo.tx.toString('hex') !== op.key) return;
-            // Cross-check: MSB tx targets this subnet + this MSB network
-            const subnetBootstrapHex = (b4a.isBuffer(this.#config.bootstrap) ? this.#config.bootstrap.toString('hex') : `${this.#config.bootstrap}`).toLowerCase();
-            if (null === decoded.txo.bs || decoded.txo.bs.toString('hex') !== subnetBootstrapHex) return;
-            if (null === decoded.txo.mbs || decoded.txo.mbs.toString('hex') !== this.#msbClient.bootstrapHex) return;
-            // Cross-check: content hash matches the subnet dispatch payload (blake3)
-            const contentHash = await createHash(jsonStringify(op.value.dispatch));
-            if (null === decoded.txo.ch || decoded.txo.ch.toString('hex') !== contentHash) return;
-            // Cross-check: requester identity matches ipk
-            const invokerAddress = decoded.address ? decoded.address.toString('ascii') : null;
-            const invokerPubKeyHex = invokerAddress ? this.#msbClient.addressToPubKeyHex(invokerAddress) : null;
-            if (null === invokerPubKeyHex || invokerPubKeyHex !== `${op.value.ipk}`.toLowerCase()) return;
-            // Cross-check: validator identity matches wp
-            const validatorAddress = decoded.txo.va ? decoded.txo.va.toString('ascii') : null;
-            const validatorPubKeyHex = validatorAddress ? this.#msbClient.addressToPubKeyHex(validatorAddress) : null;
-            if (null === validatorPubKeyHex || validatorPubKeyHex !== `${op.value.wp}`.toLowerCase()) return;
-        }
+        // Stall guard: don't allow a writer to pin apply waiting on an absurd MSB height
+        if (op.value.msbsl > this.#config.maxMsbSignedLength) return;
+        // Wait for local MSB view to reach the referenced signed length
+        await this.#msbClient.waitForSignedLengthAtLeast(op.value.msbsl);
+        // Fetch MSB apply-op at msbsl by tx key (op.key = tx hash)
+        const msbTxEntry = await this.#msbClient.getSignedAtLength(op.key, op.value.msbsl);
+        // MSB entry shape/size guards (protect protobuf decode + keep apply bounded)
+        if (null === msbTxEntry || false === b4a.isBuffer(msbTxEntry.value)) return;
+        if (msbTxEntry.value.byteLength > this.#config.maxMsbApplyOperationBytes) return;
+        // Decode MSB operation and ensure it's a TX (type 12) with required fields
+        const decoded = safeDecodeApplyOperation(msbTxEntry.value);
+        if (null === decoded || decoded.txo === undefined) return;
+        if (decoded.type !== 12) return;
+        // Cross-check: tx hash matches op.key
+        if (null === decoded.txo.tx || decoded.txo.tx.toString('hex') !== op.key) return;
+        // Cross-check: MSB tx targets this subnet + this MSB network
+        const subnetBootstrapHex = (b4a.isBuffer(this.#config.bootstrap) ? this.#config.bootstrap.toString('hex') : `${this.#config.bootstrap}`).toLowerCase();
+        if (null === decoded.txo.bs || decoded.txo.bs.toString('hex') !== subnetBootstrapHex) return;
+        if (null === decoded.txo.mbs || decoded.txo.mbs.toString('hex') !== this.#msbClient.bootstrapHex) return;
+        // Cross-check: content hash matches the subnet dispatch payload (blake3)
+        const contentHash = await createHash(jsonStringify(op.value.dispatch));
+        if (null === decoded.txo.ch || decoded.txo.ch.toString('hex') !== contentHash) return;
+        // Cross-check: requester identity matches ipk
+        const invokerAddress = decoded.address ? decoded.address.toString('ascii') : null;
+        const invokerPubKeyHex = invokerAddress ? this.#msbClient.addressToPubKeyHex(invokerAddress) : null;
+        if (null === invokerPubKeyHex || invokerPubKeyHex !== `${op.value.ipk}`.toLowerCase()) return;
+        // Cross-check: validator identity matches wp
+        const validatorAddress = decoded.txo.va ? decoded.txo.va.toString('ascii') : null;
+        const validatorPubKeyHex = validatorAddress ? this.#msbClient.addressToPubKeyHex(validatorAddress) : null;
+        if (null === validatorPubKeyHex || validatorPubKeyHex !== `${op.value.wp}`.toLowerCase()) return;
         // Transactions enabled gate (default: enabled if missing)
         const enabled = await batch.get('txen');
         if (!(enabled === null || enabled.value === true)) return;
@@ -170,14 +129,7 @@ export class TxCheck extends BaseCheck {
                 },
                 msbsl : { type : "number", integer : true, min : 0, max : Number.MAX_SAFE_INTEGER },
                 ipk : { type : "is_hex" },
-                wp : { type : "is_hex" },
-                local: { type: "boolean", optional: true },
-                sig: { type : "is_hex", optional: true },
-                nonce: { type : "is_hex", optional: true },
-                txv: { type : "is_hex", optional: true },
-                iw: { type : "is_hex", optional: true },
-                bs: { type : "is_hex", optional: true },
-                mbs: { type : "is_hex", optional: true }
+                wp : { type : "is_hex" }
             }
         };
 

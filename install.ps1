@@ -1231,15 +1231,50 @@ function Invoke-NpmInstall {
     }
 }
 
+function Invoke-IntercomNpmInstall {
+    $directory = Join-Path $ShareDir "intercom"
+    $verifier = Join-Path (Join-Path $SourceDir "scripts") "verify-intercom-dependency-topology.mjs"
+    $materializer = Join-Path (Join-Path $directory "scripts") "materialize-local-dependencies.mjs"
+
+    foreach ($required in @("package.json", "package-lock.json", ".npmrc")) {
+        if (-not (Test-Path -Path (Join-Path $directory $required) -PathType Leaf)) {
+            Fail "missing Intercom root dependency file: $(Join-Path $directory $required)"
+        }
+    }
+    if (-not (Test-Path -Path $verifier -PathType Leaf)) {
+        Fail "missing Intercom dependency topology verifier: $verifier"
+    }
+    if (-not (Test-Path -Path $materializer -PathType Leaf)) {
+        Fail "missing Intercom local dependency materializer: $materializer"
+    }
+
+    Write-Log "installing root-authoritative runtime dependencies in $directory"
+    Push-Location $directory
+    try {
+        & npm "ci" "--omit=dev" "--install-links=true"
+        if ($LASTEXITCODE -ne 0) {
+            Fail "npm dependency install failed in $directory"
+        }
+    } finally {
+        Pop-Location
+    }
+    & node $materializer $directory
+    if ($LASTEXITCODE -ne 0) {
+        Fail "Intercom local dependency materialization failed in $directory"
+    }
+    & node $verifier $directory
+    if ($LASTEXITCODE -ne 0) {
+        Fail "Intercom dependency topology verification failed in $directory"
+    }
+}
+
 function Hydrate-RuntimeAssets {
     if ($SkipNode) {
         Write-Log "skipping runtime dependency install because -SkipNode was set"
         return
     }
     Ensure-Node
-    Invoke-NpmInstall -Directory (Join-Path (Join-Path (Join-Path $ShareDir "intercom") "trac") "msb")
-    Invoke-NpmInstall -Directory (Join-Path (Join-Path (Join-Path $ShareDir "intercom") "trac") "trac-peer")
-    Invoke-NpmInstall -Directory (Join-Path $ShareDir "intercom")
+    Invoke-IntercomNpmInstall
     Invoke-NpmInstall -Directory (Join-Path $ShareDir "contracts")
 }
 

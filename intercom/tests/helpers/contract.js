@@ -110,8 +110,11 @@ export const makeFeatureOperation = (featureType, key, value, sender) => ({
   },
 });
 
-export const executeFeature = (contract, storage, featureType, key, value, sender) =>
-  contract.execute(makeFeatureOperation(featureType, key, value, sender), storage);
+export const executeFeature = async (contract, storage, featureType, key, value, sender) => {
+  contract._mayhemLastFeatureResult = undefined;
+  await contract.execute(makeFeatureOperation(featureType, key, value, sender), storage);
+  return contract._mayhemLastFeatureResult;
+};
 
 export async function epochApplyFeatureKey(contract, value) {
   const key = await contract.epochApplyFeatureKey(value);
@@ -355,7 +358,7 @@ export const makeVerifier = (wallet) => ({
   verify(signature, message, publicKey) {
     return wallet.verify(
       b4a.from(signature, 'hex'),
-      b4a.from(String(message)),
+      b4a.isBuffer(message) ? message : b4a.from(String(message)),
       b4a.from(publicKey, 'hex')
     );
   },

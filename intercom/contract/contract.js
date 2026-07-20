@@ -608,6 +608,47 @@ const stableValue = (value) => {
   return value;
 };
 const stableJson = (value) => JSON.stringify(stableValue(value));
+
+export const adminContractTxSigningValue = ({
+  address,
+  context,
+  nonce,
+  prepared_command: preparedCommand,
+  sim,
+}) => stableValue({
+  address: String(address ?? '').trim().toLowerCase(),
+  context: {
+    contract_version: context?.contract_version,
+    msb_bootstrap: String(context?.msb_bootstrap ?? '').trim().toLowerCase(),
+    network_id: context?.network_id,
+    subnet_bootstrap: String(context?.subnet_bootstrap ?? '').trim().toLowerCase(),
+  },
+  domain: 'mayhem-admin-contract-tx-v1',
+  nonce: String(nonce ?? '').trim().toLowerCase(),
+  prepared_command: preparedCommand,
+  sim: sim === true,
+});
+
+export const adminContractTxDigest = async (value) => b4a.toString(
+  await blake3(b4a.from(stableJson(adminContractTxSigningValue(value)), 'utf8')),
+  'hex'
+);
+
+const serializableFeatureResult = (value) => {
+  if (value === undefined) return null;
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: value.message,
+    };
+  }
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return String(value);
+  }
+};
+
 const ethereumPersonalMessageHash = (message) => {
   const body = b4a.from(message, 'utf8');
   const prefix = b4a.from(`\x19Ethereum Signed Message:\n${body.length}`, 'utf8');
@@ -639,7 +680,9 @@ class MayhemContract extends Contract {
     this._mayhemApplyStage = null;
 
     this.addFeature('mayhem_feature', async function () {
-      return await self.mayhemFeature();
+      const result = await self.mayhemFeature();
+      await self.recordMayhemFeatureResult(result);
+      return result;
     });
 
     this.addSchema('noop', {
@@ -1296,6 +1339,11 @@ class MayhemContract extends Contract {
       return adminError;
     }
     if (isRateFeature) this._mayhemApplyStage = 'rate:admin-verified';
+    if (value.op === 'admin_contract_tx') {
+      const result = await this.applyAdminContractTxFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
     if (value.op === 'publish_payout_context') {
       const result = await this.applyPublishPayoutContextFeature(key, value);
       this._mayhemLastFeatureResult = result;
@@ -1352,6 +1400,206 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
+  }
+
+  async recordMayhemFeatureResult(result) {
+    const hash = String(this.op?.hash ?? '').toLowerCase();
+    if (!/^[0-9a-f]+$/.test(hash)) return;
+    const error = result instanceof Error
+      ? result
+      : result === undefined
+        ? new Error('Feature returned no result.')
+        : result?.ok === false
+          ? new Error(String(result?.error?.message ?? result?.message ?? 'Feature rejected.'))
+          : null;
+    const ok = error === null;
+    await this.put(`fr/${hash}`, {
+      type: 'feature_result',
+      feature_key: this.op?.key ?? null,
+      hash,
+      address: this.address ?? null,
+      status: ok ? 'applied' : 'rejected',
+      ok,
+      result: ok ? serializableFeatureResult(result) : null,
+      error: ok
+        ? null
+        : {
+            name: error.name || 'FeatureRejected',
+            message: error.message || 'Feature rejected.',
+          },
+    });
+  }
+
+  async applyAdminContractTxFeature(key, value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      ['op', 'tx', 'prepared_command', 'address', 'signature', 'nonce', 'sim', 'context'],
+      'admin contract transaction feature'
+    );
+    if (shapeError) return shapeError;
+    if (
+      value.op !== 'admin_contract_tx' ||
+      !this.isHexBytes(value.tx, 32) ||
+      !this.isHexBytes(value.address, 32) ||
+      !this.isHexBytes(value.signature, 64) ||
+      !this.isHexBytes(value.nonce, 32) ||
+      typeof value.sim !== 'boolean' ||
+      !value.prepared_command ||
+      typeof value.prepared_command !== 'object' ||
+      Array.isArray(value.prepared_command) ||
+      !value.context ||
+      typeof value.context !== 'object' ||
+      Array.isArray(value.context)
+    ) {
+      return new Error('Invalid admin contract transaction feature.');
+    }
+    if (value.sim) {
+      return new Error('Simulated admin transactions must not be appended.');
+    }
+    if (key !== `admin/contract-tx/${value.tx}`) {
+      return new Error('Admin contract transaction key does not match its digest.');
+    }
+    const commandShapeError = this.validateExactObjectKeys(
+      value.prepared_command,
+      ['type', 'value'],
+      'prepared admin command'
+    );
+    if (commandShapeError) return commandShapeError;
+    const contextShapeError = this.validateExactObjectKeys(
+      value.context,
+      ['contract_version', 'msb_bootstrap', 'network_id', 'subnet_bootstrap'],
+      'admin contract transaction context'
+    );
+    if (contextShapeError) return contextShapeError;
+    const peer = this.protocol?.peer;
+    const configuredBootstrap = peer?.config?.bootstrap;
+    const subnetBootstrap = b4a.isBuffer(configuredBootstrap)
+      ? b4a.toString(configuredBootstrap, 'hex')
+      : typeof configuredBootstrap === 'string' && configuredBootstrap
+        ? configuredBootstrap.toLowerCase()
+        : b4a.isBuffer(peer?.base?.key)
+          ? b4a.toString(peer.base.key, 'hex')
+          : '';
+    const runtimeContext = {
+      contract_version: CONTRACT_VERSION,
+      msb_bootstrap: String(peer?.msbClient?.bootstrapHex ?? '').toLowerCase(),
+      network_id: peer?.msbClient?.networkId,
+      subnet_bootstrap: subnetBootstrap,
+    };
+    if (
+      !Number.isSafeInteger(value.context.contract_version) ||
+      !Number.isSafeInteger(value.context.network_id) ||
+      !this.isHexBytes(value.context.msb_bootstrap, 32) ||
+      !this.isHexBytes(value.context.subnet_bootstrap, 32) ||
+      stableJson(value.context) !== stableJson(runtimeContext)
+    ) {
+      return new Error('Admin contract transaction context does not match this contract network.');
+    }
+    const adminError = await this.requireAdmin(value.address);
+    if (adminError) return adminError;
+    const expectedTx = await adminContractTxDigest(value);
+    if (expectedTx !== value.tx) {
+      return new Error('Invalid admin contract transaction digest.');
+    }
+    const verify = this.protocol?.peer?.wallet?.verify;
+    if (
+      typeof verify !== 'function' ||
+      verify.call(
+        this.protocol.peer.wallet,
+        value.signature,
+        b4a.from(value.tx, 'hex'),
+        value.address
+      ) !== true
+    ) {
+      return new Error('Invalid admin contract transaction signature.');
+    }
+
+    const existing = await this.get(key);
+    if (existing !== null) return existing;
+
+    const type = value.prepared_command.type;
+    if (
+      typeof type !== 'string' ||
+      (!hasOwn(this.metadata.schemas, type) && !hasOwn(this.metadata.functions, type)) ||
+      typeof this[type] !== 'function'
+    ) {
+      return new Error('Admin contract transaction type is not a registered Mayhem command.');
+    }
+    if (
+      hasOwn(this.metadata.schemas, type) &&
+      this.check.validateSchema(type, value.prepared_command) !== true
+    ) {
+      return new Error('Invalid prepared admin command schema.');
+    }
+
+    const applyingRecord = {
+      ok: false,
+      op: 'admin_contract_tx',
+      status: 'applying',
+      tx: value.tx,
+      type,
+      result: null,
+      error: null,
+    };
+    await this.put(key, applyingRecord);
+
+    const context = {
+      address: this.address,
+      isFeature: this.is_feature,
+      op: this.op,
+      tx: this.tx,
+      value: this.value,
+    };
+    let commandResult;
+    try {
+      this.address = value.address;
+      this.is_feature = false;
+      this.op = value.prepared_command;
+      this.tx = value.tx;
+      this.value = value.prepared_command.value;
+      commandResult = await this[type]();
+    } catch (error) {
+      commandResult = error instanceof Error ? error : new Error(String(error));
+    } finally {
+      this.address = context.address;
+      this.is_feature = context.isFeature;
+      this.op = context.op;
+      this.tx = context.tx;
+      this.value = context.value;
+    }
+    const commandError = commandResult === undefined
+      ? new Error('Admin contract transaction returned no result.')
+      : commandResult instanceof Error
+        ? commandResult
+        : commandResult?.ok === false
+          ? new Error(
+              String(
+                commandResult?.error?.message ??
+                commandResult?.message ??
+                'Admin command rejected.'
+              )
+            )
+          : null;
+    if (commandError) {
+      await this.put(key, {
+        ...applyingRecord,
+        status: 'rejected',
+        error: serializableFeatureResult(commandError),
+      });
+      return commandError;
+    }
+
+    const record = {
+      ok: true,
+      op: 'admin_contract_tx',
+      status: 'applied',
+      tx: value.tx,
+      type,
+      result: serializableFeatureResult(commandResult),
+      error: null,
+    };
+    await this.put(key, record);
+    return record;
   }
 
   async applyConsentFeature(key, value) {

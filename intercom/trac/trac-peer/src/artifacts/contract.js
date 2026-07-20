@@ -55,7 +55,8 @@ class Contract {
 
         if(this.isFeature()) {
             if(this.features[this.op.type] !== undefined){
-                _return = await this.features[this.op.type]();
+                // feature returns aren't handled by peer, so not necessary to track
+                await this.features[this.op.type]();
             }
         } else if(this.isMessage()) {
             if(typeof this.message_handler === 'function'){

@@ -11,6 +11,11 @@ export async function runRootMsbTransferHelper(command, args = []) {
     const { runSettlementTransferHelper } = await import('./msb-settlement-transfer-helper.js');
     return runSettlementTransferHelper(args);
   }
-  const { runTransferHelper } = await import('trac-msb/src/transferHelper.js');
+  if (normalizedCommand !== 'transfer') {
+    throw new Error(
+      'Supported MSB helper commands: balance, transfer, settlement-transfer.'
+    );
+  }
+  const { runTransferHelper } = await import('./msb-settlement-transfer-helper.js');
   return runTransferHelper([normalizedCommand, ...args]);
 }

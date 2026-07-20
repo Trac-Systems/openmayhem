@@ -63,17 +63,12 @@ function makeNode(op, { fromKeyHex = null } = {}) {
   };
 }
 
-function makeProtocolStub({
-  msgMaxBytes = 1_000_000,
-  txMaxBytes = 1_000_000,
-  featMaxBytes = 1_000_000,
-  getError = () => null,
-} = {}) {
+function makeProtocolStub({ msgMaxBytes = 1_000_000, txMaxBytes = 1_000_000, featMaxBytes = 1_000_000 } = {}) {
   return {
     msgMaxBytes: () => msgMaxBytes,
     txMaxBytes: () => txMaxBytes,
     featMaxBytes: () => featMaxBytes,
-    getError,
+    getError: () => null,
   };
 }
 
@@ -549,7 +544,7 @@ test("operations: feature executes contract when admin-signed", async (t) => {
   const opObj = {
     type: "feature",
     key: "my_feature",
-    value: { dispatch: { value: dispatchValue, nonce, hash: signature, address: adminWallet.publicKey } },
+    value: { dispatch: { value: dispatchValue, nonce, hash: signature } },
   };
   const node = makeNode(opObj);
 
@@ -562,140 +557,4 @@ test("operations: feature executes contract when admin-signed", async (t) => {
 
   t.is((await batch.get("feature_called"))?.value ?? null, true);
   t.is((await batch.get(`sh/${signature}`))?.value ?? null, "");
-  const featureResult = (await batch.get(`fr/${signature}`))?.value ?? null;
-  t.is(featureResult?.ok, true);
-  t.is(featureResult?.status, "applied");
-  t.is(featureResult?.feature_key, "my_feature");
-});
-
-test("operations: feature executes contract when non-admin signer owns dispatch address", async (t) => {
-  const adminWallet = new Wallet();
-  await adminWallet.generateKeyPair();
-  const providerWallet = new Wallet();
-  await providerWallet.generateKeyPair();
-  const nonce = makeHex32(35);
-  const dispatchValue = { op: "consent" };
-  const strDispatchValue = JSON.stringify(dispatchValue);
-  const signature = providerWallet.sign(`${strDispatchValue}${nonce}`);
-
-  const batch = makeBatch({ admin: adminWallet.publicKey });
-  const base = makeBase();
-
-  const contractInstance = {
-    execute: async (_op, b) => {
-      await b.put("provider_feature_called", true);
-      return { ok: true };
-    },
-  };
-
-  const opObj = {
-    type: "feature",
-    key: "mayhem_consent/provider/1/hash",
-    value: {
-      dispatch: {
-        value: dispatchValue,
-        nonce,
-        hash: signature,
-        address: providerWallet.publicKey,
-      },
-    },
-  };
-  const node = makeNode(opObj);
-
-  const op = new FeatureOperation(new FeatureCheck(), {
-    wallet: adminWallet,
-    protocolInstance: makeProtocolStub({ featMaxBytes: 4096 }),
-    contractInstance,
-  });
-  await op.handle(opObj, batch, base, node);
-
-  t.is((await batch.get("provider_feature_called"))?.value ?? null, true);
-  t.is((await batch.get(`sh/${signature}`))?.value ?? null, "");
-  const featureResult = (await batch.get(`fr/${signature}`))?.value ?? null;
-  t.is(featureResult?.ok, true);
-  t.is(featureResult?.address, providerWallet.publicKey);
-});
-
-test("operations: feature does not burn replay hash when contract returns an error", async (t) => {
-  const adminWallet = new Wallet();
-  await adminWallet.generateKeyPair();
-  const nonce = makeHex32(33);
-  const dispatchValue = { a: 1 };
-  const strDispatchValue = JSON.stringify(dispatchValue);
-  const signature = adminWallet.sign(`${strDispatchValue}${nonce}`);
-
-  const batch = makeBatch({ admin: adminWallet.publicKey });
-  const base = makeBase();
-  let attempts = 0;
-
-  const contractInstance = {
-    execute: async (_op, b) => {
-      attempts += 1;
-      if (attempts === 1) return new Error("commit required");
-      await b.put("feature_called_after_retry", true);
-      return null;
-    },
-  };
-
-  const opObj = {
-    type: "feature",
-    key: "my_feature",
-    value: { dispatch: { value: dispatchValue, nonce, hash: signature, address: adminWallet.publicKey } },
-  };
-  const node = makeNode(opObj);
-
-  const op = new FeatureOperation(new FeatureCheck(), {
-    wallet: adminWallet,
-    protocolInstance: makeProtocolStub({
-      featMaxBytes: 4096,
-      getError: (value) => (value instanceof Error ? value : null),
-    }),
-    contractInstance,
-  });
-
-  await op.handle(opObj, batch, base, node);
-  t.is((await batch.get(`sh/${signature}`))?.value ?? null, null);
-  t.is((await batch.get("feature_called_after_retry"))?.value ?? null, null);
-  const rejected = (await batch.get(`fr/${signature}`))?.value ?? null;
-  t.is(rejected?.ok, false);
-  t.is(rejected?.status, "rejected");
-  t.is(rejected?.error?.message, "commit required");
-
-  await op.handle(opObj, batch, base, node);
-  t.is((await batch.get("feature_called_after_retry"))?.value ?? null, true);
-  t.is((await batch.get(`sh/${signature}`))?.value ?? null, "");
-  const applied = (await batch.get(`fr/${signature}`))?.value ?? null;
-  t.is(applied?.ok, true);
-  t.is(applied?.status, "applied");
-});
-
-test("operations: feature does not burn replay hash when contract returns undefined", async (t) => {
-  const adminWallet = new Wallet();
-  await adminWallet.generateKeyPair();
-  const nonce = makeHex32(34);
-  const dispatchValue = { a: 1 };
-  const signature = adminWallet.sign(`${JSON.stringify(dispatchValue)}${nonce}`);
-
-  const batch = makeBatch({ admin: adminWallet.publicKey });
-  const base = makeBase();
-  const contractInstance = { execute: async () => undefined };
-  const opObj = {
-    type: "feature",
-    key: "my_feature",
-    value: { dispatch: { value: dispatchValue, nonce, hash: signature, address: adminWallet.publicKey } },
-  };
-  const node = makeNode(opObj);
-
-  const op = new FeatureOperation(new FeatureCheck(), {
-    wallet: adminWallet,
-    protocolInstance: makeProtocolStub({ featMaxBytes: 4096 }),
-    contractInstance,
-  });
-  await op.handle(opObj, batch, base, node);
-
-  t.is((await batch.get(`sh/${signature}`))?.value ?? null, null);
-  const featureResult = (await batch.get(`fr/${signature}`))?.value ?? null;
-  t.is(featureResult?.ok, false);
-  t.is(featureResult?.status, "rejected");
-  t.is(featureResult?.error?.message, "Feature returned no result.");
 });

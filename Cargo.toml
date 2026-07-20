@@ -20,7 +20,7 @@ exclude = ["third_party/xet-core"]
 [workspace.package]
 version = "0.2.23"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "MIT"
 
 [profile.dev]

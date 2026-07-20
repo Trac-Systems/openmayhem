@@ -2,7 +2,6 @@ import fs from 'fs';
 import path from 'path';
 
 import { MainSettlementBus } from 'trac-msb/src/index.js';
-import { createConfig, ENV } from 'trac-msb/src/config/env.js';
 import { applyStateMessageFactory } from 'trac-msb/src/messages/state/applyStateMessageFactory.js';
 import {
   bigIntTo16ByteBuffer,
@@ -11,6 +10,10 @@ import {
   decimalStringToBigInt,
 } from 'trac-msb/src/utils/amountSerialization.js';
 import { getExtendedTxDetailsCommand } from 'trac-msb/src/utils/cliCommands.js';
+import {
+  createMayhemMsbConfig,
+  MAYHEM_NETWORK_ENV,
+} from './network-config.js';
 
 const JOURNAL_SCHEMA_VERSION = 1;
 const MAX_TRANSFER_AMOUNT = 0xffffffffffffffffffffffffffffffffn;
@@ -331,8 +334,10 @@ export async function runSettlementTransferHelper(rawArgs, options = {}) {
     fail('--max-retries must be a non-negative safe integer.');
   }
 
-  const env = network === 'mainnet' ? ENV.MAINNET : ENV.TESTNET1;
-  const config = createConfig(env, {
+  const environment = network === 'mainnet'
+    ? MAYHEM_NETWORK_ENV.MAINNET
+    : MAYHEM_NETWORK_ENV.TESTNET1;
+  const config = createMayhemMsbConfig(environment, {
     storeName,
     storesDirectory: path.resolve(storesDirectory) + path.sep,
     enableInteractiveMode: false,
@@ -357,6 +362,146 @@ export async function runSettlementTransferHelper(rawArgs, options = {}) {
       amount,
       operationId,
       journalFile,
+      timeoutSeconds,
+      expectedBalanceBefore,
+      stderr,
+      ...options.execution,
+    });
+  } finally {
+    console.log = originalLog;
+    console.info = originalInfo;
+    if (!options.keepOpen) {
+      try {
+        await msb.close();
+      } catch (_error) {}
+    }
+  }
+}
+
+export async function executeTransfer({
+  msb,
+  config,
+  network,
+  to,
+  amount,
+  timeoutSeconds,
+  expectedBalanceBefore = null,
+  stderr,
+  sleepFn = sleep,
+  buildPayload = null,
+  readConfirmedTransfer = defaultReadConfirmedTransfer,
+}) {
+  const from = msb.wallet.address;
+  const amountE18 = decimalStringToBigInt(amount);
+  if (amountE18 <= 0n) fail('transfer amount must be positive');
+  if (amountE18 > MAX_TRANSFER_AMOUNT) fail('transfer amount exceeds MSB maximum');
+  const preflight = await waitForPreflight(msb, timeoutSeconds, stderr, sleepFn);
+  if (expectedBalanceBefore && preflight.beforeBalance !== expectedBalanceBefore) {
+    fail(
+      `sender balance is ${preflight.beforeBalance}, expected ${expectedBalanceBefore}; refusing transfer`
+    );
+  }
+  const feeE18 = bufferToBigInt(msb.state.getFee());
+  const deductedE18 = from === to ? feeE18 : amountE18 + feeE18;
+  if (preflight.balanceE18 < deductedE18) {
+    fail('insufficient balance for transfer and fee');
+  }
+
+  const txValidity = await msb.state.getIndexerSequenceState();
+  const payload = buildPayload
+    ? await buildPayload({ from, to, amountE18, txValidity })
+    : await applyStateMessageFactory(msb.wallet, config)
+      .buildPartialTransferOperationMessage(
+        from,
+        to,
+        bigIntTo16ByteBuffer(amountE18),
+        txValidity,
+        'json'
+      );
+  const txHash = payload?.tro?.tx;
+  if (typeof txHash !== 'string' || !/^[0-9a-f]{64}$/.test(txHash)) {
+    fail('MSB transfer payload did not contain a canonical transaction hash');
+  }
+  const accepted = await msb.broadcastPartialTransaction(payload);
+  if (!accepted) fail('MSB validators did not accept the transfer.');
+  const confirmedLength = await waitForConfirmation(msb, txHash, timeoutSeconds, sleepFn);
+  if (confirmedLength === null) {
+    fail(`MSB transfer ${txHash} was not confirmed before timeout`);
+  }
+  const confirmed = await readConfirmedTransfer(msb, txHash, config);
+  const details = confirmed?.txDetails;
+  if (
+    details?.address !== from ||
+    details?.tro?.tx !== txHash ||
+    details?.tro?.to !== to ||
+    details?.tro?.am !== amountE18.toString() ||
+    confirmed?.confirmed_length !== confirmedLength
+  ) {
+    fail('confirmed MSB transaction does not match the requested transfer');
+  }
+  return {
+    ok: true,
+    command: 'transfer',
+    network,
+    from,
+    to,
+    amount,
+    tx_hash: txHash,
+    before_balance: preflight.beforeBalance,
+    validator_connections: preflight.validators,
+    confirmed_length: confirmedLength,
+    observed_signed_length: msb.state.getSignedLength(),
+  };
+}
+
+export async function runTransferHelper(rawArgs, options = {}) {
+  const args = [...rawArgs];
+  const command = args.shift();
+  if (command !== 'transfer') {
+    fail('Supported MSB transfer helper command: transfer.');
+  }
+  const network = normalizeNetwork(takeOption(args, '--network') ?? fail('Missing --network.'));
+  const storesDirectory = takeOption(args, '--stores-directory') ?? fail('Missing --stores-directory.');
+  const storeName = takeOption(args, '--store-name') ?? fail('Missing --store-name.');
+  const to = takeOption(args, '--to') ?? fail('Missing --to.');
+  const amount = takeOption(args, '--amount') ?? fail('Missing --amount.');
+  const timeoutSeconds = Number.parseInt(takeOption(args, '--timeout-seconds') ?? '180', 10);
+  const maxRetries = Number.parseInt(takeOption(args, '--max-retries') ?? '3', 10);
+  const expectedBalanceBefore = takeOption(args, '--expected-balance-before');
+  if (args.length > 0) fail(`Unknown argument: ${args[0]}`);
+  if (!Number.isSafeInteger(timeoutSeconds) || timeoutSeconds <= 0) {
+    fail('--timeout-seconds must be a positive safe integer.');
+  }
+  if (!Number.isSafeInteger(maxRetries) || maxRetries < 0) {
+    fail('--max-retries must be a non-negative safe integer.');
+  }
+
+  const environment = network === 'mainnet'
+    ? MAYHEM_NETWORK_ENV.MAINNET
+    : MAYHEM_NETWORK_ENV.TESTNET1;
+  const config = createMayhemMsbConfig(environment, {
+    storeName,
+    storesDirectory: path.resolve(storesDirectory) + path.sep,
+    enableInteractiveMode: false,
+    enableWallet: true,
+    maxRetries,
+  });
+  const stderr = options.stderr ?? defaultStderr();
+  const originalLog = console.log;
+  const originalInfo = console.info;
+  const redirect = (...items) => stderr.write(`${items.map(String).join(' ')}\n`);
+  console.log = redirect;
+  console.info = redirect;
+
+  const msb = options.msb ?? new MainSettlementBus(config);
+  try {
+    if (!options.ready) await msb.ready();
+    return await executeTransfer({
+      msb,
+      config,
+      network,
+      to,
+      amount,
       timeoutSeconds,
       expectedBalanceBefore,
       stderr,

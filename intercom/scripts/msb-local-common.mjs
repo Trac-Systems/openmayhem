@@ -3,8 +3,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import PeerWallet from 'trac-wallet';
-import { createConfig, ENV as MSB_ENV } from 'trac-msb/src/config/env.js';
 import { bufferToBigInt, bigIntToDecimalString } from 'trac-msb/src/utils/amountSerialization.js';
+import {
+  createMayhemMsbConfig,
+  MAYHEM_NETWORK_ENV,
+} from '../src/network-config.js';
 
 export const INTERCOM_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const REPO_ROOT = path.resolve(INTERCOM_ROOT, '..');
@@ -47,9 +50,9 @@ export function normalizeNetwork(raw = 'testnet1') {
 
 export function msbEnvironment(network) {
   return {
-    mainnet: MSB_ENV.MAINNET,
-    testnet1: MSB_ENV.TESTNET1,
-    development: MSB_ENV.DEVELOPMENT,
+    mainnet: MAYHEM_NETWORK_ENV.MAINNET,
+    testnet1: MAYHEM_NETWORK_ENV.TESTNET1,
+    development: MAYHEM_NETWORK_ENV.DEVELOPMENT,
   }[normalizeNetwork(network)];
 }
 
@@ -109,7 +112,7 @@ export function createLocalConfig({
   enableWallet = true,
   dhtBootstrap = parseCsv(process.env.MAYHEM_MSB_DHT_BOOTSTRAP || ''),
 }) {
-  return createConfig(msbEnvironment(network), {
+  return createMayhemMsbConfig(msbEnvironment(network), {
     storeName,
     storesDirectory: trailingSlash(stateDir),
     enableInteractiveMode: false,

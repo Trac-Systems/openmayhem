@@ -17,11 +17,10 @@ const requireApi = (peer) => {
 };
 
 export async function getStatus(peer) {
-  const subnetBootstrap = peer.config?.bootstrap;
-  const subnetBootstrapHex = b4a.isBuffer(subnetBootstrap)
-    ? b4a.toString(subnetBootstrap, "hex")
-    : subnetBootstrap != null
-      ? String(subnetBootstrap)
+  const subnetBootstrapHex = b4a.isBuffer(peer.bootstrap)
+    ? b4a.toString(peer.bootstrap, "hex")
+    : peer.bootstrap != null
+      ? String(peer.bootstrap)
       : null;
 
   const peerMsbAddress = peer.msbClient.pubKeyHexToAddress(peer.wallet.publicKey);
@@ -38,8 +37,7 @@ export async function getStatus(peer) {
       isIndexer: !!peer.base?.isIndexer,
       isWriter: !!peer.base?.writable,
       subnetBootstrapHex,
-      subnetChannelUtf8: peer.config?.channelName ?? null,
-      dhtBootstrap: Array.isArray(peer.config?.dhtBootstrap) ? peer.config.dhtBootstrap : [],
+      subnetChannelUtf8: peer.channel ? b4a.toString(peer.channel, "utf8") : null,
       subnetSignedLength: peer.base?.view?.core?.signedLength ?? null,
       subnetUnsignedLength: peer.base?.view?.core?.length ?? null,
       admin: admin?.value ?? null,
@@ -48,11 +46,8 @@ export async function getStatus(peer) {
     msb: {
       ready: true,
       bootstrapHex: peer.msbClient.bootstrapHex,
-      channel: peer.msbClient.channelUtf8,
       networkId: peer.msbClient.networkId,
-      signedLength: peer.msbClient.getSignedLength(),
-      connectedValidators: peer.msbClient.getConnectedValidatorsCount(),
-      dhtBootstrap: peer.msbClient.dhtBootstrap,
+      signedLength: peer.msbClient.getSignedLength()
     },
   };
 }
@@ -150,104 +145,19 @@ export async function contractTx(peer, { tx, prepared_command, address, signatur
   return { result: res };
 }
 
-export async function contractFeature(peer, { feature = "mayhem", key, value } = {}) {
-  if (!peer.base?.writable) throw new Error("Peer subnet is not writable.");
-  const featureName = String(feature ?? "").trim();
-  const recordKey = String(key ?? "").trim();
-  if (!featureName) throw new Error("Missing feature.");
-  if (!recordKey) throw new Error("Missing key.");
-  if (recordKey.length > 256) throw new Error("Invalid key. Expected at most 256 characters.");
-  if (!isObject(value)) throw new Error("Invalid value. Expected an object.");
-  const registered = peer.protocol?.instance?.features?.[featureName];
-  if (!registered || typeof registered.append !== "function") {
-    throw new Error(`Feature ${featureName} is not available.`);
-  }
-  const appended = await registered.append(recordKey, value);
-  const hash = appended?.hash ?? null;
-  const resultKey = hash ? `fr/${hash}` : null;
-  const featureResult = resultKey ? await waitForFeatureResult(peer, resultKey) : null;
-  if (!featureResult) {
-    return {
-      ok: false,
-      accepted: true,
-      status: "pending",
-      feature: featureName,
-      key: recordKey,
-      hash,
-      message: "Feature append was accepted but no applied result appeared before timeout.",
-      result_key: resultKey,
-    };
-  }
-  const ok = featureResult.ok === true;
-  return {
-    ok,
-    accepted: true,
-    status: featureResult.status,
-    feature: featureName,
-    key: recordKey,
-    hash,
-    message: ok ? "Feature applied." : featureResult.error?.message ?? "Feature rejected.",
-    result_key: resultKey,
-    result: featureResult,
-  };
-}
-
-async function waitForFeatureResult(peer, key, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() <= deadline) {
-    const session = stateView(peer, false);
-    try {
-      const result = await session.view.get(key);
-      if (result !== null) return result.value;
-    } finally {
-      await session.close();
-    }
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  return null;
-}
-
-const stateView = (peer, confirmed) => {
-  if (!peer.base?.view) throw new Error("Peer view not ready.");
-  if (!confirmed) return { view: peer.base.view, close: async () => {} };
-  const view = peer.base.view.checkout(peer.base.view.core.signedLength);
-  return { view, close: async () => view.close() };
-};
-
 export async function getState(peer, key, { confirmed = true } = {}) {
   const k = String(key ?? "");
   if (!k) throw new Error("Missing key.");
-  const session = stateView(peer, confirmed);
-  try {
-    const res = await session.view.get(k);
-    return res?.value ?? null;
-  } finally {
-    await session.close();
-  }
-}
-
-export async function getStatePrefix(peer, prefix, { confirmed = true, limit = 500 } = {}) {
-  const p = String(prefix ?? "");
-  if (!p) throw new Error("Missing prefix.");
-  if (p.length > 256) throw new Error("Prefix is too long.");
-  const n = Number(limit);
-  if (!Number.isInteger(n) || n < 1 || n > 1000) {
-    throw new Error("Invalid limit. Expected an integer from 1 to 1000.");
-  }
-
-  const session = stateView(peer, confirmed);
-  const entries = [];
-  try {
-    const stream = session.view.createReadStream({
-      gte: p,
-      lt: `${p}\xff`,
-      limit: n,
-    });
-    for await (const entry of stream) {
-      entries.push({ key: entry.key, value: entry.value });
+  if (!peer.base?.view) throw new Error("Peer view not ready.");
+  if (confirmed) {
+    const viewSession = peer.base.view.checkout(peer.base.view.core.signedLength);
+    try {
+      const res = await viewSession.get(k);
+      return res?.value ?? null;
+    } finally {
+      await viewSession.close();
     }
-  } finally {
-    await session.close();
   }
-  return entries;
+  const res = await peer.base.view.get(k);
+  return res?.value ?? null;
 }

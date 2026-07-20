@@ -31,8 +31,6 @@ test('Happy path encode/decode roundtrip for protobuf applyOperation payloads', 
         ["bootstrapDeploymentPartial", fixtures.validPartialBootstrapDeployment],
         ["transferComplete", fixtures.validTransferOperation],
         ["transferPartial", fixtures.validPartialTransferOperation],
-        ["batchTransferComplete", fixtures.validBatchTransferOperation],
-        ["batchTransferPartial", fixtures.validPartialBatchTransferOperation],
         ["balanceInitialization", fixtures.validBalanceInitOperation],
         ["disableInitialization", fixtures.validDisableInitialization],
     ]);
@@ -135,20 +133,6 @@ test('Protobuf encode/decode is order-independent for all operation types', t =>
     encoded = applyOperations.Operation.encode(shuffledPartialTransfer);
     decoded = applyOperations.Operation.decode(encoded);
     t.ok(JSON.stringify(decoded) === JSON.stringify(fixtures.validPartialTransferOperation), 'Partial TRANSFER operation encodes/decodes correctly with shuffled fields');
-
-    // Test BATCH TRANSFER operation
-    const shuffledBatchTro = shuffleObject(fixtures.validBatchTransferOperation.tro);
-    const shuffledBatchTransfer = { ...fixtures.validBatchTransferOperation, tro: shuffledBatchTro };
-    encoded = applyOperations.Operation.encode(shuffledBatchTransfer);
-    decoded = applyOperations.Operation.decode(encoded);
-    t.ok(JSON.stringify(decoded) === JSON.stringify(fixtures.validBatchTransferOperation), 'BATCH TRANSFER operation encodes/decodes correctly with shuffled fields');
-
-    // Test BATCH TRANSFER operation (partial)
-    const shuffledPartialBatchTro = shuffleObject(fixtures.validPartialBatchTransferOperation.tro);
-    const shuffledPartialBatchTransfer = { ...fixtures.validPartialBatchTransferOperation, tro: shuffledPartialBatchTro };
-    encoded = applyOperations.Operation.encode(shuffledPartialBatchTransfer);
-    decoded = applyOperations.Operation.decode(encoded);
-    t.ok(JSON.stringify(decoded) === JSON.stringify(fixtures.validPartialBatchTransferOperation), 'Partial BATCH TRANSFER operation encodes/decodes correctly with shuffled fields');
 
     // Test ADD_INDEXER operation
     const shuffledAco = shuffleObject(fixtures.validAddIndexer.aco);

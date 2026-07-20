@@ -2,40 +2,6 @@ import { BaseCheck } from '../../base/check.js';
 import b4a from 'b4a';
 import { jsonStringify } from '../../utils/types.js';
 
-function serializableResult(value) {
-    if(value === undefined) return null;
-    if(value instanceof Error) {
-        return {
-            name: value.name,
-            message: value.message,
-        };
-    }
-    try {
-        JSON.stringify(value);
-        return value;
-    } catch {
-        return String(value);
-    }
-}
-
-function featureResultRecord(op, result, err) {
-    const dispatch = op.value.dispatch;
-    const ok = result !== undefined && err === null;
-    return {
-        type: 'feature_result',
-        feature_key: op.key,
-        hash: dispatch.hash,
-        address: dispatch.address ?? null,
-        status: ok ? 'applied' : 'rejected',
-        ok,
-        result: ok ? serializableResult(result) : null,
-        error: ok ? null : {
-            message: err?.message ?? 'Feature returned no result.',
-            name: err?.name ?? 'FeatureRejected',
-        },
-    };
-}
-
 export class FeatureOperation {
     #validator
     #wallet
@@ -50,20 +16,17 @@ export class FeatureOperation {
     }
     async handle(op, batch, base, node) {
         if(false === this.#validator.validateNode(node)) return;
-        // Feature apply: signer-signed feature/contract op (replay-protected by sh/<hash>).
+        // Feature apply: admin-signed feature/contract op (replay-protected by sh/<hash>).
         if(b4a.byteLength(jsonStringify(op)) > this.#protocolInstance.featMaxBytes()) return;
         if(false === this.#validator.validate(op)) return;
-        const dispatch = op.value.dispatch;
-        const strDispatchValue = jsonStringify(dispatch.value);
-        if(null === await batch.get(`sh/${dispatch.hash}`)){
-            const verified = this.#wallet.verify(dispatch.hash, `${strDispatchValue}${dispatch.nonce}`, dispatch.address);
+        const strDispatchValue = jsonStringify(op.value.dispatch.value);
+        const admin = await batch.get('admin');
+        if(null !== admin &&
+            null === await batch.get(`sh/${op.value.dispatch.hash}`)){
+            const verified = this.#wallet.verify(op.value.dispatch.hash, `${strDispatchValue}${op.value.dispatch.nonce}`, admin.value);
             if(true === verified) {
-                const result = await this.#contractInstance.execute(op, batch);
-                const err = this.#protocolInstance.getError(result);
-                await batch.put(`fr/${dispatch.hash}`, featureResultRecord(op, result, err));
-                if(undefined !== result && null === err) {
-                    await batch.put(`sh/${dispatch.hash}`, '');
-                }
+                await this.#contractInstance.execute(op, batch);
+                await batch.put(`sh/${op.value.dispatch.hash}`, '');
                 //console.log(`Feature ${op.key} appended`);
             }
         }
@@ -87,8 +50,7 @@ export class FeatureCheck extends BaseCheck {
                     $$type : "object",
                     value : { type : "any", nullable : true },
                     nonce: { type : "string", min : 1, max : 256 },
-                    hash: { type : "is_hex" },
-                    address: { type : "is_hex" }
+                    hash: { type : "is_hex" }
                 }
             }
         };

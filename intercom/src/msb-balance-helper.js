@@ -1,8 +1,11 @@
 import path from 'path';
 
 import { MainSettlementBus } from 'trac-msb/src/index.js';
-import { createConfig, ENV } from 'trac-msb/src/config/env.js';
 import { bufferToBigInt, bigIntToDecimalString } from 'trac-msb/src/utils/amountSerialization.js';
+import {
+  createMayhemMsbConfig,
+  MAYHEM_NETWORK_ENV,
+} from './network-config.js';
 
 function fail(message) {
   throw new Error(message);
@@ -54,8 +57,10 @@ function defaultStderr() {
 export async function runRootMsbBalanceHelper(rawArgs, options = {}) {
   const parsed = parseRootMsbBalanceHelperArgs(rawArgs);
   const stderr = options.stderr ?? defaultStderr();
-  const environment = parsed.network === 'mainnet' ? ENV.MAINNET : ENV.TESTNET1;
-  const config = createConfig(environment, {
+  const environment = parsed.network === 'mainnet'
+    ? MAYHEM_NETWORK_ENV.MAINNET
+    : MAYHEM_NETWORK_ENV.TESTNET1;
+  const config = createMayhemMsbConfig(environment, {
     storeName: parsed.storeName,
     storesDirectory: `${path.resolve(parsed.storesDirectory)}${path.sep}`,
     enableInteractiveMode: false,

@@ -13,7 +13,6 @@ async function runTests() {
 	await import('./migrationUtils/validateAddressFromIncomingFile.test.js');
 	await import('./buffer/buffer.test.js')
 	await import('./amountSerialization/amountSerialization.test.js');
-	await import('./transferBatch/transferBatch.test.js');
 	test.resume();
 }
 

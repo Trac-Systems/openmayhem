@@ -58,6 +58,24 @@ shell_main="$(
 )"
 grep -F "hydrate_runtime_assets" <<<"$shell_main" >/dev/null ||
   fail "source install no longer hydrates its development runtime"
+shell_intercom_hydration="$(
+  sed -n '/^hydrate_intercom_package() {/,/^}/p' "$ROOT_DIR/install.sh"
+)"
+grep -F 'npm ci --omit=dev --install-links=true' \
+  <<<"$shell_intercom_hydration" >/dev/null ||
+  fail "Unix source install does not use root-authoritative Intercom hydration"
+grep -F 'verify-intercom-dependency-topology.mjs' \
+  <<<"$shell_intercom_hydration" >/dev/null ||
+  fail "Unix source install does not verify the Intercom dependency topology"
+grep -F 'materialize-local-dependencies.mjs' \
+  <<<"$shell_intercom_hydration" >/dev/null ||
+  fail "Unix source install does not restore exact pinned runtime files"
+shell_runtime_hydration="$(
+  sed -n '/^hydrate_runtime_assets() {/,/^}/p' "$ROOT_DIR/install.sh"
+)"
+if grep -E 'intercom/trac/(msb|trac-peer)' <<<"$shell_runtime_hydration" >/dev/null; then
+  fail "Unix source install retains nested Intercom hydration"
+fi
 artifact_branch="${shell_main#*else}"
 if grep -F "hydrate_runtime_assets" <<<"$artifact_branch" >/dev/null; then
   fail "artifact install still mutates authenticated assets with npm"
@@ -76,6 +94,24 @@ powershell_main="$(
 )"
 grep -F "Hydrate-RuntimeAssets" <<<"$powershell_main" >/dev/null ||
   fail "PowerShell source install no longer hydrates its development runtime"
+powershell_intercom_hydration="$(
+  sed -n '/^function Invoke-IntercomNpmInstall {/,/^}/p' "$ROOT_DIR/install.ps1"
+)"
+grep -F '"--install-links=true"' <<<"$powershell_intercom_hydration" >/dev/null ||
+  fail "PowerShell source install does not force physical Intercom dependencies"
+grep -F 'verify-intercom-dependency-topology.mjs' \
+  <<<"$powershell_intercom_hydration" >/dev/null ||
+  fail "PowerShell source install does not verify the Intercom dependency topology"
+grep -F 'materialize-local-dependencies.mjs' \
+  <<<"$powershell_intercom_hydration" >/dev/null ||
+  fail "PowerShell source install does not restore exact pinned runtime files"
+powershell_runtime_hydration="$(
+  sed -n '/^function Hydrate-RuntimeAssets {/,/^}/p' "$ROOT_DIR/install.ps1"
+)"
+if grep -E 'intercom.*trac.*(msb|trac-peer)' \
+  <<<"$powershell_runtime_hydration" >/dev/null; then
+  fail "PowerShell source install retains nested Intercom hydration"
+fi
 powershell_artifact="${powershell_main#*else}"
 if grep -F "Hydrate-RuntimeAssets" <<<"$powershell_artifact" >/dev/null; then
   fail "PowerShell artifact install still mutates authenticated assets with npm"
@@ -86,6 +122,26 @@ grep -F '& npm install -g "pear@$PearVersion"' "$ROOT_DIR/install.ps1" >/dev/nul
   fail "PowerShell Pear bootstrap is not pinned"
 if grep -E '& npm install -g "?pear"?([[:space:]]|$)' "$ROOT_DIR/install.ps1" >/dev/null; then
   fail "PowerShell Pear bootstrap retains an unversioned npm install"
+fi
+
+mainnet_intercom_hydration="$(
+  sed -n '/^hydrate_intercom_package() {/,/^}/p' \
+    "$ROOT_DIR/scripts/install-mainnet-systemd.sh"
+)"
+grep -F -- '--install-links=true' <<<"$mainnet_intercom_hydration" >/dev/null ||
+  fail "mainnet source install does not force physical Intercom dependencies"
+grep -F 'verify-intercom-dependency-topology.mjs' \
+  <<<"$mainnet_intercom_hydration" >/dev/null ||
+  fail "mainnet source install does not verify the Intercom dependency topology"
+grep -F 'materialize-local-dependencies.mjs' \
+  <<<"$mainnet_intercom_hydration" >/dev/null ||
+  fail "mainnet source install does not restore exact pinned runtime files"
+grep -F '"$dir/trac/msb/node_modules" "$dir/trac/trac-peer/node_modules"' \
+  <<<"$mainnet_intercom_hydration" >/dev/null ||
+  fail "mainnet source install does not remove stale nested hydration"
+if grep -E '^hydrate_npm_package "\$repo/intercom(/trac/[^"]*)?"' \
+  "$ROOT_DIR/scripts/install-mainnet-systemd.sh" >/dev/null; then
+  fail "mainnet source install retains separate Intercom npm hydration"
 fi
 
 shell_signed="$(

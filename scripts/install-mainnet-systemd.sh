@@ -233,6 +233,39 @@ hydrate_npm_package() {
   runuser -u mayhem -- npm ci --omit=dev --prefix "$dir"
 }
 
+hydrate_intercom_package() {
+  local dir="$repo/intercom"
+  local verifier="$repo/scripts/verify-intercom-dependency-topology.mjs"
+  local materializer="$dir/scripts/materialize-local-dependencies.mjs"
+
+  [[ -f "$dir/package.json" ]] || {
+    echo "Missing Intercom runtime manifest: $dir/package.json" >&2
+    exit 1
+  }
+  [[ -f "$dir/package-lock.json" ]] || {
+    echo "Missing Intercom root dependency lock: $dir/package-lock.json" >&2
+    exit 1
+  }
+  [[ -f "$dir/.npmrc" ]] || {
+    echo "Missing Intercom root npm configuration: $dir/.npmrc" >&2
+    exit 1
+  }
+  [[ -f "$verifier" ]] || {
+    echo "Missing Intercom dependency topology verifier: $verifier" >&2
+    exit 1
+  }
+  [[ -f "$materializer" ]] || {
+    echo "Missing Intercom local dependency materializer: $materializer" >&2
+    exit 1
+  }
+
+  echo "Installing root-authoritative runtime dependencies in $dir."
+  rm -rf "$dir/trac/msb/node_modules" "$dir/trac/trac-peer/node_modules"
+  runuser -u mayhem -- npm ci --omit=dev --install-links=true --prefix "$dir"
+  runuser -u mayhem -- node "$materializer" "$dir"
+  runuser -u mayhem -- node "$verifier" "$dir"
+}
+
 command -v npm >/dev/null 2>&1 || {
   echo "npm is required to install the mainnet runtime dependencies." >&2
   exit 1
@@ -258,9 +291,7 @@ command -v timeout >/dev/null 2>&1 || {
   exit 1
 }
 
-hydrate_npm_package "$repo/intercom/trac/msb"
-hydrate_npm_package "$repo/intercom/trac/trac-peer"
-hydrate_npm_package "$repo/intercom"
+hydrate_intercom_package
 hydrate_npm_package "$repo/contracts"
 
 install -d -m 700 -o mayhem -g mayhem \

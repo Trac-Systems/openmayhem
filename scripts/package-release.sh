@@ -47,6 +47,7 @@ RELEASE_ASSET_SOURCE_ALLOWLIST=(
 )
 
 INTERCOM_SOURCE_ALLOWLIST=(
+  intercom/.npmrc
   intercom/package.json
   intercom/package-lock.json
   intercom/contract
@@ -1697,259 +1698,6 @@ for (const artifact of nodeArtifacts) {
 NODE
 }
 
-prepare_intercom_local_dependency_hydrates() {
-  local intercom_root="$1"
-  local local_hydrate_root="$2"
-
-  INTERCOM_RELEASE_ROOT="$intercom_root" \
-    INTERCOM_LOCAL_HYDRATE_ROOT="$local_hydrate_root" \
-    node --input-type=module <<'NODE'
-import fs from 'node:fs';
-import path from 'node:path';
-
-const root = path.resolve(process.env.INTERCOM_RELEASE_ROOT);
-const hydrateRoot = path.resolve(process.env.INTERCOM_LOCAL_HYDRATE_ROOT);
-fs.rmSync(hydrateRoot, { recursive: true, force: true });
-fs.mkdirSync(hydrateRoot, { recursive: true });
-for (const [name, relativeSource] of [
-  ['trac-msb', 'trac/msb'],
-  ['trac-peer', 'trac/trac-peer'],
-]) {
-  const source = path.join(root, relativeSource);
-  const destination = path.join(hydrateRoot, name);
-  fs.cpSync(source, destination, {
-    recursive: true,
-    errorOnExist: true,
-    force: false,
-    dereference: false,
-  });
-}
-NODE
-}
-
-materialize_intercom_local_dependencies() {
-  local intercom_root="$1"
-  local local_hydrate_root="$2"
-
-  INTERCOM_RELEASE_ROOT="$intercom_root" \
-    INTERCOM_LOCAL_HYDRATE_ROOT="$local_hydrate_root" \
-    node --input-type=module <<'NODE'
-import fs from 'node:fs';
-import path from 'node:path';
-
-const root = path.resolve(process.env.INTERCOM_RELEASE_ROOT);
-const hydrateRoot = path.resolve(process.env.INTERCOM_LOCAL_HYDRATE_ROOT);
-const samePath = (left, right) => {
-  const normalizedLeft = path.normalize(left);
-  const normalizedRight = path.normalize(right);
-  return process.platform === 'win32'
-    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
-    : normalizedLeft === normalizedRight;
-};
-for (const [name, relativeSource] of [
-  ['trac-msb', 'trac/msb'],
-  ['trac-peer', 'trac/trac-peer'],
-]) {
-  const source = path.join(root, relativeSource);
-  const hydrated = path.join(hydrateRoot, name);
-  const destination = path.join(root, 'node_modules', name);
-  const stat = fs.lstatSync(destination);
-  if (stat.isSymbolicLink()) {
-    const resolved = fs.realpathSync(destination);
-    if (!samePath(resolved, fs.realpathSync(source))) {
-      throw new Error(`local dependency ${name} resolves outside its pinned source`);
-    }
-    fs.unlinkSync(destination);
-  } else if (stat.isDirectory()) {
-    fs.rmSync(destination, { recursive: true, force: false });
-  } else {
-    throw new Error(`local dependency ${name} is not a directory or expected npm link`);
-  }
-
-  const generatedSourceModules = path.join(source, 'node_modules');
-  if (fs.existsSync(generatedSourceModules)) {
-    const generatedStat = fs.lstatSync(generatedSourceModules);
-    if (generatedStat.isSymbolicLink() || !generatedStat.isDirectory()) {
-      throw new Error(`generated local dependency tree is unsafe: ${generatedSourceModules}`);
-    }
-    fs.rmSync(generatedSourceModules, { recursive: true, force: false });
-  }
-  fs.cpSync(hydrated, destination, {
-    recursive: true,
-    errorOnExist: true,
-    force: false,
-    dereference: false,
-  });
-}
-NODE
-}
-
-verify_materialized_intercom_local_dependencies() {
-  local intercom_root="$1"
-
-  INTERCOM_RELEASE_ROOT="$intercom_root" node --input-type=module <<'NODE'
-import fs from 'node:fs';
-import path from 'node:path';
-import { createRequire } from 'node:module';
-
-const intercomRoot = path.resolve(process.env.INTERCOM_RELEASE_ROOT);
-const packages = [
-  { name: 'trac-msb', source: 'trac/msb' },
-  { name: 'trac-peer', source: 'trac/trac-peer' },
-];
-const assertNoSymlinks = (root) => {
-  const visit = (entryPath) => {
-    const stat = fs.lstatSync(entryPath);
-    if (stat.isSymbolicLink()) {
-      throw new Error(`materialized local dependency contains symbolic link: ${entryPath}`);
-    }
-    if (!stat.isDirectory()) return;
-    for (const entry of fs.readdirSync(entryPath)) visit(path.join(entryPath, entry));
-  };
-  visit(root);
-};
-const safeLockPath = (packagePath) => {
-  if (!packagePath.startsWith('node_modules/') ||
-      packagePath.includes('\\') ||
-      path.posix.normalize(packagePath) !== packagePath ||
-      packagePath.split('/').some((part) => !part || part === '.' || part === '..')) {
-    throw new Error(`unsafe local dependency lock path: ${packagePath}`);
-  }
-};
-const packageDirectories = (packageRoot) => {
-  const installed = new Map();
-  const addPackage = (directory, lockPath) => {
-    safeLockPath(lockPath);
-    const packageJsonPath = path.join(directory, 'package.json');
-    const stat = fs.lstatSync(packageJsonPath);
-    if (!stat.isFile() || stat.isSymbolicLink()) {
-      throw new Error(`installed dependency has no regular package.json: ${lockPath}`);
-    }
-    const metadata = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
-    installed.set(lockPath, {
-      directory,
-      name: metadata.name,
-      version: metadata.version,
-    });
-    visitNodeModules(path.join(directory, 'node_modules'), `${lockPath}/`);
-  };
-  const visitNodeModules = (directory, prefix = '') => {
-    if (!fs.existsSync(directory)) return;
-    const stat = fs.lstatSync(directory);
-    if (stat.isSymbolicLink() || !stat.isDirectory()) {
-      throw new Error(`installed node_modules is not a real directory: ${directory}`);
-    }
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      if (entry.name.startsWith('.')) continue;
-      const entryPath = path.join(directory, entry.name);
-      const entryStat = fs.lstatSync(entryPath);
-      if (entryStat.isSymbolicLink()) {
-        throw new Error(`installed dependency is a symbolic link: ${entryPath}`);
-      }
-      if (!entryStat.isDirectory()) {
-        throw new Error(`unexpected file in installed node_modules: ${entryPath}`);
-      }
-      if (entry.name.startsWith('@')) {
-        for (const scoped of fs.readdirSync(entryPath, { withFileTypes: true })) {
-          const scopedPath = path.join(entryPath, scoped.name);
-          const scopedStat = fs.lstatSync(scopedPath);
-          if (scopedStat.isSymbolicLink() || !scopedStat.isDirectory()) {
-            throw new Error(`installed scoped dependency is not a real directory: ${scopedPath}`);
-          }
-          addPackage(scopedPath, `${prefix}node_modules/${entry.name}/${scoped.name}`);
-        }
-      } else {
-        addPackage(entryPath, `${prefix}node_modules/${entry.name}`);
-      }
-    }
-  }
-  visitNodeModules(path.join(packageRoot, 'node_modules'));
-  return installed;
-};
-for (const packageSpec of packages) {
-  const packageRoot = path.join(intercomRoot, 'node_modules', packageSpec.name);
-  const sourceRoot = path.join(intercomRoot, packageSpec.source);
-  if (fs.existsSync(path.join(sourceRoot, 'node_modules'))) {
-    throw new Error(`pinned source copy retains generated node_modules: ${packageSpec.source}`);
-  }
-  const destinationStat = fs.lstatSync(packageRoot);
-  if (destinationStat.isSymbolicLink() || !destinationStat.isDirectory()) {
-    throw new Error(`materialized ${packageSpec.name} is not a real directory`);
-  }
-  assertNoSymlinks(packageRoot);
-
-  const packageJson = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8'));
-  const sourcePackageJson = JSON.parse(fs.readFileSync(path.join(sourceRoot, 'package.json'), 'utf8'));
-  if (packageJson.name !== sourcePackageJson.name || packageJson.version !== sourcePackageJson.version) {
-    throw new Error(`materialized ${packageSpec.name} does not match its pinned source identity`);
-  }
-  const lock = JSON.parse(fs.readFileSync(path.join(sourceRoot, 'package-lock.json'), 'utf8'));
-  if (lock.lockfileVersion !== 3 || !lock.packages) {
-    throw new Error(`${packageSpec.name} requires an npm lockfileVersion 3 package lock`);
-  }
-  const installed = packageDirectories(packageRoot);
-  for (const [lockPath, metadata] of Object.entries(lock.packages)) {
-    if (!lockPath || !lockPath.startsWith('node_modules/')) continue;
-    safeLockPath(lockPath);
-    if (metadata.link) {
-      throw new Error(`${packageSpec.name} lockfile contains unsupported runtime link: ${lockPath}`);
-    }
-    const actual = installed.get(lockPath);
-    if (metadata.dev === true) {
-      if (actual) throw new Error(`${packageSpec.name} contains dev-only dependency: ${lockPath}`);
-      continue;
-    }
-    if (!actual) {
-      if (metadata.optional === true) continue;
-      throw new Error(`${packageSpec.name} is missing locked dependency: ${lockPath}`);
-    }
-    if (typeof metadata.version !== 'string' || actual.version !== metadata.version) {
-      throw new Error(
-        `${packageSpec.name} dependency ${lockPath} is ${actual.version}, ` +
-        `lockfile requires ${metadata.version}`
-      );
-    }
-    if (typeof metadata.name === 'string' && actual.name !== metadata.name) {
-      throw new Error(
-        `${packageSpec.name} dependency ${lockPath} is ${actual.name}, ` +
-        `lockfile requires ${metadata.name}`
-      );
-    }
-  }
-  for (const [lockPath] of installed) {
-    const metadata = lock.packages[lockPath];
-    if (!metadata || metadata.dev === true) {
-      throw new Error(`${packageSpec.name} contains dependency absent from production lock: ${lockPath}`);
-    }
-  }
-
-  const resolveFromPackage = createRequire(path.join(packageRoot, 'package.json'));
-  for (const [dependencyName, dependencySpec] of Object.entries(packageJson.dependencies ?? {})) {
-    const lockPath = `node_modules/${dependencyName}`;
-    const expected = lock.packages[lockPath];
-    const actual = installed.get(lockPath);
-    if (!expected || !actual || actual.version !== expected.version) {
-      throw new Error(`${packageSpec.name} direct dependency is not lockfile exact: ${dependencyName}`);
-    }
-    const expectedRoot = fs.realpathSync(actual.directory);
-    const resolved = resolveFromPackage.resolve(dependencyName);
-    if (resolved === dependencyName || resolved === `node:${dependencyName}`) {
-      if (!dependencySpec.startsWith('npm:')) {
-        throw new Error(`${packageSpec.name} unexpectedly resolved builtin: ${dependencyName}`);
-      }
-      continue;
-    }
-    const resolvedPath = fs.realpathSync(resolved);
-    if (resolvedPath !== expectedRoot && !resolvedPath.startsWith(`${expectedRoot}${path.sep}`)) {
-      throw new Error(
-        `${packageSpec.name} resolved ${dependencyName} outside its locked path: ${resolvedPath}`
-      );
-    }
-  }
-}
-NODE
-}
-
 verify_intercom_production_dependency_tree() {
   local intercom_root="$1"
 
@@ -1983,16 +1731,18 @@ hydrate_intercom_runtime_tree() {
   local target="$3"
   local hydrate_root="$temp_root/intercom-hydrate"
   local intercom_root="$hydrate_root/intercom"
-  local local_hydrate_root="$hydrate_root/local-dependencies"
   local package_hash lock_hash msb_package_hash msb_lock_hash
   local peer_package_hash peer_lock_hash native_host
 
   command -v npm >/dev/null 2>&1 ||
     die "npm is required to hydrate the production Intercom dependency tree"
   for required in \
+    scripts/verify-intercom-dependency-topology.mjs \
+    intercom/.npmrc \
     intercom/package.json \
     intercom/package-lock.json \
     intercom/contract/release.json \
+    intercom/scripts/materialize-local-dependencies.mjs \
     intercom/src/release-identity.js \
     intercom/trac/msb/package.json \
     intercom/trac/msb/package-lock.json \
@@ -2004,7 +1754,6 @@ hydrate_intercom_runtime_tree() {
   rm -rf "$hydrate_root"
   copy_tracked_allowlist "$hydrate_root" "${INTERCOM_SOURCE_ALLOWLIST[@]}"
   verify_intercom_release_identity "$intercom_root"
-  prepare_intercom_local_dependency_hydrates "$intercom_root" "$local_hydrate_root"
   native_host="$(host_target)"
 
   if lockfile_hints_at_native_runtime_dependencies "$intercom_root/package-lock.json"; then
@@ -2035,22 +1784,11 @@ hydrate_intercom_runtime_tree() {
     "${clean_npm_env[@]}" \
       npm ci \
         --omit=dev \
+        --install-links=true \
         --no-audit \
         --no-fund \
         --ignore-scripts \
         --no-bin-links
-    for local_package in "$local_hydrate_root/trac-msb" "$local_hydrate_root/trac-peer"; do
-      (
-        cd "$local_package"
-        "${clean_npm_env[@]}" \
-          npm ci \
-            --omit=dev \
-            --no-audit \
-            --no-fund \
-            --ignore-scripts \
-            --no-bin-links
-      )
-    done
   )
   [[ -d "$intercom_root/node_modules" ]] ||
     die "npm did not produce the Intercom production dependency tree"
@@ -2066,17 +1804,8 @@ hydrate_intercom_runtime_tree() {
     die "npm changed the pinned trac-peer package.json"
   [[ "$peer_lock_hash" == "$(sha256_file "$intercom_root/trac/trac-peer/package-lock.json")" ]] ||
     die "npm changed the pinned trac-peer package-lock.json"
-  [[ "$msb_package_hash" == "$(sha256_file "$local_hydrate_root/trac-msb/package.json")" ]] ||
-    die "npm changed the hydrated trac-msb package.json"
-  [[ "$msb_lock_hash" == "$(sha256_file "$local_hydrate_root/trac-msb/package-lock.json")" ]] ||
-    die "npm changed the hydrated trac-msb package-lock.json"
-  [[ "$peer_package_hash" == "$(sha256_file "$local_hydrate_root/trac-peer/package.json")" ]] ||
-    die "npm changed the hydrated trac-peer package.json"
-  [[ "$peer_lock_hash" == "$(sha256_file "$local_hydrate_root/trac-peer/package-lock.json")" ]] ||
-    die "npm changed the hydrated trac-peer package-lock.json"
-
-  materialize_intercom_local_dependencies "$intercom_root" "$local_hydrate_root"
-  verify_materialized_intercom_local_dependencies "$intercom_root"
+  node "$intercom_root/scripts/materialize-local-dependencies.mjs" "$intercom_root"
+  node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$intercom_root"
   verify_intercom_production_dependency_tree "$intercom_root"
   finalize_intercom_native_artifacts \
     "$intercom_root" \

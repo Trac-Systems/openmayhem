@@ -730,18 +730,24 @@ Two guardrails hold it steady. A market with fewer than two active providers sta
 
 ### What a machine can earn
 
-Worked example: `qwen3.6-35b-a3b` at its reference price of $0.05 per million input tokens and $0.35 per million output tokens. The table assumes the market sits at the seed price, demand keeps the machine busy around the clock, input runs at three tokens for every output token, and the 15% network fee is already deducted. Throughput for the GB10 row is measured; the other rows are estimates from memory bandwidth.
+The table below spans hardware from a laptop to a datacenter-class box. What a machine can hold decides what it earns: a 24 GB card or a big-memory box runs `qwen3.6-35b-a3b` at its reference price of $0.05 per million input tokens and $0.35 per million output; smaller machines run a 7B–14B model instead, which clears at roughly a third to a fifth of that price but runs several times faster. Every row assumes the market sits at the seed price, demand keeps the machine busy around the clock, input runs at three tokens for every output, and the 15% network fee is already deducted. The GB10 throughput is measured; every other figure, and the smaller-model prices, are estimates.
 
-| Machine | Concurrent sessions | Sustained output | Net per month |
-|---------|--------------------|------------------|---------------|
-| Mac mini M4 Pro, 64 GB | 2–4 | ~80–110 tok/s | ~$80–120 |
-| GB10-class box, 128 GB (DGX Spark and similar) | 2 | ~115 tok/s | ~$105–135 |
-| Mac Studio M4 Max | 4–6 | ~160–220 tok/s | ~$150–240 |
-| GB10-class box, 128 GB | 6 | ~230 tok/s | ~$210–260 |
-| Mac Studio M3 Ultra | 6–8 | ~250–350 tok/s | ~$230–380 |
-| RTX 4090 desktop, 24 GB | 8 | ~300–500 tok/s | ~$280–550 |
+| Machine | Model | Concurrent sessions | Sustained output | Net per month |
+|---------|-------|--------------------|------------------|---------------|
+| MacBook Pro, 48 GB | 7B–14B | 2–4 | ~120–220 tok/s | ~$40–90 |
+| RTX 3080, 10 GB | 7B–8B | 4–6 | ~400–700 tok/s | ~$90–170 |
+| RTX 3060, 12 GB | 7B–8B | 4–6 | ~300–500 tok/s | ~$70–130 |
+| RTX 4060 Ti, 16 GB | 7B–14B | 4–8 | ~300–550 tok/s | ~$80–150 |
+| RTX 4070 / 4070 Ti, 12 GB | 7B–8B | 6–8 | ~500–900 tok/s | ~$120–220 |
+| Mac mini M4 Pro, 64 GB | 35B-A3B | 2–4 | ~80–110 tok/s | ~$80–120 |
+| RTX 3090, 24 GB | 14B, or 35B-A3B | 6–10 | ~700–1300 tok/s | ~$140–280 |
+| GB10-class box, 128 GB (DGX Spark and similar) | 35B-A3B | 2 | ~115 tok/s | ~$105–135 |
+| Mac Studio M4 Max | 35B-A3B | 4–6 | ~160–220 tok/s | ~$150–240 |
+| GB10-class box, 128 GB | 35B-A3B | 6 | ~230 tok/s | ~$210–260 |
+| Mac Studio M3 Ultra | 35B-A3B | 6–8 | ~250–350 tok/s | ~$230–380 |
+| RTX 4090 desktop, 24 GB | 35B-A3B | 8 | ~300–500 tok/s | ~$280–550 |
 
-Three things move these numbers. Concurrency is the cheapest lever: this model batches well, so serving six sessions instead of two roughly doubles the take on the same hardware. The market price is the biggest one: the table uses the frozen seed, and a market that runs hot walks the price up toward 4× the reference, which multiplies every row with it. And the numbers assume saturation; a machine only earns while sessions are actually flowing. For cost context, a box drawing 150 W runs about €16 a month in electricity at typical European rates.
+Three things move these numbers. Concurrency is the cheapest lever: these models batch well, so serving six sessions instead of two roughly doubles the take on the same hardware. The market price is the biggest one: the table uses the frozen seed, and a market that runs hot walks the price up toward 4× the reference, which multiplies every row with it. And the numbers assume saturation; a machine only earns while sessions are actually flowing. A fast small model on a cheap card can out-earn a slow large model, because per-token price drops more slowly than throughput rises, so the 12–24 GB range is the sweet spot for consumer hardware; 8 GB or less is limited to 3B–4B models and short context, where earnings are real but thin. For cost context, a box drawing 150 W runs about €16 a month in electricity at typical European rates.
 
 Attestation tiers describe what trust evidence a provider has. They don't all mean the same thing, and a higher number isn't simply "everything below it plus more."
 

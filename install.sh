@@ -1143,15 +1143,30 @@ hydrate_npm_package() {
   fi
 }
 
+hydrate_intercom_package() {
+  local dir="$SHARE_DIR/intercom"
+  local verifier="$SOURCE_DIR/scripts/verify-intercom-dependency-topology.mjs"
+  local materializer="$dir/scripts/materialize-local-dependencies.mjs"
+
+  [[ -f "$dir/package.json" ]] || die "missing Intercom runtime manifest: $dir/package.json"
+  [[ -f "$dir/package-lock.json" ]] || die "missing Intercom root dependency lock: $dir/package-lock.json"
+  [[ -f "$dir/.npmrc" ]] || die "missing Intercom root npm configuration: $dir/.npmrc"
+  [[ -f "$verifier" ]] || die "missing Intercom dependency topology verifier: $verifier"
+  [[ -f "$materializer" ]] || die "missing Intercom local dependency materializer: $materializer"
+
+  log "installing root-authoritative runtime dependencies in $dir"
+  (cd "$dir" && npm ci --omit=dev --install-links=true)
+  node "$materializer" "$dir"
+  node "$verifier" "$dir"
+}
+
 hydrate_runtime_assets() {
   if [[ "$SKIP_NODE" == "1" ]]; then
     log "skipping runtime dependency install because --skip-node was set"
     return 0
   fi
   ensure_node
-  hydrate_npm_package "$SHARE_DIR/intercom/trac/msb"
-  hydrate_npm_package "$SHARE_DIR/intercom/trac/trac-peer"
-  hydrate_npm_package "$SHARE_DIR/intercom"
+  hydrate_intercom_package
   hydrate_npm_package "$SHARE_DIR/contracts"
 }
 

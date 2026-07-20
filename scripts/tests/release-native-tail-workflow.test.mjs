@@ -281,18 +281,18 @@ requireAbsent(
   packageSource,
 );
 requireMatch(
-  /^\[workspace\.package\]\n(?:(?!^\[)[\s\S])*^rust-version = "1\.85"$/m,
-  'workspace Rust policy must remain MSRV 1.85',
+  /^\[workspace\.package\]\n(?:(?!^\[)[\s\S])*^rust-version = "1\.89"$/m,
+  'workspace Rust policy must match the locked dependency floor at 1.89',
   cargoWorkspaceSource,
 );
 requireLiteral(
-  'rustup toolchain install "1.85.0-$TARGET" --profile minimal',
-  'Rust must install exact workspace-MSRV toolchain 1.85.0',
+  'rustup toolchain install "1.89.0-$TARGET" --profile minimal',
+  'Rust must install exact workspace-MSRV toolchain 1.89.0',
   packageSource,
 );
 requireLiteral(
-  'rustup default "1.85.0-$TARGET"',
-  'Rust default must use exact workspace-MSRV toolchain 1.85.0',
+  'rustup default "1.89.0-$TARGET"',
+  'Rust default must use exact workspace-MSRV toolchain 1.89.0',
   packageSource,
 );
 requireAbsent(

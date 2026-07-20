@@ -483,14 +483,6 @@ function defineTransferOperation () {
       var len = encodings.bytes.encodingLength(obj.vs)
       length += 1 + len
     }
-    if (defined(obj.bo)) {
-      var len = encodings.bytes.encodingLength(obj.bo)
-      length += 1 + len
-    }
-    if (defined(obj.ba)) {
-      var len = encodings.bytes.encodingLength(obj.ba)
-      length += 1 + len
-    }
     return length
   }
 
@@ -543,16 +535,6 @@ function defineTransferOperation () {
       encodings.bytes.encode(obj.vs, buf, offset)
       offset += encodings.bytes.encode.bytes
     }
-    if (defined(obj.bo)) {
-      buf[offset++] = 82
-      encodings.bytes.encode(obj.bo, buf, offset)
-      offset += encodings.bytes.encode.bytes
-    }
-    if (defined(obj.ba)) {
-      buf[offset++] = 90
-      encodings.bytes.encode(obj.ba, buf, offset)
-      offset += encodings.bytes.encode.bytes
-    }
     encode.bytes = offset - oldOffset
     return buf
   }
@@ -571,9 +553,7 @@ function defineTransferOperation () {
       is: null,
       va: null,
       vn: null,
-      vs: null,
-      bo: null,
-      ba: null
+      vs: null
     }
     while (true) {
       if (end <= offset) {
@@ -618,14 +598,6 @@ function defineTransferOperation () {
         break
         case 9:
         obj.vs = encodings.bytes.decode(buf, offset)
-        offset += encodings.bytes.decode.bytes
-        break
-        case 10:
-        obj.bo = encodings.bytes.decode(buf, offset)
-        offset += encodings.bytes.decode.bytes
-        break
-        case 11:
-        obj.ba = encodings.bytes.decode(buf, offset)
         offset += encodings.bytes.decode.bytes
         break
         default:
