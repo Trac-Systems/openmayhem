@@ -328,6 +328,16 @@ requireLiteral(
   packageSource,
 );
 requireLiteral(
+  '-Value "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$linker"',
+  'Windows ARM packaging must pin Cargo to the discovered MSVC linker',
+  packageSource,
+);
+requireLiteral(
+  '[[ -n "${CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER:-}" ]]',
+  'Windows identity must reject an unpinned Cargo ARM64 linker',
+  packageSource,
+);
+requireLiteral(
   '[[ "$rust_host" == "$TARGET" ]]',
   'Rust host must exactly match each matrix target',
   packageSource,

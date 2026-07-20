@@ -199,11 +199,25 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Visual Studio ARM64 environment setup failed"
           }
+          $pathLine = $environment |
+            Where-Object { $_ -match "^Path=" } |
+            Select-Object -First 1
+          if ([string]::IsNullOrWhiteSpace($pathLine)) {
+            throw "Visual Studio ARM64 environment did not provide PATH"
+          }
+          $toolDirectory = $pathLine.Substring($pathLine.IndexOf("=") + 1).Split(";")[0]
+          $linker = Join-Path $toolDirectory "link.exe"
+          if (-not (Test-Path -LiteralPath $linker -PathType Leaf)) {
+            throw "Visual Studio ARM64 linker is unavailable"
+          }
           foreach ($line in $environment) {
             if ($line -match "^[^=]+=") {
               Add-Content -LiteralPath $env:GITHUB_ENV -Value $line -Encoding utf8
             }
           }
+          Add-Content -LiteralPath $env:GITHUB_ENV `
+            -Value "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$linker" `
+            -Encoding utf8
 
       - name: Assert native runner identity
         shell: bash
@@ -245,6 +259,10 @@ jobs:
               }
               [[ "${VSCMD_ARG_TGT_ARCH,,}" == "arm64" ]] || {
                 printf '%s\n' "Visual Studio target tools are not ARM64" >&2
+                exit 1
+              }
+              [[ -n "${CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER:-}" ]] || {
+                printf '%s\n' "Cargo ARM64 linker is not pinned" >&2
                 exit 1
               }
               cl_path="$(where.exe cl.exe | tr -d '\r' | sed -n '1p')"
