@@ -51,100 +51,28 @@ gateway is loopback-only; a public ledger records prices, receipts, settlements.
 
 ## 3. Install
 
-### 3.1 Get the code — release-first, main-tree fallback (MANDATORY rule)
-- Check the [releases page](https://github.com/Trac-Systems/openmayhem/releases). Use a release
-  artifact only when a native archive for the host, its detached manifest, and its detached
-  signature are published. The independently trusted canonical public-key record is
-  [`release/keys/openmayhem-release-v1.json`](release/keys/openmayhem-release-v1.json), published at
-  the raw GitHub URL below with key ID `openmayhem-release-v1`. The independent record is mandatory.
-  Never trust a key from inside the archive or signature, and never invent a missing artifact URL,
-  source commit, hash, or release.
-- For a complete published `0.2.23` release, use terminal-friendly user paths and replace only the
-  target-specific artifact placeholder.
+### 3.1 Get the code — exact source release (MANDATORY rule)
+- `v0.2.23` is source-only. Never invent or offer a native archive URL: the release has no unsigned
+  OpenMayhem executable assets. Clone the exact release tag and build it locally.
 
   **macOS/Linux:**
   ```bash
-  mkdir -p "$HOME/Downloads/openmayhem-install"
-  cd "$HOME/Downloads/openmayhem-install"
-  curl -fL 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/install.sh' -o install.sh
-  curl -fL 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/release/keys/openmayhem-release-v1.json' -o openmayhem-release-v1.json
-  chmod 0755 install.sh
-  ./install.sh \
-    --artifact-url '<0.2.23-macos-or-linux-release-archive-url>' \
-    --version 0.2.23 \
-    --release-key './openmayhem-release-v1.json' \
-    --release-key-id 'openmayhem-release-v1'
+  git clone https://github.com/Trac-Systems/openmayhem.git
+  cd openmayhem
+  git checkout --detach v0.2.23
+  ./install.sh --from-source
   ```
 
   **Windows PowerShell:**
   ```powershell
-  $workDir = Join-Path $HOME 'Downloads\openmayhem-install'
-  New-Item -ItemType Directory -Force -Path $workDir | Out-Null
-  Set-Location $workDir
-  Invoke-WebRequest `
-    -Uri 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/install.ps1' `
-    -OutFile '.\install.ps1'
-  Invoke-WebRequest `
-    -Uri 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/release/keys/openmayhem-release-v1.json' `
-    -OutFile '.\openmayhem-release-v1.json'
-  .\install.ps1 `
-    -ArtifactUrl '<0.2.23-windows-release-archive-url>' `
-    -Version 0.2.23 `
-    -ReleaseKey '.\openmayhem-release-v1.json' `
-    -ReleaseKeyId 'openmayhem-release-v1'
-  ```
-
-  The installers derive the required `<archive-stem>.manifest.json` and
-  `<archive-stem>.manifest.json.sig` URLs from a macOS/Linux archive ending in `.tar.gz` or `.tgz`,
-  or a Windows archive ending in `.zip`. If the release publishes different detached URLs, provide
-  them explicitly. An exact release identity is mandatory: use `--version 0.2.23` or
-  `-Version 0.2.23` as shown. To select by commit instead, replace that option with
-  `--source-git-sha '<exact-40-lowercase-hex-source-sha>'` or
-  `-ExpectedSourceGitSha '<exact-40-lowercase-hex-source-sha>'`. Never omit both. An archive SHA-256
-  is optional:
-
-  ```bash
-  ./install.sh \
-    --artifact-url '<0.2.23-macos-or-linux-release-archive-url>' \
-    --manifest-url '<0.2.23-target-detached-manifest-url>' \
-    --signature-url '<0.2.23-target-detached-signature-url>' \
-    --version 0.2.23 \
-    --release-key './openmayhem-release-v1.json' \
-    --release-key-id 'openmayhem-release-v1' \
-    --sha256 '<optional-archive-sha256>'
-  ```
-
-  ```powershell
-  .\install.ps1 `
-    -ArtifactUrl '<0.2.23-windows-release-archive-url>' `
-    -ManifestUrl '<0.2.23-windows-detached-manifest-url>' `
-    -SignatureUrl '<0.2.23-windows-detached-signature-url>' `
-    -Version 0.2.23 `
-    -ReleaseKey '.\openmayhem-release-v1.json' `
-    -ReleaseKeyId 'openmayhem-release-v1' `
-    -Sha256 '<optional-archive-sha256>'
-  ```
-
-  Use an optional archive hash only when its exact value is published. The installer snapshots the
-  release inputs and authenticates the detached signature, manifest, trusted key, requested
-  identity, target, and anti-rollback state before candidate extraction. It checks the extracted
-  bootstrap against the signed hash before execution. Only after the authenticated artifact install
-  does it check or provision pinned Pear `2.0.4`. That npm action is limited to Pear and never
-  hydrates the signed runtime; never run `npm install` or `npm ci` there.
-- **If there is no complete native release for the host**, build from the **main tree** by cloning:
-  ```
   git clone https://github.com/Trac-Systems/openmayhem.git
-  cd openmayhem
-  ./install.sh --from-source            # Windows: .\install.ps1 -FromSource
+  Set-Location openmayhem
+  git checkout --detach v0.2.23
+  .\install.ps1 -FromSource
   ```
 Everything installs under `~/.mayhem/` — no `sudo`, no system directories.
 
 ### 3.2 Prerequisites (install these FIRST and verify each)
-**Authenticated release, every OS:** Node.js 20+ with npm and the platform's download/archive
-tools. Rust and a native compiler toolchain are not required. After artifact authentication,
-anti-rollback enforcement, and installation, npm may provision only pinned Pear `2.0.4`; it must
-never hydrate or modify the authenticated installed runtime.
-
 **From source, every OS:** Rust stable (rustup), Node.js 20+ with npm, git, curl, unzip.
 
 **macOS (Apple Silicon):**
@@ -199,12 +127,12 @@ workers, leaves their canonical registrations, and stops everything. Use `mayhem
 for an update or temporary restart; it preserves durable registrations so the next `mayhem up`
 resumes without provider re-onboarding.
 
-For a Tier-2/Tier-3 candidate, a fresh buyer needs no TPM, provider quote helper, root/admin action,
-manual verifier flag, or machine-wide setup. `mayhem up` authenticates the active policy and shared
-public collateral. When that policy requires a managed verifier, it fetches only the
-executable/manifest pair for the buyer binary's compiled target, verifies both, and wires the
-sibling automatically. Never fetch another target "just in case" or accept verifier code, roots,
-policy, JWKS, or golden measurements from a provider.
+For a Tier-2 candidate, a fresh buyer needs no TPM, provider quote helper, root/admin action,
+manual verifier flag, or machine-wide setup. The source installer builds the verifier from the same
+checked-out tag, and `mayhem up` authenticates the active policy and shared public collateral. It
+never fetches verifier code from an operator or provider. Managed Tier-3 verifier distribution is
+not active in `0.2.23`; a route that cannot prove an available higher tier falls back to the next
+tier it can prove.
 
 ---
 
@@ -545,9 +473,8 @@ forwarded as-is.
 
 | Goal | Command |
 |---|---|
-| Install release (macOS/Linux) | `./install.sh --artifact-url '<0.2.23-target-archive-url>' --version 0.2.23 --release-key './openmayhem-release-v1.json' --release-key-id openmayhem-release-v1` |
-| Install release (PowerShell) | `.\install.ps1 -ArtifactUrl '<0.2.23-windows-archive-url>' -Version 0.2.23 -ReleaseKey '.\openmayhem-release-v1.json' -ReleaseKeyId openmayhem-release-v1` |
-| Install (no release → main) | `git clone …/openmayhem.git && cd openmayhem && ./install.sh --from-source` |
+| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.23 && ./install.sh --from-source` |
+| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.23; .\install.ps1 -FromSource` |
 | Start user gateway | `mayhem up --rail <fiat\|tap\|tnk> --yes` |
 | Start provider | `mayhem up --provider --yes` |
 | Stop and leave provider registrations | `mayhem down` |
@@ -608,10 +535,11 @@ forwarded as-is.
 - Never choose the user's rail, model, or limits for them — ask.
 - Never paste a wallet mnemonic or secret into a shared, logged, or remote channel.
 - Never bypass the mainnet fail-closed checks or the signed-catalog verification.
-- Never present version metadata or focused local tests as a native/live release. A release requires
-  one clean RC commit, six fresh native signed packages carrying that exact `source_git_sha`,
-  physical-root Intercom identity verification, canary/live acceptance, and deployment of those
-  exact artifacts. The matrix is exactly `aarch64-apple-darwin`,
+- Never present version metadata or focused local tests as a live release. A source release requires
+  one clean tagged commit, fresh source-build acceptance on the six supported targets,
+  physical-root Intercom identity verification, canary/live acceptance, and exact-revision fleet
+  deployment. The matrix is exactly `aarch64-apple-darwin`,
   `x86_64-apple-darwin`, `aarch64-unknown-linux-gnu`,
   `x86_64-unknown-linux-gnu`, `aarch64-pc-windows-msvc`, and
-  `x86_64-pc-windows-msvc`. Any source change restarts the package matrix.
+  `x86_64-pc-windows-msvc`. Those builds are internal acceptance evidence, not unsigned release
+  assets. Any runtime source change restarts the build matrix.

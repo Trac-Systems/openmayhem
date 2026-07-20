@@ -74,75 +74,30 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-**Get the code first.** Either clone the repository and build from source:
-
-```bash
-git clone https://github.com/Trac-Systems/openmayhem.git
-cd openmayhem
-```
-
-Or, when the [releases page](https://github.com/Trac-Systems/openmayhem/releases)
-publishes a native archive for your host, use the authenticated release
-bootstrap. A detached manifest, its detached Ed25519 signature, and a trusted
-public-key record obtained through an independent authenticated project channel
-are required. Never use a key extracted from the archive or copied from the
-signature as the trust anchor. The canonical record is tracked at
-[`release/keys/openmayhem-release-v1.json`](release/keys/openmayhem-release-v1.json)
-with key ID `openmayhem-release-v1`. Replace the archive placeholder only when
-the matching target artifact is published.
+`v0.2.23` is a source release. GitHub publishes the tagged source archives; it
+does not publish unsigned OpenMayhem executables. Clone the exact tag and let
+the installer build for the current host.
 
 macOS/Linux:
 
 ```bash
-mkdir -p "$HOME/Downloads/openmayhem-install"
-cd "$HOME/Downloads/openmayhem-install"
-curl -fL 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/install.sh' -o install.sh
-curl -fL 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/release/keys/openmayhem-release-v1.json' -o openmayhem-release-v1.json
-chmod 0755 install.sh
-./install.sh \
-  --artifact-url '<0.2.23-macos-or-linux-release-archive-url>' \
-  --version 0.2.23 \
-  --release-key './openmayhem-release-v1.json' \
-  --release-key-id 'openmayhem-release-v1'
+git clone https://github.com/Trac-Systems/openmayhem.git
+cd openmayhem
+git checkout --detach v0.2.23
+./install.sh --from-source
 ```
 
 Windows PowerShell:
 
 ```powershell
-$workDir = Join-Path $HOME 'Downloads\openmayhem-install'
-New-Item -ItemType Directory -Force -Path $workDir | Out-Null
-Set-Location $workDir
-Invoke-WebRequest `
-  -Uri 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/install.ps1' `
-  -OutFile '.\install.ps1'
-Invoke-WebRequest `
-  -Uri 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/release/keys/openmayhem-release-v1.json' `
-  -OutFile '.\openmayhem-release-v1.json'
-.\install.ps1 `
-  -ArtifactUrl '<0.2.23-windows-release-archive-url>' `
-  -Version 0.2.23 `
-  -ReleaseKey '.\openmayhem-release-v1.json' `
-  -ReleaseKeyId 'openmayhem-release-v1'
+git clone https://github.com/Trac-Systems/openmayhem.git
+Set-Location openmayhem
+git checkout --detach v0.2.23
+.\install.ps1 -FromSource
 ```
 
-For a macOS/Linux archive URL ending in `.tar.gz` or `.tgz`, or a Windows
-archive URL ending in `.zip`, the installers derive the required
-`<archive-stem>.manifest.json` and
-`<archive-stem>.manifest.json.sig` URLs. Pass `--manifest-url` and
-`--signature-url` on macOS/Linux, or `-ManifestUrl` and `-SignatureUrl` in
-PowerShell, when the detached files use different published URLs. Every
-authenticated artifact install must select an exact identity: the examples pin
-`0.2.23`; alternatively, replace the version option with
-`--source-git-sha '<exact-40-lowercase-hex-source-sha>'` on macOS/Linux or
-`-ExpectedSourceGitSha '<exact-40-lowercase-hex-source-sha>'` in PowerShell. Do
-not omit both selectors. An archive SHA-256 is an optional additional pin.
-
-The installer snapshots the release inputs and authenticates the detached
-signature, manifest, target, requested identity, and anti-rollback state before
-candidate extraction. It checks the extracted bootstrap against the signed hash
-before execution. Pinned Pear `2.0.4` provisioning happens only after the
-authenticated artifact install. It does not hydrate or mutate the signed
-runtime inventory; do not run `npm install` or `npm ci` there afterward.
+Everything installs under `~/.mayhem/` without requiring a signed Apple or
+Windows application bundle.
 
 Every command below assumes you are in the repository directory (or have `mayhem` on your `PATH` after installing).
 
@@ -164,13 +119,13 @@ rules, payment directory, catalog, and at least one live model route have
 synchronized. Users and providers do not paste network addresses or Ethereum
 contract addresses into normal setup commands.
 
-For Tier-2 and Tier-3 routes, a fresh buyer also needs no TPM, provider helper,
-Administrator/root action, or verifier flag. `mayhem up` authenticates the
-active catalog policy and shared public trust data. When that policy requires a
-managed verifier, it fetches only the executable and manifest for the buyer
-binary's own native target and wires the verified sibling executable
-automatically. It does not fetch the other five platform builds or accept
-verifier code, roots, policy, or golden measurements from a provider.
+For Tier-2 routes, a fresh buyer also needs no TPM, provider helper,
+Administrator/root action, or verifier flag. The source installer builds the
+verifier from the same checked-out tag, and `mayhem up` authenticates the active
+catalog policy and shared public trust data. No verifier executable is fetched
+from an operator or provider. Managed Tier-3 verifier distribution is not
+activated in this source-only release; a route that cannot prove an available
+higher tier falls back to the next tier it can prove.
 
 The selected rail is persisted for later starts. Rails never borrow, convert,
 or settle across one another. To switch a running gateway, restart it with the
@@ -527,9 +482,9 @@ mayhem up --provider --yes \
 Windows uses `scripts/hardware/mayhem-tpm2-quote-windows.ps1` from the same normal account that runs `mayhem`; it obtains a fresh nonce-bound quote through Windows TBS and binds the TPM EK through PCP/NCrypt and the manufacturer certificate chain. It does not need Administrator privileges or a privileged helper. Tier-3 operators pass the matching confidential-compute quote kind/helper. A valid Tier-2 or Tier-3 proof joins the existing canonical tier market automatically. Tier 4 is different: it is the admin's KYB identity overlay.
 
 Those explicit quote commands are provider-side evidence collection. Buyers do
-not install or select them: the signed policy and the buyer's authenticated
-native release select the verifier automatically, and only routes verifiable
-under that exact active policy become locally routable.
+not install or select them: the signed policy and the verifier built from the
+same source tag select the verification profile automatically, and only routes
+verifiable under that exact active policy become locally routable.
 
 To add a higher-tier worker without restarting an already running stack, pass the same explicit proof options to `mayhem provider serve add <enclave-id> --hardware-quote-kind <kind> --hardware-quote-command <path>`.
 
@@ -845,116 +800,32 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-From a source checkout:
-
-```bash
-./install.sh --from-source        # macOS / Linux
-.\install.ps1 -FromSource         # Windows PowerShell
-```
-
-When a native release artifact is published, first obtain its public-key record
-through an independent authenticated project channel. The key record is
-mandatory and must not come from the archive or detached signature. The
-canonical record is
-[`release/keys/openmayhem-release-v1.json`](release/keys/openmayhem-release-v1.json),
-published from the repository at the URL used below, and its key ID is
-`openmayhem-release-v1`.
+`v0.2.23` is source-only. The GitHub release contains the tagged source, not
+unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
 
 ```bash
-curl -fL 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/release/keys/openmayhem-release-v1.json' -o './openmayhem-release-v1.json'
-./install.sh \
-  --artifact-url '<0.2.23-macos-or-linux-release-archive-url>' \
-  --version 0.2.23 \
-  --release-key './openmayhem-release-v1.json' \
-  --release-key-id 'openmayhem-release-v1'
+git clone https://github.com/Trac-Systems/openmayhem.git
+cd openmayhem
+git checkout --detach v0.2.23
+./install.sh --from-source
 ```
 
 Windows PowerShell:
 
 ```powershell
-Invoke-WebRequest `
-  -Uri 'https://raw.githubusercontent.com/Trac-Systems/openmayhem/main/release/keys/openmayhem-release-v1.json' `
-  -OutFile '.\openmayhem-release-v1.json'
-.\install.ps1 `
-  -ArtifactUrl '<0.2.23-windows-release-archive-url>' `
-  -Version 0.2.23 `
-  -ReleaseKey '.\openmayhem-release-v1.json' `
-  -ReleaseKeyId 'openmayhem-release-v1'
+git clone https://github.com/Trac-Systems/openmayhem.git
+Set-Location openmayhem
+git checkout --detach v0.2.23
+.\install.ps1 -FromSource
 ```
 
-Both installers require a detached signed manifest and detached signature.
-macOS/Linux release archives use `.tar.gz` or `.tgz`; Windows release archives
-use `.zip`. For an archive URL, the installer derives the metadata URLs by
-appending `.manifest.json` and `.manifest.json.sig` to the archive stem. If the
-release publishes different locations, provide every URL explicitly.
-
-An exact release identity is mandatory. The commands above select version
-`0.2.23`. To select by the signed source commit instead, omit the version option
-and use one of these exact 40-lowercase-hex alternatives:
-
-```bash
-./install.sh \
-  --artifact-url '<release-archive-url-for-this-source-commit-and-target>' \
-  --source-git-sha '<exact-40-lowercase-hex-source-sha>' \
-  --release-key './openmayhem-release-v1.json' \
-  --release-key-id 'openmayhem-release-v1'
-```
-
-```powershell
-.\install.ps1 `
-  -ArtifactUrl '<release-archive-url-for-this-source-commit-and-target>' `
-  -ExpectedSourceGitSha '<exact-40-lowercase-hex-source-sha>' `
-  -ReleaseKey '.\openmayhem-release-v1.json' `
-  -ReleaseKeyId 'openmayhem-release-v1'
-```
-
-You may pass both selectors to require both matches. The archive SHA-256 remains
-an optional additional pin. When detached metadata URLs differ from the derived
-release URLs, use the complete form:
-
-```bash
-./install.sh \
-  --artifact-url '<0.2.23-macos-or-linux-release-archive-url>' \
-  --manifest-url '<0.2.23-target-detached-manifest-url>' \
-  --signature-url '<0.2.23-target-detached-signature-url>' \
-  --version 0.2.23 \
-  --release-key './openmayhem-release-v1.json' \
-  --release-key-id 'openmayhem-release-v1' \
-  --sha256 '<optional-archive-sha256>'
-```
-
-```powershell
-.\install.ps1 `
-  -ArtifactUrl '<0.2.23-windows-release-archive-url>' `
-  -ManifestUrl '<0.2.23-windows-detached-manifest-url>' `
-  -SignatureUrl '<0.2.23-windows-detached-signature-url>' `
-  -Version 0.2.23 `
-  -ReleaseKey '.\openmayhem-release-v1.json' `
-  -ReleaseKeyId 'openmayhem-release-v1' `
-  -Sha256 '<optional-archive-sha256>'
-```
-
-Use an optional archive hash only when its exact value is published; never
-guess it. Before candidate extraction, the installer snapshots the release
-inputs and authenticates the detached signature, manifest, trusted key,
-requested identity, target, and anti-rollback state. It checks the extracted
-bootstrap against the signed hash before execution. Only after the authenticated
-artifact install does it check or provision pinned Pear `2.0.4`. That npm step
-is limited to Pear and does not hydrate the signed package inventory. Do not run
-`npm install` or `npm ci` in the installed runtime.
-
-A signed release must bind every package and staged update to one exact
-lowercase 40-hex `source_git_sha` derived from the clean RC commit. The
-supported native target matrix is `aarch64-apple-darwin`, `x86_64-apple-darwin`,
-`aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`,
-`aarch64-pc-windows-msvc`, and `x86_64-pc-windows-msvc`. The embedded Intercom
-runtime is authenticated from its physical packaged tree: Pear disk launches
-use the physical app directory and link-only `pear://` launches are rejected.
-Package/update authentication verifies the complete runtime inventory; Pear
-startup verifies the declared contract version and contract-code digests before
-opening a store or reporting a release identity.
+The source installer compiles only OpenMayhem's generic runtimes and backends.
+Model weights and model-specific catalog records remain external; adding a
+catalog model does not embed its weights or create another Mayhem executable.
+Pinned Pear `2.0.4` is provisioned without modifying the checked-in Intercom
+runtime.
 
 Installers print a copy/paste `PATH` command even when they update your shell profile, and anything that would open a browser prints the URL first. The whole system works from a terminal alone.
 
@@ -967,11 +838,11 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 ## Development
 
 The combined `0.2.23` PAYOUTFREE, ATTAUTO, FLOWRATE, and LIVEROUTE work in this
-repository is an integration candidate until its clean six-target native signed
-package matrix, canary/live acceptance, and exact-revision fleet deployment
-pass. Version strings or locally passing focused tests alone do not make it the
-latest live release; the releases page and the live signed catalog remain the
-user-facing truth.
+repository is an integration candidate until its source-build target checks,
+canary/live acceptance, and exact-revision fleet deployment pass. Version
+strings or locally passing focused tests alone do not make it the latest live
+release; the releases page and the live signed catalog remain the user-facing
+truth.
 
 ```bash
 scripts/dev-net.sh --cleanup
