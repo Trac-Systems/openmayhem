@@ -283,7 +283,7 @@ class MayhemFeature extends Feature {
     if (previousResult?.ok === true) {
       return this._featureResponse(key, hash, resultKey, previousResult);
     }
-    await this.peer.base.append({
+    const operation = {
       type: 'feature',
       key: `${this.key}_${key}`,
       value: {
@@ -296,7 +296,20 @@ class MayhemFeature extends Feature {
           address: this.peer.wallet.publicKey,
         },
       },
-    });
+    };
+    const featureMaxBytes = this.peer.protocol.instance.featMaxBytes?.();
+    const operationBytes = b4a.byteLength(JSON.stringify(operation));
+    if (Number.isSafeInteger(featureMaxBytes) && operationBytes > featureMaxBytes) {
+      return {
+        ok: false,
+        accepted: false,
+        status: 'rejected',
+        message:
+          `Feature operation is ${operationBytes} bytes, exceeding the protocol limit ` +
+          `${featureMaxBytes}; increase MAYHEM_FEATURE_MAX_BYTES consistently on the canonical network.`,
+      };
+    }
+    await this.peer.base.append(operation);
     await this.peer.base.append(null);
     const featureResult =
       (await this._waitForResult(resultKey, this.resultTimeoutMs, previousResult)) ?? previousResult;

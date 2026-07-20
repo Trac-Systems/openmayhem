@@ -25814,6 +25814,9 @@ async fn run_admin_command(
         )
         .await?;
         let keypair_path = PathBuf::from(&wallet.keypair_path);
+        if tx_type == "registerEnclave" {
+            validate_admin_register_enclave_identity(&wallet.public_key, &report["command"])?;
+        }
         let rpc = PeerRpcClient::new(&rpc_url)?;
         let submitted = submit_contract_command(
             &rpc,
@@ -25854,6 +25857,43 @@ async fn run_admin_command(
     } else {
         print_admin_report(&report)?;
     }
+    Ok(())
+}
+
+fn validate_admin_register_enclave_identity(admin_pubkey: &str, value: &Value) -> Result<()> {
+    let sidecar_roots = value
+        .get("artifact_sidecars")
+        .and_then(Value::as_object)
+        .map(|sidecars| {
+            sidecars
+                .iter()
+                .map(|(name, sidecar)| {
+                    let root = sidecar
+                        .get("artifact_root")
+                        .and_then(Value::as_str)
+                        .with_context(|| {
+                            format!("register_enclave sidecar {name} is missing artifact_root")
+                        })?;
+                    Ok((name.clone(), root.to_owned()))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let identity = CatalogEnclaveIdentity {
+        admin_pubkey: admin_pubkey.to_owned(),
+        model_id: required_json_string_for(value, "model_id", "register_enclave")?,
+        artifact_root: required_json_string_for(value, "artifact_root", "register_enclave")?,
+        artifact_sidecar_roots: sidecar_roots,
+        manifest_hash: required_json_string_for(value, "manifest_hash", "register_enclave")?,
+        binary_hash: required_json_string_for(value, "binary_hash", "register_enclave")?,
+    };
+    let expected = catalog_enclave_id(&identity);
+    let supplied = required_json_string_for(value, "enclave_id", "register_enclave")?;
+    ensure!(
+        supplied == expected,
+        "refusing malformed enclave registration: supplied enclave_id {supplied}, canonical identity is {expected}"
+    );
     Ok(())
 }
 
@@ -51926,7 +51966,9 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         .enclaves
         .iter()
         .filter(|enclave| {
-            enclave.status == "active" && admin_role_marker_ok(enclave.created_by_role.as_deref())
+            enclave.status == "active"
+                && admin_role_marker_ok(enclave.created_by_role.as_deref())
+                && ledger_enclave_identity_is_self_consistent(enclave)
         })
         .map(|enclave| (enclave.enclave_id.clone(), enclave))
         .collect::<BTreeMap<_, _>>();
@@ -54681,6 +54723,15 @@ fn build_provider_candidates(
     for enclave in contract.enclaves.iter().filter(|enclave| {
         enclave.status == "active" && admin_role_marker_ok(enclave.created_by_role.as_deref())
     }) {
+        if !ledger_enclave_identity_is_self_consistent(enclave) {
+            rejections.push(provider_rejection(
+                enclave,
+                "ledger enclave_id does not match its immutable admin/model/artifact identity"
+                    .to_owned(),
+                None,
+            ));
+            continue;
+        }
         if let Some(requested) = &requested_backend {
             if &enclave.backend != requested {
                 rejections.push(provider_rejection(
@@ -55407,6 +55458,17 @@ fn enclave_artifact_sidecar_roots(enclave: &LedgerEnclave) -> BTreeMap<String, S
         .iter()
         .map(|(name, sidecar)| (name.clone(), sidecar.artifact_root.clone()))
         .collect()
+}
+
+fn ledger_enclave_identity_is_self_consistent(enclave: &LedgerEnclave) -> bool {
+    catalog_enclave_id(&CatalogEnclaveIdentity {
+        admin_pubkey: enclave.created_by.clone(),
+        model_id: enclave.model_id.clone(),
+        artifact_root: enclave.artifact_root.clone(),
+        artifact_sidecar_roots: enclave_artifact_sidecar_roots(enclave),
+        manifest_hash: enclave.manifest_hash.clone(),
+        binary_hash: enclave.binary_hash.clone(),
+    }) == enclave.enclave_id
 }
 
 fn enclave_approved_binary_hashes(enclave: &LedgerEnclave) -> BTreeSet<String> {
@@ -72562,6 +72624,23 @@ mod tests {
         assert_eq!(payload["artifact_root"], artifact_root);
         assert_eq!(payload["model_class"], DEFAULT_MODEL_CLASS);
         assert_eq!(payload["quant"], "int4");
+        let admin_pubkey = "77".repeat(32);
+        let expected_id = catalog_enclave_id(&CatalogEnclaveIdentity {
+            admin_pubkey: admin_pubkey.clone(),
+            model_id: "test/model@4bit".to_owned(),
+            artifact_root: "aa".repeat(32),
+            artifact_sidecar_roots: BTreeMap::new(),
+            manifest_hash: "55".repeat(32),
+            binary_hash: "66".repeat(32),
+        });
+        let mut submitted_payload = payload.clone();
+        submitted_payload["enclave_id"] = json!(expected_id);
+        validate_admin_register_enclave_identity(&admin_pubkey, &submitted_payload)
+            .expect("canonical enclave id is accepted");
+        submitted_payload["enclave_id"] = json!("44".repeat(32));
+        let err = validate_admin_register_enclave_identity(&admin_pubkey, &submitted_payload)
+            .expect_err("a mismatched caller-supplied enclave id must fail before append");
+        assert!(err.to_string().contains("canonical identity is"), "{err:#}");
 
         let mut tier2_args = args;
         tier2_args.att_tier = 2;
@@ -74048,9 +74127,10 @@ mod tests {
     fn provider_lifecycle_resolves_admin_enclave_and_rejects_ambiguous_model() {
         let root = "aa".repeat(32);
         let mut contract = test_contract(&root);
+        let primary_enclave_id = contract.enclaves[0].enclave_id.clone();
         let resolved =
             resolve_provider_lifecycle_enclave(&contract.enclaves, "test/model@4bit").unwrap();
-        assert_eq!(resolved.enclave_id, "11".repeat(32));
+        assert_eq!(resolved.enclave_id, primary_enclave_id);
 
         let unknown =
             resolve_provider_lifecycle_enclave(&contract.enclaves, "provider/custom@4bit")
@@ -74124,6 +74204,7 @@ mod tests {
         let root = "aa".repeat(32);
         let mut contract = test_contract(&root);
         let provider = "55".repeat(32);
+        let enclave_id = contract.enclaves[0].enclave_id.clone();
         contract.enclaves[0].status = "retired".to_owned();
         let serves = vec![LedgerServe {
             provider: provider.clone(),
@@ -74140,12 +74221,12 @@ mod tests {
 
         let resolved =
             resolve_provider_leave_enclave(&contract.enclaves, &serves, "test/model@4bit").unwrap();
-        assert_eq!(resolved.enclave_id, "11".repeat(32));
+        assert_eq!(resolved.enclave_id, enclave_id);
         assert_eq!(resolved.status, "retired");
 
         let resolved =
-            resolve_provider_leave_enclave(&contract.enclaves, &serves, &"11".repeat(32)).unwrap();
-        assert_eq!(resolved.enclave_id, "11".repeat(32));
+            resolve_provider_leave_enclave(&contract.enclaves, &serves, &enclave_id).unwrap();
+        assert_eq!(resolved.enclave_id, enclave_id);
 
         contract.enclaves.push(LedgerEnclave {
             enclave_id: "22".repeat(32),
@@ -74199,22 +74280,25 @@ mod tests {
     fn provider_lifecycle_requires_current_admin_price() {
         let root = "aa".repeat(32);
         let mut contract = test_contract(&root);
-        assert!(require_current_au_usd_price(&contract.prices, &"11".repeat(32)).is_ok());
+        let enclave_id = contract.enclaves[0].enclave_id.clone();
+        assert!(require_current_au_usd_price(&contract.prices, &enclave_id).is_ok());
 
         contract.prices.clear();
-        let err = require_current_au_usd_price(&contract.prices, &"11".repeat(32)).unwrap_err();
+        let err = require_current_au_usd_price(&contract.prices, &enclave_id).unwrap_err();
         assert!(err.to_string().contains("has no admin price"));
 
         let mut contract = test_contract(&root);
+        let enclave_id = contract.enclaves[0].enclave_id.clone();
         contract.prices[0].current = None;
-        let err = require_current_au_usd_price(&contract.prices, &"11".repeat(32)).unwrap_err();
+        let err = require_current_au_usd_price(&contract.prices, &enclave_id).unwrap_err();
         assert!(err
             .to_string()
             .contains("has no current au_usd admin price"));
 
         let mut contract = test_contract(&root);
+        let enclave_id = contract.enclaves[0].enclave_id.clone();
         contract.prices[0].current.as_mut().unwrap().denom = "provider_points".to_owned();
-        let err = require_current_au_usd_price(&contract.prices, &"11".repeat(32)).unwrap_err();
+        let err = require_current_au_usd_price(&contract.prices, &enclave_id).unwrap_err();
         assert!(err
             .to_string()
             .contains("has no current au_usd admin price"));
@@ -74263,6 +74347,7 @@ mod tests {
     fn provider_list_summary_matches_stop_plan_and_gateway_routes() {
         let root = "aa".repeat(32);
         let contract = test_contract(&root);
+        let enclave_id = contract.enclaves[0].enclave_id.clone();
         let provider = "55".repeat(32);
         let summary = provider_list_summary(&contract, &provider);
 
@@ -74279,7 +74364,7 @@ mod tests {
         );
         assert_eq!(
             summary["active_serves"][0]["enclave_id"].as_str(),
-            Some("11".repeat(32).as_str())
+            Some(enclave_id.as_str())
         );
         assert_eq!(summary["active_serves"][0]["room_count"].as_u64(), Some(1));
         assert_eq!(
@@ -75107,7 +75192,7 @@ mod tests {
         let root = "aa".repeat(32);
         let mut contract = test_contract(&root);
         let provider = "55".repeat(32);
-        let enclave = "11".repeat(32);
+        let enclave = contract.enclaves[0].enclave_id.clone();
         contract.roomserve.push(LedgerRoomServe {
             room_id: "00".repeat(16),
             provider: provider.clone(),
@@ -76188,6 +76273,16 @@ mod tests {
         let mut mismatched = contract;
         mismatched.enclaves[0].artifact_root = "bb".repeat(32);
         assert!(build_provider_candidates(&mismatched, &catalog, &hardware, &args).is_err());
+
+        let mut malformed = test_contract(&root);
+        malformed.enclaves[0].enclave_id = "11".repeat(32);
+        let err = build_provider_candidates(&malformed, &catalog, &hardware, &args)
+            .expect_err("malformed ledger enclave ids must be rejected before provider setup");
+        assert!(
+            err.to_string()
+                .contains("immutable admin/model/artifact identity"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -76727,7 +76822,6 @@ mod tests {
 
         let mut contract = test_contract(&gguf_root);
         let mut trt_enclave = contract.enclaves[0].clone();
-        trt_enclave.enclave_id = "22".repeat(32);
         trt_enclave.backend = "trt-llm".to_owned();
         trt_enclave.artifact_root = trt_root;
         trt_enclave.artifact_source.path = "checkpoint.nvfp4.safetensors".to_owned();
@@ -76739,19 +76833,20 @@ mod tests {
             "ctx": 8192,
             "tp_degree": 1
         });
+        let trt_enclave_id = canonicalize_test_enclave_id(&mut trt_enclave);
         contract.enclaves.push(trt_enclave);
         let room_id = "dd".repeat(16);
         contract.rooms.push(LedgerRoom {
             room_id: room_id.clone(),
             sidechannel: format!("mx/room/{room_id}"),
-            enclave_id: Some("22".repeat(32)),
+            enclave_id: Some(trt_enclave_id.clone()),
             model_id: "test/model@4bit".to_owned(),
             label: "trt".to_owned(),
             status: "open".to_owned(),
             creator_role: Some("admin".to_owned()),
         });
         contract.prices.push(LedgerPriceSchedule {
-            enclave_id: "22".repeat(32),
+            enclave_id: trt_enclave_id,
             model_id: "test/model@4bit".to_owned(),
             denom: "au_usd".to_owned(),
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
@@ -76807,7 +76902,6 @@ mod tests {
 
         let mut contract = test_contract(&gguf_root);
         let mut vllm_enclave = contract.enclaves[0].clone();
-        vllm_enclave.enclave_id = "22".repeat(32);
         vllm_enclave.backend = "vllm".to_owned();
         vllm_enclave.artifact_root = vllm_root;
         vllm_enclave.artifact_source.path = "model.safetensors".to_owned();
@@ -76823,19 +76917,20 @@ mod tests {
             "kv_bytes_per_token": 20480,
             "vllm_dtype": "bfloat16"
         });
+        let vllm_enclave_id = canonicalize_test_enclave_id(&mut vllm_enclave);
         contract.enclaves.push(vllm_enclave);
         let room_id = "ee".repeat(16);
         contract.rooms.push(LedgerRoom {
             room_id: room_id.clone(),
             sidechannel: format!("mx/room/{room_id}"),
-            enclave_id: Some("22".repeat(32)),
+            enclave_id: Some(vllm_enclave_id.clone()),
             model_id: "test/model@4bit".to_owned(),
             label: "vllm".to_owned(),
             status: "open".to_owned(),
             creator_role: Some("admin".to_owned()),
         });
         contract.prices.push(LedgerPriceSchedule {
-            enclave_id: "22".repeat(32),
+            enclave_id: vllm_enclave_id,
             model_id: "test/model@4bit".to_owned(),
             denom: "au_usd".to_owned(),
             ctx_bracket: Some(ctx_bracket_for_tokens(262_144).to_owned()),
@@ -76956,6 +77051,8 @@ mod tests {
         contract.enclaves[0].artifact_root = mlx_root;
         contract.enclaves[0].artifact_source.path = "model.safetensors".to_owned();
         contract.enclaves[0].quant = "int4".to_owned();
+        let mlx_enclave_id = canonicalize_test_enclave_id(&mut contract.enclaves[0]);
+        contract.prices[0].enclave_id = mlx_enclave_id;
         let hardware = test_hardware(FixtureProfile::LinuxNvidia);
         let mut args = test_provider_start_args();
         args.enclave = Some("test/model@4bit".to_owned());
@@ -77000,6 +77097,8 @@ mod tests {
         contract.enclaves[0].artifact_root = trt_root;
         contract.enclaves[0].artifact_source.path = "checkpoint.nvfp4.safetensors".to_owned();
         contract.enclaves[0].quant = "nvfp4".to_owned();
+        let trt_enclave_id = canonicalize_test_enclave_id(&mut contract.enclaves[0]);
+        contract.prices[0].enclave_id = trt_enclave_id;
         let hardware = test_hardware(FixtureProfile::AppleSilicon);
         let mut args = test_provider_start_args();
         args.enclave = Some("test/model@4bit".to_owned());
@@ -77240,11 +77339,12 @@ mod tests {
         args.hardware_quote_command = Some(PathBuf::from("mayhem-tpm2-quote"));
         let mut contract = test_contract(&root);
         let mut tier2_enclave = contract.enclaves[0].clone();
-        tier2_enclave.enclave_id = "22".repeat(32);
         tier2_enclave.att_tier = 2;
+        tier2_enclave.manifest_hash = "23".repeat(32);
+        let tier2_enclave_id = canonicalize_test_enclave_id(&mut tier2_enclave);
         contract.enclaves.push(tier2_enclave);
         let mut tier2_price = contract.prices[0].clone();
-        tier2_price.enclave_id = "22".repeat(32);
+        tier2_price.enclave_id = tier2_enclave_id.clone();
         contract.prices.push(tier2_price);
 
         let candidates = build_provider_candidates(&contract, &catalog, &hardware, &args)
@@ -77254,7 +77354,7 @@ mod tests {
 
         assert_eq!(candidates.len(), 2);
         assert_eq!(selected.enclave.att_tier, 2);
-        assert_eq!(selected.enclave.enclave_id, "22".repeat(32));
+        assert_eq!(selected.enclave.enclave_id, tier2_enclave_id);
         assert_eq!(
             parse_hardware_quote_kind("tpm2-quote-ek").unwrap(),
             HardwareQuoteKind::Tpm2QuoteEk
@@ -77703,11 +77803,12 @@ esac
     fn gateway_models_are_built_from_canonical_contract_state() {
         let root = "aa".repeat(32);
         let mut contract = test_contract(&root);
+        let enclave_id = contract.enclaves[0].enclave_id.clone();
         contract.price_derivations.push(json!({
             "type": "price_derivation",
             "schema_version": 1,
             "epoch": 7u64,
-            "enclave_id": "11".repeat(32),
+            "enclave_id": enclave_id.clone(),
             "ctx_bracket": ctx_bracket_for_tokens(8192),
             "ctx_bracket_table_ver": CTX_BRACKET_TABLE_VERSION,
             "model_id": "test/model@4bit",
@@ -77808,10 +77909,7 @@ esac
             models[0].mayhem.route_candidates[0].provider,
             "55".repeat(32)
         );
-        assert_eq!(
-            models[0].mayhem.route_candidates[0].enclave_id,
-            "11".repeat(32)
-        );
+        assert_eq!(models[0].mayhem.route_candidates[0].enclave_id, enclave_id);
         assert_eq!(
             models[0].mayhem.route_candidates[0].room_id,
             "aa".repeat(16)
@@ -77936,10 +78034,9 @@ esac
             .is_empty());
 
         let mut wrong_same_model_enclave = test_contract(&root);
-        let other_enclave_id = "66".repeat(32);
         let mut other_enclave = wrong_same_model_enclave.enclaves[0].clone();
-        other_enclave.enclave_id = other_enclave_id.clone();
         other_enclave.artifact_root = "77".repeat(32);
+        let other_enclave_id = canonicalize_test_enclave_id(&mut other_enclave);
         wrong_same_model_enclave.enclaves.push(other_enclave);
         let mut other_price = wrong_same_model_enclave.prices[0].clone();
         other_price.enclave_id = other_enclave_id.clone();
@@ -77949,7 +78046,10 @@ esac
         assert_eq!(models.len(), 1);
         assert!(models[0].mayhem.route_candidates.is_empty());
         assert_eq!(models[0].mayhem.markets.len(), 1);
-        assert_eq!(models[0].mayhem.markets[0].enclave_id, "11".repeat(32));
+        assert_eq!(
+            models[0].mayhem.markets[0].enclave_id,
+            wrong_same_model_enclave.enclaves[0].enclave_id
+        );
         assert_eq!(models[0].mayhem.markets[0].route_count, 0);
     }
 
@@ -78030,7 +78130,7 @@ esac
 
         let second_provider = "66".repeat(32);
         let third_provider = "77".repeat(32);
-        let second_enclave_id = "88".repeat(32);
+        let primary_enclave_id = contract.enclaves[0].enclave_id.clone();
         let second_room_id = "dd".repeat(16);
         let second_model_id = "test/agent-helper@4bit".to_owned();
 
@@ -78059,13 +78159,13 @@ esac
         contract.roomserve.push(LedgerRoomServe {
             room_id: "aa".repeat(16),
             provider: second_provider.clone(),
-            enclave_id: "11".repeat(32),
+            enclave_id: primary_enclave_id.clone(),
             model_id: "test/model@4bit".to_owned(),
             status: "active".to_owned(),
         });
         contract.serves.push(LedgerServe {
             provider: second_provider.clone(),
-            enclave_id: "11".repeat(32),
+            enclave_id: primary_enclave_id,
             model_id: "test/model@4bit".to_owned(),
             status: "active".to_owned(),
             served_ctx: Some(8192),
@@ -78077,11 +78177,11 @@ esac
         });
 
         let mut second_enclave = contract.enclaves[0].clone();
-        second_enclave.enclave_id = second_enclave_id.clone();
         second_enclave.model_id = second_model_id.clone();
         second_enclave.artifact_root = "12".repeat(32);
         second_enclave.manifest_hash = "13".repeat(32);
         second_enclave.binary_hash = "14".repeat(32);
+        let second_enclave_id = canonicalize_test_enclave_id(&mut second_enclave);
         contract.enclaves.push(second_enclave);
         contract.rooms.push(LedgerRoom {
             room_id: second_room_id.clone(),
@@ -78178,7 +78278,7 @@ esac
         let mut contract = test_contract(&root);
 
         let second_provider = "66".repeat(32);
-        let tier3_enclave_id = "77".repeat(32);
+        let tier1_enclave_id = contract.enclaves[0].enclave_id.clone();
         let tier3_room_id = "dd".repeat(16);
         let model_id = "test/model@4bit".to_owned();
 
@@ -78193,12 +78293,12 @@ esac
         );
 
         let mut tier3_enclave = contract.enclaves[0].clone();
-        tier3_enclave.enclave_id = tier3_enclave_id.clone();
         tier3_enclave.att_tier = 3;
         tier3_enclave.quant = "fp16".to_owned();
         tier3_enclave.artifact_root = "78".repeat(32);
         tier3_enclave.manifest_hash = "79".repeat(32);
         tier3_enclave.binary_hash = "7a".repeat(32);
+        let tier3_enclave_id = canonicalize_test_enclave_id(&mut tier3_enclave);
         contract.enclaves.push(tier3_enclave);
 
         contract.rooms.push(LedgerRoom {
@@ -78247,7 +78347,7 @@ esac
                 set_by_role: Some("admin".to_owned()),
                 derivation: Some(json!({
                     "epoch": 12u64,
-                    "enclave_id": tier3_enclave_id,
+                    "enclave_id": tier3_enclave_id.clone(),
                     "price_root": "99".repeat(32)
                 })),
             }),
@@ -78289,7 +78389,7 @@ esac
             .price_ref_au
             .as_ref()
             .expect("tier-1 route has its own price");
-        assert_eq!(tier1.enclave_id, "11".repeat(32));
+        assert_eq!(tier1.enclave_id, tier1_enclave_id);
         assert_eq!(tier1.quant, "int4");
         assert_eq!(tier1.price_ver, 1);
         assert_eq!(tier1_price.ver, 1);
@@ -78303,7 +78403,7 @@ esac
             .price_ref_au
             .as_ref()
             .expect("tier-3 route has its own price");
-        assert_eq!(tier3.enclave_id, "77".repeat(32));
+        assert_eq!(tier3.enclave_id, tier3_enclave_id);
         assert_eq!(tier3.provider, second_provider);
         assert_eq!(tier3.quant, "fp16");
         assert_eq!(tier3.price_ver, 9);
@@ -78321,10 +78421,10 @@ esac
 
         contract
             .roomserve
-            .retain(|serving| serving.enclave_id != "77".repeat(32));
+            .retain(|serving| serving.enclave_id != tier3_enclave_id);
         contract
             .serves
-            .retain(|serve| serve.enclave_id != "77".repeat(32));
+            .retain(|serve| serve.enclave_id != tier3_enclave_id);
         let models = gateway_models_from_contract(&contract).unwrap();
         assert_eq!(models.len(), 1);
         let model = &models[0];
@@ -82296,6 +82396,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 },
             );
         }
+        let trt_enclave_id = canonicalize_test_enclave_id(&mut contract.enclaves[0]);
+        contract.prices[0].enclave_id = trt_enclave_id;
         catalog.models[0]
             .artifacts
             .insert("nvfp4".to_owned(), trt_artifact);
@@ -82443,6 +82545,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 },
             );
         }
+        let vllm_enclave_id = canonicalize_test_enclave_id(&mut contract.enclaves[0]);
+        contract.prices[0].enclave_id = vllm_enclave_id;
         catalog.models[0]
             .artifacts
             .insert("vllm-fp16".to_owned(), vllm_artifact);
@@ -82585,6 +82689,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 source_sha256: sidecar_sha.clone(),
             },
         );
+        let vision_enclave_id = canonicalize_test_enclave_id(&mut contract.enclaves[0]);
+        contract.prices[0].enclave_id = vision_enclave_id;
         let hardware = test_hardware(FixtureProfile::CpuOnly);
         let args = test_provider_start_args();
         let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
@@ -91010,7 +91116,9 @@ State initialization...
         ProviderSessionTerms {
             contract_version: CONTRACT_VERSION,
             provider: "55".repeat(32),
-            enclave_id: "11".repeat(32),
+            enclave_id: test_contract(&"aa".repeat(32)).enclaves[0]
+                .enclave_id
+                .clone(),
             model_id: "test/model@4bit".to_owned(),
             adapter: catalog::CatalogAdapter::default(),
             sampling: catalog::CatalogSamplingProfile::default(),
@@ -93394,12 +93502,25 @@ State initialization...
         }
     }
 
+    fn canonicalize_test_enclave_id(enclave: &mut LedgerEnclave) -> String {
+        let enclave_id = catalog_enclave_id(&CatalogEnclaveIdentity {
+            admin_pubkey: enclave.created_by.clone(),
+            model_id: enclave.model_id.clone(),
+            artifact_root: enclave.artifact_root.clone(),
+            artifact_sidecar_roots: enclave_artifact_sidecar_roots(enclave),
+            manifest_hash: enclave.manifest_hash.clone(),
+            binary_hash: enclave.binary_hash.clone(),
+        });
+        enclave.enclave_id = enclave_id.clone();
+        enclave_id
+    }
+
     fn test_contract(root: &str) -> ContractCatalog {
         let room_id = "aa".repeat(16);
         let closed_room_id = "bb".repeat(16);
         let other_room_id = "cc".repeat(16);
-        let enclave = LedgerEnclave {
-            enclave_id: "11".repeat(32),
+        let mut enclave = LedgerEnclave {
+            enclave_id: String::new(),
             model_id: "test/model@4bit".to_owned(),
             model_class: DEFAULT_MODEL_CLASS.to_owned(),
             backend: "llama.cpp".to_owned(),
@@ -93424,13 +93545,14 @@ State initialization...
             created_by: "44".repeat(32),
             created_by_role: Some("admin".to_owned()),
         };
+        let enclave_id = canonicalize_test_enclave_id(&mut enclave);
         ContractCatalog {
             enclaves: vec![enclave],
             rooms: vec![
                 LedgerRoom {
                     room_id: room_id.clone(),
                     sidechannel: format!("mx/room/{room_id}"),
-                    enclave_id: Some("11".repeat(32)),
+                    enclave_id: Some(enclave_id.clone()),
                     model_id: "test/model@4bit".to_owned(),
                     label: "test".to_owned(),
                     status: "open".to_owned(),
@@ -93439,7 +93561,7 @@ State initialization...
                 LedgerRoom {
                     room_id: closed_room_id.clone(),
                     sidechannel: format!("mx/room/{closed_room_id}"),
-                    enclave_id: Some("11".repeat(32)),
+                    enclave_id: Some(enclave_id.clone()),
                     model_id: "test/model@4bit".to_owned(),
                     label: "test".to_owned(),
                     status: "closed".to_owned(),
@@ -93458,13 +93580,13 @@ State initialization...
             roomserve: vec![LedgerRoomServe {
                 room_id: room_id.clone(),
                 provider: "55".repeat(32),
-                enclave_id: "11".repeat(32),
+                enclave_id: enclave_id.clone(),
                 model_id: "test/model@4bit".to_owned(),
                 status: "active".to_owned(),
             }],
             serves: vec![LedgerServe {
                 provider: "55".repeat(32),
-                enclave_id: "11".repeat(32),
+                enclave_id: enclave_id.clone(),
                 model_id: "test/model@4bit".to_owned(),
                 status: "active".to_owned(),
                 served_ctx: Some(4096),
@@ -93482,7 +93604,7 @@ State initialization...
             reputations: Vec::new(),
             kyb: Vec::new(),
             prices: vec![LedgerPriceSchedule {
-                enclave_id: "11".repeat(32),
+                enclave_id,
                 model_id: "test/model@4bit".to_owned(),
                 denom: "au_usd".to_owned(),
                 ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),

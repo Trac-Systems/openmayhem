@@ -144,7 +144,12 @@ const peerFor = (publicKey, { writable = false, bootstrap = '11'.repeat(32) } = 
       bootstrapHex: adminTxContext.msb_bootstrap,
       networkId: adminTxContext.network_id,
     },
-    protocol: { instance: { features: {} } },
+    protocol: {
+      instance: {
+        features: {},
+        featMaxBytes: () => 4_096,
+      },
+    },
   };
   return { peer, state, appended, flushes };
 };
@@ -369,6 +374,41 @@ test('admin writer deduplicates a retried relay request by deterministic request
   await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
 
   assert.equal(writer.appended.length, 1);
+});
+
+test('admin writer rejects an oversized feature before append instead of stalling', async () => {
+  const writer = peerFor(adminKey, { writable: true });
+  const writerFeature = new MayhemFeature(writer.peer, {});
+  writerFeature.key = 'mayhem';
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+
+  const result = await writerFeature.submit(
+    `admin/contract-tx/${'11'.repeat(32)}`,
+    { op: 'oversized', padding: 'x'.repeat(4_096) }
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.accepted, false);
+  assert.equal(result.status, 'rejected');
+  assert.match(result.message, /exceeding the protocol limit 4096/);
+  assert.equal(writer.appended.length, 0);
+  assert.equal(writer.flushes.length, 0);
+});
+
+test('Mayhem feature limit admits a canonical payload above the Intercom core default', async () => {
+  const writer = peerFor(adminKey, { writable: true });
+  writer.peer.protocol.instance.featMaxBytes = () => 64_000;
+  const writerFeature = new MayhemFeature(writer.peer, {});
+  writerFeature.key = 'mayhem';
+
+  const result = await writerFeature.submit(
+    `admin/contract-tx/${'11'.repeat(32)}`,
+    { op: 'large_admin_payload', padding: 'x'.repeat(5_000) }
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(writer.appended.length, 1);
+  assert.equal(writer.flushes.length, 1);
 });
 
 test('admin writer bounds concurrent remote relay work and returns retryable busy', async () => {

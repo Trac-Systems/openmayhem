@@ -425,6 +425,12 @@ test('MayhemProtocol keeps epochApply off the paid tx route', () => {
   assert.deepEqual(paidOps.map((op) => op.type), ['epochCommit']);
 });
 
+test('MayhemProtocol admits bounded canonical admin feature payloads without changing core defaults', () => {
+  const protocol = new MayhemProtocol({}, {});
+  assert.equal(protocol.featMaxBytes(), 64_000);
+  assert.equal(protocol.txMaxBytes(), 64_000);
+});
+
 test('MayhemProtocol maps empty epoch seals to the paid admin tx route', () => {
   const protocol = new MayhemProtocol({}, {});
   const op = protocol.mapTxCommand(JSON.stringify({
