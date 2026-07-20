@@ -20,7 +20,7 @@ use mayhem_paygate::{
     paygate_router, run_stripe_backfill_once, stripe_signature_header, BoxFuture,
     ContractPostResult, ContractPoster, FiatChargebackFeature, FiatDepositFeature, OracleKeypair,
     PaygateConfig, PaygateState, PeerRpcContractPoster, RailConfig, StripeConnectAccountType,
-    StripeSettings, DEFAULT_STRIPE_API_BASE_URL,
+    StripeMode, StripeSettings, DEFAULT_STRIPE_API_BASE_URL,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -42,6 +42,7 @@ struct StripeCapture {
     connect_ready: Arc<Mutex<bool>>,
     connect_account_id: Arc<Mutex<Option<String>>>,
     connect_account_type: Arc<Mutex<Option<String>>>,
+    connect_country: Arc<Mutex<Option<String>>>,
     connect_owner_provider: Arc<Mutex<Option<String>>>,
     connect_livemode: Arc<Mutex<bool>>,
     oauth_account_id: Arc<Mutex<Option<String>>>,
@@ -203,6 +204,12 @@ async fn mock_connect_account(capture: &StripeCapture, ready: bool) -> Value {
         .await
         .clone()
         .unwrap_or_else(|| "express".to_owned());
+    let country = capture
+        .connect_country
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| "DE".to_owned());
     let owner_provider = capture
         .connect_owner_provider
         .lock()
@@ -214,7 +221,7 @@ async fn mock_connect_account(capture: &StripeCapture, ready: bool) -> Value {
         "id": account_id,
         "object": "account",
         "type": account_type,
-        "country": "DE",
+        "country": country,
         "default_currency": "eur",
         "metadata": {
             "mayhem_provider": owner_provider,
@@ -559,6 +566,96 @@ fn test_config(stripe_base: String, event_store_path: std::path::PathBuf) -> Pay
         },
         ..PaygateConfig::default()
     }
+}
+
+async fn connect_account_creation_keys(
+    stripe_base: &str,
+    capture: &StripeCapture,
+    mode: StripeMode,
+    account_type: StripeConnectAccountType,
+    provider: &str,
+    country: &str,
+    rotation_nonce: Option<&str>,
+) -> Vec<String> {
+    let request_start = capture.requests.lock().await.len();
+    *capture.connect_account_id.lock().await = Some("acct_test_provider".to_owned());
+    *capture.connect_account_type.lock().await = Some(
+        match account_type {
+            StripeConnectAccountType::Express => "express",
+            StripeConnectAccountType::Custom => "custom",
+            StripeConnectAccountType::Standard => "standard",
+        }
+        .to_owned(),
+    );
+    *capture.connect_country.lock().await = Some(country.to_owned());
+    *capture.connect_owner_provider.lock().await = Some(provider.to_owned());
+    *capture.connect_livemode.lock().await = mode == StripeMode::Live;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut config = test_config(
+        stripe_base.to_owned(),
+        temp.path().join("stripe-events.jsonl"),
+    );
+    config.rails.stripe.mode = mode;
+    config.rails.stripe.secret_key = Some(match mode {
+        StripeMode::Test => "sk_test_local".to_owned(),
+        StripeMode::Live => "sk_live_local".to_owned(),
+    });
+    config.rails.stripe.connect_account_type = account_type;
+    let app = paygate_router(PaygateState::new(
+        config,
+        OracleKeypair::from_seed_hex(&"18".repeat(32)).expect("oracle"),
+    ));
+
+    let (status, body) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/stripe/connect/onboard",
+        json!({
+            "provider": provider,
+            "country": country,
+            "request_nonce": "f".repeat(64),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "initial {mode:?}/{account_type:?}/{provider}/{country}: {body}"
+    );
+
+    if let Some(rotation_nonce) = rotation_nonce {
+        *capture.connect_account_id.lock().await = Some("acct_test_rotated".to_owned());
+        let (status, body) = json_request(
+            app,
+            Method::POST,
+            "/v1/stripe/connect/onboard",
+            json!({
+                "provider": provider,
+                "country": country,
+                "request_nonce": rotation_nonce,
+                "rotate": true,
+                "previous_account_id": "acct_test_provider",
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "rotation {mode:?}/{account_type:?}/{provider}/{country}/{rotation_nonce}: {body}"
+        );
+    }
+
+    capture.requests.lock().await[request_start..]
+        .iter()
+        .filter(|request| request.body.starts_with("connect-account:"))
+        .map(|request| {
+            request
+                .idempotency_key
+                .clone()
+                .expect("connect account idempotency key")
+        })
+        .collect()
 }
 
 fn test_internal_auth_headers(
@@ -1195,6 +1292,121 @@ async fn stripe_connect_onboarding_reuses_account_and_reports_ready_status() {
 }
 
 #[tokio::test]
+async fn stripe_connect_account_creation_idempotency_key_scopes_full_intent() {
+    let (stripe_base, capture) = start_mock_stripe().await;
+    let provider = "a".repeat(64);
+    let other_provider = "b".repeat(64);
+
+    let initial = connect_account_creation_keys(
+        &stripe_base,
+        &capture,
+        StripeMode::Test,
+        StripeConnectAccountType::Express,
+        &provider,
+        "DE",
+        None,
+    )
+    .await;
+    let identical = connect_account_creation_keys(
+        &stripe_base,
+        &capture,
+        StripeMode::Test,
+        StripeConnectAccountType::Express,
+        &provider,
+        "DE",
+        None,
+    )
+    .await;
+    assert_eq!(initial, identical);
+
+    let changed_country = connect_account_creation_keys(
+        &stripe_base,
+        &capture,
+        StripeMode::Test,
+        StripeConnectAccountType::Express,
+        &provider,
+        "NL",
+        None,
+    )
+    .await;
+    let changed_type = connect_account_creation_keys(
+        &stripe_base,
+        &capture,
+        StripeMode::Test,
+        StripeConnectAccountType::Custom,
+        &provider,
+        "DE",
+        None,
+    )
+    .await;
+    let changed_mode = connect_account_creation_keys(
+        &stripe_base,
+        &capture,
+        StripeMode::Live,
+        StripeConnectAccountType::Express,
+        &provider,
+        "DE",
+        None,
+    )
+    .await;
+    let changed_provider = connect_account_creation_keys(
+        &stripe_base,
+        &capture,
+        StripeMode::Test,
+        StripeConnectAccountType::Express,
+        &other_provider,
+        "DE",
+        None,
+    )
+    .await;
+    for changed in [
+        changed_country,
+        changed_type,
+        changed_mode,
+        changed_provider,
+    ] {
+        assert_ne!(initial, changed);
+    }
+
+    let rotation = connect_account_creation_keys(
+        &stripe_base,
+        &capture,
+        StripeMode::Test,
+        StripeConnectAccountType::Express,
+        &provider,
+        "DE",
+        Some(&"1".repeat(64)),
+    )
+    .await;
+    let identical_rotation = connect_account_creation_keys(
+        &stripe_base,
+        &capture,
+        StripeMode::Test,
+        StripeConnectAccountType::Express,
+        &provider,
+        "DE",
+        Some(&"1".repeat(64)),
+    )
+    .await;
+    let changed_rotation = connect_account_creation_keys(
+        &stripe_base,
+        &capture,
+        StripeMode::Test,
+        StripeConnectAccountType::Express,
+        &provider,
+        "DE",
+        Some(&"2".repeat(64)),
+    )
+    .await;
+    assert_eq!(rotation, identical_rotation);
+    assert_eq!(rotation[0], initial[0]);
+    assert_ne!(rotation[0], rotation[1]);
+    assert_ne!(rotation[1], changed_rotation[1]);
+    assert!(initial[0].starts_with("mayhem-connect-account-"));
+    assert!(rotation[1].starts_with("mayhem-connect-account-rotation-"));
+}
+
+#[tokio::test]
 async fn stripe_connect_rotation_is_restart_idempotent_and_rejects_cas_substitution() {
     let (stripe_base, capture) = start_mock_stripe().await;
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1407,6 +1619,7 @@ async fn stripe_connect_rotation_is_restart_idempotent_and_rejects_cas_substitut
         .collect::<Vec<_>>();
     assert_eq!(creations.len(), 3);
     assert_ne!(creations[0].idempotency_key, creations[1].idempotency_key);
+    assert_ne!(creations[1].idempotency_key, creations[2].idempotency_key);
     assert!(creations[1]
         .idempotency_key
         .as_deref()

@@ -1873,6 +1873,36 @@ mod tests {
     }
 
     #[test]
+    fn provider_table_keeps_one_hundred_live_providers_in_one_room() {
+        let now = 1_000_000;
+        let room_id = "cc".repeat(16);
+        let mut table = ProviderTable::new();
+
+        for index in 1_u8..=100 {
+            let mut contract = contract_record_for(index);
+            contract.room_id.clone_from(&room_id);
+            table.upsert_contract(contract);
+
+            let mut heartbeat = heartbeat_for(index, now, 0.2, 100, 9, "44");
+            heartbeat.room_id.clone_from(&room_id);
+            table.upsert_heartbeat(heartbeat, now);
+        }
+
+        let entries = table.entries(now + 1);
+        assert_eq!(entries.len(), 100);
+        assert!(entries.iter().all(|entry| entry.heartbeat.is_some()));
+        assert_eq!(
+            eligible_candidates(
+                &entries,
+                &eligible_request(now + 1),
+                &SelectionWeights::default(),
+            )
+            .len(),
+            100
+        );
+    }
+
+    #[test]
     fn error_circuit_breaker_drops_provider_then_readmits_after_cooloff() {
         let now = 1_000_000;
         let mut table = ProviderTable::new();

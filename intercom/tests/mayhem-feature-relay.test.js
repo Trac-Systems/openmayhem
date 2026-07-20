@@ -188,19 +188,22 @@ const peerFor = (publicKey, { writable = false, bootstrap = '11'.repeat(32) } = 
   return { peer, state, appended, flushes };
 };
 
+const relayPayload = (from, message, signature = `signed:${from}`) => ({
+  from,
+  message,
+  sig: signature,
+});
+
+const verifyRelayPayload = (payload, expectedKey) =>
+  payload.from === expectedKey && payload.sig === `signed:${payload.from}`;
+
 const connect = (leftPeer, leftFeature, rightPeer, rightFeature) => {
   leftPeer.sidechannel = {
     started: true,
     connectDirectPeer: async () => true,
-    verifyPayload(payload, expectedKey) {
-      return payload.from === expectedKey && payload.sig === `signed:${payload.from}`;
-    },
+    verifyPayload: verifyRelayPayload,
     broadcast(channel, message) {
-      const payload = {
-        from: leftPeer.wallet.publicKey,
-        message,
-        sig: `signed:${leftPeer.wallet.publicKey}`,
-      };
+      const payload = relayPayload(leftPeer.wallet.publicKey, message);
       queueMicrotask(() => rightFeature.handleSidechannelMessage(channel, payload));
       return true;
     },
@@ -1505,6 +1508,330 @@ test('read-only transport relays a wallet-signed Stripe checkout without appendi
   assert.equal(writer.flushes.length, 0);
 });
 
+test('Stripe service result retries the exact cache after drop and reconnect until ACK', async () => {
+  const participant = peerFor(otherKey);
+  const signer = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  let serviceCalls = 0;
+  let acknowledgements = 0;
+  let reconnects = 0;
+  const sentResults = [];
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 500,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    resultRetryMs: 5,
+    resultRetryMax: 4,
+    async serviceHandler() {
+      serviceCalls += 1;
+      return {
+        ok: true,
+        checkout_session: { url: 'https://checkout.stripe.com/c/pay/reliable' },
+      };
+    },
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+
+  participant.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      if (message.control === 'mayhem_service_result_ack') acknowledgements += 1;
+      queueMicrotask(() => writerFeature.handleSidechannelMessage(
+        channel,
+        relayPayload(otherKey, message)
+      ));
+      return true;
+    },
+  };
+  let reconnectTimer = null;
+  const writerSidechannel = {
+    started: true,
+    async connectDirectPeer() {
+      reconnects += 1;
+      return true;
+    },
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      sentResults.push(JSON.stringify(message));
+      if (sentResults.length === 1) {
+        writer.peer.sidechannel = { started: false };
+        reconnectTimer = setTimeout(() => {
+          writer.peer.sidechannel = writerSidechannel;
+        }, 8);
+        return true;
+      }
+      queueMicrotask(() => participantFeature.handleSidechannelMessage(
+        channel,
+        relayPayload(adminKey, message)
+      ));
+      return true;
+    },
+  };
+  writer.peer.sidechannel = writerSidechannel;
+
+  const result = await requestStripeCheckout(
+    participant.peer,
+    signedServiceValue(signer.peer, 'stripe_checkout', stripeCheckoutValue(), otherKey)
+  );
+  await new Promise((resolve) => setTimeout(resolve, 40));
+
+  assert.equal(result.ok, true);
+  assert.equal(result.checkout_session.url, 'https://checkout.stripe.com/c/pay/reliable');
+  assert.equal(serviceCalls, 1);
+  assert.equal(sentResults.length, 2);
+  assert.equal(sentResults[0], sentResults[1]);
+  assert.equal(acknowledgements, 1);
+  assert.equal(reconnects, 2);
+  if (reconnectTimer !== null) clearTimeout(reconnectTimer);
+  await participantFeature.stop();
+  await writerFeature.stop();
+});
+
+test('duplicate Stripe service result is ACKed without duplicate CLI completion', async () => {
+  const participant = peerFor(otherKey);
+  const signer = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  let serviceCalls = 0;
+  let completions = 0;
+  let acknowledgements = 0;
+  let resultMessage = null;
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 500,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    resultRetryMs: 20,
+    resultRetryMax: 3,
+    async serviceHandler() {
+      serviceCalls += 1;
+      return {
+        ok: true,
+        checkout_session: { url: 'https://checkout.stripe.com/c/pay/duplicate-safe' },
+      };
+    },
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  participant.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      if (message.control === 'mayhem_service_result_ack') acknowledgements += 1;
+      queueMicrotask(() => writerFeature.handleSidechannelMessage(
+        channel,
+        relayPayload(otherKey, message)
+      ));
+      return true;
+    },
+  };
+  writer.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      resultMessage = message;
+      queueMicrotask(() => participantFeature.handleSidechannelMessage(
+        channel,
+        relayPayload(adminKey, message)
+      ));
+      return true;
+    },
+  };
+
+  const requested = requestStripeCheckout(
+    participant.peer,
+    signedServiceValue(signer.peer, 'stripe_checkout', stripeCheckoutValue(), otherKey)
+  ).then((result) => {
+    completions += 1;
+    return result;
+  });
+  const result = await requested;
+  assert.equal(result.ok, true);
+  assert.ok(resultMessage);
+  assert.equal(acknowledgements, 1);
+
+  await participantFeature.handleSidechannelMessage(
+    MAYHEM_RELAY_CHANNEL,
+    relayPayload(adminKey, resultMessage)
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(acknowledgements, 2);
+  assert.equal(completions, 1);
+  assert.equal(serviceCalls, 1);
+  await participantFeature.stop();
+  await writerFeature.stop();
+});
+
+test('Stripe service result ACK rejects forged, wrong-request, and wrong-digest frames', async () => {
+  const signer = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  let serviceCalls = 0;
+  const sentResults = [];
+  const writerFeature = new MayhemFeature(writer.peer, {
+    resultRetryMs: 50,
+    resultRetryMax: 3,
+    async serviceHandler() {
+      serviceCalls += 1;
+      return {
+        ok: true,
+        checkout_session: { url: 'https://checkout.stripe.com/c/pay/ack-test' },
+      };
+    },
+  });
+  writerFeature.key = 'mayhem';
+  writer.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(_channel, message) {
+      sentResults.push(message);
+      return true;
+    },
+  };
+  const value = signedServiceValue(signer.peer, 'stripe_checkout', stripeCheckoutValue());
+  const requestId = serviceRequestIdFor('stripe_checkout', value);
+  await writerFeature.handleSidechannelMessage(
+    MAYHEM_RELAY_CHANNEL,
+    relayPayload(providerKey, {
+      control: 'mayhem_service_request',
+      version: 1,
+      request_id: requestId,
+      service: 'stripe_checkout',
+      value,
+    })
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(sentResults.length, 1);
+  const resultMessage = sentResults[0];
+  const cached = writerFeature.serviceProcessed.get(requestId);
+  const ack = {
+    control: 'mayhem_service_result_ack',
+    version: 1,
+    request_id: requestId,
+    result_digest: resultMessage.result_digest,
+    to: adminKey,
+  };
+
+  await writerFeature.handleSidechannelMessage(
+    MAYHEM_RELAY_CHANNEL,
+    relayPayload(providerKey, ack, `signed:${otherKey}`)
+  );
+  assert.equal(cached.acked, false);
+  await writerFeature.handleSidechannelMessage(
+    MAYHEM_RELAY_CHANNEL,
+    relayPayload(providerKey, { ...ack, request_id: 'f'.repeat(64) })
+  );
+  assert.equal(cached.acked, false);
+  await writerFeature.handleSidechannelMessage(
+    MAYHEM_RELAY_CHANNEL,
+    relayPayload(providerKey, { ...ack, result_digest: 'e'.repeat(64) })
+  );
+  assert.equal(cached.acked, false);
+
+  await writerFeature.handleSidechannelMessage(
+    MAYHEM_RELAY_CHANNEL,
+    relayPayload(providerKey, ack)
+  );
+  assert.equal(cached.acked, true);
+  assert.equal(cached.resultTimer, null);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(sentResults.length, 1);
+  assert.equal(serviceCalls, 1);
+  await writerFeature.stop();
+  assert.equal(writerFeature.serviceProcessed.size, 0);
+});
+
+test('Stripe service relay delivers a checkout URL payload around 4 KiB', async () => {
+  const participant = peerFor(otherKey);
+  const signer = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const checkoutUrl = `https://checkout.stripe.com/c/pay/${'x'.repeat(4_000)}`;
+  let serviceCalls = 0;
+  const participantFeature = new MayhemFeature(participant.peer, { timeoutMs: 500 });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    resultRetryMs: 5,
+    async serviceHandler() {
+      serviceCalls += 1;
+      return { ok: true, checkout_session: { url: checkoutUrl } };
+    },
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  connect(participant.peer, participantFeature, writer.peer, writerFeature);
+  connect(writer.peer, writerFeature, participant.peer, participantFeature);
+
+  const result = await requestStripeCheckout(
+    participant.peer,
+    signedServiceValue(signer.peer, 'stripe_checkout', stripeCheckoutValue(), otherKey)
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.checkout_session.url, checkoutUrl);
+  assert.ok(result.checkout_session.url.length > 4_000);
+  assert.equal(serviceCalls, 1);
+  await participantFeature.stop();
+  await writerFeature.stop();
+});
+
+test('oversized Stripe service result returns an explicit bounded error once', async () => {
+  const participant = peerFor(otherKey);
+  const signer = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  let serviceCalls = 0;
+  const participantFeature = new MayhemFeature(participant.peer, { timeoutMs: 500 });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    resultRetryMs: 5,
+    async serviceHandler() {
+      serviceCalls += 1;
+      return {
+        ok: true,
+        checkout_session: {
+          url: `https://checkout.stripe.com/c/pay/${'x'.repeat(MAYHEM_RELAY_MAX_MESSAGE_BYTES)}`,
+        },
+      };
+    },
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  connect(participant.peer, participantFeature, writer.peer, writerFeature);
+  connect(writer.peer, writerFeature, participant.peer, participantFeature);
+  const request = signedServiceValue(
+    signer.peer,
+    'stripe_checkout',
+    stripeCheckoutValue(),
+    otherKey
+  );
+
+  const result = await requestStripeCheckout(participant.peer, request);
+  const replay = await requestStripeCheckout(participant.peer, request);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 'rejected');
+  assert.match(result.message, /service result exceeds 16384 bytes/i);
+  assert.equal(result.checkout_session, undefined);
+  assert.deepEqual(replay, result);
+  assert.equal(serviceCalls, 1);
+  assert.ok(writerFeature.relayMessageBytes(
+    writerFeature.serviceProcessed.values().next().value.result.message
+  ) <= MAYHEM_RELAY_MAX_MESSAGE_BYTES);
+  await participantFeature.stop();
+  await writerFeature.stop();
+});
+
 test('read-only transport relays wallet-signed Stripe Connect onboarding without appending', async () => {
   const participant = peerFor(otherKey);
   const signer = peerFor(providerKey);
@@ -1775,15 +2102,15 @@ test('Stripe service relay binds the request identity and deduplicates retries',
   assert.equal(writer.appended.length, 0);
 });
 
-test('poisoned relay service request is rejected locally and a retry still runs', async () => {
+test('failed relay service result is cached without rerunning the handler', async () => {
   const signer = peerFor(providerKey);
   const writer = peerFor(adminKey, { writable: true });
   let serviceCalls = 0;
   const writerFeature = new MayhemFeature(writer.peer, {
+    resultRetryMax: 1,
     async serviceHandler() {
       serviceCalls += 1;
-      if (serviceCalls === 1) throw new Error('injected relay poison');
-      return { ok: true, checkout_session: { url: 'https://checkout.stripe.com/c/pay/retry' } };
+      throw new Error('injected relay poison');
     },
   });
   writerFeature.key = 'mayhem';
@@ -1813,10 +2140,12 @@ test('poisoned relay service request is rejected locally and a retry still runs'
   await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
   await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
 
-  assert.equal(serviceCalls, 2);
+  assert.equal(serviceCalls, 1);
+  assert.equal(responses.length, 2);
   assert.equal(responses[0].ok, false);
   assert.match(responses[0].message, /injected relay poison/);
-  assert.equal(responses[1].ok, true);
+  assert.deepEqual(responses[1], responses[0]);
+  await writerFeature.stop();
 });
 
 test('admin-writer RPC keeps the local append path', async () => {

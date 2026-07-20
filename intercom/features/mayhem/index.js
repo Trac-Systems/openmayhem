@@ -17,9 +17,11 @@ const RELAY_CONTROL_REQUEST = 'mayhem_feature_request';
 const RELAY_CONTROL_RESULT = 'mayhem_feature_result';
 const SERVICE_CONTROL_REQUEST = 'mayhem_service_request';
 const SERVICE_CONTROL_RESULT = 'mayhem_service_result';
+const SERVICE_CONTROL_RESULT_ACK = 'mayhem_service_result_ack';
 const RELAY_VERSION = 1;
 const SERVICE_SIGNING_VERSION = 1;
 const SERVICE_SIGNING_DOMAIN = 'mayhem-service-request';
+const SERVICE_RESULT_DIGEST_DOMAIN = 'mayhem-service-result-v1';
 const MAYHEM_RELAY_CHANNEL = '0000mayhem-relay';
 const MAYHEM_RELAY_MAX_MESSAGE_BYTES = 16_384;
 const DEFAULT_TIMEOUT_MS = 0;
@@ -30,6 +32,7 @@ const DEFAULT_CACHE_TTL_MS = 300_000;
 const DEFAULT_CACHE_MAX = 2_048;
 const DEFAULT_PENDING_MAX = 256;
 const DEFAULT_PROCESSED_IN_FLIGHT_MAX = 256;
+const DEFAULT_RESULT_RETRY_MAX = 6;
 const PROVIDER_PAYOUT_RAILS = new Set(['fiat', 'tap', 'tnk']);
 const STRIPE_CONNECT_RELINK_CONSENT_VERSION = 1;
 const STRIPE_CONNECT_RELINK_CONSENT_MAX_SECONDS = 600;
@@ -106,6 +109,18 @@ const serviceRequestIdFor = (service, value) =>
         domain: 'mayhem-service-relay-v1',
         service,
         value,
+      })
+    )
+    .digest('hex');
+
+const serviceResultDigestFor = (requestId, response) =>
+  crypto
+    .createHash('sha256')
+    .update(
+      stableJson({
+        domain: SERVICE_RESULT_DIGEST_DOMAIN,
+        request_id: String(requestId ?? ''),
+        response: stableValue(response),
       })
     )
     .digest('hex');
@@ -226,6 +241,12 @@ class MayhemFeature extends Feature {
     this.retryMs = Number.isSafeInteger(config.retryMs) && config.retryMs > 0
       ? config.retryMs
       : DEFAULT_RETRY_MS;
+    this.resultRetryMs = Number.isSafeInteger(config.resultRetryMs) && config.resultRetryMs > 0
+      ? config.resultRetryMs
+      : this.retryMs;
+    this.resultRetryMax = Number.isSafeInteger(config.resultRetryMax) && config.resultRetryMax > 0
+      ? config.resultRetryMax
+      : DEFAULT_RESULT_RETRY_MAX;
     this.connectTimeoutMs = Number.isSafeInteger(config.connectTimeoutMs) &&
       config.connectTimeoutMs > 0
       ? config.connectTimeoutMs
@@ -265,6 +286,7 @@ class MayhemFeature extends Feature {
     this.processed = new Map();
     this.servicePending = new Map();
     this.serviceProcessed = new Map();
+    this.serviceCompleted = new Map();
     this.stopped = false;
   }
 
@@ -350,7 +372,8 @@ class MayhemFeature extends Feature {
     return control === RELAY_CONTROL_REQUEST ||
       control === RELAY_CONTROL_RESULT ||
       control === SERVICE_CONTROL_REQUEST ||
-      control === SERVICE_CONTROL_RESULT;
+      control === SERVICE_CONTROL_RESULT ||
+      control === SERVICE_CONTROL_RESULT_ACK;
   }
 
   relayMessageBytes(message) {
@@ -429,6 +452,12 @@ class MayhemFeature extends Feature {
 
     const canonicalValue = envelope;
     const requestId = serviceRequestIdFor(service, canonicalValue);
+    this._pruneMap(this.serviceCompleted);
+    const completed = this.serviceCompleted.get(requestId);
+    if (completed) {
+      completed.at = Date.now();
+      return completed.response;
+    }
     const existing = this.servicePending.get(requestId);
     if (existing) return await existing.promise;
     if (this.servicePending.size >= this.pendingMax) {
@@ -539,8 +568,10 @@ class MayhemFeature extends Feature {
       await this._handleResult(payload);
     } else if (payload.message.control === SERVICE_CONTROL_REQUEST) {
       await this._handleServiceRequest(payload);
-    } else {
+    } else if (payload.message.control === SERVICE_CONTROL_RESULT) {
       await this._handleServiceResult(payload);
+    } else {
+      await this._handleServiceResultAck(payload);
     }
     return true;
   }
@@ -748,7 +779,19 @@ class MayhemFeature extends Feature {
     for (const [key, entry] of map) {
       if (entry.pending === true) continue;
       if (entry.at >= cutoff && map.size <= this.cacheMax) break;
+      this._clearServiceResultRetry(entry);
       map.delete(key);
+    }
+  }
+
+  _clearServiceResultRetry(entry) {
+    if (entry?.resultTimer !== null && entry?.resultTimer !== undefined) {
+      clearTimeout(entry.resultTimer);
+    }
+    if (entry && typeof entry === 'object') {
+      entry.resultTimer = null;
+      entry.deliveryStarted = false;
+      entry.deliveryToken = (entry.deliveryToken ?? 0) + 1;
     }
   }
 
@@ -1071,6 +1114,93 @@ class MayhemFeature extends Feature {
     pending.resolve({ ...message.response, relayed: true, request_id: requestId });
   }
 
+  _prepareServiceResult(requestId, transport, response) {
+    const build = (boundedResponse) => {
+      const resultDigest = serviceResultDigestFor(requestId, boundedResponse);
+      return {
+        resultDigest,
+        message: {
+          control: SERVICE_CONTROL_RESULT,
+          version: RELAY_VERSION,
+          request_id: requestId,
+          result_digest: resultDigest,
+          to: transport,
+          response: boundedResponse,
+        },
+      };
+    };
+    let result = build(stableValue(response));
+    if (this.relayMessageBytes(result.message) <= this.maxMessageBytes) return result;
+    result = build(relayError(
+      `Mayhem service result exceeds ${this.maxMessageBytes} bytes.`,
+      requestId
+    ));
+    return result;
+  }
+
+  _startServiceResultDelivery(requestId, cached) {
+    if (cached.deliveryStarted || !cached.result?.message) return;
+    cached.deliveryStarted = true;
+    cached.acked = false;
+    cached.resultAttempts = 0;
+    cached.deliveryToken = (cached.deliveryToken ?? 0) + 1;
+    const deliveryToken = cached.deliveryToken;
+    let retryDelay = this.resultRetryMs;
+    const active = () => (
+      !this.stopped &&
+      !cached.acked &&
+      cached.deliveryStarted &&
+      cached.deliveryToken === deliveryToken &&
+      this.serviceProcessed.get(requestId) === cached
+    );
+    const schedule = () => {
+      if (!active() || cached.resultAttempts >= this.resultRetryMax) {
+        if (cached.deliveryToken === deliveryToken) cached.deliveryStarted = false;
+        return;
+      }
+      cached.resultTimer = setTimeout(() => {
+        cached.resultTimer = null;
+        void attempt();
+      }, retryDelay);
+      if (typeof cached.resultTimer?.unref === 'function') cached.resultTimer.unref();
+      retryDelay = Math.min(retryDelay * 2, this.resultRetryMs * 8);
+    };
+    const attempt = async () => {
+      if (!active() || cached.resultAttempts >= this.resultRetryMax) return;
+      cached.resultAttempts += 1;
+      try {
+        const sidechannel = this.peer?.sidechannel;
+        if (!sidechannel || typeof sidechannel.broadcast !== 'function') return;
+        if (typeof sidechannel.connectDirectPeer === 'function') {
+          const connected = await sidechannel.connectDirectPeer(
+            cached.transport,
+            this.channel,
+            this.connectTimeoutMs
+          );
+          if (!connected || !active()) return;
+        } else if (!sidechannel.started) return;
+        sidechannel.broadcast(this.channel, cached.result.message);
+      } catch (_error) {
+        // A bounded later attempt re-reads and reconnects the current sidechannel.
+      } finally {
+        schedule();
+      }
+    };
+    void attempt();
+  }
+
+  _sendServiceResultAck(admin, requestId, resultDigest) {
+    const sidechannel = this.peer?.sidechannel;
+    if (!sidechannel?.started || typeof sidechannel.broadcast !== 'function') return false;
+    return sidechannel.broadcast(this.channel, {
+      control: SERVICE_CONTROL_RESULT_ACK,
+      version: RELAY_VERSION,
+      request_id: requestId,
+      result_digest: resultDigest,
+      to: admin,
+    }) === true;
+  }
+
   async _handleServiceRequest(payload) {
     if (!this.peer.base?.writable) return;
     const admin = await this._adminKey();
@@ -1089,52 +1219,102 @@ class MayhemFeature extends Feature {
     this._pruneMap(this.serviceProcessed);
     let cached = this.serviceProcessed.get(expectedId);
     if (!cached && this._processedInFlight(this.serviceProcessed) >= this.processedInFlightMax) {
-      this.peer.sidechannel.broadcast(this.channel, {
-        control: SERVICE_CONTROL_RESULT,
-        version: RELAY_VERSION,
-        request_id: expectedId,
-        to: transport,
-        response: relayError('Mayhem admin service is busy; retry this signed request.', expectedId),
-      });
+      const busy = this._prepareServiceResult(
+        expectedId,
+        transport,
+        relayError('Mayhem admin service is busy; retry this signed request.', expectedId)
+      );
+      this.peer.sidechannel.broadcast(this.channel, busy.message);
       return;
     }
     if (!cached) {
       const promise = Promise.resolve()
         .then(() => this._handleService(message.service, envelope.payload, envelope))
-        .catch((error) => relayError(error?.message || 'Mayhem admin service request failed.', expectedId));
-      cached = { at: Date.now(), pending: true, promise };
+        .catch((error) => relayError(
+          error?.message || 'Mayhem admin service request failed.',
+          expectedId
+        ))
+        .then((response) => this._prepareServiceResult(expectedId, transport, response));
+      cached = {
+        at: Date.now(),
+        pending: true,
+        promise,
+        transport,
+        result: null,
+        resultTimer: null,
+      };
       this.serviceProcessed.set(expectedId, cached);
+      this._pruneMap(this.serviceProcessed);
     }
-    const response = await cached.promise;
+    const result = await cached.promise;
+    cached.result = result;
     cached.pending = false;
     cached.at = Date.now();
-    if (response?.ok !== true) this.serviceProcessed.delete(expectedId);
-    this.peer.sidechannel.broadcast(this.channel, {
-      control: SERVICE_CONTROL_RESULT,
-      version: RELAY_VERSION,
-      request_id: expectedId,
-      to: transport,
-      response,
-    });
+    if (cached.acked || !cached.deliveryStarted) {
+      this._clearServiceResultRetry(cached);
+      this._startServiceResultDelivery(expectedId, cached);
+    }
   }
 
   async _handleServiceResult(payload) {
     const message = payload.message;
     const requestId = String(message.request_id || '');
     const pending = this.servicePending.get(requestId);
-    if (!pending) return;
+    this._pruneMap(this.serviceCompleted);
+    const completed = this.serviceCompleted.get(requestId);
+    if (!pending && !completed) return;
     const admin = await this._adminKey();
     const self = normalizeKey(this.peer?.wallet?.publicKey);
+    const resultDigest = normalizeKey(message.result_digest);
     if (
       message.version !== RELAY_VERSION ||
       normalizeKey(message.to) !== self ||
       normalizeKey(payload.from) !== admin ||
-      !this._verifyEnvelope(payload, admin)
+      !this._verifyEnvelope(payload, admin) ||
+      !/^[0-9a-f]{64}$/.test(resultDigest) ||
+      serviceResultDigestFor(requestId, message.response) !== resultDigest ||
+      (completed && completed.resultDigest !== resultDigest)
     ) {
       return;
     }
+    this._sendServiceResultAck(admin, requestId, resultDigest);
+    if (!pending) {
+      completed.at = Date.now();
+      return;
+    }
+    const response = { ...message.response, relayed: true, request_id: requestId };
     this.servicePending.delete(requestId);
-    pending.resolve({ ...message.response, relayed: true, request_id: requestId });
+    this.serviceCompleted.set(requestId, {
+      at: Date.now(),
+      response,
+      resultDigest,
+    });
+    this._pruneMap(this.serviceCompleted);
+    pending.resolve(response);
+  }
+
+  async _handleServiceResultAck(payload) {
+    if (!this.peer.base?.writable) return;
+    const message = payload.message;
+    const requestId = String(message.request_id || '');
+    const cached = this.serviceProcessed.get(requestId);
+    if (!cached?.result) return;
+    const admin = await this._adminKey();
+    const self = normalizeKey(this.peer?.wallet?.publicKey);
+    const transport = normalizeKey(payload.from);
+    if (
+      message.version !== RELAY_VERSION ||
+      normalizeKey(message.to) !== self ||
+      self !== admin ||
+      transport !== cached.transport ||
+      normalizeKey(message.result_digest) !== cached.result.resultDigest ||
+      !this._verifyEnvelope(payload, cached.transport)
+    ) {
+      return;
+    }
+    cached.acked = true;
+    cached.at = Date.now();
+    this._clearServiceResultRetry(cached);
   }
 
   async _applyRelayed(key, value, requestId) {
@@ -1302,7 +1482,11 @@ class MayhemFeature extends Feature {
       pending.resolve(relayError('Mayhem service relay stopped.', requestId));
     }
     this.servicePending.clear();
+    for (const cached of this.serviceProcessed.values()) {
+      this._clearServiceResultRetry(cached);
+    }
     this.serviceProcessed.clear();
+    this.serviceCompleted.clear();
   }
 }
 

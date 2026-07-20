@@ -214,6 +214,12 @@ impl ScBridgeClient {
         .await
     }
 
+    /// Keep a send-only bridge client from accumulating unrelated asynchronous
+    /// sidechannel events while it waits for request acknowledgements.
+    pub async fn mute_sidechannel_events(&mut self) -> Result<Value> {
+        self.subscribe(std::iter::empty::<&str>()).await
+    }
+
     pub async fn unsubscribe(
         &mut self,
         channels: impl IntoIterator<Item = impl AsRef<str>>,
@@ -1116,6 +1122,89 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, BridgeError::ResourceLimit(_)));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_only_client_survives_more_than_the_bounded_event_capacity() {
+        const SEND_COUNT: usize = DEFAULT_SC_BRIDGE_MAX_QUEUED_EVENTS + 1;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            let auth = socket.next().await.unwrap().unwrap();
+            let auth: Value = match auth {
+                Message::Text(text) => serde_json::from_str(text.as_ref()).unwrap(),
+                other => panic!("expected auth text, got {other:?}"),
+            };
+            socket
+                .send(Message::Text(
+                    json!({"id": auth["id"], "type": "auth_ok"})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+
+            let subscribe = socket.next().await.unwrap().unwrap();
+            let subscribe: Value = match subscribe {
+                Message::Text(text) => serde_json::from_str(text.as_ref()).unwrap(),
+                other => panic!("expected subscribe text, got {other:?}"),
+            };
+            assert_eq!(subscribe["type"], "subscribe");
+            assert_eq!(subscribe["channels"], json!([]));
+            socket
+                .send(Message::Text(
+                    json!({
+                        "id": subscribe["id"],
+                        "type": "subscribed",
+                        "channels": [],
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            for _ in 0..SEND_COUNT {
+                let send = socket.next().await.unwrap().unwrap();
+                let send: Value = match send {
+                    Message::Text(text) => serde_json::from_str(text.as_ref()).unwrap(),
+                    other => panic!("expected send text, got {other:?}"),
+                };
+                assert_eq!(send["type"], "send");
+                socket
+                    .send(Message::Text(
+                        json!({
+                            "id": send["id"],
+                            "type": "sent",
+                            "channel": send["channel"],
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut client = ScBridgeClient::connect(
+            ScBridgeConfig::new(format!("ws://{address}"), "token")
+                .unwrap()
+                .with_operation_deadline(Some(Duration::from_secs(5))),
+        )
+        .await
+        .unwrap();
+        client.mute_sidechannel_events().await.unwrap();
+        for sequence in 0..SEND_COUNT {
+            client
+                .send("mx/room/test", json!({"t": "hb", "seq": sequence}))
+                .await
+                .unwrap();
+        }
         server.await.unwrap();
     }
 }

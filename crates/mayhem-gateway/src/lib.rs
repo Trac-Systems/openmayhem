@@ -3499,6 +3499,51 @@ mod tests {
             .contains("heartbeat is stale"));
     }
 
+    #[test]
+    fn heartbeat_receiver_keeps_one_hundred_valid_room_providers_visible() {
+        let now = 1_800_000_000_000;
+        let mut receiver = HeartbeatReceiver::new();
+        let mut accepted = BTreeSet::new();
+
+        let stale_key = SigningKey::from_bytes(&[101_u8; 32]);
+        let stale_provider = hex::encode(stale_key.verifying_key().to_bytes());
+        let stale = signed_heartbeat(
+            &stale_key,
+            &stale_provider,
+            now - DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS - 1,
+            "f1",
+        );
+        assert!(receiver.receive(&stale, now).is_none());
+
+        for index in 1_u8..=100 {
+            let signing_key = SigningKey::from_bytes(&[index; 32]);
+            let provider = hex::encode(signing_key.verifying_key().to_bytes());
+            let heartbeat = signed_heartbeat(&signing_key, &provider, now, &format!("{index:02x}"));
+            let heartbeat = receiver
+                .receive(&heartbeat, now)
+                .expect("valid same-room provider heartbeat");
+            accepted.insert(heartbeat.provider);
+        }
+
+        let wrong_version_key = SigningKey::from_bytes(&[102_u8; 32]);
+        let wrong_version_provider = hex::encode(wrong_version_key.verifying_key().to_bytes());
+        let mut wrong_version =
+            signed_heartbeat(&wrong_version_key, &wrong_version_provider, now, "f2");
+        wrong_version["contract_version"] = json!(CONTRACT_VERSION - 1);
+        resign_heartbeat(&wrong_version_key, &mut wrong_version);
+        assert!(receiver.receive(&wrong_version, now).is_none());
+
+        assert_eq!(accepted.len(), 100);
+        assert!(receiver
+            .drops()
+            .iter()
+            .any(|drop| drop.reason.contains("heartbeat is stale")));
+        assert!(receiver
+            .drops()
+            .iter()
+            .any(|drop| drop.reason.contains("contract upgrade required")));
+    }
+
     fn signed_heartbeat(
         signing_key: &SigningKey,
         provider: &str,

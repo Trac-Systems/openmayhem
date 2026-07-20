@@ -146,6 +146,17 @@ test('SC-Bridge explicit empty subscription receives no unrelated sidechannel tr
   );
 });
 
+test('SC-Bridge send-only subscription stays empty beyond the client queue bound', () => {
+  const channels = new Set();
+  let emitted = 0;
+
+  for (let sequence = 0; sequence <= 4096; sequence += 1) {
+    if (sidechannelSubscriptionMatches(channels, `mx/room/${sequence}`)) emitted += 1;
+  }
+
+  assert.equal(emitted, 0);
+});
+
 test('SC-Bridge bounds and reclaims every direct session owned by a disconnected client', () => {
   const sessions = new Map();
   const remote = 'ab'.repeat(32);

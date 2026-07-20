@@ -57369,6 +57369,10 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
     let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(url, token)?)
         .await
         .context("connecting to SC-Bridge for provider heartbeats")?;
+    bridge
+        .mute_sidechannel_events()
+        .await
+        .context("muting inbound sidechannels for the provider heartbeat sender")?;
     let transport_peer = sc_bridge_transport_peer(&mut bridge).await?;
     let mut sent = Vec::new();
     let count = u64::from(ctx.args.heartbeat_count.max(1));
@@ -57636,6 +57640,12 @@ async fn run_provider_session_heartbeat_connection(
     )
     .await
     .context("timed out connecting to SC-Bridge for live provider session heartbeats")??;
+    timeout(
+        ctx.bridge_operation_timeout,
+        bridge.mute_sidechannel_events(),
+    )
+    .await
+    .context("timed out muting inbound sidechannels for the live provider heartbeat sender")??;
     let transport_peer = timeout(
         ctx.bridge_operation_timeout,
         sc_bridge_transport_peer(&mut bridge),

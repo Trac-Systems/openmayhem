@@ -214,7 +214,7 @@ grep -F "MAYHEM_ALLOW_UNVERIFIED have been removed" "$ROOT_DIR/install.ps1" >/de
 for harness in \
   "$ROOT_DIR/scripts/macos-opencode-role-check.sh" \
   "$ROOT_DIR/scripts/docker-opencode-role-check.sh"; do
-  grep -F ':-0.2.28}' "$harness" >/dev/null ||
+  grep -F ':-0.2.29}' "$harness" >/dev/null ||
     fail "$harness does not default to canonical release semver"
   grep -F -- '--unsigned-layout' "$harness" >/dev/null ||
     fail "$harness does not explicitly request the unsigned test layout"

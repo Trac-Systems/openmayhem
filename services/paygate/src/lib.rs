@@ -2589,7 +2589,13 @@ async fn stripe_create_connect_account(
         .basic_auth(secret_key, Some(""))
         .header(
             "Idempotency-Key",
-            stripe_connect_idempotency_key(stripe.mode, provider, rotation_nonce),
+            stripe_connect_idempotency_key(
+                stripe.mode,
+                provider,
+                stripe.connect_account_type,
+                country,
+                rotation_nonce,
+            ),
         )
         .form(&form)
         .send()
@@ -2952,20 +2958,33 @@ fn stripe_string_array(value: &Value, pointer: &str) -> Result<Vec<String>> {
 fn stripe_connect_idempotency_key(
     mode: StripeMode,
     provider: &str,
+    account_type: StripeConnectAccountType,
+    country: &str,
     rotation_nonce: Option<&str>,
 ) -> String {
-    let Some(rotation_nonce) = rotation_nonce else {
-        return format!("mayhem-connect-account-{}-{provider}", mode.as_str());
-    };
     let mut hasher = Sha256::new();
-    hasher.update(format!(
-        "mayhem-connect-account-rotation-v1:{}:{provider}:{rotation_nonce}",
-        mode.as_str()
-    ));
-    format!(
-        "mayhem-connect-account-rotation-{}",
-        hex::encode(hasher.finalize())
-    )
+    hasher.update("mayhem-connect-account-v2\n");
+    hasher.update(mode.as_str());
+    hasher.update("\n");
+    hasher.update(provider);
+    hasher.update("\n");
+    hasher.update(account_type.as_str());
+    hasher.update("\n");
+    hasher.update(country);
+    match rotation_nonce {
+        Some(rotation_nonce) => {
+            hasher.update("\nrotation\n");
+            hasher.update(rotation_nonce);
+            format!(
+                "mayhem-connect-account-rotation-{}",
+                hex::encode(hasher.finalize())
+            )
+        }
+        None => {
+            hasher.update("\ninitial");
+            format!("mayhem-connect-account-{}", hex::encode(hasher.finalize()))
+        }
+    }
 }
 
 fn stripe_connect_link_idempotency_key(
