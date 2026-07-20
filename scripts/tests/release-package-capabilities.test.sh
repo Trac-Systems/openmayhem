@@ -205,9 +205,13 @@ rm -rf "$topology/node_modules/trac-peer/node_modules"
 
 mv "$topology/node_modules/trac-peer" "$topology/trac-peer-installed"
 if ln -s ../trac-peer-installed "$topology/node_modules/trac-peer" 2>/dev/null; then
-  expect_failure "topology verifier accepted linked trac-peer" \
-    node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$topology"
-  rm "$topology/node_modules/trac-peer"
+  if node -e \
+    "process.exit(require('node:fs').lstatSync(process.argv[1]).isSymbolicLink() ? 0 : 1)" \
+    "$topology/node_modules/trac-peer"; then
+    expect_failure "topology verifier accepted linked trac-peer" \
+      node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$topology"
+  fi
+  rm -rf "$topology/node_modules/trac-peer"
 fi
 mv "$topology/trac-peer-installed" "$topology/node_modules/trac-peer"
 
