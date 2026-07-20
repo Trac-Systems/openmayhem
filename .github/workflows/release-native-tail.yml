@@ -240,21 +240,14 @@ jobs:
           if ($env:TARGET -eq "aarch64-pc-windows-msvc") {
             $llvmDirectory = Join-Path $installationPath "VC\Tools\Llvm\ARM64\bin"
             $clang = Join-Path $llvmDirectory "clang-cl.exe"
-            $llvmLib = Join-Path $llvmDirectory "llvm-lib.exe"
             if (-not (Test-Path -LiteralPath $clang -PathType Leaf)) {
               throw "Visual Studio native ARM64 clang-cl is unavailable"
-            }
-            if (-not (Test-Path -LiteralPath $llvmLib -PathType Leaf)) {
-              throw "Visual Studio native ARM64 llvm-lib is unavailable"
             }
             $clangCmake = $clang.Replace("\", "/")
             $toolVariables += @(
               "CMAKE_GENERATOR=Ninja",
               "CMAKE_C_COMPILER=$clangCmake",
-              "CMAKE_CXX_COMPILER=$clangCmake",
-              "CC_aarch64_pc_windows_msvc=$clang",
-              "CXX_aarch64_pc_windows_msvc=$clang",
-              "AR_aarch64_pc_windows_msvc=$llvmLib"
+              "CMAKE_CXX_COMPILER=$clangCmake"
             )
           }
           foreach ($variable in $toolVariables) {
