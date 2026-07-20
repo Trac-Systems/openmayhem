@@ -115,7 +115,15 @@ const peerFor = (publicKey, { writable = false, bootstrap = '11'.repeat(32) } = 
         return fakeSignature(publicKey, message);
       },
       verify(signature, message, signer) {
-        return signature === fakeSignature(signer, message);
+        if (!b4a.isBuffer(signature) ||
+            !b4a.isBuffer(message) ||
+            !b4a.isBuffer(signer)) {
+          return false;
+        }
+        return b4a.toString(signature, 'hex') === fakeSignature(
+          b4a.toString(signer, 'hex'),
+          message
+        );
       },
     },
     base: {

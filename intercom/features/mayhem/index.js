@@ -35,6 +35,25 @@ const STRIPE_CONNECT_RELINK_CONSENT_VERSION = 1;
 const STRIPE_CONNECT_RELINK_CONSENT_MAX_SECONDS = 600;
 const normalizeKey = (value) => String(value ?? '').trim().toLowerCase();
 
+const verifyEd25519Hex = (wallet, signature, message, publicKey) => {
+  if (typeof wallet?.verify !== 'function' ||
+      !/^[0-9a-f]{128}$/.test(signature) ||
+      !/^[0-9a-f]{64}$/.test(publicKey) ||
+      !b4a.isBuffer(message) ||
+      message.length === 0) {
+    return false;
+  }
+  try {
+    return wallet.verify(
+      b4a.from(signature, 'hex'),
+      message,
+      b4a.from(publicKey, 'hex')
+    ) === true;
+  } catch (_error) {
+    return false;
+  }
+};
+
 const stableValue = (value) => {
   if (Array.isArray(value)) return value.map((item) => stableValue(item));
   if (value && typeof value === 'object') {
@@ -143,15 +162,12 @@ const validStripeConnectRelinkConsent = (wallet, value) => {
       value.consent_expires_at > now + STRIPE_CONNECT_RELINK_CONSENT_MAX_SECONDS) {
     return false;
   }
-  try {
-    return wallet?.verify?.(
-      signature,
-      b4a.from(stripeConnectRelinkConsentMessage(value)),
-      sourceProvider
-    ) === true;
-  } catch (_error) {
-    return false;
-  }
+  return verifyEd25519Hex(
+    wallet,
+    signature,
+    b4a.from(stripeConnectRelinkConsentMessage(value)),
+    sourceProvider
+  );
 };
 
 const participantFor = (value) => {
@@ -574,15 +590,12 @@ class MayhemFeature extends Feature {
     if (typeof this.peer?.wallet?.verify !== 'function') return null;
     if (service === 'stripe_connect_relink' &&
         !validStripeConnectRelinkConsent(this.peer.wallet, payload)) return null;
-    try {
-      if (!this.peer.wallet.verify(
-        signature,
-        b4a.from(serviceSigningMessage(service, { actor, admin, payload, transport })),
-        actor
-      )) return null;
-    } catch (_error) {
-      return null;
-    }
+    if (!verifyEd25519Hex(
+      this.peer.wallet,
+      signature,
+      b4a.from(serviceSigningMessage(service, { actor, admin, payload, transport })),
+      actor
+    )) return null;
     return {
       actor,
       admin,
@@ -722,7 +735,8 @@ class MayhemFeature extends Feature {
         intent.expires_after_epoch < 1) {
       return false;
     }
-    if (!this.peer.wallet.verify(
+    if (!verifyEd25519Hex(
+      this.peer.wallet,
       value.provider_signature,
       b4a.from(providerPayoutBindingMessage(intent)),
       intent.provider
@@ -742,7 +756,8 @@ class MayhemFeature extends Feature {
           intent.chain_id !== null ||
           !/^[0-9a-f]{64}$/.test(intent.target_wallet) ||
           !/^[0-9a-f]{128}$/.test(intent.target_signature) ||
-          !this.peer.wallet.verify(
+          !verifyEd25519Hex(
+            this.peer.wallet,
             intent.target_signature,
             b4a.from(providerPayoutTargetBindingMessage(intent)),
             intent.target_wallet
@@ -1074,7 +1089,8 @@ class MayhemFeature extends Feature {
     if (expectedTx !== value.tx) {
       return 'Invalid admin contract transaction digest.';
     }
-    if (!this.peer.wallet.verify(
+    if (!verifyEd25519Hex(
+      this.peer.wallet,
       value.signature,
       b4a.from(value.tx, 'hex'),
       value.address
