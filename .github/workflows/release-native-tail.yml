@@ -127,6 +127,10 @@ jobs:
             target: aarch64-pc-windows-msvc
             archive_suffix: .zip
             executable_suffix: .exe
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            archive_suffix: .zip
+            executable_suffix: .exe
 
     steps:
       - name: Checkout exact source commit
@@ -172,11 +176,28 @@ jobs:
           rustup toolchain install "1.89.0-$TARGET" --profile minimal
           rustup default "1.89.0-$TARGET"
 
-      - name: Configure Visual Studio ARM64 tools
+      - name: Configure native Visual Studio tools
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           $ErrorActionPreference = "Stop"
+          switch ($env:TARGET) {
+            "aarch64-pc-windows-msvc" {
+              $vsComponent = "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
+              $vsArch = "arm64"
+              $cargoLinkerVariable = "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"
+            }
+            "x86_64-pc-windows-msvc" {
+              $vsComponent = "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+              $vsArch = "x64"
+              $cargoLinkerVariable = "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"
+            }
+            default {
+              throw "Unsupported native Windows target: $env:TARGET"
+            }
+          }
           $vswhere = Join-Path ${env:ProgramFiles(x86)} `
             "Microsoft Visual Studio\Installer\vswhere.exe"
           if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
@@ -185,19 +206,19 @@ jobs:
           $installationPath = & $vswhere `
             -latest `
             -products * `
-            -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+            -requires $vsComponent `
             -property installationPath
           if ([string]::IsNullOrWhiteSpace($installationPath)) {
-            throw "Visual Studio ARM64 C++ tools are unavailable"
+            throw "Visual Studio native C++ tools are unavailable for $env:TARGET"
           }
           $devCmd = Join-Path $installationPath "Common7\Tools\VsDevCmd.bat"
           if (-not (Test-Path -LiteralPath $devCmd -PathType Leaf)) {
             throw "VsDevCmd.bat is unavailable"
           }
-          $command = "call `"$devCmd`" -no_logo -arch=arm64 -host_arch=arm64 >nul && set"
+          $command = "call `"$devCmd`" -no_logo -arch=$vsArch -host_arch=$vsArch >nul && set"
           $environment = & $env:ComSpec /d /s /c $command
           if ($LASTEXITCODE -ne 0) {
-            throw "Visual Studio ARM64 environment setup failed"
+            throw "Visual Studio native environment setup failed for $env:TARGET"
           }
           $pathLine = $environment |
             Where-Object { $_ -match "^Path=" } |
@@ -208,16 +229,37 @@ jobs:
           $toolDirectory = $pathLine.Substring($pathLine.IndexOf("=") + 1).Split(";")[0]
           $linker = Join-Path $toolDirectory "link.exe"
           if (-not (Test-Path -LiteralPath $linker -PathType Leaf)) {
-            throw "Visual Studio ARM64 linker is unavailable"
+            throw "Visual Studio native linker is unavailable for $env:TARGET"
           }
           foreach ($line in $environment) {
             if ($line -match "^[^=]+=") {
               Add-Content -LiteralPath $env:GITHUB_ENV -Value $line -Encoding utf8
             }
           }
-          Add-Content -LiteralPath $env:GITHUB_ENV `
-            -Value "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$linker" `
-            -Encoding utf8
+          $toolVariables = @("$cargoLinkerVariable=$linker")
+          if ($env:TARGET -eq "aarch64-pc-windows-msvc") {
+            $llvmDirectory = Join-Path $installationPath "VC\Tools\Llvm\ARM64\bin"
+            $clang = Join-Path $llvmDirectory "clang-cl.exe"
+            $llvmLib = Join-Path $llvmDirectory "llvm-lib.exe"
+            if (-not (Test-Path -LiteralPath $clang -PathType Leaf)) {
+              throw "Visual Studio native ARM64 clang-cl is unavailable"
+            }
+            if (-not (Test-Path -LiteralPath $llvmLib -PathType Leaf)) {
+              throw "Visual Studio native ARM64 llvm-lib is unavailable"
+            }
+            $clangCmake = $clang.Replace("\", "/")
+            $toolVariables += @(
+              "CMAKE_GENERATOR=Ninja",
+              "CMAKE_C_COMPILER=$clangCmake",
+              "CMAKE_CXX_COMPILER=$clangCmake",
+              "CC_aarch64_pc_windows_msvc=$clang",
+              "CXX_aarch64_pc_windows_msvc=$clang",
+              "AR_aarch64_pc_windows_msvc=$llvmLib"
+            )
+          }
+          foreach ($variable in $toolVariables) {
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value $variable -Encoding utf8
+          }
 
       - name: Assert native runner identity
         shell: bash
@@ -249,28 +291,71 @@ jobs:
                   -Command '[System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()' |
                   tr -d '\r\n'
               )"
-              [[ "$os_arch" == "Arm64" ]] || {
-                printf '%s\n' "Windows OS architecture is not Arm64" >&2
-                exit 1
-              }
-              [[ "${VSCMD_ARG_HOST_ARCH,,}" == "arm64" ]] || {
-                printf '%s\n' "Visual Studio host tools are not ARM64" >&2
-                exit 1
-              }
-              [[ "${VSCMD_ARG_TGT_ARCH,,}" == "arm64" ]] || {
-                printf '%s\n' "Visual Studio target tools are not ARM64" >&2
-                exit 1
-              }
-              [[ -n "${CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER:-}" ]] || {
-                printf '%s\n' "Cargo ARM64 linker is not pinned" >&2
-                exit 1
-              }
               cl_path="$(where.exe cl.exe | tr -d '\r' | sed -n '1p')"
               cl_path="${cl_path//\\//}"
-              [[ "${cl_path,,}" == *"/hostarm64/arm64/cl.exe" ]] || {
-                printf '%s\n' "cl.exe is not the native ARM64 toolchain" >&2
-                exit 1
-              }
+              case "$TARGET" in
+                aarch64-pc-windows-msvc)
+                  [[ "$os_arch" == "Arm64" ]] || {
+                    printf '%s\n' "Windows OS architecture is not Arm64" >&2
+                    exit 1
+                  }
+                  [[ "${VSCMD_ARG_HOST_ARCH,,}" == "arm64" ]] || {
+                    printf '%s\n' "Visual Studio host tools are not ARM64" >&2
+                    exit 1
+                  }
+                  [[ "${VSCMD_ARG_TGT_ARCH,,}" == "arm64" ]] || {
+                    printf '%s\n' "Visual Studio target tools are not ARM64" >&2
+                    exit 1
+                  }
+                  [[ -n "${CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER:-}" ]] || {
+                    printf '%s\n' "Cargo ARM64 linker is not pinned" >&2
+                    exit 1
+                  }
+                  [[ "${CMAKE_GENERATOR:-}" == "Ninja" ]] || {
+                    printf '%s\n' "CMake is not using the architecture-neutral Ninja generator" >&2
+                    exit 1
+                  }
+                  [[ -x "${CMAKE_C_COMPILER:-}" && "$CMAKE_C_COMPILER" == "$CMAKE_CXX_COMPILER" ]] || {
+                    printf '%s\n' "CMake ARM64 clang-cl compiler is unavailable or inconsistent" >&2
+                    exit 1
+                  }
+                  "$CMAKE_C_COMPILER" --version |
+                    grep -Fq "Target: aarch64-pc-windows-msvc" || {
+                      printf '%s\n' "clang-cl does not target native Windows ARM64" >&2
+                      exit 1
+                    }
+                  [[ "${cl_path,,}" == *"/hostarm64/arm64/cl.exe" ]] || {
+                    printf '%s\n' "cl.exe is not the native ARM64 toolchain" >&2
+                    exit 1
+                  }
+                  ;;
+                x86_64-pc-windows-msvc)
+                  [[ "$os_arch" == "X64" ]] || {
+                    printf '%s\n' "Windows OS architecture is not X64" >&2
+                    exit 1
+                  }
+                  [[ "${VSCMD_ARG_HOST_ARCH,,}" == "x64" ]] || {
+                    printf '%s\n' "Visual Studio host tools are not X64" >&2
+                    exit 1
+                  }
+                  [[ "${VSCMD_ARG_TGT_ARCH,,}" == "x64" ]] || {
+                    printf '%s\n' "Visual Studio target tools are not X64" >&2
+                    exit 1
+                  }
+                  [[ -n "${CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER:-}" ]] || {
+                    printf '%s\n' "Cargo X64 linker is not pinned" >&2
+                    exit 1
+                  }
+                  [[ "${cl_path,,}" == *"/hostx64/x64/cl.exe" ]] || {
+                    printf '%s\n' "cl.exe is not the native X64 toolchain" >&2
+                    exit 1
+                  }
+                  ;;
+                *)
+                  printf '%s\n' "unsupported Windows target" >&2
+                  exit 1
+                  ;;
+              esac
               ;;
             *)
               printf '%s\n' "unsupported runner OS" >&2

@@ -246,6 +246,7 @@ const matrixEntries = [...matrixMatch.groups.matrix.matchAll(
 const expectedMatrix = [
   "macos-15-intel/x86_64-apple-darwin/.tar.gz/''",
   'windows-11-arm/aarch64-pc-windows-msvc/.zip/.exe',
+  'windows-2025/x86_64-pc-windows-msvc/.zip/.exe',
 ];
 if (JSON.stringify(matrixEntries) !== JSON.stringify(expectedMatrix)) {
   fail(`matrix must be exactly ${expectedMatrix.join(' and ')}`);
@@ -328,13 +329,48 @@ requireLiteral(
   packageSource,
 );
 requireLiteral(
-  '-Value "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$linker"',
+  '"CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"',
   'Windows ARM packaging must pin Cargo to the discovered MSVC linker',
   packageSource,
 );
 requireLiteral(
   '[[ -n "${CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER:-}" ]]',
   'Windows identity must reject an unpinned Cargo ARM64 linker',
+  packageSource,
+);
+requireLiteral(
+  '"CMAKE_GENERATOR=Ninja"',
+  'Windows ARM packaging must avoid the unsupported MSVC ARM generator',
+  packageSource,
+);
+requireLiteral(
+  '"CMAKE_C_COMPILER=$clangCmake"',
+  'Windows ARM packaging must select native clang-cl for C',
+  packageSource,
+);
+requireLiteral(
+  '"CMAKE_CXX_COMPILER=$clangCmake"',
+  'Windows ARM packaging must select native clang-cl for C++',
+  packageSource,
+);
+requireLiteral(
+  'grep -Fq "Target: aarch64-pc-windows-msvc"',
+  'Windows identity must prove clang-cl targets native ARM64',
+  packageSource,
+);
+requireLiteral(
+  '"CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"',
+  'Windows X64 packaging must pin Cargo to the discovered MSVC linker',
+  packageSource,
+);
+requireLiteral(
+  '[[ -n "${CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER:-}" ]]',
+  'Windows identity must reject an unpinned Cargo X64 linker',
+  packageSource,
+);
+requireLiteral(
+  '[[ "$os_arch" == "X64" ]]',
+  'Windows X64 packaging must run on a native X64 OS',
   packageSource,
 );
 requireLiteral(
