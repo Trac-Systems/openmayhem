@@ -2,7 +2,6 @@
 import fs from 'fs';
 import http from 'http';
 import path from 'path';
-import crypto from 'crypto';
 import b4a from 'b4a';
 import PeerWallet from 'trac-wallet';
 import { Peer } from 'trac-peer';
@@ -28,6 +27,7 @@ import DirectSession from '../features/direct-session/index.js';
 import InferenceRelay from '../features/inference-relay/index.js';
 import ScBridge from '../features/sc-bridge/index.js';
 import { resolveScBridgeToken } from '../features/sc-bridge/token.js';
+import { createInternalStripeAuthHeaders } from './internal-stripe-auth.js';
 
 const fatalRuntimeError = installFatalRuntimeErrorPolicy(
   typeof Bare !== 'undefined' ? Bare : null
@@ -88,26 +88,11 @@ const stripeInternalAuthSecret = () => {
 };
 
 const internalStripeAuthHeaders = (endpoint, body) => {
-  const timestamp = String(Math.floor(Date.now() / 1_000));
-  const nonce = crypto.randomBytes(32).toString('hex');
-  const bodyDigest = crypto.createHash('sha256').update(body).digest('hex');
-  const message = [
-    'mayhem-paygate-internal-request-v1',
-    timestamp,
-    nonce,
-    'POST',
-    endpoint.pathname,
-    bodyDigest,
-  ].join('\n');
-  const signature = crypto
-    .createHmac('sha256', stripeInternalAuthSecret())
-    .update(message)
-    .digest('hex');
-  return {
-    'x-mayhem-paygate-timestamp': timestamp,
-    'x-mayhem-paygate-nonce': nonce,
-    'x-mayhem-paygate-signature': signature,
-  };
+  return createInternalStripeAuthHeaders({
+    endpoint,
+    body,
+    secret: stripeInternalAuthSecret(),
+  });
 };
 
 const postInternalStripeRequest = (

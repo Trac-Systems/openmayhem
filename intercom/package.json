@@ -1,6 +1,6 @@
 {
   "name": "mayhem-intercom",
-  "version": "0.2.27",
+  "version": "0.2.28",
   "type": "module",
   "main": "src/main.js",
   "scripts": {
@@ -16,7 +16,7 @@
     "test:tnk-watcher": "node --test tests/tnk-deposit-watcher.test.js",
     "test:market-sim": "node --test tests/market-sim.test.js",
     "test:contract": "node --test tests/contract-consent.test.js tests/contract-registry.test.js tests/contract-room.test.js tests/contract-price.test.js tests/contract-params.test.js tests/contract-payments.test.js tests/contract-reputation.test.js tests/contract-auditor.test.js tests/contract-ledger.test.js tests/contract-rate.test.js tests/contract-deposit.test.js tests/contract-epoch.test.js tests/contract-guardian.test.js tests/contract-payout.test.js tests/contract-slash.test.js tests/contract-dispute.test.js tests/contract-security-surface.test.js",
-    "test:features": "node --test tests/direct-session.test.js tests/mayhem-feature-relay.test.js tests/runtime-errors.test.js tests/sc-bridge-containment.test.js tests/sidechannel-policy.test.js"
+    "test:features": "node --test tests/direct-session.test.js tests/internal-stripe-auth.test.js tests/mayhem-feature-relay.test.js tests/runtime-errors.test.js tests/sc-bridge-containment.test.js tests/sidechannel-policy.test.js"
   },
   "pear": {
     "name": "mayhem-intercom",
@@ -34,6 +34,8 @@
     "hyperschema": "1.20.0",
     "path": "npm:bare-node-path",
     "protomux": "^3.10.1",
+    "sha256-universal": "1.2.1",
+    "sodium-universal": "5.0.1",
     "trac-crypto-api": "^0.1.5",
     "trac-msb": "file:trac/msb",
     "trac-peer": "file:trac/trac-peer",
