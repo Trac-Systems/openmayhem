@@ -41,7 +41,7 @@ jobs:
           WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
-          if [[ ! "$RELEASE_TAG" =~ ^v0\.2\.23(-rc\.[1-9][0-9]*)?$ ]]; then
+          if [[ ! "$RELEASE_TAG" =~ ^v0\.2\.25(-rc\.[1-9][0-9]*)?$ ]]; then
             printf '%s\n' "release_tag must be v0.2.25-rc.N or v0.2.25" >&2
             exit 1
           fi

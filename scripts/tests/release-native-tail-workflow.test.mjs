@@ -134,7 +134,7 @@ requireAbsent(
   verifySource,
 );
 requireLiteral(
-  '^v0\\.2\\.23(-rc\\.[1-9][0-9]*)?$',
+  '^v0\\.2\\.25(-rc\\.[1-9][0-9]*)?$',
   'release_tag must allow only v0.2.25-rc.N or v0.2.25',
   verifySource,
 );
