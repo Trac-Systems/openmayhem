@@ -223,7 +223,7 @@ jobs:
                 printf '%s\n' "macOS runner is not Intel" >&2
                 exit 1
               }
-              translated="$(sysctl -n sysctl.proc_translated)"
+              translated="$(sysctl -n sysctl.proc_translated 2>/dev/null || printf '0')"
               [[ "$translated" == "0" ]] || {
                 printf '%s\n' "macOS process is translated" >&2
                 exit 1

@@ -5,12 +5,13 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const workflowPath = path.join(root, '.github/workflows/release-native-tail.yml');
-const source = fs.readFileSync(workflowPath, 'utf8');
-const packageCapabilitySource = fs.readFileSync(
+const readText = (sourcePath) =>
+  fs.readFileSync(sourcePath, 'utf8').replace(/\r\n?/g, '\n');
+const source = readText(workflowPath);
+const packageCapabilitySource = readText(
   path.join(root, 'scripts/tests/release-package-capabilities.test.sh'),
-  'utf8',
 );
-const cargoWorkspaceSource = fs.readFileSync(path.join(root, 'Cargo.toml'), 'utf8');
+const cargoWorkspaceSource = readText(path.join(root, 'Cargo.toml'));
 const releaseKeysDir = path.join(root, 'release/keys');
 const releaseKeyName = 'openmayhem-release-v1.json';
 const releaseKey = JSON.parse(
@@ -302,8 +303,8 @@ requireAbsent(
 );
 
 requireLiteral(
-  'translated="$(sysctl -n sysctl.proc_translated)"',
-  'Intel macOS identity must read sysctl.proc_translated',
+  'translated="$(sysctl -n sysctl.proc_translated 2>/dev/null || printf \'0\')"',
+  'Intel macOS identity must tolerate the translation key being absent',
   packageSource,
 );
 requireLiteral(
