@@ -20,6 +20,13 @@ expect_failure() {
   fi
 }
 
+intercom_eol="$(
+  git -C "$ROOT_DIR" check-attr eol -- intercom/contract/contract.js |
+    tr -d '\r'
+)"
+[[ "$intercom_eol" == *": eol: lf" ]] ||
+  fail "byte-hashed Intercom release source is not pinned to LF checkouts"
+
 node_sees_symlink() {
   node -e \
     "process.exit(require('node:fs').lstatSync(process.argv[1]).isSymbolicLink() ? 0 : 1)" \

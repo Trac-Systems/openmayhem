@@ -1,4 +1,5 @@
 # Byte-hashed and signed release assets must be identical on every OS.
+intercom/** text eol=lf
 RULES.md text eol=lf
 catalog/*.json text eol=lf
 catalog/**/*.json text eol=lf
