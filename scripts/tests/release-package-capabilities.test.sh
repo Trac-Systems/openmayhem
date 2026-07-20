@@ -20,6 +20,12 @@ expect_failure() {
   fi
 }
 
+node_sees_symlink() {
+  node -e \
+    "process.exit(require('node:fs').lstatSync(process.argv[1]).isSymbolicLink() ? 0 : 1)" \
+    "$1"
+}
+
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/mayhem-release-capabilities.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -205,9 +211,7 @@ rm -rf "$topology/node_modules/trac-peer/node_modules"
 
 mv "$topology/node_modules/trac-peer" "$topology/trac-peer-installed"
 if ln -s ../trac-peer-installed "$topology/node_modules/trac-peer" 2>/dev/null; then
-  if node -e \
-    "process.exit(require('node:fs').lstatSync(process.argv[1]).isSymbolicLink() ? 0 : 1)" \
-    "$topology/node_modules/trac-peer"; then
+  if node_sees_symlink "$topology/node_modules/trac-peer"; then
     expect_failure "topology verifier accepted linked trac-peer" \
       node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$topology"
   fi
@@ -276,16 +280,18 @@ expect_failure "ZIP capability check accepted a data-descriptor flag" \
   "$tmp/files.txt"
 
 if ln -s mayhem.exe "$work/$archive_root/bin/mayhem-link.exe" 2>/dev/null; then
-  cp "$tmp/files.txt" "$tmp/symlink-files.txt"
-  printf '%s\n' "$archive_root/bin/mayhem-link.exe" >>"$tmp/symlink-files.txt"
-  expect_failure "deterministic ZIP writer followed a symbolic-link source" \
-    create_deterministic_windows_zip \
-    "$work" \
-    "$tmp/symlink-files.txt" \
-    "$tmp/symlink-actual.txt" \
-    "$tmp/symlink.zip" \
-    1700000000
-  rm "$work/$archive_root/bin/mayhem-link.exe"
+  if node_sees_symlink "$work/$archive_root/bin/mayhem-link.exe"; then
+    cp "$tmp/files.txt" "$tmp/symlink-files.txt"
+    printf '%s\n' "$archive_root/bin/mayhem-link.exe" >>"$tmp/symlink-files.txt"
+    expect_failure "deterministic ZIP writer followed a symbolic-link source" \
+      create_deterministic_windows_zip \
+      "$work" \
+      "$tmp/symlink-files.txt" \
+      "$tmp/symlink-actual.txt" \
+      "$tmp/symlink.zip" \
+      1700000000
+  fi
+  rm -rf "$work/$archive_root/bin/mayhem-link.exe"
 fi
 
 if grep -E '(^|[[:space:]])zip[[:space:]]+-|zipinfo' \
