@@ -18,8 +18,8 @@ permissions:
 # REQUIRED GITHUB CONFIGURATION; this file does not claim it already exists:
 # - Create the release-signing environment and store MAYHEM_RELEASE_SEED_HEX
 #   only as an environment secret (no repository- or organization-secret copy).
-# - Require at least one designated release-maintainer reviewer, prevent
-#   self-review, and disallow admin bypass.
+# - Do not configure required reviewers or self-review gates; protected-tag
+#   provenance and the environment-held signing secret must run autonomously.
 # - Select deployment branches and tags with tag rules exactly v0.2.23 and
 #   v0.2.23-rc.* and no branch rules.
 # - Protect those two tag patterns with an active repository tag ruleset that

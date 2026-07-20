@@ -103,9 +103,9 @@ requireLiteral(
   'signing seed must be documented as environment-only',
 );
 requireLiteral(
-  '# - Require at least one designated release-maintainer reviewer, prevent\n'
-    + '#   self-review, and disallow admin bypass.',
-  'environment reviewer and bypass protection must be documented',
+  '# - Do not configure required reviewers or self-review gates; protected-tag\n'
+    + '#   provenance and the environment-held signing secret must run autonomously.',
+  'autonomous release execution must be documented',
 );
 requireLiteral(
   '# - Select deployment branches and tags with tag rules exactly v0.2.23 and\n'
