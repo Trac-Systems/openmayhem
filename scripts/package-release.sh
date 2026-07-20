@@ -2010,15 +2010,32 @@ host_target() {
 }
 
 native_host_target() {
-  local host
+  local host rust_host
 
   host="$(host_target)"
-  if [[ "$host" == "x86_64-apple-darwin" ]] &&
-    [[ "$(sysctl -n sysctl.proc_translated 2>/dev/null || printf '0\n')" == "1" ]]; then
-    printf 'aarch64-apple-darwin\n'
-  else
-    printf '%s\n' "$host"
-  fi
+  case "$host" in
+    x86_64-apple-darwin)
+      if [[ "$(sysctl -n sysctl.proc_translated 2>/dev/null || printf '0\n')" == "1" ]]; then
+        printf 'aarch64-apple-darwin\n'
+      else
+        printf '%s\n' "$host"
+      fi
+      ;;
+    x86_64-pc-windows-msvc | aarch64-pc-windows-msvc)
+      rust_host="$(rustc -vV | sed -n 's/^host: //p')"
+      case "$rust_host" in
+        x86_64-pc-windows-msvc | aarch64-pc-windows-msvc)
+          printf '%s\n' "$rust_host"
+          ;;
+        *)
+          die "unsupported native Windows Rust host: ${rust_host:-unknown}"
+          ;;
+      esac
+      ;;
+    *)
+      printf '%s\n' "$host"
+      ;;
+  esac
 }
 
 if [[ "${MAYHEM_PACKAGE_RELEASE_SOURCE_ONLY:-0}" == "1" ]]; then

@@ -474,6 +474,21 @@ expect_failure "mismatched public release key was published" \
   "$tmp/wrong-output.json" \
   1700000000
 
+uname() {
+  case "$1" in
+    -s) printf 'MINGW64_NT-10.0-26100\n' ;;
+    -m) printf 'x86_64\n' ;;
+    *) return 1 ;;
+  esac
+}
+rustc() {
+  [[ "${1:-}" == "-vV" ]] || return 1
+  printf 'rustc 1.89.0\nhost: aarch64-pc-windows-msvc\n'
+}
+[[ "$(native_host_target)" == "aarch64-pc-windows-msvc" ]] ||
+  fail "native Windows ARM detection trusted the emulated Git-Bash architecture"
+unset -f uname rustc
+
 host_target() {
   printf 'x86_64-apple-darwin\n'
 }
