@@ -44371,6 +44371,7 @@ struct PreparedProviderServeWorker {
     served_ctx: u64,
     serve_terms: ProviderJoinContextTerms,
     runtime: ProviderBackendRuntime,
+    reactivation_drain_cleanup: Value,
     child: Value,
 }
 
@@ -44411,8 +44412,20 @@ async fn prepare_provider_serve_worker(
         .candidates
         .first()
         .context("explicit provider add did not select a candidate")?;
+    let mut reactivation_drain_cleanup = Value::Null;
     if let Some(path) = provider_serve_active_drain_flag(&home, &selected.enclave.enclave_id)? {
-        bail_provider_start_drained(&home, &selected.enclave.enclave_id, &path)?;
+        let rpc = PeerRpcClient::new(&computed.rpc_url)?;
+        match clear_completed_provider_drain_for_reactivation(
+            &home,
+            &rpc,
+            &selected.enclave.enclave_id,
+            &path,
+        )
+        .await?
+        {
+            Some(report) => reactivation_drain_cleanup = report,
+            None => bail_provider_start_drained(&home, &selected.enclave.enclave_id, &path)?,
+        }
     }
     let runtime = provider_backend_runtime_preflight(&home, selected, &computed.hardware)
         .with_context(|| {
@@ -44443,6 +44456,7 @@ async fn prepare_provider_serve_worker(
         served_ctx: selected.served_ctx,
         serve_terms,
         runtime,
+        reactivation_drain_cleanup,
         child,
     })
 }
@@ -44483,6 +44497,7 @@ async fn add_prepared_provider_worker(
         "model_id": prepared.model_id,
         "served_ctx": prepared.served_ctx,
         "runtime": prepared.runtime,
+        "reactivation_drain_cleanup": prepared.reactivation_drain_cleanup,
         "activation_leave_replay": activation_leave_replay,
         "child": provider_serve_public_child_report(&prepared.child),
         "response": response,
@@ -44757,6 +44772,36 @@ fn provider_serve_child_config(
     hardware_quote_config: Option<&ProviderHardwareQuoteConfig>,
     name: Option<String>,
 ) -> Result<Value> {
+    let pear_runtime = resolve_pear_runtime_path()
+        .context("resolving Pear runtime for supervised provider worker")?;
+    provider_serve_child_config_with_pear_runtime(
+        home,
+        enclave,
+        backend,
+        runtime,
+        gpu_layers,
+        ctx,
+        served_modalities,
+        served_specialities,
+        hardware_quote_config,
+        name,
+        &pear_runtime,
+    )
+}
+
+fn provider_serve_child_config_with_pear_runtime(
+    home: &Path,
+    enclave: &str,
+    backend: &str,
+    runtime: &ProviderBackendRuntime,
+    gpu_layers: Option<u32>,
+    ctx: Option<u64>,
+    served_modalities: &[String],
+    served_specialities: &BTreeMap<String, Vec<String>>,
+    hardware_quote_config: Option<&ProviderHardwareQuoteConfig>,
+    name: Option<String>,
+    pear_runtime: &Path,
+) -> Result<Value> {
     debug_assert!(
         !ProviderWorkerRetirement::Crash.leaves_durable_registration(),
         "supervisor crash restarts must preserve durable provider registration"
@@ -44822,6 +44867,10 @@ fn provider_serve_child_config(
     }
     let mayhem_path = env::current_exe().context("resolving current mayhem binary")?;
     let mut runtime_env = provider_backend_runtime_child_env(backend, runtime);
+    runtime_env.insert(
+        "MAYHEM_PEAR_RUNTIME".to_owned(),
+        pear_runtime.display().to_string(),
+    );
     runtime_env.insert("MAYHEM_SC_BRIDGE_TOKEN".to_owned(), sc_bridge_token);
     Ok(json!({
         "name": name.unwrap_or_else(|| format!("provider-live-{}", up_provider_worker_slug(enclave))),
@@ -48740,6 +48789,106 @@ fn clear_completed_provider_drain_request(
         )
     })?;
     Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CompletedProviderDrainReactivation {
+    provider: String,
+    enclave_id: String,
+    request_id: String,
+    request_path: PathBuf,
+}
+
+fn completed_provider_drain_reactivation(
+    home: &Path,
+    enclave_id: &str,
+    request_path: &Path,
+) -> Result<Option<CompletedProviderDrainReactivation>> {
+    if request_path.file_name().and_then(|name| name.to_str()) == Some("all.drain.json") {
+        return Ok(None);
+    }
+    let request = provider_drain_request(std::slice::from_ref(&request_path.to_path_buf()))?
+        .context("active provider drain request disappeared before reactivation")?;
+    let provider = request
+        .provider
+        .as_deref()
+        .context("completed provider drain request is missing provider")?;
+    let request_id = request
+        .request_id
+        .as_deref()
+        .context("completed provider drain request is missing request_id")?;
+    ensure!(
+        request.enclave_id.as_deref() == Some(enclave_id),
+        "completed provider drain request names a different enclave"
+    );
+    ensure!(
+        request.path == provider_drain_flag_path(home, provider, Some(enclave_id)),
+        "completed provider drain request path does not match its scope"
+    );
+    let completion_path = provider_drain_completion_path(home, provider, enclave_id);
+    let Some(completion) = read_json_file_if_exists(&completion_path)? else {
+        return Ok(None);
+    };
+    ensure!(
+        completion.get("request_id").and_then(Value::as_str) == Some(request_id)
+            && completion.get("provider").and_then(Value::as_str) == Some(provider)
+            && completion.get("enclave_id").and_then(Value::as_str) == Some(enclave_id)
+            && completion.get("request_path").and_then(Value::as_str) == request.path.to_str(),
+        "provider drain completion is not bound to the active reactivation scope"
+    );
+    Ok(Some(CompletedProviderDrainReactivation {
+        provider: provider.to_owned(),
+        enclave_id: enclave_id.to_owned(),
+        request_id: request_id.to_owned(),
+        request_path: request.path,
+    }))
+}
+
+async fn clear_completed_provider_drain_for_reactivation(
+    home: &Path,
+    rpc: &PeerRpcClient,
+    enclave_id: &str,
+    request_path: &Path,
+) -> Result<Option<Value>> {
+    let Some(completed) = completed_provider_drain_reactivation(home, enclave_id, request_path)?
+    else {
+        return Ok(None);
+    };
+    let serve_key = format!("serve/{}/{}", completed.provider, completed.enclave_id);
+    let serve = read_state_value(rpc, &serve_key).await?;
+    if serve
+        .as_ref()
+        .and_then(|row| row.get("status"))
+        .and_then(Value::as_str)
+        == Some("active")
+    {
+        return Ok(None);
+    }
+    let worker = SupervisedProviderWorker {
+        name: "provider-reactivation".to_owned(),
+        enclave_id: completed.enclave_id.clone(),
+        running: false,
+        pid: None,
+    };
+    clear_completed_provider_drain_request(
+        home,
+        &completed.provider,
+        &worker,
+        &json!({
+            "request_id": completed.request_id,
+            "path": completed.request_path,
+        }),
+    )?;
+    Ok(Some(json!({
+        "cleared": true,
+        "provider": completed.provider,
+        "enclave_id": completed.enclave_id,
+        "serve_key": serve_key,
+        "prior_serve_status": serve
+            .as_ref()
+            .and_then(|row| row.get("status"))
+            .and_then(Value::as_str),
+    })))
 }
 
 fn clear_completed_global_provider_drain_request(
@@ -75976,6 +76125,42 @@ mod tests {
     }
 
     #[test]
+    fn completed_provider_leave_is_the_only_drain_that_can_auto_clear_for_reactivation() {
+        let home = test_temp_dir("mayhem-provider-reactivation-drain");
+        let provider = "11".repeat(32);
+        let enclave = "22".repeat(32);
+        let request_id = "33".repeat(32);
+        let scoped_path = provider_drain_flag_path(&home, &provider, Some(&enclave));
+        write_provider_drain_request(&scoped_path, &provider, Some(&enclave), &request_id).unwrap();
+
+        assert!(
+            completed_provider_drain_reactivation(&home, &enclave, &scoped_path)
+                .unwrap()
+                .is_none()
+        );
+        let request = provider_drain_request(std::slice::from_ref(&scoped_path))
+            .unwrap()
+            .unwrap();
+        complete_provider_drain_request(&home, &provider, &enclave, &request).unwrap();
+        let completed = completed_provider_drain_reactivation(&home, &enclave, &scoped_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.provider, provider);
+        assert_eq!(completed.enclave_id, enclave);
+        assert_eq!(completed.request_id, request_id);
+
+        let global_path = provider_drain_flag_path(&home, &provider, None);
+        write_provider_drain_request(&global_path, &provider, None, &"44".repeat(32)).unwrap();
+        assert!(
+            completed_provider_drain_reactivation(&home, &enclave, &global_path)
+                .unwrap()
+                .is_none()
+        );
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn provider_drain_reuses_active_request_and_accepts_late_completion() {
         let home = test_temp_dir("mayhem-provider-drain-request-reuse");
         let provider = "11".repeat(32);
@@ -76049,7 +76234,12 @@ mod tests {
         .unwrap();
         write_config_toml_value(&config_path_for_home(&home), &config).unwrap();
 
-        let child = provider_serve_child_config(
+        let pear_runtime = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\provider\AppData\Roaming\pear\current\pear-runtime.exe")
+        } else {
+            PathBuf::from("/opt/pear/bin/pear-runtime")
+        };
+        let child = provider_serve_child_config_with_pear_runtime(
             &home,
             &"11".repeat(32),
             "llama.cpp",
@@ -76060,6 +76250,7 @@ mod tests {
             &BTreeMap::new(),
             None,
             Some("provider-live-test".to_owned()),
+            &pear_runtime,
         )
         .unwrap();
         let args = child["args"].as_array().unwrap();
@@ -76068,6 +76259,10 @@ mod tests {
         assert_eq!(
             child["env"]["MAYHEM_SC_BRIDGE_TOKEN"],
             "provider-secret-token"
+        );
+        assert_eq!(
+            child["env"]["MAYHEM_PEAR_RUNTIME"],
+            pear_runtime.display().to_string()
         );
 
         fs::remove_dir_all(home).unwrap();
@@ -92633,7 +92828,15 @@ State initialization...
     }
 
     fn write_test_release(temp: &Path, primary_binary: &str) -> Result<TestRelease> {
-        let version = "0.2.25".to_owned();
+        let mut release_version = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+            .context("parsing the package version for the release updater fixture")?;
+        release_version.patch = release_version
+            .patch
+            .checked_add(1)
+            .context("incrementing the release updater fixture patch version")?;
+        release_version.pre = semver::Prerelease::EMPTY;
+        release_version.build = semver::BuildMetadata::EMPTY;
+        let version = release_version.to_string();
         let target = release_host_target();
         let base_name = format!("mayhem-{version}-{target}");
         let release_root = temp.join(&base_name);

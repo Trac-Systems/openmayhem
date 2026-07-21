@@ -1854,8 +1854,6 @@ impl GatewayAttestationAuthority {
 struct LiveHeartbeatAttestationAdvertisement {
     advertisement: HardwareQuoteRouteAdvertisement,
     tpm_activation_hello: Option<TpmActivateCredentialHello>,
-    heartbeat_epoch: u64,
-    heartbeat_head: String,
     heartbeat_ts: u64,
     transport_peer: Option<String>,
 }
@@ -1869,11 +1867,11 @@ struct GatewayTpmActivationCacheEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct GatewayTpmActivationCacheBinding {
+    // EK/AK ownership is stable across unrelated ledger-head changes. Current
+    // route state and heartbeat freshness are enforced independently.
     policy_sequence: u64,
     policy_digest: String,
     device_id: String,
-    heartbeat_epoch: u64,
-    heartbeat_head: String,
     transport_peer: String,
     hello_digest: String,
 }
@@ -10388,8 +10386,6 @@ fn signed_heartbeat_attestation_advertisement(
             declared_platform,
         },
         tpm_activation_hello,
-        heartbeat_epoch: heartbeat.att.epoch,
-        heartbeat_head: heartbeat.att.head.clone(),
         heartbeat_ts: heartbeat.ts,
         transport_peer: heartbeat.transport_peer.clone(),
     }))
@@ -10560,8 +10556,6 @@ fn route_attestation_policy_resolution(
             policy_sequence: route_binding.policy_sequence,
             policy_digest: route_binding.policy_digest.clone(),
             device_id: route_binding.device_id.clone(),
-            heartbeat_epoch: live_advertisement.heartbeat_epoch,
-            heartbeat_head: live_advertisement.heartbeat_head.clone(),
             transport_peer: transport_peer.to_owned(),
             hello_digest,
         });
@@ -21108,8 +21102,6 @@ impl GatewayState {
                         policy_sequence,
                         policy_digest,
                         device_id,
-                        heartbeat_epoch: live.heartbeat_epoch,
-                        heartbeat_head: live.heartbeat_head.clone(),
                         transport_peer,
                         hello_digest,
                     },
@@ -29738,8 +29730,6 @@ mod tests {
             policy_sequence: 7,
             policy_digest: "11".repeat(32),
             device_id: "22".repeat(32),
-            heartbeat_epoch: 9,
-            heartbeat_head: "33".repeat(32),
             transport_peer: "44".repeat(32),
             hello_digest: "55".repeat(32),
         };
@@ -29752,12 +29742,6 @@ mod tests {
         mismatches.push(changed);
         let mut changed = baseline.clone();
         changed.device_id = "77".repeat(32);
-        mismatches.push(changed);
-        let mut changed = baseline.clone();
-        changed.heartbeat_epoch += 1;
-        mismatches.push(changed);
-        let mut changed = baseline.clone();
-        changed.heartbeat_head = "88".repeat(32);
         mismatches.push(changed);
         let mut changed = baseline.clone();
         changed.transport_peer = "99".repeat(32);
