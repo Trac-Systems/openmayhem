@@ -396,6 +396,7 @@ try {
   await dialog.getByRole('button', { name: 'Close evidence' }).click();
   await page.getByRole('button', { name: 'Show amounts' }).click();
 
+  await page.setViewportSize({ width: 1440, height: 900 });
   await open('/mayhem/dashboard/playground');
   const playgroundModel = page.locator('[data-playground-model]');
   const playgroundPrompt = page.locator('[data-playground-prompt]');
@@ -454,16 +455,83 @@ try {
   await page.locator('.pg-generated-image').waitFor();
   await page.getByRole('tab', { name: 'Text', exact: true }).click();
 
-  await page.locator('.pg-advanced > summary').click();
+  const playgroundControlsToggle = page.locator('[data-playground-controls-toggle]');
+  await playgroundControlsToggle.click();
+  equal(await playgroundControlsToggle.getAttribute('aria-expanded'), 'true', 'Playground generation settings', 'opens the settings rail');
+  await page.waitForFunction(() => document.querySelector('[data-playground-controls]')?.getBoundingClientRect().width >= 400);
+  check(await page.locator('[data-playground-controls]').evaluate((node) => node.getBoundingClientRect().width >= 400), 'Playground generation settings', 'uses a comfortably wide desktop settings rail');
+  check(await page.locator('.pg-experience').evaluate((node) => {
+    const surfaceWidth = node.querySelector('.pg-surface')?.getBoundingClientRect().width || 0;
+    const controlsWidth = node.querySelector('[data-playground-controls]')?.getBoundingClientRect().width || 0;
+    return Math.abs(surfaceWidth - controlsWidth) <= 2;
+  }), 'Playground generation settings', 'splits the expanded workspace evenly between chat and settings');
+  check(await page.locator('.pg-controls-heading').getByText('Generation settings', { exact: true }).isVisible(), 'Playground generation settings', 'keeps a clear title inside the expanded panel');
+  check(await page.locator('[data-playground-context-value]').isVisible(), 'Playground generation settings', 'shows the signed context limit as read-only information');
+  equal(await page.locator('[data-playground-context-value]').locator('input').count(), 0, 'Playground generation settings', 'does not present the context window as an editable request field');
   check(await rateOption.count() > 0, 'Playground price controls', 'offers a rate-priced fixture model');
   check(await fixedOption.count() > 0, 'Playground price controls', 'offers a fixed-only fixture model');
   await choosePlaygroundModel(await rateOption.getAttribute('value'));
+  const rateSchema = JSON.parse((await playgroundModel.locator('option:checked').getAttribute('data-parameter-schema')) || '{}');
+  const renderedParameters = await page.locator('[data-playground-parameter]').evaluateAll((inputs) => inputs.map((input) => input.dataset.playgroundParameter));
+  equal(JSON.stringify(renderedParameters.sort()), JSON.stringify(rateSchema.controls.map((control) => control.key).sort()), 'Playground generation settings', 'renders exactly the settings published by the selected model contract');
+  const rateTemperature = page.locator('[data-playground-parameter="temperature"]');
+  const rateTopP = page.locator('[data-playground-parameter="top_p"]');
+  await rateTemperature.fill('0.4');
+  if (await rateTopP.count()) {
+    const moreSettings = page.locator('[data-playground-more-settings]');
+    if (await moreSettings.getAttribute('open') === null) await moreSettings.locator('summary').click();
+    check(await page.locator('[data-playground-parameter-section="advanced"]').evaluate((node) => {
+      const body = node.closest('.pg-control-disclosure-body');
+      if (!body) return false;
+      const style = getComputedStyle(body);
+      const availableWidth = body.getBoundingClientRect().width - Number.parseFloat(style.paddingLeft) - Number.parseFloat(style.paddingRight);
+      return node.getBoundingClientRect().width >= availableWidth - 2;
+    }), 'Playground generation settings', 'gives advanced model controls the full disclosure width');
+    await rateTopP.fill('0.8');
+  }
+  const rateModelValue = await rateOption.getAttribute('value');
+  await choosePlaygroundModel(await fixedOption.getAttribute('value'));
+  const fixedTemperature = page.locator('[data-playground-parameter="temperature"]');
+  if (await fixedTemperature.count()) await fixedTemperature.fill('0.7');
+  await choosePlaygroundModel(rateModelValue);
+  equal(await rateTemperature.inputValue(), '0.4', 'Playground generation settings', 'restores generation settings per model');
+  check(Boolean(await page.evaluate(() => localStorage.getItem('mayhem.dashboard.playgroundParameters.v1'))), 'Playground generation settings', 'persists model profiles locally');
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  equal(await playgroundModel.inputValue(), rateModelValue, 'Playground generation settings', 'restores the selected model after refresh');
+  equal(await rateTemperature.inputValue(), '0.4', 'Playground generation settings', 'restores the model profile after refresh');
+  equal(await playgroundControlsToggle.getAttribute('aria-expanded'), 'true', 'Playground generation settings', 'restores the desktop rail state');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(240);
+  equal(await playgroundControlsToggle.getAttribute('aria-expanded'), 'false', 'Playground generation settings', 'starts the mobile settings sheet closed');
+  await playgroundControlsToggle.click();
+  equal(await page.locator('[data-playground-controls]').evaluate((node) => getComputedStyle(node).position), 'fixed', 'Playground generation settings', 'uses a mobile bottom sheet');
+  check(await page.locator('[data-playground-controls]').evaluate((node) => innerWidth - node.getBoundingClientRect().width <= 14), 'Playground generation settings', 'uses the available mobile width without touching the viewport edges');
+  check(await page.locator('[data-playground-controls-backdrop]').isVisible(), 'Playground generation settings', 'adds a dismissible mobile backdrop');
+  await page.keyboard.press('Escape');
+  await page.waitForTimeout(220);
+  equal(await playgroundControlsToggle.getAttribute('aria-expanded'), 'false', 'Playground generation settings', 'closes the mobile sheet with Escape');
+  check(await playgroundControlsToggle.evaluate((node) => node === document.activeElement), 'Playground generation settings', 'returns focus after closing the mobile sheet');
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.waitForTimeout(50);
+  equal(await playgroundControlsToggle.getAttribute('aria-expanded'), 'true', 'Playground generation settings', 'restores the saved desktop state after a responsive transition');
+  const routingDisclosure = page.locator('[data-playground-routing-settings]');
+  if (await routingDisclosure.getAttribute('open') === null) await routingDisclosure.locator('summary').click();
+  check(await page.locator('[data-playground-preflight]').evaluate((node) => {
+    const body = node.closest('.pg-control-disclosure-body');
+    if (!body) return false;
+    const style = getComputedStyle(body);
+    const availableWidth = body.getBoundingClientRect().width - Number.parseFloat(style.paddingLeft) - Number.parseFloat(style.paddingRight);
+    return node.getBoundingClientRect().width >= availableWidth - 2;
+  }), 'Playground generation settings', 'gives routing evidence the full disclosure width');
   equal(await page.locator('[data-playground-price-unit]').innerText(), '$ / 1M-unit basket', 'Playground price controls', 'names the composite rate basis');
   await playgroundPrice.fill('0.50');
   await playgroundPrompt.fill('Verify the rate-price request control.');
   const rateRequestPromise = page.waitForRequest((request) => request.url().endsWith('/v1/chat/completions') && request.method() === 'POST');
   await playgroundSend.click();
   const rateRequest = await rateRequestPromise;
+  const rateRequestBody = rateRequest.postDataJSON();
+  equal(rateRequestBody.temperature, 0.4, 'Playground generation settings', 'sends the selected temperature to the chat endpoint');
+  if (await rateTopP.count()) equal(rateRequestBody.top_p, 0.8, 'Playground generation settings', 'sends advanced sampling settings to the chat endpoint');
   equal(rateRequest.headers()['x-mayhem-max-price-au'], '500000000000000', 'Playground price controls', 'converts $0.50 per 1M-unit basket to the gateway rate basis');
   // Wait on the result COUNT: a `.last()` wait would match the previous
   // send's result while this one is still streaming, racing the composer
@@ -478,8 +546,7 @@ try {
   await playgroundPrice.fill('0.50');
   await page.getByRole('button', { name: 'Hide amounts' }).click();
   equal(await playgroundPrice.getAttribute('type'), 'password', 'Playground financial privacy', 'masks the price input while amounts are hidden');
-  check((await page.locator('[data-playground-request-summary]').innerText()).includes('price ceiling hidden'), 'Playground financial privacy', 'removes the entered amount from the request summary');
-  check(!(await page.locator('[data-playground-request-summary]').innerText()).includes('$0.50'), 'Playground financial privacy', 'does not leak the entered ceiling in nearby text');
+  check(!(await page.locator('[data-playground-controls]').innerText()).includes('$0.50'), 'Playground financial privacy', 'does not repeat the entered ceiling in nearby settings text');
   await page.getByRole('button', { name: 'Show amounts' }).click();
   await playgroundPrompt.fill('Verify the fixed-charge request control.');
   const fixedRequestPromise = page.waitForRequest((request) => request.url().endsWith('/v1/chat/completions') && request.method() === 'POST');
@@ -500,6 +567,8 @@ try {
   equal(await playgroundOutput.inputValue(), '128', 'Playground output limit', 'prepares a larger bounded output limit');
   equal(await playgroundPrompt.inputValue(), 'Continue from where you stopped.', 'Playground output limit', 'prepares but does not auto-send the continuation');
 
+  const moreSettingsDisclosure = page.locator('[data-playground-more-settings]');
+  if (await moreSettingsDisclosure.getAttribute('open') === null) await moreSettingsDisclosure.locator('summary').click();
   await page.locator('[data-playground-system]').fill('Temporary saved instruction');
   await playgroundPrice.fill('0.25');
   await page.locator('[data-playground-min-att-tier]').selectOption('2');
@@ -509,6 +578,7 @@ try {
   equal(await playgroundOutput.inputValue(), '512', 'Playground draft reset', 'restores the output limit default');
   equal(await playgroundPrice.inputValue(), '', 'Playground draft reset', 'clears the saved price ceiling');
   equal(await page.evaluate(() => sessionStorage.getItem('mayhem.dashboard.playgroundDraft')), null, 'Playground draft reset', 'removes the tab-scoped saved record');
+  equal(await page.evaluate(() => localStorage.getItem('mayhem.dashboard.playgroundParameters.v1')), null, 'Playground draft reset', 'removes saved per-model generation profiles');
 
   await page.route('**/v1/chat/completions', async (route) => {
     const body = `data: ${JSON.stringify({

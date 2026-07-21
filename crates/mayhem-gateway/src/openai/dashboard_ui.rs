@@ -707,7 +707,7 @@ html.js-ready .playground-interactive{min-height:clamp(520px,64vh,720px)}
   --pg-snow:#f4f5f7;--pg-fog:#b2b8c2;--pg-dim:#7e8794;
   --pg-accent:#c54459;--pg-accent-soft:#d67866;--pg-accent-deep:#8e2e42;
   --pg-live:#58d6a8;--pg-ease:cubic-bezier(.16,1,.3,1);
-  width:min(100%,1040px);margin-inline:auto
+  width:min(100%,1240px);margin-inline:auto
 }
 .pg-page button{font:inherit}
 .pg-page svg{width:1rem;height:1rem;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
@@ -770,6 +770,7 @@ html.js-ready .playground-interactive{min-height:clamp(520px,64vh,720px)}
 .pg-preview-note>span{width:.38rem;height:.38rem;flex:none;border-radius:50%;background:var(--app-good);box-shadow:0 0 0 4px rgba(88,214,168,.08)}
 .pg-evidence-link{min-height:2.3rem;flex:none;padding:.35rem .2rem;color:var(--pg-fog);display:inline-flex;align-items:center;font-size:.68rem;text-decoration:none}
 .pg-evidence-link:hover{color:var(--pg-snow)}
+.pg-experience{height:clamp(32rem,calc(100dvh - 19rem),42rem);min-height:32rem;display:grid;grid-template-columns:minmax(0,1fr) 3.75rem;gap:.75rem;transition:grid-template-columns .34s var(--pg-ease)}.pg-experience:has(.pg-controls.is-open){grid-template-columns:repeat(2,minmax(0,1fr))}
 .pg-surface{height:clamp(32rem,calc(100dvh - 19rem),42rem);min-height:32rem;overflow:hidden;border:1px solid rgba(229,231,235,.1);border-radius:1rem;background:var(--pg-surface);box-shadow:inset 0 1px 0 rgba(229,231,235,.04),0 28px 70px -42px #000}
 .pg-mode-stack,.pg-mode-panel{height:100%;min-height:0}
 .pg-mode-panel{animation:pg-mode-in .28s var(--pg-ease) backwards}
@@ -856,8 +857,25 @@ html.js-ready .playground-interactive{min-height:clamp(520px,64vh,720px)}
 .pg-network-chevron{color:var(--pg-dim);transition:transform .2s var(--pg-ease)}.pg-network-summary[aria-expanded="true"] .pg-network-chevron{transform:rotate(180deg)}
 .pg-network-body{padding:1rem;border-top:1px solid var(--pg-line-soft)}.pg-network-steps{margin:0;padding:0;display:grid;grid-template-columns:repeat(4,1fr);list-style:none}.pg-network-steps li{position:relative;min-width:0;display:flex;gap:.55rem}.pg-network-steps li:not(:last-child)::after{content:"";position:absolute;top:.55rem;left:1.1rem;right:0;height:1px;background:var(--pg-line)}.pg-step-marker{position:relative;z-index:1;width:1.1rem;height:1.1rem;flex:none;border:1px solid var(--pg-line);border-radius:50%;background:var(--pg-pit)}.pg-network-steps li.is-active .pg-step-marker{border-color:var(--app-accent-strong);box-shadow:0 0 0 4px rgba(255,107,122,.1)}.pg-network-steps li.is-done .pg-step-marker{border-color:var(--pg-live);background:var(--pg-live)}.pg-step-copy{min-width:0;display:flex;flex-direction:column}.pg-step-label{color:var(--pg-fog);font-size:.65rem;font-weight:700}.pg-step-detail{color:var(--pg-dim);font-size:.57rem}
 .pg-network-facts{margin:1rem 0 0;display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:.55rem}.pg-network-facts div{min-width:0;padding:.65rem;border:1px solid var(--pg-line-soft);border-radius:.55rem}.pg-network-facts dt{color:var(--pg-dim);font-size:.56rem}.pg-network-facts dd{margin:.2rem 0 0;overflow-wrap:anywhere;color:var(--pg-fog);font-size:.63rem}.pg-network-footnote{margin:.8rem 0 0!important;color:var(--pg-dim);font-size:.6rem}
-.pg-advanced{margin-top:.85rem;border:1px solid var(--pg-line-soft);border-radius:.75rem;background:rgba(16,16,19,.55)}.pg-advanced>summary{min-height:3rem;padding:.65rem .9rem;color:var(--pg-fog);display:flex;align-items:center;justify-content:space-between;gap:1rem;cursor:pointer;font-size:.68rem;font-weight:700}.pg-advanced>summary span:last-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--pg-dim);font-weight:500}.pg-advanced-grid{padding:.2rem .9rem .9rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.75rem}.pg-advanced-field{min-width:0;display:flex;flex-direction:column;gap:.35rem}.pg-advanced-field>span{color:var(--pg-fog);font-size:.64rem;font-weight:650}.pg-advanced-field em,.pg-advanced-field small{color:var(--pg-dim);font-size:.58rem;font-style:normal}.pg-advanced-field input,.pg-advanced-field select,.pg-advanced-field textarea{width:100%;min-height:2.45rem;padding:.55rem .65rem;border:1px solid var(--pg-line);border-radius:.5rem;background:var(--pg-surface);color:var(--pg-snow);font-size:.7rem}.pg-advanced-field textarea{resize:vertical}.pg-advanced .preflight{padding:.65rem;border:1px solid var(--pg-line-soft);border-radius:.55rem}.pg-advanced .span-all{grid-column:1/-1}
+.pg-controls{width:100%;height:100%;min-height:0;border:1px solid rgba(229,231,235,.11);border-radius:1rem;background:linear-gradient(155deg,rgba(20,22,27,.985),rgba(14,15,19,.985));display:flex;overflow:hidden;box-shadow:inset 0 1px 0 rgba(255,255,255,.045),0 30px 76px -42px #000;transition:border-color .2s ease}
+.pg-controls.is-open{width:100%;border-color:rgba(229,231,235,.14)}.pg-controls-backdrop{display:none}
+.pg-controls-toggle{width:3.7rem;min-width:3.7rem;height:100%;padding:.85rem 0;border:0;border-radius:0;background:transparent;color:var(--pg-fog);display:flex;flex-direction:column;align-items:center;gap:.75rem}.pg-controls-toggle:hover{background:rgba(229,231,235,.025);color:var(--pg-snow)}.pg-controls-toggle>svg:first-child{width:1.2rem;height:1.2rem;color:var(--app-accent-strong)}
+.pg-controls-toggle-copy{min-height:0;flex:1;display:flex;align-items:center;writing-mode:vertical-rl;transform:rotate(180deg);gap:.45rem}.pg-controls-toggle-copy strong{font-size:.7rem}.pg-controls-toggle-copy small{max-width:15rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--pg-dim);font-size:.58rem;font-weight:500}.pg-controls-chevron{transition:transform .22s var(--pg-ease)}.pg-controls.is-open .pg-controls-chevron{transform:rotate(180deg)}
+.pg-controls-body{min-width:0;flex:1;display:flex;flex-direction:column;border-left:1px solid var(--pg-line-soft)}.pg-controls-head{min-height:4.75rem;padding:.8rem 1rem;border-bottom:1px solid var(--pg-line-soft);display:flex;align-items:center;justify-content:space-between;gap:.8rem;background:rgba(255,255,255,.012)}.pg-controls-heading{min-width:0;display:flex;flex-direction:column;gap:.2rem}.pg-controls-heading>strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--pg-snow);font-size:.78rem;letter-spacing:-.01em}.pg-controls-heading>span{min-width:0;color:var(--pg-dim);display:flex;align-items:center;gap:.4rem;font-size:.58rem}.pg-controls-heading>span>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.pg-controls-heading i{width:.35rem;height:.35rem;flex:none;border-radius:50%;background:var(--pg-live);box-shadow:0 0 0 3px rgba(88,214,168,.08)}.pg-controls-head-actions{display:flex;gap:.4rem}.pg-controls-head button{min-height:2.45rem;padding:0 .65rem;border:1px solid var(--pg-line);border-radius:.55rem;background:rgba(13,14,17,.55);color:var(--pg-fog);display:inline-flex;align-items:center;justify-content:center;gap:.35rem;font-size:.61rem;font-weight:650}.pg-controls-head button svg{width:.9rem;height:.9rem}.pg-controls-head button:hover{border-color:rgba(229,231,235,.24);background:rgba(229,231,235,.035);color:var(--pg-snow)}.pg-controls-head [data-playground-controls-close]{display:none;width:2.45rem;padding:0}
+.pg-controls-scroll{min-height:0;flex:1;padding:1rem;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}.pg-context-card{padding:.78rem .82rem;border:1px solid rgba(229,231,235,.09);border-radius:.7rem;background:linear-gradient(145deg,rgba(13,14,17,.92),rgba(18,20,25,.82));display:grid;grid-template-columns:1fr auto;gap:.18rem .7rem;box-shadow:inset 0 1px 0 rgba(255,255,255,.025)}.pg-context-card span,.pg-context-card small{color:var(--pg-dim);font-size:.58rem}.pg-context-card strong{color:var(--pg-snow);font-size:.72rem;font-variant-numeric:tabular-nums}.pg-context-card small{grid-column:1/-1}
+.pg-control-group{margin-top:.95rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.85rem .8rem}.pg-control-field{min-width:0;display:flex;flex-direction:column;gap:.38rem}.pg-control-field.span-all,.pg-control-group .span-all{grid-column:1/-1}.pg-control-field>span{color:var(--pg-fog);display:flex;align-items:baseline;justify-content:space-between;gap:.45rem;font-size:.66rem;font-weight:680}.pg-control-field em,.pg-control-field small{color:var(--pg-dim);font-size:.58rem;line-height:1.42;font-style:normal;font-weight:500}.pg-control-field input,.pg-control-field select,.pg-control-field textarea{width:100%;min-height:2.65rem;padding:.58rem .68rem;border:1px solid rgba(229,231,235,.13);border-radius:.58rem;outline:0;background:rgba(13,14,17,.82);color:var(--pg-snow);font-size:.72rem;box-shadow:inset 0 1px 0 rgba(255,255,255,.02);transition:border-color .18s ease,box-shadow .18s ease,background .18s ease}.pg-control-field textarea{resize:vertical;line-height:1.5}.pg-control-field input:hover,.pg-control-field select:hover,.pg-control-field textarea:hover{border-color:rgba(229,231,235,.2)}.pg-control-field input:focus,.pg-control-field select:focus,.pg-control-field textarea:focus{border-color:rgba(214,120,102,.62);background:rgba(17,18,22,.96);box-shadow:0 0 0 3px rgba(197,68,89,.11)}.pg-control-field input:invalid{border-color:var(--app-danger)}
+.pg-control-empty{grid-column:1/-1;margin:0!important;padding:.75rem;border:1px dashed var(--pg-line);border-radius:.55rem;color:var(--pg-dim);font-size:.62rem;line-height:1.45}
+.pg-control-slider{display:grid;grid-template-columns:minmax(0,1fr) 4.7rem;gap:.55rem;align-items:center}.pg-control-slider input[type="range"]{min-height:2rem;padding:0;border:0;background:transparent;box-shadow:none;accent-color:var(--app-accent-strong)}.pg-control-slider input[type="number"]{text-align:right;font-variant-numeric:tabular-nums}
+.pg-control-disclosure{margin-top:.9rem;border-top:1px solid var(--pg-line-soft)}.pg-control-disclosure>summary{min-height:3.5rem;padding:0 .35rem;color:var(--pg-fog);display:flex;align-items:center;justify-content:space-between;gap:.8rem;border-radius:.5rem;cursor:pointer;list-style:none;transition:background .18s ease,color .18s ease}.pg-control-disclosure>summary:hover{background:rgba(229,231,235,.025);color:var(--pg-snow)}.pg-control-disclosure>summary::-webkit-details-marker{display:none}.pg-control-disclosure>summary>span{display:flex;flex-direction:column;gap:.08rem}.pg-control-disclosure>summary strong{font-size:.68rem}.pg-control-disclosure>summary small{color:var(--pg-dim);font-size:.57rem;font-weight:500}.pg-control-disclosure>summary svg{color:var(--pg-dim);transition:transform .2s var(--pg-ease)}.pg-control-disclosure[open]>summary svg{transform:rotate(180deg)}.pg-control-disclosure-body{padding:.08rem .35rem .9rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.8rem}.pg-control-disclosure-body>.span-all,.pg-control-group-advanced{grid-column:1/-1}.pg-control-group-advanced{margin-top:0}.pg-control-disclosure .preflight{padding:.72rem;border:1px solid var(--pg-line-soft);border-radius:.6rem;background:rgba(13,14,17,.42)}.pg-controls-reset-all{width:100%;min-height:2.65rem;margin-top:.35rem;padding:0 .8rem;justify-content:center;border:1px solid var(--pg-line);border-radius:.55rem;background:rgba(229,231,235,.018);color:var(--pg-fog)}.pg-controls-reset-all:hover{border-color:rgba(229,231,235,.22);background:rgba(229,231,235,.04);color:var(--pg-snow)}
 .pg-local-note{margin:.6rem .2rem 0!important;color:var(--pg-dim);font-size:.6rem;text-align:right}
+body.playground-controls-open{overflow:hidden}
+@media(max-width:1180px){
+  .pg-experience{height:auto;min-height:0;display:block}.pg-surface{height:clamp(31rem,calc(100dvh - 19rem),39rem);min-height:31rem}
+  .pg-controls{width:100%;height:3.65rem;margin-top:.75rem;border-radius:.8rem;display:block;overflow:hidden;transition:none}.pg-controls.is-open{position:fixed;z-index:61;left:50%;right:auto;bottom:max(.4rem,env(safe-area-inset-bottom));width:min(36rem,calc(100vw - .8rem));height:auto;max-height:min(86dvh,44rem);display:flex;flex-direction:column;border-radius:1.05rem;animation:pg-sheet-in .28s var(--pg-ease) both}.pg-controls.is-closing{animation:pg-sheet-out .2s ease both}
+  @keyframes pg-sheet-in{from{opacity:0;transform:translate(-50%,1rem)}to{opacity:1;transform:translate(-50%,0)}}@keyframes pg-sheet-out{from{transform:translate(-50%,0)}to{opacity:0;transform:translate(-50%,1rem)}}
+  .pg-controls-toggle{width:100%;min-width:0;height:3.6rem;padding:0 .9rem;flex-direction:row}.pg-controls-toggle-copy{min-width:0;flex:1;align-items:flex-start;justify-content:center;writing-mode:horizontal-tb;transform:none;gap:.05rem}.pg-controls-toggle-copy strong,.pg-controls-toggle-copy small{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.pg-controls.is-open .pg-controls-toggle{display:none}.pg-controls-chevron{transform:rotate(90deg)}
+  .pg-controls-body{min-height:0;border-left:0}.pg-controls.is-open .pg-controls-body{display:flex!important}.pg-controls-head{padding:.85rem 1rem}.pg-controls-head [data-playground-controls-close]{display:inline-flex;align-items:center}.pg-controls-scroll{padding:1rem}.pg-controls-backdrop:not([hidden]){position:fixed;z-index:60;inset:0;display:block;border:0;background:rgba(4,5,7,.72);backdrop-filter:blur(4px)}
+}
 @media(max-width:780px){
   .app-main--playground{padding-top:1.25rem}
   .pg-toolbar{align-items:stretch;flex-direction:column-reverse}
@@ -867,7 +885,6 @@ html.js-ready .playground-interactive{min-height:clamp(520px,64vh,720px)}
   .pg-model-panel-grip{width:2.4rem;height:.23rem;margin:.1rem auto .45rem;border-radius:999px;background:var(--pg-line);display:block}
   .pg-model-list{max-height:calc(78dvh - 4.8rem)}
   .pg-meta-row{align-items:flex-start}.pg-evidence-link{display:none}
-  .pg-surface{height:clamp(31rem,calc(100dvh - 19rem),39rem);min-height:31rem}
   .pg-media{grid-template-columns:1fr;overflow-y:auto}.pg-settings{border-right:0;border-bottom:1px solid var(--pg-line-soft)}.pg-output{min-height:22rem}
   .pg-network-steps{grid-template-columns:1fr;gap:.8rem}.pg-network-steps li:not(:last-child)::after{top:1.1rem;bottom:-.8rem;left:.55rem;right:auto;width:1px;height:auto}
   .pg-network-facts{grid-template-columns:repeat(2,minmax(0,1fr))}
@@ -880,7 +897,7 @@ html.js-ready .playground-interactive{min-height:clamp(520px,64vh,720px)}
   .pg-composer-wrap{padding:.75rem}.pg-messages{padding:1rem 1rem 2rem}
   .pg-settings,.pg-output{padding:1.2rem}.pg-ratio-field>div{grid-template-columns:repeat(2,1fr)}.pg-voice-grid{grid-template-columns:1fr}
   .pg-network-model{display:none}.pg-network-summary{grid-template-columns:auto auto 1fr auto}
-  .pg-network-facts,.pg-advanced-grid{grid-template-columns:1fr}.pg-advanced .span-all{grid-column:1}
+  .pg-network-facts,.pg-control-group,.pg-control-disclosure-body{grid-template-columns:1fr}.pg-control-field.span-all,.pg-control-group .span-all{grid-column:1}
 }
 html.motion-reduced .pg-page *{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}
 @media(prefers-reduced-motion:reduce){.pg-page *{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
@@ -1221,6 +1238,8 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
   };
   const playgroundDraftKey = 'mayhem.dashboard.playgroundDraft';
   const playgroundConversationKey = 'mayhem.dashboard.playgroundConversation.v1';
+  const playgroundParameterProfilesKey = 'mayhem.dashboard.playgroundParameters.v1';
+  const playgroundControlsOpenKey = 'mayhem.dashboard.playgroundControlsOpen';
   const localProductEventsKey = 'mayhem.dashboard.localProductEvents.v1';
 
   root.classList.toggle('amounts-hidden', storage.get(preferenceKeys.amounts) === '1');
@@ -1328,6 +1347,232 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       } catch (_) {
         return { prompt: stored };
       }
+    };
+
+    const selectedPlaygroundParameterSchema = () => {
+      const option = safeQuery('[data-playground-model]')?.selectedOptions?.[0];
+      try {
+        const schema = JSON.parse(option?.dataset.parameterSchema || '{}');
+        return schema && typeof schema === 'object'
+          ? { ...schema, controls: Array.isArray(schema.controls) ? schema.controls : [] }
+          : { version: 1, controls: [] };
+      } catch (_) {
+        return { version: 1, controls: [] };
+      }
+    };
+
+    const readPlaygroundParameterProfiles = () => {
+      try {
+        const parsed = JSON.parse(storage.get(playgroundParameterProfilesKey) || '{}');
+        return parsed && typeof parsed === 'object' && parsed.models && typeof parsed.models === 'object'
+          ? parsed
+          : { version: 1, models: {} };
+      } catch (_) {
+        return { version: 1, models: {} };
+      }
+    };
+
+    const playgroundParameterDefault = (control) =>
+      control?.default === null || control?.default === undefined ? '' : String(control.default);
+
+    const playgroundParameterValues = (validate = false) => {
+      const schema = selectedPlaygroundParameterSchema();
+      const parameters = {};
+      let valid = true;
+      for (const control of schema.controls) {
+        const input = safeQuery(`[data-playground-parameter="${control.key}"]`);
+        if (!input) continue;
+        input.setCustomValidity('');
+        const raw = input.value.trim();
+        if (control.kind === 'lines') {
+          const values = raw.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+          if (values.length > 4) input.setCustomValidity('Enter no more than four stop sequences.');
+          else if (values.some((value) => value.length > 256)) input.setCustomValidity('Keep each stop sequence at 256 characters or fewer.');
+          else if (values.length) parameters[control.key] = values;
+        } else if (control.kind === 'select') {
+          const allowed = Array.isArray(control.options) ? control.options.map((option) => String(option.value)) : [];
+          if (raw && !allowed.includes(raw)) input.setCustomValidity('Choose a supported value.');
+          else if (raw) parameters[control.key] = raw;
+        } else {
+          if (!raw && control.key === 'max_tokens') input.setCustomValidity('Choose an output limit.');
+          if (raw) {
+            const value = Number(raw);
+            const minimum = control.minimum === null || control.minimum === undefined ? Number.NaN : Number(control.minimum);
+            const maximum = control.maximum === null || control.maximum === undefined ? Number.NaN : Number(control.maximum);
+            if (!Number.isFinite(value)) input.setCustomValidity('Enter a valid number.');
+            else if (control.kind === 'integer' && !Number.isInteger(value)) input.setCustomValidity('Enter a whole number.');
+            else if (Number.isFinite(minimum) && value < minimum) input.setCustomValidity(`Choose ${minimum} or higher.`);
+            else if (Number.isFinite(maximum) && value > maximum) input.setCustomValidity(`Choose ${maximum} or lower.`);
+            else parameters[control.key] = value;
+          }
+        }
+        if (input.validationMessage) {
+          valid = false;
+          if (validate) {
+            input.reportValidity();
+            input.focus();
+            break;
+          }
+        }
+      }
+      return { valid, parameters, schema };
+    };
+
+    const updatePlaygroundParameterState = () => {
+      const { parameters, schema } = playgroundParameterValues(false);
+      const changed = schema.controls.reduce((count, control) => {
+        const current = parameters[control.key];
+        const expected = control.default;
+        if (current === undefined && (expected === undefined || expected === null)) return count;
+        return String(current ?? '') === String(expected ?? '') ? count : count + 1;
+      }, 0);
+      const state = safeQuery('[data-playground-controls-state]');
+      if (state) state.textContent = changed ? `${changed} customized` : 'Model defaults';
+    };
+
+    const savePlaygroundParameterProfile = () => {
+      const model = safeQuery('[data-playground-model]')?.value || '';
+      if (!model) return;
+      const values = {};
+      document.querySelectorAll('[data-playground-parameter]').forEach((input) => {
+        values[input.dataset.playgroundParameter] = input.value;
+      });
+      const profiles = readPlaygroundParameterProfiles();
+      profiles.models[model] = { values, updatedAt: Date.now() };
+      storage.set(playgroundParameterProfilesKey, JSON.stringify(profiles));
+      updatePlaygroundParameterState();
+    };
+
+    const resetPlaygroundParameterProfile = (model = safeQuery('[data-playground-model]')?.value || '', all = false) => {
+      if (all) storage.remove(playgroundParameterProfilesKey);
+      else if (model) {
+        const profiles = readPlaygroundParameterProfiles();
+        delete profiles.models[model];
+        storage.set(playgroundParameterProfilesKey, JSON.stringify(profiles));
+      }
+    };
+
+    const makePlaygroundParameterField = (control, value) => {
+      const field = document.createElement('label');
+      field.className = `pg-control-field${control.kind === 'lines' ? ' span-all' : ''}`;
+      const id = `playground-parameter-${String(control.key).replace(/[^a-z0-9_-]/gi, '-')}`;
+      field.htmlFor = id;
+      const title = document.createElement('span');
+      title.textContent = control.label || control.key;
+      field.append(title);
+      let input;
+      if (control.kind === 'select') {
+        input = document.createElement('select');
+        for (const option of control.options || []) {
+          const node = document.createElement('option');
+          node.value = String(option.value);
+          node.textContent = option.label || option.value;
+          input.append(node);
+        }
+      } else if (control.kind === 'lines') {
+        input = document.createElement('textarea');
+        input.rows = 3;
+        input.placeholder = 'One sequence per line';
+      } else {
+        input = document.createElement('input');
+        input.type = 'number';
+        input.inputMode = control.kind === 'integer' ? 'numeric' : 'decimal';
+        if (control.minimum !== null && control.minimum !== undefined && Number.isFinite(Number(control.minimum))) input.min = String(control.minimum);
+        if (control.maximum !== null && control.maximum !== undefined && Number.isFinite(Number(control.maximum))) input.max = String(control.maximum);
+        if (control.step !== null && control.step !== undefined && Number.isFinite(Number(control.step))) {
+          input.step = control.kind === 'integer' ? String(control.step) : 'any';
+        }
+      }
+      input.id = id;
+      input.dataset.playgroundParameter = control.key;
+      if (control.key === 'max_tokens') input.dataset.playgroundMaxTokens = '';
+      input.value = value;
+      if (control.kind === 'select' && input.selectedIndex < 0 && input.options.length) input.selectedIndex = 0;
+      const boundedSlider = control.kind === 'number'
+        && control.minimum !== null && control.minimum !== undefined
+        && control.maximum !== null && control.maximum !== undefined
+        && Number.isFinite(Number(control.minimum)) && Number.isFinite(Number(control.maximum));
+      if (boundedSlider) {
+        const sliderRow = document.createElement('span');
+        sliderRow.className = 'pg-control-slider';
+        const range = document.createElement('input');
+        range.type = 'range';
+        range.min = input.min;
+        range.max = input.max;
+        range.step = control.step !== null && control.step !== undefined && Number.isFinite(Number(control.step))
+          ? String(control.step)
+          : '0.1';
+        range.value = input.value || playgroundParameterDefault(control) || range.min;
+        range.dataset.playgroundParameterRange = control.key;
+        range.setAttribute('aria-label', `${control.label || control.key} slider`);
+        sliderRow.append(range, input);
+        field.append(sliderRow);
+      } else {
+        field.append(input);
+      }
+      if (control.help) {
+        const help = document.createElement('small');
+        help.textContent = control.help;
+        field.append(help);
+      }
+      return field;
+    };
+
+    const syncPlaygroundParameterRail = () => {
+      const model = safeQuery('[data-playground-model]');
+      if (!model) return;
+      const selected = model.selectedOptions[0];
+      const schema = selectedPlaygroundParameterSchema();
+      const profile = readPlaygroundParameterProfiles().models[model.value]?.values || {};
+      const primary = safeQuery('[data-playground-parameter-section="primary"]');
+      const advanced = safeQuery('[data-playground-parameter-section="advanced"]');
+      if (!primary || !advanced) return;
+      primary.replaceChildren();
+      advanced.replaceChildren();
+      for (const control of schema.controls) {
+        const value = Object.prototype.hasOwnProperty.call(profile, control.key)
+          ? String(profile[control.key])
+          : playgroundParameterDefault(control);
+        const field = makePlaygroundParameterField(control, value);
+        (control.section === 'advanced' ? advanced : primary).append(field);
+      }
+      if (!primary.children.length) {
+        const note = document.createElement('p');
+        note.className = 'pg-control-empty';
+        note.textContent = 'This model exposes no generation settings in its signed catalog contract.';
+        primary.append(note);
+      }
+      const more = safeQuery('[data-playground-more-settings]');
+      if (more) more.hidden = !advanced.children.length && selected?.dataset.playgroundMode !== 'chat';
+      const modelName = safeQuery('[data-playground-controls-model]');
+      if (modelName) modelName.textContent = selected?.dataset.modelName || model.value;
+      const context = safeQuery('[data-playground-context-value]');
+      if (context) context.textContent = schema.contextLabel ? `${schema.contextLabel} tokens` : 'Not published';
+      updatePlaygroundParameterState();
+    };
+
+    const setPlaygroundControlsOpen = (open, refocus = false) => {
+      const controls = safeQuery('[data-playground-controls]');
+      const toggle = safeQuery('[data-playground-controls-toggle]');
+      const panel = safeQuery('[data-playground-controls-body]');
+      const backdrop = safeQuery('[data-playground-controls-backdrop]');
+      if (!controls || !toggle || !panel) return;
+      const mobile = window.matchMedia('(max-width: 1180px)').matches;
+      const finish = () => {
+        controls.classList.remove('is-closing');
+        controls.classList.toggle('is-open', open);
+        panel.hidden = !open;
+        if (backdrop) backdrop.hidden = !(open && mobile);
+        toggle.setAttribute('aria-expanded', String(open));
+        body.classList.toggle('playground-controls-open', open && mobile);
+        if (open) (safeQuery('[data-playground-parameter]', panel) || safeQuery('input, select, textarea, button', panel))?.focus({ preventScroll: true });
+        else if (refocus) toggle.focus();
+      };
+      if (!open && mobile && controls.classList.contains('is-open')) {
+        controls.classList.add('is-closing');
+        window.setTimeout(finish, root.classList.contains('motion-reduced') ? 0 : 190);
+      } else finish();
+      if (!mobile) storage.set(playgroundControlsOpenKey, open ? '1' : '0');
     };
 
     const savePlaygroundConversation = () => {
@@ -1802,7 +2047,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       } else if (drawerTrigger && typeof drawerTrigger.focus === 'function') {
         const restore = drawerTrigger;
         drawerTrigger = null;
-        window.requestAnimationFrame(() => restore.focus());
+        restore.focus({ preventScroll: true });
       }
     };
 
@@ -2088,19 +2333,13 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
     };
 
     const playgroundRequestControls = (form) => {
-      const output = safeQuery('[data-playground-max-tokens]', form);
       const price = safeQuery('[data-playground-max-price]', form);
       const tier = safeQuery('[data-playground-min-att-tier]', form);
       const priceMode = selectedPlaygroundPriceMode(form);
-      const outputValue = output?.value.trim() || '';
-      const outputTokens = /^\d+$/.test(outputValue) ? Number.parseInt(outputValue, 10) : Number.NaN;
-      if (!Number.isInteger(outputTokens) || outputTokens < 64 || outputTokens > 4096) {
-        output?.setCustomValidity('Choose an output limit from 64 through 4,096 tokens.');
-        output?.reportValidity();
-        output?.focus();
+      const generation = playgroundParameterValues(true);
+      if (!generation.valid) {
         return null;
       }
-      output.setCustomValidity('');
       const maxPriceAu = maxPriceAuFromUsd(price, priceMode);
       if (price?.validationMessage) {
         price.reportValidity();
@@ -2115,7 +2354,13 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         return null;
       }
       tier?.setCustomValidity('');
-      return { outputTokens, maxPriceAu, minAttTier, priceMode };
+      return {
+        outputTokens: generation.parameters.max_tokens || 512,
+        generationParameters: generation.parameters,
+        maxPriceAu,
+        minAttTier,
+        priceMode
+      };
     };
 
     const classifyPlaygroundFailure = (status, message) => {
@@ -2304,6 +2549,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       const imageButton = safeQuery('[data-playground-generate-image]');
       const speechButton = safeQuery('[data-playground-generate-speech]');
       document.querySelectorAll('[data-playground-mode-tab]').forEach((tab) => { tab.disabled = busy || tab.dataset.empty === 'true'; });
+      document.querySelectorAll('[data-playground-parameter], [data-playground-parameter-range], [data-playground-reset-model]').forEach((control) => { control.disabled = busy; });
       if (trigger) trigger.disabled = busy;
       if (imageButton) imageButton.disabled = busy || !safeQuery('[data-playground-image-prompt]')?.value.trim();
       if (speechButton) speechButton.disabled = busy || !safeQuery('[data-playground-speech-text]')?.value.trim();
@@ -2558,6 +2804,13 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       messages.push({ role: 'user', content: promptValue });
       const headers = playgroundHeaders(form, requestControls);
       const requestedMaxTokens = requestControls.outputTokens;
+      const requestBody = {
+        model: model.value,
+        messages,
+        stream: true,
+        stream_options: { include_usage: true },
+        ...requestControls.generationParameters
+      };
       let assembled = '';
       let reportedModel = '';
       let reportedSessionId = '';
@@ -2571,7 +2824,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
           method: 'POST',
           credentials: 'same-origin',
           headers,
-          body: JSON.stringify({ model: model.value, messages, stream: true, stream_options: { include_usage: true }, max_tokens: requestedMaxTokens }),
+          body: JSON.stringify(requestBody),
           signal: controller.signal
         });
         if (!response.ok) {
@@ -2792,23 +3045,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
     };
 
     const updatePlaygroundControlSummary = () => {
-      const summary = safeQuery('[data-playground-request-summary]');
-      if (!summary) return;
-      const outputTokens = safeQuery('[data-playground-max-tokens]')?.value.trim() || '512';
-      const maxPrice = safeQuery('[data-playground-max-price]')?.value.trim() || '';
-      const minAttTier = safeQuery('[data-playground-min-att-tier]')?.value || '';
-      const priceMode = selectedPlaygroundPriceMode();
-      const controls = [`${outputTokens} output tokens`];
-      if (maxPrice) {
-        controls.push(root.classList.contains('amounts-hidden')
-          ? 'price ceiling hidden'
-          : priceMode === 'fixed'
-            ? `≤ $${maxPrice} fixed route charge`
-            : `≤ $${maxPrice} / 1M-unit route basket`);
-      }
-      if (minAttTier) controls.push(`minimum T${minAttTier}`);
-      if (!maxPrice && !minAttTier) controls.push('gateway price/trust defaults');
-      summary.textContent = controls.join(' · ');
+      updatePlaygroundParameterState();
     };
 
     const updatePreflight = () => {
@@ -2973,6 +3210,30 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       }
       if (event.target.closest('[data-playground-model-close]')) {
         closePlaygroundModelPicker(true);
+        return;
+      }
+      const controlsToggle = event.target.closest('[data-playground-controls-toggle]');
+      if (controlsToggle) {
+        setPlaygroundControlsOpen(controlsToggle.getAttribute('aria-expanded') !== 'true');
+        return;
+      }
+      if (event.target.closest('[data-playground-controls-backdrop]')) {
+        setPlaygroundControlsOpen(false, true);
+        return;
+      }
+      if (event.target.closest('[data-playground-controls-close]')) {
+        setPlaygroundControlsOpen(false, true);
+        return;
+      }
+      if (event.target.closest('[data-playground-reset-model]')) {
+        if (playgroundController) {
+          announce('Stop the current request before resetting model settings.', true);
+          return;
+        }
+        resetPlaygroundParameterProfile();
+        syncPlaygroundParameterRail();
+        savePlaygroundDraft();
+        announce('Generation settings reset to this model\'s defaults.', false, false);
         return;
       }
       if (!event.target.closest('[data-playground-model-picker]')) closePlaygroundModelPicker(false);
@@ -3283,6 +3544,8 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
           const defaultValue = model.dataset.defaultValue || model.options[0]?.value || '';
           if (Array.from(model.options).some((option) => option.value === defaultValue)) model.value = defaultValue;
         }
+        resetPlaygroundParameterProfile('', true);
+        syncPlaygroundParameterRail();
         if (prompt) prompt.value = '';
         if (imagePrompt) imagePrompt.value = '';
         if (speechText) speechText.value = '';
@@ -3322,7 +3585,8 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         const nextOutput = Number.parseInt(continuation.dataset.nextMaxTokens || '', 10);
         if (output && Number.isInteger(nextOutput) && nextOutput >= 64 && nextOutput <= 4096) {
           output.value = String(nextOutput);
-          output.closest('details')?.setAttribute('open', '');
+          setPlaygroundControlsOpen(true);
+          savePlaygroundParameterProfile();
         }
         if (prompt) {
           prompt.value = 'Continue from where you stopped.';
@@ -3503,6 +3767,21 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       if (event.target.matches('[data-wallet-funding-amount]')) {
         syncWalletFundingAmount(event.target);
       }
+      if (event.target.matches('[data-playground-parameter-range]')) {
+        const key = event.target.dataset.playgroundParameterRange;
+        const input = safeQuery(`[data-playground-parameter="${key}"]`);
+        if (input) input.value = event.target.value;
+        savePlaygroundParameterProfile();
+        savePlaygroundDraft();
+        return;
+      }
+      if (event.target.matches('[data-playground-parameter]')) {
+        const range = safeQuery(`[data-playground-parameter-range="${event.target.dataset.playgroundParameter}"]`);
+        if (range && event.target.value) range.value = event.target.value;
+        savePlaygroundParameterProfile();
+        savePlaygroundDraft();
+        return;
+      }
       if (event.target.matches('[data-playground-draft]')) {
         // A select emits `input` before `change`. Preserve the old price-mode
         // marker until the change handler can compare bases and clear a value
@@ -3527,6 +3806,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
             price.value = '';
             announce('Price ceiling cleared because this model uses a different price basis.', false, false);
           }
+          syncPlaygroundParameterRail();
         }
         updatePreflight();
         savePlaygroundDraft();
@@ -3588,6 +3868,21 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         event.preventDefault();
         closePlaygroundModelPicker(true);
         return;
+      }
+      if (event.key === 'Escape' && safeQuery('[data-playground-controls]')?.classList.contains('is-open')) {
+        event.preventDefault();
+        setPlaygroundControlsOpen(false, true);
+        return;
+      }
+      if (event.key === 'Tab' && body.classList.contains('playground-controls-open')) {
+        const panel = safeQuery('[data-playground-controls-body]');
+        const focusable = panel ? Array.from(panel.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), summary')) : [];
+        if (focusable.length) {
+          const first = focusable[0];
+          const last = focusable[focusable.length - 1];
+          if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); return; }
+          if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); return; }
+        }
       }
       if (event.key === 'Escape' && body.classList.contains('nav-open')) {
         event.preventDefault();
@@ -3835,13 +4130,14 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       refreshVolatileEvidence();
     }
 
+    syncPlaygroundParameterRail();
     const savedDraft = readPlaygroundDraft();
     if (savedDraft) {
       const playgroundPrompt = safeQuery('[data-playground-prompt]');
       const playgroundImagePrompt = safeQuery('[data-playground-image-prompt]');
       const playgroundSpeechText = safeQuery('[data-playground-speech-text]');
       const playgroundSystem = safeQuery('[data-playground-system]');
-      const playgroundMaxTokens = safeQuery('[data-playground-max-tokens]');
+      let playgroundMaxTokens = safeQuery('[data-playground-max-tokens]');
       const playgroundMaxPrice = safeQuery('[data-playground-max-price]');
       const playgroundMinAttTier = safeQuery('[data-playground-min-att-tier]');
       const playgroundModel = safeQuery('[data-playground-model]');
@@ -3851,6 +4147,8 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         && Array.from(playgroundModel.options).some((option) => option.value === savedDraft.model)) {
         playgroundModel.value = savedDraft.model;
       }
+      syncPlaygroundParameterRail();
+      playgroundMaxTokens = safeQuery('[data-playground-max-tokens]');
       const restoredMode = ['chat', 'image', 'speech'].includes(savedDraft.mode)
         ? savedDraft.mode
         : playgroundModel?.selectedOptions?.[0]?.dataset.playgroundMode;
@@ -3907,6 +4205,13 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
     applyPreferenceButtons();
     updatePreflight();
     syncPlaygroundInputs();
+    if (!window.matchMedia('(max-width: 1180px)').matches && storage.get(playgroundControlsOpenKey) === '1') {
+      setPlaygroundControlsOpen(true);
+    }
+    const playgroundControlsMedia = window.matchMedia('(max-width: 1180px)');
+    playgroundControlsMedia.addEventListener?.('change', (event) => {
+      setPlaygroundControlsOpen(event.matches ? false : storage.get(playgroundControlsOpenKey) === '1');
+    });
     const activeSubnavItem = safeQuery('.subnav a[aria-current="page"]');
     const activeSubnav = activeSubnavItem ? activeSubnavItem.closest('.subnav') : null;
     if (activeSubnavItem && activeSubnav) {

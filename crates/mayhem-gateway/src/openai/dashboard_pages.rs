@@ -2418,6 +2418,227 @@ fn signed_dimension_allows(spec: Option<&mayhem_proto::EndpointAttributeSpec>, v
             .any(|candidate| candidate.as_u64() == Some(value as u64))
 }
 
+fn playground_numeric_parameter(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    key: &str,
+    label: &str,
+    section: &str,
+    step: f64,
+    default: Option<f64>,
+    help: &str,
+) -> Option<Value> {
+    let spec = contract.request_attribute_specs.get(key)?;
+    Some(json!({
+        "key": key,
+        "label": label,
+        "kind": if spec
+            .value_types
+            .contains(&mayhem_proto::EndpointValueType::Integer)
+        {
+            "integer"
+        } else {
+            "number"
+        },
+        "section": section,
+        "minimum": spec.minimum,
+        "maximum": spec.maximum,
+        "step": step,
+        "default": default.or_else(|| spec.default.as_ref().and_then(Value::as_f64)),
+        "help": help,
+    }))
+}
+
+fn playground_text_parameter_schema(model: &GatewayModel) -> Value {
+    let Some(contract) = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS)
+    else {
+        return json!({
+            "version": 1,
+            "contextTokens": model.mayhem.caps.ctx,
+            "contextLabel": format_token_count(u64::from(model.mayhem.caps.ctx)),
+            "controls": [],
+        });
+    };
+
+    let mut controls = Vec::new();
+    if let Some(spec) = contract.request_attribute_specs.get("max_tokens") {
+        let maximum = spec.maximum.unwrap_or(4_096.0).clamp(1.0, 4_096.0);
+        let contract_minimum = spec.minimum.unwrap_or(1.0).clamp(1.0, maximum);
+        let minimum = if maximum >= 64.0 {
+            contract_minimum.max(64.0)
+        } else {
+            contract_minimum
+        };
+        let default = 512_f64.clamp(minimum, maximum);
+        controls.push(json!({
+            "key": "max_tokens",
+            "label": "Output limit",
+            "kind": "integer",
+            "section": "primary",
+            "minimum": minimum,
+            "maximum": maximum,
+            "step": if maximum >= 64.0 { 64 } else { 1 },
+            "default": default,
+            "help": "Maximum tokens generated for this response. The model can finish sooner.",
+        }));
+    }
+
+    if let Some(control) = playground_numeric_parameter(
+        contract,
+        "temperature",
+        "Temperature",
+        "primary",
+        0.1,
+        model.mayhem.sampling.temperature,
+        "Lower values are more focused. Higher values introduce more variation.",
+    ) {
+        controls.push(control);
+    }
+
+    if let Some(spec) = contract.request_attribute_specs.get("thinking_mode") {
+        let options = spec
+            .enum_values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|value| {
+                json!({
+                    "value": value,
+                    "label": if value == "enabled" { "On" } else { "Off" },
+                })
+            })
+            .collect::<Vec<_>>();
+        if !options.is_empty() {
+            controls.push(json!({
+                "key": "thinking_mode",
+                "label": "Thinking",
+                "kind": "select",
+                "section": "primary",
+                "default": spec.default.as_ref().and_then(Value::as_str),
+                "options": options,
+                "help": "Use the model's reasoning mode when the signed contract supports it.",
+            }));
+        }
+    }
+
+    for (key, label, step, default, help) in [
+        (
+            "top_p",
+            "Top P",
+            0.05,
+            model.mayhem.sampling.top_p,
+            "Limits sampling to the most likely token mass.",
+        ),
+        (
+            "top_k",
+            "Top K",
+            1.0,
+            model.mayhem.sampling.top_k.map(f64::from),
+            "Limits each step to the most likely token candidates.",
+        ),
+        (
+            "min_p",
+            "Min P",
+            0.01,
+            model.mayhem.sampling.min_p,
+            "Drops token choices that are too unlikely relative to the best candidate.",
+        ),
+        (
+            "presence_penalty",
+            "Presence penalty",
+            0.1,
+            model.mayhem.sampling.presence_penalty,
+            "Discourages returning to topics already present in the response.",
+        ),
+        (
+            "frequency_penalty",
+            "Frequency penalty",
+            0.1,
+            model.mayhem.sampling.frequency_penalty,
+            "Discourages repeating tokens in proportion to how often they appeared.",
+        ),
+        (
+            "repeat_penalty",
+            "Repeat penalty",
+            0.05,
+            model.mayhem.sampling.repeat_penalty,
+            "Applies the model's native repetition penalty when supported.",
+        ),
+    ] {
+        if let Some(control) =
+            playground_numeric_parameter(contract, key, label, "advanced", step, default, help)
+        {
+            controls.push(control);
+        }
+    }
+
+    if let Some(control) = playground_numeric_parameter(
+        contract,
+        "seed",
+        "Seed",
+        "advanced",
+        1.0,
+        None,
+        "Optional repeatable seed. Leave blank to let the provider choose.",
+    ) {
+        controls.push(control);
+    }
+
+    if contract
+        .request_attributes
+        .iter()
+        .any(|path| path == "stop")
+    {
+        controls.push(json!({
+            "key": "stop",
+            "label": "Stop sequences",
+            "kind": "lines",
+            "section": "advanced",
+            "default": Value::Null,
+            "help": "Optional. Enter one sequence per line, up to four sequences.",
+        }));
+    }
+
+    if let Some(spec) = contract.request_attribute_specs.get("thinking_history") {
+        let options = spec
+            .enum_values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|value| {
+                json!({
+                    "value": value,
+                    "label": match value {
+                        "latest_only" => "Latest only",
+                        "preserve" => "Preserve",
+                        _ => value,
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        if !options.is_empty() {
+            controls.push(json!({
+                "key": "thinking_history",
+                "label": "Thinking history",
+                "kind": "select",
+                "section": "advanced",
+                "default": spec.default.as_ref().and_then(Value::as_str),
+                "options": options,
+                "help": "Controls whether earlier reasoning state is replayed in a conversation.",
+            }));
+        }
+    }
+
+    json!({
+        "version": 1,
+        "contextTokens": model.mayhem.caps.ctx,
+        "contextLabel": format_token_count(u64::from(model.mayhem.caps.ctx)),
+        "controls": controls,
+    })
+}
+
 fn playground_page(data: &DashboardData, expires: u64, selected_model: Option<&str>) -> String {
     let credential_needed = data.requires_auth() && data.active_token_count() == 0;
     let mut choices = data
@@ -2498,8 +2719,12 @@ fn playground_page(data: &DashboardData, expires: u64, selected_model: Option<&s
                     html_escape(&sizes),
                 )
             });
+        let parameter_schema = html_escape(
+            &serde_json::to_string(&playground_text_parameter_schema(model))
+                .unwrap_or_else(|_| r#"{"version":1,"controls":[]}"#.to_owned()),
+        );
         options.push_str(&format!(
-            r##"<option value="{}" data-playground-mode="{mode}" data-availability="{}" data-price="{}" data-price-mode="{price_mode}" data-location="Network provider route" data-protection="{}" data-context="Up to {context} catalog tokens" data-model-name="{}" data-model-lab="{}" data-model-purpose="{purpose}"{image_attributes}{selected}>{} &mdash; {}</option>"##,
+            r##"<option value="{}" data-playground-mode="{mode}" data-availability="{}" data-price="{}" data-price-mode="{price_mode}" data-location="Network provider route" data-protection="{}" data-context="Up to {context} catalog tokens" data-model-name="{}" data-model-lab="{}" data-model-purpose="{purpose}" data-parameter-schema="{parameter_schema}"{image_attributes}{selected}>{} &mdash; {}</option>"##,
             html_escape(&model.id),
             html_escape(availability.label),
             html_escape(&dashboard_model_price(model)),
@@ -2571,7 +2796,7 @@ fn playground_page(data: &DashboardData, expires: u64, selected_model: Option<&s
         ""
     };
     let token_field = if data.requires_auth() {
-        r##"<label class="pg-advanced-field span-all" for="playground-token"><span>Access token</span><input id="playground-token" data-playground-token type="password" autocomplete="off" spellcheck="false" required><small>Kept only in this page's memory.</small></label>"##
+        r##"<label class="pg-control-field span-all" for="playground-token"><span>Access token</span><input id="playground-token" data-playground-token type="password" autocomplete="off" spellcheck="false" required><small>Kept only in this page's memory.</small></label>"##
     } else {
         r##"<input data-playground-token type="hidden" value="">"##
     };
@@ -2655,13 +2880,26 @@ fn playground_page(data: &DashboardData, expires: u64, selected_model: Option<&s
       </div>
     </div>
 
-    <section class="pg-network" data-playground-network>
-      <button type="button" class="pg-network-summary" data-playground-network-toggle aria-expanded="false" aria-controls="playground-network-body"><span class="pg-network-grip" aria-hidden="true"></span><span class="pg-network-dot" aria-hidden="true"></span><span class="pg-network-labels"><span class="pg-network-title">Network activity</span><span class="pg-network-state" data-playground-network-state>Ready</span></span><span class="pg-network-model"><span class="pg-logo-tile pg-network-model-logo" data-playground-network-icon>{default_model_icon}</span><span data-playground-network-model>{default_model_name}</span></span><svg class="pg-network-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg></button>
-      <div class="pg-network-body" id="playground-network-body" data-playground-network-body hidden><ol class="pg-network-steps" aria-label="Request progression"><li data-playground-step="request"><span class="pg-step-marker" aria-hidden="true"></span><span class="pg-step-copy"><span class="pg-step-label">Request</span><span class="pg-step-detail">Waiting for input</span></span></li><li data-playground-step="provider"><span class="pg-step-marker" aria-hidden="true"></span><span class="pg-step-copy"><span class="pg-step-label">Provider route</span><span class="pg-step-detail">Not started</span></span></li><li data-playground-step="generate"><span class="pg-step-marker" aria-hidden="true"></span><span class="pg-step-copy"><span class="pg-step-label">Generate</span><span class="pg-step-detail">Not started</span></span></li><li data-playground-step="receipt"><span class="pg-step-marker" aria-hidden="true"></span><span class="pg-step-copy"><span class="pg-step-label">Signed receipt</span><span class="pg-step-detail">Pending generation</span></span></li></ol><dl class="pg-network-facts"><div><dt>Model</dt><dd data-playground-fact="model">{default_model_name}</dd></div><div><dt>Provider</dt><dd data-playground-fact="provider">Revealed after receipt</dd></div><div><dt>Timing</dt><dd data-playground-fact="timing">Pending</dd></div><div><dt>Cost</dt><dd data-playground-fact="cost">Pending</dd></div><div><dt>Request ID</dt><dd data-playground-fact="request">Not started</dd></div></dl><p class="pg-network-footnote">Live values appear only as the gateway confirms them. Provider identity is revealed after a signed receipt is returned.</p></div>
-    </section>
+    <button class="pg-controls-backdrop" type="button" data-playground-controls-backdrop aria-label="Close generation settings" hidden></button>
+    <aside class="pg-controls" data-playground-controls aria-label="Generation settings">
+      <button class="pg-controls-toggle" type="button" data-playground-controls-toggle aria-expanded="false" aria-controls="playground-controls-body"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M14 4v6M4 17h2M10 17h10M10 14v6"/></svg><span class="pg-controls-toggle-copy"><strong>Generation settings</strong><small data-playground-controls-state>Model defaults</small></span><svg class="pg-controls-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></button>
+      <div class="pg-controls-body" id="playground-controls-body" data-playground-controls-body hidden>
+        <header class="pg-controls-head"><div class="pg-controls-heading"><strong>Generation settings</strong><span><i aria-hidden="true"></i><span data-playground-controls-model>{default_model_name}</span></span></div><span class="pg-controls-head-actions"><button type="button" data-playground-reset-model aria-label="Reset generation settings for selected model" title="Reset model settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v6h6M20 20v-6h-6"/><path d="M5.1 15a8 8 0 0 0 13.2 2M18.9 9A8 8 0 0 0 5.7 7"/></svg><span>Reset</span></button><button type="button" data-playground-controls-close aria-label="Close generation settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg><span class="sr-only">Close generation settings</span></button></span></header>
+        <div class="pg-controls-scroll">
+          <div class="pg-context-card"><span>Context window</span><strong data-playground-context-value>Checking catalog</strong><small>Read-only model limit</small></div>
+          <div class="pg-control-group" data-playground-parameter-section="primary"></div>
+          <details class="pg-control-disclosure" data-playground-more-settings><summary><span><strong>More settings</strong><small>Sampling and instructions</small></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg></summary><div class="pg-control-disclosure-body"><label class="pg-control-field span-all" for="playground-system"><span>System instructions <em>Text only</em></span><textarea id="playground-system" data-playground-system data-playground-draft rows="3" placeholder="Optional guidance for the model"></textarea><small>Saved only for this browser tab.</small></label><div class="pg-control-group pg-control-group-advanced" data-playground-parameter-section="advanced"></div></div></details>
+          <details class="pg-control-disclosure" data-playground-routing-settings><summary><span><strong>Routing and trust</strong><small>Gateway limits</small></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg></summary><div class="pg-control-disclosure-body">{token_field}<label class="pg-control-field" for="playground-max-price"><span><span data-playground-price-label>Route price ceiling</span><em data-playground-price-unit>USD</em></span><input id="playground-max-price" data-playground-max-price data-playground-draft data-money-input type="text" inputmode="decimal" autocomplete="off" spellcheck="false" pattern="[0-9]+([.][0-9]{{1,18}})?" placeholder="Optional USD ceiling"></label><label class="pg-control-field" for="playground-min-att-tier"><span>Minimum attestation tier</span><select id="playground-min-att-tier" data-playground-min-att-tier data-playground-draft><option value="">Gateway default</option><option value="1">At least T1 numerically</option><option value="2">At least T2 numerically</option><option value="3">At least T3 numerically</option><option value="4">T4 only</option></select><small>Numeric tier does not promise confidential compute.</small></label><div class="preflight span-all" data-playground-preflight><span><strong>Capacity:</strong> <span data-preflight-value="availability">Checking</span></span><span><strong>Protection:</strong> <span data-preflight-value="protection">Checking catalog</span></span><span><strong>Context:</strong> <span data-preflight-value="context">Checking catalog</span></span><span><strong>Catalog rates:</strong> <span class="money-value" data-money data-preflight-value="price">Unavailable</span></span></div></div></details>
+          <button class="pg-text-action pg-controls-reset-all" type="button" data-playground-reset-draft>Reset Playground</button>
+        </div>
+      </div>
+    </aside>
   </div>
 
-  <details class="pg-advanced" data-playground-request-settings><summary><span>Advanced request controls</span><span data-playground-request-summary>Gateway price and trust defaults</span></summary><div class="pg-advanced-grid">{token_field}<label class="pg-advanced-field span-all" for="playground-system"><span>System instructions <em>Text only</em></span><textarea id="playground-system" data-playground-system data-playground-draft rows="3"></textarea></label><label class="pg-advanced-field" for="playground-max-tokens"><span>Output limit <em>Text only</em></span><input id="playground-max-tokens" data-playground-max-tokens data-playground-draft type="number" inputmode="numeric" min="64" max="4096" step="64" value="512"></label><label class="pg-advanced-field" for="playground-max-price"><span><span data-playground-price-label>Route price ceiling</span><em data-playground-price-unit>USD</em></span><input id="playground-max-price" data-playground-max-price data-playground-draft data-money-input type="text" inputmode="decimal" autocomplete="off" spellcheck="false" pattern="[0-9]+([.][0-9]{{1,18}})?" placeholder="Optional USD ceiling"></label><label class="pg-advanced-field" for="playground-min-att-tier"><span>Minimum attestation tier</span><select id="playground-min-att-tier" data-playground-min-att-tier data-playground-draft><option value="">Gateway default</option><option value="1">At least T1 numerically</option><option value="2">At least T2 numerically</option><option value="3">At least T3 numerically</option><option value="4">T4 only</option></select><small>Numeric identity tier does not promise confidential compute.</small></label><div class="preflight span-all" data-playground-preflight><span><strong>Capacity:</strong> <span data-preflight-value="availability">Checking</span></span><span><strong>Protection:</strong> <span data-preflight-value="protection">Checking catalog</span></span><span><strong>Context:</strong> <span data-preflight-value="context">Checking catalog</span></span><span><strong>Catalog rates:</strong> <span class="money-value" data-money data-preflight-value="price">Unavailable</span></span></div><button class="pg-text-action span-all" type="button" data-playground-reset-draft>Reset saved draft and settings</button></div></details>
+  <section class="pg-network" data-playground-network>
+    <button type="button" class="pg-network-summary" data-playground-network-toggle aria-expanded="false" aria-controls="playground-network-body"><span class="pg-network-grip" aria-hidden="true"></span><span class="pg-network-dot" aria-hidden="true"></span><span class="pg-network-labels"><span class="pg-network-title">Network activity</span><span class="pg-network-state" data-playground-network-state>Ready</span></span><span class="pg-network-model"><span class="pg-logo-tile pg-network-model-logo" data-playground-network-icon>{default_model_icon}</span><span data-playground-network-model>{default_model_name}</span></span><svg class="pg-network-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg></button>
+    <div class="pg-network-body" id="playground-network-body" data-playground-network-body hidden><ol class="pg-network-steps" aria-label="Request progression"><li data-playground-step="request"><span class="pg-step-marker" aria-hidden="true"></span><span class="pg-step-copy"><span class="pg-step-label">Request</span><span class="pg-step-detail">Waiting for input</span></span></li><li data-playground-step="provider"><span class="pg-step-marker" aria-hidden="true"></span><span class="pg-step-copy"><span class="pg-step-label">Provider route</span><span class="pg-step-detail">Not started</span></span></li><li data-playground-step="generate"><span class="pg-step-marker" aria-hidden="true"></span><span class="pg-step-copy"><span class="pg-step-label">Generate</span><span class="pg-step-detail">Not started</span></span></li><li data-playground-step="receipt"><span class="pg-step-marker" aria-hidden="true"></span><span class="pg-step-copy"><span class="pg-step-label">Signed receipt</span><span class="pg-step-detail">Pending generation</span></span></li></ol><dl class="pg-network-facts"><div><dt>Model</dt><dd data-playground-fact="model">{default_model_name}</dd></div><div><dt>Provider</dt><dd data-playground-fact="provider">Revealed after receipt</dd></div><div><dt>Timing</dt><dd data-playground-fact="timing">Pending</dd></div><div><dt>Cost</dt><dd data-playground-fact="cost">Pending</dd></div><div><dt>Request ID</dt><dd data-playground-fact="request">Not started</dd></div></dl><p class="pg-network-footnote">Live values appear only as the gateway confirms them. Provider identity is revealed after a signed receipt is returned.</p></div>
+  </section>
   <p class="pg-local-note" data-playground-meta>No request sent · drafts and history stay in this browser tab · access tokens are never saved</p>
 </form>
 </div>
@@ -7272,16 +7510,21 @@ mod tests {
         let data = DashboardData::from_state(&GatewayState::fixture());
         let html = playground_page(&data, 60, None);
 
-        assert!(html.contains("data-playground-max-tokens"));
-        assert!(html.contains(r#"min="64" max="4096""#));
+        assert!(html.contains("data-playground-controls"));
+        assert!(html.contains("Generation settings"));
+        assert!(html.contains("data-playground-parameter-section=\"primary\""));
+        assert!(html.contains("data-parameter-schema="));
+        assert!(html.contains("&quot;key&quot;:&quot;max_tokens&quot;"));
+        assert!(html.contains("&quot;maximum&quot;:4096.0"));
         assert!(html.contains("data-playground-max-price"));
         assert!(html.contains(r#"data-price-mode="rate""#));
         assert!(html.contains("data-money-input"));
         assert!(html.contains("Route price ceiling"));
         assert!(html.contains("data-playground-min-att-tier"));
         assert!(html.contains(r#"<option value="4">T4 only"#));
-        assert!(html.contains("Numeric identity tier does not promise confidential compute."));
-        assert!(html.contains("data-playground-request-summary"));
+        assert!(html.contains("Numeric tier does not promise confidential compute."));
+        assert!(html.contains("data-playground-controls-state"));
+        assert!(html.contains("Context window"));
         assert!(html.contains("drafts and history stay in this browser tab"));
         assert!(html.contains("access tokens are never saved"));
         assert!(html.contains("data-playground-reset-draft"));
