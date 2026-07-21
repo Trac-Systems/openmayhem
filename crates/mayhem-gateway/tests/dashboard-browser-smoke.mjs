@@ -460,6 +460,11 @@ try {
   equal(await playgroundControlsToggle.getAttribute('aria-expanded'), 'true', 'Playground generation settings', 'opens the settings rail');
   await page.waitForFunction(() => document.querySelector('[data-playground-controls]')?.getBoundingClientRect().width >= 400);
   check(await page.locator('[data-playground-controls]').evaluate((node) => node.getBoundingClientRect().width >= 400), 'Playground generation settings', 'uses a comfortably wide desktop settings rail');
+  check(await page.locator('.pg-experience').evaluate((node) => {
+    const surfaceWidth = node.querySelector('.pg-surface')?.getBoundingClientRect().width || 0;
+    const controlsWidth = node.querySelector('[data-playground-controls]')?.getBoundingClientRect().width || 0;
+    return Math.abs(surfaceWidth - controlsWidth) <= 2;
+  }), 'Playground generation settings', 'splits the expanded workspace evenly between chat and settings');
   check(await page.locator('.pg-controls-heading').getByText('Generation settings', { exact: true }).isVisible(), 'Playground generation settings', 'keeps a clear title inside the expanded panel');
   check(await page.locator('[data-playground-context-value]').isVisible(), 'Playground generation settings', 'shows the signed context limit as read-only information');
   equal(await page.locator('[data-playground-context-value]').locator('input').count(), 0, 'Playground generation settings', 'does not present the context window as an editable request field');
@@ -473,7 +478,15 @@ try {
   const rateTopP = page.locator('[data-playground-parameter="top_p"]');
   await rateTemperature.fill('0.4');
   if (await rateTopP.count()) {
-    await page.locator('[data-playground-more-settings] > summary').click();
+    const moreSettings = page.locator('[data-playground-more-settings]');
+    if (await moreSettings.getAttribute('open') === null) await moreSettings.locator('summary').click();
+    check(await page.locator('[data-playground-parameter-section="advanced"]').evaluate((node) => {
+      const body = node.closest('.pg-control-disclosure-body');
+      if (!body) return false;
+      const style = getComputedStyle(body);
+      const availableWidth = body.getBoundingClientRect().width - Number.parseFloat(style.paddingLeft) - Number.parseFloat(style.paddingRight);
+      return node.getBoundingClientRect().width >= availableWidth - 2;
+    }), 'Playground generation settings', 'gives advanced model controls the full disclosure width');
     await rateTopP.fill('0.8');
   }
   const rateModelValue = await rateOption.getAttribute('value');
@@ -503,6 +516,13 @@ try {
   equal(await playgroundControlsToggle.getAttribute('aria-expanded'), 'true', 'Playground generation settings', 'restores the saved desktop state after a responsive transition');
   const routingDisclosure = page.locator('[data-playground-routing-settings]');
   if (await routingDisclosure.getAttribute('open') === null) await routingDisclosure.locator('summary').click();
+  check(await page.locator('[data-playground-preflight]').evaluate((node) => {
+    const body = node.closest('.pg-control-disclosure-body');
+    if (!body) return false;
+    const style = getComputedStyle(body);
+    const availableWidth = body.getBoundingClientRect().width - Number.parseFloat(style.paddingLeft) - Number.parseFloat(style.paddingRight);
+    return node.getBoundingClientRect().width >= availableWidth - 2;
+  }), 'Playground generation settings', 'gives routing evidence the full disclosure width');
   equal(await page.locator('[data-playground-price-unit]').innerText(), '$ / 1M-unit basket', 'Playground price controls', 'names the composite rate basis');
   await playgroundPrice.fill('0.50');
   await playgroundPrompt.fill('Verify the rate-price request control.');
