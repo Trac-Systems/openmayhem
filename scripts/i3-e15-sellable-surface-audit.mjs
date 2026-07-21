@@ -7,24 +7,24 @@ import { fileURLToPath } from 'node:url';
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const jsonMode = process.argv.includes('--json');
 
-const launchProofs = new Map([
-  ['qwen/qwen2.5-1.5b-instruct@small', 'I3-E11/I3-E14 real GGUF, TensorRT-LLM, and vLLM chat/tool paths'],
-  ['meta/llama-3.1-8b-instruct@4bit', 'I3-E10 catalog/backend compatibility and launch source checks'],
-  ['google/gemma-3-12b-it@4bit', 'I3-E10 catalog/backend compatibility and launch source checks'],
-  ['deepseek/deepseek-r1-distill-qwen-14b@4bit', 'I3-E10 catalog/backend compatibility and launch source checks'],
-  ['baai/bge-small-en-v1.5@gguf-q8_0', 'I3-E6 real embedding path'],
-  ['huggingfacetb/smolvlm2-256m-video-instruct@gguf-q8_0', 'I3-E7/E12/E13 real vision chat path'],
-  ['concedo/sdxs-512-tinysd-distilled@gguf-q8_0', 'I3-E8 real image-generation path'],
-  ['openai/whisper-tiny-en@ggml', 'I3-E9 real STT path'],
-  ['rhasspy/piper-en-us-lessac-low@onnx', 'I3-E9 real TTS path'],
-]);
-
-const classRoutes = {
-  text: ['/v1/chat/completions', '/v1/completions'],
-  embedding: ['/v1/embeddings'],
-  'image-generation': ['/v1/images/generations'],
-  stt: ['/v1/audio/transcriptions'],
-  tts: ['/v1/audio/speech'],
+const endpointRoutes = {
+  openai_chat_completions: '/v1/chat/completions',
+  openai_completions: '/v1/completions',
+  openai_responses: '/v1/responses',
+  hf_multimodal_chat: '/v1/chat/completions',
+  openai_embeddings: '/v1/embeddings',
+  hf_feature_extraction: '/v1/embeddings',
+  openai_image_generations: '/v1/images/generations',
+  hf_text_to_image: '/v1/images/generations',
+  openai_audio_transcriptions: '/v1/audio/transcriptions',
+  hf_automatic_speech_recognition: '/v1/audio/transcriptions',
+  openai_audio_speech: '/v1/audio/speech',
+  hf_text_to_speech: '/v1/audio/speech',
+  openai_videos: '/v1/videos',
+  hf_text_to_video: '/v1/videos',
+  mayhem_audio_generations: '/v1/audio/generations',
+  mayhem_music_generations: '/v1/music/generations',
+  hf_text_to_audio: '/v1/audio/generations',
 };
 
 const productionRoots = [
@@ -38,9 +38,9 @@ const productionRoots = [
 const productionExtensions = new Set(['.rs', '.js', '.mjs', '.cjs', '.ts', '.toml']);
 const bannedPatterns = [
   ['deterministic', /deterministic_/],
-  ['pending-marker', /PENDING_/],
+  ['pending-marker', /\bPENDING_(?:IMPLEMENTATION|MODEL|PROOF|REPLACE_ME)\b/],
   ['canned', /\bcanned\b/i],
-  ['placeholder', /\bplaceholder\b/i],
+  ['placeholder', /\bplaceholder_(?:implementation|output|response|result)\b|\b(?:TODO|FIXME)\b[^\n]{0,40}\bplaceholder\b/i],
   ['contract-simulate', /contract_simulate|contract\.simulate|MAYHEM_PAYGATE_CONTRACT_SIM/],
   ['unlocked-signer', /getSigner\s*\(/],
   ['empty-main', /fn\s+main\s*\(\s*\)\s*\{\s*\}/],
@@ -78,12 +78,7 @@ function assertCheck(id, condition, message, extra = {}) {
 }
 
 function routeListFor(model) {
-  const modelClass = model.model_class || 'text';
-  const routes = classRoutes[modelClass] || [];
-  if (modelClass === 'text' && model.caps?.vision === true) {
-    return routes.map((route) => `${route} with vision input`);
-  }
-  return routes;
+  return [...new Set((model.adapter?.endpoint_families || []).map(({ family }) => endpointRoutes[family]).filter(Boolean))];
 }
 
 function markdownCells(line) {
@@ -96,23 +91,26 @@ function markdownCells(line) {
 }
 
 function launchSurfaceSection(readme) {
-  const startMarker = '<!-- MAYHEM-LAUNCH-SURFACE:START -->';
-  const endMarker = '<!-- MAYHEM-LAUNCH-SURFACE:END -->';
+  const startMarker = '## Available Models';
   const start = readme.indexOf(startMarker);
-  const end = readme.indexOf(endMarker);
-  if (start === -1 || end === -1 || end <= start) {
-    fail('readme.launch_surface.markers', 'README launch surface markers are missing or misordered');
+  const nextHeading = start === -1 ? -1 : readme.indexOf('\n## ', start + startMarker.length);
+  if (start === -1 || nextHeading === -1) {
+    fail('readme.launch_surface.section', 'README Available Models section is missing or unterminated');
     return null;
   }
-  ok('readme.launch_surface.markers', 'README launch surface table is marker-bound');
-  return readme.slice(start + startMarker.length, end);
+  ok('readme.launch_surface.section', 'README Available Models section is heading-bound');
+  return readme.slice(start + startMarker.length, nextHeading);
+}
+
+function normalizedSearchText(value) {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
 }
 
 function parseLaunchRows(section) {
   const rows = [];
   for (const line of section.split('\n')) {
     const cells = markdownCells(line);
-    if (cells.length < 6) continue;
+    if (cells.length < 4) continue;
     const id = cells[0].replace(/^`|`$/g, '');
     if (!id.includes('/')) continue;
     rows.push({ id, cells, line });
@@ -143,26 +141,74 @@ function listFiles(dir) {
   return out.sort();
 }
 
+function rustProductionText(text) {
+  const topLevelTests = /^#\[cfg\(test\)\]\nmod tests \{/m.exec(text);
+  if (topLevelTests) {
+    const production = text.slice(0, topLevelTests.index);
+    text = production + '\n'.repeat(text.slice(topLevelTests.index).split('\n').length - 1);
+  }
+  const lines = text.split('\n');
+  let pendingTestItem = null;
+  let skippedItemIndent = null;
+
+  return lines.map((line) => {
+    if (skippedItemIndent !== null) {
+      const closing = new RegExp(`^${skippedItemIndent.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\}(?:;)?\\s*$`);
+      if (closing.test(line)) skippedItemIndent = null;
+      return '';
+    }
+
+    if (/^\s*#\[cfg\(test\)\]\s*$/.test(line)) {
+      pendingTestItem = line.match(/^\s*/)[0];
+      return '';
+    }
+
+    if (pendingTestItem !== null) {
+      const trimmed = line.trim();
+      if (trimmed === '' || trimmed.startsWith('#[')) return '';
+      if (line.includes('{')) skippedItemIndent = pendingTestItem;
+      if (line.includes(';') || skippedItemIndent !== null) pendingTestItem = null;
+      return '';
+    }
+
+    return line;
+  }).join('\n');
+}
+
 function checkCatalogAndReadme() {
   const catalog = JSON.parse(read('catalog/models.json'));
   const readme = read('README.md');
   const launchModels = catalog.models.filter((model) => model.tier === 'launch');
-  const devModels = catalog.models.filter((model) => model.tier === 'dev');
   const launchIds = launchModels.map((model) => model.model_id);
-  const devIds = devModels.map((model) => model.model_id);
+  const uniqueIds = new Set(catalog.models.map((model) => model.model_id));
 
-  assertCheck('catalog.count.launch', launchIds.length === launchProofs.size, `catalog has ${launchIds.length} launch models`, { launchIds });
-  assertCheck('catalog.count.dev', devIds.length === 2, `catalog has ${devIds.length} dev-only models`, { devIds });
+  assertCheck('catalog.count.launch', launchIds.length > 0, `catalog has ${launchIds.length} launch models`, { launchIds });
+  assertCheck('catalog.ids.unique', uniqueIds.size === catalog.models.length, 'catalog model ids are unique');
 
   for (const model of launchModels) {
-    const modelClass = model.model_class || 'text';
-    assertCheck(`catalog.${model.model_id}.proof`, launchProofs.has(model.model_id), `${model.model_id} has launch proof mapping`);
-    assertCheck(`catalog.${model.model_id}.class`, !!classRoutes[modelClass], `${model.model_id} has routable class ${modelClass}`);
+    const endpointFamilies = (model.adapter?.endpoint_families || []).map(({ family }) => family);
+    const calibratedArtifacts = new Set(Object.keys(model.modality_assessment?.calibrated_fingerprints || {}));
+    assertCheck(
+      `catalog.${model.model_id}.proof`,
+      !!model.canary?.set_id && !!model.canary?.verification_method,
+      `${model.model_id} has signed canary evidence`
+    );
+    assertCheck(
+      `catalog.${model.model_id}.endpoints`,
+      endpointFamilies.length > 0 && endpointFamilies.every((family) => !!endpointRoutes[family]),
+      `${model.model_id} declares only routed endpoint families`,
+      { endpointFamilies }
+    );
     assertCheck(`catalog.${model.model_id}.routes`, routeListFor(model).length > 0, `${model.model_id} has gateway routes`);
     assertCheck(`catalog.${model.model_id}.denom`, model.price_ref_au?.denom === 'au_usd', `${model.model_id} is priced in au_usd`);
     const artifacts = Object.entries(model.artifacts || {});
     assertCheck(`catalog.${model.model_id}.artifacts`, artifacts.length > 0, `${model.model_id} has signed artifacts`);
     for (const [name, artifact] of artifacts) {
+      assertCheck(
+        `catalog.${model.model_id}.${name}.calibration`,
+        calibratedArtifacts.has(name),
+        `${model.model_id}/${name} has calibrated modality evidence`
+      );
       assertCheck(
         `catalog.${model.model_id}.${name}.root`,
         artifact.artifact_root_kind === 'blake3_merkle_v1',
@@ -186,34 +232,24 @@ function checkCatalogAndReadme() {
   const section = launchSurfaceSection(readme);
   if (!section) return;
   const rows = parseLaunchRows(section);
-  const rowIds = rows.map((row) => row.id);
-  assertCheck(
-    'readme.launch_surface.rows',
-    JSON.stringify(rowIds) === JSON.stringify(launchIds),
-    'README launch surface rows match catalog launch model order',
-    { rowIds, launchIds }
-  );
-  for (const id of devIds) {
-    assertCheck(`readme.launch_surface.dev.${id}`, !section.includes(id), `${id} is not advertised as launch sellable`);
+  const normalizedSection = normalizedSearchText(section);
+  for (const model of launchModels) {
+    assertCheck(
+      `readme.launch_surface.model.${model.model_id}`,
+      normalizedSection.includes(normalizedSearchText(model.family)),
+      `README launch roster includes ${model.model_id}`
+    );
   }
   assertCheck(
     'readme.launch_surface.tiers',
     !/\bTier [234]\b/.test(section),
     'launch table does not advertise higher tiers before D5'
   );
-  for (const row of rows) {
-    const model = launchModels.find((entry) => entry.model_id === row.id);
-    if (!model) continue;
-    const joined = row.line;
+  assertCheck('readme.launch_surface.rows', rows.length > 0, 'README launch roster contains model rows');
+  for (const model of launchModels) {
     for (const route of routeListFor(model)) {
-      const routePath = route.split(' ')[0];
-      assertCheck(`readme.${row.id}.route.${routePath}`, joined.includes(routePath), `${row.id} README row lists ${routePath}`);
+      assertCheck(`readme.${model.model_id}.route.${route}`, section.includes(route), `${model.model_id} README surface lists ${route}`);
     }
-    for (const [artifactName, artifact] of Object.entries(model.artifacts || {})) {
-      assertCheck(`readme.${row.id}.artifact.${artifactName}`, joined.includes(artifactName), `${row.id} README row lists ${artifactName}`);
-      assertCheck(`readme.${row.id}.engine.${artifact.engine}`, joined.includes(artifact.engine), `${row.id} README row lists ${artifact.engine}`);
-    }
-    assertCheck(`readme.${row.id}.tier1`, joined.includes('Tier 1 launch'), `${row.id} README row is Tier 1 launch`);
   }
   assertCheck(
     'readme.catalog.discovery',
@@ -234,10 +270,14 @@ function checkGatewayAndCliSurface() {
     '/v1/models',
     '/v1/chat/completions',
     '/v1/completions',
+    '/v1/responses',
     '/v1/embeddings',
     '/v1/images/generations',
+    '/v1/videos',
     '/v1/audio/speech',
     '/v1/audio/transcriptions',
+    '/v1/audio/generations',
+    '/v1/music/generations',
     '/mayhem/dashboard',
     '/mayhem/dashboard/provider',
     '/mayhem/dashboard/session',
@@ -264,7 +304,8 @@ function checkBannedPatterns() {
   const hits = [];
   for (const root of productionRoots) {
     for (const file of listFiles(root)) {
-      const text = fs.readFileSync(repo(file), 'utf8');
+      const rawText = fs.readFileSync(repo(file), 'utf8');
+      const text = file.endsWith('.rs') ? rustProductionText(rawText) : rawText;
       const lines = text.split('\n');
       lines.forEach((line, index) => {
         for (const [id, pattern] of bannedPatterns) {

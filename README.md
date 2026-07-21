@@ -748,10 +748,12 @@ Class = smallest machine class that serves it well: **A** CPU/laptop, **B** cons
 
 | Class | Routes |
 |-------|--------|
-| Text generation | `/v1/chat/completions`, `/v1/completions` — tools, JSON mode, streaming, vision input where the catalog says so |
+| Text generation | `/v1/chat/completions`, `/v1/completions`, `/v1/responses` — tools, JSON mode, streaming, vision input where the catalog says so |
 | Embedding | `/v1/embeddings` |
 | Image generation | `/v1/images/generations` |
-| Audio | `/v1/audio/speech`, `/v1/audio/transcriptions` |
+| Video generation | `/v1/videos` |
+| Speech and transcription | `/v1/audio/speech`, `/v1/audio/transcriptions` |
+| Audio and music generation | `/v1/audio/generations`, `/v1/music/generations` |
 
 ## Dashboards
 

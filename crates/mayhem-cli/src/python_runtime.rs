@@ -873,6 +873,7 @@ fn venv_executable(venv: &Path, name: &str) -> PathBuf {
 fn open_lock_file(path: &Path) -> Result<File> {
     OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)
