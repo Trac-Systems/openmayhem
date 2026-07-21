@@ -1980,6 +1980,47 @@ test('read-only provider relays bounded Stripe Standard adoption without an acco
   assert.equal(writer.appended.length, 0);
 });
 
+test('Stripe service verification survives the pinned peer-wallet wrapper', async () => {
+  const seed = b4a.alloc(sodium.crypto_sign_SEEDBYTES, 23);
+  const publicKey = b4a.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
+  const secretKey = b4a.alloc(sodium.crypto_sign_SECRETKEYBYTES);
+  sodium.crypto_sign_seed_keypair(publicKey, secretKey, seed);
+  const actor = b4a.toString(publicKey, 'hex');
+  const payload = stripeConnectAdoptValue(actor);
+  const envelope = {
+    actor,
+    admin: adminKey,
+    payload,
+    signing_version: 1,
+    transport: adminKey,
+  };
+  const signature = b4a.alloc(sodium.crypto_sign_BYTES);
+  sodium.crypto_sign_detached(
+    signature,
+    b4a.from(serviceSigningMessage('stripe_connect_adopt', envelope)),
+    secretKey
+  );
+
+  const writer = peerFor(adminKey, { writable: true });
+  writer.peer.wallet.verify = () => {
+    throw new TypeError('pinned peer-wallet wrapper has no static verifier');
+  };
+  const feature = new MayhemFeature(writer.peer, {
+    async serviceHandler(service, value) {
+      assert.equal(service, 'stripe_connect_adopt');
+      assert.deepEqual(value, payload);
+      return { ok: true };
+    },
+  });
+  feature.key = 'mayhem';
+
+  const result = await feature.requestService('stripe_connect_adopt', {
+    ...envelope,
+    signature: b4a.toString(signature, 'hex'),
+  });
+  assert.deepEqual(result, { ok: true });
+});
+
 test('Stripe Standard adoption rejects typed accounts, stale consent, and forged actors locally', async () => {
   const transport = peerFor(otherKey);
   const signer = peerFor(providerKey);

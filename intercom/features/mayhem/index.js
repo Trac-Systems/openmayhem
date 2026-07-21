@@ -40,19 +40,25 @@ const STRIPE_CONNECT_ADOPT_CONSENT_MAX_SECONDS = 600;
 const normalizeKey = (value) => String(value ?? '').trim().toLowerCase();
 
 const verifyEd25519Hex = (wallet, signature, message, publicKey) => {
-  if (typeof wallet?.verify !== 'function' ||
-      !/^[0-9a-f]{128}$/.test(signature) ||
+  if (!/^[0-9a-f]{128}$/.test(signature) ||
       !/^[0-9a-f]{64}$/.test(publicKey) ||
       !b4a.isBuffer(message) ||
       message.length === 0) {
     return false;
   }
+  const signatureBytes = b4a.from(signature, 'hex');
+  const publicKeyBytes = b4a.from(publicKey, 'hex');
   try {
-    return wallet.verify(
-      b4a.from(signature, 'hex'),
-      message,
-      b4a.from(publicKey, 'hex')
-    ) === true;
+    if (typeof PeerWallet?.verify === 'function' &&
+        PeerWallet.verify(signatureBytes, message, publicKeyBytes) === true) {
+      return true;
+    }
+  } catch (_error) {
+    // Fall through to the peer wallet for older dependency layouts.
+  }
+  try {
+    return typeof wallet?.verify === 'function' &&
+      wallet.verify(signatureBytes, message, publicKeyBytes) === true;
   } catch (_error) {
     return false;
   }
