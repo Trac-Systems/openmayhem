@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${MAYHEM_MACOS_VERSION:-0.2.32}"
+VERSION="${MAYHEM_MACOS_VERSION:-0.2.33}"
 DIST_REL="${MAYHEM_MACOS_DIST_REL:-dist/macos-local-install-check}"
 DIST_DIR="${MAYHEM_MACOS_DIST_DIR:-$ROOT_DIR/$DIST_REL}"
 SKIP_BUILD="${MAYHEM_MACOS_SKIP_BUILD:-0}"
@@ -44,7 +44,7 @@ install.sh. The check verifies:
 
 Environment:
   MAYHEM_MACOS_VERSION       Artifact version string
-                             (default: 0.2.32; canonical semver is required)
+                             (default: 0.2.33; canonical semver is required)
   MAYHEM_MACOS_DIST_DIR      Dist output directory
                              (default: dist/macos-local-install-check)
   MAYHEM_MACOS_SKIP_BUILD    Use existing target/release binaries when set to 1

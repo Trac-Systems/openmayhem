@@ -247,7 +247,7 @@ jobs:
           import { verifyStartupReleaseIdentity } from './intercom/src/release-identity.js';
 
           const identity = verifyStartupReleaseIdentity({ rootDir: path.resolve('intercom') });
-          if (identity.releaseVersion !== '0.2.32' || identity.contractVersion !== 14) {
+          if (identity.releaseVersion !== '0.2.33' || identity.contractVersion !== 14) {
             throw new Error(`unexpected release identity: ${JSON.stringify(identity)}`);
           }
           NODE
@@ -292,7 +292,7 @@ jobs:
           } >>"$GITHUB_STEP_SUMMARY"
 
           version="$($release_dir/mayhem$EXE --version | tr -d '\r')"
-          [[ "$version" == "mayhem 0.2.32" ]] || {
+          [[ "$version" == "mayhem 0.2.33" ]] || {
             printf 'unexpected mayhem version: %s\n' "$version" >&2
             exit 1
           }

@@ -52,14 +52,14 @@ gateway is loopback-only; a public ledger records prices, receipts, settlements.
 ## 3. Install
 
 ### 3.1 Get the code — exact source release (MANDATORY rule)
-- `v0.2.32` is source-only. Never invent or offer a native archive URL: the release has no unsigned
+- `v0.2.33` is source-only. Never invent or offer a native archive URL: the release has no unsigned
   OpenMayhem executable assets. Clone the exact release tag and build it locally.
 
   **macOS/Linux:**
   ```bash
   git clone https://github.com/Trac-Systems/openmayhem.git
   cd openmayhem
-  git checkout --detach v0.2.32
+  git checkout --detach v0.2.33
   ./install.sh --from-source
   ```
 
@@ -67,7 +67,7 @@ gateway is loopback-only; a public ledger records prices, receipts, settlements.
   ```powershell
   git clone https://github.com/Trac-Systems/openmayhem.git
   Set-Location openmayhem
-  git checkout --detach v0.2.32
+  git checkout --detach v0.2.33
   .\install.ps1 -FromSource
   ```
 Everything installs under `~/.mayhem/` — no `sudo`, no system directories.
@@ -477,8 +477,8 @@ forwarded as-is.
 
 | Goal | Command |
 |---|---|
-| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.32 && ./install.sh --from-source` |
-| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.32; .\install.ps1 -FromSource` |
+| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.33 && ./install.sh --from-source` |
+| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.33; .\install.ps1 -FromSource` |
 | Start user gateway | `mayhem up --rail <fiat\|tap\|tnk> --yes` |
 | Start provider | `mayhem up --provider --yes` |
 | Stop and leave provider registrations | `mayhem down` |

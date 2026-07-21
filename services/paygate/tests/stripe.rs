@@ -847,6 +847,18 @@ fn stripe_adopt_request(provider: &str, request_nonce: &str) -> Value {
     })
 }
 
+fn stripe_oauth_state(response: &Value) -> String {
+    let url = response["onboarding"]["url"]
+        .as_str()
+        .expect("Stripe OAuth consent URL");
+    reqwest::Url::parse(url)
+        .expect("valid Stripe OAuth consent URL")
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .map(|(_, value)| value.into_owned())
+        .expect("Stripe OAuth state")
+}
+
 fn succeeded_payment_payload(event_id: &str, payment_intent: &str) -> String {
     json!({
         "id": event_id,
@@ -1940,6 +1952,16 @@ async fn stripe_connect_relink_requires_and_replays_verified_standard_oauth_cons
     let (status, _) = get_request(app.clone(), &substituted_callback).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     *capture.oauth_account_id.lock().await = None;
+
+    let (status, relink) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/stripe/connect/relink",
+        stripe_relink_request(&"b".repeat(64), &"a".repeat(64), &"3".repeat(64)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let oauth_state = stripe_oauth_state(&relink);
     *capture.oauth_livemode.lock().await = true;
     let crossover_callback = format!(
         "/v1/stripe/connect/relink/return?state={oauth_state}&code=ac_wrong_mode&scope=read_write"
@@ -1958,6 +1980,16 @@ async fn stripe_connect_relink_requires_and_replays_verified_standard_oauth_cons
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, relink) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/stripe/connect/relink",
+        stripe_relink_request(&"b".repeat(64), &"a".repeat(64), &"4".repeat(64)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let oauth_state = stripe_oauth_state(&relink);
 
     let callback = format!(
         "/v1/stripe/connect/relink/return?state={oauth_state}&code=ac_test_consent&scope=read_write"
@@ -1998,7 +2030,7 @@ async fn stripe_connect_relink_requires_and_replays_verified_standard_oauth_cons
     drop(requests);
     let consent_log = std::fs::read_to_string(temp.path().join("stripe-connect-consents.jsonl"))
         .expect("consent log");
-    assert_eq!(consent_log.lines().count(), 2);
+    assert_eq!(consent_log.lines().count(), 4);
 
     let reloaded = PaygateState::try_new_with_contract_poster(
         config,
@@ -2111,11 +2143,35 @@ async fn stripe_connect_adopts_metadata_free_standard_account_with_single_use_oa
     assert_eq!(status, StatusCode::BAD_REQUEST);
     *capture.oauth_scope.lock().await = None;
 
+    let (status, adopt) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/stripe/connect/adopt",
+        stripe_adopt_request(&"b".repeat(64), &"3".repeat(64)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let state_token = stripe_oauth_state(&adopt);
+    let callback = format!(
+        "/v1/stripe/connect/adopt/return?state={state_token}&code=ac_adopt_mode&scope=read_write"
+    );
     *capture.oauth_livemode.lock().await = true;
     let (status, _) = get_request(app.clone(), &callback).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     *capture.oauth_livemode.lock().await = false;
 
+    let (status, adopt) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/stripe/connect/adopt",
+        stripe_adopt_request(&"b".repeat(64), &"4".repeat(64)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let state_token = stripe_oauth_state(&adopt);
+    let callback = format!(
+        "/v1/stripe/connect/adopt/return?state={state_token}&code=ac_adopt_success&scope=read_write"
+    );
     let (status, body) = get_request(app.clone(), &callback).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body.contains("consent verified"));

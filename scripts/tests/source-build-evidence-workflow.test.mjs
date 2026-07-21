@@ -27,7 +27,7 @@ requireText('[[ "$WORKFLOW_SHA" == "$SOURCE_SHA" ]]', 'workflow bytes are not bo
 requireText('cargo "${args[@]}"', 'native build command is missing');
 requireText('build --release --workspace --bins --locked --target "$TARGET"',
   'native build is not fresh, locked, release, workspace-wide, and target-bound');
-requireText("identity.releaseVersion !== '0.2.32' || identity.contractVersion !== 14",
+requireText("identity.releaseVersion !== '0.2.33' || identity.contractVersion !== 14",
   'release and contract identity gate is stale');
 
 const entries = [...workflow.matchAll(

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_IMAGE="${MAYHEM_DOCKER_BUILD_IMAGE:-rust:1.89-bookworm}"
 INSTALL_IMAGE="${MAYHEM_DOCKER_INSTALL_IMAGE:-debian:bookworm-slim}"
-VERSION="${MAYHEM_DOCKER_VERSION:-0.2.32}"
+VERSION="${MAYHEM_DOCKER_VERSION:-0.2.33}"
 DIST_REL="${MAYHEM_DOCKER_DIST_REL:-dist/docker-linux-install-check}"
 DIST_DIR="${MAYHEM_DOCKER_DIST_DIR:-$ROOT_DIR/$DIST_REL}"
 CARGO_CACHE="${MAYHEM_DOCKER_CARGO_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/mayhem/docker-cargo}"
@@ -50,7 +50,7 @@ container using the generated .sha256 sidecar. The check verifies:
 Environment:
   MAYHEM_DOCKER_BUILD_IMAGE    Rust image (default: rust:1.89-bookworm)
   MAYHEM_DOCKER_INSTALL_IMAGE  Clean install image (default: debian:bookworm-slim)
-  MAYHEM_DOCKER_VERSION        Artifact version string (default: 0.2.32)
+  MAYHEM_DOCKER_VERSION        Artifact version string (default: 0.2.33)
   MAYHEM_DOCKER_DIST_DIR       Dist output directory (default: dist/docker-linux-install-check)
   MAYHEM_DOCKER_CARGO_CACHE    Cargo cache mount (default: ~/.cache/mayhem/docker-cargo)
   MAYHEM_DOCKER_BUILD_APT_PACKAGES

@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { MAINNET_MSB, proveMainnet, validateMainnetState } from '../mainnet-proof.mjs';
+import {
+  MAINNET_MSB,
+  proveMainnet,
+  validateCanonicalPaymentsState,
+  validateMainnetState,
+} from '../mainnet-proof.mjs';
 
 function status(overrides = {}) {
   return {
@@ -17,18 +22,61 @@ function status(overrides = {}) {
   };
 }
 
+function payments(overrides = {}) {
+  return {
+    key: 'payments/current',
+    confirmed: true,
+    value: {
+      denom: 'au_usd',
+      rails: ['fiat', 'tap', 'tnk'],
+      fiat: {
+        processor: 'stripe',
+        integration_currency: 'usd',
+        adaptive_pricing: true,
+        payout_currencies: ['eur', 'gbp', 'usd'],
+        locale: 'en',
+      },
+      tap: {
+        chain_id: 1,
+        token_address: '0x5e7f6e008c6d9d7ad4c7eb75bd4ce62864cc7454',
+        pool_address: '0xcfea9a256f1f96269d848cabf1ecb00fd2dd6a28',
+      },
+      tnk: {
+        network: 'mainnet',
+        treasury_address: 'trac1f3w8ja3qxcnmzzmxxt8m0ystdf683sy5arnhxvz0h7a8ydd0kqwq3lcgdh',
+      },
+      ver: 5,
+      updated_at: 'a'.repeat(64),
+      set_by: 'b'.repeat(64),
+      set_by_role: 'admin',
+      ...overrides,
+    },
+  };
+}
+
 test('mainnet proof requires both Ethereum and live official MSB evidence', () => {
-  assert.equal(validateMainnetState(1, status()).ok, true);
-  assert.match(validateMainnetState(5, status()).failures.join(' '), /chainId/);
-  assert.match(validateMainnetState(1, status({ networkId: 919 })).failures.join(' '), /networkId/);
-  assert.match(validateMainnetState(1, status({ channel: 'testnet' })).failures.join(' '), /channel/);
-  assert.match(validateMainnetState(1, status({ connectedValidators: 0 })).failures.join(' '), /validator/);
+  assert.equal(validateMainnetState(1, status(), payments()).ok, true);
+  assert.match(validateMainnetState(5, status(), payments()).failures.join(' '), /chainId/);
+  assert.match(validateMainnetState(1, status({ networkId: 919 }), payments()).failures.join(' '), /networkId/);
+  assert.match(validateMainnetState(1, status({ channel: 'testnet' }), payments()).failures.join(' '), /channel/);
+  assert.match(validateMainnetState(1, status({ connectedValidators: 0 }), payments()).failures.join(' '), /validator/);
+});
+
+test('mainnet proof rejects the retired fiat currencies schema before service startup', () => {
+  const legacy = payments();
+  legacy.value.fiat = { processor: 'stripe', currencies: ['usd', 'eur'], locale: 'en' };
+  const report = validateCanonicalPaymentsState(legacy);
+  assert.equal(report.ok, false);
+  assert.match(report.failures.join(' '), /fiat schema is incompatible/);
 });
 
 test('mainnet proof returns only verified public network evidence', async () => {
-  const fetchImpl = async (_url, options) => {
+  const fetchImpl = async (url, options) => {
     if (options?.method === 'POST') {
       return { ok: true, json: async () => ({ jsonrpc: '2.0', result: '0x1' }) };
+    }
+    if (String(url).includes('state?key=payments%2Fcurrent')) {
+      return { ok: true, json: async () => payments() };
     }
     return { ok: true, json: async () => status() };
   };
@@ -46,9 +94,12 @@ test('mainnet proof returns only verified public network evidence', async () => 
 
 test('mainnet proof timeout zero keeps polling until healthy convergence', async () => {
   let statusCalls = 0;
-  const fetchImpl = async (_url, options) => {
+  const fetchImpl = async (url, options) => {
     if (options?.method === 'POST') {
       return { ok: true, json: async () => ({ jsonrpc: '2.0', result: '0x1' }) };
+    }
+    if (String(url).includes('state?key=payments%2Fcurrent')) {
+      return { ok: true, json: async () => payments() };
     }
     statusCalls += 1;
     return {

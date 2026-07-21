@@ -181,15 +181,129 @@ grep -Fq \
   'append_default MAYHEM_STRIPE_CONNECT_CONSENTS_PATH "$root/.mayhem-local/paygate/stripe-connect-consents.jsonl"' \
   "$ROOT_DIR/scripts/install-mainnet-systemd.sh" ||
   fail "mainnet install does not persist Stripe OAuth consent state privately"
-grep -Fq "require_prefix MAYHEM_STRIPE_CONNECT_OAUTH_CLIENT_ID 'ca_'" \
+grep -Fq "append_default MAYHEM_STRIPE_CONNECT_OAUTH_BRIDGE_URL ''" \
   "$ROOT_DIR/scripts/install-mainnet-systemd.sh" ||
-  fail "mainnet install does not require the live Stripe Connect OAuth client"
-grep -Fq "require_prefix MAYHEM_STRIPE_CONNECT_OAUTH_REDIRECT_URL 'https://'" \
+  fail "mainnet install does not default the optional Stripe OAuth bridge URL"
+grep -Fq "append_default MAYHEM_STRIPE_CONNECT_OAUTH_BRIDGE_SECRET_FILE ''" \
   "$ROOT_DIR/scripts/install-mainnet-systemd.sh" ||
-  fail "mainnet install does not require an HTTPS Stripe OAuth callback"
+  fail "mainnet install does not default the optional Stripe OAuth bridge secret file"
 grep -Fq 'ensure_private_random_secret_file \' \
   "$ROOT_DIR/scripts/install-mainnet-systemd.sh" ||
   fail "mainnet install does not initialize the private paygate authentication secret"
+
+oauth_require_equal="$(
+  sed -n '/^require_equal() {/,/^}/p' \
+    "$ROOT_DIR/scripts/install-mainnet-systemd.sh"
+)"
+oauth_require_prefix="$(
+  sed -n '/^require_prefix() {/,/^}/p' \
+    "$ROOT_DIR/scripts/install-mainnet-systemd.sh"
+)"
+oauth_require_https_url="$(
+  sed -n '/^require_https_url() {/,/^}/p' \
+    "$ROOT_DIR/scripts/install-mainnet-systemd.sh"
+)"
+oauth_validator="$(
+  sed -n '/^validate_stripe_oauth_config() {/,/^}/p' \
+    "$ROOT_DIR/scripts/install-mainnet-systemd.sh"
+)"
+[[ -n "$oauth_require_equal" && -n "$oauth_require_prefix" &&
+  -n "$oauth_require_https_url" && -n "$oauth_validator" ]] ||
+  fail "mainnet Stripe OAuth installer validation functions are missing"
+
+run_oauth_validation() {
+  local expected_secret_calls="$1"
+  shift
+  (
+    local oauth_client_id='' oauth_redirect_url='' oauth_bridge_url=''
+    local oauth_bridge_secret_file='' oauth_token_url='https://connect.stripe.com/oauth/token'
+    local oauth_secret_calls=0 assignment key value
+    root='/opt/mayhem'
+
+    for assignment in "$@"; do
+      key="${assignment%%=*}"
+      value="${assignment#*=}"
+      case "$key" in
+        client_id) oauth_client_id="$value" ;;
+        redirect_url) oauth_redirect_url="$value" ;;
+        bridge_url) oauth_bridge_url="$value" ;;
+        bridge_secret_file) oauth_bridge_secret_file="$value" ;;
+        token_url) oauth_token_url="$value" ;;
+        *) fail "unknown Stripe OAuth test field: $key" ;;
+      esac
+    done
+
+    env_value() {
+      case "$1" in
+        MAYHEM_STRIPE_CONNECT_OAUTH_CLIENT_ID) printf '%s' "$oauth_client_id" ;;
+        MAYHEM_STRIPE_CONNECT_OAUTH_REDIRECT_URL) printf '%s' "$oauth_redirect_url" ;;
+        MAYHEM_STRIPE_CONNECT_OAUTH_BRIDGE_URL) printf '%s' "$oauth_bridge_url" ;;
+        MAYHEM_STRIPE_CONNECT_OAUTH_BRIDGE_SECRET_FILE) printf '%s' "$oauth_bridge_secret_file" ;;
+        MAYHEM_STRIPE_CONNECT_OAUTH_TOKEN_URL) printf '%s' "$oauth_token_url" ;;
+        *) return 1 ;;
+      esac
+    }
+    ensure_private_random_secret_file() {
+      [[ "$1" == 'MAYHEM_STRIPE_CONNECT_OAUTH_BRIDGE_SECRET_FILE' ]] || return 1
+      [[ "$2" == '/opt/mayhem/.mayhem-local/live-home/paygate/stripe-oauth-bridge.secret' ]] || return 1
+      [[ "$oauth_bridge_secret_file" == "$2" ]] || return 1
+      oauth_secret_calls=$((oauth_secret_calls + 1))
+    }
+    require_file_env() {
+      [[ "$1" == 'MAYHEM_STRIPE_CONNECT_OAUTH_BRIDGE_SECRET_FILE' &&
+        -n "$oauth_bridge_secret_file" ]]
+    }
+
+    eval "$oauth_require_equal"
+    eval "$oauth_require_prefix"
+    eval "$oauth_require_https_url"
+    eval "$oauth_validator"
+    validate_stripe_oauth_config || return $?
+    [[ "$oauth_secret_calls" == "$expected_secret_calls" ]]
+  )
+}
+
+oauth_complete=(
+  'client_id=ca_live_test'
+  'redirect_url=https://www.openmayhem.ai/api/stripe/connect/oauth/callback'
+  'bridge_url=https://www.openmayhem.ai/api/stripe/connect/oauth'
+  'bridge_secret_file=/opt/mayhem/.mayhem-local/live-home/paygate/stripe-oauth-bridge.secret'
+)
+run_oauth_validation 0 ||
+  fail "mainnet live install rejects an entirely unconfigured optional Stripe OAuth bridge"
+run_oauth_validation 1 "${oauth_complete[@]}" ||
+  fail "mainnet live install rejects a complete canonical Stripe OAuth bridge configuration"
+if run_oauth_validation 0 'client_id=ca_partial' >/dev/null 2>&1; then
+  fail "mainnet live install accepts a partial Stripe OAuth bridge configuration"
+fi
+if run_oauth_validation 0 "${oauth_complete[@]}" \
+  'redirect_url=https://www.openmayhem.ai/wrong/callback' >/dev/null 2>&1; then
+  fail "mainnet live install accepts a callback outside the configured OAuth bridge"
+fi
+if run_oauth_validation 0 "${oauth_complete[@]}" \
+  'bridge_url=http://www.openmayhem.ai/api/stripe/connect/oauth' \
+  'redirect_url=http://www.openmayhem.ai/api/stripe/connect/oauth/callback' >/dev/null 2>&1; then
+  fail "mainnet live install accepts a non-HTTPS Stripe OAuth bridge"
+fi
+if run_oauth_validation 0 "${oauth_complete[@]}" \
+  'bridge_url=https://operator@www.openmayhem.ai/api/stripe/connect/oauth' \
+  'redirect_url=https://operator@www.openmayhem.ai/api/stripe/connect/oauth/callback' >/dev/null 2>&1; then
+  fail "mainnet live install accepts credentials in the Stripe OAuth bridge URL"
+fi
+if run_oauth_validation 0 "${oauth_complete[@]}" \
+  'bridge_url=https:///api/stripe/connect/oauth' \
+  'redirect_url=https:///api/stripe/connect/oauth/callback' >/dev/null 2>&1; then
+  fail "mainnet live install accepts a Stripe OAuth bridge URL without a host"
+fi
+if run_oauth_validation 0 "${oauth_complete[@]}" \
+  'bridge_url=https://paygate.trac.network/api/stripe/connect/oauth' \
+  'redirect_url=https://paygate.trac.network/api/stripe/connect/oauth/callback' >/dev/null 2>&1; then
+  fail "mainnet live install accepts the retired paygate.trac.network OAuth bridge"
+fi
+if run_oauth_validation 0 "${oauth_complete[@]}" \
+  'token_url=https://example.invalid/oauth/token' >/dev/null 2>&1; then
+  fail "mainnet live install accepts a non-official Stripe OAuth token endpoint"
+fi
 grep -Fq '"$root/.mayhem-local/settlement/tap" \' \
   "$ROOT_DIR/scripts/install-mainnet-systemd.sh" ||
   fail "mainnet install does not explicitly own the TAP settlement spool root"
@@ -224,7 +338,7 @@ grep -F "MAYHEM_ALLOW_UNVERIFIED have been removed" "$ROOT_DIR/install.ps1" >/de
 for harness in \
   "$ROOT_DIR/scripts/macos-opencode-role-check.sh" \
   "$ROOT_DIR/scripts/docker-opencode-role-check.sh"; do
-  grep -F ':-0.2.32}' "$harness" >/dev/null ||
+  grep -F ':-0.2.33}' "$harness" >/dev/null ||
     fail "$harness does not default to canonical release semver"
   grep -F -- '--unsigned-layout' "$harness" >/dev/null ||
     fail "$harness does not explicitly request the unsigned test layout"

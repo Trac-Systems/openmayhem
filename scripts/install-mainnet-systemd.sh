@@ -84,6 +84,8 @@ append_default MAYHEM_STRIPE_CONNECT_RETURN_URL 'https://dashboard.stripe.com/'
 append_default MAYHEM_STRIPE_CONNECT_REFRESH_URL 'https://dashboard.stripe.com/'
 append_default MAYHEM_STRIPE_CONNECT_OAUTH_CLIENT_ID ''
 append_default MAYHEM_STRIPE_CONNECT_OAUTH_REDIRECT_URL ''
+append_default MAYHEM_STRIPE_CONNECT_OAUTH_BRIDGE_URL ''
+append_default MAYHEM_STRIPE_CONNECT_OAUTH_BRIDGE_SECRET_FILE ''
 append_default MAYHEM_STRIPE_CONNECT_OAUTH_TOKEN_URL 'https://connect.stripe.com/oauth/token'
 append_default MAYHEM_STRIPE_BACKFILL_ENABLED '1'
 append_default MAYHEM_STRIPE_BACKFILL_CURSOR_PATH "$root/.mayhem-local/paygate/stripe-backfill-cursor.json"
@@ -127,6 +129,36 @@ require_prefix() {
   value="$(env_value "$key")"
   [[ "$value" == "$prefix"* ]] || {
     echo "Refusing live install: $key is missing or has the wrong live-mode prefix." >&2
+    exit 1
+  }
+}
+
+require_https_url() {
+  local key="$1" value
+  value="$(env_value "$key")"
+  python3 - "$value" <<'PY' || {
+import sys
+from urllib.parse import urlsplit
+
+value = sys.argv[1]
+try:
+    parsed = urlsplit(value)
+    valid = (
+        parsed.scheme == "https"
+        and parsed.hostname is not None
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+        and parsed.path not in ("", "/")
+        and not value.endswith("/")
+        and not any(char.isspace() for char in value)
+    )
+except ValueError:
+    valid = False
+raise SystemExit(0 if valid else 1)
+PY
+    echo "Refusing live install: $key must be an HTTPS base URL without whitespace, query, fragment, or trailing slash." >&2
     exit 1
   }
 }
@@ -196,6 +228,52 @@ ensure_private_random_secret_file() {
   chown mayhem:mayhem "$path"
 }
 
+validate_stripe_oauth_config() {
+  local key configured=0 bridge_url redirect_url
+  local -a fields=(
+    MAYHEM_STRIPE_CONNECT_OAUTH_CLIENT_ID
+    MAYHEM_STRIPE_CONNECT_OAUTH_REDIRECT_URL
+    MAYHEM_STRIPE_CONNECT_OAUTH_BRIDGE_URL
+    MAYHEM_STRIPE_CONNECT_OAUTH_BRIDGE_SECRET_FILE
+  )
+
+  for key in "${fields[@]}"; do
+    if [[ -n "$(env_value "$key")" ]]; then
+      configured=1
+      break
+    fi
+  done
+  [[ "$configured" == "1" ]] || return 0
+
+  for key in "${fields[@]}"; do
+    [[ -n "$(env_value "$key")" ]] || {
+      echo "Refusing live install: Stripe Connect OAuth is partially configured; $key is required." >&2
+      return 1
+    }
+  done
+
+  require_prefix MAYHEM_STRIPE_CONNECT_OAUTH_CLIENT_ID 'ca_'
+  require_https_url MAYHEM_STRIPE_CONNECT_OAUTH_BRIDGE_URL
+  require_equal MAYHEM_STRIPE_CONNECT_OAUTH_TOKEN_URL 'https://connect.stripe.com/oauth/token'
+
+  bridge_url="$(env_value MAYHEM_STRIPE_CONNECT_OAUTH_BRIDGE_URL)"
+  redirect_url="$(env_value MAYHEM_STRIPE_CONNECT_OAUTH_REDIRECT_URL)"
+  [[ "$redirect_url" == "$bridge_url/callback" ]] || {
+    echo "Refusing live install: MAYHEM_STRIPE_CONNECT_OAUTH_REDIRECT_URL must equal MAYHEM_STRIPE_CONNECT_OAUTH_BRIDGE_URL plus /callback." >&2
+    return 1
+  }
+  [[ "$bridge_url" != *paygate.trac.network* &&
+    "$redirect_url" != *paygate.trac.network* ]] || {
+    echo "Refusing live install: the retired/nonexistent paygate.trac.network OAuth endpoint must not be used." >&2
+    return 1
+  }
+
+  ensure_private_random_secret_file \
+    MAYHEM_STRIPE_CONNECT_OAUTH_BRIDGE_SECRET_FILE \
+    "$root/.mayhem-local/live-home/paygate/stripe-oauth-bridge.secret"
+  require_file_env MAYHEM_STRIPE_CONNECT_OAUTH_BRIDGE_SECRET_FILE
+}
+
 require_live_rpc() {
   local key="$1" value
   value="$(env_value "$key")"
@@ -231,13 +309,6 @@ require_equal MAYHEM_PAYGATE_STRIPE_ENABLED '1'
 require_equal MAYHEM_STRIPE_MODE 'live'
 require_equal MAYHEM_STRIPE_API_BASE_URL 'https://api.stripe.com'
 require_prefix MAYHEM_STRIPE_SECRET_KEY 'sk_live_'
-require_prefix MAYHEM_STRIPE_CONNECT_OAUTH_CLIENT_ID 'ca_'
-require_prefix MAYHEM_STRIPE_CONNECT_OAUTH_REDIRECT_URL 'https://'
-require_equal MAYHEM_STRIPE_CONNECT_OAUTH_TOKEN_URL 'https://connect.stripe.com/oauth/token'
-[[ "$(env_value MAYHEM_STRIPE_CONNECT_OAUTH_REDIRECT_URL)" != *paygate.trac.network* ]] || {
-  echo "Refusing live install: the retired/nonexistent paygate.trac.network redirect must not be used." >&2
-  exit 1
-}
 command -v python3 >/dev/null 2>&1 || {
   echo "python3 is required to initialize private mainnet runtime authentication." >&2
   exit 1
@@ -246,6 +317,7 @@ ensure_private_random_secret_file \
   MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE \
   "$root/.mayhem-local/live-home/paygate/internal-auth.secret"
 require_file_env MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE
+validate_stripe_oauth_config
 require_equal MAYHEM_FIAT_SETTLEMENT_ENABLED '1'
 require_equal MAYHEM_TAP_SETTLEMENT_ENABLED '1'
 require_equal MAYHEM_TNK_SETTLEMENT_ENABLED '1'

@@ -8,6 +8,27 @@ export const MAINNET_MSB = Object.freeze({
   channel: '0000trac0network0msb0mainnet0000',
 });
 
+const PAYMENT_KEYS = Object.freeze([
+  'denom',
+  'fiat',
+  'rails',
+  'set_by',
+  'set_by_role',
+  'tap',
+  'tnk',
+  'updated_at',
+  'ver',
+]);
+const FIAT_KEYS = Object.freeze([
+  'adaptive_pricing',
+  'integration_currency',
+  'locale',
+  'payout_currencies',
+  'processor',
+]);
+const TAP_KEYS = Object.freeze(['chain_id', 'pool_address', 'token_address']);
+const TNK_KEYS = Object.freeze(['network', 'treasury_address']);
+
 function parseArgs(argv = process.argv.slice(2)) {
   const args = {};
   for (let i = 0; i < argv.length; i += 1) {
@@ -76,9 +97,87 @@ async function fetchWithTimeout(fetchImpl, input, init, timeoutMs) {
   }
 }
 
-export function validateMainnetState(chainId, status) {
-  const msb = status?.msb ?? {};
+function exactKeys(value, expected) {
+  return value !== null
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && JSON.stringify(Object.keys(value).sort()) === JSON.stringify(expected);
+}
+
+function isLowerHex(value, length) {
+  return typeof value === 'string' && new RegExp(`^[0-9a-f]{${length}}$`).test(value);
+}
+
+function isEthereumAddress(value) {
+  return typeof value === 'string' && /^0x[0-9a-f]{40}$/.test(value);
+}
+
+export function validateCanonicalPaymentsState(state) {
   const failures = [];
+  const payments = state?.value;
+  if (state?.confirmed !== true) failures.push('payments/current is not confirmed');
+  if (!exactKeys(payments, PAYMENT_KEYS)) {
+    failures.push('payments/current has an incompatible top-level schema');
+  }
+  if (payments?.denom !== 'au_usd') failures.push('payments/current denom is not au_usd');
+  if (JSON.stringify(payments?.rails) !== JSON.stringify(['fiat', 'tap', 'tnk'])) {
+    failures.push('payments/current rails are not exactly fiat,tap,tnk');
+  }
+  if (!Number.isSafeInteger(payments?.ver) || payments.ver <= 0) {
+    failures.push('payments/current version is not positive');
+  }
+  if (payments?.set_by_role !== 'admin' || !isLowerHex(payments?.set_by, 64)) {
+    failures.push('payments/current is not attributed to a canonical admin identity');
+  }
+
+  const fiat = payments?.fiat;
+  if (!exactKeys(fiat, FIAT_KEYS)) {
+    failures.push('payments/current fiat schema is incompatible');
+  }
+  if (fiat?.processor !== 'stripe') failures.push('payments/current fiat processor is not stripe');
+  if (fiat?.integration_currency !== 'usd') {
+    failures.push('payments/current Stripe integration currency is not usd');
+  }
+  if (fiat?.adaptive_pricing !== true) {
+    failures.push('payments/current Stripe Adaptive Pricing is not enabled');
+  }
+  if (fiat?.locale !== 'en') failures.push('payments/current Stripe locale is not en');
+  const payoutCurrencies = fiat?.payout_currencies;
+  if (!Array.isArray(payoutCurrencies)
+      || payoutCurrencies.length < 3
+      || payoutCurrencies.some((currency) => !/^[a-z]{3}$/.test(currency))
+      || new Set(payoutCurrencies).size !== payoutCurrencies.length
+      || JSON.stringify(payoutCurrencies) !== JSON.stringify([...payoutCurrencies].sort())
+      || !['eur', 'gbp', 'usd'].every((currency) => payoutCurrencies.includes(currency))) {
+    failures.push('payments/current Stripe payout currencies are invalid');
+  }
+
+  const tap = payments?.tap;
+  if (!exactKeys(tap, TAP_KEYS)) failures.push('payments/current TAP schema is incompatible');
+  if (!Number.isSafeInteger(tap?.chain_id) || tap.chain_id <= 0) {
+    failures.push('payments/current TAP chain id is invalid');
+  }
+  if (!isEthereumAddress(tap?.token_address) || !isEthereumAddress(tap?.pool_address)) {
+    failures.push('payments/current TAP addresses are invalid');
+  }
+
+  const tnk = payments?.tnk;
+  if (!exactKeys(tnk, TNK_KEYS)) failures.push('payments/current TNK schema is incompatible');
+  if (tnk?.network !== 'mainnet' || !/^trac1[a-z0-9]{20,120}$/.test(tnk?.treasury_address ?? '')) {
+    failures.push('payments/current TNK mainnet directory is invalid');
+  }
+
+  return {
+    ok: failures.length === 0,
+    failures,
+    version: Number.isSafeInteger(payments?.ver) ? payments.ver : null,
+  };
+}
+
+export function validateMainnetState(chainId, status, paymentsState) {
+  const msb = status?.msb ?? {};
+  const payments = validateCanonicalPaymentsState(paymentsState);
+  const failures = [...payments.failures];
   if (chainId !== 1) failures.push(`Ethereum chainId is ${chainId ?? 'missing'}, expected 1`);
   if (msb.ready !== true) failures.push('MSB is not ready');
   if (msb.networkId !== MAINNET_MSB.networkId) {
@@ -108,6 +207,10 @@ export function validateMainnetState(chainId, status) {
       signed_length: msb.signedLength ?? null,
       connected_validators: msb.connectedValidators ?? null,
     },
+    payments: {
+      version: payments.version,
+      schema_valid: payments.ok,
+    },
   };
 }
 
@@ -129,7 +232,7 @@ export async function proveMainnet({
 
   do {
     try {
-      const [chainResponse, statusResponse] = await Promise.all([
+      const [chainResponse, statusResponse, paymentsResponse] = await Promise.all([
         fetchWithTimeout(fetchImpl, ethRpc, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -141,15 +244,22 @@ export async function proveMainnet({
           undefined,
           attemptTimeout,
         ),
+        fetchWithTimeout(
+          fetchImpl,
+          new URL('state?key=payments%2Fcurrent', rpcBase(peerRpc)),
+          undefined,
+          attemptTimeout,
+        ),
       ]);
-      const [chainBody, status] = await Promise.all([
+      const [chainBody, status, paymentsState] = await Promise.all([
         responseJson(chainResponse, 'Ethereum RPC'),
         responseJson(statusResponse, 'peer status'),
+        responseJson(paymentsResponse, 'payments/current'),
       ]);
       const chainId = typeof chainBody?.result === 'string'
         ? Number.parseInt(chainBody.result, 16)
         : null;
-      const report = validateMainnetState(chainId, status);
+      const report = validateMainnetState(chainId, status, paymentsState);
       if (report.ok) return report;
       last = report.failures.join('; ');
     } catch (error) {
