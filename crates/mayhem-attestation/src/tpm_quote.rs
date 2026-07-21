@@ -788,6 +788,7 @@ mod tests {
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
     use rsa::{
+        pkcs1::EncodeRsaPublicKey,
         pkcs1v15::SigningKey as RsaSigningKey,
         pss::SigningKey as RsaPssSigningKey,
         signature::{RandomizedSigner, SignatureEncoding, Signer},
@@ -822,8 +823,13 @@ mod tests {
             VERIFY_AT_UNIX,
         )
         .unwrap();
-        assert!(matches!(rsa.public_key, EkPublicKey::Rsa(_)));
-        assert_eq!(rsa.device_id.len(), 64);
+        let EkPublicKey::Rsa(rsa_key) = &rsa.public_key else {
+            panic!("fixture did not expose an RSA EK");
+        };
+        assert_eq!(
+            rsa.device_id,
+            hex::encode(Sha256::digest(rsa_key.to_pkcs1_der().unwrap().as_bytes()))
+        );
 
         let ecc = verify_ek_certificate_chain(
             &[fixture_der(ECC_EK_B64), intermediate],
@@ -831,7 +837,13 @@ mod tests {
             VERIFY_AT_UNIX,
         )
         .unwrap();
-        assert!(matches!(ecc.public_key, EkPublicKey::EccP256(_)));
+        let EkPublicKey::EccP256(ecc_key) = &ecc.public_key else {
+            panic!("fixture did not expose a P-256 EK");
+        };
+        assert_eq!(
+            ecc.device_id,
+            hex::encode(Sha256::digest(ecc_key.to_encoded_point(false).as_bytes()))
+        );
         assert!(P256PublicKey::from_public_key_der(&ecc.canonical_spki_der).is_ok());
     }
 

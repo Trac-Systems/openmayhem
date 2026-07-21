@@ -148,7 +148,9 @@ sealed class WindowsEkEvidence
     public static WindowsEkEvidence Read()
     {
         var pcpBlob = ReadPcpRsaPublicBlob();
-        var pcpSpki = RsaSpki(RsaParameters(pcpBlob));
+        var pcpParameters = RsaParameters(pcpBlob);
+        var pcpSpki = RsaSpki(pcpParameters);
+        var deviceIdentity = RsaPublicKey(pcpParameters);
         var candidates = ReadEkCertificates().ToArray();
         var certificate = candidates
             .FirstOrDefault(candidate => CertificateSpki(candidate).SequenceEqual(pcpSpki));
@@ -169,7 +171,8 @@ sealed class WindowsEkEvidence
         var chain = new List<byte[]> { certificate.RawData };
         using var builder = new X509Chain();
         builder.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck;
-        builder.ChainPolicy.DisableCertificateDownloads = true;
+        builder.ChainPolicy.DisableCertificateDownloads = false;
+        builder.ChainPolicy.UrlRetrievalTimeout = TimeSpan.FromSeconds(10);
         _ = builder.Build(certificate);
         foreach (var element in builder.ChainElements.Cast<X509ChainElement>())
         {
@@ -185,7 +188,7 @@ sealed class WindowsEkEvidence
         return new WindowsEkEvidence
         {
             CanonicalSpki = canonicalSpki,
-            DeviceKey = Hex(SHA256.HashData(certificate.RawData)),
+            DeviceKey = Hex(SHA256.HashData(deviceIdentity)),
             Certificate = certificate,
             Chain = chain,
         };
@@ -261,6 +264,13 @@ sealed class WindowsEkEvidence
         using var rsa = RSA.Create();
         rsa.ImportParameters(parameters);
         return rsa.ExportSubjectPublicKeyInfo();
+    }
+
+    static byte[] RsaPublicKey(RSAParameters parameters)
+    {
+        using var rsa = RSA.Create();
+        rsa.ImportParameters(parameters);
+        return rsa.ExportRSAPublicKey();
     }
 
     static byte[] CertificateSpki(X509Certificate2 certificate)
@@ -653,6 +663,11 @@ static class Program
         {
             throw new InvalidOperationException("TPM quote failed local verification");
         }
+        if (quoteSignature is not SignatureRsassa rsassa ||
+            rsassa.hash != TpmAlgId.Sha256)
+        {
+            throw new InvalidOperationException("TPM quote is not RSASSA-SHA256");
+        }
 
         var pcrOutput = new List<Dictionary<string, object?>>();
         for (var index = 0; index < pcrIndices.Length; index++)
@@ -678,7 +693,7 @@ static class Program
             ["ak_name_b64"] = akNameB64,
             ["quote_attest_b64"] = Convert.ToBase64String(quotedInfo.GetTpmRepresentation()),
             ["quote_signature_b64"] =
-                Convert.ToBase64String(Marshaller.GetTpmRepresentation(quoteSignature)),
+                Convert.ToBase64String(EncodeQuoteSignature(rsassa)),
             ["pcr_values"] = pcrOutput,
         };
         var hardwareQuote = new Dictionary<string, object?>
@@ -740,9 +755,8 @@ static class Program
             throw new InvalidOperationException("TPM activation replay cache is full");
         }
 
-        var credentialBlob = UnwrapTpm2b(challenge.CredentialBlob, "credential_blob_b64");
+        var credential = ParseCredentialBlob(challenge.CredentialBlob);
         var encryptedSecret = UnwrapTpm2b(challenge.EncryptedSecret, "encrypted_secret_b64");
-        var credential = Marshaller.FromTpmRepresentation<IdObject>(credentialBlob);
         var policy = StartEndorsementPolicy(tpm);
         byte[] activated;
         try
@@ -1128,6 +1142,49 @@ static class Program
         return encoded.AsSpan(2).ToArray();
     }
 
+    internal static IdObject ParseCredentialBlob(byte[] encoded)
+    {
+        var body = UnwrapTpm2b(encoded, "credential_blob_b64");
+        var offset = 0;
+        var integrityHmac = ReadTpm2b(body, ref offset, "credential_blob_b64.integrity_hmac");
+        var encryptedIdentity = ReadTpm2b(
+            body,
+            ref offset,
+            "credential_blob_b64.encrypted_identity");
+        if (offset != body.Length || integrityHmac.Length != 32 || encryptedIdentity.Length == 0)
+        {
+            throw new InvalidOperationException(
+                "credential_blob_b64 is not one canonical SHA-256 TPM2B_ID_OBJECT");
+        }
+        return new IdObject(integrityHmac, encryptedIdentity);
+    }
+
+    internal static byte[] EncodeQuoteSignature(SignatureRsassa signature)
+    {
+        var body = Marshaller.GetTpmRepresentation(signature);
+        var encoded = new byte[2 + body.Length];
+        BinaryPrimitives.WriteUInt16BigEndian(encoded.AsSpan(0, 2), 0x0014);
+        body.CopyTo(encoded, 2);
+        return encoded;
+    }
+
+    static byte[] ReadTpm2b(byte[] encoded, ref int offset, string field)
+    {
+        if (offset < 0 || offset > encoded.Length - 2)
+        {
+            throw new InvalidOperationException($"{field} is not one bounded TPM2B value");
+        }
+        var length = BinaryPrimitives.ReadUInt16BigEndian(encoded.AsSpan(offset, 2));
+        offset += 2;
+        if (length > encoded.Length - offset)
+        {
+            throw new InvalidOperationException($"{field} is not one bounded TPM2B value");
+        }
+        var value = encoded.AsSpan(offset, length).ToArray();
+        offset += length;
+        return value;
+    }
+
     static byte[] DecodeCanonicalBase64(string encoded, int maximumBytes, string field)
     {
         byte[] decoded;
@@ -1228,59 +1285,53 @@ static class Program
 }
 '@
 
-if (-not (Test-Path $csprojPath) -or ((Get-Content -Raw $csprojPath) -ne $csproj)) {
-  Set-Content -Path $csprojPath -Value $csproj -Encoding UTF8
-}
-if (-not (Test-Path $programPath) -or ((Get-Content -Raw $programPath) -ne $program)) {
-  Set-Content -Path $programPath -Value $program -Encoding UTF8
-}
-
 $sourceBytes = [Text.Encoding]::UTF8.GetBytes($csproj + "`n--PROGRAM--`n" + $program)
 $sourceDigest = [Security.Cryptography.SHA256]::Create().ComputeHash($sourceBytes)
 $sourceHash = -join ($sourceDigest | ForEach-Object { $_.ToString("x2") })
 $outputRoot = Join-Path $helperRoot "bin\Release\$targetFramework"
 $helperExe = Join-Path $outputRoot "MayhemTpm2ProviderHelper.exe"
-$stampMatches = (Test-Path $buildStampPath) -and
-  ((Get-Content -Raw $buildStampPath).Trim() -eq $sourceHash)
-
-if (-not $stampMatches -or -not (Test-Path $helperExe)) {
-  $rootDigest = [Security.Cryptography.SHA256]::Create().ComputeHash(
-    [Text.Encoding]::UTF8.GetBytes($helperRoot.ToLowerInvariant())
-  )
-  $rootHash = -join ($rootDigest | ForEach-Object { $_.ToString("x2") })
-  $buildMutex = New-Object Threading.Mutex(
-    $false,
-    "Local\MayhemTpm2ProviderHelper-$($rootHash.Substring(0,16))"
-  )
-  $mutexHeld = $false
+$rootDigest = [Security.Cryptography.SHA256]::Create().ComputeHash(
+  [Text.Encoding]::UTF8.GetBytes($helperRoot.ToLowerInvariant())
+)
+$rootHash = -join ($rootDigest | ForEach-Object { $_.ToString("x2") })
+$buildMutex = New-Object Threading.Mutex(
+  $false,
+  "Local\MayhemTpm2ProviderHelper-$($rootHash.Substring(0,16))"
+)
+$mutexHeld = $false
+try {
   try {
-    try {
-      $mutexHeld = $buildMutex.WaitOne([TimeSpan]::FromMinutes(10))
-    } catch [Threading.AbandonedMutexException] {
-      $mutexHeld = $true
-    }
-    if (-not $mutexHeld) {
-      Fail "timed out waiting for another TPM helper build"
-    }
-    $stampMatches = (Test-Path $buildStampPath) -and
-      ((Get-Content -Raw $buildStampPath).Trim() -eq $sourceHash)
-    if (-not $stampMatches -or -not (Test-Path $helperExe)) {
-      & $dotnetPath restore $csprojPath --nologo | Out-Null
-      if ($LASTEXITCODE -ne 0) {
-        Fail "dotnet restore failed for Microsoft.TSS"
-      }
-      & $dotnetPath build $csprojPath -c Release --no-restore --nologo | Out-Null
-      if ($LASTEXITCODE -ne 0 -or -not (Test-Path $helperExe)) {
-        Fail "building the Windows TPM provider helper failed"
-      }
-      Set-Content -Path $buildStampPath -Value $sourceHash -Encoding ASCII
-    }
-  } finally {
-    if ($mutexHeld) {
-      $null = $buildMutex.ReleaseMutex()
-    }
-    $buildMutex.Dispose()
+    $mutexHeld = $buildMutex.WaitOne([TimeSpan]::FromMinutes(10))
+  } catch [Threading.AbandonedMutexException] {
+    $mutexHeld = $true
   }
+  if (-not $mutexHeld) {
+    Fail "timed out waiting for another TPM helper build"
+  }
+  if (-not (Test-Path $csprojPath) -or ((Get-Content -Raw $csprojPath) -ne $csproj)) {
+    Set-Content -Path $csprojPath -Value $csproj -Encoding UTF8
+  }
+  if (-not (Test-Path $programPath) -or ((Get-Content -Raw $programPath) -ne $program)) {
+    Set-Content -Path $programPath -Value $program -Encoding UTF8
+  }
+  $stampMatches = (Test-Path $buildStampPath) -and
+    ((Get-Content -Raw $buildStampPath).Trim() -eq $sourceHash)
+  if (-not $stampMatches -or -not (Test-Path $helperExe)) {
+    & $dotnetPath restore $csprojPath --nologo | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      Fail "dotnet restore failed for Microsoft.TSS"
+    }
+    & $dotnetPath build $csprojPath -c Release --no-restore --nologo | Out-Null
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $helperExe)) {
+      Fail "building the Windows TPM provider helper failed"
+    }
+    Set-Content -Path $buildStampPath -Value $sourceHash -Encoding ASCII
+  }
+} finally {
+  if ($mutexHeld) {
+    $null = $buildMutex.ReleaseMutex()
+  }
+  $buildMutex.Dispose()
 }
 
 & $helperExe $Operation

@@ -2,12 +2,14 @@ use std::collections::BTreeSet;
 
 use p256::{
     elliptic_curve::{
-        bigint::U256, ff::PrimeField, ops::Reduce, point::AffineCoordinates, Field, Group,
+        bigint::U256, ff::PrimeField, ops::Reduce, point::AffineCoordinates, sec1::ToEncodedPoint,
+        Field, Group,
     },
     pkcs8::{DecodePublicKey, EncodePublicKey},
     FieldBytes, ProjectivePoint, PublicKey as P256PublicKey, Scalar,
 };
 use rsa::{
+    pkcs1::EncodeRsaPublicKey,
     pkcs1v15::{Signature as RsaSignature, VerifyingKey as RsaVerifyingKey},
     signature::Verifier as _,
     traits::PublicKeyParts,
@@ -21,7 +23,11 @@ const MAX_CERTIFICATE_CHAIN_DEPTH: usize = 8;
 
 const OID_BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
 const OID_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
+const OID_SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11];
 const OID_EXTENDED_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
+const OID_TCG_AT_TPM_MANUFACTURER: &[u8] = &[0x67, 0x81, 0x05, 0x02, 0x01];
+const OID_TCG_AT_TPM_MODEL: &[u8] = &[0x67, 0x81, 0x05, 0x02, 0x02];
+const OID_TCG_AT_TPM_VERSION: &[u8] = &[0x67, 0x81, 0x05, 0x02, 0x03];
 const OID_TCG_KP_EK_CERTIFICATE: &[u8] = &[0x67, 0x81, 0x05, 0x08, 0x01];
 const OID_RSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
 const OID_RSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
@@ -146,22 +152,31 @@ pub(crate) fn verify_ek_certificate_chain(
         return Err(EkCertificateError::Untrusted);
     }
 
-    let canonical_spki_der = match &public_key {
-        EkPublicKey::Rsa(key) => key
-            .to_public_key_der()
-            .map_err(|err| EkCertificateError::UnsupportedEkPublicKey(err.to_string()))?
-            .as_bytes()
-            .to_vec(),
-        EkPublicKey::EccP256(key) => key
-            .to_public_key_der()
-            .map_err(|err| EkCertificateError::UnsupportedEkPublicKey(err.to_string()))?
-            .as_bytes()
-            .to_vec(),
+    let (canonical_spki_der, device_identity) = match &public_key {
+        EkPublicKey::Rsa(key) => (
+            key.to_public_key_der()
+                .map_err(|err| EkCertificateError::UnsupportedEkPublicKey(err.to_string()))?
+                .as_bytes()
+                .to_vec(),
+            key.to_pkcs1_der()
+                .map_err(|err| EkCertificateError::UnsupportedEkPublicKey(err.to_string()))?
+                .as_bytes()
+                .to_vec(),
+        ),
+        EkPublicKey::EccP256(key) => (
+            key.to_public_key_der()
+                .map_err(|err| EkCertificateError::UnsupportedEkPublicKey(err.to_string()))?
+                .as_bytes()
+                .to_vec(),
+            key.to_encoded_point(false).as_bytes().to_vec(),
+        ),
     };
     Ok(TrustedEkCertificate {
         public_key,
         canonical_spki_der,
-        device_id: hex::encode(Sha256::digest(leaf.raw)),
+        // The device identity is the stable public-key material, not the
+        // replaceable vendor certificate that carries it.
+        device_id: hex::encode(Sha256::digest(device_identity)),
     })
 }
 
@@ -285,10 +300,7 @@ fn parse_certificate(input: &[u8]) -> Result<ParsedCertificate<'_>, String> {
                     }
                     let critical = if fields.peek_tag() == Some(0x01) {
                         let value = fields.take(0x01)?.value;
-                        if value != [0xff] {
-                            return Err("critical extension BOOLEAN is not canonical".to_owned());
-                        }
-                        true
+                        parse_x509_boolean(value, "critical extension")?
                     } else {
                         false
                     };
@@ -309,6 +321,8 @@ fn parse_certificate(input: &[u8]) -> Result<ParsedCertificate<'_>, String> {
                         OID_EXTENDED_KEY_USAGE => {
                             extended_key_usage = Some(parse_extended_key_usage(value)?)
                         }
+                        OID_SUBJECT_ALT_NAME if critical => parse_tpm_subject_alt_name(value)?,
+                        OID_SUBJECT_ALT_NAME => {}
                         _ if critical => {
                             return Err("unsupported critical X.509 extension".to_owned());
                         }
@@ -538,10 +552,7 @@ fn parse_basic_constraints(input: &[u8]) -> Result<(bool, Option<u32>), String> 
     let mut fields = DerReader::new(sequence.value);
     let is_ca = if fields.peek_tag() == Some(0x01) {
         let value = fields.take(0x01)?.value;
-        if value != [0xff] {
-            return Err("basicConstraints cA BOOLEAN is not canonical".to_owned());
-        }
-        true
+        parse_x509_boolean(value, "basicConstraints cA")?
     } else {
         false
     };
@@ -555,6 +566,77 @@ fn parse_basic_constraints(input: &[u8]) -> Result<(bool, Option<u32>), String> 
         return Err("path length is present on a non-CA certificate".to_owned());
     }
     Ok((is_ca, path_len))
+}
+
+fn parse_x509_boolean(input: &[u8], field: &str) -> Result<bool, String> {
+    // Some signed TPM EK certificates explicitly encode DEFAULT FALSE or use
+    // BER's 0x01 TRUE. The original TBS bytes are still verified unchanged.
+    match input {
+        [value] => Ok(*value != 0),
+        _ => Err(format!("{field} BOOLEAN must contain exactly one byte")),
+    }
+}
+
+fn parse_tpm_subject_alt_name(input: &[u8]) -> Result<(), String> {
+    let sequence = parse_single(input, 0x30)?;
+    let mut names = DerReader::new(sequence.value);
+    if names.is_empty() {
+        return Err("critical TPM subjectAltName is empty".to_owned());
+    }
+
+    let required = [
+        OID_TCG_AT_TPM_MANUFACTURER,
+        OID_TCG_AT_TPM_MODEL,
+        OID_TCG_AT_TPM_VERSION,
+    ];
+    let mut seen = BTreeSet::new();
+    while !names.is_empty() {
+        let directory_name = names.take(0xa4).map_err(|_| {
+            "critical TPM subjectAltName contains a non-directoryName entry".to_owned()
+        })?;
+        let name = parse_single(directory_name.value, 0x30)?;
+        let mut rdns = DerReader::new(name.value);
+        if rdns.is_empty() {
+            return Err("critical TPM subjectAltName contains an empty directoryName".to_owned());
+        }
+        while !rdns.is_empty() {
+            let rdn = rdns.take(0x31)?;
+            let mut attributes = DerReader::new(rdn.value);
+            if attributes.is_empty() {
+                return Err("critical TPM subjectAltName contains an empty RDN".to_owned());
+            }
+            while !attributes.is_empty() {
+                let attribute = attributes.take(0x30)?;
+                let mut fields = DerReader::new(attribute.value);
+                let oid = fields.take(0x06)?.value;
+                let value = fields.take_any()?;
+                fields.finish()?;
+                if required.contains(&oid) {
+                    if !seen.insert(oid.to_vec()) {
+                        return Err(
+                            "critical TPM subjectAltName repeats a TCG attribute".to_owned()
+                        );
+                    }
+                    if value.tag != 0x0c
+                        || value.value.is_empty()
+                        || value.value.len() > 256
+                        || std::str::from_utf8(value.value).is_err()
+                    {
+                        return Err(
+                            "critical TPM subjectAltName has an invalid TCG attribute value"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    if required.iter().any(|oid| !seen.contains(*oid)) {
+        return Err(
+            "critical TPM subjectAltName must identify manufacturer, model, and version".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn parse_key_usage(input: &[u8]) -> Result<KeyUsage, String> {
@@ -786,7 +868,40 @@ fn parse_element(input: &[u8]) -> Result<(DerElement<'_>, &[u8]), String> {
 mod tests {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
-    use super::{parse_certificate, parse_signature_algorithm};
+    use super::{
+        parse_certificate, parse_signature_algorithm, parse_tpm_subject_alt_name,
+        parse_x509_boolean,
+    };
+
+    #[test]
+    fn x509_boolean_accepts_der_and_vendor_ber_encodings() {
+        assert_eq!(parse_x509_boolean(&[0xff], "test"), Ok(true));
+        assert_eq!(parse_x509_boolean(&[0x01], "test"), Ok(true));
+        assert_eq!(parse_x509_boolean(&[0x00], "test"), Ok(false));
+    }
+
+    #[test]
+    fn x509_boolean_rejects_malformed_values() {
+        assert!(parse_x509_boolean(&[], "test").is_err());
+        assert!(parse_x509_boolean(&[0x01, 0xff], "test").is_err());
+    }
+
+    #[test]
+    fn critical_tpm_subject_alt_name_requires_the_standard_tcg_identity() {
+        let encoded = BASE64
+            .decode("MESkQjBAMRYwFAYFZ4EFAgEMC2lkOjQxNEQ0NDAwMQ4wDAYFZ4EFAgIMA0FNRDEWMBQGBWeBBQIDDAtpZDowMDAzMDAwMQ==")
+            .unwrap();
+        assert!(parse_tpm_subject_alt_name(&encoded).is_ok());
+
+        let mut missing_model = encoded;
+        let model_oid = [0x06, 0x05, 0x67, 0x81, 0x05, 0x02, 0x02];
+        let offset = missing_model
+            .windows(model_oid.len())
+            .position(|window| window == model_oid)
+            .unwrap();
+        missing_model[offset + model_oid.len() - 1] = 0x04;
+        assert!(parse_tpm_subject_alt_name(&missing_model).is_err());
+    }
 
     #[test]
     fn ecdsa_certificate_signature_parameters_must_be_absent() {

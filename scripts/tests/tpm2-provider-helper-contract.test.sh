@@ -36,6 +36,18 @@ grep -F 'TpmRh.Endorsement' "$windows_helper" >/dev/null ||
   fail "Windows helper does not use the endorsement hierarchy"
 grep -F 'ActivateCredential' "$windows_helper" >/dev/null ||
   fail "Windows helper does not implement credential activation"
+grep -F 'DeviceKey = Hex(SHA256.HashData(deviceIdentity))' "$windows_helper" >/dev/null ||
+  fail "Windows helper device identity is not derived from stable EK public-key material"
+grep -F 'Convert.ToBase64String(EncodeQuoteSignature(rsassa))' "$windows_helper" >/dev/null ||
+  fail "Windows helper does not emit one complete canonical TPMT_SIGNATURE"
+grep -F 'DisableCertificateDownloads = false' "$windows_helper" >/dev/null ||
+  fail "Windows helper cannot retrieve a missing vendor-signed EK intermediate"
+grep -F 'UrlRetrievalTimeout = TimeSpan.FromSeconds(10)' "$windows_helper" >/dev/null ||
+  fail "Windows helper EK issuer retrieval is not bounded"
+mutex_line="$(grep -nF '$buildMutex.WaitOne' "$windows_helper" | head -n 1 | cut -d: -f1)"
+source_write_line="$(grep -nF 'Set-Content -Path $programPath' "$windows_helper" | head -n 1 | cut -d: -f1)"
+[ -n "$mutex_line" ] && [ -n "$source_write_line" ] && [ "$mutex_line" -lt "$source_write_line" ] ||
+  fail "Windows helper writes its shared build cache before acquiring the build mutex"
 
 mkdir -p "$tmp/fixture" "$tmp/mock-bin" "$tmp/state"
 openssl req \
@@ -470,12 +482,63 @@ if command -v dotnet >/dev/null 2>&1; then
     inside && /^'\''@$/ { exit }
     inside { print }
   ' "$windows_helper" >"$tmp/windows-build/Program.cs"
+  cat >"$tmp/windows-build/ParserContract.cs" <<'CS'
+using System;
+using System.Buffers.Binary;
+using System.Linq;
+using Tpm2Lib;
+
+static class ParserContract
+{
+    static byte[] Tpm2b(byte[] value)
+    {
+        var encoded = new byte[value.Length + 2];
+        BinaryPrimitives.WriteUInt16BigEndian(encoded.AsSpan(0, 2), checked((ushort)value.Length));
+        value.CopyTo(encoded, 2);
+        return encoded;
+    }
+
+    public static int Main()
+    {
+        var integrity = Enumerable.Range(0, 32).Select(value => (byte)value).ToArray();
+        var identity = Enumerable.Range(32, 34).Select(value => (byte)value).ToArray();
+        var body = Tpm2b(integrity).Concat(Tpm2b(identity)).ToArray();
+        var parsed = Program.ParseCredentialBlob(Tpm2b(body));
+        if (!parsed.integrityHMAC.SequenceEqual(integrity) ||
+            !parsed.encIdentity.SequenceEqual(identity))
+        {
+            return 1;
+        }
+
+        var signature = Program.EncodeQuoteSignature(
+            new SignatureRsassa(TpmAlgId.Sha256, new byte[256]));
+        if (signature.Length != 262 ||
+            signature[0] != 0x00 || signature[1] != 0x14 ||
+            signature[2] != 0x00 || signature[3] != 0x0b ||
+            signature[4] != 0x01 || signature[5] != 0x00)
+        {
+            return 3;
+        }
+
+        try
+        {
+            Program.ParseCredentialBlob(Tpm2b(body.Concat(new byte[] { 0 }).ToArray()));
+            return 2;
+        }
+        catch (InvalidOperationException)
+        {
+            return 0;
+        }
+    }
+}
+CS
   dotnet_major="$(dotnet --version | sed 's/\..*//')"
   cat >"$tmp/windows-build/MayhemTpm2ProviderHelper.csproj" <<EOF
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net${dotnet_major}.0</TargetFramework>
+    <StartupObject>ParserContract</StartupObject>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
@@ -488,6 +551,7 @@ EOF
     cd "$tmp/windows-build"
     dotnet restore --nologo >/dev/null
     dotnet build --no-restore --nologo >/dev/null
+    dotnet run --no-build --nologo >/dev/null
   )
 fi
 
