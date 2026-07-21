@@ -789,7 +789,7 @@ function checkScenarioSemantics(report, scenario, route, html) {
       report.includes(html, 'aria-label="Playground mode"', scope, 'renders the Text, Image, and Speech mode switcher');
       report.includes(html, 'data-playground-mode-panel="image"', scope, 'renders the image workspace');
       report.includes(html, 'data-playground-mode-panel="speech"', scope, 'renders the speech workspace');
-      report.includes(html, 'data-playground-max-tokens', scope, 'offers an enforceable output limit');
+      report.includes(html, '&quot;key&quot;:&quot;max_tokens&quot;', scope, 'offers a contract-backed output limit');
       report.includes(html, 'data-playground-max-price', scope, 'offers the selected model price ceiling');
       report.includes(html, 'data-price-mode="rate"', scope, 'exposes the fixture model price basis');
       report.includes(html, 'data-price-mode="fixed"', scope, 'includes a fixed-only model price basis fixture');
@@ -805,7 +805,7 @@ function checkScenarioSemantics(report, scenario, route, html) {
       report.includes(html, 'data-playground-reset-draft', scope, 'offers an explicit low-noise draft reset');
       report.includes(
         html,
-        'Numeric identity tier does not promise confidential compute.',
+        'Numeric tier does not promise confidential compute.',
         scope,
         'does not overstate attestation as a privacy guarantee',
       );
@@ -1224,7 +1224,7 @@ async function exerciseWorkbench(baseUrl, options) {
   report.includes(appJs.text, 'data-playground-reset-draft', 'app script', 'wires the explicit saved-draft reset');
   report.includes(appJs.text, 'Stream ended before the provider reported a finish reason.', 'app script', 'routes cleanly truncated SSE through incomplete-response recovery');
   report.includes(appJs.text, "input.type = hidden ? 'password' : 'text'", 'app script', 'masks the entered price ceiling with hidden amounts');
-  report.includes(appJs.text, 'price ceiling hidden', 'app script', 'redacts the price ceiling from the preflight summary');
+  report.includes(appJs.text, 'updatePlaygroundParameterState', 'app script', 'keeps the rail summary limited to generation customization state');
   report.includes(appJs.text, 'maxPriceMode', 'app script', 'persists the price unit basis beside the draft value');
   report.includes(appJs.text, 'Continue with ${nextOutputLimit.toLocaleString()}-token limit', 'app script', 'offers a higher-limit continuation after truncation');
   report.includes(
