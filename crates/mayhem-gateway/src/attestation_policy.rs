@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 use crate::HardwareQuoteVerifierCommand;
 
-pub const GATEWAY_ATTESTATION_VERIFIER_VERSION: u32 = 3;
+pub const GATEWAY_ATTESTATION_VERIFIER_VERSION: u32 = 4;
 pub const MANAGED_VERIFIER_EXECUTABLE_MEDIA_TYPE: &str =
     ValidatedAttestationPolicy::MANAGED_VERIFIER_EXECUTABLE_MEDIA_TYPE;
 pub const MANAGED_VERIFIER_MANIFEST_MEDIA_TYPE: &str =

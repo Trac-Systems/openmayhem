@@ -23,18 +23,20 @@ use hmac::{Hmac, Mac};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use mayhem_attestation::{
     issue_tpm_activate_credential_challenge_with_rng, ActivatedTpmIdentity, AttestationPolicyChain,
-    CollateralInventory, EvidenceBinding, ValidatedAttestationPolicy,
+    AttestationReadiness, CollateralInventory, EvidenceBinding, QuoteKindReadinessStatus,
+    ValidatedAttestationPolicy, VerifierCapabilities,
 };
 use mayhem_enclave::{
     build_hardware_attestation_report, build_tier1_attestation_report, measure_binary,
     HardwareAttestationOptions, RuntimeKeypair, Tier1AttestationOptions,
 };
+use mayhem_gateway::openai::{GatewayAttestationAuthority, GatewayAttestationCollateral};
 use mayhem_gateway::{
     verify_attestation, verify_tier1_attestation, AttestationPolicyVerificationContext,
     AttestationVerificationRequest, EnclaveContractRecord, GatewayError,
-    HardwareQuoteVerifierCommand, MAX_HARDWARE_QUOTE_ENDORSEMENTS_BYTES,
-    MAX_HARDWARE_QUOTE_EVIDENCE_BYTES, MAX_HARDWARE_QUOTE_METADATA_BYTES,
-    MAX_HARDWARE_QUOTE_METADATA_DEPTH,
+    HardwareQuoteVerifierCommand, GATEWAY_ATTESTATION_VERIFIER_VERSION,
+    MAX_HARDWARE_QUOTE_ENDORSEMENTS_BYTES, MAX_HARDWARE_QUOTE_EVIDENCE_BYTES,
+    MAX_HARDWARE_QUOTE_METADATA_BYTES, MAX_HARDWARE_QUOTE_METADATA_DEPTH,
 };
 use mayhem_proto::{
     catalog_enclave_id, hardware_quote_binding, AdminAttestationPolicy,
@@ -423,8 +425,7 @@ fn test_policy_with_managed_identity_for_target(
     include_release_target_matrix: bool,
 ) -> TestPolicy {
     let key_bytes = serde_json::to_vec(&test_nvidia_jwks()).unwrap();
-    let pcr_bytes = br#"{"schema_version":1,"hash_algorithm":"sha256","pcrs":{"0":"a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"}}"#
-        .to_vec();
+    let pcr_bytes = br#"{"schema_version":2,"hash_algorithm":"sha256","pcrs":[0]}"#.to_vec();
     let root_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         include_str!("../../mayhem-attestation/tests/fixtures/tpm-root.der.b64").trim(),
@@ -768,7 +769,7 @@ fn native_tpm_policy(
         issued_epoch: 1,
         effective_epoch: 1,
         expires_epoch: None,
-        min_verifier_version: 3,
+        min_verifier_version: GATEWAY_ATTESTATION_VERIFIER_VERSION,
         emergency_disabled_quote_kinds: BTreeSet::new(),
         origin_pins: Vec::new(),
         trust_data,
@@ -839,6 +840,10 @@ struct NativeTpmFixture {
     contract: EnclaveContractRecord,
     policy: TestPolicy,
     activated: ActivatedTpmIdentity,
+    catalog_policy: AdminAttestationPolicy,
+    catalog_binding: AdminEnclaveAttestationBinding,
+    root_der: Vec<u8>,
+    pcr_policy: Vec<u8>,
 }
 
 fn native_tpm_fixture() -> NativeTpmFixture {
@@ -870,7 +875,7 @@ fn native_tpm_fixture() -> NativeTpmFixture {
     let pcr_policy = serde_json::to_vec(&serde_json::json!({
         "schema_version": TPM_PCR_POLICY_SCHEMA_VERSION,
         "hash_algorithm": "sha256",
-        "pcrs": { "0": pcr_value }
+        "pcrs": [0]
     }))
     .unwrap();
 
@@ -904,6 +909,18 @@ fn native_tpm_fixture() -> NativeTpmFixture {
         runtime_config: AttestationRuntimeConfig::default(),
     };
     let policy = native_tpm_policy(&root_der, &pcr_policy, body.enclave_id.clone(), device_id);
+    let catalog_policy = policy
+        .chain
+        .active_at(TEST_POLICY_EPOCH)
+        .expect("native TPM policy is active")
+        .policy()
+        .clone();
+    let catalog_binding = AdminEnclaveAttestationBinding {
+        enclave_id: body.enclave_id.clone(),
+        kind: HardwareQuoteKind::Tpm2QuoteEk,
+        platform: Some("test-tpm2".to_owned()),
+        measurement_trust_data: BTreeMap::new(),
+    };
     let quote_binding = hardware_quote_binding(&body).unwrap();
     let evidence_binding = EvidenceBinding::new(
         &policy.route_binding,
@@ -994,6 +1011,10 @@ fn native_tpm_fixture() -> NativeTpmFixture {
         contract,
         policy,
         activated,
+        catalog_policy,
+        catalog_binding,
+        root_der,
+        pcr_policy,
     }
 }
 
@@ -2005,6 +2026,94 @@ fn native_tpm_quote_and_ek_chain_verify_without_external_helper() {
     assert_eq!(verified.att_tier, TIER2_DEVICE_IDENTITY_TIER);
     assert_eq!(verified.runtime_binary_hash, fixture.report.binary_hash);
     assert_ne!(verified.runtime_binary_hash, fixture.contract.binary_hash);
+}
+
+#[test]
+fn native_tpm_catalog_authority_preflights_collateral_semantics() {
+    let fixture = native_tpm_fixture();
+    let collateral = |policy: &AdminAttestationPolicy, pcr_policy: Vec<u8>| {
+        let root = policy
+            .trust_data
+            .iter()
+            .find(|reference| reference.id == "native-tpm-root")
+            .unwrap()
+            .clone();
+        let pcrs = policy
+            .trust_data
+            .iter()
+            .find(|reference| reference.id == "native-tpm-pcrs")
+            .unwrap()
+            .clone();
+        vec![
+            GatewayAttestationCollateral {
+                reference: root,
+                bytes: fixture.root_der.clone(),
+                observed_epoch: TEST_POLICY_EPOCH,
+            },
+            GatewayAttestationCollateral {
+                reference: pcrs,
+                bytes: pcr_policy,
+                observed_epoch: TEST_POLICY_EPOCH,
+            },
+        ]
+    };
+
+    GatewayAttestationAuthority::from_catalog_records(
+        Some(vec![fixture.catalog_policy.clone()]),
+        vec![fixture.catalog_binding.clone()],
+        collateral(&fixture.catalog_policy, fixture.pcr_policy.clone()),
+        TEST_POLICY_EPOCH,
+    )
+    .expect("schema-2 native TPM collateral preflights");
+
+    let stale_pcr_policy = br#"{"schema_version":1,"hash_algorithm":"sha256","pcrs":{"0":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#.to_vec();
+    let mut stale_policy = fixture.catalog_policy.clone();
+    let stale_reference = stale_policy
+        .trust_data
+        .iter_mut()
+        .find(|reference| reference.id == "native-tpm-pcrs")
+        .unwrap();
+    stale_reference.sha256 = hex::encode(Sha256::digest(&stale_pcr_policy));
+    stale_reference.max_bytes = stale_pcr_policy.len() as u64;
+    let error = GatewayAttestationAuthority::from_catalog_records(
+        Some(vec![stale_policy.clone()]),
+        vec![fixture.catalog_binding.clone()],
+        collateral(&stale_policy, stale_pcr_policy),
+        TEST_POLICY_EPOCH,
+    )
+    .expect_err("schema-1 PCR collateral must fail before routing");
+    assert!(error.contains("native TPM collateral preflight failed"));
+    assert!(error.contains("PCR policy"));
+}
+
+#[test]
+fn native_tpm_policy_rejects_version_three_buyers_before_routing() {
+    let fixture = native_tpm_fixture();
+    assert_eq!(GATEWAY_ATTESTATION_VERIFIER_VERSION, 4);
+    let old_capabilities = VerifierCapabilities::with_evidence_schemas(
+        3,
+        [(
+            AttestationVerifierProfile::Tpm2EkActivateCredentialV1,
+            BTreeSet::from([TPM_QUOTE_EVIDENCE_SCHEMA_VERSION]),
+        )],
+    );
+    let readiness = AttestationReadiness::evaluate(
+        &fixture.policy.chain,
+        &fixture.policy.collateral,
+        &old_capabilities,
+        TEST_POLICY_EPOCH,
+    );
+    assert_eq!(
+        readiness
+            .quote_kinds
+            .get(&HardwareQuoteKind::Tpm2QuoteEk)
+            .unwrap()
+            .status,
+        QuoteKindReadinessStatus::VerifierTooOld {
+            required: 4,
+            actual: 3,
+        }
+    );
 }
 
 #[test]

@@ -2909,36 +2909,48 @@ struct CatalogApplyAttestationAuthorityArgs {
     bindings: PathBuf,
 
     /// Directory containing one or more authenticated target release publications. Repeatable.
-    #[arg(long, value_name = "DIR", required = true)]
+    #[arg(long, value_name = "DIR", required_unless_present = "native_only")]
     release_dir: Vec<PathBuf>,
 
     /// Independently provisioned trusted release public-key record.
-    #[arg(long, value_name = "PATH")]
-    release_key: PathBuf,
+    #[arg(long, value_name = "PATH", required_unless_present = "native_only")]
+    release_key: Option<PathBuf>,
 
     /// Exact trusted release key id required on every detached signature.
-    #[arg(long, value_name = "ID")]
-    release_key_id: String,
+    #[arg(long, value_name = "ID", required_unless_present = "native_only")]
+    release_key_id: Option<String>,
 
     /// Exact source Git commit required in every signed release manifest.
-    #[arg(long, value_name = "40_LOWER_HEX")]
-    source_git_sha: String,
+    #[arg(
+        long,
+        value_name = "40_LOWER_HEX",
+        required_unless_present = "native_only"
+    )]
+    source_git_sha: Option<String>,
 
     /// Whether this is a complete final publication or an incremental draft.
     #[arg(long, value_enum)]
     mode: CatalogAttestationAuthorityApplyMode,
 
     /// Canonical semantic version used in every release-matrix file name.
-    #[arg(long, value_name = "SEMVER")]
-    release_version: String,
+    #[arg(long, value_name = "SEMVER", required_unless_present = "native_only")]
+    release_version: Option<String>,
 
     /// Canonical public HTTPS origin serving the detached verifier artifacts.
-    #[arg(long, value_name = "HTTPS_ORIGIN")]
-    public_origin: String,
+    #[arg(
+        long,
+        value_name = "HTTPS_ORIGIN",
+        required_unless_present = "native_only"
+    )]
+    public_origin: Option<String>,
 
     /// Canonical absolute path below the public origin containing the detached artifacts.
-    #[arg(long, value_name = "PATH")]
-    public_path: String,
+    #[arg(long, value_name = "PATH", required_unless_present = "native_only")]
+    public_path: Option<String>,
+
+    /// Apply a policy containing only native verifier kinds; no managed release binaries are used.
+    #[arg(long)]
+    native_only: bool,
 
     /// Write the deterministic unsigned catalog draft here.
     #[arg(long, value_name = "PATH")]
@@ -8383,7 +8395,7 @@ fn catalog_verify(args: CatalogVerifyArgs) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct CatalogApplyAttestationAuthorityRequest {
     catalog_path: PathBuf,
     policy_chain_path: PathBuf,
@@ -8396,6 +8408,7 @@ struct CatalogApplyAttestationAuthorityRequest {
     release_version: String,
     public_origin: String,
     public_path: String,
+    native_only: bool,
     output: PathBuf,
 }
 
@@ -8407,14 +8420,22 @@ struct CatalogApplyAttestationAuthorityReport {
     policy_chain_path: PathBuf,
     bindings_path: PathBuf,
     mode: CatalogAttestationAuthorityApplyMode,
+    native_only: bool,
     release_dirs: Vec<PathBuf>,
-    release_key: PathBuf,
-    release_key_id: String,
-    release_public_key: String,
-    release_version: String,
-    source_git_sha: String,
-    verifier_id: String,
-    verifier_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release_key: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release_public_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_git_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verifier_version: Option<u32>,
     policy_sequence: u64,
     target_count: usize,
     published_target_count: usize,
@@ -8678,13 +8699,18 @@ fn catalog_apply_attestation_authority(args: CatalogApplyAttestationAuthorityArg
             .into_iter()
             .map(absolutize)
             .collect::<Result<Vec<_>>>()?,
-        release_key: absolutize(args.release_key)?,
-        release_key_id: args.release_key_id,
-        source_git_sha: args.source_git_sha,
+        release_key: args
+            .release_key
+            .map(absolutize)
+            .transpose()?
+            .unwrap_or_default(),
+        release_key_id: args.release_key_id.unwrap_or_default(),
+        source_git_sha: args.source_git_sha.unwrap_or_default(),
         mode: args.mode,
-        release_version: args.release_version,
-        public_origin: args.public_origin,
-        public_path: args.public_path,
+        release_version: args.release_version.unwrap_or_default(),
+        public_origin: args.public_origin.unwrap_or_default(),
+        public_path: args.public_path.unwrap_or_default(),
+        native_only: args.native_only,
         output: absolutize(args.output)?,
     };
     let report = catalog_apply_attestation_authority_report(request)?;
@@ -8695,27 +8721,53 @@ fn catalog_apply_attestation_authority(args: CatalogApplyAttestationAuthorityArg
         println!("Catalog: {}", report.catalog_path.display());
         println!("Output: {}", report.output.display());
         println!("Mode: {}", report.mode.as_str());
-        for release_dir in &report.release_dirs {
-            println!("Release directory: {}", release_dir.display());
+        if report.native_only {
+            println!("Verifier: native Mayhem verifier implementations only");
+        } else {
+            for release_dir in &report.release_dirs {
+                println!("Release directory: {}", release_dir.display());
+            }
+            println!(
+                "Trusted release key: {} ({}, {})",
+                report
+                    .release_key
+                    .as_ref()
+                    .expect("managed report has a release key")
+                    .display(),
+                report
+                    .release_key_id
+                    .as_deref()
+                    .expect("managed report has a release key id"),
+                report
+                    .release_public_key
+                    .as_deref()
+                    .expect("managed report has a release public key")
+            );
+            println!(
+                "Release: {} @ expected source Git SHA {}",
+                report
+                    .release_version
+                    .as_deref()
+                    .expect("managed report has a release version"),
+                report
+                    .source_git_sha
+                    .as_deref()
+                    .expect("managed report has a source Git SHA")
+            );
+            println!(
+                "Verifier: {} v{} across {} active targets ({} published, {} preserved)",
+                report
+                    .verifier_id
+                    .as_deref()
+                    .expect("managed report has a verifier id"),
+                report
+                    .verifier_version
+                    .expect("managed report has a verifier version"),
+                report.target_count,
+                report.published_target_count,
+                report.preserved_target_count
+            );
         }
-        println!(
-            "Trusted release key: {} ({}, {})",
-            report.release_key.display(),
-            report.release_key_id,
-            report.release_public_key
-        );
-        println!(
-            "Release: {} @ expected source Git SHA {}",
-            report.release_version, report.source_git_sha
-        );
-        println!(
-            "Verifier: {} v{} across {} active targets ({} published, {} preserved)",
-            report.verifier_id,
-            report.verifier_version,
-            report.target_count,
-            report.published_target_count,
-            report.preserved_target_count
-        );
         println!(
             "Policy: sequence {}, {} managed quote kinds, {} generated refs",
             report.policy_sequence, report.managed_quote_kind_count, report.managed_reference_count
@@ -8755,6 +8807,9 @@ fn catalog_apply_attestation_authority_report(
         request.output != request.release_key,
         "catalog authority output must be isolated from --release-key"
     );
+    if request.native_only {
+        return catalog_apply_native_attestation_authority_report(request);
+    }
     ensure!(
         request.source_git_sha.len() == 40
             && request
@@ -9245,14 +9300,15 @@ fn catalog_apply_attestation_authority_report(
         policy_chain_path: request.policy_chain_path,
         bindings_path: request.bindings_path,
         mode: request.mode,
+        native_only: false,
         release_dirs: request.release_dirs,
-        release_key: request.release_key,
-        release_key_id: request.release_key_id,
-        release_public_key: trusted_key.public_key,
-        release_version: request.release_version,
-        source_git_sha: request.source_git_sha,
-        verifier_id: verifier_manifest.verifier_id,
-        verifier_version: verifier_manifest.version,
+        release_key: Some(request.release_key),
+        release_key_id: Some(request.release_key_id),
+        release_public_key: Some(trusted_key.public_key),
+        release_version: Some(request.release_version),
+        source_git_sha: Some(request.source_git_sha),
+        verifier_id: Some(verifier_manifest.verifier_id),
+        verifier_version: Some(verifier_manifest.version),
         policy_sequence: authority
             .attestation_policy_chain
             .as_ref()
@@ -9264,6 +9320,148 @@ fn catalog_apply_attestation_authority_report(
         preserved_target_count: preserved_targets.len(),
         managed_quote_kind_count: managed_quote_kinds.len(),
         managed_reference_count,
+    })
+}
+
+fn catalog_apply_native_attestation_authority_report(
+    mut request: CatalogApplyAttestationAuthorityRequest,
+) -> Result<CatalogApplyAttestationAuthorityReport> {
+    ensure!(
+        request.mode == CatalogAttestationAuthorityApplyMode::FinalRelease,
+        "--native-only requires --mode final-release"
+    );
+    ensure!(
+        request.release_dirs.is_empty()
+            && request.release_key.as_os_str().is_empty()
+            && request.release_key_id.is_empty()
+            && request.source_git_sha.is_empty()
+            && request.release_version.is_empty()
+            && request.public_origin.is_empty()
+            && request.public_path.is_empty(),
+        "--native-only cannot be combined with managed release inputs"
+    );
+
+    request.output = canonical_catalog_authority_new_output_path(&request.output)?;
+    for (input, label) in [
+        (&request.catalog_path, "catalog"),
+        (&request.policy_chain_path, "policy chain"),
+        (&request.bindings_path, "bindings"),
+    ] {
+        let canonical_input = fs::canonicalize(input)
+            .with_context(|| format!("canonicalizing {label} input {}", input.display()))?;
+        ensure!(
+            request.output != canonical_input,
+            "catalog authority output must not overwrite the {label} input"
+        );
+    }
+
+    let policies: Vec<AdminAttestationPolicy> =
+        read_typed_json_file(&request.policy_chain_path, "attestation policy chain")?;
+    let bindings: Vec<mayhem_proto::AdminEnclaveAttestationBinding> =
+        read_typed_json_file(&request.bindings_path, "enclave attestation bindings")?;
+    let chain =
+        AttestationPolicyChain::from_catalog_records(Some(policies.clone()), bindings.clone())
+            .map_err(anyhow::Error::msg)
+            .context("validating native attestation policy chain and bindings")?;
+    ensure!(
+        !chain.is_empty(),
+        "native attestation policy chain is empty"
+    );
+    let mut native_quote_kind_count = 0usize;
+    for policy in &policies {
+        for kind_policy in &policy.quote_kinds {
+            if !kind_policy.enabled {
+                continue;
+            }
+            ensure!(
+                !ValidatedAttestationPolicy::is_managed_verifier_kind(kind_policy.kind),
+                "--native-only policy enables managed verifier kind {}",
+                kind_policy.kind.as_str()
+            );
+            native_quote_kind_count += 1;
+        }
+        for reference in &policy.trust_data {
+            ensure!(
+                ValidatedAttestationPolicy::parse_managed_verifier_trust_data(reference)
+                    .map_err(anyhow::Error::msg)?
+                    .is_none(),
+                "--native-only policy contains managed verifier trust data {}",
+                reference.id
+            );
+        }
+    }
+    ensure!(
+        native_quote_kind_count > 0,
+        "--native-only policy enables no native verifier quote kinds"
+    );
+
+    let authority = catalog::CatalogAttestationAuthority {
+        attestation_policy_chain: Some(policies),
+        enclave_attestation_bindings: bindings,
+    };
+    catalog::validate_catalog_attestation_authority_canonical(&authority)
+        .context("validating native catalog attestation authority")?;
+
+    let mut catalog_value = read_json_file(&request.catalog_path)?;
+    let models_before = catalog_value
+        .get("models")
+        .cloned()
+        .context("catalog draft must contain models")?;
+    let catalog_object = catalog_value
+        .as_object_mut()
+        .context("catalog draft must be a JSON object")?;
+    catalog_object.remove("attestation_policy_chain");
+    catalog_object.remove("enclave_attestation_bindings");
+    catalog_object.insert(
+        "attestation_policy_chain".to_owned(),
+        serde_json::to_value(
+            authority
+                .attestation_policy_chain
+                .as_ref()
+                .expect("native authority has a policy chain"),
+        )?,
+    );
+    catalog_object.insert(
+        "enclave_attestation_bindings".to_owned(),
+        serde_json::to_value(&authority.enclave_attestation_bindings)?,
+    );
+    ensure!(
+        catalog_value.get("models") == Some(&models_before),
+        "attestation authority apply changed catalog model semantics"
+    );
+    serde_json::from_value::<catalog::CatalogDocument>(catalog_value.clone())
+        .context("validating catalog document after native attestation authority apply")?;
+    let output_bytes = serde_json::to_vec_pretty(&catalog_value)?;
+    catalog::validate_catalog_attestation_authority_bytes(&output_bytes)?;
+    write_new_json_file(&request.output, &catalog_value)?;
+
+    Ok(CatalogApplyAttestationAuthorityReport {
+        ok: true,
+        catalog_path: request.catalog_path,
+        output: request.output,
+        policy_chain_path: request.policy_chain_path,
+        bindings_path: request.bindings_path,
+        mode: request.mode,
+        native_only: true,
+        release_dirs: Vec::new(),
+        release_key: None,
+        release_key_id: None,
+        release_public_key: None,
+        release_version: None,
+        source_git_sha: None,
+        verifier_id: None,
+        verifier_version: None,
+        policy_sequence: authority
+            .attestation_policy_chain
+            .as_ref()
+            .and_then(|items| items.last())
+            .expect("validated native policy chain is non-empty")
+            .sequence,
+        target_count: 0,
+        published_target_count: 0,
+        preserved_target_count: 0,
+        managed_quote_kind_count: 0,
+        managed_reference_count: 0,
     })
 }
 
@@ -89477,16 +89675,26 @@ State initialization...
             args.release_dir,
             [PathBuf::from("release-a"), PathBuf::from("release-b")]
         );
-        assert_eq!(args.release_key, PathBuf::from("trusted-release-key.json"));
-        assert_eq!(args.release_key_id, "test-release-key");
-        assert_eq!(args.source_git_sha, TEST_CATALOG_AUTHORITY_SOURCE_GIT_SHA);
+        assert_eq!(
+            args.release_key,
+            Some(PathBuf::from("trusted-release-key.json"))
+        );
+        assert_eq!(args.release_key_id.as_deref(), Some("test-release-key"));
+        assert_eq!(
+            args.source_git_sha.as_deref(),
+            Some(TEST_CATALOG_AUTHORITY_SOURCE_GIT_SHA)
+        );
         assert_eq!(
             args.mode,
             CatalogAttestationAuthorityApplyMode::FinalRelease
         );
-        assert_eq!(args.release_version, "0.2.25");
-        assert_eq!(args.public_origin, "https://downloads.example");
-        assert_eq!(args.public_path, "/mayhem/0.2.25");
+        assert_eq!(args.release_version.as_deref(), Some("0.2.25"));
+        assert_eq!(
+            args.public_origin.as_deref(),
+            Some("https://downloads.example")
+        );
+        assert_eq!(args.public_path.as_deref(), Some("/mayhem/0.2.25"));
+        assert!(!args.native_only);
         assert!(args.json);
     }
 
@@ -89542,6 +89750,176 @@ State initialization...
     }
 
     #[test]
+    fn catalog_apply_attestation_authority_native_only_needs_no_release_binary_inputs() {
+        let cli = Cli::try_parse_from([
+            "mayhem",
+            "catalog",
+            "apply-attestation-authority",
+            "--catalog-path",
+            "catalog.json",
+            "--policy-chain",
+            "policy-chain.json",
+            "--bindings",
+            "bindings.json",
+            "--mode",
+            "final-release",
+            "--native-only",
+            "--output",
+            "draft.json",
+        ])
+        .unwrap();
+        let Commands::Catalog {
+            command: CatalogCommands::ApplyAttestationAuthority(args),
+        } = cli.command
+        else {
+            panic!("expected catalog apply-attestation-authority command");
+        };
+        assert!(args.native_only);
+        assert!(args.release_dir.is_empty());
+        assert!(args.release_key.is_none());
+        assert!(args.release_key_id.is_none());
+        assert!(args.source_git_sha.is_none());
+    }
+
+    #[test]
+    fn catalog_apply_attestation_authority_writes_native_only_final_catalog() {
+        let fixture = write_catalog_authority_test_fixture("catalog-authority-native-only");
+        let models_before = read_json_file(&fixture.catalog_path).unwrap()["models"].clone();
+        let source = |path: &str| {
+            Some(mayhem_proto::AttestationTrustDataSource {
+                origin_pin: "native-tpm-policy".to_owned(),
+                path: path.to_owned(),
+            })
+        };
+        let policy = AdminAttestationPolicy {
+            schema_version: mayhem_proto::ATTESTATION_POLICY_SCHEMA_VERSION,
+            sequence: 1,
+            previous_policy_digest: None,
+            issued_epoch: 1,
+            effective_epoch: 1,
+            expires_epoch: None,
+            min_verifier_version: 1,
+            emergency_disabled_quote_kinds: BTreeSet::new(),
+            origin_pins: vec![mayhem_proto::AttestationOriginPin {
+                id: "native-tpm-policy".to_owned(),
+                https_origin: "https://trust.example".to_owned(),
+            }],
+            trust_data: vec![
+                AttestationTrustDataRef {
+                    id: "tpm-manufacturer-root".to_owned(),
+                    kind: mayhem_proto::AttestationTrustDataKind::TrustAnchor,
+                    sha256: "11".repeat(32),
+                    media_type: "application/pkix-cert".to_owned(),
+                    max_bytes: 4096,
+                    valid_from_epoch: None,
+                    valid_until_epoch: None,
+                    source: source("/tpm/root.der"),
+                },
+                AttestationTrustDataRef {
+                    id: "tpm-pcr-policy".to_owned(),
+                    kind: mayhem_proto::AttestationTrustDataKind::Measurement,
+                    sha256: "22".repeat(32),
+                    media_type: "application/vnd.mayhem.tpm-pcr-policy+json".to_owned(),
+                    max_bytes: 4096,
+                    valid_from_epoch: None,
+                    valid_until_epoch: None,
+                    source: source("/tpm/pcr-policy.json"),
+                },
+            ],
+            quote_kinds: HardwareQuoteKind::ALL
+                .into_iter()
+                .map(|kind| {
+                    let enabled = kind == HardwareQuoteKind::Tpm2QuoteEk;
+                    mayhem_proto::AttestationQuoteKindPolicy {
+                        kind,
+                        enabled,
+                        verifier_profile: test_attestation_verifier_profile(kind),
+                        evidence_schema_version: 1,
+                        required_trust_data: if enabled {
+                            BTreeSet::from([
+                                "tpm-manufacturer-root".to_owned(),
+                                "tpm-pcr-policy".to_owned(),
+                            ])
+                        } else {
+                            BTreeSet::new()
+                        },
+                        measurement_trust_data: if enabled {
+                            BTreeSet::from(["tpm-pcr-policy".to_owned()])
+                        } else {
+                            BTreeSet::new()
+                        },
+                        required_measurement_layers: BTreeSet::new(),
+                        platforms: BTreeSet::new(),
+                    }
+                })
+                .collect(),
+        };
+        write_json_file(&fixture.policy_chain_path, &vec![policy]).unwrap();
+        write_json_file(
+            &fixture.bindings_path,
+            &vec![mayhem_proto::AdminEnclaveAttestationBinding {
+                enclave_id: "44".repeat(32),
+                kind: HardwareQuoteKind::Tpm2QuoteEk,
+                platform: None,
+                measurement_trust_data: BTreeMap::new(),
+            }],
+        )
+        .unwrap();
+        let output = fixture.temp.join("native-final.json");
+        let mut request = fixture.final_request(output.clone());
+        request.native_only = true;
+        request.release_dirs.clear();
+        request.release_key = PathBuf::new();
+        request.release_key_id.clear();
+        request.source_git_sha.clear();
+        request.release_version.clear();
+        request.public_origin.clear();
+        request.public_path.clear();
+
+        let mut incremental = request.clone();
+        incremental.mode = CatalogAttestationAuthorityApplyMode::IncrementalDraft;
+        incremental.output = fixture.temp.join("native-incremental.json");
+        assert!(catalog_apply_attestation_authority_report(incremental)
+            .unwrap_err()
+            .to_string()
+            .contains("--mode final-release"));
+
+        let mut mixed = request.clone();
+        mixed.release_dirs.push(fixture.release_dir.clone());
+        mixed.output = fixture.temp.join("native-mixed.json");
+        assert!(catalog_apply_attestation_authority_report(mixed)
+            .unwrap_err()
+            .to_string()
+            .contains("managed release inputs"));
+
+        let report = catalog_apply_attestation_authority_report(request).unwrap();
+        assert!(report.native_only);
+        assert_eq!(report.policy_sequence, 1);
+        assert_eq!(report.target_count, 0);
+        assert!(report.release_key.is_none());
+        let output_value = read_json_file(&output).unwrap();
+        assert_eq!(output_value["models"], models_before);
+        let authority: catalog::CatalogAttestationAuthority =
+            serde_json::from_value(output_value).unwrap();
+        catalog::validate_catalog_attestation_authority_canonical(&authority).unwrap();
+        assert_eq!(
+            authority
+                .attestation_policy_chain
+                .as_ref()
+                .unwrap()
+                .last()
+                .unwrap()
+                .quote_kinds
+                .iter()
+                .filter(|entry| entry.enabled)
+                .map(|entry| entry.kind)
+                .collect::<Vec<_>>(),
+            vec![HardwareQuoteKind::Tpm2QuoteEk]
+        );
+        let _ = fs::remove_dir_all(fixture.temp);
+    }
+
+    #[test]
     fn catalog_apply_attestation_authority_writes_deterministic_final_and_non_signable_draft() {
         let fixture = write_catalog_authority_test_fixture("catalog-authority-positive");
         let models_before = read_json_file(&fixture.catalog_path).unwrap()["models"].clone();
@@ -89568,17 +89946,20 @@ State initialization...
             [fs::canonicalize(&fixture.release_dir).unwrap()]
         );
         assert_eq!(
-            report.release_key,
-            fs::canonicalize(&fixture.release_key).unwrap()
+            report.release_key.as_ref(),
+            Some(&fs::canonicalize(&fixture.release_key).unwrap())
         );
-        assert_eq!(report.release_key_id, "test-release-key");
-        assert_eq!(report.release_public_key.len(), 64);
+        assert_eq!(report.release_key_id.as_deref(), Some("test-release-key"));
+        assert_eq!(report.release_public_key.as_deref().map(str::len), Some(64));
         assert_eq!(report.target_count, 6);
         assert_eq!(report.published_target_count, 6);
         assert_eq!(report.preserved_target_count, 0);
         assert_eq!(report.managed_quote_kind_count, 1);
         assert_eq!(report.managed_reference_count, 12);
-        assert_eq!(report.source_git_sha, TEST_CATALOG_AUTHORITY_SOURCE_GIT_SHA);
+        assert_eq!(
+            report.source_git_sha.as_deref(),
+            Some(TEST_CATALOG_AUTHORITY_SOURCE_GIT_SHA)
+        );
         assert_eq!(
             fs::read(&first_output).unwrap(),
             fs::read(&second_output).unwrap()
@@ -91782,6 +92163,7 @@ State initialization...
                 release_version: TEST_CATALOG_AUTHORITY_VERSION.to_owned(),
                 public_origin: "https://downloads.example".to_owned(),
                 public_path: format!("/mayhem/{TEST_CATALOG_AUTHORITY_VERSION}"),
+                native_only: false,
                 output,
             }
         }

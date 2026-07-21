@@ -19,8 +19,7 @@ use mayhem_proto::{
 use sha2::{Digest, Sha256};
 
 const ROOT_B64: &str = include_str!("fixtures/tpm-root.der.b64");
-const PCR_BYTES: &[u8] =
-    br#"{"schema_version":1,"hash_algorithm":"sha256","pcrs":{"0":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#;
+const PCR_BYTES: &[u8] = br#"{"schema_version":2,"hash_algorithm":"sha256","pcrs":[0]}"#;
 
 fn root_bytes() -> &'static [u8] {
     static ROOT: OnceLock<Vec<u8>> = OnceLock::new();
@@ -447,7 +446,7 @@ fn collateral_is_content_addressed_and_required_for_readiness() {
         .unwrap()
         .pcr_policy()
         .pcrs
-        .keys()
+        .iter()
         .copied()
         .collect::<Vec<_>>(),
         vec![0]

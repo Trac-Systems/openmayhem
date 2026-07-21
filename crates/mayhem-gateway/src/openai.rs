@@ -78,7 +78,7 @@ use futures_util::{stream, Stream};
 use image::ImageReader;
 use mayhem_attestation::{
     issue_tpm_activate_credential_challenge, ActivatedTpmIdentity, AttestationPolicyChain,
-    AttestationReadiness, CollateralInventory, VerifierCapabilities,
+    AttestationReadiness, CollateralInventory, TpmVerificationMaterials, VerifierCapabilities,
     DEFAULT_TPM_CHALLENGE_TTL_SECS,
 };
 use mayhem_bridge::{sc_bridge_session_transport, BridgeError, ScBridgeClient, ScBridgeConfig};
@@ -1821,7 +1821,28 @@ impl GatewayAttestationAuthority {
                     )
                 })?;
         }
-        Ok(Self::new(policy_chain, inventory, policy_epoch))
+        let authority = Self::new(policy_chain, inventory, policy_epoch);
+        authority.preflight_native_collateral()?;
+        Ok(authority)
+    }
+
+    fn preflight_native_collateral(&self) -> Result<(), String> {
+        let Some(policy) = self.policy_chain.active_at(self.policy_epoch) else {
+            return Ok(());
+        };
+        let tpm_policy = policy
+            .quote_kind(HardwareQuoteKind::Tpm2QuoteEk)
+            .expect("validated policy contains every quote kind");
+        if !tpm_policy.enabled {
+            return Ok(());
+        }
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system clock is before the Unix epoch".to_owned())?
+            .as_secs();
+        TpmVerificationMaterials::from_policy(policy, &self.collateral, now_unix)
+            .map(|_| ())
+            .map_err(|error| format!("native TPM collateral preflight failed: {error}"))
     }
 
     pub fn policy_epoch(&self) -> u64 {

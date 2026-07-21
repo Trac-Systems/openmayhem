@@ -36,7 +36,7 @@ pub const TPM_ACTIVATE_CREDENTIAL_SCHEMA_VERSION: u32 = 1;
 pub const TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION: u32 = 1;
 pub const TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE: &str = "tpm.activate.challenge";
 pub const TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE: &str = "tpm.activate.response";
-pub const TPM_PCR_POLICY_SCHEMA_VERSION: u32 = 1;
+pub const TPM_PCR_POLICY_SCHEMA_VERSION: u32 = 2;
 pub const TPM_QUOTE_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 9;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
@@ -757,7 +757,7 @@ pub enum TpmHashAlgorithm {
 pub struct TpmPcrPolicy {
     pub schema_version: u32,
     pub hash_algorithm: TpmHashAlgorithm,
-    pub pcrs: BTreeMap<u8, String>,
+    pub pcrs: BTreeSet<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

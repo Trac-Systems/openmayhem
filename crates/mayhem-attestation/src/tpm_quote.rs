@@ -124,8 +124,6 @@ pub enum TpmQuoteError {
     PcrSelectionMismatch,
     #[error("TPM quote PCR values are incomplete, duplicated, or malformed")]
     InvalidPcrValues,
-    #[error("TPM quote PCR {0} differs from immutable admin policy")]
-    PcrValueMismatch(u8),
     #[error("TPM quote PCR digest does not match the selected PCR values")]
     PcrDigestMismatch,
     #[error("TPM evidence binding is invalid: {0}")]
@@ -384,14 +382,9 @@ fn validate_pcr_policy(policy: &TpmPcrPolicy) -> Result<(), TpmQuoteError> {
             "only SHA-256 PCR banks are supported".to_owned(),
         ));
     }
-    if policy.pcrs.is_empty() || policy.pcrs.keys().any(|index| *index > TPM_MAX_PCR_INDEX) {
+    if policy.pcrs.is_empty() || policy.pcrs.iter().any(|index| *index > TPM_MAX_PCR_INDEX) {
         return Err(TpmQuoteError::InvalidPcrPolicy(
             "PCR selection must contain indices 0 through 23".to_owned(),
-        ));
-    }
-    if policy.pcrs.values().any(|digest| !valid_sha256(digest)) {
-        return Err(TpmQuoteError::InvalidPcrPolicy(
-            "PCR values must be lowercase SHA-256 digests".to_owned(),
         ));
     }
     Ok(())
@@ -581,7 +574,7 @@ fn verify_pcrs(
     values: &[TpmPcrValue],
     policy: &TpmPcrPolicy,
 ) -> Result<(), TpmQuoteError> {
-    let expected_selection = policy.pcrs.keys().copied().collect::<BTreeSet<_>>();
+    let expected_selection = policy.pcrs.clone();
     if attest.selected_pcrs != expected_selection {
         return Err(TpmQuoteError::PcrSelectionMismatch);
     }
@@ -603,17 +596,7 @@ fn verify_pcrs(
         return Err(TpmQuoteError::InvalidPcrValues);
     }
     let mut concatenated = Vec::with_capacity(observed.len() * TPM_SHA256_DIGEST_BYTES);
-    for (index, actual) in &observed {
-        let expected = hex::decode(
-            policy
-                .pcrs
-                .get(index)
-                .expect("selection was compared to policy"),
-        )
-        .expect("validated PCR policy digest");
-        if !constant_time_equal(actual, &expected) {
-            return Err(TpmQuoteError::PcrValueMismatch(*index));
-        }
+    for actual in observed.values() {
         concatenated.extend_from_slice(actual);
     }
     let digest = Sha256::digest(&concatenated);
@@ -1167,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn quote_rejects_signature_ak_name_pcr_digest_selection_and_golden_value_changes() {
+    fn quote_rejects_signature_ak_name_pcr_digest_and_selection_but_accepts_value_changes() {
         let fixture = quote_fixture();
 
         let mut bad_signature = fixture.quote.clone();
@@ -1238,8 +1221,35 @@ mod tests {
                 &fixture.materials,
                 VERIFY_AT_UNIX,
             ),
-            Err(TpmQuoteError::PcrValueMismatch(0))
+            Err(TpmQuoteError::PcrDigestMismatch)
         );
+
+        let mut changed_values = fixture.pcr_values.clone();
+        changed_values[0].digest = "55".repeat(32);
+        let attest = make_attest(
+            &fixture.ak_name,
+            &fixture.expected.digest().unwrap(),
+            &[0, 7],
+            &pcr_digest(&changed_values),
+        );
+        let mut changed_quote = fixture.quote.clone();
+        changed_quote.evidence = serde_json::to_string(&TpmQuoteEvidence {
+            schema_version: TPM_QUOTE_EVIDENCE_SCHEMA_VERSION,
+            ak_public_b64: BASE64.encode(&fixture.ak_public),
+            ak_name_b64: BASE64.encode(&fixture.ak_name),
+            quote_attest_b64: BASE64.encode(&attest),
+            quote_signature_b64: BASE64.encode(sign_quote(&fixture.ak_private, &attest)),
+            pcr_values: changed_values,
+        })
+        .unwrap();
+        verify_tpm_hardware_quote(
+            &changed_quote,
+            &fixture.expected,
+            &fixture.activated,
+            &fixture.materials,
+            VERIFY_AT_UNIX,
+        )
+        .unwrap();
 
         let mut bad_selection = fixture.quote.clone();
         let mut evidence = quote_evidence(&bad_selection);
@@ -1353,10 +1363,7 @@ mod tests {
         let pcr_policy = TpmPcrPolicy {
             schema_version: TPM_PCR_POLICY_SCHEMA_VERSION,
             hash_algorithm: TpmHashAlgorithm::Sha256,
-            pcrs: pcr_values
-                .iter()
-                .map(|value| (value.index, value.digest.clone()))
-                .collect(),
+            pcrs: pcr_values.iter().map(|value| value.index).collect(),
         };
         let route = HardwareQuoteRoutePolicyBinding {
             enclave_id: "canonical-enclave".to_owned(),
