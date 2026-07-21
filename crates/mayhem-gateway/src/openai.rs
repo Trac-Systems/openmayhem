@@ -1863,6 +1863,12 @@ struct LiveHeartbeatAttestationAdvertisement {
 #[derive(Clone, Debug)]
 struct GatewayTpmActivationCacheEntry {
     identity: ActivatedTpmIdentity,
+    binding: GatewayTpmActivationCacheBinding,
+    expires_at_millis: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GatewayTpmActivationCacheBinding {
     policy_sequence: u64,
     policy_digest: String,
     device_id: String,
@@ -1870,7 +1876,6 @@ struct GatewayTpmActivationCacheEntry {
     heartbeat_head: String,
     transport_peer: String,
     hello_digest: String,
-    expires_at_millis: u64,
 }
 
 struct GatewayTpmActivationAttemptGuard {
@@ -3520,9 +3525,21 @@ impl GatewayState {
             advertisements.retain(|key, _| valid_route_keys.contains(key));
             advertisements.clone()
         };
-        self.tpm_activation_cache
-            .lock_recover("TPM activation cache")
-            .clear();
+        let now_millis = now_millis_u64();
+        let tpm_activation_cache = {
+            let mut cache = self
+                .tpm_activation_cache
+                .lock_recover("TPM activation cache");
+            cache.retain(|key, entry| {
+                tpm_activation_cache_entry_survives_catalog_refresh(
+                    key,
+                    entry.expires_at_millis,
+                    &valid_route_keys,
+                    now_millis,
+                )
+            });
+            cache.clone()
+        };
         let snapshots = models
             .iter()
             .flat_map(|model| {
@@ -3533,7 +3550,7 @@ impl GatewayState {
                         self.receipt_config.rules_ver,
                         authority.as_ref(),
                         &heartbeat_advertisements,
-                        &BTreeMap::new(),
+                        &tpm_activation_cache,
                         self.hardware_quote_trust.verifier_command.as_ref(),
                     )
                 })
@@ -10539,15 +10556,17 @@ fn route_attestation_policy_resolution(
             .transport_peer
             .as_deref()
             .filter(|peer| is_hex_len(peer, 64));
+        let binding = transport_peer.map(|transport_peer| GatewayTpmActivationCacheBinding {
+            policy_sequence: route_binding.policy_sequence,
+            policy_digest: route_binding.policy_digest.clone(),
+            device_id: route_binding.device_id.clone(),
+            heartbeat_epoch: live_advertisement.heartbeat_epoch,
+            heartbeat_head: live_advertisement.heartbeat_head.clone(),
+            transport_peer: transport_peer.to_owned(),
+            hello_digest,
+        });
         let identity = tpm_activation_cache.get(&key).filter(|entry| {
-            entry.expires_at_millis > now_millis
-                && entry.policy_sequence == route_binding.policy_sequence
-                && entry.policy_digest == route_binding.policy_digest
-                && entry.device_id == route_binding.device_id
-                && entry.heartbeat_epoch == live_advertisement.heartbeat_epoch
-                && entry.heartbeat_head == live_advertisement.heartbeat_head
-                && transport_peer == Some(entry.transport_peer.as_str())
-                && entry.hello_digest == hello_digest
+            entry.expires_at_millis > now_millis && binding.as_ref() == Some(&entry.binding)
         });
         let Some(identity) = identity.map(|entry| entry.identity.clone()) else {
             status.tpm_activation_pending = transport_peer.is_some();
@@ -10579,6 +10598,15 @@ fn tpm_activation_hello_digest(hello: &TpmActivateCredentialHello) -> Result<Str
         .and_then(|value| stable_json_bytes(&value))
         .map(|bytes| blake3_hex(&bytes))
         .map_err(|err| format!("signed TPM activation hello is not canonical JSON: {err}"))
+}
+
+fn tpm_activation_cache_entry_survives_catalog_refresh(
+    key: &ProviderKey,
+    expires_at_millis: u64,
+    valid_route_keys: &BTreeSet<ProviderKey>,
+    now_millis: u64,
+) -> bool {
+    expires_at_millis > now_millis && valid_route_keys.contains(key)
 }
 
 fn native_gateway_attestation_capabilities() -> VerifierCapabilities {
@@ -21076,13 +21104,15 @@ impl GatewayState {
                 key,
                 GatewayTpmActivationCacheEntry {
                     identity,
-                    policy_sequence,
-                    policy_digest,
-                    device_id,
-                    heartbeat_epoch: live.heartbeat_epoch,
-                    heartbeat_head: live.heartbeat_head.clone(),
-                    transport_peer,
-                    hello_digest,
+                    binding: GatewayTpmActivationCacheBinding {
+                        policy_sequence,
+                        policy_digest,
+                        device_id,
+                        heartbeat_epoch: live.heartbeat_epoch,
+                        heartbeat_head: live.heartbeat_head.clone(),
+                        transport_peer,
+                        hello_digest,
+                    },
                     expires_at_millis: now_millis.saturating_add(TPM_ACTIVATION_CACHE_TTL_MILLIS),
                 },
             );
@@ -29671,6 +29701,72 @@ mod tests {
             "relayed": true
         })));
         assert!(!sc_bridge_session_transport_valid(&json!({})));
+    }
+
+    #[test]
+    fn catalog_refresh_retains_only_live_tpm_activation_routes() {
+        let key = ProviderKey {
+            provider: "11".repeat(32),
+            enclave_id: "22".repeat(32),
+            room_id: "33".repeat(16),
+        };
+        let valid_routes = BTreeSet::from([key.clone()]);
+
+        assert!(tpm_activation_cache_entry_survives_catalog_refresh(
+            &key,
+            101,
+            &valid_routes,
+            100,
+        ));
+        assert!(!tpm_activation_cache_entry_survives_catalog_refresh(
+            &key,
+            100,
+            &valid_routes,
+            100,
+        ));
+        assert!(!tpm_activation_cache_entry_survives_catalog_refresh(
+            &key,
+            101,
+            &BTreeSet::new(),
+            100,
+        ));
+    }
+
+    #[test]
+    fn retained_tpm_activation_requires_an_exact_signed_route_binding() {
+        let baseline = GatewayTpmActivationCacheBinding {
+            policy_sequence: 7,
+            policy_digest: "11".repeat(32),
+            device_id: "22".repeat(32),
+            heartbeat_epoch: 9,
+            heartbeat_head: "33".repeat(32),
+            transport_peer: "44".repeat(32),
+            hello_digest: "55".repeat(32),
+        };
+        let mut mismatches = Vec::new();
+        let mut changed = baseline.clone();
+        changed.policy_sequence += 1;
+        mismatches.push(changed);
+        let mut changed = baseline.clone();
+        changed.policy_digest = "66".repeat(32);
+        mismatches.push(changed);
+        let mut changed = baseline.clone();
+        changed.device_id = "77".repeat(32);
+        mismatches.push(changed);
+        let mut changed = baseline.clone();
+        changed.heartbeat_epoch += 1;
+        mismatches.push(changed);
+        let mut changed = baseline.clone();
+        changed.heartbeat_head = "88".repeat(32);
+        mismatches.push(changed);
+        let mut changed = baseline.clone();
+        changed.transport_peer = "99".repeat(32);
+        mismatches.push(changed);
+        let mut changed = baseline.clone();
+        changed.hello_digest = "aa".repeat(32);
+        mismatches.push(changed);
+
+        assert!(mismatches.iter().all(|candidate| candidate != &baseline));
     }
 
     #[test]
