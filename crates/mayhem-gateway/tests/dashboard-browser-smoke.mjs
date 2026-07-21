@@ -458,6 +458,9 @@ try {
   const playgroundControlsToggle = page.locator('[data-playground-controls-toggle]');
   await playgroundControlsToggle.click();
   equal(await playgroundControlsToggle.getAttribute('aria-expanded'), 'true', 'Playground generation settings', 'opens the settings rail');
+  await page.waitForFunction(() => document.querySelector('[data-playground-controls]')?.getBoundingClientRect().width >= 400);
+  check(await page.locator('[data-playground-controls]').evaluate((node) => node.getBoundingClientRect().width >= 400), 'Playground generation settings', 'uses a comfortably wide desktop settings rail');
+  check(await page.locator('.pg-controls-heading').getByText('Generation settings', { exact: true }).isVisible(), 'Playground generation settings', 'keeps a clear title inside the expanded panel');
   check(await page.locator('[data-playground-context-value]').isVisible(), 'Playground generation settings', 'shows the signed context limit as read-only information');
   equal(await page.locator('[data-playground-context-value]').locator('input').count(), 0, 'Playground generation settings', 'does not present the context window as an editable request field');
   check(await rateOption.count() > 0, 'Playground price controls', 'offers a rate-priced fixture model');
@@ -489,6 +492,7 @@ try {
   equal(await playgroundControlsToggle.getAttribute('aria-expanded'), 'false', 'Playground generation settings', 'starts the mobile settings sheet closed');
   await playgroundControlsToggle.click();
   equal(await page.locator('[data-playground-controls]').evaluate((node) => getComputedStyle(node).position), 'fixed', 'Playground generation settings', 'uses a mobile bottom sheet');
+  check(await page.locator('[data-playground-controls]').evaluate((node) => innerWidth - node.getBoundingClientRect().width <= 14), 'Playground generation settings', 'uses the available mobile width without touching the viewport edges');
   check(await page.locator('[data-playground-controls-backdrop]').isVisible(), 'Playground generation settings', 'adds a dismissible mobile backdrop');
   await page.keyboard.press('Escape');
   await page.waitForTimeout(220);
