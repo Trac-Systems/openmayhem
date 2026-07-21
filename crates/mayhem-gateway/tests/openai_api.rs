@@ -7655,7 +7655,11 @@ async fn user_dashboard_renders_live_gateway_data() {
         .with_receipt_rail("tap")
         .with_payment_directory(json!({
             "payments": {
-                "fiat": { "currencies": ["usd", "eur"] }
+                "fiat": {
+                    "integration_currency": "usd",
+                    "adaptive_pricing": true,
+                    "payout_currencies": ["eur", "gbp", "usd"]
+                }
             },
             "rates": {
                 "tap": {

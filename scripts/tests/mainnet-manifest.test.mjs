@@ -49,6 +49,29 @@ test('mainnet manifest rejects retired admin payout-target controls', () => {
   assert.match(errors, /provider_payout_bindings_ownership_verified must be true/);
 });
 
+test('mainnet manifest pins canonical Stripe integration and payout currencies', () => {
+  const wrongIntegration = structuredClone(template);
+  wrongIntegration.payments.fiat.integration_currency = 'eur';
+  assert.match(
+    validateMainnetManifest(wrongIntegration, { allowPlaceholders: true }).errors.join('\n'),
+    /payments\.fiat\.integration_currency must be "usd"/,
+  );
+
+  const disabledAdaptive = structuredClone(template);
+  disabledAdaptive.payments.fiat.adaptive_pricing = false;
+  assert.match(
+    validateMainnetManifest(disabledAdaptive, { allowPlaceholders: true }).errors.join('\n'),
+    /payments\.fiat\.adaptive_pricing must be true/,
+  );
+
+  const missingGbp = structuredClone(template);
+  missingGbp.payments.fiat.payout_currencies = ['eur', 'usd'];
+  assert.match(
+    validateMainnetManifest(missingGbp, { allowPlaceholders: true }).errors.join('\n'),
+    /payout_currencies must be exactly/,
+  );
+});
+
 test('mainnet Pear command wires private auth files and the loopback Stripe worker', () => {
   const command = buildCommands(template).start_intercom.at(-1);
   assert.match(command, /--sc-bridge-token-file "\$MAYHEM_SC_BRIDGE_TOKEN_FILE"/);

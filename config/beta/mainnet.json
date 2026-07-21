@@ -169,7 +169,9 @@
     "fiat": {
       "processor": "stripe",
       "mode": "live",
-      "currencies": ["usd", "eur"],
+      "integration_currency": "usd",
+      "adaptive_pricing": true,
+      "payout_currencies": ["eur", "gbp", "usd"],
       "locale": "en",
       "event_collection": "stripe_api_polling",
       "connect_enabled": true

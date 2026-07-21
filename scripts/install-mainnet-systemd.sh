@@ -79,8 +79,12 @@ append_default MAYHEM_STRIPE_WORKER_URL 'http://127.0.0.1:11436'
 append_default MAYHEM_PAYGATE_STRIPE_EVENTS_PATH "$root/.mayhem-local/paygate/stripe-events.jsonl"
 append_default MAYHEM_STRIPE_CONNECT_ACCOUNT_TYPE 'express'
 append_default MAYHEM_STRIPE_CONNECT_ACCOUNTS_PATH "$root/.mayhem-local/paygate/stripe-connect-accounts.jsonl"
+append_default MAYHEM_STRIPE_CONNECT_CONSENTS_PATH "$root/.mayhem-local/paygate/stripe-connect-consents.jsonl"
 append_default MAYHEM_STRIPE_CONNECT_RETURN_URL 'https://dashboard.stripe.com/'
 append_default MAYHEM_STRIPE_CONNECT_REFRESH_URL 'https://dashboard.stripe.com/'
+append_default MAYHEM_STRIPE_CONNECT_OAUTH_CLIENT_ID ''
+append_default MAYHEM_STRIPE_CONNECT_OAUTH_REDIRECT_URL ''
+append_default MAYHEM_STRIPE_CONNECT_OAUTH_TOKEN_URL 'https://connect.stripe.com/oauth/token'
 append_default MAYHEM_STRIPE_BACKFILL_ENABLED '1'
 append_default MAYHEM_STRIPE_BACKFILL_CURSOR_PATH "$root/.mayhem-local/paygate/stripe-backfill-cursor.json"
 append_default MAYHEM_STRIPE_BACKFILL_INTERVAL_SECONDS '300'
@@ -227,6 +231,13 @@ require_equal MAYHEM_PAYGATE_STRIPE_ENABLED '1'
 require_equal MAYHEM_STRIPE_MODE 'live'
 require_equal MAYHEM_STRIPE_API_BASE_URL 'https://api.stripe.com'
 require_prefix MAYHEM_STRIPE_SECRET_KEY 'sk_live_'
+require_prefix MAYHEM_STRIPE_CONNECT_OAUTH_CLIENT_ID 'ca_'
+require_prefix MAYHEM_STRIPE_CONNECT_OAUTH_REDIRECT_URL 'https://'
+require_equal MAYHEM_STRIPE_CONNECT_OAUTH_TOKEN_URL 'https://connect.stripe.com/oauth/token'
+[[ "$(env_value MAYHEM_STRIPE_CONNECT_OAUTH_REDIRECT_URL)" != *paygate.trac.network* ]] || {
+  echo "Refusing live install: the retired/nonexistent paygate.trac.network redirect must not be used." >&2
+  exit 1
+}
 command -v python3 >/dev/null 2>&1 || {
   echo "python3 is required to initialize private mainnet runtime authentication." >&2
   exit 1

@@ -20,7 +20,7 @@ use mayhem_paygate::{
     paygate_router, run_stripe_backfill_once, stripe_signature_header, BoxFuture,
     ContractPostResult, ContractPoster, FiatChargebackFeature, FiatDepositFeature, OracleKeypair,
     PaygateConfig, PaygateState, PeerRpcContractPoster, RailConfig, StripeConnectAccountType,
-    StripeMode, StripeSettings, DEFAULT_STRIPE_API_BASE_URL,
+    StripeMode, StripeSettings, DEFAULT_STRIPE_API_BASE_URL, STRIPE_API_VERSION,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -43,21 +43,27 @@ struct StripeCapture {
     connect_account_id: Arc<Mutex<Option<String>>>,
     connect_account_type: Arc<Mutex<Option<String>>>,
     connect_country: Arc<Mutex<Option<String>>>,
+    connect_default_currency: Arc<Mutex<Option<String>>>,
     connect_owner_provider: Arc<Mutex<Option<String>>>,
+    connect_omit_metadata: Arc<Mutex<bool>>,
     connect_livemode: Arc<Mutex<bool>>,
     oauth_account_id: Arc<Mutex<Option<String>>>,
     oauth_livemode: Arc<Mutex<bool>>,
+    oauth_scope: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Clone, Debug)]
 struct StripeRequest {
     authorization: Option<String>,
     idempotency_key: Option<String>,
+    stripe_version: Option<String>,
     body: String,
 }
 
 fn requested_currency(body: &str) -> &'static str {
-    if body.contains("currency=eur") || body.contains("currency%5D=eur") {
+    if body.contains("currency=gbp") || body.contains("currency%5D=gbp") {
+        "gbp"
+    } else if body.contains("currency=eur") || body.contains("currency%5D=eur") {
         "eur"
     } else {
         "usd"
@@ -148,6 +154,10 @@ async fn mock_create_payment_intent(
             .get("idempotency-key")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned),
+        stripe_version: headers
+            .get("stripe-version")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
         body,
     });
     Json(json!({
@@ -176,6 +186,10 @@ async fn mock_create_checkout_session(
             .get("idempotency-key")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned),
+        stripe_version: headers
+            .get("stripe-version")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
         body,
     });
     Json(json!({
@@ -188,6 +202,10 @@ async fn mock_create_checkout_session(
         "payment_status": "unpaid",
         "status": "open",
         "expires_at": 1_900_000_000u64
+        ,"presentment_details": {
+            "presentment_amount": 216,
+            "presentment_currency": "eur"
+        }
     }))
 }
 
@@ -216,17 +234,27 @@ async fn mock_connect_account(capture: &StripeCapture, ready: bool) -> Value {
         .await
         .clone()
         .unwrap_or_else(|| "a".repeat(64));
-    let livemode = *capture.connect_livemode.lock().await;
+    let default_currency = capture
+        .connect_default_currency
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| "eur".to_owned());
+    let metadata = if *capture.connect_omit_metadata.lock().await {
+        Value::Null
+    } else {
+        json!({
+            "mayhem_provider": owner_provider,
+            "mayhem_mode": if *capture.connect_livemode.lock().await { "live" } else { "test" }
+        })
+    };
     json!({
         "id": account_id,
         "object": "account",
         "type": account_type,
         "country": country,
-        "default_currency": "eur",
-        "metadata": {
-            "mayhem_provider": owner_provider,
-            "mayhem_mode": if livemode { "live" } else { "test" }
-        },
+        "default_currency": default_currency,
+        "metadata": metadata,
         "details_submitted": ready,
         "charges_enabled": false,
         "payouts_enabled": ready,
@@ -266,6 +294,10 @@ async fn mock_create_connect_account(
             .get("idempotency-key")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned),
+        stripe_version: headers
+            .get("stripe-version")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
         body: format!("connect-account:{body}"),
     });
     Json(mock_connect_account(&capture, *capture.connect_ready.lock().await).await)
@@ -282,6 +314,10 @@ async fn mock_retrieve_connect_account(
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned),
         idempotency_key: None,
+        stripe_version: headers
+            .get("stripe-version")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
         body: format!("connect-status:{account_id}"),
     });
     Json(mock_connect_account(&capture, *capture.connect_ready.lock().await).await)
@@ -300,6 +336,10 @@ async fn mock_create_connect_link(
             .map(str::to_owned),
         idempotency_key: headers
             .get("idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        stripe_version: headers
+            .get("stripe-version")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned),
         body: format!("connect-link:{body}"),
@@ -323,12 +363,24 @@ async fn mock_exchange_connect_oauth(
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned),
         idempotency_key: None,
+        stripe_version: headers
+            .get("stripe-version")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
         body: format!("connect-oauth:{body}"),
     });
+    let scope = capture
+        .oauth_scope
+        .lock()
+        .await
+        .clone()
+        .unwrap_or_else(|| "read_write".to_owned());
     Json(json!({
         "token_type": "bearer",
-        "scope": "read_write",
+        "scope": scope,
         "livemode": *capture.oauth_livemode.lock().await,
+        "access_token": "sk_test_oauth_ephemeral_not_persisted",
+        "refresh_token": "rt_test_oauth_ephemeral_not_persisted",
         "stripe_user_id": capture
             .oauth_account_id
             .lock()
@@ -349,6 +401,10 @@ async fn mock_list_events(
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned),
         idempotency_key: None,
+        stripe_version: headers
+            .get("stripe-version")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
         body: format!("events:{query:?}"),
     });
     let event_type = query.get("type").map(String::as_str);
@@ -781,6 +837,16 @@ fn stripe_relink_request(provider: &str, source_provider: &str, request_nonce: &
     })
 }
 
+fn stripe_adopt_request(provider: &str, request_nonce: &str) -> Value {
+    json!({
+        "provider": provider,
+        "country": "DE",
+        "request_nonce": request_nonce,
+        "consent_expires_at": now_seconds() + 300,
+        "target_service_signature": "9".repeat(128),
+    })
+}
+
 fn succeeded_payment_payload(event_id: &str, payment_intent: &str) -> String {
     json!({
         "id": event_id,
@@ -794,6 +860,10 @@ fn succeeded_payment_payload(event_id: &str, payment_intent: &str) -> String {
                 "latest_charge": format!("ch_{payment_intent}"),
                 "amount_received": 250,
                 "currency": "usd",
+                "presentment_details": {
+                    "presentment_amount": 198,
+                    "presentment_currency": "gbp"
+                },
                 "metadata": {
                     "mayhem_who": "b".repeat(64),
                     "mayhem_au": "2500000000000000000",
@@ -945,7 +1015,7 @@ async fn internal_stripe_posts_require_fresh_unreplayed_request_auth() {
     let body = json!({
         "who": "a".repeat(64),
         "au": "2500000000000000000",
-        "currency": "eur",
+        "currency": "usd",
         "idempotency_key": "stripe-internal-auth-test"
     });
     let serialized = body.to_string();
@@ -1054,7 +1124,7 @@ async fn stripe_payment_intent_route_posts_canonical_au_metadata_to_stripe() {
         json!({
             "who": "a".repeat(64),
             "au": "2500000000000000000",
-            "currency": "eur",
+            "currency": "usd",
             "idempotency_key": "stripe-route-test-1"
         }),
     )
@@ -1065,7 +1135,7 @@ async fn stripe_payment_intent_route_posts_canonical_au_metadata_to_stripe() {
     assert_eq!(body["denom"], "au_usd");
     assert_eq!(body["payment_intent"]["id"], "pi_test_123");
     assert_eq!(body["payment_intent"]["amount"], 250);
-    assert_eq!(body["payment_intent"]["currency"], "eur");
+    assert_eq!(body["payment_intent"]["currency"], "usd");
 
     let requests = capture.requests.lock().await;
     assert_eq!(requests.len(), 1);
@@ -1079,7 +1149,7 @@ async fn stripe_payment_intent_route_posts_canonical_au_metadata_to_stripe() {
         Some("stripe-route-test-1")
     );
     assert!(requests[0].body.contains("amount=250"));
-    assert!(requests[0].body.contains("currency=eur"));
+    assert!(requests[0].body.contains("currency=usd"));
     assert!(requests[0]
         .body
         .contains("metadata%5Bmayhem_who%5D=aaaaaaaa"));
@@ -1091,7 +1161,7 @@ async fn stripe_payment_intent_route_posts_canonical_au_metadata_to_stripe() {
         .contains("metadata%5Bmayhem_denom%5D=au_usd"));
     assert!(requests[0]
         .body
-        .contains("metadata%5Bmayhem_fiat_currency%5D=eur"));
+        .contains("metadata%5Bmayhem_fiat_currency%5D=usd"));
     assert!(requests[0]
         .body
         .contains("metadata%5Bmayhem_fiat_amount_minor%5D=250"));
@@ -1139,6 +1209,15 @@ async fn stripe_checkout_session_route_returns_hosted_url_and_binds_payment_inte
         "https://checkout.stripe.com/c/pay/cs_test_123"
     );
     assert_eq!(body["checkout_session"]["amount_total"], 250);
+    assert_eq!(body["checkout_session"]["currency"], "usd");
+    assert_eq!(
+        body["checkout_session"]["presentment_details"]["amount"],
+        216
+    );
+    assert_eq!(
+        body["checkout_session"]["presentment_details"]["currency"],
+        "eur"
+    );
 
     let requests = capture.requests.lock().await;
     assert_eq!(requests.len(), 1);
@@ -1151,7 +1230,14 @@ async fn stripe_checkout_session_route_returns_hosted_url_and_binds_payment_inte
         requests[0].idempotency_key.as_deref(),
         Some("stripe-checkout-test-1")
     );
+    assert_eq!(
+        requests[0].stripe_version.as_deref(),
+        Some(STRIPE_API_VERSION)
+    );
     assert!(requests[0].body.contains("mode=payment"));
+    assert!(requests[0]
+        .body
+        .contains("adaptive_pricing%5Benabled%5D=true"));
     assert!(requests[0].body.contains("locale=en"));
     assert!(requests[0]
         .body
@@ -1180,6 +1266,49 @@ async fn stripe_checkout_session_route_returns_hosted_url_and_binds_payment_inte
     assert!(requests[0]
         .body
         .contains("payment_intent_data%5Bmetadata%5D%5Bmayhem_fiat_amount_minor%5D=250"));
+}
+
+#[tokio::test]
+async fn stripe_direct_and_checkout_integration_reject_non_usd_currency() {
+    let (stripe_base, capture) = start_mock_stripe().await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state = PaygateState::try_new_with_contract_poster(
+        test_config(stripe_base, temp.path().join("stripe-events.jsonl")),
+        OracleKeypair::from_seed_hex(&"67".repeat(32)).expect("oracle"),
+        Arc::new(RecordingContractPoster::default()),
+    )
+    .expect("state");
+    let app = paygate_router(state);
+
+    for (uri, body) in [
+        (
+            "/v1/stripe/payment-intents",
+            json!({
+                "who": "a".repeat(64),
+                "au": "2500000000000000000",
+                "currency": "eur"
+            }),
+        ),
+        (
+            "/v1/stripe/checkout-sessions",
+            json!({
+                "who": "a".repeat(64),
+                "au": "2500000000000000000",
+                "success_url": "http://127.0.0.1:11436/v1/stripe/return",
+                "cancel_url": "http://127.0.0.1:11436/v1/stripe/cancel",
+                "currency": "gbp",
+                "locale": "en"
+            }),
+        ),
+    ] {
+        let (status, body) = json_request(app.clone(), Method::POST, uri, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("integration currency must be usd"));
+    }
+    assert!(capture.requests.lock().await.is_empty());
 }
 
 #[tokio::test]
@@ -1289,6 +1418,35 @@ async fn stripe_connect_onboarding_reuses_account_and_reports_ready_status() {
             .count(),
         2
     );
+}
+
+#[tokio::test]
+async fn stripe_connect_accepts_iso_default_currencies_including_gbp() {
+    for currency in ["usd", "eur", "gbp"] {
+        let (stripe_base, capture) = start_mock_stripe().await;
+        *capture.connect_default_currency.lock().await = Some(currency.to_owned());
+        *capture.connect_country.lock().await = Some("GB".to_owned());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = PaygateState::try_new_with_contract_poster(
+            test_config(stripe_base, temp.path().join("stripe-events.jsonl")),
+            OracleKeypair::from_seed_hex(&"68".repeat(32)).expect("oracle"),
+            Arc::new(RecordingContractPoster::default()),
+        )
+        .expect("state");
+        let (status, body) = json_request(
+            paygate_router(state),
+            Method::POST,
+            "/v1/stripe/connect/onboard",
+            json!({
+                "provider": "a".repeat(64),
+                "country": "GB",
+                "request_nonce": "1".repeat(64)
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{currency}: {body}");
+        assert_eq!(body["account"]["default_currency"], currency);
+    }
 }
 
 #[tokio::test]
@@ -1860,6 +2018,377 @@ async fn stripe_connect_relink_requires_and_replays_verified_standard_oauth_cons
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(target["account"]["ready"], true);
+}
+
+#[tokio::test]
+async fn stripe_connect_adopts_metadata_free_standard_account_with_single_use_oauth() {
+    let (stripe_base, capture) = start_mock_stripe().await;
+    *capture.connect_ready.lock().await = true;
+    *capture.connect_account_id.lock().await = Some("acct_adopted_standard".to_owned());
+    *capture.connect_account_type.lock().await = Some("standard".to_owned());
+    *capture.connect_default_currency.lock().await = Some("gbp".to_owned());
+    *capture.connect_omit_metadata.lock().await = true;
+    *capture.oauth_account_id.lock().await = Some("acct_adopted_standard".to_owned());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut config = test_config(stripe_base.clone(), temp.path().join("stripe-events.jsonl"));
+    config.rails.stripe.connect_oauth_client_id = Some("ca_test_mayhem".to_owned());
+    config.rails.stripe.connect_oauth_redirect_url =
+        Some("https://paygate.example/v1/stripe/connect/adopt/return".to_owned());
+    config.rails.stripe.connect_oauth_token_url = format!("{stripe_base}/oauth/token");
+    let state = PaygateState::try_new_with_contract_poster(
+        config.clone(),
+        OracleKeypair::from_seed_hex(&"69".repeat(32)).expect("oracle"),
+        Arc::new(RecordingContractPoster::default()),
+    )
+    .expect("state");
+    let app = paygate_router(state);
+    let request = stripe_adopt_request(&"b".repeat(64), &"2".repeat(64));
+
+    let (status, adopt) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/stripe/connect/adopt",
+        request.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{adopt}");
+    assert_eq!(adopt["status"], "consent_required");
+    assert!(adopt["account"].is_null());
+    let consent_url = adopt["copy_paste"]["onboarding_url"]
+        .as_str()
+        .expect("adoption consent URL");
+    assert!(!consent_url.contains("acct_"));
+    let parsed = reqwest::Url::parse(consent_url).expect("consent URL");
+    assert_eq!(parsed.host_str(), Some("connect.stripe.com"));
+    assert_eq!(
+        parsed
+            .query_pairs()
+            .find(|(key, _)| key == "redirect_uri")
+            .map(|(_, value)| value.into_owned())
+            .as_deref(),
+        Some("https://paygate.example/v1/stripe/connect/adopt/return")
+    );
+    let state_token = parsed
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .map(|(_, value)| value.into_owned())
+        .expect("opaque OAuth state");
+
+    let (status, replay) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/stripe/connect/adopt",
+        request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replay["copy_paste"]["onboarding_url"], consent_url);
+
+    let (status, _) = get_request(
+        app.clone(),
+        &format!(
+            "/v1/stripe/connect/adopt/return?state={}&code=ac_unknown&scope=read_write",
+            "0".repeat(64)
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = get_request(
+        app.clone(),
+        &format!(
+            "/v1/stripe/connect/adopt/return?state={state_token}&code=ac_bad_scope&scope=read_only"
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    *capture.oauth_scope.lock().await = Some("read_only".to_owned());
+    let callback = format!(
+        "/v1/stripe/connect/adopt/return?state={state_token}&code=ac_adopt&scope=read_write"
+    );
+    let (status, _) = get_request(app.clone(), &callback).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    *capture.oauth_scope.lock().await = None;
+
+    *capture.oauth_livemode.lock().await = true;
+    let (status, _) = get_request(app.clone(), &callback).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    *capture.oauth_livemode.lock().await = false;
+
+    let (status, body) = get_request(app.clone(), &callback).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("consent verified"));
+    let (status, _) = get_request(app.clone(), &callback).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, account) = json_request(
+        app,
+        Method::POST,
+        "/v1/stripe/connect/status",
+        json!({
+            "provider": "b".repeat(64),
+            "request_nonce": "3".repeat(64)
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{account}");
+    assert_eq!(account["account"]["id"], "acct_adopted_standard");
+    assert_eq!(account["account"]["account_type"], "standard");
+    assert_eq!(account["account"]["default_currency"], "gbp");
+    assert_eq!(account["account"]["ready"], true);
+
+    let oauth_calls = capture
+        .requests
+        .lock()
+        .await
+        .iter()
+        .filter(|request| request.body.starts_with("connect-oauth:"))
+        .count();
+    assert_eq!(oauth_calls, 3);
+    let account_log =
+        fs::read_to_string(&config.rails.stripe.connect_accounts_path).expect("account log");
+    let consent_log =
+        fs::read_to_string(&config.rails.stripe.connect_consents_path).expect("consent log");
+    for persisted in [&account_log, &consent_log] {
+        assert!(!persisted.contains("access_token"));
+        assert!(!persisted.contains("refresh_token"));
+        assert!(!persisted.contains("oauth_ephemeral"));
+    }
+
+    let reloaded = PaygateState::try_new_with_contract_poster(
+        config,
+        OracleKeypair::from_seed_hex(&"69".repeat(32)).expect("oracle"),
+        Arc::new(RecordingContractPoster::default()),
+    )
+    .expect("reloaded state");
+    let (status, account) = json_request(
+        paygate_router(reloaded),
+        Method::POST,
+        "/v1/stripe/connect/status",
+        json!({
+            "provider": "b".repeat(64),
+            "request_nonce": "4".repeat(64)
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(account["account"]["ready"], true);
+}
+
+#[tokio::test]
+async fn stripe_connect_adoption_rejects_account_substitution_and_unready_accounts() {
+    for (account_type, country, ready, expected) in [
+        ("express", "DE", true, "requires a Standard account"),
+        ("standard", "NL", true, "country did not match"),
+        ("standard", "DE", false, "not ready to receive transfers"),
+    ] {
+        let (stripe_base, capture) = start_mock_stripe().await;
+        *capture.connect_ready.lock().await = ready;
+        *capture.connect_account_id.lock().await = Some("acct_adoption_candidate".to_owned());
+        *capture.connect_account_type.lock().await = Some(account_type.to_owned());
+        *capture.connect_country.lock().await = Some(country.to_owned());
+        *capture.connect_omit_metadata.lock().await = true;
+        *capture.oauth_account_id.lock().await = Some("acct_adoption_candidate".to_owned());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(stripe_base.clone(), temp.path().join("stripe-events.jsonl"));
+        config.rails.stripe.connect_oauth_client_id = Some("ca_test_mayhem".to_owned());
+        config.rails.stripe.connect_oauth_redirect_url =
+            Some("https://paygate.example/v1/stripe/connect/adopt/return".to_owned());
+        config.rails.stripe.connect_oauth_token_url = format!("{stripe_base}/oauth/token");
+        let app = paygate_router(
+            PaygateState::try_new_with_contract_poster(
+                config,
+                OracleKeypair::from_seed_hex(&"70".repeat(32)).expect("oracle"),
+                Arc::new(RecordingContractPoster::default()),
+            )
+            .expect("state"),
+        );
+        let (status, adopt) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/stripe/connect/adopt",
+            stripe_adopt_request(&"b".repeat(64), &"2".repeat(64)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let state_token = reqwest::Url::parse(
+            adopt["copy_paste"]["onboarding_url"]
+                .as_str()
+                .expect("OAuth URL"),
+        )
+        .expect("OAuth URL parses")
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .map(|(_, value)| value.into_owned())
+        .expect("state");
+        let (status, body) = get_request(
+            app,
+            &format!(
+                "/v1/stripe/connect/adopt/return?state={state_token}&code=ac_candidate&scope=read_write"
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains(expected), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn stripe_connect_adoption_never_accepts_typed_or_cross_provider_account_ids() {
+    let (stripe_base, capture) = start_mock_stripe().await;
+    *capture.connect_ready.lock().await = true;
+    *capture.connect_account_id.lock().await = Some("acct_shared_standard".to_owned());
+    *capture.connect_account_type.lock().await = Some("standard".to_owned());
+    *capture.connect_omit_metadata.lock().await = true;
+    *capture.oauth_account_id.lock().await = Some("acct_shared_standard".to_owned());
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut config = test_config(stripe_base.clone(), temp.path().join("stripe-events.jsonl"));
+    config.rails.stripe.connect_oauth_client_id = Some("ca_test_mayhem".to_owned());
+    config.rails.stripe.connect_oauth_redirect_url =
+        Some("https://paygate.example/v1/stripe/connect/adopt/return".to_owned());
+    config.rails.stripe.connect_oauth_token_url = format!("{stripe_base}/oauth/token");
+    let app = paygate_router(
+        PaygateState::try_new_with_contract_poster(
+            config,
+            OracleKeypair::from_seed_hex(&"71".repeat(32)).expect("oracle"),
+            Arc::new(RecordingContractPoster::default()),
+        )
+        .expect("state"),
+    );
+
+    let mut typed = stripe_adopt_request(&"a".repeat(64), &"1".repeat(64));
+    typed["account_id"] = json!("acct_shared_standard");
+    let (status, _) =
+        json_request(app.clone(), Method::POST, "/v1/stripe/connect/adopt", typed).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    for (provider, nonce) in [
+        ("a".repeat(64), "2".repeat(64)),
+        ("b".repeat(64), "3".repeat(64)),
+    ] {
+        let (status, adopt) = json_request(
+            app.clone(),
+            Method::POST,
+            "/v1/stripe/connect/adopt",
+            stripe_adopt_request(&provider, &nonce),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let state_token = reqwest::Url::parse(
+            adopt["copy_paste"]["onboarding_url"]
+                .as_str()
+                .expect("OAuth URL"),
+        )
+        .expect("OAuth URL parses")
+        .query_pairs()
+        .find(|(key, _)| key == "state")
+        .map(|(_, value)| value.into_owned())
+        .expect("state");
+        let (callback_status, callback_body) = get_request(
+            app.clone(),
+            &format!(
+                "/v1/stripe/connect/adopt/return?state={state_token}&code=ac_{nonce}&scope=read_write"
+            ),
+        )
+        .await;
+        if provider.starts_with('a') {
+            assert_eq!(callback_status, StatusCode::OK, "{callback_body}");
+        } else {
+            assert_eq!(callback_status, StatusCode::BAD_REQUEST);
+            assert!(callback_body.contains("already bound to another provider"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn stripe_connect_deauthorization_persists_and_status_fails_closed() {
+    let (stripe_base, capture) = start_mock_stripe().await;
+    *capture.connect_ready.lock().await = true;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let config = test_config(stripe_base, temp.path().join("stripe-events.jsonl"));
+    let poster = Arc::new(RecordingContractPoster::default());
+    let state = PaygateState::try_new_with_contract_poster(
+        config.clone(),
+        OracleKeypair::from_seed_hex(&"72".repeat(32)).expect("oracle"),
+        poster.clone(),
+    )
+    .expect("state");
+    let app = paygate_router(state);
+    let (status, onboarded) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/stripe/connect/onboard",
+        json!({
+            "provider": "a".repeat(64),
+            "country": "DE",
+            "request_nonce": "1".repeat(64)
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(onboarded["account"]["ready"], true);
+
+    let payload = json!({
+        "id": "evt_connect_deauthorized",
+        "object": "event",
+        "type": "account.application.deauthorized",
+        "created": 7_200,
+        "account": "acct_test_provider",
+        "data": {
+            "object": {
+                "id": "ca_test_mayhem",
+                "object": "application"
+            }
+        }
+    })
+    .to_string();
+    for expected_duplicate in [false, true] {
+        let response = post_signed_webhook(app.clone(), &payload).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response bytes");
+        let body: Value = serde_json::from_slice(&bytes).expect("response JSON");
+        assert_eq!(body["duplicate"], expected_duplicate);
+    }
+
+    let (status, account) = json_request(
+        app,
+        Method::POST,
+        "/v1/stripe/connect/status",
+        json!({
+            "provider": "a".repeat(64),
+            "request_nonce": "2".repeat(64)
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(account["account"]["ready"], false);
+    assert_eq!(account["account"]["payouts_enabled"], false);
+    assert_eq!(
+        account["account"]["disabled_reason"],
+        "platform.application_deauthorized"
+    );
+
+    let reloaded = PaygateState::try_new_with_contract_poster(
+        config,
+        OracleKeypair::from_seed_hex(&"72".repeat(32)).expect("oracle"),
+        poster,
+    )
+    .expect("reloaded state");
+    let (status, account) = json_request(
+        paygate_router(reloaded),
+        Method::POST,
+        "/v1/stripe/connect/status",
+        json!({
+            "provider": "a".repeat(64),
+            "request_nonce": "3".repeat(64)
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(account["account"]["ready"], false);
 }
 
 #[tokio::test]
@@ -2564,6 +3093,10 @@ async fn stripe_dispute_webhook_claws_back_once_and_dedups_replay() {
                 "latest_charge": "ch_test_dispute",
                 "amount_received": 250,
                 "currency": "usd",
+                "presentment_details": {
+                    "presentment_amount": 198,
+                    "presentment_currency": "gbp"
+                },
                 "metadata": {
                     "mayhem_who": "c".repeat(64),
                     "mayhem_au": "2500000000000000000",
@@ -2662,6 +3195,132 @@ async fn stripe_dispute_webhook_claws_back_once_and_dedups_replay() {
     assert_eq!(event_log.lines().count(), 2);
     assert!(event_log.contains("evt_test_deposit_before_dispute"));
     assert!(event_log.contains("evt_test_dispute_replay"));
+    assert!(event_log.contains("\"presentment_currency\":\"gbp\""));
+    assert!(event_log.contains("\"presentment_amount_minor\":198"));
+}
+
+#[tokio::test]
+async fn stripe_partial_disputes_use_restart_safe_proportional_cumulative_au() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let event_store_path = temp.path().join("stripe-events.jsonl");
+    let config = test_config("http://127.0.0.1:9".to_owned(), event_store_path.clone());
+    let poster = Arc::new(RecordingContractPoster::default());
+    let app = paygate_router(
+        PaygateState::try_new_with_contract_poster(
+            config.clone(),
+            OracleKeypair::from_seed_hex(&"73".repeat(32)).expect("oracle"),
+            poster.clone(),
+        )
+        .expect("state"),
+    );
+    let deposit = json!({
+        "id": "evt_partial_deposit",
+        "object": "event",
+        "type": "payment_intent.succeeded",
+        "created": 3_600,
+        "data": {
+            "object": {
+                "id": "pi_partial",
+                "object": "payment_intent",
+                "latest_charge": "ch_partial",
+                "amount_received": 301,
+                "currency": "usd",
+                "metadata": {
+                    "mayhem_who": "e".repeat(64),
+                    "mayhem_au": "3010000000000000000",
+                    "mayhem_denom": "au_usd",
+                    "mayhem_fiat_currency": "usd",
+                    "mayhem_fiat_amount_minor": "301"
+                }
+            }
+        }
+    })
+    .to_string();
+    assert_eq!(
+        post_signed_webhook(app.clone(), &deposit).await.status(),
+        StatusCode::OK
+    );
+
+    let first = json!({
+        "id": "evt_partial_first",
+        "object": "event",
+        "type": "charge.dispute.created",
+        "created": 7_200,
+        "data": {
+            "object": {
+                "id": "dp_partial_first",
+                "object": "dispute",
+                "amount": 100,
+                "currency": "usd",
+                "charge": "ch_partial",
+                "payment_intent": "pi_partial"
+            }
+        }
+    })
+    .to_string();
+    assert_eq!(
+        post_signed_webhook(app, &first).await.status(),
+        StatusCode::OK
+    );
+
+    let restarted = paygate_router(
+        PaygateState::try_new_with_contract_poster(
+            config,
+            OracleKeypair::from_seed_hex(&"73".repeat(32)).expect("oracle"),
+            poster.clone(),
+        )
+        .expect("restarted state"),
+    );
+    let final_dispute = json!({
+        "id": "evt_partial_final",
+        "object": "event",
+        "type": "charge.dispute.created",
+        "created": 10_800,
+        "data": {
+            "object": {
+                "id": "dp_partial_final",
+                "object": "dispute",
+                "amount": 201,
+                "currency": "usd",
+                "charge": "ch_partial",
+                "payment_intent": "pi_partial"
+            }
+        }
+    })
+    .to_string();
+    assert_eq!(
+        post_signed_webhook(restarted.clone(), &final_dispute)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let duplicate = post_signed_webhook(restarted, &final_dispute).await;
+    assert_eq!(duplicate.status(), StatusCode::OK);
+    let duplicate: Value = serde_json::from_slice(
+        &to_bytes(duplicate.into_body(), usize::MAX)
+            .await
+            .expect("response bytes"),
+    )
+    .expect("response JSON");
+    assert_eq!(duplicate["duplicate"], true);
+
+    let chargebacks = poster.chargebacks.lock().await;
+    assert_eq!(chargebacks.len(), 2);
+    assert_eq!(chargebacks[0].fiat_amount_minor, 100);
+    assert_eq!(chargebacks[0].au, 1_000_000_000_000_000_000u128);
+    assert_eq!(chargebacks[1].fiat_amount_minor, 201);
+    assert_eq!(chargebacks[1].au, 2_010_000_000_000_000_000u128);
+    assert_eq!(
+        chargebacks.iter().map(|feature| feature.au).sum::<u128>(),
+        3_010_000_000_000_000_000u128
+    );
+    assert_eq!(
+        fs::read_to_string(event_store_path)
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
 }
 
 #[tokio::test]

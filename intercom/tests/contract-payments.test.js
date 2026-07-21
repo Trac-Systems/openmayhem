@@ -9,7 +9,9 @@ const paymentConfig = (overrides = {}) => ({
   ver: 1,
   fiat: {
     processor: 'stripe',
-    currencies: ['eur', 'usd'],
+    integration_currency: 'usd',
+    adaptive_pricing: true,
+    payout_currencies: ['eur', 'gbp', 'usd'],
     locale: 'en',
   },
   tap: {
@@ -44,7 +46,9 @@ test('admin publishes one complete canonical payment directory', async () => {
     rails: ['fiat', 'tap', 'tnk'],
     fiat: {
       processor: 'stripe',
-      currencies: ['usd', 'eur'],
+      integration_currency: 'usd',
+      adaptive_pricing: true,
+      payout_currencies: ['eur', 'gbp', 'usd'],
       locale: 'en',
     },
     tap: {
@@ -106,7 +110,9 @@ test('payment directory is admin-only and rejects local or incomplete discovery'
     paymentConfig({
       fiat: {
         processor: 'stripe',
-        currencies: ['usd', 'eur'],
+        integration_currency: 'usd',
+        adaptive_pricing: true,
+        payout_currencies: ['eur', 'gbp', 'usd'],
         locale: 'en',
         paygate_url: 'https://paygate.invalid',
       },
@@ -151,6 +157,58 @@ test('payment directory is admin-only and rejects local or incomplete discovery'
   );
   assert.match(badTap.message, /invalid TAP chain id/i);
   assert.equal(await storage.get('payments/current'), null);
+});
+
+test('fiat config is exact, Adaptive-Pricing based, and payout-currency generic', async () => {
+  const { admin, storage, contract } = await setup();
+  const legacy = await execute(
+    contract,
+    storage,
+    'setPayments',
+    paymentConfig({
+      fiat: { processor: 'stripe', currencies: ['usd'], locale: 'en' },
+    }),
+    admin.publicKey,
+    1
+  );
+  assert.match(legacy.message, /does not accept fields: currencies/i);
+
+  for (const fiat of [
+    { ...paymentConfig().fiat, integration_currency: 'eur' },
+    { ...paymentConfig().fiat, adaptive_pricing: false },
+    { ...paymentConfig().fiat, payout_currencies: ['eur', 'usd'] },
+    { ...paymentConfig().fiat, payout_currencies: ['usd', 'gbp', 'eur'] },
+    { ...paymentConfig().fiat, payout_currencies: ['eur', 'gbp', 'USD'] },
+  ]) {
+    const result = await execute(
+      contract,
+      storage,
+      'setPayments',
+      paymentConfig({ fiat }),
+      admin.publicKey,
+      2
+    );
+    assert.ok(result instanceof Error, JSON.stringify(result));
+  }
+
+  const generic = await execute(
+    contract,
+    storage,
+    'setPayments',
+    paymentConfig({
+      fiat: {
+        ...paymentConfig().fiat,
+        payout_currencies: ['cad', 'eur', 'gbp', 'usd'],
+      },
+    }),
+    admin.publicKey,
+    3
+  );
+  assert.equal(generic.ok, true, generic.message);
+  assert.deepEqual(
+    (await storage.get('payments/current')).value.fiat.payout_currencies,
+    ['cad', 'eur', 'gbp', 'usd']
+  );
 });
 
 test('rotating the canonical TAP pool isolates every pool-backed monetary record', async () => {

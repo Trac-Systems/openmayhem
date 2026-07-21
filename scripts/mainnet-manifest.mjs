@@ -423,7 +423,9 @@ function validateManifest(manifest, { allowPlaceholders = false } = {}) {
       requireOnlyKeys(add, manifest.payments.fiat, 'payments.fiat', [
         'processor',
         'mode',
-        'currencies',
+        'integration_currency',
+        'adaptive_pricing',
+        'payout_currencies',
         'locale',
         'event_collection',
         'connect_enabled',
@@ -431,8 +433,10 @@ function validateManifest(manifest, { allowPlaceholders = false } = {}) {
       requireLiteral(add, manifest.payments.fiat.processor, 'stripe', 'payments.fiat.processor');
       requireLiteral(add, manifest.payments.fiat.mode, 'live', 'payments.fiat.mode');
       requireLiteral(add, manifest.payments.fiat.connect_enabled, true, 'payments.fiat.connect_enabled');
-      if (!Array.isArray(manifest.payments.fiat.currencies) || manifest.payments.fiat.currencies.join(',') !== 'usd,eur') {
-        add('error', 'payments.fiat.currencies must be exactly ["usd","eur"]');
+      requireLiteral(add, manifest.payments.fiat.integration_currency, 'usd', 'payments.fiat.integration_currency');
+      requireLiteral(add, manifest.payments.fiat.adaptive_pricing, true, 'payments.fiat.adaptive_pricing');
+      if (!Array.isArray(manifest.payments.fiat.payout_currencies) || manifest.payments.fiat.payout_currencies.join(',') !== 'eur,gbp,usd') {
+        add('error', 'payments.fiat.payout_currencies must be exactly ["eur","gbp","usd"]');
       }
       requireLiteral(add, manifest.payments.fiat.locale, 'en', 'payments.fiat.locale');
       requireLiteral(add, manifest.payments.fiat.event_collection, 'stripe_api_polling', 'payments.fiat.event_collection');

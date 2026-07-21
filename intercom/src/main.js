@@ -74,6 +74,24 @@ const stripeWorkerEndpoint = (raw, endpointPath) => {
 const stripePayoutTargetPointerKey = (provider, accountId) =>
   `payout/stripe-verified/target/${provider}/${accountId}`;
 
+const canonicalStripeFiatConfig = (payments, admin) => {
+  const fiat = payments?.fiat;
+  const payoutCurrencies = fiat?.payout_currencies;
+  if (!/^[0-9a-f]{64}$/.test(String(admin ?? '')) ||
+      !payments || payments.denom !== 'au_usd' || payments.set_by !== admin ||
+      payments.set_by_role !== 'admin' ||
+      fiat?.processor !== 'stripe' || fiat.integration_currency !== 'usd' ||
+      fiat.adaptive_pricing !== true || fiat.locale !== 'en' ||
+      !Array.isArray(payoutCurrencies) || payoutCurrencies.length < 3 ||
+      payoutCurrencies.some((currency) => !/^[a-z]{3}$/.test(currency)) ||
+      new Set(payoutCurrencies).size !== payoutCurrencies.length ||
+      JSON.stringify(payoutCurrencies) !== JSON.stringify(payoutCurrencies.slice().sort()) ||
+      !['eur', 'gbp', 'usd'].every((currency) => payoutCurrencies.includes(currency))) {
+    throw new Error('Canonical Stripe payment configuration is unavailable.');
+  }
+  return fiat;
+};
+
 const stripeInternalAuthSecret = () => {
   return loadPrivateInternalAuthSecret({
     fsModule: fs,
@@ -149,8 +167,6 @@ const stripeCheckoutRequest = async (peer, value) => {
   const allowedKeys = new Set([
     'who',
     'au',
-    'currency',
-    'locale',
     'idempotency_key',
     'request_nonce',
     'success_url',
@@ -160,7 +176,8 @@ const stripeCheckoutRequest = async (peer, value) => {
   if (unknownKeys.length > 0) {
     throw new Error(`Stripe checkout request does not accept fields: ${unknownKeys.join(', ')}.`);
   }
-  if (!/^[0-9a-f]{64}$/.test(String(value.who || '').toLowerCase())) {
+  const who = String(value.who || '');
+  if (!/^[0-9a-f]{64}$/.test(who)) {
     throw new Error('Invalid Stripe checkout participant.');
   }
   if (!/^[1-9][0-9]*$/.test(String(value.au || ''))) {
@@ -186,20 +203,11 @@ const stripeCheckoutRequest = async (peer, value) => {
     throw new Error('Invalid Stripe checkout request nonce.');
   }
 
-  const payments = (await peer.base.view.get('payments/current'))?.value;
-  if (!payments || payments.denom !== 'au_usd' || payments.set_by_role !== 'admin') {
-    throw new Error('Canonical payment configuration is unavailable.');
-  }
-  const currency = String(value.currency || '').toLowerCase();
-  const locale = String(value.locale || '');
-  if (payments.fiat?.processor !== 'stripe' ||
-      !Array.isArray(payments.fiat.currencies) ||
-      !payments.fiat.currencies.includes(currency)) {
-    throw new Error('Stripe checkout currency is not enabled by the admin.');
-  }
-  if (payments.fiat.locale !== locale) {
-    throw new Error('Stripe checkout locale is not enabled by the admin.');
-  }
+  const [paymentsEntry, adminEntry] = await Promise.all([
+    peer.base.view.get('payments/current'),
+    peer.base.view.get('admin'),
+  ]);
+  const fiat = canonicalStripeFiatConfig(paymentsEntry?.value, adminEntry?.value);
 
   const endpoint = stripeWorkerEndpoint(
     stripeWorkerUrl,
@@ -212,8 +220,9 @@ const stripeCheckoutRequest = async (peer, value) => {
   }
   return await postInternalStripeRequest(endpoint, {
     ...workerValue,
-    currency,
-    locale,
+    integration_currency: fiat.integration_currency,
+    adaptive_pricing: fiat.adaptive_pricing,
+    locale: fiat.locale,
   }, stripeWorkerRequestTimeoutMs);
 };
 
@@ -229,6 +238,13 @@ const validateStripeConnectRequest = async (peer, service, value) => {
         'rotate',
         'previous_account_id',
       ])
+    : service === 'stripe_connect_adopt'
+      ? new Set([
+          'provider',
+          'country',
+          'request_nonce',
+          'consent_expires_at',
+        ])
     : service === 'stripe_connect_relink'
       ? new Set([
           'provider',
@@ -263,7 +279,9 @@ const validateStripeConnectRequest = async (peer, service, value) => {
       !providerRecord.accepted_rails.includes('fiat')) {
     throw new Error('Stripe Connect onboarding requires the provider to accept fiat.');
   }
-  if (service === 'stripe_connect_onboard' || service === 'stripe_connect_relink') {
+  if (service === 'stripe_connect_onboard' ||
+      service === 'stripe_connect_adopt' ||
+      service === 'stripe_connect_relink') {
     const country = String(value.country || '').toUpperCase();
     if (!/^[A-Z]{2}$/.test(country)) {
       throw new Error('Stripe Connect country must be a two-letter ISO country code.');
@@ -284,6 +302,21 @@ const validateStripeConnectRequest = async (peer, service, value) => {
         country,
         rotate,
         previous_account_id: previousAccountId,
+      };
+    }
+    if (service === 'stripe_connect_adopt') {
+      const now = Math.floor(Date.now() / 1_000);
+      if (value.country !== country ||
+          !Number.isSafeInteger(value.consent_expires_at) ||
+          value.consent_expires_at <= now ||
+          value.consent_expires_at > now + 600) {
+        throw new Error('Stripe Connect adoption consent is stale or exceeds its bounded lifetime.');
+      }
+      return {
+        provider,
+        country,
+        request_nonce: requestNonce,
+        consent_expires_at: value.consent_expires_at,
       };
     }
     if (service === 'stripe_connect_relink') {
@@ -403,9 +436,13 @@ const verifyStripePayoutTarget = async (
   if (!/^acct_[A-Za-z0-9._-]+$/.test(accountId)) {
     throw new Error('Stripe Connect status returned an invalid account id.');
   }
-  const payments = (await peer.base.view.get('payments/current'))?.value;
-  if (!Array.isArray(payments?.fiat?.currencies) ||
-      !payments.fiat.currencies.includes(currency)) {
+  const [paymentsEntry, adminEntry] = await Promise.all([
+    peer.base.view.get('payments/current'),
+    peer.base.view.get('admin'),
+  ]);
+  const payments = paymentsEntry?.value;
+  const fiat = canonicalStripeFiatConfig(payments, adminEntry?.value);
+  if (!fiat.payout_currencies.includes(currency)) {
     throw new Error(`Stripe payout currency ${currency || '(missing)'} is not enabled by the admin.`);
   }
   if (!['express', 'standard', 'custom'].includes(account?.account_type) ||
@@ -418,6 +455,9 @@ const verifyStripePayoutTarget = async (
         account.transfers_enabled
       )) {
     throw new Error('Stripe Connect account returned invalid payout readiness.');
+  }
+  if (verificationKind === 'adopt' && account.account_type !== 'standard') {
+    throw new Error('Stripe Connect adoption requires a Standard account.');
   }
   if (!['live', 'test'].includes(mode)) {
     throw new Error('Stripe Connect worker returned an invalid mode.');
@@ -495,20 +535,23 @@ const stripeConnectService = async (peer, service, value, authorization) => {
   const previousVerification = verificationPointer?.revision ?? null;
   const workerPath = service === 'stripe_connect_onboard'
     ? '/v1/stripe/connect/onboard'
+    : service === 'stripe_connect_adopt'
+      ? '/v1/stripe/connect/adopt'
     : service === 'stripe_connect_relink'
       ? '/v1/stripe/connect/relink'
       : '/v1/stripe/connect/status';
   const endpoint = stripeWorkerEndpoint(stripeWorkerUrl, workerPath);
-  const workerRequest = service === 'stripe_connect_relink'
+  const workerRequest = service === 'stripe_connect_relink' ||
+    service === 'stripe_connect_adopt'
     ? {
         ...request,
         target_service_signature: authorization?.signature,
       }
     : request;
-  if (service === 'stripe_connect_relink' &&
+  if ((service === 'stripe_connect_relink' || service === 'stripe_connect_adopt') &&
       (authorization?.actor !== request.provider ||
         !/^[0-9a-f]{128}$/.test(String(authorization?.signature || '')))) {
-    throw new Error('Stripe Connect relink target authorization is unavailable.');
+    throw new Error('Stripe Connect provider authorization is unavailable.');
   }
   const response = await postInternalStripeRequest(
     endpoint,
@@ -544,6 +587,7 @@ const stripeAdminService = (peer) => {
     if (service === 'stripe_checkout') return await stripeCheckoutRequest(peer, value);
     if (![
       'stripe_connect_onboard',
+      'stripe_connect_adopt',
       'stripe_connect_status',
       'stripe_connect_relink',
     ].includes(service)) {

@@ -74,7 +74,7 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.25` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.32` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -83,7 +83,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.25
+git checkout --detach v0.2.32
 ./install.sh --from-source
 ```
 
@@ -92,7 +92,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.25
+git checkout --detach v0.2.32
 .\install.ps1 -FromSource
 ```
 
@@ -300,6 +300,11 @@ Waiting for payment confirmation...
 ```
 
 Pay in the browser like any online purchase. Stripe notifies the network, the signature-verified webhook credits your balance:
+
+The signed Checkout price and ledger credit stay in USD. Stripe Adaptive
+Pricing may present and collect a supported local currency such as EUR or GBP;
+that local display never changes the USD-denominated model price or mixes
+payment rails.
 
 ```bash
 mayhem deposit status
@@ -567,6 +572,12 @@ different provider identity, run `mayhem provider stripe relink --help`; the
 source and destination provider identities must both consent, and entering an
 `acct_...` value is never enough.
 
+If the provider already has a Standard Stripe account that has never been used
+with Mayhem, use `mayhem provider stripe adopt --country DE`. Stripe's hosted
+OAuth page lets the provider choose the account; Mayhem never accepts a typed
+account id. The URL is still printed before browser open and works from a
+headless terminal with `--no-open`.
+
 To replace this provider identity's current Connect account, run
 `mayhem provider stripe rotate --country DE` (using the provider's actual
 country). The command requires the current account as a signed compare-and-swap,
@@ -606,7 +617,7 @@ Two rails push the money to you. One is a pull, for a reason:
 
 | Rail you accepted | How you receive it | Push or pull |
 |---|---|---|
-| `fiat` | Onboarding happens once: the CLI prints a Stripe Connect link, you finish it in the browser, and the verified binding makes fiat sessions eligible. Stripe then pays your bank account from settled earnings. | Push, automatic |
+| `fiat` | Onboarding happens once: the CLI prints a Stripe Connect link, you finish it in the browser, and the verified binding makes fiat sessions eligible. Buyer credit remains USD-denominated while Stripe presents supported local currencies; settlement converts separately into the account's verified payout currency. | Push, automatic |
 | `tnk` | After the one-time wallet ownership binding, epoch settlement sends real TNK transfers straight to your verified Trac address, with fees sponsored. | Push, automatic |
 | `tap` | The epoch settlement publishes a settlement root on Ethereum and your earnings accumulate under it. `mayhem claim` runs a Merkle claim that transfers everything owed to your Ethereum address in one transaction. | Pull, you claim |
 
@@ -646,7 +657,7 @@ mayhem provider rails get
 | `mayhem provider list / health` | joins, ledger state, heartbeats, visibility |
 | `mayhem provider rails set/get` | which payment rails you accept |
 | `mayhem provider payout set/get/rotate` | bind or rotate a provider-signed TAP/TNK destination |
-| `mayhem provider stripe onboard/rotate/relink/status` | create, replace, reuse, or inspect a verified Stripe Connect payout binding |
+| `mayhem provider stripe onboard/adopt/rotate/relink/status` | create, adopt an existing Standard account, replace, reuse, or inspect a verified Stripe Connect payout binding |
 | `mayhem provider min-ask set/get` | your price floor per market |
 | `mayhem provider limits set` | concurrency / accept-rate / daily budget caps |
 | `mayhem provider drain` | graceful sign-off |
@@ -802,7 +813,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.25` is source-only. The GitHub release contains the tagged source, not
+`v0.2.32` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -810,7 +821,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.25
+git checkout --detach v0.2.32
 ./install.sh --from-source
 ```
 
@@ -819,7 +830,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.25
+git checkout --detach v0.2.32
 .\install.ps1 -FromSource
 ```
 
@@ -839,12 +850,9 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
-The combined `0.2.25` PAYOUTFREE, ATTAUTO, FLOWRATE, and LIVEROUTE work in this
-repository is an integration candidate until its source-build target checks,
-canary/live acceptance, and exact-revision fleet deployment pass. Version
-strings or locally passing focused tests alone do not make it the latest live
-release; the releases page and the live signed catalog remain the user-facing
-truth.
+The `0.2.32` source release carries the current PAYOUTFREE, ATTAUTO, FLOWRATE,
+and LIVEROUTE implementation. The releases page and live signed catalog remain
+the user-facing truth for the current software revision and available models.
 
 ```bash
 scripts/dev-net.sh --cleanup

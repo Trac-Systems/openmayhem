@@ -5,7 +5,7 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 13;
+export const CONTRACT_VERSION = 14;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -23,7 +23,7 @@ const PAYOUT_PARAM_DEFINITIONS = Object.freeze({
   },
 });
 const FIAT_DEPOSIT_RAILS = new Set(['stripe']);
-const FIAT_CURRENCIES = new Set(['usd', 'eur']);
+const REQUIRED_FIAT_PAYOUT_CURRENCIES = Object.freeze(['eur', 'gbp', 'usd']);
 const PRICE_DENOMINATION = 'au_usd';
 const RATE_SOURCES = new Set(['gate-spot', 'mexc-spot']);
 const CATALOG_SOURCE_KINDS = new Set(['https', 'huggingface']);
@@ -79,11 +79,11 @@ const CTX_BRACKETS = Object.freeze([
 const TNK_E18 = 1_000_000_000_000_000_000n;
 const TAP_WEI = 1_000_000_000_000_000_000n;
 const USD_AU = 1_000_000_000_000_000_000n;
-const FIAT_MINOR_AU = 10_000_000_000_000_000n;
+const USD_CENT_AU = 10_000_000_000_000_000n;
 const TAP_DEPOSIT_EVENT_SIGNATURE = '0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c';
 const TAP_DEPOSIT_WATCHER_ID = 'tap-deposit-watcher-v1';
 const MSB_TRANSFER_EVIDENCE_VERSION = 1;
-const STRIPE_TRANSFER_EVIDENCE_VERSION = 1;
+const STRIPE_TRANSFER_EVIDENCE_VERSION = 2;
 const REPUTATION_HALF_LIFE_SECONDS = 14 * DAY_SECONDS;
 const REPUTATION_KAPPA = 25;
 const REPUTATION_RAW_NANO_SCALE = 1_000_000_000n;
@@ -2202,7 +2202,8 @@ class MayhemContract extends Contract {
         !['express', 'standard', 'custom'].includes(value.account_type) ||
         typeof value.country !== 'string' ||
         !/^[A-Z]{2}$/.test(value.country) ||
-        !['onboard', 'status', 'relink'].includes(value.verification_kind) ||
+        !['adopt', 'onboard', 'status', 'relink'].includes(value.verification_kind) ||
+        (value.verification_kind === 'adopt' && value.account_type !== 'standard') ||
         (value.source_provider !== null &&
           (!this.isHexBytes(value.source_provider, 32) ||
             value.source_provider !== value.source_provider.toLowerCase())) ||
@@ -2322,8 +2323,8 @@ class MayhemContract extends Contract {
         payments.set_by !== admin ||
         payments.set_by_role !== 'admin' ||
         payments.fiat?.processor !== 'stripe' ||
-        !Array.isArray(payments.fiat.currencies) ||
-        !payments.fiat.currencies.includes(value.currency)) {
+        !Array.isArray(payments.fiat.payout_currencies) ||
+        !payments.fiat.payout_currencies.includes(value.currency)) {
       return new Error('Stripe payout verification currency is not canonical.');
     }
     const provider = await this.get(`prov/${value.provider}`);
@@ -7093,19 +7094,35 @@ class MayhemContract extends Contract {
   }
 
   normalizeStripeTransferEvidence(value, label = 'Stripe settlement evidence') {
-    const shapeError = this.validateExactObjectKeys(
-      value,
-      [
-        'schema_version',
-        'kind',
-        'ref',
-        'destination',
-        'currency',
-        'amount_minor',
-        'transfer_group',
-      ],
-      label
-    );
+    const providerTransfer = value?.kind === 'stripe_transfer';
+    const hasFxQuoteId = providerTransfer && hasOwn(value, 'fx_quote_id');
+    const hasFxQuoteHash = providerTransfer && hasOwn(value, 'fx_quote_hash');
+    if (hasFxQuoteId !== hasFxQuoteHash) {
+      return new Error(`${label} FX quote identity must be present or absent as a pair.`);
+    }
+    const shapeError = this.validateExactObjectKeys(value, providerTransfer
+      ? [
+          'schema_version',
+          'kind',
+          'ref',
+          'destination',
+          'source_currency',
+          'source_amount_minor',
+          'destination_currency',
+          'destination_amount_minor',
+          ...(hasFxQuoteId ? ['fx_quote_id', 'fx_quote_hash'] : []),
+          'destination_payment',
+          'transfer_group',
+        ]
+      : [
+          'schema_version',
+          'kind',
+          'ref',
+          'destination',
+          'source_currency',
+          'source_amount_minor',
+          'transfer_group',
+        ], label);
     if (shapeError) return shapeError;
     if (value.schema_version !== STRIPE_TRANSFER_EVIDENCE_VERSION) {
       return new Error(`${label} schema version is invalid.`);
@@ -7122,33 +7139,90 @@ class MayhemContract extends Contract {
     if (value.kind === 'platform_balance' && !value.ref.startsWith('platform_balance:')) {
       return new Error(`${label} platform balance reference is invalid.`);
     }
-    const currency = this.normalizeFiatCurrency(value.currency);
-    if (currency instanceof Error) return currency;
-    const amountMinor = this.normalizeFiatMinor(value.amount_minor);
-    if (amountMinor instanceof Error) return amountMinor;
-    if (
-      value.kind === 'stripe_transfer' &&
-      (typeof value.transfer_group !== 'string' || !this.isSafeKeyPart(value.transfer_group))
-    ) {
+    const sourceCurrency = this.normalizeFiatCurrency(value.source_currency);
+    if (sourceCurrency instanceof Error || sourceCurrency !== value.source_currency) {
+      return new Error(`${label} source currency is invalid.`);
+    }
+    const sourceAmountMinor = this.normalizeFiatMinor(value.source_amount_minor);
+    if (sourceAmountMinor instanceof Error || sourceAmountMinor === '0') {
+      return new Error(`${label} source amount must be positive.`);
+    }
+    if (providerTransfer &&
+        (typeof value.transfer_group !== 'string' || !this.isSafeKeyPart(value.transfer_group))) {
       return new Error(`${label} transfer group is invalid.`);
     }
-    if (value.kind === 'platform_balance' && value.transfer_group !== null) {
+    if (!providerTransfer && value.transfer_group !== null) {
       return new Error(`${label} platform balance transfer group must be null.`);
     }
-    return {
+    if (!providerTransfer) return {
       schema_version: STRIPE_TRANSFER_EVIDENCE_VERSION,
-      kind: value.kind,
+      kind: 'platform_balance',
       ref: value.ref,
       destination: value.destination,
-      currency,
-      amount_minor: amountMinor,
+      source_currency: sourceCurrency,
+      source_amount_minor: sourceAmountMinor,
+      transfer_group: null,
+    };
+
+    const destinationCurrency = this.normalizeFiatCurrency(value.destination_currency);
+    if (destinationCurrency instanceof Error ||
+        destinationCurrency !== value.destination_currency) {
+      return new Error(`${label} destination currency is invalid.`);
+    }
+    const destinationAmountMinor = this.normalizeFiatMinor(value.destination_amount_minor);
+    if (destinationAmountMinor instanceof Error || destinationAmountMinor === '0') {
+      return new Error(`${label} destination amount must be positive.`);
+    }
+    const requiresUsdValuationQuote =
+      sourceCurrency !== 'usd' || destinationCurrency !== 'usd';
+    if (requiresUsdValuationQuote &&
+        (!hasFxQuoteId ||
+          !/^fxq_[A-Za-z0-9._-]+$/.test(String(value.fx_quote_id || '')) ||
+          !this.isHexBytes(value.fx_quote_hash, 32) ||
+          value.fx_quote_hash !== value.fx_quote_hash.toLowerCase())) {
+      return new Error(`${label} FX quote identity is required and invalid.`);
+    }
+    if (!requiresUsdValuationQuote && hasFxQuoteId &&
+        (value.fx_quote_id !== null || value.fx_quote_hash !== null)) {
+      return new Error(`${label} direct USD transfer must not include an FX quote identity.`);
+    }
+    if (!/^py_[A-Za-z0-9._-]+$/.test(String(value.destination_payment || ''))) {
+      return new Error(`${label} destination payment readback is invalid.`);
+    }
+    const normalized = {
+      schema_version: STRIPE_TRANSFER_EVIDENCE_VERSION,
+      kind: 'stripe_transfer',
+      ref: value.ref,
+      destination: value.destination,
+      source_currency: sourceCurrency,
+      source_amount_minor: sourceAmountMinor,
+      destination_currency: destinationCurrency,
+      destination_amount_minor: destinationAmountMinor,
+      destination_payment: value.destination_payment,
       transfer_group: value.transfer_group,
     };
+    if (hasFxQuoteId) {
+      normalized.fx_quote_id = value.fx_quote_id;
+      normalized.fx_quote_hash = value.fx_quote_hash;
+    }
+    return normalized;
   }
 
   stripeTransferSeenKey(evidence) {
     return evidence.kind === 'stripe_transfer'
       ? `rail/seen/stripe/${evidence.ref}`
+      : `rail/seen/stripe-platform/${evidence.ref}`;
+  }
+
+  stripeFxQuoteSeenKey(evidence) {
+    return evidence.kind === 'stripe_transfer' && evidence.fx_quote_id != null
+      ? `rail/seen/stripe-fx-quote/${evidence.fx_quote_id}`
+      : null;
+  }
+
+  stripeDestinationPaymentSeenKey(evidence) {
+    return evidence.kind === 'stripe_transfer'
+      ? `rail/seen/stripe-destination-payment/${evidence.destination_payment}`
       : null;
   }
 
@@ -7291,14 +7365,22 @@ class MayhemContract extends Contract {
         'at',
         'rail',
         'processor',
+        'source_currency',
         'operator_to',
         'epoch_apply_hash',
         'stripe_transfers',
         'transfer_root',
         'provider_count',
-        'provider_au',
-        'operator_fee_au',
-        'gross_au',
+        'provider_liability_au',
+        'provider_paid_au',
+        'operator_fee_liability_au',
+        'operator_fee_retained_au',
+        'gross_liability_au',
+        'gross_paid_au',
+        'rounding_au',
+        'dust_au',
+        'source_amount_minor',
+        'destination_totals',
         'outputs',
       ],
       'targeted fiat settlement'
@@ -7314,24 +7396,55 @@ class MayhemContract extends Contract {
         !this.isHexBytes(value.transfer_root, 32) ||
         !Number.isSafeInteger(value.provider_count) || value.provider_count < 0 ||
         !Array.isArray(value.outputs) || value.outputs.length === 0 ||
+        !Array.isArray(value.destination_totals) ||
         !Array.isArray(value.stripe_transfers) ||
         value.stripe_transfers.length !== value.outputs.length) {
       return new Error('Invalid targeted fiat settlement.');
     }
-    for (const field of ['provider_au', 'operator_fee_au', 'gross_au']) {
+    const sourceCurrency = this.normalizeFiatCurrency(value.source_currency);
+    if (sourceCurrency instanceof Error || sourceCurrency !== value.source_currency) {
+      return new Error('Invalid targeted fiat settlement source currency.');
+    }
+    const sourceAmountMinor = this.normalizeFiatMinor(value.source_amount_minor);
+    if (sourceAmountMinor instanceof Error || sourceAmountMinor === '0' ||
+        sourceAmountMinor !== value.source_amount_minor) {
+      return new Error('Invalid targeted fiat settlement source amount.');
+    }
+    const auFields = [
+      'provider_liability_au',
+      'provider_paid_au',
+      'operator_fee_liability_au',
+      'operator_fee_retained_au',
+      'gross_liability_au',
+      'gross_paid_au',
+      'rounding_au',
+      'dust_au',
+    ];
+    for (const field of auFields) {
       if (this.normalizeAu(
         value[field],
         `targeted fiat settlement ${field}`,
-        { allowZero: field !== 'gross_au' }
+        { allowZero: !['gross_liability_au', 'gross_paid_au'].includes(field) }
       ) instanceof Error) {
         return new Error('Invalid targeted fiat settlement total.');
       }
     }
-    const gross = this.safeAddAu(value.provider_au, value.operator_fee_au);
-    if (gross instanceof Error || this.compareAu(gross, value.gross_au) !== 0) {
-      return new Error('Targeted fiat settlement gross amount does not balance.');
+    const grossLiability = this.safeAddAu(
+      value.provider_liability_au,
+      value.operator_fee_liability_au
+    );
+    const grossPaid = this.safeAddAu(value.provider_paid_au, value.operator_fee_retained_au);
+    const paidPlusDust = this.safeAddAu(value.gross_paid_au, value.dust_au);
+    if (grossLiability instanceof Error || grossPaid instanceof Error || paidPlusDust instanceof Error ||
+        this.compareAu(grossLiability, value.gross_liability_au) !== 0 ||
+        this.compareAu(grossPaid, value.gross_paid_au) !== 0 ||
+        this.compareAu(paidPlusDust, value.gross_liability_au) !== 0 ||
+        this.compareAu(value.rounding_au, value.dust_au) !== 0) {
+      return new Error('Targeted fiat settlement canonical AU totals do not balance.');
     }
     const seenTransfers = new Set();
+    const seenQuotes = new Set();
+    const seenDestinationPayments = new Set();
     for (const entry of value.stripe_transfers) {
       const transfer = this.normalizeStripeTransferEvidence(
         entry,
@@ -7342,15 +7455,48 @@ class MayhemContract extends Contract {
         return new Error('Duplicate targeted fiat settlement transfer.');
       }
       seenTransfers.add(transfer.ref);
+      if (transfer.kind === 'stripe_transfer') {
+        if (transfer.fx_quote_id != null) {
+          if (seenQuotes.has(transfer.fx_quote_id)) {
+            return new Error('Duplicate targeted fiat settlement FX quote.');
+          }
+          seenQuotes.add(transfer.fx_quote_id);
+        }
+        if (seenDestinationPayments.has(transfer.destination_payment)) {
+          return new Error('Duplicate targeted fiat settlement destination payment.');
+        }
+        seenDestinationPayments.add(transfer.destination_payment);
+      }
     }
     const outputs = [];
     const seen = new Set();
     let operatorSeen = false;
     for (const output of value.outputs) {
       if (output?.role === 'provider') {
+        const hasFxQuoteId = hasOwn(output, 'fx_quote_id');
+        const hasFxQuoteHash = hasOwn(output, 'fx_quote_hash');
+        if (hasFxQuoteId !== hasFxQuoteHash) {
+          return new Error(
+            'Targeted fiat provider output FX quote identity must be present or absent as a pair.'
+          );
+        }
         const shapeError = this.validateExactObjectKeys(
           output,
-          ['role', 'provider', 'payout_revision', 'to', 'currency', 'amount_minor', 'au'],
+          [
+            'role',
+            'provider',
+            'payout_revision',
+            'to',
+            'liability_au',
+            'paid_au',
+            'rounding_au',
+            'dust_au',
+            'source_currency',
+            'source_amount_minor',
+            'destination_currency',
+            'destination_amount_minor',
+            ...(hasFxQuoteId ? ['fx_quote_id', 'fx_quote_hash'] : []),
+          ],
           'targeted fiat provider output'
         );
         if (shapeError) return shapeError;
@@ -7361,20 +7507,23 @@ class MayhemContract extends Contract {
         const identity = stableJson([output.provider, output.payout_revision]);
         if (seen.has(identity)) return new Error('Duplicate targeted fiat payout liability.');
         seen.add(identity);
-        const normalized = this.normalizeTargetedFiatSettlementOutput({
-          role: output.role,
-          provider: output.provider,
-          to: output.to,
-          currency: output.currency,
-          amount_minor: output.amount_minor,
-          au: output.au,
-        });
+        const { payout_revision: payoutRevision, ...settlementOutput } = output;
+        const normalized = this.normalizeTargetedFiatSettlementOutput(settlementOutput);
         if (normalized instanceof Error) return normalized;
-        outputs.push({ ...normalized, payout_revision: output.payout_revision });
+        outputs.push({ ...normalized, payout_revision: payoutRevision });
       } else if (output?.role === 'operator_fee') {
         const shapeError = this.validateExactObjectKeys(
           output,
-          ['role', 'to', 'currency', 'amount_minor', 'au'],
+          [
+            'role',
+            'to',
+            'liability_au',
+            'paid_au',
+            'rounding_au',
+            'dust_au',
+            'source_currency',
+            'source_amount_minor',
+          ],
           'targeted fiat operator output'
         );
         if (shapeError) return shapeError;
@@ -7396,7 +7545,9 @@ class MayhemContract extends Contract {
     if (stableJson(outputs) !== stableJson(value.outputs)) {
       return new Error('Targeted fiat settlement outputs must be canonical.');
     }
-    return { outputs };
+    const destinationTotals = this.normalizeFiatDestinationTotals(value.destination_totals);
+    if (destinationTotals instanceof Error) return destinationTotals;
+    return { outputs, destination_totals: destinationTotals };
   }
 
   async targetedTnkSettlementTransferRoot(outputs) {
@@ -7408,7 +7559,7 @@ class MayhemContract extends Contract {
 
   async targetedFiatSettlementTransferRoot(outputs) {
     return await this.opaqueHash(
-      'mayhem-targeted-fiat-settlement-transfer-root-v1',
+      'mayhem-targeted-fiat-settlement-transfer-root-v2',
       outputs
     );
   }
@@ -7447,7 +7598,7 @@ class MayhemContract extends Contract {
       if (binding.target !== output.to) {
         return new Error('Targeted settlement payout target mismatch.');
       }
-      if (rail === 'fiat' && binding.currency !== output.currency) {
+      if (rail === 'fiat' && binding.currency !== output.destination_currency) {
         return new Error('Targeted settlement payout currency mismatch.');
       }
       const liabilityKey = this.providerPayoutLiabilityKey(
@@ -7484,17 +7635,24 @@ class MayhemContract extends Contract {
         refreshed.paid_cum_au
       );
       if (payable instanceof Error) return payable;
-      const transferable = rail === 'fiat'
-        ? this.fiatWholeMinorTransferAu(payable)
-        : payable;
-      if (transferable instanceof Error) return transferable;
-      if (this.isZeroAu(transferable)) {
+      let settledAu = output.au;
+      if (rail === 'fiat') {
+        const dust = this.safeSubAu(payable, output.paid_au);
+        if (dust instanceof Error ||
+            this.compareAu(output.liability_au, payable) !== 0 ||
+            this.compareAu(output.dust_au, dust) !== 0 ||
+            this.compareAu(output.rounding_au, dust) !== 0) {
+          return new Error('Targeted fiat settlement does not match revision liability and dust.');
+        }
+        settledAu = output.paid_au;
+      }
+      if (this.isZeroAu(settledAu)) {
         return new Error('Targeted settlement liability has no payable earnings.');
       }
-      if (this.compareAu(output.au, transferable) !== 0) {
+      if (rail !== 'fiat' && this.compareAu(output.au, payable) !== 0) {
         return new Error('Targeted settlement amount does not match revision liability.');
       }
-      const paidCumAu = this.safeAddAu(refreshed.paid_cum_au, output.au);
+      const paidCumAu = this.safeAddAu(refreshed.paid_cum_au, settledAu);
       if (paidCumAu instanceof Error) return paidCumAu;
       liabilityUpdates.push({
         key: liabilityKey,
@@ -7509,7 +7667,7 @@ class MayhemContract extends Contract {
       });
       const nextProviderPaid = this.safeAddAu(
         paidByProvider.get(output.provider) ?? ZERO_AU,
-        output.au
+        settledAu
       );
       if (nextProviderPaid instanceof Error) return nextProviderPaid;
       paidByProvider.set(output.provider, nextProviderPaid);
@@ -7736,6 +7894,16 @@ class MayhemContract extends Contract {
       return new Error('Targeted fiat settlement output count exceeds limit.');
     }
     const outputs = normalized.outputs;
+    const payments = await this.get('payments/current');
+    const admin = await this.get('admin');
+    if (!payments || payments.set_by !== admin || payments.set_by_role !== 'admin' ||
+        payments.denom !== PRICE_DENOMINATION ||
+        payments.fiat?.processor !== 'stripe' ||
+        payments.fiat?.integration_currency !== 'usd' ||
+        payments.fiat?.adaptive_pricing !== true ||
+        !Array.isArray(payments.fiat?.payout_currencies)) {
+      return new Error('Targeted fiat settlement does not match canonical payment configuration.');
+    }
     const transfers = value.stripe_transfers.map((entry) => (
       this.normalizeStripeTransferEvidence(
         entry,
@@ -7756,19 +7924,38 @@ class MayhemContract extends Contract {
         : 'platform_balance';
       if (transfer.kind !== expectedKind ||
           transfer.destination !== output.to ||
-          transfer.currency !== output.currency ||
-          transfer.amount_minor !== output.amount_minor ||
+          transfer.source_currency !== output.source_currency ||
+          transfer.source_amount_minor !== output.source_amount_minor ||
           (expectedKind === 'stripe_transfer' &&
-            transfer.transfer_group !== expectedGroup)) {
+            (transfer.destination_currency !== output.destination_currency ||
+              transfer.destination_amount_minor !== output.destination_amount_minor ||
+              transfer.fx_quote_id !== output.fx_quote_id ||
+              transfer.fx_quote_hash !== output.fx_quote_hash ||
+              transfer.transfer_group !== expectedGroup))) {
         return new Error('Targeted fiat transfer does not match output.');
+      }
+      if (output.source_currency !== value.source_currency) {
+        return new Error('Targeted fiat output source currency mismatch.');
+      }
+      if (output.role === 'provider' &&
+          !payments.fiat.payout_currencies.includes(output.destination_currency)) {
+        return new Error('Targeted fiat provider destination currency is not canonical.');
       }
     }
     const totals = this.targetedFiatSettlementTotals(outputs);
     if (totals instanceof Error) return totals;
     if (totals.provider_count !== value.provider_count ||
-        this.compareAu(totals.provider_au, value.provider_au) !== 0 ||
-        this.compareAu(totals.operator_fee_au, value.operator_fee_au) !== 0 ||
-        this.compareAu(totals.gross_au, value.gross_au) !== 0) {
+        this.compareAu(totals.provider_liability_au, value.provider_liability_au) !== 0 ||
+        this.compareAu(totals.provider_paid_au, value.provider_paid_au) !== 0 ||
+        this.compareAu(totals.operator_fee_liability_au, value.operator_fee_liability_au) !== 0 ||
+        this.compareAu(totals.operator_fee_retained_au, value.operator_fee_retained_au) !== 0 ||
+        this.compareAu(totals.gross_liability_au, value.gross_liability_au) !== 0 ||
+        this.compareAu(totals.gross_paid_au, value.gross_paid_au) !== 0 ||
+        this.compareAu(totals.rounding_au, value.rounding_au) !== 0 ||
+        this.compareAu(totals.dust_au, value.dust_au) !== 0 ||
+        totals.source_currency !== value.source_currency ||
+        totals.source_amount_minor !== value.source_amount_minor ||
+        stableJson(totals.destination_totals) !== stableJson(normalized.destination_totals)) {
       return new Error('Targeted fiat settlement totals do not match outputs.');
     }
     const transferRoot = await this.targetedFiatSettlementTransferRoot(outputs);
@@ -7805,9 +7992,14 @@ class MayhemContract extends Contract {
       return new Error('Targeted fiat settlement apply hash mismatch.');
     }
     for (const transfer of transfers) {
-      const seenKey = this.stripeTransferSeenKey(transfer);
-      if (seenKey && (await this.get(seenKey)) !== null) {
-        return new Error('Targeted Stripe transfer was already consumed.');
+      for (const seenKey of [
+        this.stripeTransferSeenKey(transfer),
+        this.stripeFxQuoteSeenKey(transfer),
+        this.stripeDestinationPaymentSeenKey(transfer),
+      ]) {
+        if (seenKey && (await this.get(seenKey)) !== null) {
+          return new Error('Targeted Stripe transfer evidence was already consumed.');
+        }
       }
     }
     const updates = await this.targetedPayoutSettlementUpdates(
@@ -7825,18 +8017,18 @@ class MayhemContract extends Contract {
     if (feeError) return feeError;
     const payableFee = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
     if (payableFee instanceof Error) return payableFee;
-    const transferableFee = this.fiatWholeMinorTransferAu(payableFee);
-    if (transferableFee instanceof Error) return transferableFee;
-    if (this.compareAu(transferableFee, value.operator_fee_au) !== 0) {
-      return new Error('Targeted fiat operator fee does not match fee state.');
-    }
     const operatorOutputs = outputs.filter((entry) => entry.role === 'operator_fee');
-    if ((this.isZeroAu(transferableFee) && operatorOutputs.length !== 0) ||
-        (this.compareAu(transferableFee, ZERO_AU) > 0 &&
-          (operatorOutputs.length !== 1 || operatorOutputs[0].to !== value.operator_to))) {
+    const retainedFee = operatorOutputs[0]?.paid_au ?? ZERO_AU;
+    if ((operatorOutputs.length === 0 &&
+          (!this.isZeroAu(value.operator_fee_liability_au) ||
+            !this.isZeroAu(value.operator_fee_retained_au))) ||
+        (operatorOutputs.length === 1 &&
+          (operatorOutputs[0].to !== value.operator_to ||
+            this.compareAu(operatorOutputs[0].liability_au, payableFee) !== 0 ||
+            this.compareAu(operatorOutputs[0].paid_au, value.operator_fee_retained_au) !== 0))) {
       return new Error('Targeted fiat operator output mismatch.');
     }
-    const sweptCumAu = this.safeAddAu(fee.swept_cum_au, value.operator_fee_au);
+    const sweptCumAu = this.safeAddAu(fee.swept_cum_au, retainedFee);
     if (sweptCumAu instanceof Error) return sweptCumAu;
     const operatorIndex = outputs.findIndex((entry) => entry.role === 'operator_fee');
     const nextFee = {
@@ -7855,16 +8047,21 @@ class MayhemContract extends Contract {
       await this.put(this.earningKey(earning.provider, 'fiat'), earning);
     }
     for (const [index, transfer] of transfers.entries()) {
-      const seenKey = this.stripeTransferSeenKey(transfer);
-      if (!seenKey) continue;
-      await this.put(seenKey, {
-        rail: 'fiat',
-        purpose: 'targeted_settlement',
-        epoch: value.epoch,
-        output_index: index,
-        transfer_root: value.transfer_root,
-        consumed_at: this.tx,
-      });
+      for (const seenKey of [
+        this.stripeTransferSeenKey(transfer),
+        this.stripeFxQuoteSeenKey(transfer),
+        this.stripeDestinationPaymentSeenKey(transfer),
+      ]) {
+        if (!seenKey) continue;
+        await this.put(seenKey, {
+          rail: 'fiat',
+          purpose: 'targeted_settlement',
+          epoch: value.epoch,
+          output_index: index,
+          transfer_root: value.transfer_root,
+          consumed_at: this.tx,
+        });
+      }
     }
     await this.put(this.feeCumKey('fiat'), nextFee);
     await this.put(recordKey, record);
@@ -7875,9 +8072,17 @@ class MayhemContract extends Contract {
       rail: 'fiat',
       processor: 'stripe',
       idempotent: false,
-      provider_au: value.provider_au,
-      operator_fee_au: value.operator_fee_au,
-      gross_au: value.gross_au,
+      provider_liability_au: value.provider_liability_au,
+      provider_paid_au: value.provider_paid_au,
+      operator_fee_liability_au: value.operator_fee_liability_au,
+      operator_fee_retained_au: value.operator_fee_retained_au,
+      gross_liability_au: value.gross_liability_au,
+      gross_paid_au: value.gross_paid_au,
+      rounding_au: value.rounding_au,
+      dust_au: value.dust_au,
+      source_currency: value.source_currency,
+      source_amount_minor: value.source_amount_minor,
+      destination_totals: normalized.destination_totals,
       stripe_transfers: transfers,
       transfer_root: value.transfer_root,
     };
@@ -8013,7 +8218,7 @@ class MayhemContract extends Contract {
     if (unpaid instanceof Error) return unpaid;
     const unpaidValue = this.parseAu(unpaid, 'Fiat unpaid provider earnings');
     if (unpaidValue instanceof Error) return unpaidValue;
-    const dustValue = unpaidValue % FIAT_MINOR_AU;
+    const dustValue = unpaidValue % USD_CENT_AU;
     if (dustValue === 0n) return new Error('Provider has no fiat dust to sweep.');
     const dustAu = this.canonicalAu(dustValue);
     const totalAu = this.safeSubAu(refreshed.total_au, dustAu);
@@ -8104,57 +8309,181 @@ class MayhemContract extends Contract {
 
   normalizeTargetedFiatSettlementOutput(output) {
     if (!this.isSafeKeyPart(output.to)) return new Error('Invalid fiat settlement output target.');
-    const currency = this.normalizeFiatCurrency(output.currency);
-    if (currency instanceof Error) return currency;
-    const amountMinor = this.normalizeFiatMinor(output.amount_minor);
-    if (amountMinor instanceof Error) return amountMinor;
-    const au = this.normalizeAu(output.au, 'Fiat settlement output amount', { allowZero: false });
-    if (au instanceof Error) return new Error('Invalid fiat settlement output amount.');
-    const expectedAu = this.fiatMinorToAu(amountMinor);
-    if (expectedAu instanceof Error) return expectedAu;
-    if (this.compareAu(au, expectedAu) !== 0) {
-      return new Error('Fiat settlement output amount must match fiat minor units.');
+    const sourceCurrency = this.normalizeFiatCurrency(output.source_currency);
+    if (sourceCurrency instanceof Error || sourceCurrency !== output.source_currency) {
+      return new Error('Invalid fiat settlement source currency.');
     }
-    return output.role === 'provider'
-      ? {
-          role: 'provider',
-          provider: output.provider,
-          to: output.to,
-          currency,
-          amount_minor: amountMinor,
-          au,
-        }
-      : {
-          role: 'operator_fee',
-          to: output.to,
-          currency,
-          amount_minor: amountMinor,
-          au,
-        };
+    const sourceAmountMinor = this.normalizeFiatMinor(output.source_amount_minor);
+    if (sourceAmountMinor instanceof Error || sourceAmountMinor === '0') {
+      return new Error('Fiat settlement source amount must be positive.');
+    }
+    const canonicalAu = {};
+    for (const [field, allowZero] of [
+      ['liability_au', false],
+      ['paid_au', false],
+      ['rounding_au', true],
+      ['dust_au', true],
+    ]) {
+      canonicalAu[field] = this.normalizeAu(
+        output[field],
+        `Fiat settlement output ${field}`,
+        { allowZero }
+      );
+      if (canonicalAu[field] instanceof Error) {
+        return new Error(`Invalid fiat settlement output ${field}.`);
+      }
+    }
+    const paidPlusDust = this.safeAddAu(canonicalAu.paid_au, canonicalAu.dust_au);
+    if (paidPlusDust instanceof Error ||
+        this.compareAu(paidPlusDust, canonicalAu.liability_au) !== 0 ||
+        this.compareAu(canonicalAu.rounding_au, canonicalAu.dust_au) !== 0) {
+      return new Error('Fiat settlement output liability, paid amount, rounding, and dust do not balance.');
+    }
+    if (output.role === 'operator_fee') return {
+      role: 'operator_fee',
+      to: output.to,
+      ...canonicalAu,
+      source_currency: sourceCurrency,
+      source_amount_minor: sourceAmountMinor,
+    };
+    if (!this.isHexBytes(output.provider, 32) ||
+        output.provider !== output.provider.toLowerCase()) {
+      return new Error('Invalid fiat settlement provider.');
+    }
+    const destinationCurrency = this.normalizeFiatCurrency(output.destination_currency);
+    if (destinationCurrency instanceof Error ||
+        destinationCurrency !== output.destination_currency) {
+      return new Error('Invalid fiat settlement destination currency.');
+    }
+    const destinationAmountMinor = this.normalizeFiatMinor(output.destination_amount_minor);
+    if (destinationAmountMinor instanceof Error || destinationAmountMinor === '0') {
+      return new Error('Fiat settlement destination amount must be positive.');
+    }
+    const hasFxQuoteId = hasOwn(output, 'fx_quote_id');
+    const hasFxQuoteHash = hasOwn(output, 'fx_quote_hash');
+    if (hasFxQuoteId !== hasFxQuoteHash) {
+      return new Error('Fiat settlement FX quote identity must be present or absent as a pair.');
+    }
+    const requiresUsdValuationQuote =
+      sourceCurrency !== 'usd' || destinationCurrency !== 'usd';
+    if (requiresUsdValuationQuote &&
+        (!hasFxQuoteId ||
+          !/^fxq_[A-Za-z0-9._-]+$/.test(String(output.fx_quote_id || '')) ||
+          !this.isHexBytes(output.fx_quote_hash, 32) ||
+          output.fx_quote_hash !== output.fx_quote_hash.toLowerCase())) {
+      return new Error('Fiat settlement FX quote identity is required and invalid.');
+    }
+    if (!requiresUsdValuationQuote && hasFxQuoteId &&
+        (output.fx_quote_id !== null || output.fx_quote_hash !== null)) {
+      return new Error('Direct USD fiat settlement must not include an FX quote identity.');
+    }
+    const normalized = {
+      role: 'provider',
+      provider: output.provider,
+      to: output.to,
+      ...canonicalAu,
+      source_currency: sourceCurrency,
+      source_amount_minor: sourceAmountMinor,
+      destination_currency: destinationCurrency,
+      destination_amount_minor: destinationAmountMinor,
+    };
+    if (hasFxQuoteId) {
+      normalized.fx_quote_id = output.fx_quote_id;
+      normalized.fx_quote_hash = output.fx_quote_hash;
+    }
+    return normalized;
   }
 
   targetedFiatSettlementTotals(outputs) {
-    let providerAu = ZERO_AU;
-    let operatorFeeAu = ZERO_AU;
+    let providerLiabilityAu = ZERO_AU;
+    let providerPaidAu = ZERO_AU;
+    let operatorFeeLiabilityAu = ZERO_AU;
+    let operatorFeeRetainedAu = ZERO_AU;
+    let roundingAu = ZERO_AU;
+    let dustAu = ZERO_AU;
+    let sourceAmountMinor = 0n;
+    let sourceCurrency = null;
     let providerCount = 0;
+    const destinationTotals = new Map();
     for (const output of outputs) {
+      if (sourceCurrency === null) sourceCurrency = output.source_currency;
+      if (sourceCurrency !== output.source_currency) {
+        return new Error('Targeted fiat outputs must use one platform source currency.');
+      }
+      sourceAmountMinor += BigInt(output.source_amount_minor);
+      roundingAu = this.safeAddAu(roundingAu, output.rounding_au);
+      if (roundingAu instanceof Error) return roundingAu;
+      dustAu = this.safeAddAu(dustAu, output.dust_au);
+      if (dustAu instanceof Error) return dustAu;
       if (output.role === 'provider') {
         providerCount += 1;
-        providerAu = this.safeAddAu(providerAu, output.au);
-        if (providerAu instanceof Error) return providerAu;
+        providerLiabilityAu = this.safeAddAu(providerLiabilityAu, output.liability_au);
+        if (providerLiabilityAu instanceof Error) return providerLiabilityAu;
+        providerPaidAu = this.safeAddAu(providerPaidAu, output.paid_au);
+        if (providerPaidAu instanceof Error) return providerPaidAu;
+        destinationTotals.set(
+          output.destination_currency,
+          (destinationTotals.get(output.destination_currency) ?? 0n) +
+            BigInt(output.destination_amount_minor)
+        );
       } else {
-        operatorFeeAu = this.safeAddAu(operatorFeeAu, output.au);
-        if (operatorFeeAu instanceof Error) return operatorFeeAu;
+        operatorFeeLiabilityAu = this.safeAddAu(
+          operatorFeeLiabilityAu,
+          output.liability_au
+        );
+        if (operatorFeeLiabilityAu instanceof Error) return operatorFeeLiabilityAu;
+        operatorFeeRetainedAu = this.safeAddAu(operatorFeeRetainedAu, output.paid_au);
+        if (operatorFeeRetainedAu instanceof Error) return operatorFeeRetainedAu;
       }
     }
-    const grossAu = this.safeAddAu(providerAu, operatorFeeAu);
-    if (grossAu instanceof Error) return grossAu;
+    const grossLiabilityAu = this.safeAddAu(providerLiabilityAu, operatorFeeLiabilityAu);
+    if (grossLiabilityAu instanceof Error) return grossLiabilityAu;
+    const grossPaidAu = this.safeAddAu(providerPaidAu, operatorFeeRetainedAu);
+    if (grossPaidAu instanceof Error) return grossPaidAu;
     return {
       provider_count: providerCount,
-      provider_au: providerAu,
-      operator_fee_au: operatorFeeAu,
-      gross_au: grossAu,
+      provider_liability_au: providerLiabilityAu,
+      provider_paid_au: providerPaidAu,
+      operator_fee_liability_au: operatorFeeLiabilityAu,
+      operator_fee_retained_au: operatorFeeRetainedAu,
+      gross_liability_au: grossLiabilityAu,
+      gross_paid_au: grossPaidAu,
+      rounding_au: roundingAu,
+      dust_au: dustAu,
+      source_currency: sourceCurrency,
+      source_amount_minor: sourceAmountMinor.toString(),
+      destination_totals: [...destinationTotals]
+        .sort(([left], [right]) => compareCodepoint(left, right))
+        .map(([currency, amount]) => ({ currency, amount_minor: amount.toString() })),
     };
+  }
+
+  normalizeFiatDestinationTotals(value) {
+    const totals = [];
+    const seen = new Set();
+    for (const entry of value) {
+      const shapeError = this.validateExactObjectKeys(
+        entry,
+        ['currency', 'amount_minor'],
+        'targeted fiat destination total'
+      );
+      if (shapeError) return shapeError;
+      const currency = this.normalizeFiatCurrency(entry.currency);
+      const amountMinor = this.normalizeFiatMinor(entry.amount_minor);
+      if (currency instanceof Error || currency !== entry.currency ||
+          amountMinor instanceof Error || amountMinor === '0' ||
+          amountMinor !== entry.amount_minor ||
+          seen.has(currency)) {
+        return new Error('Invalid targeted fiat destination total.');
+      }
+      seen.add(currency);
+      totals.push({ currency, amount_minor: amountMinor });
+    }
+    totals.sort((left, right) => compareCodepoint(left.currency, right.currency));
+    if (stableJson(totals) !== stableJson(value)) {
+      return new Error('Targeted fiat destination totals must be canonical.');
+    }
+    return totals;
   }
 
   normalizeFiatMinor(value) {
@@ -8164,18 +8493,6 @@ class MayhemContract extends Contract {
     const parsed = BigInt(value);
     if (parsed <= 0n) return new Error('Fiat minor amount must be positive.');
     return parsed.toString();
-  }
-
-  fiatMinorToAu(amountMinor) {
-    const parsed = this.normalizeFiatMinor(amountMinor);
-    if (parsed instanceof Error) return parsed;
-    return this.canonicalAu(BigInt(parsed) * FIAT_MINOR_AU);
-  }
-
-  fiatWholeMinorTransferAu(au) {
-    const parsed = this.parseAu(au, 'Fiat payable amount');
-    if (parsed instanceof Error) return parsed;
-    return this.canonicalAu((parsed / FIAT_MINOR_AU) * FIAT_MINOR_AU);
   }
 
   async depositTnk() {
@@ -10230,22 +10547,48 @@ class MayhemContract extends Contract {
 
     const fiatShape = this.validateExactObjectKeys(
       value.fiat,
-      ['processor', 'currencies', 'locale'],
+      [
+        'processor',
+        'integration_currency',
+        'adaptive_pricing',
+        'payout_currencies',
+        'locale',
+      ],
       'fiat payment config'
     );
     if (fiatShape) return fiatShape;
     if (value.fiat.processor !== 'stripe') return new Error('Fiat processor must be stripe.');
-    if (!Array.isArray(value.fiat.currencies) || value.fiat.currencies.length < 1) {
-      return new Error('Fiat currencies must be a non-empty array.');
+    if (value.fiat.integration_currency !== 'usd') {
+      return new Error('Stripe integration currency must be usd for au_usd accounting.');
     }
-    const fiatCurrencies = [];
-    for (const currency of value.fiat.currencies) {
+    if (value.fiat.adaptive_pricing !== true) {
+      return new Error('Stripe Adaptive Pricing must be enabled.');
+    }
+    if (!Array.isArray(value.fiat.payout_currencies) ||
+        value.fiat.payout_currencies.length < REQUIRED_FIAT_PAYOUT_CURRENCIES.length) {
+      return new Error('Fiat payout currencies must include EUR, GBP, and USD.');
+    }
+    const payoutCurrencies = [];
+    for (const currency of value.fiat.payout_currencies) {
       const normalized = this.normalizeFiatCurrency(currency);
       if (normalized instanceof Error) return normalized;
-      if (fiatCurrencies.includes(normalized)) return new Error('Duplicate fiat currency.');
-      fiatCurrencies.push(normalized);
+      if (normalized !== currency) {
+        return new Error('Fiat payout currencies must be canonical lowercase codes.');
+      }
+      if (payoutCurrencies.includes(normalized)) {
+        return new Error('Duplicate fiat payout currency.');
+      }
+      payoutCurrencies.push(normalized);
     }
-    fiatCurrencies.sort((left, right) => ['usd', 'eur'].indexOf(left) - ['usd', 'eur'].indexOf(right));
+    const sortedPayoutCurrencies = payoutCurrencies.slice().sort(compareCodepoint);
+    if (stableJson(payoutCurrencies) !== stableJson(sortedPayoutCurrencies)) {
+      return new Error('Fiat payout currencies must be sorted.');
+    }
+    for (const required of REQUIRED_FIAT_PAYOUT_CURRENCIES) {
+      if (!payoutCurrencies.includes(required)) {
+        return new Error('Fiat payout currencies must include EUR, GBP, and USD.');
+      }
+    }
     if (value.fiat.locale !== 'en') return new Error('Stripe checkout locale must be en.');
 
     const tapShape = this.validateExactObjectKeys(
@@ -10287,7 +10630,9 @@ class MayhemContract extends Contract {
     return {
       fiat: {
         processor: 'stripe',
-        currencies: fiatCurrencies,
+        integration_currency: 'usd',
+        adaptive_pricing: true,
+        payout_currencies: payoutCurrencies,
         locale: 'en',
       },
       tap: {
@@ -12743,7 +13088,7 @@ class MayhemContract extends Contract {
     }
 
     if (intent.rail === 'fiat') {
-      if (!payments.fiat?.currencies?.includes(intent.currency)) {
+      if (!payments.fiat?.payout_currencies?.includes(intent.currency)) {
         return new Error('Invalid verified Stripe payout target.');
       }
       const verification = await this.providerStripePayoutVerificationForTarget(
@@ -15026,7 +15371,7 @@ class MayhemContract extends Contract {
   normalizeFiatCurrency(value) {
     if (typeof value !== 'string') return new Error('Invalid fiat currency.');
     const currency = value.trim().toLowerCase();
-    if (!FIAT_CURRENCIES.has(currency)) return new Error('Unsupported fiat currency.');
+    if (!/^[a-z]{3}$/.test(currency)) return new Error('Unsupported fiat currency.');
     return currency;
   }
 
@@ -15385,7 +15730,7 @@ class MayhemContract extends Contract {
     if (normalized instanceof Error) return normalized;
     const digest = b4a.toString(
       await blake3(b4a.from(stableJson({
-        domain: 'mayhem-targeted-fiat-settlement-feature-v1',
+        domain: 'mayhem-targeted-fiat-settlement-feature-v2',
         value,
       }))),
       'hex'

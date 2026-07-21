@@ -53,6 +53,7 @@ use mayhem_proto::{
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;
 use rsa::{
+    pkcs1::EncodeRsaPublicKey,
     pkcs1v15::SigningKey as RsaSigningKey,
     pkcs8::EncodePublicKey,
     signature::{SignatureEncoding, Signer as _},
@@ -870,7 +871,12 @@ fn native_tpm_fixture() -> NativeTpmFixture {
         &root_key,
         false,
     );
-    let device_id = hex::encode(Sha256::digest(&leaf_der));
+    let device_id = hex::encode(Sha256::digest(
+        RsaPublicKey::from(&ek_key)
+            .to_pkcs1_der()
+            .expect("test EK public key encodes")
+            .as_bytes(),
+    ));
     let pcr_value = "a0".repeat(32);
     let pcr_policy = serde_json::to_vec(&serde_json::json!({
         "schema_version": TPM_PCR_POLICY_SCHEMA_VERSION,

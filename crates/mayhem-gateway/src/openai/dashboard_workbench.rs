@@ -1101,7 +1101,12 @@ fn showcase_state_from_models_with_receipts(
             "observed_at": now_secs(),
             "payments": {
                 "rails": ["fiat", "tap", "tnk"],
-                "fiat": { "processor": "stripe", "currencies": ["usd", "eur"] },
+                "fiat": {
+                    "processor": "stripe",
+                    "integration_currency": "usd",
+                    "adaptive_pricing": true,
+                    "payout_currencies": ["eur", "gbp", "usd"]
+                },
                 "tap": { "network": "ethereum" },
                 "tnk": { "network": "trac" }
             },

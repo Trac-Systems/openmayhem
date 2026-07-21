@@ -845,9 +845,17 @@ async function validateLaunchManifest(manifest, { manifestPath, allowPlaceholder
       add('error', 'payments.rails must be exactly fiat,tap,tnk');
     }
     if (requireObject(add, manifest.payments.fiat, 'payments.fiat')) {
-      requireOnlyKeys(add, manifest.payments.fiat, 'payments.fiat', ['processor', 'currencies', 'locale']);
+      requireOnlyKeys(add, manifest.payments.fiat, 'payments.fiat', [
+        'processor',
+        'integration_currency',
+        'adaptive_pricing',
+        'payout_currencies',
+        'locale',
+      ]);
       requireLiteral(add, manifest.payments.fiat.processor, 'stripe', 'payments.fiat.processor');
-      requireStringArray(add, manifest.payments.fiat.currencies, 'payments.fiat.currencies', 1);
+      requireLiteral(add, manifest.payments.fiat.integration_currency, 'usd', 'payments.fiat.integration_currency');
+      requireLiteral(add, manifest.payments.fiat.adaptive_pricing, true, 'payments.fiat.adaptive_pricing');
+      requireStringArray(add, manifest.payments.fiat.payout_currencies, 'payments.fiat.payout_currencies', 1);
       requireLiteral(add, manifest.payments.fiat.locale, 'en', 'payments.fiat.locale');
     }
     if (requireObject(add, manifest.payments.tap, 'payments.tap')) {

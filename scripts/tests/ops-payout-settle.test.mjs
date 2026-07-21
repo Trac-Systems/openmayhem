@@ -20,6 +20,11 @@ const FIAT_ROOT = 'b'.repeat(64);
 const TNK_ROOT = 'c'.repeat(64);
 const TAP_ROOT = `0x${'d'.repeat(64)}`;
 const TAP_TX = `0x${'e'.repeat(64)}`;
+const FIAT_PROVIDER = '6'.repeat(64);
+const FIAT_PAYOUT_REVISION = '7'.repeat(64);
+const FIAT_QUOTE_HASH = 'aeb7dc5278b6ad207b3dfad34b7708b1859690166b1d1f8751fd4afe5204b7d8';
+const FIAT_EUR_QUOTE_HASH = '005b308d26296de4fee01e15fdf659b88e874f502f20d7d71a1d82e4b1ac4943';
+const FIAT_SETTLED_BY = '9'.repeat(64);
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -35,6 +40,452 @@ function writeExecutable(target, source) {
   fs.writeFileSync(target, source, { mode: 0o755 });
 }
 
+function clone(value) {
+  return structuredClone(value);
+}
+
+function writeFiatFixtures(root) {
+  const fixtureDir = path.join(root, 'fiat-fixtures');
+  fs.mkdirSync(fixtureDir, { recursive: true });
+  const transferGroup = `mayhem_fiat_epoch_7_${APPLY_HASH.slice(0, 16)}`;
+  const providerOutput = {
+    role: 'provider',
+    provider: FIAT_PROVIDER,
+    payout_revision: FIAT_PAYOUT_REVISION,
+    to: 'acct_provider',
+    liability_au: '850000000000000000',
+    paid_au: '840000000000000000',
+    rounding_au: '10000000000000000',
+    dust_au: '10000000000000000',
+    source_currency: 'eur',
+    source_amount_minor: '84',
+    destination_currency: 'gbp',
+    destination_amount_minor: '66',
+    fx_quote_id: 'fxq_provider',
+    fx_quote_hash: FIAT_QUOTE_HASH,
+  };
+  const operatorOutput = {
+    role: 'operator_fee',
+    to: 'platform_balance',
+    liability_au: '150000000000000000',
+    paid_au: '140000000000000000',
+    rounding_au: '10000000000000000',
+    dust_au: '10000000000000000',
+    source_currency: 'eur',
+    source_amount_minor: '14',
+  };
+  const providerTransfer = {
+    schema_version: 2,
+    kind: 'stripe_transfer',
+    ref: 'tr_provider',
+    destination: 'acct_provider',
+    source_currency: 'eur',
+    source_amount_minor: '84',
+    destination_currency: 'gbp',
+    destination_amount_minor: '66',
+    fx_quote_id: 'fxq_provider',
+    fx_quote_hash: FIAT_QUOTE_HASH,
+    destination_payment: 'py_provider',
+    transfer_group: transferGroup,
+  };
+  const operatorTransfer = {
+    schema_version: 2,
+    kind: 'platform_balance',
+    ref: 'platform_balance:7:aaaaaaaaaaaaaaaa',
+    destination: 'platform_balance',
+    source_currency: 'eur',
+    source_amount_minor: '14',
+    transfer_group: null,
+  };
+  const settlement = {
+    op: 'settle_targeted_fiat',
+    epoch: 7,
+    at: 1000,
+    rail: 'fiat',
+    processor: 'stripe',
+    source_currency: 'eur',
+    operator_to: 'platform_balance',
+    epoch_apply_hash: APPLY_HASH,
+    stripe_transfers: [providerTransfer, operatorTransfer],
+    transfer_root: FIAT_ROOT,
+    provider_count: 1,
+    provider_liability_au: '850000000000000000',
+    provider_paid_au: '840000000000000000',
+    operator_fee_liability_au: '150000000000000000',
+    operator_fee_retained_au: '140000000000000000',
+    gross_liability_au: '1000000000000000000',
+    gross_paid_au: '980000000000000000',
+    rounding_au: '20000000000000000',
+    dust_au: '20000000000000000',
+    source_amount_minor: '98',
+    destination_totals: [{ currency: 'gbp', amount_minor: '66' }],
+    outputs: [providerOutput, operatorOutput],
+  };
+  const settlementState = {
+    type: 'targeted_fiat_settlement',
+    ...settlement,
+    settled_by: FIAT_SETTLED_BY,
+    settled_by_role: 'admin',
+  };
+  const providerReport = {
+    // This is the pre-transfer plan index and may have gaps after sub-minor skips.
+    output_index: 3,
+    account: {
+      id: 'acct_provider',
+      default_currency: 'gbp',
+      details_submitted: true,
+      payouts_enabled: true,
+      transfers_enabled: true,
+      ready: true,
+      attempts: 1,
+    },
+    fx: {
+      liability_au: providerOutput.liability_au,
+      paid_au: providerOutput.paid_au,
+      rounding_au: providerOutput.rounding_au,
+      dust_au: providerOutput.dust_au,
+      source_currency: providerOutput.source_currency,
+      source_amount_minor: providerOutput.source_amount_minor,
+      destination_currency: providerOutput.destination_currency,
+      target_destination_amount_minor: '65',
+      maximum_destination_amount_minor: '67',
+    },
+    quote: {
+      id: providerOutput.fx_quote_id,
+      created: 1000,
+      expires_at: 1300,
+      lock_duration: 'five_minutes',
+      lock_status: 'active',
+      to_currency: providerOutput.destination_currency,
+      usage: { type: 'transfer', destination: providerOutput.to },
+      rates: {
+        eur: { exchange_rate: '0.84', base_rate: '1.1' },
+        usd: { exchange_rate: '0.7857142857', base_rate: '1' },
+      },
+    },
+    transfer: {
+      id: providerTransfer.ref,
+      source_amount_minor: 84,
+      source_currency: providerOutput.source_currency,
+      destination: providerOutput.to,
+      destination_payment: providerTransfer.destination_payment,
+      balance_transaction: 'txn_transfer',
+      fx_quote: providerOutput.fx_quote_id,
+      created: 1001,
+      reversed: false,
+      amount_reversed: 0,
+      transfer_group: transferGroup,
+      verified: true,
+      recovered: false,
+      attempts: 1,
+    },
+    destination_payment: {
+      id: providerTransfer.destination_payment,
+      source_amount_minor: 84,
+      source_currency: providerOutput.source_currency,
+      amount_minor: 66,
+      gross_amount_minor: 67,
+      currency: providerOutput.destination_currency,
+      fee_minor: 1,
+      net_minor: 66,
+      exchange_rate: '1.1000',
+      paid: true,
+      captured: true,
+      source_transfer: providerTransfer.ref,
+      balance_transaction: 'txn_destination',
+    },
+  };
+  const operatorReport = {
+    output_index: null,
+    kind: 'platform_balance',
+    platform_account: 'acct_platform',
+    source_currency: operatorOutput.source_currency,
+    source_amount_minor: operatorOutput.source_amount_minor,
+    liability_au: operatorOutput.liability_au,
+    retained_au: operatorOutput.paid_au,
+    dust_au: operatorOutput.dust_au,
+    quote: null,
+  };
+  const reconciliation = {
+    denom: 'au_usd',
+    provider_liability_au: settlement.provider_liability_au,
+    provider_paid_au: settlement.provider_paid_au,
+    operator_fee_liability_au: settlement.operator_fee_liability_au,
+    operator_fee_retained_au: settlement.operator_fee_retained_au,
+    gross_liability_au: settlement.gross_liability_au,
+    gross_paid_au: settlement.gross_paid_au,
+    rounding_au: settlement.rounding_au,
+    dust_au: settlement.dust_au,
+    provider_source_minor_by_currency: { eur: '84' },
+    provider_destination_minor_by_currency: { gbp: '66' },
+    operator_retained_minor_by_currency: { eur: '14' },
+    operator_fee_mechanism: 'retained_platform_balance',
+    provider_output_count: 1,
+    verified_transfer_count: 1,
+    all_provider_transfers_verified: true,
+  };
+  const finalReport = {
+    ok: true,
+    epoch: 7,
+    submitted: true,
+    already_settled: null,
+    nothing_to_settle: false,
+    settlement,
+    settlement_state: settlementState,
+    platform_account: {
+      id: 'acct_platform',
+      default_currency: 'eur',
+      livemode: false,
+      attempts: 1,
+    },
+    stripe_transfers: [providerReport, operatorReport],
+    reconciliation,
+    skipped_providers: [],
+  };
+  const draftSettlement = {
+    ...settlement,
+    source_currency: null,
+    stripe_transfers: [],
+    transfer_root: null,
+    provider_paid_au: '0',
+    operator_fee_retained_au: '0',
+    gross_paid_au: '0',
+    rounding_au: settlement.gross_liability_au,
+    dust_au: settlement.gross_liability_au,
+    source_amount_minor: '0',
+    destination_totals: [],
+    outputs: [],
+  };
+  const planReport = {
+    ok: true,
+    epoch: 7,
+    submitted: false,
+    already_settled: null,
+    nothing_to_settle: false,
+    settlement: draftSettlement,
+    skipped_providers: [],
+  };
+  const noWorkReport = {
+    ...planReport,
+    nothing_to_settle: true,
+    settlement: {
+      ...draftSettlement,
+      provider_count: 0,
+      provider_liability_au: '0',
+      operator_fee_liability_au: '0',
+      gross_liability_au: '0',
+      rounding_au: '0',
+      dust_au: '0',
+    },
+  };
+  const blockingReport = clone(planReport);
+  blockingReport.skipped_providers = [{ blocking: true }];
+  const staleReport = clone(planReport);
+  staleReport.settlement.epoch = 6;
+
+  const variants = { success: finalReport };
+  variants.bad_source_total = clone(finalReport);
+  variants.bad_source_total.settlement.source_amount_minor = '99';
+  variants.bad_source_total.settlement_state.source_amount_minor = '99';
+  variants.bad_destination_totals = clone(finalReport);
+  variants.bad_destination_totals.settlement.destination_totals[0].amount_minor = '65';
+  variants.bad_destination_totals.settlement_state.destination_totals[0].amount_minor = '65';
+  variants.bad_provider_au = clone(finalReport);
+  variants.bad_provider_au.settlement.outputs[0].paid_au = '830000000000000000';
+  variants.bad_provider_au.settlement_state.outputs[0].paid_au = '830000000000000000';
+  variants.bad_quote_hash = clone(finalReport);
+  variants.bad_quote_hash.settlement.stripe_transfers[0].fx_quote_hash = '0'.repeat(64);
+  variants.bad_quote_hash.settlement_state.stripe_transfers[0].fx_quote_hash = '0'.repeat(64);
+  variants.bad_transfer_readback = clone(finalReport);
+  variants.bad_transfer_readback.stripe_transfers[0].destination_payment.amount_minor = 65;
+  variants.bad_payment_schema_missing = clone(finalReport);
+  delete variants.bad_payment_schema_missing.stripe_transfers[0].destination_payment.fee_minor;
+  variants.bad_payment_schema_extra = clone(finalReport);
+  variants.bad_payment_schema_extra.stripe_transfers[0].destination_payment.unexpected = true;
+  variants.bad_payment_source_amount = clone(finalReport);
+  variants.bad_payment_source_amount.stripe_transfers[0].destination_payment.source_amount_minor = 83;
+  variants.bad_payment_source_currency = clone(finalReport);
+  variants.bad_payment_source_currency.stripe_transfers[0].destination_payment.source_currency =
+    'usd';
+  variants.bad_payment_id = clone(finalReport);
+  variants.bad_payment_id.stripe_transfers[0].destination_payment.id = 'py_other';
+  variants.bad_payment_currency = clone(finalReport);
+  variants.bad_payment_currency.stripe_transfers[0].destination_payment.currency = 'eur';
+  variants.bad_payment_net_detail = clone(finalReport);
+  variants.bad_payment_net_detail.stripe_transfers[0].destination_payment.net_minor = 65;
+  variants.bad_payment_gross = clone(finalReport);
+  variants.bad_payment_gross.stripe_transfers[0].destination_payment.gross_amount_minor = 68;
+  variants.bad_payment_fee = clone(finalReport);
+  variants.bad_payment_fee.stripe_transfers[0].destination_payment.fee_minor = 2;
+  variants.bad_payment_rate = clone(finalReport);
+  variants.bad_payment_rate.stripe_transfers[0].destination_payment.exchange_rate = '1.1001';
+  variants.bad_payment_rate_null = clone(finalReport);
+  variants.bad_payment_rate_null.stripe_transfers[0].destination_payment.exchange_rate = null;
+  variants.bad_payment_rate_number = clone(finalReport);
+  variants.bad_payment_rate_number.stripe_transfers[0].destination_payment.exchange_rate = 1.1;
+  variants.bad_payment_amount_type = clone(finalReport);
+  variants.bad_payment_amount_type.stripe_transfers[0].destination_payment.amount_minor = '66';
+  variants.bad_payment_unpaid = clone(finalReport);
+  variants.bad_payment_unpaid.stripe_transfers[0].destination_payment.paid = false;
+  variants.bad_payment_uncaptured = clone(finalReport);
+  variants.bad_payment_uncaptured.stripe_transfers[0].destination_payment.captured = false;
+  variants.bad_payment_source_transfer = clone(finalReport);
+  variants.bad_payment_source_transfer.stripe_transfers[0].destination_payment.source_transfer =
+    'tr_other';
+  variants.bad_payment_balance_transaction = clone(finalReport);
+  variants.bad_payment_balance_transaction.stripe_transfers[0].destination_payment[
+    'balance_transaction'
+  ] = 'charge_not_a_balance_transaction';
+  variants.bad_applied_quote = clone(finalReport);
+  variants.bad_applied_quote.stripe_transfers[0].transfer.fx_quote = null;
+  variants.bad_state = clone(finalReport);
+  variants.bad_state.settlement_state.transfer_root = '0'.repeat(64);
+  variants.bad_platform_source = clone(finalReport);
+  variants.bad_platform_source.platform_account.default_currency = 'usd';
+
+  const sameNonUsd = clone(finalReport);
+  for (const value of [sameNonUsd.settlement, sameNonUsd.settlement_state]) {
+    value.destination_totals = [{ currency: 'eur', amount_minor: '84' }];
+    value.outputs[0].destination_currency = 'eur';
+    value.outputs[0].destination_amount_minor = '84';
+    value.outputs[0].fx_quote_id = 'fxq_provider_eur';
+    value.outputs[0].fx_quote_hash = FIAT_EUR_QUOTE_HASH;
+    value.stripe_transfers[0].destination_currency = 'eur';
+    value.stripe_transfers[0].destination_amount_minor = '84';
+    value.stripe_transfers[0].fx_quote_id = 'fxq_provider_eur';
+    value.stripe_transfers[0].fx_quote_hash = FIAT_EUR_QUOTE_HASH;
+  }
+  const sameNonUsdReport = sameNonUsd.stripe_transfers[0];
+  sameNonUsdReport.account.default_currency = 'eur';
+  sameNonUsdReport.fx.destination_currency = 'eur';
+  sameNonUsdReport.fx.target_destination_amount_minor = '84';
+  sameNonUsdReport.fx.maximum_destination_amount_minor = '84';
+  sameNonUsdReport.quote = {
+    id: 'fxq_provider_eur',
+    created: 1000,
+    expires_at: 1300,
+    lock_duration: 'five_minutes',
+    lock_status: 'active',
+    to_currency: 'eur',
+    usage: { type: 'transfer', destination: providerOutput.to },
+    rates: { usd: { exchange_rate: '0.92', base_rate: '1' } },
+  };
+  sameNonUsdReport.transfer.fx_quote = null;
+  sameNonUsdReport.destination_payment.source_amount_minor = 84;
+  sameNonUsdReport.destination_payment.source_currency = 'eur';
+  sameNonUsdReport.destination_payment.amount_minor = 84;
+  sameNonUsdReport.destination_payment.gross_amount_minor = 84;
+  sameNonUsdReport.destination_payment.currency = 'eur';
+  sameNonUsdReport.destination_payment.fee_minor = 0;
+  sameNonUsdReport.destination_payment.net_minor = 84;
+  sameNonUsdReport.destination_payment.exchange_rate = null;
+  sameNonUsd.reconciliation.provider_destination_minor_by_currency = { eur: '84' };
+  variants.same_currency_non_usd = sameNonUsd;
+
+  variants.same_non_usd_missing_quote = clone(sameNonUsd);
+  for (const value of [
+    variants.same_non_usd_missing_quote.settlement,
+    variants.same_non_usd_missing_quote.settlement_state,
+  ]) {
+    value.outputs[0].fx_quote_id = null;
+    value.outputs[0].fx_quote_hash = null;
+    value.stripe_transfers[0].fx_quote_id = null;
+    value.stripe_transfers[0].fx_quote_hash = null;
+  }
+  variants.same_non_usd_missing_readback_quote = clone(sameNonUsd);
+  variants.same_non_usd_missing_readback_quote.stripe_transfers[0].quote = null;
+  variants.same_non_usd_unbound_quote = clone(sameNonUsd);
+  variants.same_non_usd_unbound_quote.stripe_transfers[0].quote.usage.destination =
+    'acct_other';
+  variants.same_non_usd_bad_quote_hash = clone(sameNonUsd);
+  for (const value of [
+    variants.same_non_usd_bad_quote_hash.settlement,
+    variants.same_non_usd_bad_quote_hash.settlement_state,
+  ]) {
+    value.outputs[0].fx_quote_hash = '0'.repeat(64);
+    value.stripe_transfers[0].fx_quote_hash = '0'.repeat(64);
+  }
+  variants.same_non_usd_applied_transfer_quote = clone(sameNonUsd);
+  variants.same_non_usd_applied_transfer_quote.stripe_transfers[0].transfer.fx_quote =
+    'fxq_provider_eur';
+  variants.same_non_usd_missing_transfer_quote = clone(sameNonUsd);
+  delete variants.same_non_usd_missing_transfer_quote.stripe_transfers[0].transfer.fx_quote;
+  variants.same_non_usd_payment_rate = clone(sameNonUsd);
+  variants.same_non_usd_payment_rate.stripe_transfers[0].destination_payment.exchange_rate = '1';
+
+  const directUsd = clone(sameNonUsd);
+  for (const value of [directUsd.settlement, directUsd.settlement_state]) {
+    value.source_currency = 'usd';
+    value.destination_totals = [{ currency: 'usd', amount_minor: '84' }];
+    value.outputs[0].source_currency = 'usd';
+    value.outputs[0].destination_currency = 'usd';
+    value.outputs[0].fx_quote_id = null;
+    value.outputs[0].fx_quote_hash = null;
+    value.outputs[1].source_currency = 'usd';
+    value.stripe_transfers[0].source_currency = 'usd';
+    value.stripe_transfers[0].destination_currency = 'usd';
+    value.stripe_transfers[0].fx_quote_id = null;
+    value.stripe_transfers[0].fx_quote_hash = null;
+    value.stripe_transfers[1].source_currency = 'usd';
+  }
+  directUsd.platform_account.default_currency = 'usd';
+  directUsd.stripe_transfers[0].account.default_currency = 'usd';
+  directUsd.stripe_transfers[0].fx.source_currency = 'usd';
+  directUsd.stripe_transfers[0].fx.destination_currency = 'usd';
+  directUsd.stripe_transfers[0].quote = null;
+  directUsd.stripe_transfers[0].transfer.source_currency = 'usd';
+  directUsd.stripe_transfers[0].transfer.fx_quote = null;
+  directUsd.stripe_transfers[0].destination_payment.source_currency = 'usd';
+  directUsd.stripe_transfers[0].destination_payment.currency = 'usd';
+  directUsd.stripe_transfers[1].source_currency = 'usd';
+  directUsd.reconciliation.provider_source_minor_by_currency = { usd: '84' };
+  directUsd.reconciliation.provider_destination_minor_by_currency = { usd: '84' };
+  directUsd.reconciliation.operator_retained_minor_by_currency = { usd: '14' };
+  variants.direct_usd_null_quotes = directUsd;
+
+  variants.direct_usd_absent_quotes = clone(directUsd);
+  for (const value of [
+    variants.direct_usd_absent_quotes.settlement,
+    variants.direct_usd_absent_quotes.settlement_state,
+  ]) {
+    delete value.outputs[0].fx_quote_id;
+    delete value.outputs[0].fx_quote_hash;
+    delete value.stripe_transfers[0].fx_quote_id;
+    delete value.stripe_transfers[0].fx_quote_hash;
+  }
+  delete variants.direct_usd_absent_quotes.stripe_transfers[0].quote;
+  delete variants.direct_usd_absent_quotes.stripe_transfers[0].transfer.fx_quote;
+
+  variants.direct_usd_with_quote = clone(directUsd);
+  for (const value of [
+    variants.direct_usd_with_quote.settlement,
+    variants.direct_usd_with_quote.settlement_state,
+  ]) {
+    value.outputs[0].fx_quote_id = 'fxq_provider';
+    value.outputs[0].fx_quote_hash = FIAT_QUOTE_HASH;
+    value.stripe_transfers[0].fx_quote_id = 'fxq_provider';
+    value.stripe_transfers[0].fx_quote_hash = FIAT_QUOTE_HASH;
+  }
+
+  variants.direct_usd_quote_readback = clone(directUsd);
+  variants.direct_usd_quote_readback.stripe_transfers[0].quote = clone(providerReport.quote);
+  variants.direct_usd_bad_transfer = clone(directUsd);
+  variants.direct_usd_bad_transfer.stripe_transfers[0].transfer.source_amount_minor = 83;
+  variants.direct_usd_bad_payment = clone(directUsd);
+  variants.direct_usd_bad_payment.stripe_transfers[0].destination_payment.amount_minor = 83;
+  variants.direct_usd_payment_rate = clone(directUsd);
+  variants.direct_usd_payment_rate.stripe_transfers[0].destination_payment.exchange_rate = '1';
+
+  writeJson(path.join(fixtureDir, 'plan.json'), planReport);
+  writeJson(path.join(fixtureDir, 'no_work.json'), noWorkReport);
+  writeJson(path.join(fixtureDir, 'blocking.json'), blockingReport);
+  writeJson(path.join(fixtureDir, 'stale_epoch.json'), staleReport);
+  for (const [name, value] of Object.entries(variants)) {
+    writeJson(path.join(fixtureDir, `${name}.json`), value);
+  }
+  return fixtureDir;
+}
+
 function harness({ bundle = true, emptySeal = !bundle } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mayhem-payout-worker-'));
   const state = path.join(root, 'settlement');
@@ -44,6 +495,7 @@ function harness({ bundle = true, emptySeal = !bundle } = {}) {
   const applyState = path.join(root, 'apply-state.json');
   const emptySealDefault = emptySeal ? '1' : '0';
   fs.mkdirSync(bin, { recursive: true });
+  const fiatFixtures = writeFiatFixtures(root);
   writeJson(applyState, {
     value: {
       updated_epoch: 7,
@@ -99,19 +551,13 @@ for arg in "$@"; do
   [[ "$arg" == "--submit-transfer" ]] && submit=1
 done
 if [[ "$rail" == "fiat-settlement" ]]; then
-  fiat_plan='{"ok":true,"epoch":7,"submitted":false,"already_settled":null,"nothing_to_settle":false,"settlement":{"op":"settle_targeted_fiat","rail":"fiat","epoch":7,"epoch_apply_hash":"${APPLY_HASH}","transfer_root":"${FIAT_ROOT}","outputs":[{"role":"provider","provider":"provider","payout_revision":"revision","to":"acct_provider","currency":"eur","amount_minor":"100","au":"10000000000000000"}],"stripe_transfers":[]},"skipped_providers":[]}'
-  fiat_empty='{"ok":true,"epoch":7,"submitted":false,"already_settled":null,"nothing_to_settle":true,"settlement":{"op":"settle_targeted_fiat","rail":"fiat","epoch":7,"epoch_apply_hash":"${APPLY_HASH}","transfer_root":"${FIAT_ROOT}","outputs":[],"stripe_transfers":[]},"skipped_providers":[]}'
-  fiat_final='{"ok":true,"epoch":7,"submitted":true,"already_settled":null,"nothing_to_settle":false,"settlement":{"op":"settle_targeted_fiat","rail":"fiat","epoch":7,"epoch_apply_hash":"${APPLY_HASH}","transfer_root":"${FIAT_ROOT}","outputs":[{"role":"provider","provider":"provider","payout_revision":"revision","to":"acct_provider","currency":"eur","amount_minor":"100","au":"10000000000000000"}],"stripe_transfers":[{"schema_version":1,"kind":"stripe_transfer","ref":"tr_1","destination":"acct_provider","currency":"eur","amount_minor":"100","transfer_group":"epoch-7"}]},"settlement_state":{"op":"settle_targeted_fiat","rail":"fiat","epoch":7,"epoch_apply_hash":"${APPLY_HASH}","transfer_root":"${FIAT_ROOT}","outputs":[{"role":"provider","provider":"provider","payout_revision":"revision","to":"acct_provider","currency":"eur","amount_minor":"100","au":"10000000000000000"}],"stripe_transfers":[{"schema_version":1,"kind":"stripe_transfer","ref":"tr_1","destination":"acct_provider","currency":"eur","amount_minor":"100","transfer_group":"epoch-7"}]},"stripe_transfers":[{"output_index":0,"transfer":{"id":"tr_1","verified":true}}],"reconciliation":{"all_provider_transfers_verified":true},"skipped_providers":[]}'
-  if [[ "\${MOCK_FIAT_MODE:-success}" == "blocking" ]]; then
-    printf '%s\\n' "\${fiat_plan/\\\"skipped_providers\\\":[]/\\\"skipped_providers\\\":[{\\\"blocking\\\":true}]}"
-  elif [[ "\${MOCK_FIAT_MODE:-success}" == "no_work" ]]; then
-    printf '%s\\n' "$fiat_empty"
-  elif [[ "\${MOCK_FIAT_MODE:-success}" == "stale_epoch" ]]; then
-    printf '%s\\n' "\${fiat_plan/\\\"epoch\\\":7,\\\"epoch_apply_hash\\\"/\\\"epoch\\\":6,\\\"epoch_apply_hash\\\"}"
+  mode="\${MOCK_FIAT_MODE:-success}"
+  if [[ "$mode" == "blocking" || "$mode" == "no_work" || "$mode" == "stale_epoch" ]]; then
+    cat "$MOCK_FIAT_FIXTURES/$mode.json"
   elif (( submit == 1 )); then
-    printf '%s\\n' "$fiat_final"
+    cat "$MOCK_FIAT_FIXTURES/$mode.json"
   else
-    printf '%s\\n' "$fiat_plan"
+    cat "$MOCK_FIAT_FIXTURES/plan.json"
   fi
 elif [[ "$rail" == "tnk-settlement" ]]; then
   tnk_plan='{"ok":true,"epoch":7,"submitted":false,"already_settled":null,"settlement":{"op":"settle_targeted_tnk","rail":"tnk","epoch":7,"epoch_apply_hash":"${APPLY_HASH}","transfer_root":"${TNK_ROOT}","outputs":[{"role":"provider","provider":"provider","payout_revision":"revision","to":"trac1provider","au":"10","tnk_e18":"10"}],"msb_transfers":[]},"skipped_providers":[],"msb_outputs":[{"to":"trac1provider","amount":"0.000000000000000010"}]}'
@@ -194,10 +640,11 @@ fi
   }
 
   const env = {
-    PATH: `${bin}:/usr/bin:/bin:/usr/sbin:/sbin`,
+    PATH: `${path.dirname(process.execPath)}:${bin}:/usr/bin:/bin:/usr/sbin:/sbin`,
     HOME: path.join(root, 'home'),
     LANG: 'C',
     MAYHEM_BIN: path.join(bin, 'mock-mayhem'),
+    MAYHEM_SOURCE_DIR: ROOT,
     MAYHEM_RPC_URL: 'http://mock.invalid/v1',
     MAYHEM_ADMIN_HOME: path.join(root, 'admin-home'),
     MAYHEM_ADMIN_STORE: 'test-admin',
@@ -209,6 +656,7 @@ fi
     MOCK_APPLY_STATE: applyState,
     MOCK_MAYHEM_LOG: log,
     MOCK_NOW_FILE: nowFile,
+    MOCK_FIAT_FIXTURES: fiatFixtures,
   };
   return { root, state, spool, log, nowFile, env };
 }
@@ -420,6 +868,128 @@ test('stale fiat evidence is rejected before a completion marker is written', (t
   assert.equal(fs.existsSync(path.join(workDir, 'fiat.complete')), false);
 });
 
+test('fiat settlement requires exact cross-currency state and Stripe readbacks', async (t) => {
+  const cases = [
+    ['bad_source_total', /settlement totals do not match outputs/],
+    ['bad_destination_totals', /destination totals do not match provider outputs/],
+    ['bad_provider_au', /output AU liability, paid amount, rounding, and dust do not balance/],
+    ['bad_quote_hash', /provider FX\/transfer evidence is inconsistent/],
+    ['bad_transfer_readback', /destination-payment readback disagrees with retained evidence/],
+    [
+      'bad_payment_schema_missing',
+      /destination-payment readback does not have the exact canonical schema/,
+    ],
+    [
+      'bad_payment_schema_extra',
+      /destination-payment readback does not have the exact canonical schema/,
+    ],
+    ['bad_payment_source_amount', /destination-payment readback disagrees with retained evidence/],
+    ['bad_payment_source_currency', /destination-payment readback disagrees with retained evidence/],
+    ['bad_payment_id', /destination-payment readback disagrees with retained evidence/],
+    ['bad_payment_currency', /destination-payment readback disagrees with retained evidence/],
+    ['bad_payment_net_detail', /destination-payment readback disagrees with retained evidence/],
+    ['bad_payment_gross', /destination-payment readback disagrees with retained evidence/],
+    ['bad_payment_fee', /destination-payment readback disagrees with retained evidence/],
+    ['bad_payment_rate', /destination-payment readback disagrees with retained evidence/],
+    [
+      'bad_payment_rate_null',
+      /destination-payment exchange rate is not a positive exact decimal rate/,
+    ],
+    [
+      'bad_payment_rate_number',
+      /destination-payment exchange rate is not a positive exact decimal rate/,
+    ],
+    [
+      'bad_payment_amount_type',
+      /destination-payment net amount is not a canonical JSON minor-unit integer/,
+    ],
+    ['bad_payment_unpaid', /destination-payment readback disagrees with retained evidence/],
+    ['bad_payment_uncaptured', /destination-payment readback disagrees with retained evidence/],
+    ['bad_payment_source_transfer', /destination-payment readback disagrees with retained evidence/],
+    ['bad_payment_balance_transaction', /destination-payment readback disagrees with retained evidence/],
+    ['bad_applied_quote', /Stripe transfer readback disagrees with retained evidence/],
+    ['bad_state', /canonical state disagrees on transfer_root/],
+    ['bad_platform_source', /settlement source disagrees with Stripe platform account/],
+  ];
+  for (const [mode, error] of cases) {
+    await t.test(mode, () => {
+      const ctx = harness({ bundle: false });
+      t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));
+      const result = runWorker(ctx, {
+        MOCK_FIAT_MODE: mode,
+        MOCK_TNK_MODE: 'no_work',
+      });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, error);
+      const workDir = path.join(ctx.state, `payout/epoch-7-${APPLY_HASH}`);
+      assert.equal(fs.existsSync(path.join(workDir, 'fiat.complete')), false);
+      assert.equal(
+        logLines(ctx).filter((line) => line.startsWith('admin fiat-settlement')).length,
+        2
+      );
+    });
+  }
+});
+
+test('fiat reconciliation accepts valuation-quoted same-currency non-USD settlement', (t) => {
+  const ctx = harness({ bundle: false });
+  t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));
+  const result = runWorker(ctx, {
+    MOCK_FIAT_MODE: 'same_currency_non_usd',
+    MOCK_TNK_MODE: 'no_work',
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const workDir = path.join(ctx.state, `payout/epoch-7-${APPLY_HASH}`);
+  assert.equal(fs.existsSync(path.join(workDir, 'fiat.complete')), true);
+});
+
+test('fiat reconciliation accepts direct USD with null or absent quotes', async (t) => {
+  for (const mode of ['direct_usd_null_quotes', 'direct_usd_absent_quotes']) {
+    await t.test(mode, () => {
+      const ctx = harness({ bundle: false });
+      t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));
+      const result = runWorker(ctx, {
+        MOCK_FIAT_MODE: mode,
+        MOCK_TNK_MODE: 'no_work',
+      });
+      assert.equal(result.status, 0, result.stderr);
+      const workDir = path.join(ctx.state, `payout/epoch-7-${APPLY_HASH}`);
+      assert.equal(fs.existsSync(path.join(workDir, 'fiat.complete')), true);
+    });
+  }
+});
+
+test('fiat reconciliation enforces same-currency valuation and direct-USD quote rules', async (t) => {
+  const cases = [
+    ['same_non_usd_missing_quote', /provider FX quote id is invalid/],
+    ['same_non_usd_missing_readback_quote', /provider Stripe readback is incomplete/],
+    ['same_non_usd_unbound_quote', /FX quote readback disagrees with output/],
+    ['same_non_usd_bad_quote_hash', /FX quote readback hash disagrees with retained evidence/],
+    ['same_non_usd_applied_transfer_quote', /Stripe transfer readback disagrees with retained evidence/],
+    ['same_non_usd_missing_transfer_quote', /Stripe transfer readback disagrees with retained evidence/],
+    ['same_non_usd_payment_rate', /destination-payment readback disagrees with retained evidence/],
+    ['direct_usd_with_quote', /provider output does not have the exact canonical schema/],
+    ['direct_usd_quote_readback', /direct-USD provider has an FX quote readback/],
+    ['direct_usd_bad_transfer', /Stripe transfer readback disagrees with retained evidence/],
+    ['direct_usd_bad_payment', /destination-payment readback disagrees with retained evidence/],
+    ['direct_usd_payment_rate', /destination-payment readback disagrees with retained evidence/],
+  ];
+  for (const [mode, error] of cases) {
+    await t.test(mode, () => {
+      const ctx = harness({ bundle: false });
+      t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));
+      const result = runWorker(ctx, {
+        MOCK_FIAT_MODE: mode,
+        MOCK_TNK_MODE: 'no_work',
+      });
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, error);
+      const workDir = path.join(ctx.state, `payout/epoch-7-${APPLY_HASH}`);
+      assert.equal(fs.existsSync(path.join(workDir, 'fiat.complete')), false);
+    });
+  }
+});
+
 test('cross-epoch TAP processed evidence is rejected', (t) => {
   const ctx = harness();
   t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));
@@ -610,4 +1180,8 @@ test('systemd and finalizer wiring preserve the automatic payout handoff', () =>
   assert.match(installer, /require_file_env MAYHEM_TNK_TREASURY_KEYPAIR_PATH/);
   assert.match(tapRoller, /find "\$working"/);
   assert.match(tapRoller, /timeout "\$attempt_timeout"/);
+  assert.doesNotMatch(
+    fs.readFileSync(SCRIPT, 'utf8'),
+    /FIAT_OPERATOR_CURRENCY|--operator-currency/
+  );
 });

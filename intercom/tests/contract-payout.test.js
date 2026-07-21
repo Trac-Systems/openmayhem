@@ -42,7 +42,13 @@ const payoutBootstrap = 'b'.repeat(64);
 const payoutPayments = {
   denom: 'au_usd',
   rails: ['fiat', 'tap', 'tnk'],
-  fiat: { processor: 'stripe', currencies: ['usd', 'eur'], locale: 'en' },
+  fiat: {
+    processor: 'stripe',
+    integration_currency: 'usd',
+    adaptive_pricing: true,
+    payout_currencies: ['eur', 'gbp', 'usd'],
+    locale: 'en',
+  },
   tap: {
     chain_id: 61_000,
     token_address: `0x${'1'.repeat(40)}`,
@@ -1001,6 +1007,57 @@ test('Stripe verification is immutable, CAS-ordered, and restart-idempotent', as
   assert.match(
     (await executeStripeVerification(ctx, nonceCollision)).message,
     /nonce already consumed/i
+  );
+});
+
+test('Stripe Standard adoption verifies and binds a provider-scoped GBP payout currency', async () => {
+  const ctx = await setupBindingContract();
+  const adopted = await stripeVerificationValue(ctx, {
+    account_id: 'acct_adopted_standard_gbp',
+    account_type: 'standard',
+    country: 'GB',
+    currency: 'gbp',
+    verification_kind: 'adopt',
+    request_nonce: 'd'.repeat(64),
+  });
+  const verified = await executeStripeVerification(ctx, adopted);
+  assert.equal(verified.ok, true, verified.message);
+
+  const binding = await payoutBindingValue({
+    contract: ctx.contract,
+    provider: ctx.provider,
+    targetOwner: ctx.provider,
+    admin: ctx.admin.publicKey,
+    rail: 'fiat',
+    contextRevision: ctx.contextRevision,
+    fiatTarget: adopted.value.account_id,
+    fiatCurrency: 'gbp',
+    nonce: 'e'.repeat(64),
+  });
+  const bound = await executePayoutBinding(
+    ctx.contract,
+    ctx.storage,
+    binding,
+    ctx.admin.publicKey
+  );
+  assert.equal(bound.ok, true, bound.message);
+  assert.equal(
+    (await ctx.storage.get(binding.key)).value.currency,
+    'gbp'
+  );
+
+  const nonStandard = await stripeVerificationValue(ctx, {
+    account_id: 'acct_invalid_adopted_express',
+    account_type: 'express',
+    country: 'GB',
+    currency: 'gbp',
+    verification_kind: 'adopt',
+    previous_verification: verified.revision,
+    request_nonce: 'f'.repeat(64),
+  });
+  assert.match(
+    (await executeStripeVerification(ctx, nonStandard)).message,
+    /invalid stripe payout verification/i
   );
 });
 

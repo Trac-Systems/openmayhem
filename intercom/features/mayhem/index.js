@@ -36,6 +36,7 @@ const DEFAULT_RESULT_RETRY_MAX = 6;
 const PROVIDER_PAYOUT_RAILS = new Set(['fiat', 'tap', 'tnk']);
 const STRIPE_CONNECT_RELINK_CONSENT_VERSION = 1;
 const STRIPE_CONNECT_RELINK_CONSENT_MAX_SECONDS = 600;
+const STRIPE_CONNECT_ADOPT_CONSENT_MAX_SECONDS = 600;
 const normalizeKey = (value) => String(value ?? '').trim().toLowerCase();
 
 const verifyEd25519Hex = (wallet, signature, message, publicKey) => {
@@ -185,6 +186,52 @@ const validStripeConnectRelinkConsent = (wallet, value) => {
   );
 };
 
+const validStripeConnectAdoptPayload = (value) => {
+  if (!exactKeys(value, [
+    'provider',
+    'country',
+    'request_nonce',
+    'consent_expires_at',
+  ])) return false;
+  if (!/^[0-9a-f]{64}$/.test(String(value.provider ?? '')) ||
+      !/^[A-Z]{2}$/.test(String(value.country ?? '')) ||
+      !/^[0-9a-f]{64}$/.test(String(value.request_nonce ?? '')) ||
+      !Number.isSafeInteger(value.consent_expires_at)) return false;
+  const now = Math.floor(Date.now() / 1_000);
+  return value.consent_expires_at > now &&
+    value.consent_expires_at <= now + STRIPE_CONNECT_ADOPT_CONSENT_MAX_SECONDS;
+};
+
+const validStripeCheckoutPayload = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const requiredKeys = [
+    'who',
+    'au',
+    'request_nonce',
+    'success_url',
+    'cancel_url',
+  ];
+  const allowedKeys = new Set([...requiredKeys, 'idempotency_key']);
+  if (requiredKeys.some((key) => !Object.hasOwn(value, key)) ||
+      Object.keys(value).some((key) => !allowedKeys.has(key)) ||
+      !/^[0-9a-f]{64}$/.test(String(value.who ?? '')) ||
+      !/^[1-9][0-9]*$/.test(String(value.au ?? '')) ||
+      !/^[0-9a-f]{64}$/.test(String(value.request_nonce ?? '')) ||
+      (value.idempotency_key !== undefined &&
+        (typeof value.idempotency_key !== 'string' || value.idempotency_key.length > 255))) {
+    return false;
+  }
+  try {
+    for (const field of ['success_url', 'cancel_url']) {
+      const parsed = new URL(String(value[field] ?? ''));
+      if (parsed.protocol !== 'https:' || parsed.username || parsed.password) return false;
+    }
+  } catch (_error) {
+    return false;
+  }
+  return true;
+};
+
 const participantFor = (value) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   if (value.op === 'admin_contract_tx') return normalizeKey(value.address);
@@ -210,6 +257,7 @@ const serviceParticipantFor = (service, value) => {
   if (service === 'stripe_checkout') return normalizeKey(value.who);
   if ([
     'provider_payout_context',
+    'stripe_connect_adopt',
     'stripe_connect_onboard',
     'stripe_connect_status',
     'stripe_connect_relink',
@@ -621,6 +669,9 @@ class MayhemFeature extends Feature {
     if (typeof this.peer?.wallet?.verify !== 'function') return null;
     if (service === 'stripe_connect_relink' &&
         !validStripeConnectRelinkConsent(this.peer.wallet, payload)) return null;
+    if (service === 'stripe_checkout' && !validStripeCheckoutPayload(payload)) return null;
+    if (service === 'stripe_connect_adopt' &&
+        !validStripeConnectAdoptPayload(payload)) return null;
     if (!verifyEd25519Hex(
       this.peer.wallet,
       signature,

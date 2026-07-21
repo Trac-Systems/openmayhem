@@ -52,14 +52,14 @@ gateway is loopback-only; a public ledger records prices, receipts, settlements.
 ## 3. Install
 
 ### 3.1 Get the code — exact source release (MANDATORY rule)
-- `v0.2.25` is source-only. Never invent or offer a native archive URL: the release has no unsigned
+- `v0.2.32` is source-only. Never invent or offer a native archive URL: the release has no unsigned
   OpenMayhem executable assets. Clone the exact release tag and build it locally.
 
   **macOS/Linux:**
   ```bash
   git clone https://github.com/Trac-Systems/openmayhem.git
   cd openmayhem
-  git checkout --detach v0.2.25
+  git checkout --detach v0.2.32
   ./install.sh --from-source
   ```
 
@@ -67,7 +67,7 @@ gateway is loopback-only; a public ledger records prices, receipts, settlements.
   ```powershell
   git clone https://github.com/Trac-Systems/openmayhem.git
   Set-Location openmayhem
-  git checkout --detach v0.2.25
+  git checkout --detach v0.2.32
   .\install.ps1 -FromSource
   ```
 Everything installs under `~/.mayhem/` — no `sudo`, no system directories.
@@ -130,9 +130,9 @@ resumes without provider re-onboarding.
 For a Tier-2 candidate, a fresh buyer needs no TPM, provider quote helper, root/admin action,
 manual verifier flag, or machine-wide setup. The source installer builds the verifier from the same
 checked-out tag, and `mayhem up` authenticates the active policy and shared public collateral. It
-never fetches verifier code from an operator or provider. Managed Tier-3 verifier distribution is
-not active in `0.2.25`; a route that cannot prove an available higher tier falls back to the next
-tier it can prove.
+never fetches verifier code from an operator or provider. Managed Tier-3 verification is enabled
+only by authenticated admin policy; a route that cannot prove an available higher tier falls back
+to the next tier it can prove.
 
 ---
 
@@ -220,6 +220,10 @@ run `mayhem provider stripe status`. Readiness automatically creates the
 provider-signed fiat binding. For a ready Stripe account owned by another
 provider identity, inspect `mayhem provider stripe relink --help`: both provider
 identities must consent, and an account id alone is rejected.
+If an existing Standard Stripe account has never been connected to Mayhem, use
+`mayhem provider stripe adopt --country <CC>`. It always prints the Stripe OAuth
+URL, accepts `--no-open`, and obtains the account identity only from Stripe's
+callback; never ask the operator or provider to paste an `acct_...` value.
 For a German provider, `mayhem provider stripe rotate --country DE` replaces
 the current Connect account; use the actual country code the provider answered
 with. It signs the current account as a compare-and-swap, always prints the new
@@ -473,8 +477,8 @@ forwarded as-is.
 
 | Goal | Command |
 |---|---|
-| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.25 && ./install.sh --from-source` |
-| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.25; .\install.ps1 -FromSource` |
+| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.32 && ./install.sh --from-source` |
+| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.32; .\install.ps1 -FromSource` |
 | Start user gateway | `mayhem up --rail <fiat\|tap\|tnk> --yes` |
 | Start provider | `mayhem up --provider --yes` |
 | Stop and leave provider registrations | `mayhem down` |
@@ -492,6 +496,7 @@ forwarded as-is.
 | Bind TNK payout | `mayhem provider payout set --rail tnk --submit` |
 | Inspect payout bindings | `mayhem provider payout get` |
 | Stripe payout setup | `mayhem provider stripe onboard --help` |
+| Adopt existing Standard Stripe account | `mayhem provider stripe adopt --help` |
 | Stripe account replacement | `mayhem provider stripe rotate --help` |
 | Stripe account reuse | `mayhem provider stripe relink --help` |
 | Min-ask floor | `mayhem provider min-ask set <…>` |

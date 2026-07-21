@@ -557,7 +557,9 @@ async function buildLaunchManifest(outDir, adminKey, providerIds, syntheticCatal
       rails: ['fiat', 'tap', 'tnk'],
       fiat: {
         processor: 'stripe',
-        currencies: ['usd', 'eur'],
+        integration_currency: 'usd',
+        adaptive_pricing: true,
+        payout_currencies: ['eur', 'gbp', 'usd'],
         locale: 'en',
       },
       tap: {
@@ -666,7 +668,9 @@ async function buildCanonicalSnapshot(outDir, adminPubkey, providerKeys, enclave
     rails: [...payoutRails],
     fiat: {
       processor: 'stripe',
-      currencies: ['usd', 'eur'],
+      integration_currency: 'usd',
+      adaptive_pricing: true,
+      payout_currencies: ['eur', 'gbp', 'usd'],
       locale: 'en',
     },
     tap: {

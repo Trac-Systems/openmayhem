@@ -1,0 +1,304 @@
+name: Source build evidence
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact lowercase 40-hex commit currently at origin/main
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify-source:
+    name: Verify exact source
+    runs-on: ubuntu-24.04
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - name: Bind workflow and source to canonical main
+        id: source
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == "Trac-Systems/openmayhem" ]] || {
+            printf '%s\n' "workflow is not running in the canonical repository" >&2
+            exit 1
+          }
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+            printf '%s\n' "source evidence must be dispatched from main" >&2
+            exit 1
+          }
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+            printf '%s\n' "source_sha must be exact lowercase 40-hex" >&2
+            exit 1
+          }
+          [[ "$GITHUB_SHA" == "$SOURCE_SHA" ]] || {
+            printf '%s\n' "dispatch commit does not match source_sha" >&2
+            exit 1
+          }
+          [[ "$WORKFLOW_SHA" == "$SOURCE_SHA" ]] || {
+            printf '%s\n' "workflow definition does not match source_sha" >&2
+            exit 1
+          }
+          remote_main="$(git ls-remote https://github.com/Trac-Systems/openmayhem.git refs/heads/main | awk '{print $1}')"
+          [[ "$remote_main" == "$SOURCE_SHA" ]] || {
+            printf '%s\n' "canonical origin/main does not match source_sha" >&2
+            exit 1
+          }
+          printf 'source_sha=%s\n' "$SOURCE_SHA" >>"$GITHUB_OUTPUT"
+
+  native-build:
+    name: Build ${{ matrix.target }}
+    needs: verify-source
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            executable_suffix: ''
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            executable_suffix: ''
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            executable_suffix: ''
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            executable_suffix: ''
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            executable_suffix: .exe
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            executable_suffix: .exe
+
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ needs.verify-source.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Assert clean source
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.verify-source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse --verify HEAD)" == "$SOURCE_SHA" ]] || {
+            printf '%s\n' "checked-out HEAD does not match source_sha" >&2
+            exit 1
+          }
+          status="$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
+          [[ -z "$status" ]] || {
+            printf '%s\n' "checked-out source tree is not clean" >&2
+            exit 1
+          }
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.22.0
+
+      - name: Install native Rust toolchain
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install "1.89.0-$TARGET" --profile minimal
+          rustup default "1.89.0-$TARGET"
+
+      - name: Install Linux build prerequisites
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            libssl-dev \
+            ninja-build \
+            pkg-config
+
+      - name: Configure native Visual Studio tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          switch ($env:TARGET) {
+            "aarch64-pc-windows-msvc" {
+              $vsComponent = "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
+              $vsArch = "arm64"
+              $cargoLinkerVariable = "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER"
+            }
+            "x86_64-pc-windows-msvc" {
+              $vsComponent = "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+              $vsArch = "x64"
+              $cargoLinkerVariable = "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"
+            }
+            default { throw "unsupported native Windows target: $env:TARGET" }
+          }
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $installationPath = & $vswhere -latest -products * -requires $vsComponent -property installationPath
+          if ([string]::IsNullOrWhiteSpace($installationPath)) {
+            throw "Visual Studio native C++ tools are unavailable for $env:TARGET"
+          }
+          $devCmd = Join-Path $installationPath "Common7\Tools\VsDevCmd.bat"
+          $environment = & $env:ComSpec /d /s /c "call `"$devCmd`" -no_logo -arch=$vsArch -host_arch=$vsArch >nul && set"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Visual Studio native environment setup failed for $env:TARGET"
+          }
+          $pathLine = $environment | Where-Object { $_ -match "^Path=" } | Select-Object -First 1
+          $toolDirectory = $pathLine.Substring($pathLine.IndexOf("=") + 1).Split(";")[0]
+          $linker = Join-Path $toolDirectory "link.exe"
+          if (-not (Test-Path -LiteralPath $linker -PathType Leaf)) {
+            throw "Visual Studio native linker is unavailable for $env:TARGET"
+          }
+          foreach ($line in $environment) {
+            if ($line -match "^[^=]+=") {
+              Add-Content -LiteralPath $env:GITHUB_ENV -Value $line -Encoding utf8
+            }
+          }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "$cargoLinkerVariable=$linker" -Encoding utf8
+
+          if ($env:TARGET -eq "aarch64-pc-windows-msvc") {
+            $clang = Join-Path $installationPath "VC\Tools\Llvm\ARM64\bin\clang-cl.exe"
+            if (-not (Test-Path -LiteralPath $clang -PathType Leaf)) {
+              throw "Visual Studio native ARM64 clang-cl is unavailable"
+            }
+            $clangCmake = $clang.Replace("\", "/")
+            foreach ($value in @(
+              "CMAKE_GENERATOR=Ninja",
+              "CMAKE_C_COMPILER=$clangCmake",
+              "CMAKE_CXX_COMPILER=$clangCmake",
+              "CMAKE_CXX_FLAGS=-EHsc",
+              "CXXFLAGS_aarch64_pc_windows_msvc=-EHsc"
+            )) {
+              Add-Content -LiteralPath $env:GITHUB_ENV -Value $value -Encoding utf8
+            }
+          }
+
+      - name: Assert native runner identity
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rust_host="$(rustc -vV | sed -n 's/^host: //p')"
+          [[ "$rust_host" == "$TARGET" ]] || {
+            printf '%s\n' "Rust host does not match the expected native target" >&2
+            exit 1
+          }
+          case "$TARGET" in
+            aarch64-apple-darwin)
+              [[ "$RUNNER_OS/$RUNNER_ARCH/$(uname -m)" == "macOS/ARM64/arm64" ]]
+              ;;
+            x86_64-apple-darwin)
+              [[ "$RUNNER_OS/$RUNNER_ARCH/$(uname -m)" == "macOS/X64/x86_64" ]]
+              [[ "$(sysctl -n sysctl.proc_translated 2>/dev/null || printf '0')" == "0" ]]
+              ;;
+            aarch64-unknown-linux-gnu)
+              [[ "$RUNNER_OS/$RUNNER_ARCH/$(uname -m)" == "Linux/ARM64/aarch64" ]]
+              ;;
+            x86_64-unknown-linux-gnu)
+              [[ "$RUNNER_OS/$RUNNER_ARCH/$(uname -m)" == "Linux/X64/x86_64" ]]
+              ;;
+            aarch64-pc-windows-msvc)
+              [[ "$RUNNER_OS/$RUNNER_ARCH" == "Windows/ARM64" ]]
+              [[ "${VSCMD_ARG_HOST_ARCH,,}/${VSCMD_ARG_TGT_ARCH,,}" == "arm64/arm64" ]]
+              [[ -n "${CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER:-}" ]]
+              [[ "${CMAKE_GENERATOR:-}" == "Ninja" ]]
+              "$CMAKE_C_COMPILER" --version | grep -Fq "Target: aarch64-pc-windows-msvc"
+              ;;
+            x86_64-pc-windows-msvc)
+              [[ "$RUNNER_OS/$RUNNER_ARCH" == "Windows/X64" ]]
+              [[ "${VSCMD_ARG_HOST_ARCH,,}/${VSCMD_ARG_TGT_ARCH,,}" == "x64/x64" ]]
+              [[ -n "${CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER:-}" ]]
+              ;;
+            *)
+              printf '%s\n' "unsupported native target" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Verify release and contract identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import path from 'node:path';
+          import { verifyStartupReleaseIdentity } from './intercom/src/release-identity.js';
+
+          const identity = verifyStartupReleaseIdentity({ rootDir: path.resolve('intercom') });
+          if (identity.releaseVersion !== '0.2.32' || identity.contractVersion !== 14) {
+            throw new Error(`unexpected release identity: ${JSON.stringify(identity)}`);
+          }
+          NODE
+
+      - name: Build locked native release
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          args=(build --release --workspace --bins --locked --target "$TARGET")
+          if [[ "$TARGET" == *-apple-darwin ]]; then
+            args+=(--features mayhem-cli/llama-cpp-metal)
+          fi
+          cargo "${args[@]}"
+
+      - name: Verify native outputs and record evidence
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXE: ${{ matrix.executable_suffix }}
+          SOURCE_SHA: ${{ needs.verify-source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          release_dir="target/$TARGET/release"
+          bins=(mayhem mayhem-gateway mayhem-attestation-verifier mayhem-pay mayhemd mayhem-enclave mayhem-paygate)
+          {
+            printf '## `%s`\n\n' "$TARGET"
+            printf -- '- Source: `%s`\n' "$SOURCE_SHA"
+            printf -- '- Rust host: `%s`\n' "$(rustc -vV | sed -n 's/^host: //p')"
+            printf -- '- Runner: `%s/%s`\n\n' "$RUNNER_OS" "$RUNNER_ARCH"
+            printf '| Binary | SHA-256 |\n|---|---|\n'
+            for bin in "${bins[@]}"; do
+              file="$release_dir/$bin$EXE"
+              [[ -f "$file" && ! -L "$file" && -s "$file" ]] || {
+                printf 'missing native release binary: %s\n' "$file" >&2
+                exit 1
+              }
+              digest="$(sha256sum "$file" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$file" | awk '{print $1}')"
+              printf '| `%s` | `%s` |\n' "$bin$EXE" "$digest"
+            done
+          } >>"$GITHUB_STEP_SUMMARY"
+
+          version="$($release_dir/mayhem$EXE --version | tr -d '\r')"
+          [[ "$version" == "mayhem 0.2.32" ]] || {
+            printf 'unexpected mayhem version: %s\n' "$version" >&2
+            exit 1
+          }
+          git diff --exit-code -- .
+          status="$(git status --porcelain=v1 --untracked-files=all --ignore-submodules=none)"
+          [[ -z "$status" ]] || {
+            printf '%s\n' "native build modified the source tree" >&2
+            exit 1
+          }

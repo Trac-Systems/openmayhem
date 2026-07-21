@@ -194,7 +194,13 @@ async function setupLedgerContract(identities = null) {
     {
       op: 'set_payments',
       ver: 1,
-      fiat: { processor: 'stripe', currencies: ['usd', 'eur'], locale: 'en' },
+      fiat: {
+        processor: 'stripe',
+        integration_currency: 'usd',
+        adaptive_pricing: true,
+        payout_currencies: ['eur', 'gbp', 'usd'],
+        locale: 'en',
+      },
       tap: {
         chain_id: 61_000,
         token_address: `0x${'1'.repeat(40)}`,

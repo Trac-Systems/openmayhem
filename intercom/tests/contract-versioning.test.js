@@ -29,7 +29,7 @@ const versioningLockedRateMap = [
 const versioningBillingId = 'bb'.repeat(32);
 
 test('launch version gates cover A16/A17/D6/D7/M5/M6/M8 deterministic changes', () => {
-  assert.equal(CONTRACT_VERSION, 13);
+  assert.equal(CONTRACT_VERSION, 14);
   assert.deepEqual(signingMessageVersions(), [2]);
   assert.equal(SESSION_RECEIPT_SCHEMA_VERSION, 9);
 });

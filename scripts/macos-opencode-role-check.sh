@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VERSION="${MAYHEM_MACOS_OPENCODE_VERSION:-0.2.31}"
+VERSION="${MAYHEM_MACOS_OPENCODE_VERSION:-0.2.32}"
 DIST_REL="${MAYHEM_MACOS_OPENCODE_DIST_REL:-dist/macos-opencode-role-check}"
 DIST_DIR="${MAYHEM_MACOS_OPENCODE_DIST_DIR:-$ROOT_DIR/$DIST_REL}"
 SKIP_BUILD="${MAYHEM_MACOS_OPENCODE_SKIP_BUILD:-0}"
@@ -33,7 +33,7 @@ provider/user reference-machine acceptance gate.
 
 Environment:
   MAYHEM_MACOS_OPENCODE_VERSION       Artifact version string
-                                      (default: 0.2.31; canonical semver is required)
+                                      (default: 0.2.32; canonical semver is required)
   MAYHEM_MACOS_OPENCODE_DIST_DIR      Dist output directory
                                       (default: dist/macos-opencode-role-check)
   MAYHEM_MACOS_OPENCODE_SKIP_BUILD    Use existing target/release binaries when set to 1

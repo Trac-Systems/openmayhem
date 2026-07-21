@@ -41,6 +41,7 @@ pub const CREDIT_DENOM: &str = "au_usd";
 pub const DEFAULT_BIND: &str = "127.0.0.1:11436";
 pub const DEFAULT_CONTRACT_RPC_URL: &str = "http://127.0.0.1:49223/v1";
 pub const DEFAULT_STRIPE_API_BASE_URL: &str = "https://api.stripe.com";
+pub const STRIPE_API_VERSION: &str = "2025-03-31.basil";
 pub const DEFAULT_STRIPE_WEBHOOK_TOLERANCE_SECONDS: u64 = 300;
 pub const DEFAULT_STRIPE_BACKFILL_INTERVAL_SECONDS: u64 = 300;
 pub const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
@@ -55,7 +56,12 @@ pub const AU_PER_USD_CENT: MoneyAu = 10_000_000_000_000_000;
 pub const STRIPE_MIN_USD_CENTS: u64 = 50;
 pub const DEFAULT_STRIPE_CURRENCY: &str = "usd";
 pub const DEFAULT_STRIPE_LOCALE: &str = "en";
-const HANDLED_STRIPE_EVENT_TYPES: &[&str] = &["payment_intent.succeeded", "charge.dispute.created"];
+const STRIPE_CONNECT_ADOPT_CONTEXT: &str = "mayhem-stripe-connect-adopt-v1";
+const HANDLED_STRIPE_EVENT_TYPES: &[&str] = &[
+    "payment_intent.succeeded",
+    "charge.dispute.created",
+    "account.application.deauthorized",
+];
 
 type HmacSha256 = Hmac<Sha256>;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -374,6 +380,13 @@ pub struct StripeCheckoutSessionSummary {
     pub payment_status: Option<String>,
     pub status: Option<String>,
     pub expires_at: Option<u64>,
+    pub presentment_details: Option<StripePresentmentSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StripePresentmentSummary {
+    pub amount: u64,
+    pub currency: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -416,7 +429,17 @@ pub struct StripeConnectRelinkRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StripeConnectRelinkReturnQuery {
+pub struct StripeConnectAdoptRequest {
+    pub provider: String,
+    pub country: String,
+    pub request_nonce: String,
+    pub consent_expires_at: u64,
+    pub target_service_signature: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StripeConnectOAuthReturnQuery {
     state: String,
     #[serde(default)]
     code: Option<String>,
@@ -481,6 +504,19 @@ pub struct StripeConnectRelinkResponse {
     pub copy_paste: Option<StripeConnectCopyPaste>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct StripeConnectAdoptResponse {
+    pub ok: bool,
+    pub rail: &'static str,
+    pub processor_rail: &'static str,
+    pub provider: String,
+    pub mode: &'static str,
+    pub status: &'static str,
+    pub account: Option<StripeConnectAccountSummary>,
+    pub onboarding: Option<StripeConnectOnboardingSummary>,
+    pub copy_paste: Option<StripeConnectCopyPaste>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct FiatDepositFeature {
     pub op: &'static str,
@@ -524,6 +560,8 @@ struct StripeEventEnvelope {
     event_type: String,
     #[serde(default)]
     created: Option<u64>,
+    #[serde(default)]
+    account: Option<String>,
     data: StripeEventData,
 }
 
@@ -611,6 +649,10 @@ struct StripeEventRecord {
     currency: Option<String>,
     #[serde(default)]
     amount_minor: Option<u64>,
+    #[serde(default)]
+    presentment_currency: Option<String>,
+    #[serde(default)]
+    presentment_amount_minor: Option<u64>,
     ext_ref_hash: String,
     #[serde(default)]
     dispute_ref_hash: Option<String>,
@@ -626,7 +668,15 @@ struct StripeEventStore {
     processing: HashSet<String>,
     deposits_by_payment_intent: HashMap<String, StripeEventRecord>,
     deposits_by_charge: HashMap<String, StripeEventRecord>,
+    chargebacks_by_deposit: HashMap<String, StripeChargebackTotals>,
+    processing_chargeback_sources: HashMap<String, String>,
     path: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StripeChargebackTotals {
+    amount_minor: u64,
+    au: MoneyAu,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -642,6 +692,16 @@ struct StripeConnectAccountRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     previous_account_id: Option<String>,
     created_at: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct StripeConnectDeauthorizationRecord {
+    schema_version: u32,
+    mode: StripeMode,
+    account_id: String,
+    event_id: String,
+    deauthorized_at: u64,
+    deauthorized: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -667,9 +727,9 @@ struct StripeConnectConsentRecord {
 #[derive(Clone, Debug)]
 struct VerifiedStripeConnectAccount {
     summary: StripeConnectAccountSummary,
-    owner_provider: String,
+    owner_provider: Option<String>,
     livemode: Option<bool>,
-    metadata_mode: StripeMode,
+    metadata_mode: Option<StripeMode>,
 }
 
 #[derive(Debug)]
@@ -678,6 +738,8 @@ struct StripeConnectStore {
     bindings: HashMap<String, StripeConnectAccountRecord>,
     requests: HashMap<String, StripeConnectAccountRecord>,
     path: Option<PathBuf>,
+    deauthorizations: HashMap<String, StripeConnectDeauthorizationRecord>,
+    deauthorizations_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -1737,6 +1799,11 @@ pub fn paygate_router(state: PaygateState) -> Router {
             "/v1/stripe/connect/relink",
             post(create_stripe_connect_relink),
         )
+        .route("/stripe/connect/adopt", post(create_stripe_connect_adopt))
+        .route(
+            "/v1/stripe/connect/adopt",
+            post(create_stripe_connect_adopt),
+        )
         .route_layer(middleware::from_fn({
             let state = state.clone();
             move |request: Request, next: Next| {
@@ -1755,6 +1822,14 @@ pub fn paygate_router(state: PaygateState) -> Router {
         .route(
             "/v1/stripe/connect/relink/return",
             get(stripe_connect_relink_return),
+        )
+        .route(
+            "/stripe/connect/adopt/return",
+            get(stripe_connect_adopt_return),
+        )
+        .route(
+            "/v1/stripe/connect/adopt/return",
+            get(stripe_connect_adopt_return),
         )
         .route("/stripe/return", get(stripe_return))
         .route("/v1/stripe/return", get(stripe_return))
@@ -1830,11 +1905,34 @@ async fn create_stripe_connect_relink(
     }
 }
 
+async fn create_stripe_connect_adopt(
+    State(state): State<Arc<PaygateState>>,
+    Json(request): Json<StripeConnectAdoptRequest>,
+) -> Response {
+    match create_connect_adopt(&state, request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
 async fn stripe_connect_relink_return(
     State(state): State<Arc<PaygateState>>,
-    Query(query): Query<StripeConnectRelinkReturnQuery>,
+    Query(query): Query<StripeConnectOAuthReturnQuery>,
 ) -> Response {
-    match complete_connect_relink(&state, query).await {
+    match complete_connect_oauth(&state, query).await {
+        Ok(()) => Html(
+            "Stripe account consent verified. Return to the Mayhem CLI while payout activation completes.",
+        )
+        .into_response(),
+        Err(err) => ApiError::from(err).into_response(),
+    }
+}
+
+async fn stripe_connect_adopt_return(
+    State(state): State<Arc<PaygateState>>,
+    Query(query): Query<StripeConnectOAuthReturnQuery>,
+) -> Response {
+    match complete_connect_oauth(&state, query).await {
         Ok(()) => Html(
             "Stripe account consent verified. Return to the Mayhem CLI while payout activation completes.",
         )
@@ -1873,8 +1971,8 @@ async fn create_payment_intent(
         ));
     }
     validate_safe_key_part("who", &request.who)?;
-    let currency = normalize_stripe_currency(request.currency.as_deref())?;
-    let amount_cents = au_to_stripe_minor(request.au, &currency)?;
+    let currency = normalize_stripe_integration_currency(request.currency.as_deref())?;
+    let amount_cents = au_to_stripe_usd_minor(request.au)?;
     let secret_key = stripe
         .secret_key
         .as_deref()
@@ -1911,9 +2009,9 @@ async fn create_checkout_session(
     validate_safe_key_part("who", &request.who)?;
     validate_checkout_url("success_url", &request.success_url)?;
     validate_checkout_url("cancel_url", &request.cancel_url)?;
-    let currency = normalize_stripe_currency(request.currency.as_deref())?;
+    let currency = normalize_stripe_integration_currency(request.currency.as_deref())?;
     let _locale = normalize_stripe_locale(request.locale.as_deref())?;
-    let amount_cents = au_to_stripe_minor(request.au, &currency)?;
+    let amount_cents = au_to_stripe_usd_minor(request.au)?;
     let secret_key = stripe
         .secret_key
         .as_deref()
@@ -1929,6 +2027,11 @@ async fn create_checkout_session(
     {
         return Err(PaygateError::Stripe(
             "Checkout Session response currency did not match request".to_owned(),
+        ));
+    }
+    if session.amount_total != Some(amount_cents) {
+        return Err(PaygateError::Stripe(
+            "Checkout Session response amount did not match canonical au_usd".to_owned(),
         ));
     }
     let copy_paste = checkout_copy_paste(&session.url);
@@ -2112,17 +2215,31 @@ async fn read_connect_status(
         .secret_key
         .as_deref()
         .ok_or_else(|| PaygateError::InvalidConfig("stripe.secret_key missing".to_owned()))?;
-    let record = state
-        .stripe_connect
-        .lock()
-        .await
-        .get(stripe.mode, &request.provider)
-        .cloned()
-        .ok_or_else(|| {
-            PaygateError::InvalidRequest(
-                "provider has not started Stripe Connect onboarding".to_owned(),
-            )
-        })?;
+    let (record, deauthorized) = {
+        let store = state.stripe_connect.lock().await;
+        let record = store
+            .get(stripe.mode, &request.provider)
+            .cloned()
+            .ok_or_else(|| {
+                PaygateError::InvalidRequest(
+                    "provider has not started Stripe Connect onboarding".to_owned(),
+                )
+            })?;
+        let deauthorized = store.is_deauthorized(stripe.mode, &record.account_id);
+        (record, deauthorized)
+    };
+    if deauthorized {
+        return Ok(StripeConnectResponse {
+            ok: true,
+            rail: "fiat",
+            processor_rail: "stripe",
+            provider: request.provider,
+            mode: stripe.mode.as_str(),
+            account: deauthorized_connect_account_summary(&record),
+            onboarding: None,
+            copy_paste: None,
+        });
+    }
     let account = retrieve_bound_connect_account(state, stripe, secret_key, &record).await?;
     Ok(StripeConnectResponse {
         ok: true,
@@ -2142,27 +2259,56 @@ async fn retrieve_bound_connect_account(
     secret_key: &str,
     record: &StripeConnectAccountRecord,
 ) -> Result<StripeConnectAccountSummary> {
+    if state
+        .stripe_connect
+        .lock()
+        .await
+        .is_deauthorized(stripe.mode, &record.account_id)
+    {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe Connect account was deauthorized".to_owned(),
+        ));
+    }
     let account =
         stripe_retrieve_connect_account(&state.http, stripe, secret_key, &record.account_id)
             .await?;
     verify_connect_account_record(&account, stripe, record)?;
-    let owner_record = state
+    let bound_record = state
         .stripe_connect
         .lock()
         .await
-        .get_bound(stripe.mode, &account.owner_provider, &record.account_id)
+        .get_bound(stripe.mode, &record.provider, &record.account_id)
         .cloned()
         .ok_or_else(|| {
             PaygateError::InvalidConfig(
-                "Stripe account owner provider is not bound in the Connect store".to_owned(),
+                "Stripe account provider is not bound in the Connect store".to_owned(),
             )
         })?;
-    if owner_record.account_id != record.account_id {
+    if &bound_record != record {
         return Err(PaygateError::InvalidConfig(
-            "Stripe account owner provider is bound to a different account".to_owned(),
+            "Stripe account provider binding is inconsistent".to_owned(),
         ));
     }
     Ok(account.summary)
+}
+
+fn deauthorized_connect_account_summary(
+    record: &StripeConnectAccountRecord,
+) -> StripeConnectAccountSummary {
+    StripeConnectAccountSummary {
+        id: record.account_id.clone(),
+        account_type: record.account_type.as_str().to_owned(),
+        country: record.country.clone(),
+        default_currency: String::new(),
+        details_submitted: false,
+        charges_enabled: false,
+        payouts_enabled: false,
+        transfers_enabled: false,
+        ready: false,
+        currently_due: Vec::new(),
+        eventually_due: Vec::new(),
+        disabled_reason: Some("platform.application_deauthorized".to_owned()),
+    }
 }
 
 async fn create_connect_relink(
@@ -2365,7 +2511,7 @@ async fn create_connect_relink(
                     .to_owned(),
             )
         })?;
-    let url = stripe_connect_relink_authorize_url(client_id, redirect_url, &challenge.state)?;
+    let url = stripe_connect_authorize_url(client_id, redirect_url, &challenge.state)?;
     let onboarding = StripeConnectOnboardingSummary {
         url,
         expires_at: challenge.expires_at,
@@ -2387,9 +2533,321 @@ async fn create_connect_relink(
     })
 }
 
+async fn create_connect_adopt(
+    state: &PaygateState,
+    request: StripeConnectAdoptRequest,
+) -> Result<StripeConnectAdoptResponse> {
+    let stripe = require_stripe(state)?;
+    validate_provider_id(&request.provider)?;
+    validate_connect_request_nonce(&request.request_nonce)?;
+    validate_target_service_signature(&request.target_service_signature)?;
+    let country = normalize_stripe_country(&request.country)?;
+    let now = unix_epoch_seconds()?;
+    let latest_expiry = now
+        .checked_add(stripe.connect_consent_ttl_seconds)
+        .ok_or_else(|| PaygateError::Crypto("Stripe consent expiry overflow".to_owned()))?;
+    if request.consent_expires_at <= now || request.consent_expires_at > latest_expiry {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe adoption consent is stale or exceeds its bounded lifetime".to_owned(),
+        ));
+    }
+    let secret_key = stripe
+        .secret_key
+        .as_deref()
+        .ok_or_else(|| PaygateError::InvalidConfig("stripe.secret_key missing".to_owned()))?;
+
+    let existing = {
+        let store = state.stripe_connect.lock().await;
+        store
+            .get(stripe.mode, &request.provider)
+            .cloned()
+            .map(|record| {
+                let deauthorized = store.is_deauthorized(stripe.mode, &record.account_id);
+                (record, deauthorized)
+            })
+    };
+    if let Some((existing, deauthorized)) = existing {
+        if existing.account_type != StripeConnectAccountType::Standard {
+            return Err(PaygateError::InvalidRequest(
+                "provider already has a non-Standard Stripe Connect account".to_owned(),
+            ));
+        }
+        if existing.country != country {
+            return Err(PaygateError::InvalidRequest(format!(
+                "provider Stripe Connect account is registered in {}",
+                existing.country
+            )));
+        }
+        if !deauthorized {
+            let account =
+                retrieve_bound_connect_account(state, stripe, secret_key, &existing).await?;
+            return Ok(StripeConnectAdoptResponse {
+                ok: true,
+                rail: "fiat",
+                processor_rail: "stripe",
+                provider: request.provider,
+                mode: stripe.mode.as_str(),
+                status: "linked",
+                account: Some(account),
+                onboarding: None,
+                copy_paste: None,
+            });
+        }
+    }
+
+    let client_id = stripe.connect_oauth_client_id.as_deref().ok_or_else(|| {
+        PaygateError::InvalidConfig(
+            "stripe.connect_oauth_client_id is required for Standard account adoption".to_owned(),
+        )
+    })?;
+    let redirect_url = stripe
+        .connect_oauth_redirect_url
+        .as_deref()
+        .ok_or_else(|| {
+            PaygateError::InvalidConfig(
+                "stripe.connect_oauth_redirect_url is required for Standard account adoption"
+                    .to_owned(),
+            )
+        })?;
+    let challenge = StripeConnectConsentRecord {
+        schema_version: 1,
+        mode: stripe.mode,
+        provider: request.provider.clone(),
+        source_provider: request.provider.clone(),
+        account_id: String::new(),
+        account_type: StripeConnectAccountType::Standard,
+        context_revision: STRIPE_CONNECT_ADOPT_CONTEXT.to_owned(),
+        country,
+        request_nonce: request.request_nonce,
+        source_consent_signature: String::new(),
+        target_service_signature: request.target_service_signature,
+        state: random_connect_oauth_state()?,
+        created_at: now,
+        expires_at: request.consent_expires_at,
+        completed_at: None,
+    };
+    let challenge = state
+        .stripe_connect_consents
+        .lock()
+        .await
+        .insert_pending(challenge)?;
+    let url = stripe_connect_authorize_url(client_id, redirect_url, &challenge.state)?;
+    let onboarding = StripeConnectOnboardingSummary {
+        url,
+        expires_at: challenge.expires_at,
+    };
+    let copy_paste = StripeConnectCopyPaste {
+        onboarding_url: onboarding.url.clone(),
+    };
+    Ok(StripeConnectAdoptResponse {
+        ok: true,
+        rail: "fiat",
+        processor_rail: "stripe",
+        provider: request.provider,
+        mode: stripe.mode.as_str(),
+        status: "consent_required",
+        account: None,
+        onboarding: Some(onboarding),
+        copy_paste: Some(copy_paste),
+    })
+}
+
+fn is_connect_adopt_challenge(challenge: &StripeConnectConsentRecord) -> bool {
+    challenge.source_provider == challenge.provider
+        && challenge.account_id.is_empty()
+        && challenge.account_type == StripeConnectAccountType::Standard
+        && challenge.context_revision == STRIPE_CONNECT_ADOPT_CONTEXT
+        && challenge.source_consent_signature.is_empty()
+}
+
+async fn complete_connect_oauth(
+    state: &PaygateState,
+    query: StripeConnectOAuthReturnQuery,
+) -> Result<()> {
+    validate_connect_oauth_state(&query.state)?;
+    let challenge = state
+        .stripe_connect_consents
+        .lock()
+        .await
+        .get(&query.state)?;
+    if is_connect_adopt_challenge(&challenge) {
+        complete_connect_adopt(state, query).await
+    } else {
+        complete_connect_relink(state, query).await
+    }
+}
+
+async fn complete_connect_adopt(
+    state: &PaygateState,
+    query: StripeConnectOAuthReturnQuery,
+) -> Result<()> {
+    validate_connect_oauth_state(&query.state)?;
+    let challenge = {
+        let mut store = state.stripe_connect_consents.lock().await;
+        match store.begin(&query.state)? {
+            StripeConnectConsentBegin::Completed => return Ok(()),
+            StripeConnectConsentBegin::Started(challenge) => challenge,
+        }
+    };
+    if !is_connect_adopt_challenge(&challenge) {
+        state
+            .stripe_connect_consents
+            .lock()
+            .await
+            .fail(&query.state);
+        return Err(PaygateError::InvalidRequest(
+            "Stripe OAuth state is not an account-adoption challenge".to_owned(),
+        ));
+    }
+    let result = complete_connect_adopt_started(state, &query, &challenge).await;
+    let mut store = state.stripe_connect_consents.lock().await;
+    match result {
+        Ok(()) => store.complete(&query.state, unix_epoch_seconds()?),
+        Err(err) => {
+            store.fail(&query.state);
+            Err(err)
+        }
+    }
+}
+
+async fn complete_connect_adopt_started(
+    state: &PaygateState,
+    query: &StripeConnectOAuthReturnQuery,
+    challenge: &StripeConnectConsentRecord,
+) -> Result<()> {
+    let stripe = require_stripe(state)?;
+    if challenge.mode != stripe.mode {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe adoption mode does not match the active paygate mode".to_owned(),
+        ));
+    }
+    if challenge.expires_at < unix_epoch_seconds()? {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe adoption consent challenge has expired".to_owned(),
+        ));
+    }
+    if query.error.is_some() {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe account holder denied adoption consent".to_owned(),
+        ));
+    }
+    if query.scope.as_deref() != Some("read_write") {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe adoption consent did not grant read_write scope".to_owned(),
+        ));
+    }
+
+    let existing = {
+        let store = state.stripe_connect.lock().await;
+        store
+            .get(stripe.mode, &challenge.provider)
+            .cloned()
+            .map(|record| {
+                let deauthorized = store.is_deauthorized(stripe.mode, &record.account_id);
+                (record, deauthorized)
+            })
+    };
+    let reauthorizing = match existing {
+        Some((existing, false))
+            if existing.request_nonce.as_deref() == Some(&challenge.request_nonce)
+                && existing.account_type == StripeConnectAccountType::Standard
+                && existing.country == challenge.country =>
+        {
+            return Ok(())
+        }
+        Some((existing, true))
+            if existing.account_type == StripeConnectAccountType::Standard
+                && existing.country == challenge.country =>
+        {
+            Some(existing)
+        }
+        Some(_) => {
+            return Err(PaygateError::InvalidRequest(
+                "provider acquired a different Stripe account during adoption".to_owned(),
+            ))
+        }
+        None => None,
+    };
+
+    let code = query.code.as_deref().ok_or_else(|| {
+        PaygateError::InvalidRequest("Stripe adoption callback is missing an OAuth code".to_owned())
+    })?;
+    validate_connect_oauth_code(code)?;
+    let secret_key = stripe
+        .secret_key
+        .as_deref()
+        .ok_or_else(|| PaygateError::InvalidConfig("stripe.secret_key missing".to_owned()))?;
+    let oauth = stripe_exchange_connect_oauth_code(&state.http, stripe, secret_key, code).await?;
+    let stripe_user_id = json_string_field(&oauth, "stripe_user_id")?;
+    validate_stripe_account_id(&stripe_user_id)?;
+    let livemode = oauth
+        .get("livemode")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| PaygateError::Stripe("OAuth response missing livemode".to_owned()))?;
+    if livemode != (stripe.mode == StripeMode::Live) {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe OAuth consent mode does not match the active paygate mode".to_owned(),
+        ));
+    }
+    if oauth.get("scope").and_then(Value::as_str) != Some("read_write") {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe OAuth token did not grant read_write scope".to_owned(),
+        ));
+    }
+
+    let account =
+        stripe_retrieve_connect_account(&state.http, stripe, secret_key, &stripe_user_id).await?;
+    if account.summary.id != stripe_user_id {
+        return Err(PaygateError::Stripe(
+            "retrieved Stripe account id did not match OAuth response".to_owned(),
+        ));
+    }
+    if account.summary.account_type != StripeConnectAccountType::Standard.as_str() {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe account adoption requires a Standard account".to_owned(),
+        ));
+    }
+    if account.summary.country != challenge.country {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe account country did not match adoption consent".to_owned(),
+        ));
+    }
+    verify_connect_account_mode(&account, stripe)?;
+    if !account.summary.ready {
+        return Err(PaygateError::InvalidRequest(
+            "Stripe account is not ready to receive transfers".to_owned(),
+        ));
+    }
+    if let Some(existing) = reauthorizing {
+        if existing.account_id != stripe_user_id {
+            return Err(PaygateError::InvalidRequest(
+                "Stripe reauthorization selected a different connected account".to_owned(),
+            ));
+        }
+        return state.stripe_connect.lock().await.clear_deauthorized(
+            stripe.mode,
+            &stripe_user_id,
+            &challenge.state,
+            unix_epoch_seconds()?,
+        );
+    }
+    let record = StripeConnectAccountRecord {
+        schema_version: 1,
+        mode: challenge.mode,
+        provider: challenge.provider.clone(),
+        account_id: stripe_user_id,
+        account_type: StripeConnectAccountType::Standard,
+        country: challenge.country.clone(),
+        request_nonce: Some(challenge.request_nonce.clone()),
+        previous_account_id: None,
+        created_at: unix_epoch_seconds()?,
+    };
+    state.stripe_connect.lock().await.insert_created(record)
+}
+
 async fn complete_connect_relink(
     state: &PaygateState,
-    query: StripeConnectRelinkReturnQuery,
+    query: StripeConnectOAuthReturnQuery,
 ) -> Result<()> {
     validate_connect_oauth_state(&query.state)?;
     let challenge = {
@@ -2412,7 +2870,7 @@ async fn complete_connect_relink(
 
 async fn complete_connect_relink_started(
     state: &PaygateState,
-    query: &StripeConnectRelinkReturnQuery,
+    query: &StripeConnectOAuthReturnQuery,
     challenge: &StripeConnectConsentRecord,
 ) -> Result<()> {
     let stripe = require_stripe(state)?;
@@ -2587,6 +3045,7 @@ async fn stripe_create_connect_account(
             stripe.api_base_url.trim_end_matches('/')
         ))
         .basic_auth(secret_key, Some(""))
+        .header("Stripe-Version", STRIPE_API_VERSION)
         .header(
             "Idempotency-Key",
             stripe_connect_idempotency_key(
@@ -2617,6 +3076,7 @@ async fn stripe_retrieve_connect_account(
             stripe.api_base_url.trim_end_matches('/')
         ))
         .basic_auth(secret_key, Some(""))
+        .header("Stripe-Version", STRIPE_API_VERSION)
         .send()
         .await?;
     let value = stripe_json_response(response, "retrieving connected account").await?;
@@ -2645,6 +3105,7 @@ async fn stripe_create_connect_account_link(
             stripe.api_base_url.trim_end_matches('/')
         ))
         .basic_auth(secret_key, Some(""))
+        .header("Stripe-Version", STRIPE_API_VERSION)
         .header(
             "Idempotency-Key",
             stripe_connect_link_idempotency_key(stripe.mode, provider, request_nonce),
@@ -2674,13 +3135,14 @@ async fn stripe_exchange_connect_oauth_code(
     let response = http
         .post(&stripe.connect_oauth_token_url)
         .basic_auth(secret_key, Some(""))
+        .header("Stripe-Version", STRIPE_API_VERSION)
         .form(&form)
         .send()
         .await?;
     stripe_json_response(response, "exchanging connected-account OAuth consent").await
 }
 
-fn stripe_connect_relink_authorize_url(
+fn stripe_connect_authorize_url(
     client_id: &str,
     redirect_url: &str,
     state: &str,
@@ -2799,8 +3261,10 @@ fn stripe_connect_account_summary(value: Value) -> Result<VerifiedStripeConnectA
         ));
     }
     let country = normalize_stripe_country(&json_string_field(&value, "country")?)?;
-    let default_currency =
-        normalize_stripe_currency(Some(&json_string_field(&value, "default_currency")?))?;
+    let default_currency = normalize_stripe_connected_account_currency(&json_string_field(
+        &value,
+        "default_currency",
+    )?)?;
     let details_submitted = value
         .get("details_submitted")
         .and_then(Value::as_bool)
@@ -2826,24 +3290,22 @@ fn stripe_connect_account_summary(value: Value) -> Result<VerifiedStripeConnectA
     let owner_provider = value
         .pointer("/metadata/mayhem_provider")
         .and_then(Value::as_str)
-        .ok_or_else(|| {
+        .map(str::to_ascii_lowercase);
+    if let Some(owner_provider) = owner_provider.as_deref() {
+        validate_provider_id(owner_provider).map_err(|_| {
             PaygateError::Stripe(
-                "connected account is missing Mayhem provider ownership metadata".to_owned(),
+                "connected account has invalid Mayhem provider ownership metadata".to_owned(),
             )
-        })?
-        .to_ascii_lowercase();
-    validate_provider_id(&owner_provider).map_err(|_| {
-        PaygateError::Stripe(
-            "connected account has invalid Mayhem provider ownership metadata".to_owned(),
-        )
-    })?;
+        })?;
+    }
     let livemode = value.get("livemode").and_then(Value::as_bool);
     let metadata_mode = match value
         .pointer("/metadata/mayhem_mode")
         .and_then(Value::as_str)
     {
-        Some("test") => StripeMode::Test,
-        Some("live") => StripeMode::Live,
+        Some("test") => Some(StripeMode::Test),
+        Some("live") => Some(StripeMode::Live),
+        None => None,
         _ => {
             return Err(PaygateError::Stripe(
                 "connected account has invalid Mayhem mode metadata".to_owned(),
@@ -2878,7 +3340,7 @@ fn verify_new_connect_account(
     account_type: StripeConnectAccountType,
     country: &str,
 ) -> Result<()> {
-    if account.owner_provider != provider {
+    if account.owner_provider.as_deref() != Some(provider) {
         return Err(PaygateError::Stripe(
             "created connected account ownership metadata did not match provider".to_owned(),
         ));
@@ -2931,7 +3393,10 @@ fn verify_connect_account_mode(
             "connected account mode did not match paygate mode".to_owned(),
         ));
     }
-    if account.metadata_mode != stripe.mode {
+    if account
+        .metadata_mode
+        .is_some_and(|metadata_mode| metadata_mode != stripe.mode)
+    {
         return Err(PaygateError::Stripe(
             "connected account Mayhem mode metadata did not match paygate mode".to_owned(),
         ));
@@ -3008,7 +3473,7 @@ async fn stripe_create_payment_intent(
     request: &StripeCreatePaymentIntentRequest,
     amount_cents: u64,
 ) -> Result<StripePaymentIntentSummary> {
-    let currency = normalize_stripe_currency(request.currency.as_deref())?;
+    let currency = normalize_stripe_integration_currency(request.currency.as_deref())?;
     let form = [
         ("amount".to_owned(), amount_cents.to_string()),
         ("currency".to_owned(), currency.clone()),
@@ -3031,6 +3496,7 @@ async fn stripe_create_payment_intent(
             stripe.api_base_url.trim_end_matches('/')
         ))
         .basic_auth(secret_key, Some(""))
+        .header("Stripe-Version", STRIPE_API_VERSION)
         .form(&form);
     if let Some(idempotency_key) = &request.idempotency_key {
         if !idempotency_key.is_empty() {
@@ -3057,10 +3523,11 @@ async fn stripe_create_checkout_session(
     request: &StripeCreateCheckoutSessionRequest,
     amount_cents: u64,
 ) -> Result<StripeCheckoutSessionSummary> {
-    let currency = normalize_stripe_currency(request.currency.as_deref())?;
+    let currency = normalize_stripe_integration_currency(request.currency.as_deref())?;
     let locale = normalize_stripe_locale(request.locale.as_deref())?;
     let form = [
         ("mode".to_owned(), "payment".to_owned()),
+        ("adaptive_pricing[enabled]".to_owned(), "true".to_owned()),
         ("success_url".to_owned(), request.success_url.to_owned()),
         ("cancel_url".to_owned(), request.cancel_url.to_owned()),
         ("locale".to_owned(), locale),
@@ -3120,6 +3587,7 @@ async fn stripe_create_checkout_session(
             stripe.api_base_url.trim_end_matches('/')
         ))
         .basic_auth(secret_key, Some(""))
+        .header("Stripe-Version", STRIPE_API_VERSION)
         .form(&form);
     if let Some(idempotency_key) = &request.idempotency_key {
         if !idempotency_key.is_empty() {
@@ -3180,6 +3648,7 @@ fn stripe_checkout_session_summary(value: Value) -> Result<StripeCheckoutSession
         .and_then(Value::as_str)
         .ok_or_else(|| PaygateError::Stripe("Checkout Session response missing url".to_owned()))?;
     validate_hosted_checkout_url("checkout_session.url", url, "checkout.stripe.com")?;
+    let presentment_details = stripe_presentment_summary(value.get("presentment_details"))?;
     Ok(StripeCheckoutSessionSummary {
         id: id.to_owned(),
         url: url.to_owned(),
@@ -3201,7 +3670,42 @@ fn stripe_checkout_session_summary(value: Value) -> Result<StripeCheckoutSession
             .and_then(Value::as_str)
             .map(str::to_owned),
         expires_at: value.get("expires_at").and_then(Value::as_u64),
+        presentment_details,
     })
+}
+
+fn stripe_presentment_summary(value: Option<&Value>) -> Result<Option<StripePresentmentSummary>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let amount = value
+        .get("presentment_amount")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            PaygateError::Stripe("Stripe presentment_details missing amount".to_owned())
+        })?;
+    if amount == 0 {
+        return Err(PaygateError::Stripe(
+            "Stripe presentment_details amount must be positive".to_owned(),
+        ));
+    }
+    let currency = value
+        .get("presentment_currency")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            PaygateError::Stripe("Stripe presentment_details missing currency".to_owned())
+        })?;
+    Ok(Some(StripePresentmentSummary {
+        amount,
+        currency: normalize_stripe_iso_currency("presentment currency", currency)?,
+    }))
+}
+
+fn payment_intent_presentment_summary(value: &Value) -> Result<Option<StripePresentmentSummary>> {
+    if let Some(summary) = stripe_presentment_summary(value.get("presentment_details"))? {
+        return Ok(Some(summary));
+    }
+    stripe_presentment_summary(value.pointer("/latest_charge/presentment_details"))
 }
 
 async fn handle_stripe_webhook(
@@ -3244,6 +3748,9 @@ async fn handle_stripe_event(
     }
     if stripe_event_is_unrelated(state, &event).await? {
         return Ok(ignored_stripe_event_response(event));
+    }
+    if event.event_type == "account.application.deauthorized" {
+        return handle_stripe_connect_deauthorized(state, event).await;
     }
 
     {
@@ -3347,8 +3854,57 @@ async fn stripe_event_is_unrelated(
                 .lookup_deposit(payment_intent.as_deref(), charge.as_deref())
                 .is_none())
         }
+        "account.application.deauthorized" => {
+            let Some(account_id) = stripe_event_account_id(event) else {
+                return Ok(false);
+            };
+            validate_stripe_account_id(&account_id)?;
+            Ok(!state
+                .stripe_connect
+                .lock()
+                .await
+                .has_account_id(state.config.rails.stripe.mode, &account_id))
+        }
         _ => Ok(false),
     }
+}
+
+fn stripe_event_account_id(event: &StripeEventEnvelope) -> Option<String> {
+    event.account.clone().or_else(|| {
+        stripe_expandable_id(event.data.object.get("account"))
+            .or_else(|| stripe_expandable_id(event.data.object.get("stripe_account")))
+    })
+}
+
+async fn handle_stripe_connect_deauthorized(
+    state: &PaygateState,
+    event: StripeEventEnvelope,
+) -> Result<StripeWebhookResponse> {
+    let account_id = stripe_event_account_id(&event).ok_or_else(|| {
+        PaygateError::Stripe("Stripe deauthorization event missing account".to_owned())
+    })?;
+    validate_stripe_account_id(&account_id)?;
+    let deauthorized_at = event.created.unwrap_or(unix_epoch_seconds()?);
+    let changed = state.stripe_connect.lock().await.mark_deauthorized(
+        state.config.rails.stripe.mode,
+        &account_id,
+        &event.id,
+        deauthorized_at,
+    )?;
+    Ok(StripeWebhookResponse {
+        ok: true,
+        event_id: event.id,
+        event_type: event.event_type,
+        duplicate: !changed,
+        credited: false,
+        clawed_back: false,
+        ignored: false,
+        payment_intent: None,
+        charge: None,
+        dispute: None,
+        au: None,
+        contract: None,
+    })
 }
 
 pub async fn run_stripe_backfill_once(state: &PaygateState) -> Result<StripeBackfillReport> {
@@ -3469,6 +4025,7 @@ async fn stripe_fetch_backfill_events(
             let response = http
                 .get(url)
                 .basic_auth(secret_key, Some(""))
+                .header("Stripe-Version", STRIPE_API_VERSION)
                 .send()
                 .await?;
             let status = response.status();
@@ -3507,15 +4064,14 @@ async fn handle_stripe_payment_intent_succeeded(
     state: &PaygateState,
     event: &StripeEventEnvelope,
 ) -> Result<(StripeEventRecord, ContractPostResult)> {
+    let presentment = payment_intent_presentment_summary(&event.data.object)?;
     let object: StripePaymentIntentObject = serde_json::from_value(event.data.object.clone())?;
-    let currency = normalize_stripe_currency(Some(&object.currency))?;
+    let currency = normalize_stripe_integration_currency(Some(&object.currency))?;
     let amount_cents = object
         .amount_received
         .or(object.amount)
         .ok_or_else(|| PaygateError::Stripe("PaymentIntent missing amount".to_owned()))?;
-    let au_from_amount = MoneyAu::from(amount_cents)
-        .checked_mul(AU_PER_USD_CENT)
-        .ok_or_else(|| PaygateError::Stripe("PaymentIntent amount overflow".to_owned()))?;
+    let au_from_amount = stripe_usd_minor_to_au(amount_cents)?;
     let who = object
         .metadata
         .get("mayhem_who")
@@ -3535,11 +4091,9 @@ async fn handle_stripe_payment_intent_succeeded(
             "PaymentIntent amount does not match mayhem_au metadata".to_owned(),
         ));
     }
-    let denom = object
-        .metadata
-        .get("mayhem_denom")
-        .map(String::as_str)
-        .unwrap_or(CREDIT_DENOM);
+    let denom = object.metadata.get("mayhem_denom").ok_or_else(|| {
+        PaygateError::Stripe("PaymentIntent missing mayhem_denom metadata".to_owned())
+    })?;
     if denom != CREDIT_DENOM {
         return Err(PaygateError::Stripe(
             "PaymentIntent denomination must be au_usd".to_owned(),
@@ -3600,6 +4154,8 @@ async fn handle_stripe_payment_intent_succeeded(
             au,
             currency: Some(currency),
             amount_minor: Some(amount_cents),
+            presentment_currency: presentment.as_ref().map(|details| details.currency.clone()),
+            presentment_amount_minor: presentment.map(|details| details.amount),
             ext_ref_hash,
             dispute_ref_hash: None,
             credited_at: Some(at),
@@ -3617,7 +4173,7 @@ async fn handle_stripe_dispute_created(
     let dispute = json_string_field(object, "id")?;
     let amount_cents = json_u64_field(object, "amount")?;
     let currency = json_string_field(object, "currency")?;
-    let currency = normalize_stripe_currency(Some(&currency))?;
+    let currency = normalize_stripe_integration_currency(Some(&currency))?;
     let charge = stripe_expandable_id(object.get("charge"));
     let payment_intent = stripe_expandable_id(object.get("payment_intent"));
     if charge.is_none() && payment_intent.is_none() {
@@ -3637,17 +4193,40 @@ async fn handle_stripe_dispute_created(
             ));
         }
     }
-    let au = MoneyAu::from(amount_cents)
-        .checked_mul(AU_PER_USD_CENT)
-        .ok_or_else(|| PaygateError::Stripe("Dispute amount overflow".to_owned()))?;
-    if au == 0 {
+    if amount_cents == 0 {
         return Err(PaygateError::Stripe(
             "Dispute amount must be positive".to_owned(),
         ));
     }
-    if au > deposit.au {
+    let deposit_amount_minor = deposit.amount_minor.ok_or_else(|| {
+        PaygateError::InvalidConfig("Stripe original deposit has no integration amount".to_owned())
+    })?;
+    let previous = {
+        let mut store = state.stripe_events.lock().await;
+        store.reserve_chargeback(&event.id, &deposit.ext_ref_hash)?;
+        store.chargeback_totals(&deposit.ext_ref_hash)
+    };
+    let cumulative_minor = previous
+        .amount_minor
+        .checked_add(amount_cents)
+        .ok_or_else(|| PaygateError::Stripe("Dispute amount overflow".to_owned()))?;
+    if cumulative_minor > deposit_amount_minor {
         return Err(PaygateError::Stripe(
             "Dispute amount exceeds original deposit".to_owned(),
+        ));
+    }
+    let target_cumulative_au =
+        proportional_chargeback_au(deposit.au, cumulative_minor, deposit_amount_minor)?;
+    let au = target_cumulative_au
+        .checked_sub(previous.au)
+        .ok_or_else(|| {
+            PaygateError::InvalidConfig(
+                "Stripe cumulative chargeback AU exceeds its proportional target".to_owned(),
+            )
+        })?;
+    if au == 0 {
+        return Err(PaygateError::Stripe(
+            "Dispute produces no additional proportional chargeback".to_owned(),
         ));
     }
     let at = event
@@ -3692,6 +4271,8 @@ async fn handle_stripe_dispute_created(
             au,
             currency: Some(currency),
             amount_minor: Some(amount_cents),
+            presentment_currency: None,
+            presentment_amount_minor: None,
             ext_ref_hash: deposit.ext_ref_hash,
             dispute_ref_hash: Some(dispute_ref_hash),
             credited_at: None,
@@ -3784,6 +4365,8 @@ impl StripeEventStore {
             processing: HashSet::new(),
             deposits_by_payment_intent: HashMap::new(),
             deposits_by_charge: HashMap::new(),
+            chargebacks_by_deposit: HashMap::new(),
+            processing_chargeback_sources: HashMap::new(),
             path: None,
         }
     }
@@ -3794,6 +4377,8 @@ impl StripeEventStore {
             processing: HashSet::new(),
             deposits_by_payment_intent: HashMap::new(),
             deposits_by_charge: HashMap::new(),
+            chargebacks_by_deposit: HashMap::new(),
+            processing_chargeback_sources: HashMap::new(),
             path: Some(path.to_path_buf()),
         };
         if !path.exists() {
@@ -3803,7 +4388,7 @@ impl StripeEventStore {
         for line in text.lines().filter(|line| !line.trim().is_empty()) {
             let record: StripeEventRecord = serde_json::from_str(line)?;
             store.seen.insert(record.event_id.clone());
-            store.index_record(record);
+            store.index_record(record)?;
         }
         Ok(store)
     }
@@ -3819,6 +4404,7 @@ impl StripeEventStore {
 
     fn complete(&mut self, record: StripeEventRecord) -> Result<()> {
         self.processing.remove(&record.event_id);
+        self.processing_chargeback_sources.remove(&record.event_id);
         if self.seen.insert(record.event_id.clone()) {
             if let Some(path) = &self.path {
                 if let Some(parent) = path.parent() {
@@ -3830,26 +4416,57 @@ impl StripeEventStore {
                 writeln!(file, "{}", serde_json::to_string(&record)?)?;
                 file.flush()?;
             }
-            self.index_record(record);
+            self.index_record(record)?;
         }
         Ok(())
     }
 
     fn fail(&mut self, event_id: &str) {
         self.processing.remove(event_id);
+        self.processing_chargeback_sources.remove(event_id);
     }
 
-    fn index_record(&mut self, record: StripeEventRecord) {
-        if record.kind != "deposit" {
-            return;
+    fn index_record(&mut self, record: StripeEventRecord) -> Result<()> {
+        match record.kind.as_str() {
+            "deposit" => {
+                if let Some(payment_intent) = &record.payment_intent {
+                    self.deposits_by_payment_intent
+                        .insert(payment_intent.clone(), record.clone());
+                }
+                if let Some(charge) = &record.charge {
+                    self.deposits_by_charge.insert(charge.clone(), record);
+                }
+            }
+            "chargeback" => {
+                let amount_minor = record.amount_minor.ok_or_else(|| {
+                    PaygateError::InvalidConfig(
+                        "Stripe chargeback record has no integration amount".to_owned(),
+                    )
+                })?;
+                let totals = self
+                    .chargebacks_by_deposit
+                    .entry(record.ext_ref_hash)
+                    .or_default();
+                totals.amount_minor =
+                    totals
+                        .amount_minor
+                        .checked_add(amount_minor)
+                        .ok_or_else(|| {
+                            PaygateError::InvalidConfig(
+                                "Stripe chargeback integration amount overflow".to_owned(),
+                            )
+                        })?;
+                totals.au = totals.au.checked_add(record.au).ok_or_else(|| {
+                    PaygateError::InvalidConfig("Stripe chargeback AU overflow".to_owned())
+                })?;
+            }
+            _ => {
+                return Err(PaygateError::InvalidConfig(
+                    "Stripe event record has an unsupported kind".to_owned(),
+                ));
+            }
         }
-        if let Some(payment_intent) = &record.payment_intent {
-            self.deposits_by_payment_intent
-                .insert(payment_intent.clone(), record.clone());
-        }
-        if let Some(charge) = &record.charge {
-            self.deposits_by_charge.insert(charge.clone(), record);
-        }
+        Ok(())
     }
 
     fn lookup_deposit(
@@ -3861,6 +4478,28 @@ impl StripeEventStore {
             .and_then(|id| self.deposits_by_payment_intent.get(id).cloned())
             .or_else(|| charge.and_then(|id| self.deposits_by_charge.get(id).cloned()))
     }
+
+    fn reserve_chargeback(&mut self, event_id: &str, ext_ref_hash: &str) -> Result<()> {
+        if self
+            .processing_chargeback_sources
+            .values()
+            .any(|source| source == ext_ref_hash)
+        {
+            return Err(PaygateError::Stripe(
+                "another dispute for the original deposit is still processing".to_owned(),
+            ));
+        }
+        self.processing_chargeback_sources
+            .insert(event_id.to_owned(), ext_ref_hash.to_owned());
+        Ok(())
+    }
+
+    fn chargeback_totals(&self, ext_ref_hash: &str) -> StripeChargebackTotals {
+        self.chargebacks_by_deposit
+            .get(ext_ref_hash)
+            .copied()
+            .unwrap_or_default()
+    }
 }
 
 impl StripeConnectStore {
@@ -3870,38 +4509,65 @@ impl StripeConnectStore {
             bindings: HashMap::new(),
             requests: HashMap::new(),
             path: None,
+            deauthorizations: HashMap::new(),
+            deauthorizations_path: None,
         }
     }
 
     fn load(path: &Path) -> Result<Self> {
+        let deauthorizations_path = path.with_extension("deauthorized.jsonl");
         let mut store = Self {
             accounts: HashMap::new(),
             bindings: HashMap::new(),
             requests: HashMap::new(),
             path: Some(path.to_path_buf()),
+            deauthorizations: HashMap::new(),
+            deauthorizations_path: Some(deauthorizations_path.clone()),
         };
-        if !path.exists() {
-            return Ok(store);
+        if path.exists() {
+            let text = fs::read_to_string(path)?;
+            for line in text.lines().filter(|line| !line.trim().is_empty()) {
+                let value: Value = serde_json::from_str(line)?;
+                let schema_version = value
+                    .get("schema_version")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| {
+                        PaygateError::InvalidConfig(
+                            "Stripe Connect account record has no schema_version".to_owned(),
+                        )
+                    })?;
+                if schema_version != 1 {
+                    return Err(PaygateError::InvalidConfig(format!(
+                        "unsupported Stripe Connect account schema_version {}",
+                        schema_version
+                    )));
+                }
+                let record: StripeConnectAccountRecord = serde_json::from_value(value)?;
+                store.load_record(record)?;
+            }
         }
-        let text = fs::read_to_string(path)?;
-        for line in text.lines().filter(|line| !line.trim().is_empty()) {
-            let value: Value = serde_json::from_str(line)?;
-            let schema_version = value
-                .get("schema_version")
-                .and_then(Value::as_u64)
-                .ok_or_else(|| {
+        if deauthorizations_path.exists() {
+            let text = fs::read_to_string(deauthorizations_path)?;
+            for line in text.lines().filter(|line| !line.trim().is_empty()) {
+                let record: StripeConnectDeauthorizationRecord = serde_json::from_str(line)?;
+                if record.schema_version != 1 {
+                    return Err(PaygateError::InvalidConfig(format!(
+                        "unsupported Stripe Connect deauthorization schema_version {}",
+                        record.schema_version
+                    )));
+                }
+                validate_stripe_account_id(&record.account_id).map_err(|_| {
                     PaygateError::InvalidConfig(
-                        "Stripe Connect account record has no schema_version".to_owned(),
+                        "Stripe Connect deauthorization has an invalid account id".to_owned(),
                     )
                 })?;
-            if schema_version != 1 {
-                return Err(PaygateError::InvalidConfig(format!(
-                    "unsupported Stripe Connect account schema_version {}",
-                    schema_version
-                )));
+                let key = Self::deauthorization_key(record.mode, &record.account_id);
+                if record.deauthorized {
+                    store.deauthorizations.insert(key, record);
+                } else {
+                    store.deauthorizations.remove(&key);
+                }
             }
-            let record: StripeConnectAccountRecord = serde_json::from_value(value)?;
-            store.load_record(record)?;
         }
         Ok(store)
     }
@@ -3918,6 +4584,10 @@ impl StripeConnectStore {
         format!("{}:{provider}:{request_nonce}", mode.as_str())
     }
 
+    fn deauthorization_key(mode: StripeMode, account_id: &str) -> String {
+        format!("{}:{account_id}", mode.as_str())
+    }
+
     fn get(&self, mode: StripeMode, provider: &str) -> Option<&StripeConnectAccountRecord> {
         self.accounts.get(&Self::key(mode, provider))
     }
@@ -3930,6 +4600,91 @@ impl StripeConnectStore {
     ) -> Option<&StripeConnectAccountRecord> {
         self.bindings
             .get(&Self::binding_key(mode, provider, account_id))
+    }
+
+    fn has_account_id(&self, mode: StripeMode, account_id: &str) -> bool {
+        self.bindings
+            .values()
+            .any(|record| record.mode == mode && record.account_id == account_id)
+    }
+
+    fn is_deauthorized(&self, mode: StripeMode, account_id: &str) -> bool {
+        self.deauthorizations
+            .contains_key(&Self::deauthorization_key(mode, account_id))
+    }
+
+    fn mark_deauthorized(
+        &mut self,
+        mode: StripeMode,
+        account_id: &str,
+        event_id: &str,
+        deauthorized_at: u64,
+    ) -> Result<bool> {
+        if !self.has_account_id(mode, account_id) {
+            return Err(PaygateError::InvalidRequest(
+                "Stripe deauthorization does not match a bound account".to_owned(),
+            ));
+        }
+        let key = Self::deauthorization_key(mode, account_id);
+        if self.deauthorizations.contains_key(&key) {
+            return Ok(false);
+        }
+        let record = StripeConnectDeauthorizationRecord {
+            schema_version: 1,
+            mode,
+            account_id: account_id.to_owned(),
+            event_id: event_id.to_owned(),
+            deauthorized_at,
+            deauthorized: true,
+        };
+        self.persist_deauthorization(&record)?;
+        self.deauthorizations.insert(key, record);
+        Ok(true)
+    }
+
+    fn clear_deauthorized(
+        &mut self,
+        mode: StripeMode,
+        account_id: &str,
+        event_id: &str,
+        at: u64,
+    ) -> Result<()> {
+        let key = Self::deauthorization_key(mode, account_id);
+        if !self.deauthorizations.contains_key(&key) {
+            return Ok(());
+        }
+        let record = StripeConnectDeauthorizationRecord {
+            schema_version: 1,
+            mode,
+            account_id: account_id.to_owned(),
+            event_id: event_id.to_owned(),
+            deauthorized_at: at,
+            deauthorized: false,
+        };
+        self.persist_deauthorization(&record)?;
+        self.deauthorizations.remove(&key);
+        Ok(())
+    }
+
+    fn persist_deauthorization(&self, record: &StripeConnectDeauthorizationRecord) -> Result<()> {
+        let Some(path) = &self.deauthorizations_path else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(path)?;
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        writeln!(file, "{}", serde_json::to_string(record)?)?;
+        file.sync_all()?;
+        Ok(())
     }
 
     fn replay_rotation(
@@ -4174,6 +4929,13 @@ impl StripeConnectConsentStore {
         format!("{}:{provider}:{request_nonce}", mode.as_str())
     }
 
+    fn get(&self, state: &str) -> Result<StripeConnectConsentRecord> {
+        self.challenges
+            .get(state)
+            .cloned()
+            .ok_or_else(|| PaygateError::InvalidRequest("unknown Stripe consent state".to_owned()))
+    }
+
     fn insert_pending(
         &mut self,
         record: StripeConnectConsentRecord,
@@ -4200,6 +4962,11 @@ impl StripeConnectConsentStore {
                 ));
             }
             return Ok(existing.clone());
+        }
+        if self.challenges.contains_key(&record.state) {
+            return Err(PaygateError::Crypto(
+                "Stripe OAuth state collision".to_owned(),
+            ));
         }
         self.append(&record)?;
         self.requests.insert(request_key, record.state.clone());
@@ -4416,6 +5183,10 @@ fn random_seed() -> Result<[u8; 32]> {
     let mut seed = [0_u8; 32];
     getrandom::fill(&mut seed).map_err(|err| PaygateError::Crypto(err.to_string()))?;
     Ok(seed)
+}
+
+fn random_connect_oauth_state() -> Result<String> {
+    Ok(hex::encode(random_seed()?))
 }
 
 fn write_new_seed_file(path: &Path, seed_hex: &str) -> std::io::Result<()> {
@@ -4741,16 +5512,30 @@ fn checkout_copy_paste(url: &str) -> CheckoutCopyPaste {
     }
 }
 
-fn normalize_stripe_currency(value: Option<&str>) -> Result<String> {
+fn normalize_stripe_integration_currency(value: Option<&str>) -> Result<String> {
     let currency = value
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_STRIPE_CURRENCY)
         .to_ascii_lowercase();
-    if !matches!(currency.as_str(), "usd" | "eur") {
+    if currency != DEFAULT_STRIPE_CURRENCY {
         return Err(PaygateError::InvalidRequest(
-            "Stripe currency must be usd or eur".to_owned(),
+            "Stripe au_usd integration currency must be usd".to_owned(),
         ));
+    }
+    Ok(currency)
+}
+
+fn normalize_stripe_connected_account_currency(value: &str) -> Result<String> {
+    normalize_stripe_iso_currency("connected-account default currency", value)
+}
+
+fn normalize_stripe_iso_currency(field: &str, value: &str) -> Result<String> {
+    let currency = value.trim().to_ascii_lowercase();
+    if currency.len() != 3 || !currency.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        return Err(PaygateError::InvalidRequest(format!(
+            "Stripe {field} must be a three-letter ISO currency code"
+        )));
     }
     Ok(currency)
 }
@@ -4877,16 +5662,16 @@ fn is_safe_key_part(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
-fn au_to_stripe_minor(au: MoneyAu, currency: &str) -> Result<u64> {
+fn au_to_stripe_usd_minor(au: MoneyAu) -> Result<u64> {
     if au == 0 {
         return Err(PaygateError::InvalidRequest(
             "au must be positive".to_owned(),
         ));
     }
     if au % AU_PER_USD_CENT != 0 {
-        return Err(PaygateError::InvalidRequest(format!(
-            "Stripe {currency} deposits must be whole cents"
-        )));
+        return Err(PaygateError::InvalidRequest(
+            "Stripe au_usd deposits must be whole USD cents".to_owned(),
+        ));
     }
     let cents = u64::try_from(au / AU_PER_USD_CENT)
         .map_err(|_| PaygateError::InvalidRequest("Stripe amount exceeds u64 cents".to_owned()))?;
@@ -4896,6 +5681,44 @@ fn au_to_stripe_minor(au: MoneyAu, currency: &str) -> Result<u64> {
         ));
     }
     Ok(cents)
+}
+
+fn stripe_usd_minor_to_au(cents: u64) -> Result<MoneyAu> {
+    if cents < STRIPE_MIN_USD_CENTS {
+        return Err(PaygateError::Stripe(
+            "Stripe integration amount is below the minimum USD amount".to_owned(),
+        ));
+    }
+    MoneyAu::from(cents)
+        .checked_mul(AU_PER_USD_CENT)
+        .ok_or_else(|| PaygateError::Stripe("Stripe integration amount overflow".to_owned()))
+}
+
+fn proportional_chargeback_au(
+    deposit_au: MoneyAu,
+    cumulative_minor: u64,
+    deposit_minor: u64,
+) -> Result<MoneyAu> {
+    if deposit_minor == 0 || cumulative_minor > deposit_minor {
+        return Err(PaygateError::Stripe(
+            "Dispute amount exceeds original deposit".to_owned(),
+        ));
+    }
+    if cumulative_minor == deposit_minor {
+        return Ok(deposit_au);
+    }
+    let denominator = MoneyAu::from(deposit_minor);
+    let numerator = MoneyAu::from(cumulative_minor);
+    let quotient = deposit_au / denominator;
+    let remainder = deposit_au % denominator;
+    quotient
+        .checked_mul(numerator)
+        .and_then(|whole| {
+            remainder
+                .checked_mul(numerator)
+                .and_then(|partial| whole.checked_add(partial / denominator))
+        })
+        .ok_or_else(|| PaygateError::Stripe("Dispute proportional amount overflow".to_owned()))
 }
 
 fn stripe_ext_ref_hash(payment_intent: &str) -> String {
@@ -5166,19 +5989,24 @@ mod tests {
 
     #[test]
     fn stripe_au_to_cents_requires_cent_aligned_minimum() {
+        assert_eq!(au_to_stripe_usd_minor(500_000_000_000_000_000).unwrap(), 50);
+        assert!(au_to_stripe_usd_minor(499_999_999_999_999_999).is_err());
+        assert!(au_to_stripe_usd_minor(10_001).is_err());
+        assert_eq!(normalize_stripe_integration_currency(None).unwrap(), "usd");
         assert_eq!(
-            au_to_stripe_minor(500_000_000_000_000_000, "usd").unwrap(),
-            50
+            normalize_stripe_integration_currency(Some("USD")).unwrap(),
+            "usd"
+        );
+        assert!(normalize_stripe_integration_currency(Some("eur")).is_err());
+        assert_eq!(
+            normalize_stripe_connected_account_currency("EUR").unwrap(),
+            "eur"
         );
         assert_eq!(
-            au_to_stripe_minor(500_000_000_000_000_000, "eur").unwrap(),
-            50
+            normalize_stripe_connected_account_currency("gbp").unwrap(),
+            "gbp"
         );
-        assert!(au_to_stripe_minor(499_999_999_999_999_999, "usd").is_err());
-        assert!(au_to_stripe_minor(10_001, "eur").is_err());
-        assert_eq!(normalize_stripe_currency(None).unwrap(), "usd");
-        assert_eq!(normalize_stripe_currency(Some("EUR")).unwrap(), "eur");
-        assert!(normalize_stripe_currency(Some("gbp")).is_err());
+        assert!(normalize_stripe_connected_account_currency("EURO").is_err());
         assert_eq!(normalize_stripe_locale(None).unwrap(), "en");
         assert!(normalize_stripe_locale(Some("de")).is_err());
     }

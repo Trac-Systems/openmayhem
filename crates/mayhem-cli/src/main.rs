@@ -253,7 +253,9 @@ struct MainnetManifestTnk {
 struct MainnetManifestFiat {
     processor: String,
     mode: String,
-    currencies: Vec<String>,
+    integration_currency: String,
+    adaptive_pricing: bool,
+    payout_currencies: Vec<String>,
     locale: String,
     event_collection: String,
     connect_enabled: bool,
@@ -594,6 +596,8 @@ enum ProviderStripeCommands {
     Rotate(ProviderStripeOnboardArgs),
     /// Relink an existing ready Connect account with source and target provider consent.
     Relink(ProviderStripeRelinkArgs),
+    /// Adopt a pre-existing Standard Stripe account through provider-bound OAuth.
+    Adopt(ProviderStripeAdoptArgs),
     /// Refresh Stripe account readiness and verified payout binding status.
     Status(ProviderStripeStatusArgs),
 }
@@ -1989,13 +1993,13 @@ struct ReceiptsCollectArgs {
 
 #[derive(Debug, Parser)]
 struct PayRailArgs {
-    /// Fiat amount to buy, for example 10 or 10.25.
+    /// Canonical USD-denominated credit to buy, for example 10 or 10.25.
     #[arg(long)]
     amount: String,
 
-    /// Fiat checkout currency for Stripe. Defaults to USD.
-    #[arg(long, default_value = "usd")]
-    currency: String,
+    /// Stripe presentation policy. Adaptive pricing currently supports auto.
+    #[arg(long, default_value = "auto")]
+    presentation: String,
 
     /// Hosted checkout locale. Stripe beta supports English checkout.
     #[arg(long, default_value = "en")]
@@ -3976,9 +3980,9 @@ struct AdminSetPaymentsArgs {
     #[arg(long)]
     tnk_treasury_address: String,
 
-    /// Stripe presentment currencies administered by Mayhem.
-    #[arg(long, value_delimiter = ',', default_value = "usd,eur")]
-    stripe_currencies: Vec<String>,
+    /// Stripe settlement currencies providers may select after Stripe verification.
+    #[arg(long, value_delimiter = ',', default_value = "usd,eur,gbp")]
+    stripe_payout_currencies: Vec<String>,
 
     /// Stripe hosted-checkout locale.
     #[arg(long, default_value = "en")]
@@ -4670,10 +4674,6 @@ struct AdminFiatSettlementArgs {
     #[arg(long, default_value = "platform_balance")]
     operator_stripe_account: String,
 
-    /// Operator fee evidence currency. Defaults to EUR for the operator platform balance.
-    #[arg(long, default_value = "eur")]
-    operator_currency: String,
-
     /// Broadcast provider Stripe Connect transfers. Requires --submit.
     #[arg(long)]
     submit_transfer: bool,
@@ -5291,6 +5291,32 @@ struct ProviderStripeRelinkArgs {
     /// Print the OAuth URL but do not launch a browser.
     #[arg(long)]
     no_open: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderStripeAdoptArgs {
+    #[command(flatten)]
+    provider: ProviderStripeArgs,
+
+    /// Two-letter ISO country code for the existing Standard account.
+    #[arg(long)]
+    country: String,
+
+    /// Print the OAuth URL but do not launch a browser.
+    #[arg(long)]
+    no_open: bool,
+
+    /// Return after creating the OAuth link instead of polling account readiness.
+    #[arg(long)]
+    no_wait: bool,
+
+    /// Maximum seconds to wait for OAuth completion and verified payout binding.
+    #[arg(long, default_value_t = 900)]
+    timeout_seconds: u64,
+
+    /// Poll interval in milliseconds while waiting for account readiness.
+    #[arg(long, default_value_t = 2_000)]
+    poll_interval_ms: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -6359,6 +6385,7 @@ async fn provider_command(command: ProviderCommands, verbose: bool) -> Result<()
             ProviderStripeCommands::Onboard(args) => provider_stripe_onboard(args, false).await,
             ProviderStripeCommands::Rotate(args) => provider_stripe_onboard(args, true).await,
             ProviderStripeCommands::Relink(args) => provider_stripe_relink(args).await,
+            ProviderStripeCommands::Adopt(args) => provider_stripe_adopt(args).await,
             ProviderStripeCommands::Status(args) => provider_stripe_status(args).await,
         },
         ProviderCommands::MinAsk { command } => match command {
@@ -23684,24 +23711,20 @@ fn admin_set_payments_payload(args: &AdminSetPaymentsArgs) -> Result<Value> {
             || (tnk_network == "testnet1" && treasury.starts_with("testtrac1")),
         "--tnk-treasury-address does not match --tnk-network"
     );
-    let mut currencies = Vec::new();
-    for currency in &args.stripe_currencies {
-        let currency = currency.trim().to_ascii_lowercase();
+    let mut payout_currencies = Vec::new();
+    for currency in &args.stripe_payout_currencies {
+        let currency = normalize_admin_fiat_currency(currency)?;
         ensure!(
-            matches!(currency.as_str(), "usd" | "eur"),
-            "--stripe-currencies supports only usd and eur"
+            !payout_currencies.contains(&currency),
+            "--stripe-payout-currencies contains duplicate {currency}"
         );
-        ensure!(
-            !currencies.contains(&currency),
-            "--stripe-currencies contains duplicate {currency}"
-        );
-        currencies.push(currency);
+        payout_currencies.push(currency);
     }
     ensure!(
-        !currencies.is_empty(),
-        "--stripe-currencies must not be empty"
+        !payout_currencies.is_empty(),
+        "--stripe-payout-currencies must not be empty"
     );
-    currencies.sort_by_key(|currency| if currency == "usd" { 0 } else { 1 });
+    payout_currencies.sort();
     ensure!(
         args.stripe_locale.trim().eq_ignore_ascii_case("en"),
         "--stripe-locale must be en"
@@ -23711,7 +23734,9 @@ fn admin_set_payments_payload(args: &AdminSetPaymentsArgs) -> Result<Value> {
         "ver": args.ver,
         "fiat": {
             "processor": "stripe",
-            "currencies": currencies,
+            "integration_currency": "usd",
+            "adaptive_pricing": true,
+            "payout_currencies": payout_currencies,
             "locale": "en",
         },
         "tap": {
@@ -24583,10 +24608,11 @@ fn validate_rate_map_entries(
 
 fn normalize_admin_fiat_currency(value: &str) -> Result<String> {
     let currency = value.trim().to_ascii_lowercase();
-    match currency.as_str() {
-        "usd" | "eur" => Ok(currency),
-        _ => bail!("fiat currency must be usd or eur"),
-    }
+    ensure!(
+        currency.len() == 3 && currency.bytes().all(|byte| byte.is_ascii_lowercase()),
+        "fiat currency must be a three-letter lowercase ISO currency code"
+    );
+    Ok(currency)
 }
 
 fn admin_set_provider_kyb_payload(args: &AdminSetProviderKybArgs) -> Result<Value> {
@@ -25208,7 +25234,6 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
     if !is_safe_key_part(&operator_to) {
         bail!("operator Stripe account is not contract-safe");
     }
-    let operator_currency = normalize_admin_fiat_currency(&args.operator_currency)?;
     let home = args.tx.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.tx.rpc_url.as_deref())?;
@@ -25216,22 +25241,21 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
         require_secure_fund_rpc_url(&rpc_url)?;
     }
     let rpc = PeerRpcClient::new(&rpc_url)?;
-    let mut plan =
-        build_fiat_settlement_plan(&rpc, epoch, at, &operator_to, &operator_currency).await?;
+    let mut plan = build_fiat_settlement_plan(&rpc, epoch, at, &operator_to).await?;
 
     if plan.already_settled.is_none()
-        && plan
-            .payload
-            .get("stripe_transfers")
-            .and_then(Value::as_array)
-            .is_none_or(Vec::is_empty)
         && args.tx.submit
+        && !args.tx.sim
         && !args.submit_transfer
+        && !plan.stripe_outputs.is_empty()
     {
-        bail!("--submit requires --submit-transfer so every provider payout is retrieved and verified from Stripe");
+        bail!("--submit requires --submit-transfer so every FX quote, transfer, and destination payment is retrieved and verified from Stripe");
     }
 
     let mut stripe_transfers = Vec::new();
+    let mut stripe_transfer_evidence = Vec::new();
+    let mut evidence_outputs = Vec::new();
+    let mut platform_account = None;
     if plan.already_settled.is_none() && args.submit_transfer {
         let blocking_skips = plan
             .skipped_providers
@@ -25252,7 +25276,15 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             stripe_transfer_runtime_is_mainnet()?,
         )?;
         let client = reqwest::Client::new();
-        let mut evidence = Vec::with_capacity(plan.stripe_outputs.len());
+        let platform = stripe_platform_account(
+            &client,
+            &api_base_url,
+            &secret_key,
+            args.stripe_transfer_max_attempts,
+            args.stripe_transfer_retry_ms,
+        )
+        .await?;
+        platform_account = Some(platform.clone());
         for (index, output) in plan.stripe_outputs.iter().enumerate() {
             if output.role == "provider" {
                 let account = stripe_connect_payout_status(
@@ -25276,31 +25308,24 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                         account.transfers_enabled
                     );
                 }
-                if account.default_currency != output.currency {
+                let destination_currency = output
+                    .destination_currency
+                    .as_deref()
+                    .context("Stripe provider output is missing destination currency")?;
+                if account.default_currency != destination_currency {
                     bail!(
                         "Stripe Connect account {} default currency {} did not match planned {}",
                         account.id,
                         account.default_currency,
-                        output.currency
+                        destination_currency
                     );
                 }
-                let transfer = stripe_create_transfer_verified(
+                let Some(verified) = stripe_create_transfer_verified(
                     &client,
                     &api_base_url,
                     &secret_key,
+                    &platform,
                     output,
-                    &stripe_transfer_idempotency_key(
-                        epoch,
-                        output
-                            .provider
-                            .as_deref()
-                            .context("Stripe provider transfer output missing provider")?,
-                        output
-                            .payout_revision
-                            .as_deref()
-                            .context("Stripe provider transfer output missing payout revision")?,
-                        &plan.epoch_apply_hash,
-                    )?,
                     epoch,
                     index,
                     &plan.epoch_apply_hash,
@@ -25315,58 +25340,92 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                         plan.stripe_outputs.len(),
                         output.to
                     )
-                })?;
-                if transfer.destination != output.to {
-                    bail!(
-                        "Stripe transfer destination {} did not match planned {}",
-                        transfer.destination,
-                        output.to
-                    );
-                }
-                if transfer.currency != output.currency
-                    || transfer.amount_minor != output.amount_minor
-                {
-                    bail!(
-                        "Stripe transfer result does not match planned output {}",
-                        index + 1
-                    );
-                }
-                evidence.push(json!({
-                    "schema_version": 1,
-                    "kind": "stripe_transfer",
-                    "ref": transfer.id.clone(),
-                    "destination": transfer.destination.clone(),
-                    "currency": transfer.currency.clone(),
-                    "amount_minor": transfer.amount_minor.to_string(),
-                    "transfer_group": transfer.transfer_group.clone(),
-                }));
-                stripe_transfers.push(json!({
-                    "output_index": index,
-                    "account": account,
-                    "transfer": transfer,
-                }));
+                })?
+                else {
+                    plan.skipped_providers.push(json!({
+                        "provider": output.provider,
+                        "payout_revision": output.payout_revision,
+                        "au": money_au_json(output.liability_au),
+                        "reason": "payable amount is below one destination-currency minor unit",
+                        "blocking": false,
+                    }));
+                    continue;
+                };
+                let canonical_output_index = evidence_outputs.len();
+                evidence_outputs.push(fiat_provider_settlement_output(output, &verified)?);
+                stripe_transfer_evidence.push(stripe_provider_transfer_evidence(&verified)?);
+                stripe_transfers.push(indexed_fiat_transfer_report(
+                    json!({
+                        "account": account,
+                        "fx": fiat_fx_plan_report(&verified.fx),
+                        "quote": verified.quote.as_ref().map(stripe_fx_quote_evidence).transpose()?,
+                        "transfer": verified.transfer,
+                        "destination_payment": verified.destination_payment,
+                    }),
+                    canonical_output_index,
+                    index,
+                )?);
             } else {
-                evidence.push(json!({
-                    "schema_version": 1,
-                    "kind": "platform_balance",
-                    "ref": operator_fiat_settlement_ref(epoch, &plan.epoch_apply_hash),
-                    "destination": output.to,
-                    "currency": output.currency,
-                    "amount_minor": output.amount_minor.to_string(),
-                    "transfer_group": null,
-                }));
+                if let Some((output_evidence, transfer_evidence, report)) =
+                    stripe_operator_fee_evidence(
+                        &client,
+                        &api_base_url,
+                        &secret_key,
+                        &platform,
+                        output,
+                        epoch,
+                        &plan.epoch_apply_hash,
+                        args.stripe_transfer_max_attempts,
+                        args.stripe_transfer_retry_ms,
+                    )
+                    .await?
+                {
+                    let canonical_output_index = evidence_outputs.len();
+                    evidence_outputs.push(output_evidence);
+                    stripe_transfer_evidence.push(transfer_evidence);
+                    stripe_transfers.push(indexed_fiat_transfer_report(
+                        report,
+                        canonical_output_index,
+                        index,
+                    )?);
+                } else {
+                    plan.skipped_providers.push(json!({
+                        "role": "operator_fee",
+                        "au": money_au_json(output.liability_au),
+                        "reason": "operator fee is below one USD minor unit",
+                        "blocking": false,
+                    }));
+                }
             }
         }
-        plan.payload["stripe_transfers"] = json!(evidence);
+        if evidence_outputs.is_empty() {
+            ensure!(
+                stripe_transfer_evidence.is_empty() && stripe_transfers.is_empty(),
+                "empty fiat settlement outputs have stray transfer evidence"
+            );
+            plan.payload["source_currency"] = json!(platform.default_currency);
+        } else {
+            finalize_fiat_settlement_payload(
+                &mut plan.payload,
+                &platform,
+                &evidence_outputs,
+                &stripe_transfer_evidence,
+            )?;
+        }
     }
 
     let settlement_report = plan.payload.clone();
     let feature = if plan.already_settled.is_none()
         && plan
             .payload
-            .get("stripe_transfers")
+            .get("outputs")
             .and_then(Value::as_array)
-            .is_some_and(|items| items.len() == plan.stripe_outputs.len() && !items.is_empty())
+            .is_some_and(|items| !items.is_empty())
+        && plan
+            .payload
+            .get("transfer_root")
+            .and_then(Value::as_str)
+            .is_some()
     {
         Some(json!({
             "feature": "mayhem",
@@ -25408,11 +25467,10 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
     }
 
     let copy_paste_submit = format!(
-        "mayhem admin fiat-settlement --epoch {} --at {} --operator-stripe-account {} --operator-currency {} --submit-transfer --submit{}{}{}{}",
+        "mayhem admin fiat-settlement --epoch {} --at {} --operator-stripe-account {} --submit-transfer --submit{}{}{}{}",
         epoch,
         at,
         shell_single_quote(&operator_to),
-        shell_single_quote(&operator_currency),
         args.tx
             .home
             .as_ref()
@@ -25445,51 +25503,15 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             shell_single_quote(&feature_json)
         )
     });
-    let stripe_transfer_commands = plan
-        .stripe_outputs
-        .iter()
-        .enumerate()
-        .filter(|(_, output)| output.role == "provider")
-        .map(|(index, output)| {
-            let provider = output
-                .provider
-                .as_deref()
-                .context("Stripe provider transfer output missing provider")?;
-            let payout_revision = output
-                .payout_revision
-                .as_deref()
-                .context("Stripe provider transfer output missing payout revision")?;
-            let idempotency_key = stripe_transfer_idempotency_key(
-                epoch,
-                provider,
-                payout_revision,
-                &plan.epoch_apply_hash,
-            )?;
-            let transfer_group = format!(
-                "mayhem_fiat_epoch_{epoch}_{}",
-                plan.epoch_apply_hash
-                    .get(..16)
-                    .unwrap_or(&plan.epoch_apply_hash)
-            );
-            Ok(format!(
-                "curl -sS {} -u \"$STRIPE_SECRET_KEY:\" -H {} -d amount={} -d currency={} -d destination={} -d transfer_group={} -d metadata[mayhem_provider]={} -d metadata[mayhem_payout_revision]={} -d metadata[mayhem_epoch]={} -d metadata[mayhem_output_index]={} -d metadata[mayhem_epoch_apply_hash]={}",
-                shell_single_quote(&format!("{}/v1/transfers", stripe_api_base_url(args.stripe_api_base_url.as_deref()).unwrap_or_else(|_| "https://api.stripe.com".to_owned()).trim_end_matches('/'))),
-                shell_single_quote(&format!("Idempotency-Key: {idempotency_key}")),
-                output.amount_minor,
-                shell_single_quote(&output.currency),
-                shell_single_quote(&output.to),
-                shell_single_quote(&transfer_group),
-                shell_single_quote(provider),
-                shell_single_quote(payout_revision),
-                epoch,
-                index,
-                shell_single_quote(&plan.epoch_apply_hash)
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
 
-    let nothing_to_settle = plan.already_settled.is_none() && plan.stripe_outputs.is_empty();
-    let reconciliation = fiat_settlement_reconciliation(&plan.stripe_outputs, &stripe_transfers)?;
+    let nothing_to_settle = fiat_settlement_nothing_to_settle(
+        plan.already_settled.is_some(),
+        plan.stripe_outputs.len(),
+        args.submit_transfer,
+        &settlement_report,
+        feature.as_ref(),
+    );
+    let reconciliation = fiat_settlement_reconciliation(&settlement_report, &stripe_transfers)?;
     let report = json!({
         "ok": true,
         "submitted": feature_result.is_some(),
@@ -25501,17 +25523,17 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
         "at": at,
         "processor": "stripe",
         "operator_to": operator_to,
+        "platform_account": platform_account,
         "settlement": settlement_report,
         "feature": feature,
         "feature_result": feature_result,
         "settlement_state": settlement_state,
         "stripe_transfers": stripe_transfers,
-        "stripe_outputs": plan.stripe_outputs,
+        "planned_liabilities": fiat_settlement_output_values(&plan.stripe_outputs),
         "skipped_providers": plan.skipped_providers,
         "reconciliation": reconciliation,
         "copy_paste": {
             "submit_settlement": copy_paste_submit,
-            "stripe_transfer_curl": stripe_transfer_commands,
             "feature_rpc": feature_rpc_command,
         },
     });
@@ -25846,7 +25868,7 @@ fn fiat_settlement_feature_key(value: &Value) -> Result<String> {
         .and_then(Value::as_u64)
         .context("fiat settlement feature payload missing epoch")?;
     let digest = stable_value_hash(&json!({
-        "domain": "mayhem-targeted-fiat-settlement-feature-v1",
+        "domain": "mayhem-targeted-fiat-settlement-feature-v2",
         "value": value,
     }));
     Ok(format!("settle/targeted/fiat/{epoch}/{digest}"))
@@ -26536,7 +26558,9 @@ struct CanonicalPayments {
 #[serde(deny_unknown_fields)]
 struct CanonicalFiatRail {
     processor: String,
-    currencies: Vec<String>,
+    integration_currency: String,
+    adaptive_pricing: bool,
+    payout_currencies: Vec<String>,
     locale: String,
 }
 
@@ -28781,16 +28805,11 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
     require_secure_fund_rpc_url(&rpc_url)?;
     let rpc = PeerRpcClient::new(&rpc_url)?;
     let payment_state = read_canonical_payment_state(&rpc).await?;
-    let currency = args.currency.trim().to_ascii_lowercase();
+    let presentation = args.presentation.trim().to_ascii_lowercase();
     let locale = args.locale.trim().to_ascii_lowercase();
     ensure!(
-        payment_state
-            .payments
-            .fiat
-            .currencies
-            .iter()
-            .any(|enabled| enabled == &currency),
-        "Stripe currency {currency} is not enabled by the admin"
+        presentation == "auto",
+        "Stripe presentation must be auto; Stripe Adaptive Pricing selects the buyer currency"
     );
     ensure!(
         locale == payment_state.payments.fiat.locale,
@@ -28803,7 +28822,7 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
         rpc: &rpc,
         who: &wallet.public_key,
         amount_au,
-        currency: &currency,
+        presentation: &presentation,
         locale: &locale,
         idempotency_key: args.idempotency_key.as_deref(),
         success_url: args.success_url.as_deref(),
@@ -28812,7 +28831,7 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
         wallet_password: &wallet_password,
     })
     .await?;
-    emit_checkout_handoff(args.json, rail, amount_au, &currency, &checkout.url)?;
+    emit_checkout_handoff(args.json, rail, amount_au, &presentation, &checkout.url)?;
     let opened = open_checkout_url(&checkout.url, args.no_open).await;
     let target_au = before_au
         .checked_add(amount_au)
@@ -28844,13 +28863,15 @@ async fn pay(rail: PayRail, args: PayRailArgs) -> Result<()> {
         "denom": "au_usd",
         "amount_au": money_au_json(amount_au),
         "amount_usd": au_to_usd_amount(amount_au),
-        "currency": currency,
+        "presentation": presentation,
         "who": wallet.public_key,
         "rpc_url": rpc_url,
         "payment_config": {
             "source": "payments/current",
             "processor": payment_state.payments.fiat.processor,
-            "currencies": payment_state.payments.fiat.currencies,
+            "integration_currency": payment_state.payments.fiat.integration_currency,
+            "adaptive_pricing": payment_state.payments.fiat.adaptive_pricing,
+            "payout_currencies": payment_state.payments.fiat.payout_currencies,
             "locale": payment_state.payments.fiat.locale,
             "checkout_host": "checkout.stripe.com",
         },
@@ -29062,7 +29083,9 @@ async fn canonical_mainnet_readiness(
     );
     ensure!(
         payments.fiat.processor == manifest.payments.fiat.processor
-            && payments.fiat.currencies == manifest.payments.fiat.currencies
+            && payments.fiat.integration_currency == manifest.payments.fiat.integration_currency
+            && payments.fiat.adaptive_pricing == manifest.payments.fiat.adaptive_pricing
+            && payments.fiat.payout_currencies == manifest.payments.fiat.payout_currencies
             && payments.fiat.locale == manifest.payments.fiat.locale,
         "payments/current Stripe configuration does not match canonical mainnet"
     );
@@ -30174,7 +30197,9 @@ fn validate_mainnet_manifest(manifest: &MainnetManifest) -> Result<()> {
     ensure!(
         manifest.payments.fiat.processor == "stripe"
             && manifest.payments.fiat.mode == "live"
-            && manifest.payments.fiat.currencies == ["usd", "eur"]
+            && manifest.payments.fiat.integration_currency == "usd"
+            && manifest.payments.fiat.adaptive_pricing
+            && manifest.payments.fiat.payout_currencies == ["eur", "gbp", "usd"]
             && manifest.payments.fiat.locale == "en"
             && manifest.payments.fiat.event_collection == "stripe_api_polling"
             && manifest.payments.fiat.connect_enabled,
@@ -32907,22 +32932,27 @@ fn validate_canonical_payments(payments: &CanonicalPayments, admin: &str) -> Res
         "canonical fiat processor must be stripe"
     );
     ensure!(
+        payments.fiat.integration_currency == "usd",
+        "canonical Stripe integration currency must be usd"
+    );
+    ensure!(
+        payments.fiat.adaptive_pricing,
+        "canonical Stripe checkout must enable adaptive pricing"
+    );
+    ensure!(
         payments.fiat.locale == "en",
         "canonical Stripe locale must be en"
     );
     ensure!(
-        !payments.fiat.currencies.is_empty(),
-        "canonical Stripe currencies must not be empty"
+        !payments.fiat.payout_currencies.is_empty(),
+        "canonical Stripe payout currencies must not be empty"
     );
     let mut seen = BTreeSet::new();
-    for currency in &payments.fiat.currencies {
-        ensure!(
-            matches!(currency.as_str(), "usd" | "eur"),
-            "unsupported canonical Stripe currency {currency}"
-        );
+    for currency in &payments.fiat.payout_currencies {
+        normalize_admin_fiat_currency(currency)?;
         ensure!(
             seen.insert(currency),
-            "duplicate canonical Stripe currency {currency}"
+            "duplicate canonical Stripe payout currency {currency}"
         );
     }
     ensure!(
@@ -33056,16 +33086,21 @@ async fn payments(args: PaymentsArgs) -> Result<()> {
     } else {
         println!("Canonical payment denomination: au_usd");
         println!(
-            "Stripe: {} checkout in {} (hosted by checkout.stripe.com)",
+            "Stripe: {} integration, adaptive pricing={}, locale={} (hosted by checkout.stripe.com)",
+            state.payments.fiat.integration_currency.to_ascii_uppercase(),
+            state.payments.fiat.adaptive_pricing,
+            state.payments.fiat.locale,
+        );
+        println!(
+            "Stripe provider payout currencies: {}",
             state
                 .payments
                 .fiat
-                .currencies
+                .payout_currencies
                 .iter()
                 .map(|currency| currency.to_ascii_uppercase())
                 .collect::<Vec<_>>()
-                .join(", "),
-            state.payments.fiat.locale
+                .join(", ")
         );
         println!(
             "TAP: chain {} token {} pool {}",
@@ -39682,7 +39717,343 @@ fn normalize_tnk_holdbacks(earning: &LedgerEarningRecord) -> Result<Vec<LedgerHo
         .collect())
 }
 
-const FIAT_MINOR_AU_CLI: MoneyAu = 10_000_000_000_000_000;
+const STRIPE_FX_API_VERSION: &str = "2025-07-30.preview";
+const STRIPE_FX_QUOTE_LOCK_DURATION: &str = "five_minutes";
+
+fn stripe_currency_minor_exponent(currency: &str) -> Result<u32> {
+    let currency = normalize_admin_fiat_currency(currency)?;
+    Ok(match currency.as_str() {
+        "bif" | "clp" | "djf" | "gnf" | "jpy" | "kmf" | "krw" | "mga" | "pyg" | "rwf" | "ugx"
+        | "vnd" | "vuv" | "xaf" | "xof" | "xpf" => 0,
+        "bhd" | "jod" | "kwd" | "omr" | "tnd" => 3,
+        "clf" => 4,
+        _ => 2,
+    })
+}
+
+fn checked_pow10_u128(exponent: u32) -> Result<u128> {
+    10_u128
+        .checked_pow(exponent)
+        .context("decimal scale exceeds u128")
+}
+
+fn gcd_u128(mut left: u128, mut right: u128) -> u128 {
+    while right != 0 {
+        let remainder = left % right;
+        left = right;
+        right = remainder;
+    }
+    left
+}
+
+fn parse_exact_decimal_ratio(value: &str) -> Result<ExactDecimalRatio> {
+    let value = value.trim();
+    ensure!(!value.is_empty(), "Stripe decimal is empty");
+    ensure!(
+        !value.starts_with('-'),
+        "Stripe decimal must not be negative"
+    );
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let (mantissa, exponent) = value
+        .split_once(['e', 'E'])
+        .map(|(mantissa, exponent)| {
+            let exponent = exponent
+                .parse::<i32>()
+                .context("Stripe decimal exponent is invalid")?;
+            Ok::<_, anyhow::Error>((mantissa, exponent))
+        })
+        .transpose()?
+        .unwrap_or((value, 0));
+    let (whole, fractional) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    ensure!(
+        !whole.is_empty() || !fractional.is_empty(),
+        "Stripe decimal has no digits"
+    );
+    ensure!(
+        whole.bytes().all(|byte| byte.is_ascii_digit())
+            && fractional.bytes().all(|byte| byte.is_ascii_digit()),
+        "Stripe decimal contains non-digits"
+    );
+    let digits = format!("{whole}{fractional}");
+    let mut numerator = digits
+        .parse::<u128>()
+        .context("Stripe decimal exceeds exact u128 precision")?;
+    let scale = i32::try_from(fractional.len())
+        .context("Stripe decimal precision is too large")?
+        .checked_sub(exponent)
+        .context("Stripe decimal scale overflow")?;
+    let mut denominator = 1_u128;
+    if scale >= 0 {
+        denominator = checked_pow10_u128(scale as u32)?;
+    } else {
+        numerator = numerator
+            .checked_mul(checked_pow10_u128(scale.unsigned_abs())?)
+            .context("Stripe decimal exceeds exact u128 precision")?;
+    }
+    let divisor = gcd_u128(numerator, denominator).max(1);
+    Ok(ExactDecimalRatio {
+        numerator: numerator / divisor,
+        denominator: denominator / divisor,
+    })
+}
+
+fn stripe_decimal(value: &Value, label: &str) -> Result<(String, ExactDecimalRatio)> {
+    let text = match value {
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => text.clone(),
+        _ => bail!("Stripe {label} must be an exact JSON number or decimal string"),
+    };
+    let ratio =
+        parse_exact_decimal_ratio(&text).with_context(|| format!("parsing Stripe {label}"))?;
+    ensure!(ratio.numerator > 0, "Stripe {label} must be positive");
+    Ok((text, ratio))
+}
+
+fn cancelled_product_ratio(
+    mut numerators: Vec<u128>,
+    mut denominators: Vec<u128>,
+) -> Result<(u128, u128)> {
+    ensure!(
+        denominators.iter().all(|value| *value > 0),
+        "exact rational denominator must be positive"
+    );
+    for numerator in &mut numerators {
+        for denominator in &mut denominators {
+            let divisor = gcd_u128(*numerator, *denominator).max(1);
+            *numerator /= divisor;
+            *denominator /= divisor;
+        }
+    }
+    let numerator = numerators.into_iter().try_fold(1_u128, |total, value| {
+        total
+            .checked_mul(value)
+            .context("exact rational numerator overflow")
+    })?;
+    let denominator = denominators.into_iter().try_fold(1_u128, |total, value| {
+        total
+            .checked_mul(value)
+            .context("exact rational denominator overflow")
+    })?;
+    Ok((numerator, denominator))
+}
+
+fn exact_mul_div_floor(numerators: Vec<u128>, denominators: Vec<u128>) -> Result<u128> {
+    let (numerator, denominator) = cancelled_product_ratio(numerators, denominators)?;
+    Ok(numerator / denominator)
+}
+
+fn exact_mul_div_ceil(numerators: Vec<u128>, denominators: Vec<u128>) -> Result<u128> {
+    let (numerator, denominator) = cancelled_product_ratio(numerators, denominators)?;
+    Ok(numerator / denominator + u128::from(numerator % denominator != 0))
+}
+
+fn fiat_fx_plan(
+    liability_au: MoneyAu,
+    source_currency: &str,
+    destination_currency: &str,
+    quote: &StripeFxQuote,
+) -> Result<FiatFxPlan> {
+    ensure!(liability_au > 0, "fiat FX liability must be positive");
+    let source_currency = normalize_admin_fiat_currency(source_currency)?;
+    let destination_currency = normalize_admin_fiat_currency(destination_currency)?;
+    ensure!(
+        quote.to_currency == destination_currency,
+        "Stripe FX quote destination currency mismatch"
+    );
+    let usd_rate = quote
+        .rates
+        .get("usd")
+        .context("Stripe FX quote is missing its USD valuation rate")?;
+    let source_rate = quote
+        .rates
+        .get(&source_currency)
+        .context("Stripe FX quote is missing its platform source rate")?;
+    let source_scale = checked_pow10_u128(stripe_currency_minor_exponent(&source_currency)?)?;
+    let destination_scale =
+        checked_pow10_u128(stripe_currency_minor_exponent(&destination_currency)?)?;
+    let target_destination = exact_mul_div_floor(
+        vec![
+            liability_au,
+            usd_rate.base_ratio.numerator,
+            destination_scale,
+        ],
+        vec![AU_PER_USD, usd_rate.base_ratio.denominator],
+    )?;
+    if target_destination == 0 {
+        return Ok(FiatFxPlan {
+            liability_au,
+            paid_au: 0,
+            dust_au: liability_au,
+            source_currency,
+            source_amount_minor: 0,
+            destination_currency,
+            target_destination_amount_minor: 0,
+            maximum_destination_amount_minor: 0,
+        });
+    }
+    let source_amount = exact_mul_div_ceil(
+        vec![
+            target_destination,
+            source_scale,
+            source_rate.exchange_ratio.denominator,
+        ],
+        vec![destination_scale, source_rate.exchange_ratio.numerator],
+    )?;
+    let paid_au = exact_mul_div_floor(
+        vec![
+            target_destination,
+            AU_PER_USD,
+            usd_rate.base_ratio.denominator,
+        ],
+        vec![destination_scale, usd_rate.base_ratio.numerator],
+    )?;
+    ensure!(
+        paid_au > 0 && paid_au <= liability_au,
+        "invalid paid AU from Stripe FX quote"
+    );
+    let one_source_minor_destination = exact_mul_div_ceil(
+        vec![source_rate.exchange_ratio.numerator, destination_scale],
+        vec![source_rate.exchange_ratio.denominator, source_scale],
+    )?
+    .max(1);
+    Ok(FiatFxPlan {
+        liability_au,
+        paid_au,
+        dust_au: liability_au - paid_au,
+        source_currency,
+        source_amount_minor: u64::try_from(source_amount)
+            .context("Stripe transfer source amount exceeds u64")?,
+        destination_currency,
+        target_destination_amount_minor: u64::try_from(target_destination)
+            .context("Stripe destination amount exceeds u64")?,
+        maximum_destination_amount_minor: u64::try_from(
+            target_destination
+                .checked_add(one_source_minor_destination)
+                .context("Stripe destination tolerance overflow")?,
+        )
+        .context("Stripe destination tolerance exceeds u64")?,
+    })
+}
+
+fn fiat_same_currency_plan(
+    liability_au: MoneyAu,
+    currency: &str,
+    quote: &StripeFxQuote,
+) -> Result<FiatFxPlan> {
+    ensure!(liability_au > 0, "fiat liability must be positive");
+    let currency = normalize_admin_fiat_currency(currency)?;
+    ensure!(
+        currency != "usd",
+        "USD settlement does not require an FX valuation quote"
+    );
+    ensure!(
+        quote.to_currency == currency,
+        "Stripe FX valuation quote currency mismatch"
+    );
+    let usd_rate = quote
+        .rates
+        .get("usd")
+        .context("Stripe FX valuation quote is missing its USD rate")?;
+    let scale = checked_pow10_u128(stripe_currency_minor_exponent(&currency)?)?;
+    let amount = exact_mul_div_floor(
+        vec![liability_au, usd_rate.base_ratio.numerator, scale],
+        vec![AU_PER_USD, usd_rate.base_ratio.denominator],
+    )?;
+    if amount == 0 {
+        return Ok(FiatFxPlan {
+            liability_au,
+            paid_au: 0,
+            dust_au: liability_au,
+            source_currency: currency.clone(),
+            source_amount_minor: 0,
+            destination_currency: currency,
+            target_destination_amount_minor: 0,
+            maximum_destination_amount_minor: 0,
+        });
+    }
+    let paid_au = exact_mul_div_floor(
+        vec![amount, AU_PER_USD, usd_rate.base_ratio.denominator],
+        vec![scale, usd_rate.base_ratio.numerator],
+    )?;
+    ensure!(
+        paid_au > 0 && paid_au <= liability_au,
+        "invalid paid AU from Stripe FX valuation quote"
+    );
+    let amount = u64::try_from(amount).context("Stripe transfer amount exceeds u64")?;
+    Ok(FiatFxPlan {
+        liability_au,
+        paid_au,
+        dust_au: liability_au - paid_au,
+        source_currency: currency.clone(),
+        source_amount_minor: amount,
+        destination_currency: currency,
+        target_destination_amount_minor: amount,
+        maximum_destination_amount_minor: amount,
+    })
+}
+
+fn fiat_usd_transfer_plan(liability_au: MoneyAu) -> Result<FiatFxPlan> {
+    ensure!(liability_au > 0, "fiat USD liability must be positive");
+    let scale = checked_pow10_u128(stripe_currency_minor_exponent("usd")?)?;
+    let amount = exact_mul_div_floor(vec![liability_au, scale], vec![AU_PER_USD])?;
+    if amount == 0 {
+        return Ok(FiatFxPlan {
+            liability_au,
+            paid_au: 0,
+            dust_au: liability_au,
+            source_currency: "usd".to_owned(),
+            source_amount_minor: 0,
+            destination_currency: "usd".to_owned(),
+            target_destination_amount_minor: 0,
+            maximum_destination_amount_minor: 0,
+        });
+    }
+    let paid_au = exact_mul_div_floor(vec![amount, AU_PER_USD], vec![scale])?;
+    ensure!(
+        paid_au > 0 && paid_au <= liability_au,
+        "invalid paid AU for USD transfer"
+    );
+    let amount = u64::try_from(amount).context("Stripe USD transfer amount exceeds u64")?;
+    Ok(FiatFxPlan {
+        liability_au,
+        paid_au,
+        dust_au: liability_au - paid_au,
+        source_currency: "usd".to_owned(),
+        source_amount_minor: amount,
+        destination_currency: "usd".to_owned(),
+        target_destination_amount_minor: amount,
+        maximum_destination_amount_minor: amount,
+    })
+}
+
+fn fiat_provider_transfer_plan(
+    liability_au: MoneyAu,
+    source_currency: &str,
+    destination_currency: &str,
+    quote: Option<&StripeFxQuote>,
+) -> Result<FiatFxPlan> {
+    let source_currency = normalize_admin_fiat_currency(source_currency)?;
+    let destination_currency = normalize_admin_fiat_currency(destination_currency)?;
+    if source_currency == destination_currency {
+        if source_currency == "usd" {
+            ensure!(quote.is_none(), "USD settlement must not carry an FX quote");
+            fiat_usd_transfer_plan(liability_au)
+        } else {
+            fiat_same_currency_plan(
+                liability_au,
+                &source_currency,
+                quote.context("non-USD settlement is missing its FX valuation quote")?,
+            )
+        }
+    } else {
+        fiat_fx_plan(
+            liability_au,
+            &source_currency,
+            &destination_currency,
+            quote.context("cross-currency settlement is missing its FX quote")?,
+        )
+    }
+}
 
 async fn targeted_payout_liability_binding(
     rpc: &PeerRpcClient,
@@ -39726,12 +40097,10 @@ async fn build_fiat_settlement_plan(
     epoch: u64,
     at: u64,
     operator_to: &str,
-    operator_currency: &str,
 ) -> Result<FiatSettlementPlan> {
     if !is_safe_key_part(operator_to) {
         bail!("operator Stripe account is not contract-safe");
     }
-    let operator_currency = normalize_admin_fiat_currency(operator_currency)?;
     if let Some(existing) = read_state_value(rpc, &format!("settle/targeted/fiat/{epoch}")).await? {
         return Ok(FiatSettlementPlan {
             payload: existing.clone(),
@@ -39801,17 +40170,7 @@ async fn build_fiat_settlement_plan(
         let earning = liability.earning_view();
         let (_, payable_au) =
             tnk_payable_earning_state(rpc, &earning, provider, epoch, &params).await?;
-        let transferable_au = fiat_whole_minor_au(payable_au);
-        if transferable_au == 0 {
-            if payable_au > 0 {
-                skipped_providers.push(json!({
-                    "provider": liability.provider,
-                    "payout_revision": liability.revision,
-                    "au": money_au_json(payable_au),
-                    "reason": "payable amount is below one Stripe minor unit",
-                    "blocking": false,
-                }));
-            }
+        if payable_au == 0 {
             continue;
         }
         match targeted_payout_liability_binding(rpc, &liability, epoch).await {
@@ -39827,25 +40186,26 @@ async fn build_fiat_settlement_plan(
                         .as_str()
                         .context("verified fiat payout binding is missing target")?
                         .to_owned(),
-                    currency: binding["currency"]
-                        .as_str()
-                        .context("verified fiat payout binding is missing currency")
-                        .and_then(normalize_admin_fiat_currency)?,
-                    amount_minor: fiat_au_to_minor(transferable_au)?,
-                    au: transferable_au,
+                    destination_currency: Some(
+                        binding["currency"]
+                            .as_str()
+                            .context("verified fiat payout binding is missing currency")
+                            .and_then(normalize_admin_fiat_currency)?,
+                    ),
+                    liability_au: payable_au,
                 })
             }
             Ok(_) => skipped_providers.push(json!({
                 "provider": liability.provider,
                 "payout_revision": liability.revision,
-                "au": money_au_json(transferable_au),
+                "au": money_au_json(payable_au),
                 "reason": "Stripe payout binding is temporarily not ready",
                 "blocking": true,
             })),
             Err(error) => skipped_providers.push(json!({
                 "provider": liability.provider,
                 "payout_revision": liability.revision,
-                "au": money_au_json(transferable_au),
+                "au": money_au_json(payable_au),
                 "reason": error.to_string(),
                 "blocking": true,
             })),
@@ -39857,23 +40217,16 @@ async fn build_fiat_settlement_plan(
         .cum_au
         .checked_sub(fee.swept_cum_au)
         .context("fee/fiat/cum swept amount exceeds cumulative fee")?;
-    let operator_fee_au = fiat_whole_minor_au(payable_fee_au);
-    if operator_fee_au > 0 {
+    if payable_fee_au > 0 {
         outputs.push(FiatSettlementOutput {
             role: "operator_fee".to_owned(),
             provider: None,
             payout_revision: None,
             to: operator_to.to_owned(),
-            currency: operator_currency,
-            amount_minor: fiat_au_to_minor(operator_fee_au)?,
-            au: operator_fee_au,
+            destination_currency: None,
+            liability_au: payable_fee_au,
         });
     }
-    let output_values = fiat_settlement_output_values(&outputs);
-    let transfer_root = stable_value_hash(&json!({
-        "domain": "mayhem-targeted-fiat-settlement-transfer-root-v1",
-        "value": output_values,
-    }));
     let totals = fiat_settlement_output_totals(&outputs)?;
     let payload = json!({
         "op": "settle_targeted_fiat",
@@ -39881,15 +40234,23 @@ async fn build_fiat_settlement_plan(
         "at": at,
         "rail": "fiat",
         "processor": "stripe",
+        "source_currency": null,
         "operator_to": operator_to,
         "epoch_apply_hash": epoch_apply_hash,
         "stripe_transfers": [],
-        "transfer_root": transfer_root,
+        "transfer_root": null,
         "provider_count": totals.provider_count,
-        "provider_au": money_au_json(totals.provider_au),
-        "operator_fee_au": money_au_json(totals.operator_fee_au),
-        "gross_au": money_au_json(totals.gross_au),
-        "outputs": output_values,
+        "provider_liability_au": money_au_json(totals.provider_au),
+        "provider_paid_au": money_au_json(0),
+        "operator_fee_liability_au": money_au_json(totals.operator_fee_au),
+        "operator_fee_retained_au": money_au_json(0),
+        "gross_liability_au": money_au_json(totals.gross_au),
+        "gross_paid_au": money_au_json(0),
+        "rounding_au": money_au_json(totals.gross_au),
+        "dust_au": money_au_json(totals.gross_au),
+        "source_amount_minor": "0",
+        "destination_totals": [],
+        "outputs": [],
     });
 
     Ok(FiatSettlementPlan {
@@ -39908,10 +40269,11 @@ fn fiat_settlement_output_values(outputs: &[FiatSettlementOutput]) -> Vec<Value>
             let mut value = json!({
                 "role": output.role,
                 "to": output.to,
-                "currency": output.currency,
-                "amount_minor": output.amount_minor.to_string(),
-                "au": money_au_json(output.au),
+                "liability_au": money_au_json(output.liability_au),
             });
+            if let Some(currency) = output.destination_currency.as_ref() {
+                value["destination_currency"] = json!(currency);
+            }
             if let Some(provider) = output.provider.as_ref() {
                 value["provider"] = json!(provider);
                 value["payout_revision"] = json!(output
@@ -39943,12 +40305,12 @@ fn fiat_settlement_output_totals(outputs: &[FiatSettlementOutput]) -> Result<Fia
                     .checked_add(1)
                     .context("fiat settlement provider count overflow")?;
                 provider_au = provider_au
-                    .checked_add(output.au)
+                    .checked_add(output.liability_au)
                     .context("fiat settlement provider amount overflow")?;
             }
             "operator_fee" => {
                 operator_fee_au = operator_fee_au
-                    .checked_add(output.au)
+                    .checked_add(output.liability_au)
                     .context("fiat settlement operator amount overflow")?;
             }
             other => bail!("invalid fiat settlement output role {other}"),
@@ -39965,30 +40327,66 @@ fn fiat_settlement_output_totals(outputs: &[FiatSettlementOutput]) -> Result<Fia
     })
 }
 
-fn fiat_settlement_reconciliation(
-    outputs: &[FiatSettlementOutput],
-    stripe_transfers: &[Value],
-) -> Result<Value> {
-    let totals = fiat_settlement_output_totals(outputs)?;
-    let mut provider_minor = BTreeMap::<String, u128>::new();
+fn fiat_settlement_reconciliation(settlement: &Value, stripe_transfers: &[Value]) -> Result<Value> {
+    let outputs = settlement
+        .get("outputs")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let mut provider_source_minor = BTreeMap::<String, u128>::new();
+    let mut provider_destination_minor = BTreeMap::<String, u128>::new();
     let mut operator_retained_minor = BTreeMap::<String, u128>::new();
     for output in outputs {
-        let target = match output.role.as_str() {
-            "provider" => &mut provider_minor,
+        let role = output
+            .get("role")
+            .and_then(Value::as_str)
+            .context("fiat settlement evidence output is missing role")?;
+        let target = match role {
+            "provider" => &mut provider_source_minor,
             "operator_fee" => &mut operator_retained_minor,
             other => bail!("invalid fiat settlement output role {other}"),
         };
+        let currency = output
+            .get("source_currency")
+            .and_then(Value::as_str)
+            .context("fiat settlement evidence is missing source currency")?;
+        let amount = output
+            .get("source_amount_minor")
+            .and_then(Value::as_str)
+            .context("fiat settlement evidence is missing source amount")?
+            .parse::<u128>()
+            .context("fiat settlement evidence source amount is invalid")?;
         let next = target
-            .get(&output.currency)
+            .get(currency)
             .copied()
             .unwrap_or(0)
-            .checked_add(u128::from(output.amount_minor))
+            .checked_add(amount)
             .context("fiat settlement reconciliation overflow")?;
-        target.insert(output.currency.clone(), next);
+        target.insert(currency.to_owned(), next);
+        if role == "provider" {
+            let destination_currency =
+                output
+                    .get("destination_currency")
+                    .and_then(Value::as_str)
+                    .context("fiat provider evidence is missing destination currency")?;
+            let destination_amount = output
+                .get("destination_amount_minor")
+                .and_then(Value::as_str)
+                .context("fiat provider evidence is missing destination amount")?
+                .parse::<u128>()
+                .context("fiat provider destination amount is invalid")?;
+            let next = provider_destination_minor
+                .get(destination_currency)
+                .copied()
+                .unwrap_or(0)
+                .checked_add(destination_amount)
+                .context("fiat destination reconciliation overflow")?;
+            provider_destination_minor.insert(destination_currency.to_owned(), next);
+        }
     }
     let provider_output_count = outputs
         .iter()
-        .filter(|output| output.role == "provider")
+        .filter(|output| output.get("role").and_then(Value::as_str) == Some("provider"))
         .count();
     let verified_transfer_count = stripe_transfers
         .iter()
@@ -39996,10 +40394,19 @@ fn fiat_settlement_reconciliation(
         .count();
     Ok(json!({
         "denom": "au_usd",
-        "provider_au": money_au_json(totals.provider_au),
-        "operator_fee_au": money_au_json(totals.operator_fee_au),
-        "gross_au": money_au_json(totals.gross_au),
-        "provider_minor_by_currency": provider_minor
+        "provider_liability_au": settlement.get("provider_liability_au").cloned().unwrap_or_else(|| money_au_json(0)),
+        "provider_paid_au": settlement.get("provider_paid_au").cloned().unwrap_or_else(|| money_au_json(0)),
+        "operator_fee_liability_au": settlement.get("operator_fee_liability_au").cloned().unwrap_or_else(|| money_au_json(0)),
+        "operator_fee_retained_au": settlement.get("operator_fee_retained_au").cloned().unwrap_or_else(|| money_au_json(0)),
+        "gross_liability_au": settlement.get("gross_liability_au").cloned().unwrap_or_else(|| money_au_json(0)),
+        "gross_paid_au": settlement.get("gross_paid_au").cloned().unwrap_or_else(|| money_au_json(0)),
+        "rounding_au": settlement.get("rounding_au").cloned().unwrap_or_else(|| money_au_json(0)),
+        "dust_au": settlement.get("dust_au").cloned().unwrap_or_else(|| money_au_json(0)),
+        "provider_source_minor_by_currency": provider_source_minor
+            .into_iter()
+            .map(|(currency, amount)| (currency, amount.to_string()))
+            .collect::<BTreeMap<_, _>>(),
+        "provider_destination_minor_by_currency": provider_destination_minor
             .into_iter()
             .map(|(currency, amount)| (currency, amount.to_string()))
             .collect::<BTreeMap<_, _>>(),
@@ -40012,6 +40419,36 @@ fn fiat_settlement_reconciliation(
         "verified_transfer_count": verified_transfer_count,
         "all_provider_transfers_verified": verified_transfer_count == provider_output_count,
     }))
+}
+
+fn indexed_fiat_transfer_report(
+    mut report: Value,
+    output_index: usize,
+    planned_output_index: usize,
+) -> Result<Value> {
+    ensure!(
+        report.is_object(),
+        "Stripe transfer report must be a JSON object"
+    );
+    report["output_index"] = json!(output_index);
+    report["planned_output_index"] = json!(planned_output_index);
+    Ok(report)
+}
+
+fn fiat_settlement_nothing_to_settle(
+    already_settled: bool,
+    planned_output_count: usize,
+    settlement_attempted: bool,
+    settlement: &Value,
+    feature: Option<&Value>,
+) -> bool {
+    let finalized_outputs_empty = settlement
+        .get("outputs")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty);
+    !already_settled
+        && feature.is_none()
+        && (planned_output_count == 0 || (settlement_attempted && finalized_outputs_empty))
 }
 
 async fn read_fee_record(rpc: &PeerRpcClient, rail: &str) -> Result<LedgerFeeRecord> {
@@ -40033,23 +40470,14 @@ async fn read_fee_record(rpc: &PeerRpcClient, rail: &str) -> Result<LedgerFeeRec
     }
 }
 
-fn fiat_whole_minor_au(au: MoneyAu) -> MoneyAu {
-    (au / FIAT_MINOR_AU_CLI) * FIAT_MINOR_AU_CLI
-}
-
-fn fiat_au_to_minor(au: MoneyAu) -> Result<u64> {
-    if au == 0 || au % FIAT_MINOR_AU_CLI != 0 {
-        bail!("fiat settlement amount must be a positive whole Stripe minor unit");
-    }
-    u64::try_from(au / FIAT_MINOR_AU_CLI)
-        .context("fiat settlement amount exceeds Stripe u64 minor units")
-}
-
 fn stripe_transfer_idempotency_key(
     epoch: u64,
     provider: &str,
     payout_revision: &str,
     epoch_apply_hash: &str,
+    quote_id: &str,
+    source_currency: &str,
+    source_amount_minor: u64,
 ) -> Result<String> {
     if epoch == 0 {
         bail!("Stripe transfer idempotency epoch must be positive");
@@ -40063,12 +40491,26 @@ fn stripe_transfer_idempotency_key(
     if !is_hex_len(epoch_apply_hash, 64) {
         bail!("Stripe transfer idempotency apply hash must be 32-byte hex");
     }
-    Ok(format!(
-        "mayhem:fiat:targeted:v1:{epoch}:{}:{}:{}",
-        provider.to_ascii_lowercase(),
-        payout_revision.to_ascii_lowercase(),
-        epoch_apply_hash.to_ascii_lowercase()
-    ))
+    ensure!(
+        quote_id.starts_with("fxq_") && is_safe_key_part(quote_id),
+        "Stripe transfer idempotency quote id is invalid"
+    );
+    let source_currency = normalize_admin_fiat_currency(source_currency)?;
+    ensure!(
+        source_amount_minor > 0,
+        "Stripe transfer amount must be positive"
+    );
+    let attempt = stable_value_hash(&json!({
+        "domain": "mayhem-fiat-fx-transfer-attempt-v1",
+        "epoch": epoch,
+        "provider": provider.to_ascii_lowercase(),
+        "payout_revision": payout_revision.to_ascii_lowercase(),
+        "epoch_apply_hash": epoch_apply_hash.to_ascii_lowercase(),
+        "quote_id": quote_id,
+        "source_currency": source_currency,
+        "source_amount_minor": source_amount_minor.to_string(),
+    }));
+    Ok(format!("mayhem:fiat:fx:v1:{epoch}:{attempt}"))
 }
 
 fn operator_fiat_settlement_ref(epoch: u64, epoch_apply_hash: &str) -> String {
@@ -40273,18 +40715,397 @@ async fn stripe_connect_payout_status(
     unreachable!("positive max_attempts checked by caller")
 }
 
+async fn stripe_platform_account(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    secret_key: &str,
+    max_attempts: u32,
+    retry_ms: u64,
+) -> Result<StripePlatformAccount> {
+    for attempt in 1..=max_attempts {
+        let response = client
+            .get(format!("{}/v1/account", api_base_url.trim_end_matches('/')))
+            .basic_auth(secret_key, Some(""))
+            .header("Stripe-Version", STRIPE_FX_API_VERSION)
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_) if attempt < max_attempts => {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            Err(error) => return Err(error).context("retrieving Stripe platform account"),
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            if stripe_status_is_retryable(status) && attempt < max_attempts {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            bail!(
+                "Stripe platform account API returned {status}: {}",
+                stripe_api_error_message(&body)
+            );
+        }
+        let value: Value =
+            serde_json::from_str(&body).context("parsing Stripe platform account")?;
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| id.starts_with("acct_") && is_safe_key_part(id))
+            .context("Stripe platform account id is invalid")?
+            .to_owned();
+        let default_currency = value
+            .get("default_currency")
+            .and_then(Value::as_str)
+            .context("Stripe platform account is missing default_currency")
+            .and_then(normalize_admin_fiat_currency)?;
+        // Stripe's Account object does not expose `livemode`. The credential and
+        // runtime mode were already cross-checked before this authenticated read.
+        let livemode = secret_key.starts_with("sk_live_");
+        return Ok(StripePlatformAccount {
+            id,
+            default_currency,
+            livemode,
+            attempts: attempt,
+        });
+    }
+    unreachable!("positive max_attempts checked by caller")
+}
+
+fn stripe_timestamp_seconds(value: &Value, label: &str) -> Result<u64> {
+    let text = match value {
+        Value::Number(number) => number.to_string(),
+        Value::String(text) => text.clone(),
+        _ => bail!("Stripe {label} timestamp is invalid"),
+    };
+    let whole = text.split(['.', 'e', 'E']).next().unwrap_or("");
+    whole
+        .parse::<u64>()
+        .with_context(|| format!("Stripe {label} timestamp is invalid"))
+}
+
+fn stripe_fx_quote_result(value: &Value) -> Result<StripeFxQuote> {
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| id.starts_with("fxq_") && is_safe_key_part(id))
+        .context("Stripe FX quote id is invalid")?
+        .to_owned();
+    ensure!(
+        value.get("object").and_then(Value::as_str) == Some("fx_quote"),
+        "Stripe FX quote object type is invalid"
+    );
+    let created = stripe_timestamp_seconds(
+        value
+            .get("created")
+            .context("Stripe FX quote is missing created")?,
+        "FX quote created",
+    )?;
+    let expires_at = value
+        .get("lock_expires_at")
+        .filter(|value| !value.is_null())
+        .map(|value| stripe_timestamp_seconds(value, "FX quote expiry"))
+        .transpose()?;
+    let lock_duration = value
+        .get("lock_duration")
+        .and_then(Value::as_str)
+        .context("Stripe FX quote is missing lock_duration")?
+        .to_owned();
+    let lock_status = value
+        .get("lock_status")
+        .and_then(Value::as_str)
+        .context("Stripe FX quote is missing lock_status")?
+        .to_owned();
+    let to_currency = value
+        .get("to_currency")
+        .and_then(Value::as_str)
+        .context("Stripe FX quote is missing to_currency")
+        .and_then(normalize_admin_fiat_currency)?;
+    let usage_type = value
+        .pointer("/usage/type")
+        .and_then(Value::as_str)
+        .context("Stripe FX quote is missing usage.type")?
+        .to_owned();
+    ensure!(
+        matches!(usage_type.as_str(), "payment" | "transfer"),
+        "Stripe FX quote usage is invalid"
+    );
+    let usage_destination = value
+        .pointer("/usage/transfer/destination")
+        .or_else(|| value.pointer("/usage/payment/destination"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let rates_value = value
+        .get("rates")
+        .and_then(Value::as_object)
+        .context("Stripe FX quote is missing rates")?;
+    let mut rates = BTreeMap::new();
+    for (currency, rate) in rates_value {
+        let currency = normalize_admin_fiat_currency(currency)?;
+        let (exchange_rate, exchange_ratio) = stripe_decimal(
+            rate.get("exchange_rate")
+                .context("Stripe FX quote rate is missing exchange_rate")?,
+            "FX exchange_rate",
+        )?;
+        let (base_rate, base_ratio) = stripe_decimal(
+            rate.pointer("/rate_details/base_rate")
+                .context("Stripe FX quote rate is missing base_rate")?,
+            "FX base_rate",
+        )?;
+        ensure!(
+            rates
+                .insert(
+                    currency,
+                    StripeFxRate {
+                        exchange_rate,
+                        exchange_ratio,
+                        base_rate,
+                        base_ratio,
+                    },
+                )
+                .is_none(),
+            "Stripe FX quote contains duplicate rates"
+        );
+    }
+    Ok(StripeFxQuote {
+        id,
+        created,
+        expires_at,
+        lock_duration,
+        lock_status,
+        to_currency,
+        usage_type,
+        usage_destination,
+        rates,
+    })
+}
+
+fn stripe_fx_quote_evidence(quote: &StripeFxQuote) -> Result<Value> {
+    let rates = quote
+        .rates
+        .iter()
+        .map(|(currency, rate)| {
+            (
+                currency.clone(),
+                json!({
+                    "exchange_rate": rate.exchange_rate,
+                    "base_rate": rate.base_rate,
+                }),
+            )
+        })
+        .collect::<Map<String, Value>>();
+    Ok(json!({
+        "id": quote.id,
+        "created": quote.created,
+        "expires_at": quote.expires_at,
+        "lock_duration": quote.lock_duration,
+        "lock_status": quote.lock_status,
+        "to_currency": quote.to_currency,
+        "usage": {
+            "type": quote.usage_type,
+            "destination": quote.usage_destination,
+        },
+        "rates": rates,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stripe_create_fx_quote(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    secret_key: &str,
+    from_currencies: &[String],
+    to_currency: &str,
+    usage_type: &str,
+    usage_destination: Option<&str>,
+    lock_duration: &str,
+    operation_identity: &Value,
+    max_attempts: u32,
+    retry_ms: u64,
+) -> Result<StripeFxQuote> {
+    let to_currency = normalize_admin_fiat_currency(to_currency)?;
+    ensure!(
+        matches!(usage_type, "payment" | "transfer"),
+        "Stripe FX quote usage must be payment or transfer"
+    );
+    ensure!(
+        matches!(lock_duration, "none" | "five_minutes" | "hour" | "day"),
+        "Stripe FX quote lock duration is invalid"
+    );
+    if usage_type == "transfer" {
+        ensure!(
+            usage_destination
+                .is_some_and(|value| value.starts_with("acct_") && is_safe_key_part(value)),
+            "Stripe transfer FX quote requires a destination account"
+        );
+    }
+    let mut from = from_currencies
+        .iter()
+        .map(|currency| normalize_admin_fiat_currency(currency))
+        .collect::<Result<Vec<_>>>()?;
+    from.sort();
+    from.dedup();
+    ensure!(
+        !from.is_empty(),
+        "Stripe FX quote requires source currencies"
+    );
+    let mut params = vec![
+        ("to_currency", to_currency.clone()),
+        ("lock_duration", lock_duration.to_owned()),
+        ("usage[type]", usage_type.to_owned()),
+    ];
+    for currency in &from {
+        params.push(("from_currencies[]", currency.clone()));
+    }
+    if let Some(destination) = usage_destination {
+        params.push((
+            if usage_type == "transfer" {
+                "usage[transfer][destination]"
+            } else {
+                "usage[payment][destination]"
+            },
+            destination.to_owned(),
+        ));
+    }
+    let body = form_urlencoded_body(&params);
+    let generation = unix_epoch_seconds()? / 300;
+    let key_hash = stable_value_hash(&json!({
+        "domain": "mayhem-stripe-fx-quote-attempt-v1",
+        "generation": generation,
+        "operation": operation_identity,
+        "body": body,
+    }));
+    let idempotency_key = format!("mayhem:fiat:fx-quote:v1:{key_hash}");
+    for attempt in 1..=max_attempts {
+        let response = client
+            .post(format!(
+                "{}/v1/fx_quotes",
+                api_base_url.trim_end_matches('/')
+            ))
+            .basic_auth(secret_key, Some(""))
+            .header("Stripe-Version", STRIPE_FX_API_VERSION)
+            .header("Idempotency-Key", &idempotency_key)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(body.clone())
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_) if attempt < max_attempts => {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            Err(error) => return Err(error).context("creating Stripe FX quote"),
+        };
+        let status = response.status();
+        let response_body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            if stripe_status_is_retryable(status) && attempt < max_attempts {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            bail!(
+                "Stripe FX quote API returned {status}: {}",
+                stripe_api_error_message(&response_body)
+            );
+        }
+        let value: Value =
+            serde_json::from_str(&response_body).context("parsing Stripe FX quote response")?;
+        let quote = stripe_fx_quote_result(&value)?;
+        ensure!(
+            quote.to_currency == to_currency
+                && quote.usage_type == usage_type
+                && quote.usage_destination.as_deref() == usage_destination,
+            "Stripe FX quote response does not match its request"
+        );
+        if lock_duration == "none" {
+            ensure!(
+                quote.lock_status == "none",
+                "unlocked Stripe FX quote is not usable"
+            );
+        } else {
+            let now = unix_epoch_seconds()?;
+            ensure!(
+                quote.lock_status == "active"
+                    && quote
+                        .expires_at
+                        .is_some_and(|expires| expires > now.saturating_add(15)),
+                "Stripe FX quote is not active long enough to create a transfer"
+            );
+        }
+        return Ok(quote);
+    }
+    unreachable!("positive max_attempts checked by caller")
+}
+
+async fn stripe_retrieve_fx_quote(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    secret_key: &str,
+    quote_id: &str,
+    max_attempts: u32,
+    retry_ms: u64,
+) -> Result<StripeFxQuote> {
+    ensure!(
+        quote_id.starts_with("fxq_") && is_safe_key_part(quote_id),
+        "invalid FX quote id"
+    );
+    for attempt in 1..=max_attempts {
+        let response = client
+            .get(format!(
+                "{}/v1/fx_quotes/{quote_id}",
+                api_base_url.trim_end_matches('/')
+            ))
+            .basic_auth(secret_key, Some(""))
+            .header("Stripe-Version", STRIPE_FX_API_VERSION)
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_) if attempt < max_attempts => {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            Err(error) => return Err(error).context("retrieving Stripe FX quote"),
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            if stripe_status_is_retryable(status) && attempt < max_attempts {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            bail!(
+                "Stripe FX quote retrieval returned {status}: {}",
+                stripe_api_error_message(&body)
+            );
+        }
+        let value: Value = serde_json::from_str(&body).context("parsing Stripe FX quote")?;
+        let quote = stripe_fx_quote_result(&value)?;
+        ensure!(
+            quote.id == quote_id,
+            "Stripe FX quote retrieval id mismatch"
+        );
+        return Ok(quote);
+    }
+    unreachable!("positive max_attempts checked by caller")
+}
+
 async fn stripe_create_transfer_verified(
     client: &reqwest::Client,
     api_base_url: &str,
     secret_key: &str,
+    platform: &StripePlatformAccount,
     output: &FiatSettlementOutput,
-    idempotency_key: &str,
     epoch: u64,
     output_index: usize,
     epoch_apply_hash: &str,
     max_attempts: u32,
     retry_ms: u64,
-) -> Result<StripeTransferResult> {
+) -> Result<Option<StripeVerifiedTransfer>> {
     let provider = output
         .provider
         .as_deref()
@@ -40293,29 +41114,16 @@ async fn stripe_create_transfer_verified(
         .payout_revision
         .as_deref()
         .context("Stripe provider transfer output missing payout revision")?;
+    let destination_currency = output
+        .destination_currency
+        .as_deref()
+        .context("Stripe provider transfer output missing destination currency")?;
+    let source_currency = platform.default_currency.as_str();
+    let quote_is_applied = source_currency != destination_currency;
     let transfer_group = format!(
         "mayhem_fiat_epoch_{epoch}_{}",
         epoch_apply_hash.get(..16).unwrap_or(epoch_apply_hash)
     );
-    let params = [
-        ("amount", output.amount_minor.to_string()),
-        ("currency", output.currency.clone()),
-        ("destination", output.to.clone()),
-        ("transfer_group", transfer_group.clone()),
-        ("metadata[mayhem_provider]", provider.to_owned()),
-        (
-            "metadata[mayhem_payout_revision]",
-            payout_revision.to_owned(),
-        ),
-        ("metadata[mayhem_au]", output.au.to_string()),
-        ("metadata[mayhem_epoch]", epoch.to_string()),
-        ("metadata[mayhem_output_index]", output_index.to_string()),
-        (
-            "metadata[mayhem_epoch_apply_hash]",
-            epoch_apply_hash.to_owned(),
-        ),
-    ];
-    let form = form_urlencoded_body(&params);
     let recovered = stripe_find_existing_transfer(
         client,
         api_base_url,
@@ -40331,11 +41139,125 @@ async fn stripe_create_transfer_verified(
         retry_ms,
     )
     .await?;
-    let (created, attempts) = if let Some(mut recovered) = recovered {
-        recovered.recovered = true;
-        (recovered, 0)
+    let (created, quote, fx, attempts, recovered) = if let Some(recovered) = recovered {
+        let created = stripe_retrieve_transfer(
+            client,
+            api_base_url,
+            secret_key,
+            &recovered.id,
+            0,
+            max_attempts,
+            retry_ms,
+        )
+        .await?;
+        let quote = if let Some(quote_id) = created.metadata_fx_quote.as_deref() {
+            Some(
+                stripe_retrieve_fx_quote(
+                    client,
+                    api_base_url,
+                    secret_key,
+                    quote_id,
+                    max_attempts,
+                    retry_ms,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+        let fx = fiat_provider_transfer_plan(
+            output.liability_au,
+            source_currency,
+            destination_currency,
+            quote.as_ref(),
+        )?;
+        (created, quote, fx, 0, true)
     } else {
-        let mut created = None;
+        let quote = if source_currency == "usd" && destination_currency == "usd" {
+            None
+        } else {
+            let mut from_currencies = if source_currency == destination_currency {
+                vec!["usd".to_owned()]
+            } else {
+                vec!["usd".to_owned(), source_currency.to_owned()]
+            };
+            from_currencies.retain(|currency| currency != destination_currency);
+            Some(
+                stripe_create_fx_quote(
+                    client,
+                    api_base_url,
+                    secret_key,
+                    &from_currencies,
+                    destination_currency,
+                    "transfer",
+                    Some(&output.to),
+                    STRIPE_FX_QUOTE_LOCK_DURATION,
+                    &json!({
+                        "epoch": epoch,
+                        "provider": provider,
+                        "payout_revision": payout_revision,
+                        "epoch_apply_hash": epoch_apply_hash,
+                        "liability_au": money_au_json(output.liability_au),
+                    }),
+                    max_attempts,
+                    retry_ms,
+                )
+                .await?,
+            )
+        };
+        let fx = fiat_provider_transfer_plan(
+            output.liability_au,
+            source_currency,
+            destination_currency,
+            quote.as_ref(),
+        )?;
+        if fx.source_amount_minor == 0 {
+            return Ok(None);
+        }
+        let quote_identity = quote
+            .as_ref()
+            .map_or("direct-usd", |quote| quote.id.as_str());
+        let idempotency_key = stripe_transfer_idempotency_key(
+            epoch,
+            provider,
+            payout_revision,
+            epoch_apply_hash,
+            quote_identity,
+            &fx.source_currency,
+            fx.source_amount_minor,
+        )?;
+        let mut params = vec![
+            ("amount", fx.source_amount_minor.to_string()),
+            ("currency", fx.source_currency.clone()),
+            ("destination", output.to.clone()),
+            ("transfer_group", transfer_group.clone()),
+            ("metadata[mayhem_schema]", "fiat_fx_v1".to_owned()),
+            ("metadata[mayhem_provider]", provider.to_owned()),
+            (
+                "metadata[mayhem_payout_revision]",
+                payout_revision.to_owned(),
+            ),
+            (
+                "metadata[mayhem_liability_au]",
+                output.liability_au.to_string(),
+            ),
+            ("metadata[mayhem_paid_au]", fx.paid_au.to_string()),
+            ("metadata[mayhem_fx_quote]", quote_identity.to_owned()),
+            ("metadata[mayhem_epoch]", epoch.to_string()),
+            ("metadata[mayhem_output_index]", output_index.to_string()),
+            (
+                "metadata[mayhem_epoch_apply_hash]",
+                epoch_apply_hash.to_owned(),
+            ),
+        ];
+        if quote_is_applied {
+            let quote = quote
+                .as_ref()
+                .context("cross-currency Stripe transfer is missing its FX quote")?;
+            params.push(("fx_quote", quote.id.clone()));
+        }
+        let form = form_urlencoded_body(&params);
+        let mut created_id = None;
         for attempt in 1..=max_attempts {
             let response = client
                 .post(format!(
@@ -40343,7 +41265,8 @@ async fn stripe_create_transfer_verified(
                     api_base_url.trim_end_matches('/')
                 ))
                 .basic_auth(secret_key, Some(""))
-                .header("Idempotency-Key", idempotency_key)
+                .header("Stripe-Version", STRIPE_FX_API_VERSION)
+                .header("Idempotency-Key", &idempotency_key)
                 .header("content-type", "application/x-www-form-urlencoded")
                 .body(form.clone())
                 .send()
@@ -40370,76 +41293,121 @@ async fn stripe_create_transfer_verified(
             }
             let value: Value =
                 serde_json::from_str(&body).context("parsing Stripe transfer response")?;
-            created = Some(stripe_transfer_result(&value, attempt)?);
+            created_id = Some((stripe_transfer_result(&value, attempt)?.id, attempt));
             break;
         }
-        let created = created.context("Stripe transfer attempts were exhausted")?;
-        let attempts = created.attempts;
-        (created, attempts)
-    };
-    if created.transfer_group.as_deref() != Some(&transfer_group) {
-        bail!("Stripe transfer response transfer_group mismatch");
-    }
-
-    let mut verified = None;
-    let mut verified_identity = false;
-    for attempt in 1..=max_attempts {
-        let response = client
-            .get(format!(
-                "{}/v1/transfers/{}",
-                api_base_url.trim_end_matches('/'),
-                created.id
-            ))
-            .basic_auth(secret_key, Some(""))
-            .send()
-            .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(_error) if attempt < max_attempts => {
-                stripe_retry_sleep(retry_ms, attempt).await;
-                continue;
-            }
-            Err(error) => return Err(error).context("verifying Stripe transfer"),
+        let (created_id, attempts) =
+            created_id.context("Stripe transfer attempts were exhausted")?;
+        let created = stripe_retrieve_transfer(
+            client,
+            api_base_url,
+            secret_key,
+            &created_id,
+            attempts,
+            max_attempts,
+            retry_ms,
+        )
+        .await?;
+        let quote = if let Some(quote_id) = created.metadata_fx_quote.as_deref() {
+            Some(
+                stripe_retrieve_fx_quote(
+                    client,
+                    api_base_url,
+                    secret_key,
+                    quote_id,
+                    max_attempts,
+                    retry_ms,
+                )
+                .await?,
+            )
+        } else {
+            None
         };
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            if stripe_status_is_retryable(status) && attempt < max_attempts {
-                stripe_retry_sleep(retry_ms, attempt).await;
-                continue;
-            }
-            bail!(
-                "Stripe transfer verification returned {status}: {}",
-                stripe_api_error_message(&body)
-            );
-        }
-        let value: Value =
-            serde_json::from_str(&body).context("parsing Stripe transfer verification")?;
-        verified_identity = stripe_transfer_has_identity(
-            &value,
+        let fx = fiat_provider_transfer_plan(
+            output.liability_au,
+            source_currency,
+            destination_currency,
+            quote.as_ref(),
+        )?;
+        (created, quote, fx, attempts, false)
+    };
+    let expected_applied_quote = quote_is_applied
+        .then(|| quote.as_ref().map(|quote| quote.id.as_str()))
+        .flatten();
+    if created.destination != output.to
+        || created.source_currency != fx.source_currency
+        || created.source_amount_minor != fx.source_amount_minor
+        || created.fx_quote.as_deref() != expected_applied_quote
+        || created.transfer_group.as_deref() != Some(&transfer_group)
+        || created.reversed
+        || created.amount_reversed != 0
+        || !stripe_transfer_has_identity(
+            &created,
             provider,
             payout_revision,
-            output.au,
+            output.liability_au,
+            fx.paid_au,
             epoch,
             output_index,
             epoch_apply_hash,
-        );
-        verified = Some(stripe_transfer_result(&value, attempts)?);
-        break;
-    }
-    let mut verified = verified.context("Stripe transfer verification attempts were exhausted")?;
-    if verified.id != created.id
-        || verified.destination != output.to
-        || verified.currency != output.currency
-        || verified.amount_minor != output.amount_minor
-        || verified.transfer_group.as_deref() != Some(&transfer_group)
-        || !verified_identity
+        )
     {
         bail!("Stripe transfer verification did not match the planned output");
     }
-    verified.verified = true;
-    verified.recovered = created.recovered;
-    Ok(verified)
+    if let Some(quote) = quote.as_ref() {
+        ensure!(
+            quote.usage_type == "transfer"
+                && quote.usage_destination.as_deref() == Some(output.to.as_str()),
+            "Stripe FX quote is not bound to the provider destination"
+        );
+    }
+    let destination_payment = stripe_retrieve_destination_payment(
+        client,
+        api_base_url,
+        secret_key,
+        &output.to,
+        &created.destination_payment,
+        max_attempts,
+        retry_ms,
+    )
+    .await?;
+    let destination_rate_matches = if fx.source_currency == fx.destination_currency {
+        destination_payment.exchange_rate.is_none()
+    } else {
+        let observed = destination_payment
+            .exchange_rate
+            .as_deref()
+            .context("Stripe destination conversion is missing exchange_rate")
+            .and_then(parse_exact_decimal_ratio)?;
+        let expected = quote
+            .as_ref()
+            .and_then(|quote| quote.rates.get(&fx.source_currency))
+            .context("Stripe FX quote is missing its source base rate")?
+            .base_ratio;
+        observed == expected
+    };
+    ensure!(
+        destination_payment.source_transfer == created.id
+            && destination_payment.source_currency == created.source_currency
+            && destination_payment.source_amount_minor == created.source_amount_minor
+            && destination_payment.currency == fx.destination_currency
+            && destination_payment.amount_minor >= fx.target_destination_amount_minor
+            && destination_payment.amount_minor <= fx.maximum_destination_amount_minor
+            && destination_rate_matches
+            && destination_payment.paid
+            && destination_payment.captured,
+        "Stripe destination payment did not match the fiat settlement"
+    );
+    let mut transfer = created;
+    transfer.verified = true;
+    transfer.recovered = recovered;
+    transfer.attempts = attempts;
+    Ok(Some(StripeVerifiedTransfer {
+        transfer,
+        destination_payment,
+        quote,
+        fx,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -40457,104 +41425,125 @@ async fn stripe_find_existing_transfer(
     max_attempts: u32,
     retry_ms: u64,
 ) -> Result<Option<StripeTransferResult>> {
-    for attempt in 1..=max_attempts {
-        let response = client
-            .get(format!(
-                "{}/v1/transfers",
-                api_base_url.trim_end_matches('/')
-            ))
-            .basic_auth(secret_key, Some(""))
-            .query(&[
-                ("transfer_group", transfer_group),
-                ("destination", output.to.as_str()),
-                ("limit", "100"),
-            ])
-            .send()
-            .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(_error) if attempt < max_attempts => {
-                stripe_retry_sleep(retry_ms, attempt).await;
-                continue;
+    let mut starting_after = None::<String>;
+    let mut found = None;
+    for page in 0..10_000_u32 {
+        let mut value = None;
+        for attempt in 1..=max_attempts {
+            let mut query = vec![
+                ("transfer_group".to_owned(), transfer_group.to_owned()),
+                ("destination".to_owned(), output.to.clone()),
+                ("limit".to_owned(), "100".to_owned()),
+            ];
+            if let Some(cursor) = starting_after.as_ref() {
+                query.push(("starting_after".to_owned(), cursor.clone()));
             }
-            Err(error) => return Err(error).context("reconciling existing Stripe transfers"),
-        };
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            if stripe_status_is_retryable(status) && attempt < max_attempts {
-                stripe_retry_sleep(retry_ms, attempt).await;
-                continue;
+            let response = client
+                .get(format!(
+                    "{}/v1/transfers",
+                    api_base_url.trim_end_matches('/')
+                ))
+                .basic_auth(secret_key, Some(""))
+                .header("Stripe-Version", STRIPE_FX_API_VERSION)
+                .query(&query)
+                .send()
+                .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(_) if attempt < max_attempts => {
+                    stripe_retry_sleep(retry_ms, attempt).await;
+                    continue;
+                }
+                Err(error) => return Err(error).context("reconciling existing Stripe transfers"),
+            };
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            if !status.is_success() {
+                if stripe_status_is_retryable(status) && attempt < max_attempts {
+                    stripe_retry_sleep(retry_ms, attempt).await;
+                    continue;
+                }
+                bail!(
+                    "Stripe transfer reconciliation returned {status}: {}",
+                    stripe_api_error_message(&body)
+                );
             }
-            bail!(
-                "Stripe transfer reconciliation returned {status}: {}",
-                stripe_api_error_message(&body)
+            value = Some(
+                serde_json::from_str::<Value>(&body)
+                    .context("parsing Stripe transfer reconciliation")?,
             );
+            break;
         }
-        let value: Value =
-            serde_json::from_str(&body).context("parsing Stripe transfer reconciliation")?;
-        if value.get("has_more").and_then(Value::as_bool) == Some(true) {
-            bail!("Stripe transfer reconciliation exceeded one 100-transfer destination page");
-        }
+        let value = value.context("Stripe transfer reconciliation attempts were exhausted")?;
         let transfers = value
             .get("data")
             .and_then(Value::as_array)
             .context("Stripe transfer reconciliation missing data")?;
-        let matches = transfers
-            .iter()
-            .filter(|candidate| {
-                stripe_transfer_has_identity(
-                    candidate,
-                    provider,
-                    payout_revision,
-                    output.au,
-                    epoch,
-                    output_index,
-                    epoch_apply_hash,
-                )
-            })
-            .collect::<Vec<_>>();
-        if matches.len() > 1 {
-            bail!("Stripe has duplicate transfers for one Mayhem settlement output");
+        for candidate in transfers {
+            if stripe_transfer_metadata_has_liability_identity(
+                candidate,
+                provider,
+                payout_revision,
+                output.liability_au,
+                epoch,
+                output_index,
+                epoch_apply_hash,
+            ) {
+                ensure!(
+                    found.is_none(),
+                    "Stripe has duplicate transfers for one Mayhem settlement output"
+                );
+                found = Some(stripe_transfer_result(candidate, 0)?);
+            }
         }
-        let Some(value) = matches.first() else {
-            return Ok(None);
-        };
-        let mut transfer = stripe_transfer_result(value, 0)?;
-        if transfer.destination != output.to
-            || transfer.currency != output.currency
-            || transfer.amount_minor != output.amount_minor
-            || transfer.transfer_group.as_deref() != Some(transfer_group)
-        {
-            bail!("existing Stripe transfer identity conflicts with the planned output");
+        if value.get("has_more").and_then(Value::as_bool) != Some(true) {
+            return Ok(found);
         }
-        transfer.recovered = true;
-        return Ok(Some(transfer));
+        let next = transfers
+            .last()
+            .and_then(|entry| entry.get("id"))
+            .and_then(Value::as_str)
+            .context("Stripe paginated transfer response has no cursor")?;
+        ensure!(
+            starting_after.as_deref() != Some(next),
+            "Stripe transfer pagination did not advance"
+        );
+        starting_after = Some(next.to_owned());
+        if page == 9_999 {
+            bail!("Stripe transfer reconciliation exceeded the fail-closed page bound");
+        }
     }
-    unreachable!("positive max_attempts checked by caller")
+    unreachable!("bounded Stripe pagination returns or fails")
 }
 
-fn stripe_transfer_has_identity(
+fn stripe_transfer_metadata_has_liability_identity(
     value: &Value,
     provider: &str,
     payout_revision: &str,
-    au: MoneyAu,
+    liability_au: MoneyAu,
     epoch: u64,
     output_index: usize,
     epoch_apply_hash: &str,
 ) -> bool {
-    let au = au.to_string();
+    let liability_au = liability_au.to_string();
     let epoch = epoch.to_string();
     let output_index = output_index.to_string();
     value
-        .pointer("/metadata/mayhem_provider")
+        .pointer("/metadata/mayhem_schema")
         .and_then(Value::as_str)
-        == Some(provider)
+        == Some("fiat_fx_v1")
+        && value
+            .pointer("/metadata/mayhem_provider")
+            .and_then(Value::as_str)
+            == Some(provider)
         && value
             .pointer("/metadata/mayhem_payout_revision")
             .and_then(Value::as_str)
             == Some(payout_revision)
-        && value.pointer("/metadata/mayhem_au").and_then(Value::as_str) == Some(au.as_str())
+        && value
+            .pointer("/metadata/mayhem_liability_au")
+            .and_then(Value::as_str)
+            == Some(liability_au.as_str())
         && value
             .pointer("/metadata/mayhem_epoch")
             .and_then(Value::as_str)
@@ -40569,6 +41558,25 @@ fn stripe_transfer_has_identity(
             == Some(epoch_apply_hash)
 }
 
+fn stripe_transfer_has_identity(
+    value: &StripeTransferResult,
+    provider: &str,
+    payout_revision: &str,
+    liability_au: MoneyAu,
+    paid_au: MoneyAu,
+    epoch: u64,
+    output_index: usize,
+    epoch_apply_hash: &str,
+) -> bool {
+    value.metadata_provider == provider
+        && value.metadata_payout_revision == payout_revision
+        && value.metadata_liability_au == liability_au
+        && value.metadata_paid_au == paid_au
+        && value.metadata_epoch == epoch
+        && value.metadata_output_index == output_index
+        && value.metadata_epoch_apply_hash == epoch_apply_hash
+}
+
 fn stripe_transfer_result(value: &Value, attempts: u32) -> Result<StripeTransferResult> {
     let id = value
         .get("id")
@@ -40576,11 +41584,11 @@ fn stripe_transfer_result(value: &Value, attempts: u32) -> Result<StripeTransfer
         .filter(|value| value.starts_with("tr_"))
         .context("Stripe transfer response missing transfer id")?
         .to_owned();
-    let amount_minor = value
+    let source_amount_minor = value
         .get("amount")
         .and_then(Value::as_u64)
         .context("Stripe transfer response missing amount")?;
-    let currency = value
+    let source_currency = value
         .get("currency")
         .and_then(Value::as_str)
         .context("Stripe transfer response missing currency")
@@ -40590,19 +41598,725 @@ fn stripe_transfer_result(value: &Value, attempts: u32) -> Result<StripeTransfer
         .and_then(Value::as_str)
         .context("Stripe transfer response missing destination")?
         .to_owned();
+    let destination_payment = value
+        .get("destination_payment")
+        .and_then(Value::as_str)
+        .filter(|id| id.starts_with("py_") && is_safe_key_part(id))
+        .context("Stripe transfer response missing destination_payment")?
+        .to_owned();
+    let balance_transaction = value
+        .get("balance_transaction")
+        .and_then(Value::as_str)
+        .filter(|id| id.starts_with("txn_") && is_safe_key_part(id))
+        .context("Stripe transfer response missing balance_transaction")?
+        .to_owned();
+    let fx_quote = value
+        .get("fx_quote")
+        .filter(|quote| !quote.is_null())
+        .map(|quote| {
+            quote
+                .as_str()
+                .or_else(|| quote.get("id").and_then(Value::as_str))
+                .filter(|id| id.starts_with("fxq_") && is_safe_key_part(id))
+                .context("Stripe transfer response has an invalid fx_quote")
+                .map(str::to_owned)
+        })
+        .transpose()?;
+    let created = stripe_timestamp_seconds(
+        value
+            .get("created")
+            .context("Stripe transfer response missing created")?,
+        "transfer created",
+    )?;
+    let reversed = value
+        .get("reversed")
+        .and_then(Value::as_bool)
+        .context("Stripe transfer response missing reversed")?;
+    let amount_reversed = value
+        .get("amount_reversed")
+        .and_then(Value::as_u64)
+        .context("Stripe transfer response missing amount_reversed")?;
+    ensure!(
+        value
+            .pointer("/metadata/mayhem_schema")
+            .and_then(Value::as_str)
+            == Some("fiat_fx_v1"),
+        "Stripe transfer metadata schema is invalid"
+    );
+    let metadata_provider = value
+        .pointer("/metadata/mayhem_provider")
+        .and_then(Value::as_str)
+        .filter(|provider| is_hex_len(provider, 64))
+        .context("Stripe transfer metadata provider is invalid")?
+        .to_owned();
+    let metadata_payout_revision = value
+        .pointer("/metadata/mayhem_payout_revision")
+        .and_then(Value::as_str)
+        .filter(|revision| is_hex_len(revision, 64))
+        .context("Stripe transfer metadata payout revision is invalid")?
+        .to_owned();
+    let metadata_liability_au = value
+        .pointer("/metadata/mayhem_liability_au")
+        .and_then(Value::as_str)
+        .context("Stripe transfer metadata liability is missing")
+        .and_then(parse_decimal_money_au)?;
+    let metadata_paid_au = value
+        .pointer("/metadata/mayhem_paid_au")
+        .and_then(Value::as_str)
+        .context("Stripe transfer metadata paid amount is missing")
+        .and_then(parse_decimal_money_au)?;
+    let metadata_fx_quote = match value
+        .pointer("/metadata/mayhem_fx_quote")
+        .and_then(Value::as_str)
+        .context("Stripe transfer metadata FX quote identity is missing")?
+    {
+        "direct-usd" => None,
+        quote if quote.starts_with("fxq_") && is_safe_key_part(quote) => Some(quote.to_owned()),
+        _ => bail!("Stripe transfer metadata FX quote identity is invalid"),
+    };
+    let metadata_epoch = value
+        .pointer("/metadata/mayhem_epoch")
+        .and_then(Value::as_str)
+        .context("Stripe transfer metadata epoch is missing")?
+        .parse::<u64>()
+        .context("Stripe transfer metadata epoch is invalid")?;
+    let metadata_output_index = value
+        .pointer("/metadata/mayhem_output_index")
+        .and_then(Value::as_str)
+        .context("Stripe transfer metadata output index is missing")?
+        .parse::<usize>()
+        .context("Stripe transfer metadata output index is invalid")?;
+    let metadata_epoch_apply_hash = value
+        .pointer("/metadata/mayhem_epoch_apply_hash")
+        .and_then(Value::as_str)
+        .filter(|hash| is_hex_len(hash, 64))
+        .context("Stripe transfer metadata apply hash is invalid")?
+        .to_owned();
     Ok(StripeTransferResult {
         id,
-        amount_minor,
-        currency,
+        source_amount_minor,
+        source_currency,
         destination,
+        destination_payment,
+        balance_transaction,
+        fx_quote,
+        created,
+        reversed,
+        amount_reversed,
         transfer_group: value
             .get("transfer_group")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        metadata_provider,
+        metadata_payout_revision,
+        metadata_liability_au,
+        metadata_paid_au,
+        metadata_fx_quote,
+        metadata_epoch,
+        metadata_output_index,
+        metadata_epoch_apply_hash,
         verified: false,
         recovered: false,
         attempts,
     })
+}
+
+async fn stripe_retrieve_transfer(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    secret_key: &str,
+    transfer_id: &str,
+    attempts: u32,
+    max_attempts: u32,
+    retry_ms: u64,
+) -> Result<StripeTransferResult> {
+    ensure!(
+        transfer_id.starts_with("tr_") && is_safe_key_part(transfer_id),
+        "invalid transfer id"
+    );
+    for attempt in 1..=max_attempts {
+        let response = client
+            .get(format!(
+                "{}/v1/transfers/{transfer_id}",
+                api_base_url.trim_end_matches('/')
+            ))
+            .basic_auth(secret_key, Some(""))
+            .header("Stripe-Version", STRIPE_FX_API_VERSION)
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_) if attempt < max_attempts => {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            Err(error) => return Err(error).context("retrieving Stripe transfer"),
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            if stripe_status_is_retryable(status) && attempt < max_attempts {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            bail!(
+                "Stripe transfer retrieval returned {status}: {}",
+                stripe_api_error_message(&body)
+            );
+        }
+        let value: Value = serde_json::from_str(&body).context("parsing Stripe transfer")?;
+        ensure!(
+            value.get("id").and_then(Value::as_str) == Some(transfer_id),
+            "Stripe transfer retrieval id mismatch"
+        );
+        return stripe_transfer_result(&value, attempts);
+    }
+    unreachable!("positive max_attempts checked by caller")
+}
+
+async fn stripe_retrieve_destination_payment(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    secret_key: &str,
+    account_id: &str,
+    payment_id: &str,
+    max_attempts: u32,
+    retry_ms: u64,
+) -> Result<StripeDestinationPaymentResult> {
+    ensure!(
+        account_id.starts_with("acct_") && is_safe_key_part(account_id),
+        "invalid connected account id"
+    );
+    ensure!(
+        payment_id.starts_with("py_") && is_safe_key_part(payment_id),
+        "invalid destination payment id"
+    );
+    for attempt in 1..=max_attempts {
+        let response = client
+            .get(format!(
+                "{}/v1/charges/{payment_id}",
+                api_base_url.trim_end_matches('/')
+            ))
+            .basic_auth(secret_key, Some(""))
+            .header("Stripe-Version", STRIPE_FX_API_VERSION)
+            .header("Stripe-Account", account_id)
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_) if attempt < max_attempts => {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            Err(error) => return Err(error).context("retrieving Stripe destination payment"),
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            if stripe_status_is_retryable(status) && attempt < max_attempts {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            bail!(
+                "Stripe destination payment retrieval returned {status}: {}",
+                stripe_api_error_message(&body)
+            );
+        }
+        let value: Value =
+            serde_json::from_str(&body).context("parsing Stripe destination payment")?;
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| *id == payment_id)
+            .context("Stripe destination payment id mismatch")?
+            .to_owned();
+        let source_amount_minor = value
+            .get("amount")
+            .and_then(Value::as_u64)
+            .context("Stripe destination payment missing amount")?;
+        let source_currency = value
+            .get("currency")
+            .and_then(Value::as_str)
+            .context("Stripe destination payment missing currency")
+            .and_then(normalize_admin_fiat_currency)?;
+        let paid = value.get("paid").and_then(Value::as_bool).unwrap_or(false);
+        let captured = value
+            .get("captured")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let source_transfer = value
+            .get("source_transfer")
+            .and_then(Value::as_str)
+            .filter(|id| id.starts_with("tr_") && is_safe_key_part(id))
+            .context("Stripe destination payment missing source_transfer")?
+            .to_owned();
+        let balance_transaction = value
+            .get("balance_transaction")
+            .and_then(Value::as_str)
+            .filter(|id| id.starts_with("txn_") && is_safe_key_part(id))
+            .context("Stripe destination payment missing balance_transaction")?
+            .to_owned();
+        let destination = stripe_retrieve_destination_balance_transaction(
+            client,
+            api_base_url,
+            secret_key,
+            account_id,
+            &balance_transaction,
+            &id,
+            max_attempts,
+            retry_ms,
+        )
+        .await?;
+        return Ok(StripeDestinationPaymentResult {
+            id,
+            source_amount_minor,
+            source_currency,
+            amount_minor: destination.net_minor,
+            gross_amount_minor: destination.amount_minor,
+            currency: destination.currency,
+            fee_minor: destination.fee_minor,
+            net_minor: destination.net_minor,
+            exchange_rate: destination.exchange_rate,
+            paid,
+            captured,
+            source_transfer,
+            balance_transaction,
+        });
+    }
+    unreachable!("positive max_attempts checked by caller")
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stripe_retrieve_destination_balance_transaction(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    secret_key: &str,
+    account_id: &str,
+    balance_transaction_id: &str,
+    payment_id: &str,
+    max_attempts: u32,
+    retry_ms: u64,
+) -> Result<StripeDestinationBalanceTransaction> {
+    for attempt in 1..=max_attempts {
+        let response = client
+            .get(format!(
+                "{}/v1/balance_transactions/{balance_transaction_id}",
+                api_base_url.trim_end_matches('/')
+            ))
+            .basic_auth(secret_key, Some(""))
+            .header("Stripe-Version", STRIPE_FX_API_VERSION)
+            .header("Stripe-Account", account_id)
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_) if attempt < max_attempts => {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            Err(error) => {
+                return Err(error).context("retrieving Stripe destination balance transaction")
+            }
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            if stripe_status_is_retryable(status) && attempt < max_attempts {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            bail!(
+                "Stripe destination balance transaction returned {status}: {}",
+                stripe_api_error_message(&body)
+            );
+        }
+        let value: Value = serde_json::from_str(&body)
+            .context("parsing Stripe destination balance transaction")?;
+        ensure!(
+            value.get("id").and_then(Value::as_str) == Some(balance_transaction_id)
+                && value.get("object").and_then(Value::as_str) == Some("balance_transaction")
+                && value.get("type").and_then(Value::as_str) == Some("payment")
+                && value.get("source").and_then(Value::as_str) == Some(payment_id),
+            "Stripe destination balance transaction identity is invalid"
+        );
+        let amount_minor = value
+            .get("amount")
+            .and_then(Value::as_u64)
+            .filter(|amount| *amount > 0)
+            .context("Stripe destination balance transaction amount is invalid")?;
+        let currency = value
+            .get("currency")
+            .and_then(Value::as_str)
+            .context("Stripe destination balance transaction currency is missing")
+            .and_then(normalize_admin_fiat_currency)?;
+        let fee_minor = value
+            .get("fee")
+            .and_then(Value::as_u64)
+            .context("Stripe destination balance transaction fee is invalid")?;
+        let net_minor = value
+            .get("net")
+            .and_then(Value::as_u64)
+            .context("Stripe destination balance transaction net is invalid")?;
+        ensure!(
+            net_minor.checked_add(fee_minor) == Some(amount_minor),
+            "Stripe destination balance transaction does not balance"
+        );
+        let exchange_rate = value
+            .get("exchange_rate")
+            .filter(|rate| !rate.is_null())
+            .map(|rate| stripe_decimal(rate, "destination exchange_rate").map(|(text, _)| text))
+            .transpose()?;
+        return Ok(StripeDestinationBalanceTransaction {
+            amount_minor,
+            currency,
+            fee_minor,
+            net_minor,
+            exchange_rate,
+        });
+    }
+    unreachable!("positive max_attempts checked by caller")
+}
+
+fn stripe_fx_quote_hash(quote: &StripeFxQuote) -> Result<String> {
+    Ok(stable_value_hash(&json!({
+        "domain": "mayhem-stripe-fx-quote-evidence-v1",
+        "value": stripe_fx_quote_evidence(quote)?,
+    })))
+}
+
+fn fiat_fx_plan_report(plan: &FiatFxPlan) -> Value {
+    json!({
+        "liability_au": money_au_json(plan.liability_au),
+        "paid_au": money_au_json(plan.paid_au),
+        "rounding_au": money_au_json(plan.dust_au),
+        "dust_au": money_au_json(plan.dust_au),
+        "source_currency": plan.source_currency,
+        "source_amount_minor": plan.source_amount_minor.to_string(),
+        "destination_currency": plan.destination_currency,
+        "target_destination_amount_minor": plan.target_destination_amount_minor.to_string(),
+        "maximum_destination_amount_minor": plan.maximum_destination_amount_minor.to_string(),
+    })
+}
+
+fn fiat_provider_settlement_output(
+    output: &FiatSettlementOutput,
+    verified: &StripeVerifiedTransfer,
+) -> Result<Value> {
+    let provider = output
+        .provider
+        .as_deref()
+        .context("Stripe provider output is missing provider")?;
+    let payout_revision = output
+        .payout_revision
+        .as_deref()
+        .context("Stripe provider output is missing payout revision")?;
+    let quote_hash = verified
+        .quote
+        .as_ref()
+        .map(stripe_fx_quote_hash)
+        .transpose()?;
+    Ok(json!({
+        "role": "provider",
+        "provider": provider,
+        "payout_revision": payout_revision,
+        "to": output.to,
+        "liability_au": money_au_json(verified.fx.liability_au),
+        "paid_au": money_au_json(verified.fx.paid_au),
+        "rounding_au": money_au_json(verified.fx.dust_au),
+        "dust_au": money_au_json(verified.fx.dust_au),
+        "source_currency": verified.fx.source_currency,
+        "source_amount_minor": verified.fx.source_amount_minor.to_string(),
+        "destination_currency": verified.fx.destination_currency,
+        "destination_amount_minor": verified.destination_payment.amount_minor.to_string(),
+        "fx_quote_id": verified.quote.as_ref().map(|quote| quote.id.as_str()),
+        "fx_quote_hash": quote_hash,
+    }))
+}
+
+fn stripe_provider_transfer_evidence(verified: &StripeVerifiedTransfer) -> Result<Value> {
+    Ok(json!({
+        "schema_version": 2,
+        "kind": "stripe_transfer",
+        "ref": verified.transfer.id,
+        "destination": verified.transfer.destination,
+        "source_currency": verified.transfer.source_currency,
+        "source_amount_minor": verified.transfer.source_amount_minor.to_string(),
+        "destination_currency": verified.destination_payment.currency,
+        "destination_amount_minor": verified.destination_payment.amount_minor.to_string(),
+        "fx_quote_id": verified.quote.as_ref().map(|quote| quote.id.as_str()),
+        "fx_quote_hash": verified.quote.as_ref().map(stripe_fx_quote_hash).transpose()?,
+        "destination_payment": verified.destination_payment.id,
+        "transfer_group": verified.transfer.transfer_group,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stripe_operator_fee_evidence(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    secret_key: &str,
+    platform: &StripePlatformAccount,
+    output: &FiatSettlementOutput,
+    epoch: u64,
+    epoch_apply_hash: &str,
+    max_attempts: u32,
+    retry_ms: u64,
+) -> Result<Option<(Value, Value, Value)>> {
+    ensure!(
+        output.role == "operator_fee",
+        "invalid operator fee output role"
+    );
+    let source_scale =
+        checked_pow10_u128(stripe_currency_minor_exponent(&platform.default_currency)?)?;
+    let (source_amount, paid_au, quote) = if platform.default_currency == "usd" {
+        let amount =
+            exact_mul_div_floor(vec![output.liability_au, source_scale], vec![AU_PER_USD])?;
+        let paid = exact_mul_div_floor(vec![amount, AU_PER_USD], vec![source_scale])?;
+        (amount, paid, None)
+    } else {
+        let quote = stripe_create_fx_quote(
+            client,
+            api_base_url,
+            secret_key,
+            &["usd".to_owned()],
+            &platform.default_currency,
+            "payment",
+            None,
+            "none",
+            &json!({
+                "epoch": epoch,
+                "operator_to": output.to,
+                "epoch_apply_hash": epoch_apply_hash,
+                "liability_au": money_au_json(output.liability_au),
+            }),
+            max_attempts,
+            retry_ms,
+        )
+        .await?;
+        let usd = quote
+            .rates
+            .get("usd")
+            .context("operator FX quote is missing USD rate")?;
+        let amount = exact_mul_div_floor(
+            vec![output.liability_au, usd.base_ratio.numerator, source_scale],
+            vec![AU_PER_USD, usd.base_ratio.denominator],
+        )?;
+        let paid = exact_mul_div_floor(
+            vec![amount, AU_PER_USD, usd.base_ratio.denominator],
+            vec![source_scale, usd.base_ratio.numerator],
+        )?;
+        (amount, paid, Some(quote))
+    };
+    if source_amount == 0 || paid_au == 0 {
+        return Ok(None);
+    }
+    ensure!(
+        paid_au <= output.liability_au,
+        "operator retained AU exceeds liability"
+    );
+    let source_amount =
+        u64::try_from(source_amount).context("operator source amount exceeds u64")?;
+    let dust_au = output.liability_au - paid_au;
+    let settlement_output = json!({
+        "role": "operator_fee",
+        "to": output.to,
+        "liability_au": money_au_json(output.liability_au),
+        "paid_au": money_au_json(paid_au),
+        "rounding_au": money_au_json(dust_au),
+        "dust_au": money_au_json(dust_au),
+        "source_currency": platform.default_currency,
+        "source_amount_minor": source_amount.to_string(),
+    });
+    let transfer = json!({
+        "schema_version": 2,
+        "kind": "platform_balance",
+        "ref": operator_fiat_settlement_ref(epoch, epoch_apply_hash),
+        "destination": output.to,
+        "source_currency": platform.default_currency,
+        "source_amount_minor": source_amount.to_string(),
+        "transfer_group": null,
+    });
+    let report = json!({
+        "output_index": null,
+        "kind": "platform_balance",
+        "platform_account": platform.id,
+        "source_currency": platform.default_currency,
+        "source_amount_minor": source_amount.to_string(),
+        "liability_au": money_au_json(output.liability_au),
+        "retained_au": money_au_json(paid_au),
+        "dust_au": money_au_json(dust_au),
+        "quote": quote.as_ref().map(stripe_fx_quote_evidence).transpose()?,
+    });
+    Ok(Some((settlement_output, transfer, report)))
+}
+
+fn finalize_fiat_settlement_payload(
+    payload: &mut Value,
+    platform: &StripePlatformAccount,
+    outputs: &[Value],
+    transfers: &[Value],
+) -> Result<()> {
+    ensure!(
+        !outputs.is_empty() && outputs.len() == transfers.len(),
+        "fiat settlement evidence is incomplete"
+    );
+    let mut paired = outputs
+        .iter()
+        .cloned()
+        .zip(transfers.iter().cloned())
+        .collect::<Vec<_>>();
+    paired.sort_by(|(left, _), (right, _)| {
+        let left_role = left.get("role").and_then(Value::as_str).unwrap_or("");
+        let right_role = right.get("role").and_then(Value::as_str).unwrap_or("");
+        match (left_role, right_role) {
+            ("provider", "operator_fee") => std::cmp::Ordering::Less,
+            ("operator_fee", "provider") => std::cmp::Ordering::Greater,
+            ("provider", "provider") => left
+                .get("provider")
+                .and_then(Value::as_str)
+                .cmp(&right.get("provider").and_then(Value::as_str))
+                .then_with(|| {
+                    left.get("payout_revision")
+                        .and_then(Value::as_str)
+                        .cmp(&right.get("payout_revision").and_then(Value::as_str))
+                }),
+            _ => std::cmp::Ordering::Equal,
+        }
+    });
+    let (outputs, transfers): (Vec<_>, Vec<_>) = paired.into_iter().unzip();
+    let mut provider_count = 0_u64;
+    let mut provider_liability_au = 0_u128;
+    let mut provider_paid_au = 0_u128;
+    let mut operator_fee_liability_au = 0_u128;
+    let mut operator_fee_retained_au = 0_u128;
+    let mut rounding_au = 0_u128;
+    let mut dust_au = 0_u128;
+    let mut source_amount_minor = 0_u128;
+    let mut destination_totals = BTreeMap::<String, u128>::new();
+    let mut operator_seen = false;
+    for output in &outputs {
+        let role = output
+            .get("role")
+            .and_then(Value::as_str)
+            .context("fiat settlement output is missing role")?;
+        ensure!(
+            output.get("source_currency").and_then(Value::as_str)
+                == Some(platform.default_currency.as_str()),
+            "fiat settlement outputs must use the Stripe platform source currency"
+        );
+        let liability = output
+            .get("liability_au")
+            .and_then(value_money_au)
+            .context("fiat settlement output liability is invalid")?;
+        let paid = output
+            .get("paid_au")
+            .and_then(value_money_au)
+            .context("fiat settlement output paid amount is invalid")?;
+        let rounding = output
+            .get("rounding_au")
+            .and_then(value_money_au)
+            .context("fiat settlement output rounding is invalid")?;
+        let dust = output
+            .get("dust_au")
+            .and_then(value_money_au)
+            .context("fiat settlement output dust is invalid")?;
+        ensure!(
+            paid.checked_add(dust) == Some(liability) && rounding == dust,
+            "fiat settlement output AU does not balance"
+        );
+        rounding_au = rounding_au
+            .checked_add(rounding)
+            .context("fiat settlement rounding overflow")?;
+        dust_au = dust_au
+            .checked_add(dust)
+            .context("fiat settlement dust overflow")?;
+        let source_minor = output
+            .get("source_amount_minor")
+            .and_then(Value::as_str)
+            .context("fiat settlement output source amount is missing")?
+            .parse::<u128>()
+            .context("fiat settlement output source amount is invalid")?;
+        ensure!(
+            source_minor > 0,
+            "fiat settlement source amount must be positive"
+        );
+        source_amount_minor = source_amount_minor
+            .checked_add(source_minor)
+            .context("fiat settlement source amount overflow")?;
+        match role {
+            "provider" => {
+                provider_count = provider_count
+                    .checked_add(1)
+                    .context("fiat settlement provider count overflow")?;
+                provider_liability_au = provider_liability_au
+                    .checked_add(liability)
+                    .context("fiat provider liability overflow")?;
+                provider_paid_au = provider_paid_au
+                    .checked_add(paid)
+                    .context("fiat provider paid amount overflow")?;
+                let currency = output
+                    .get("destination_currency")
+                    .and_then(Value::as_str)
+                    .context("fiat provider output destination currency is missing")?;
+                let amount = output
+                    .get("destination_amount_minor")
+                    .and_then(Value::as_str)
+                    .context("fiat provider output destination amount is missing")?
+                    .parse::<u128>()
+                    .context("fiat provider destination amount is invalid")?;
+                let next = destination_totals
+                    .get(currency)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(amount)
+                    .context("fiat destination total overflow")?;
+                destination_totals.insert(currency.to_owned(), next);
+            }
+            "operator_fee" => {
+                ensure!(!operator_seen, "duplicate fiat operator output");
+                operator_seen = true;
+                operator_fee_liability_au = liability;
+                operator_fee_retained_au = paid;
+            }
+            other => bail!("invalid fiat settlement output role {other}"),
+        }
+    }
+    let gross_liability_au = provider_liability_au
+        .checked_add(operator_fee_liability_au)
+        .context("fiat gross liability overflow")?;
+    let gross_paid_au = provider_paid_au
+        .checked_add(operator_fee_retained_au)
+        .context("fiat gross paid amount overflow")?;
+    ensure!(
+        gross_paid_au > 0 && gross_paid_au.checked_add(dust_au) == Some(gross_liability_au),
+        "fiat settlement totals do not balance"
+    );
+    let transfer_root = stable_value_hash(&json!({
+        "domain": "mayhem-targeted-fiat-settlement-transfer-root-v2",
+        "value": outputs,
+    }));
+    payload["source_currency"] = json!(platform.default_currency);
+    payload["stripe_transfers"] = json!(transfers);
+    payload["transfer_root"] = json!(transfer_root);
+    payload["provider_count"] = json!(provider_count);
+    payload["provider_liability_au"] = money_au_json(provider_liability_au);
+    payload["provider_paid_au"] = money_au_json(provider_paid_au);
+    payload["operator_fee_liability_au"] = money_au_json(operator_fee_liability_au);
+    payload["operator_fee_retained_au"] = money_au_json(operator_fee_retained_au);
+    payload["gross_liability_au"] = money_au_json(gross_liability_au);
+    payload["gross_paid_au"] = money_au_json(gross_paid_au);
+    payload["rounding_au"] = money_au_json(rounding_au);
+    payload["dust_au"] = money_au_json(dust_au);
+    payload["source_amount_minor"] = json!(source_amount_minor.to_string());
+    payload["destination_totals"] = json!(destination_totals
+        .into_iter()
+        .map(|(currency, amount)| json!({
+            "currency": currency,
+            "amount_minor": amount.to_string(),
+        }))
+        .collect::<Vec<_>>());
+    payload["outputs"] = json!(outputs);
+    Ok(())
 }
 
 fn stripe_status_is_retryable(status: reqwest::StatusCode) -> bool {
@@ -41088,7 +42802,7 @@ struct PayCheckoutRequest<'a> {
     rpc: &'a PeerRpcClient,
     who: &'a str,
     amount_au: MoneyAu,
-    currency: &'a str,
+    presentation: &'a str,
     locale: &'a str,
     idempotency_key: Option<&'a str>,
     success_url: Option<&'a str>,
@@ -41099,21 +42813,21 @@ struct PayCheckoutRequest<'a> {
 
 #[cfg(test)]
 fn checkout_handoff_lines(rail: PayRail, amount_au: MoneyAu, url: &str) -> [String; 2] {
-    checkout_handoff_lines_with_currency(rail, amount_au, "usd", url)
+    checkout_handoff_lines_with_presentation(rail, amount_au, "auto", url)
 }
 
-fn checkout_handoff_lines_with_currency(
+fn checkout_handoff_lines_with_presentation(
     rail: PayRail,
     amount_au: MoneyAu,
-    currency: &str,
+    presentation: &str,
     url: &str,
 ) -> [String; 2] {
     [
         format!(
-            "Mayhem {} checkout for {} {}",
+            "Mayhem {} checkout for {} USD credit (presentation: {})",
             rail.as_str(),
             au_to_usd_amount(amount_au),
-            currency.to_ascii_uppercase()
+            presentation
         ),
         format!("Copy/paste checkout URL: {url}"),
     ]
@@ -41129,10 +42843,10 @@ fn emit_checkout_handoff(
     json_output: bool,
     rail: PayRail,
     amount_au: MoneyAu,
-    currency: &str,
+    presentation: &str,
     url: &str,
 ) -> Result<()> {
-    let lines = checkout_handoff_lines_with_currency(rail, amount_au, currency, url);
+    let lines = checkout_handoff_lines_with_presentation(rail, amount_au, presentation, url);
     if json_output {
         let mut stderr = io::stderr().lock();
         for line in lines {
@@ -41166,7 +42880,7 @@ async fn create_pay_checkout(request: PayCheckoutRequest<'_>) -> Result<PayCheck
     });
     body["success_url"] = Value::String(success_url);
     body["cancel_url"] = Value::String(cancel_url);
-    body["currency"] = Value::String(request.currency.to_ascii_lowercase());
+    body["presentation"] = Value::String(request.presentation.to_ascii_lowercase());
     body["locale"] = Value::String(request.locale.to_ascii_lowercase());
     body["request_nonce"] = Value::String(service_request_nonce()?);
     if let Some(idempotency_key) = request.idempotency_key.filter(|value| !value.is_empty()) {
@@ -42369,22 +44083,124 @@ struct FiatSettlementOutput {
     provider: Option<String>,
     payout_revision: Option<String>,
     to: String,
-    currency: String,
-    amount_minor: u64,
+    destination_currency: Option<String>,
     #[serde(with = "mayhem_proto::decimal_u128")]
-    au: MoneyAu,
+    liability_au: MoneyAu,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct StripeTransferResult {
     id: String,
-    amount_minor: u64,
-    currency: String,
+    source_amount_minor: u64,
+    source_currency: String,
     destination: String,
+    destination_payment: String,
+    balance_transaction: String,
+    fx_quote: Option<String>,
+    created: u64,
+    reversed: bool,
+    amount_reversed: u64,
     transfer_group: Option<String>,
+    #[serde(skip_serializing)]
+    metadata_provider: String,
+    #[serde(skip_serializing)]
+    metadata_payout_revision: String,
+    #[serde(skip_serializing)]
+    metadata_liability_au: MoneyAu,
+    #[serde(skip_serializing)]
+    metadata_paid_au: MoneyAu,
+    #[serde(skip_serializing)]
+    metadata_fx_quote: Option<String>,
+    #[serde(skip_serializing)]
+    metadata_epoch: u64,
+    #[serde(skip_serializing)]
+    metadata_output_index: usize,
+    #[serde(skip_serializing)]
+    metadata_epoch_apply_hash: String,
     verified: bool,
     recovered: bool,
     attempts: u32,
+}
+
+#[derive(Debug, Clone)]
+struct StripeVerifiedTransfer {
+    transfer: StripeTransferResult,
+    destination_payment: StripeDestinationPaymentResult,
+    quote: Option<StripeFxQuote>,
+    fx: FiatFxPlan,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StripeDestinationPaymentResult {
+    id: String,
+    source_amount_minor: u64,
+    source_currency: String,
+    amount_minor: u64,
+    gross_amount_minor: u64,
+    currency: String,
+    fee_minor: u64,
+    net_minor: u64,
+    exchange_rate: Option<String>,
+    paid: bool,
+    captured: bool,
+    source_transfer: String,
+    balance_transaction: String,
+}
+
+#[derive(Debug, Clone)]
+struct StripeDestinationBalanceTransaction {
+    amount_minor: u64,
+    currency: String,
+    fee_minor: u64,
+    net_minor: u64,
+    exchange_rate: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StripePlatformAccount {
+    id: String,
+    default_currency: String,
+    livemode: bool,
+    attempts: u32,
+}
+
+#[derive(Debug, Clone)]
+struct StripeFxRate {
+    exchange_rate: String,
+    exchange_ratio: ExactDecimalRatio,
+    base_rate: String,
+    base_ratio: ExactDecimalRatio,
+}
+
+#[derive(Debug, Clone)]
+struct StripeFxQuote {
+    id: String,
+    created: u64,
+    expires_at: Option<u64>,
+    lock_duration: String,
+    lock_status: String,
+    to_currency: String,
+    usage_type: String,
+    usage_destination: Option<String>,
+    rates: BTreeMap<String, StripeFxRate>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ExactDecimalRatio {
+    numerator: u128,
+    denominator: u128,
+}
+
+#[derive(Debug, Clone)]
+struct FiatFxPlan {
+    liability_au: MoneyAu,
+    paid_au: MoneyAu,
+    dust_au: MoneyAu,
+    source_currency: String,
+    source_amount_minor: u64,
+    destination_currency: String,
+    target_destination_amount_minor: u64,
+    maximum_destination_amount_minor: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -47148,10 +48964,14 @@ fn validate_provider_stripe_response(value: &Value, provider: &str) -> Result<()
     {
         bail!("Stripe Connect response did not match the requesting fiat provider");
     }
-    let account = value
-        .get("account")
-        .and_then(Value::as_object)
-        .context("Stripe Connect response missing account")?;
+    let Some(account) = value.get("account").and_then(Value::as_object) else {
+        ensure!(
+            value.get("status").and_then(Value::as_str) == Some("consent_required")
+                && value.get("onboarding").is_some_and(|item| !item.is_null()),
+            "Stripe Connect response missing account"
+        );
+        return Ok(());
+    };
     let account_id = account
         .get("id")
         .and_then(Value::as_str)
@@ -47322,6 +49142,28 @@ fn provider_stripe_onboarding_url(value: &Value) -> Result<Option<String>> {
         }
     }
     Ok(Some(url))
+}
+
+fn provider_stripe_adopt_handoff_url(value: &Value) -> Result<Option<String>> {
+    match value.get("status").and_then(Value::as_str) {
+        Some("consent_required") => provider_stripe_onboarding_url(value)?.map_or_else(
+            || bail!("Stripe Standard adoption consent response did not include its OAuth URL"),
+            |url| Ok(Some(url)),
+        ),
+        Some("linked") => {
+            ensure!(
+                value.pointer("/account/ready").and_then(Value::as_bool) == Some(true),
+                "Stripe Standard adoption linked response is not ready"
+            );
+            ensure!(
+                provider_stripe_onboarding_url(value)?.is_none(),
+                "Stripe Standard adoption linked response unexpectedly included an OAuth URL"
+            );
+            Ok(None)
+        }
+        Some(status) => bail!("Stripe Standard adoption returned unsupported status {status}"),
+        None => bail!("Stripe Standard adoption response is missing status"),
+    }
 }
 
 fn emit_provider_stripe_handoff(json_output: bool, url: &str) -> Result<()> {
@@ -47554,6 +49396,84 @@ async fn provider_stripe_relink(args: ProviderStripeRelinkArgs) -> Result<()> {
         let binding = ensure_provider_stripe_payout_binding(&ctx, &report).await?;
         report["payout_binding"] = binding;
     }
+    print_provider_stripe_report(&report, args.provider.json)
+}
+
+async fn provider_stripe_adopt(args: ProviderStripeAdoptArgs) -> Result<()> {
+    ensure!(
+        (1..=900).contains(&args.timeout_seconds),
+        "--timeout-seconds must be between 1 and 900"
+    );
+    ensure!(
+        args.poll_interval_ms > 0,
+        "--poll-interval-ms must be positive"
+    );
+    let country = args.country.trim().to_ascii_uppercase();
+    ensure!(
+        country.len() == 2 && country.bytes().all(|byte| byte.is_ascii_uppercase()),
+        "--country must be a two-letter ISO country code"
+    );
+    let ctx = provider_stripe_context(&args.provider).await?;
+    let consent_expires_at = unix_epoch_seconds()?
+        .checked_add(args.timeout_seconds)
+        .context("Stripe adoption consent expiry overflow")?;
+    let signed = signed_service_request(
+        "stripe_connect_adopt",
+        &ctx.rpc,
+        &ctx.wallet,
+        &ctx.wallet_password,
+        json!({
+            "provider": ctx.wallet.public_key,
+            "country": country,
+            "request_nonce": service_request_nonce()?,
+            "consent_expires_at": consent_expires_at,
+        }),
+    )
+    .await?;
+    let mut report = ctx
+        .rpc
+        .post("payment/stripe/connect/adopt", &signed)
+        .await
+        .context("requesting provider-bound Stripe Standard account adoption")?;
+    validate_provider_stripe_response(&report, &ctx.wallet.public_key)?;
+    if report.pointer("/account/ready").and_then(Value::as_bool) == Some(true) {
+        let binding = ensure_provider_stripe_payout_binding(&ctx, &report).await?;
+        report["payout_binding"] = binding;
+    }
+    let onboarding_url = provider_stripe_adopt_handoff_url(&report)?;
+    let mut browser_opened = false;
+    if let Some(url) = onboarding_url.as_deref() {
+        emit_provider_stripe_handoff(args.provider.json, url)?;
+        browser_opened = open_checkout_url(url, args.no_open).await;
+    }
+
+    let started = Instant::now();
+    if !args.no_wait && !provider_stripe_ready(&report) {
+        let timeout = Duration::from_secs(args.timeout_seconds);
+        let interval = Duration::from_millis(args.poll_interval_ms);
+        loop {
+            if started.elapsed() >= timeout {
+                break;
+            }
+            sleep(interval).await;
+            report = request_provider_stripe_status(&ctx).await?;
+            validate_provider_stripe_response(&report, &ctx.wallet.public_key)?;
+            if report.pointer("/account/ready").and_then(Value::as_bool) == Some(true) {
+                let binding = ensure_provider_stripe_payout_binding(&ctx, &report).await?;
+                report["payout_binding"] = binding;
+            }
+            if provider_stripe_ready(&report) {
+                break;
+            }
+        }
+    }
+    report["action"] = json!("provider.stripe.adopt");
+    report["browser_opened"] = json!(browser_opened);
+    report["wait"] = json!({
+        "requested": !args.no_wait,
+        "ready": provider_stripe_ready(&report),
+        "waited_ms": millis_since(started),
+    });
     print_provider_stripe_report(&report, args.provider.json)
 }
 
@@ -73411,49 +75331,75 @@ mod tests {
             "at": 25_200,
             "rail": "fiat",
             "processor": "stripe",
+            "source_currency": "eur",
             "operator_to": "platform_balance",
             "epoch_apply_hash": "a".repeat(64),
             "stripe_transfers": [
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "kind": "stripe_transfer",
                     "ref": "tr_test_provider",
                     "destination": "acct_provider",
-                    "currency": "usd",
-                    "amount_minor": "85",
+                    "source_currency": "eur",
+                    "source_amount_minor": "85",
+                    "destination_currency": "gbp",
+                    "destination_amount_minor": "85",
+                    "fx_quote_id": "fxq_test_provider",
+                    "fx_quote_hash": "e".repeat(64),
+                    "destination_payment": "py_test_provider",
                     "transfer_group": format!("mayhem_fiat_epoch_7_{}", &"a".repeat(64)[..16])
                 },
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "kind": "platform_balance",
                     "ref": "platform_balance:7:fee",
                     "destination": "platform_balance",
-                    "currency": "eur",
-                    "amount_minor": "15",
+                    "source_currency": "eur",
+                    "source_amount_minor": "15",
                     "transfer_group": null
                 }
             ],
             "transfer_root": "c".repeat(64),
             "provider_count": 1,
-            "provider_au": "850000000000000000",
-            "operator_fee_au": "150000000000000000",
-            "gross_au": "1000000000000000000",
+            "provider_liability_au": "850000000000000000",
+            "provider_paid_au": "840000000000000000",
+            "operator_fee_liability_au": "150000000000000000",
+            "operator_fee_retained_au": "140000000000000000",
+            "gross_liability_au": "1000000000000000000",
+            "gross_paid_au": "980000000000000000",
+            "rounding_au": "20000000000000000",
+            "dust_au": "20000000000000000",
+            "source_amount_minor": "100",
+            "destination_totals": [{
+                "currency": "gbp",
+                "amount_minor": "85"
+            }],
             "outputs": [
                 {
                     "role": "provider",
                     "provider": "b".repeat(64),
                     "payout_revision": "d".repeat(64),
                     "to": "acct_provider",
-                    "currency": "usd",
-                    "amount_minor": "85",
-                    "au": "850000000000000000"
+                    "liability_au": "850000000000000000",
+                    "paid_au": "840000000000000000",
+                    "rounding_au": "10000000000000000",
+                    "dust_au": "10000000000000000",
+                    "source_currency": "eur",
+                    "source_amount_minor": "85",
+                    "destination_currency": "gbp",
+                    "destination_amount_minor": "85",
+                    "fx_quote_id": "fxq_test_provider",
+                    "fx_quote_hash": "e".repeat(64)
                 },
                 {
                     "role": "operator_fee",
                     "to": "platform_balance",
-                    "currency": "eur",
-                    "amount_minor": "15",
-                    "au": "150000000000000000"
+                    "liability_au": "150000000000000000",
+                    "paid_au": "140000000000000000",
+                    "rounding_au": "10000000000000000",
+                    "dust_au": "10000000000000000",
+                    "source_currency": "eur",
+                    "source_amount_minor": "15"
                 }
             ]
         });
@@ -73465,7 +75411,6 @@ mod tests {
                 epoch: None,
                 at: None,
                 operator_stripe_account: "platform_balance".to_owned(),
-                operator_currency: "eur".to_owned(),
                 submit_transfer: false,
                 stripe_env_file: None,
                 stripe_api_base_url: None,
@@ -73492,7 +75437,6 @@ mod tests {
                 epoch: None,
                 at: None,
                 operator_stripe_account: "platform_balance".to_owned(),
-                operator_currency: "eur".to_owned(),
                 submit_transfer: false,
                 stripe_env_file: None,
                 stripe_api_base_url: None,
@@ -73700,18 +75644,114 @@ mod tests {
     }
 
     #[test]
-    fn fiat_settlement_helpers_floor_to_stripe_minor_units_and_bind_platform_balance() {
+    fn admin_payment_directory_emits_exact_adaptive_stripe_schema() {
+        let payload = admin_set_payments_payload(&AdminSetPaymentsArgs {
+            tx: test_admin_tx_args(),
+            ver: 3,
+            tap_chain_id: MAINNET_TAP_CHAIN_ID,
+            tap_token_address: MAINNET_TAP_TOKEN_ADDRESS.to_owned(),
+            tap_pool_address: MAINNET_TAP_POOL_ADDRESS.to_owned(),
+            tnk_network: "mainnet".to_owned(),
+            tnk_treasury_address: "trac1treasury".to_owned(),
+            stripe_payout_currencies: vec!["GBP".to_owned(), "usd".to_owned(), "EUR".to_owned()],
+            stripe_locale: "EN".to_owned(),
+        })
+        .unwrap();
         assert_eq!(
-            fiat_whole_minor_au(FIAT_MINOR_AU_CLI * 85 + 1),
-            FIAT_MINOR_AU_CLI * 85
+            payload["fiat"],
+            json!({
+                "processor": "stripe",
+                "integration_currency": "usd",
+                "adaptive_pricing": true,
+                "payout_currencies": ["eur", "gbp", "usd"],
+                "locale": "en"
+            })
         );
-        assert_eq!(fiat_au_to_minor(FIAT_MINOR_AU_CLI * 85).unwrap(), 85);
-        assert!(fiat_au_to_minor(FIAT_MINOR_AU_CLI * 85 + 1).is_err());
+        assert_eq!(payload["fiat"].as_object().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn fiat_settlement_helpers_use_exact_currency_scales_and_preserve_dust() {
+        assert_eq!(stripe_currency_minor_exponent("usd").unwrap(), 2);
+        assert_eq!(stripe_currency_minor_exponent("eur").unwrap(), 2);
+        assert_eq!(stripe_currency_minor_exponent("gbp").unwrap(), 2);
+        assert_eq!(stripe_currency_minor_exponent("jpy").unwrap(), 0);
+        assert_eq!(stripe_currency_minor_exponent("bhd").unwrap(), 3);
+        assert_eq!(stripe_currency_minor_exponent("clf").unwrap(), 4);
+        assert_eq!(
+            parse_exact_decimal_ratio("9.25e-1").unwrap(),
+            ExactDecimalRatio {
+                numerator: 37,
+                denominator: 40,
+            }
+        );
+
+        let mut rates = BTreeMap::new();
+        rates.insert(
+            "usd".to_owned(),
+            StripeFxRate {
+                exchange_rate: "0.8".to_owned(),
+                exchange_ratio: parse_exact_decimal_ratio("0.8").unwrap(),
+                base_rate: "0.8".to_owned(),
+                base_ratio: parse_exact_decimal_ratio("0.8").unwrap(),
+            },
+        );
+        rates.insert(
+            "eur".to_owned(),
+            StripeFxRate {
+                exchange_rate: "0.9".to_owned(),
+                exchange_ratio: parse_exact_decimal_ratio("0.9").unwrap(),
+                base_rate: "0.92".to_owned(),
+                base_ratio: parse_exact_decimal_ratio("0.92").unwrap(),
+            },
+        );
+        let quote = StripeFxQuote {
+            id: "fxq_test_exact".to_owned(),
+            created: 1,
+            expires_at: Some(u64::MAX),
+            lock_duration: "five_minutes".to_owned(),
+            lock_status: "active".to_owned(),
+            to_currency: "gbp".to_owned(),
+            usage_type: "transfer".to_owned(),
+            usage_destination: Some("acct_provider".to_owned()),
+            rates,
+        };
+        let plan = fiat_fx_plan(10 * AU_PER_USD + 1, "eur", "gbp", &quote).unwrap();
+        assert_eq!(plan.source_amount_minor, 889);
+        assert_eq!(plan.target_destination_amount_minor, 800);
+        assert_eq!(plan.maximum_destination_amount_minor, 801);
+        assert_eq!(plan.paid_au, 10 * AU_PER_USD);
+        assert_eq!(plan.dust_au, 1);
 
         assert_eq!(
             operator_fiat_settlement_ref(7, &"ab".repeat(32)),
             format!("platform_balance:7:{}", &"ab".repeat(32)[..16])
         );
+    }
+
+    #[test]
+    fn fiat_settlement_reports_canonical_and_planned_indices_separately() {
+        let first = indexed_fiat_transfer_report(json!({"kind": "provider"}), 0, 2).unwrap();
+        let second = indexed_fiat_transfer_report(json!({"kind": "operator_fee"}), 1, 5).unwrap();
+        assert_eq!(first["output_index"], 0);
+        assert_eq!(first["planned_output_index"], 2);
+        assert_eq!(second["output_index"], 1);
+        assert_eq!(second["planned_output_index"], 5);
+
+        let empty = json!({"outputs": []});
+        assert!(fiat_settlement_nothing_to_settle(
+            false, 2, true, &empty, None
+        ));
+        assert!(!fiat_settlement_nothing_to_settle(
+            false, 2, false, &empty, None
+        ));
+        assert!(!fiat_settlement_nothing_to_settle(
+            false,
+            2,
+            true,
+            &empty,
+            Some(&json!({"key": "unexpected"}))
+        ));
     }
 
     #[test]
@@ -73784,94 +75824,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stripe_transfer_retries_and_replays_with_one_deterministic_identity() {
+    async fn stripe_transfer_recovery_paginates_and_keeps_exact_identity() {
         let provider = "aa".repeat(32);
         let payout_revision = "cc".repeat(32);
         let apply_hash = "bb".repeat(32);
-        let idempotency_key =
-            stripe_transfer_idempotency_key(7, &provider, &payout_revision, &apply_hash).unwrap();
+        let liability_au = 10 * AU_PER_USD + 1;
+        let idempotency_key = stripe_transfer_idempotency_key(
+            7,
+            &provider,
+            &payout_revision,
+            &apply_hash,
+            "fxq_exact",
+            "eur",
+            889,
+        )
+        .unwrap();
         assert_eq!(
             idempotency_key,
-            format!("mayhem:fiat:targeted:v1:7:{provider}:{payout_revision}:{apply_hash}")
+            stripe_transfer_idempotency_key(
+                7,
+                &provider,
+                &payout_revision,
+                &apply_hash,
+                "fxq_exact",
+                "eur",
+                889,
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            idempotency_key,
+            stripe_transfer_idempotency_key(
+                7,
+                &provider,
+                &payout_revision,
+                &apply_hash,
+                "fxq_requote",
+                "eur",
+                889,
+            )
+            .unwrap()
         );
 
         let transfer_group = format!("mayhem_fiat_epoch_7_{}", &apply_hash[..16]);
         let transfer_value = json!({
-            "id": "tr_test_replay",
-            "amount": 85,
-            "currency": "usd",
+            "id": "tr_test_recovered",
+            "amount": 889,
+            "currency": "eur",
             "destination": "acct_provider",
+            "destination_payment": "py_test_destination",
+            "balance_transaction": "txn_test_transfer",
+            "fx_quote": "fxq_exact",
+            "created": 100,
+            "reversed": false,
+            "amount_reversed": 0,
             "transfer_group": transfer_group,
             "metadata": {
+                "mayhem_schema": "fiat_fx_v1",
                 "mayhem_provider": provider,
                 "mayhem_payout_revision": payout_revision,
-                "mayhem_au": (FIAT_MINOR_AU_CLI * 85).to_string(),
+                "mayhem_liability_au": liability_au.to_string(),
+                "mayhem_paid_au": (10 * AU_PER_USD).to_string(),
+                "mayhem_fx_quote": "fxq_exact",
                 "mayhem_epoch": "7",
-                "mayhem_output_index": "0",
+                "mayhem_output_index": "2",
                 "mayhem_epoch_apply_hash": apply_hash,
             },
         });
-        let transfer_json = transfer_value.to_string();
         let responses = vec![
-            (
-                200_u16,
-                json!({"object": "list", "has_more": false, "data": []}).to_string(),
-            ),
-            (
-                500_u16,
-                json!({"error": {"message": "transient"}}).to_string(),
-            ),
-            (200, transfer_json.clone()),
-            (200, transfer_json.clone()),
-            (
-                200,
-                json!({"object": "list", "has_more": false, "data": [transfer_value]}).to_string(),
-            ),
-            (200, transfer_json),
+            json!({
+                "object": "list",
+                "has_more": true,
+                "data": [{"id": "tr_page_cursor"}]
+            })
+            .to_string(),
+            json!({
+                "object": "list",
+                "has_more": false,
+                "data": [transfer_value]
+            })
+            .to_string(),
         ];
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let captured = Arc::new(Mutex::new(Vec::<String>::new()));
         let captured_server = Arc::clone(&captured);
         let server = thread::spawn(move || {
-            for (status, body) in responses {
+            for body in responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0_u8; 4096];
-                let header_end = loop {
+                loop {
                     let read = stream.read(&mut buffer).unwrap();
                     assert!(read > 0, "Stripe mock request ended before headers");
                     request.extend_from_slice(&buffer[..read]);
-                    if let Some(offset) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                        break offset + 4;
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
                     }
-                };
-                let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap_or(0);
-                while request.len() < header_end + content_length {
-                    let read = stream.read(&mut buffer).unwrap();
-                    assert!(read > 0, "Stripe mock request ended before body");
-                    request.extend_from_slice(&buffer[..read]);
                 }
                 captured_server
                     .lock()
                     .unwrap()
                     .push(String::from_utf8_lossy(&request).to_string());
-                let reason = if status == 200 {
-                    "OK"
-                } else {
-                    "Internal Server Error"
-                };
                 write!(
                     stream,
-                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 )
                 .unwrap();
@@ -73882,98 +75939,74 @@ mod tests {
         let output = FiatSettlementOutput {
             role: "provider".to_owned(),
             provider: Some(provider.clone()),
-            payout_revision: Some(payout_revision),
+            payout_revision: Some(payout_revision.clone()),
             to: "acct_provider".to_owned(),
-            currency: "usd".to_owned(),
-            amount_minor: 85,
-            au: FIAT_MINOR_AU_CLI * 85,
+            destination_currency: Some("gbp".to_owned()),
+            liability_au,
         };
-        let client = reqwest::Client::new();
-        let api_base = format!("http://{address}");
-        let first = stripe_create_transfer_verified(
-            &client,
-            &api_base,
+        let recovered = stripe_find_existing_transfer(
+            &reqwest::Client::new(),
+            &format!("http://{address}"),
             "sk_test_redacted",
             &output,
-            &idempotency_key,
+            &transfer_group,
+            &provider,
+            &payout_revision,
             7,
-            0,
+            2,
             &apply_hash,
-            3,
+            1,
             1,
         )
         .await
+        .unwrap()
         .unwrap();
-        assert!(first.verified);
-        assert!(!first.recovered);
-        assert_eq!(first.attempts, 2);
-
-        let replay = stripe_create_transfer_verified(
-            &client,
-            &api_base,
-            "sk_test_redacted",
-            &output,
-            &idempotency_key,
-            7,
-            0,
-            &apply_hash,
-            3,
-            1,
-        )
-        .await
-        .unwrap();
-        assert!(replay.verified);
-        assert!(replay.recovered);
-        assert_eq!(replay.attempts, 0);
-        assert_eq!(replay.id, first.id);
         server.join().unwrap();
 
+        assert_eq!(recovered.id, "tr_test_recovered");
+        assert_eq!(recovered.source_amount_minor, 889);
+        assert_eq!(recovered.metadata_paid_au, 10 * AU_PER_USD);
         let requests = captured.lock().unwrap();
-        assert_eq!(requests.len(), 6);
-        for index in [1_usize, 2] {
-            assert!(requests[index].starts_with("POST /v1/transfers HTTP/1.1"));
-            assert!(requests[index]
-                .to_ascii_lowercase()
-                .contains(&format!("idempotency-key: {idempotency_key}").to_ascii_lowercase()));
-        }
-        for index in [3_usize, 5] {
-            assert!(requests[index].starts_with("GET /v1/transfers/tr_test_replay HTTP/1.1"));
-        }
-        for index in [0_usize, 4] {
-            assert!(requests[index].starts_with("GET /v1/transfers?"));
-            assert!(requests[index].contains("transfer_group="));
-            assert!(requests[index].contains("destination=acct_provider"));
-        }
-        assert!(requests[2].contains("metadata%5Bmayhem_epoch_apply_hash%5D="));
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /v1/transfers?"));
+        assert!(requests[1].contains("starting_after=tr_page_cursor"));
     }
-
     #[test]
     fn fiat_settlement_reconciliation_separates_provider_transfers_and_retained_fee() {
-        let outputs = vec![
-            FiatSettlementOutput {
-                role: "provider".to_owned(),
-                provider: Some("aa".repeat(32)),
-                payout_revision: Some("bb".repeat(32)),
-                to: "acct_provider".to_owned(),
-                currency: "usd".to_owned(),
-                amount_minor: 85,
-                au: FIAT_MINOR_AU_CLI * 85,
-            },
-            FiatSettlementOutput {
-                role: "operator_fee".to_owned(),
-                provider: None,
-                payout_revision: None,
-                to: "platform_balance".to_owned(),
-                currency: "eur".to_owned(),
-                amount_minor: 15,
-                au: FIAT_MINOR_AU_CLI * 15,
-            },
-        ];
+        let settlement = json!({
+            "provider_liability_au": "10000000000000000001",
+            "provider_paid_au": "10000000000000000000",
+            "operator_fee_liability_au": "200000000000000001",
+            "operator_fee_retained_au": "200000000000000000",
+            "gross_liability_au": "10200000000000000002",
+            "gross_paid_au": "10200000000000000000",
+            "rounding_au": "2",
+            "dust_au": "2",
+            "outputs": [
+                {
+                    "role": "provider",
+                    "source_currency": "eur",
+                    "source_amount_minor": "889",
+                    "destination_currency": "gbp",
+                    "destination_amount_minor": "800"
+                },
+                {
+                    "role": "operator_fee",
+                    "source_currency": "eur",
+                    "source_amount_minor": "20"
+                }
+            ]
+        });
         let report =
-            fiat_settlement_reconciliation(&outputs, &[json!({"transfer": {"verified": true}})])
+            fiat_settlement_reconciliation(&settlement, &[json!({"transfer": {"verified": true}})])
                 .unwrap();
-        assert_eq!(report["provider_minor_by_currency"]["usd"], "85");
-        assert_eq!(report["operator_retained_minor_by_currency"]["eur"], "15");
+        assert_eq!(report["provider_source_minor_by_currency"]["eur"], "889");
+        assert_eq!(
+            report["provider_destination_minor_by_currency"]["gbp"],
+            "800"
+        );
+        assert_eq!(report["operator_retained_minor_by_currency"]["eur"], "20");
+        assert_eq!(report["dust_au"], "2");
         assert_eq!(
             report["operator_fee_mechanism"],
             "retained_platform_balance"
@@ -74290,7 +76323,7 @@ mod tests {
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 13);
+        assert_eq!(CONTRACT_VERSION, 14);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 9);
     }
@@ -74304,7 +76337,9 @@ mod tests {
             "rails": ["fiat", "tap", "tnk"],
             "fiat": {
                 "processor": "stripe",
-                "currencies": ["usd", "eur"],
+                "integration_currency": "usd",
+                "adaptive_pricing": true,
+                "payout_currencies": ["eur", "usd"],
                 "locale": "en",
             },
             "tap": {
@@ -74522,7 +76557,7 @@ mod tests {
             },
         });
         let context = json!({
-            "contract_version": 13,
+            "contract_version": CONTRACT_VERSION,
             "msb_bootstrap": "55".repeat(32),
             "network_id": 918,
             "subnet_bootstrap": "66".repeat(32),
@@ -74530,7 +76565,7 @@ mod tests {
         let tx = admin_contract_tx_digest(&prepared_command, &admin, &nonce, false, &context);
         assert_eq!(
             tx,
-            "1b1de56991947fedabb8385ed47d759174265f1063169d7fd7e0f92ca6df2e35"
+            "6438227adf3f54e80514752ea3ffd94e201d00f72ac7a79ceab8f975593f2338"
         );
         assert_eq!(
             admin_contract_tx_feature(
@@ -85479,14 +87514,17 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             "https://checkout.stripe.com/c/pay/cs_test",
         );
 
-        assert_eq!(lines[0], "Mayhem stripe checkout for 10.00 USD");
-        let eur_lines = checkout_handoff_lines_with_currency(
+        assert_eq!(
+            lines[0],
+            "Mayhem stripe checkout for 10.00 USD credit (presentation: auto)"
+        );
+        let adaptive_lines = checkout_handoff_lines_with_presentation(
             PayRail::Stripe,
             10_000_000_000_000_000_000,
-            "eur",
+            "auto",
             "https://checkout.stripe.com/c/pay/cs_test",
         );
-        assert_eq!(eur_lines[0], "Mayhem stripe checkout for 10.00 EUR");
+        assert_eq!(adaptive_lines, lines);
         assert_eq!(
             lines[1],
             "Copy/paste checkout URL: https://checkout.stripe.com/c/pay/cs_test"
@@ -85601,6 +87639,58 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn provider_stripe_adopt_accepts_idempotent_link_without_oauth_url() {
+        let provider = "aa".repeat(32);
+        let linked = json!({
+            "ok": true,
+            "rail": "fiat",
+            "processor_rail": "stripe",
+            "provider": provider,
+            "status": "linked",
+            "account": {
+                "id": "acct_standard_existing",
+                "account_type": "standard",
+                "ready": true
+            },
+            "onboarding": null,
+            "payout_binding": {
+                "ok": true,
+                "pending": false
+            }
+        });
+        validate_provider_stripe_response(&linked, &provider).unwrap();
+        assert_eq!(provider_stripe_adopt_handoff_url(&linked).unwrap(), None);
+        assert!(provider_stripe_ready(&linked));
+
+        let consent = json!({
+            "ok": true,
+            "rail": "fiat",
+            "processor_rail": "stripe",
+            "provider": provider,
+            "status": "consent_required",
+            "account": null,
+            "onboarding": {
+                "url": "https://connect.stripe.com/oauth/authorize/test"
+            },
+            "copy_paste": {
+                "onboarding_url": "https://connect.stripe.com/oauth/authorize/test"
+            }
+        });
+        validate_provider_stripe_response(&consent, &provider).unwrap();
+        assert_eq!(
+            provider_stripe_adopt_handoff_url(&consent)
+                .unwrap()
+                .as_deref(),
+            Some("https://connect.stripe.com/oauth/authorize/test")
+        );
+
+        let mut missing_url = consent;
+        missing_url["onboarding"] = Value::Null;
+        missing_url["copy_paste"] = Value::Null;
+        assert!(provider_stripe_adopt_handoff_url(&missing_url).is_err());
+    }
+
+    #[test]
     fn pay_tnk_helpers_prepare_deposit_bound_transfer() {
         let tnk_e18 =
             au_to_tnk_e18_ceil_u128(10_000_000_000_000_000_000, 50_000_000_000_000_000).unwrap();
@@ -85704,7 +87794,9 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 rails: vec!["fiat".to_owned(), "tap".to_owned(), "tnk".to_owned()],
                 fiat: CanonicalFiatRail {
                     processor: "stripe".to_owned(),
-                    currencies: vec!["usd".to_owned(), "eur".to_owned()],
+                    integration_currency: "usd".to_owned(),
+                    adaptive_pricing: true,
+                    payout_currencies: vec!["usd".to_owned(), "eur".to_owned(), "gbp".to_owned()],
                     locale: "en".to_owned(),
                 },
                 tap: CanonicalTapRail {

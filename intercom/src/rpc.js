@@ -295,6 +295,7 @@ export async function requestStripeConnect(peer, service, body) {
     throw new Error('Missing provider.');
   }
   if (![
+    'stripe_connect_adopt',
     'stripe_connect_onboard',
     'stripe_connect_status',
     'stripe_connect_relink',
@@ -402,6 +403,10 @@ export const createServer = (
       if (req.method === 'POST' && requestPath === '/v1/payment/stripe/connect/onboard') {
         const body = await readJsonBody(req, { maxBytes: maxBodyBytes });
         return respond(200, await requestStripeConnect(peer, 'stripe_connect_onboard', body));
+      }
+      if (req.method === 'POST' && requestPath === '/v1/payment/stripe/connect/adopt') {
+        const body = await readJsonBody(req, { maxBytes: maxBodyBytes });
+        return respond(200, await requestStripeConnect(peer, 'stripe_connect_adopt', body));
       }
       if (req.method === 'POST' && requestPath === '/v1/payment/stripe/connect/status') {
         const body = await readJsonBody(req, { maxBytes: maxBodyBytes });

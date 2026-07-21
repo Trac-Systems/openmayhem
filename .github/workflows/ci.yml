@@ -5,6 +5,16 @@ on:
   pull_request:
 
 jobs:
+  source-build-workflow-contract:
+    name: Source-build workflow contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify source-only evidence boundary
+        run: node scripts/tests/source-build-evidence-workflow.test.mjs
+
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

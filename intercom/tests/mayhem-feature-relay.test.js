@@ -221,8 +221,6 @@ const consentValue = (sender = providerKey) => ({
 const stripeCheckoutValue = (who = providerKey) => ({
   who,
   au: '1000000000000000000',
-  currency: 'usd',
-  locale: 'en',
   success_url: 'https://stripe.com',
   cancel_url: 'https://stripe.com',
   idempotency_key: 'checkout-test-1',
@@ -233,6 +231,14 @@ const stripeConnectValue = (provider = providerKey) => ({
   provider,
   country: 'DE',
   request_nonce: '12'.repeat(32),
+});
+
+const stripeConnectAdoptValue = (provider = providerKey, overrides = {}) => ({
+  provider,
+  country: 'DE',
+  request_nonce: '13'.repeat(32),
+  consent_expires_at: Math.floor(Date.now() / 1_000) + 300,
+  ...overrides,
 });
 
 const stripeConnectRelinkValue = (provider = providerKey, overrides = {}) => {
@@ -773,7 +779,7 @@ test('16KB relay cap fits a maximal canonical targeted spend-reserve envelope', 
   const value = {
     op: 'spend_reserve_targeted',
     payout_revision: '77'.repeat(32),
-    contract_version: 13,
+    contract_version: CONTRACT_VERSION,
     session_id: voucher.session_id,
     epoch: Number.MAX_SAFE_INTEGER,
     at: Number.MAX_SAFE_INTEGER,
@@ -1141,7 +1147,13 @@ test('fiat payout relay keeps the active account admissible during verified rota
   const key = `payout/binding/fiat/${providerKey}/${revision}`;
   writer.state.set('payments/current', {
     rails: ['fiat', 'tap', 'tnk'],
-    fiat: { currencies: ['usd', 'eur'] },
+    fiat: {
+      processor: 'stripe',
+      integration_currency: 'usd',
+      adaptive_pricing: true,
+      payout_currencies: ['eur', 'gbp', 'usd'],
+      locale: 'en',
+    },
     tap: { chain_id: 1 },
     tnk: { network: 'mainnet' },
     ver: 7,
@@ -1506,6 +1518,30 @@ test('read-only transport relays a wallet-signed Stripe checkout without appendi
   assert.equal(participant.appended.length, 0);
   assert.equal(writer.appended.length, 0);
   assert.equal(writer.flushes.length, 0);
+});
+
+test('Stripe checkout relay rejects caller-selected currency before forwarding', async () => {
+  const participant = peerFor(otherKey);
+  const signer = peerFor(providerKey);
+  const participantFeature = new MayhemFeature(participant.peer, {});
+  participantFeature.key = 'mayhem';
+  let broadcasts = 0;
+  participant.peer.sidechannel = {
+    started: true,
+    broadcast() {
+      broadcasts += 1;
+      return true;
+    },
+  };
+  const checkout = { ...stripeCheckoutValue(), currency: 'gbp' };
+  await assert.rejects(
+    participantFeature.requestService(
+      'stripe_checkout',
+      signedServiceValue(signer.peer, 'stripe_checkout', checkout, otherKey)
+    ),
+    /Invalid Mayhem service request signature/
+  );
+  assert.equal(broadcasts, 0);
 });
 
 test('Stripe service result retries the exact cache after drop and reconnect until ACK', async () => {
@@ -1878,6 +1914,114 @@ test('read-only transport relays wallet-signed Stripe Connect onboarding without
   assert.equal(participant.appended.length, 0);
   assert.equal(writer.appended.length, 0);
   assert.equal(writer.flushes.length, 0);
+});
+
+test('read-only provider relays bounded Stripe Standard adoption without an account id', async () => {
+  const participant = peerFor(otherKey);
+  const signer = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const adoption = stripeConnectAdoptValue();
+  const signed = signedServiceValue(
+    signer.peer,
+    'stripe_connect_adopt',
+    adoption,
+    otherKey
+  );
+  let serviceCalls = 0;
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+    async serviceHandler(service, value, authorization) {
+      serviceCalls += 1;
+      assert.equal(service, 'stripe_connect_adopt');
+      assert.deepEqual(value, adoption);
+      assert.equal(authorization.actor, providerKey);
+      assert.equal(authorization.signature, signed.signature);
+      assert.equal(Object.hasOwn(value, 'account_id'), false);
+      return {
+        ok: true,
+        rail: 'fiat',
+        processor_rail: 'stripe',
+        provider: providerKey,
+        status: 'consent_required',
+        account: null,
+        onboarding: { url: 'https://connect.stripe.com/oauth/authorize?state=test' },
+      };
+    },
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  connect(participant.peer, participantFeature, writer.peer, writerFeature);
+  connect(writer.peer, writerFeature, participant.peer, participantFeature);
+
+  const result = await requestStripeConnect(
+    participant.peer,
+    'stripe_connect_adopt',
+    signed
+  );
+  const replay = await requestStripeConnect(
+    participant.peer,
+    'stripe_connect_adopt',
+    signed
+  );
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(replay, result);
+  assert.equal(result.relayed, true);
+  assert.equal(result.status, 'consent_required');
+  assert.equal(serviceCalls, 1);
+  assert.equal(participant.appended.length, 0);
+  assert.equal(writer.appended.length, 0);
+});
+
+test('Stripe Standard adoption rejects typed accounts, stale consent, and forged actors locally', async () => {
+  const transport = peerFor(otherKey);
+  const signer = peerFor(providerKey);
+  const feature = new MayhemFeature(transport.peer, {});
+  feature.key = 'mayhem';
+  let broadcasts = 0;
+  transport.peer.sidechannel = {
+    started: true,
+    broadcast() {
+      broadcasts += 1;
+      return true;
+    },
+  };
+  const invalid = [
+    { ...stripeConnectAdoptValue(), account_id: 'acct_forbidden' },
+    stripeConnectAdoptValue(providerKey, {
+      consent_expires_at: Math.floor(Date.now() / 1_000) - 1,
+    }),
+    stripeConnectAdoptValue(providerKey, { country: 'de' }),
+  ];
+  for (const payload of invalid) {
+    await assert.rejects(
+      feature.requestService(
+        'stripe_connect_adopt',
+        signedServiceValue(signer.peer, 'stripe_connect_adopt', payload, otherKey)
+      ),
+      /Invalid Mayhem service request signature/
+    );
+  }
+  await assert.rejects(
+    feature.requestService(
+      'stripe_connect_adopt',
+      signedServiceValue(
+        transport.peer,
+        'stripe_connect_adopt',
+        stripeConnectAdoptValue(),
+        otherKey
+      )
+    ),
+    /Invalid Mayhem service request signature/
+  );
+  assert.equal(broadcasts, 0);
 });
 
 test('read-only transport relays dual-provider-signed Stripe Connect relink consent once', async () => {

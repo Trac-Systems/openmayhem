@@ -48,7 +48,6 @@ Options:
   --stripe-env-file <path>   File with STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET
                              (default: ${DEFAULT_STRIPE_ENV_FILE})
   --au <au_usd>              Whole-cent au_usd amount (default: ${DEFAULT_AU})
-  --currency <usd|eur>       Stripe checkout currency (default: usd)
   --who <hex-pubkey>         64-hex test user id (default: random)
   --paygate-port <port>      Local paygate port (default: auto)
   --contract-port <port>     Local contract RPC port (default: auto)
@@ -102,7 +101,6 @@ function parseArgs(argv) {
     };
     if (arg === '--stripe-env-file') args.stripeEnvFile = next();
     else if (arg === '--au') args.au = next();
-    else if (arg === '--currency') args.currency = next().trim().toLowerCase();
     else if (arg === '--who') args.who = next();
     else if (arg === '--paygate-port') args.paygatePort = Number.parseInt(next(), 10);
     else if (arg === '--contract-port') args.contractPort = Number.parseInt(next(), 10);
@@ -120,7 +118,6 @@ function parseArgs(argv) {
   const au = parseAu(args.au);
   args.au = au.toString();
   args.stripeAmountMinor = auToStripeMinor(au);
-  if (!['usd', 'eur'].includes(args.currency)) throw new Error('--currency must be usd or eur');
   if (!/^[0-9a-f]{64}$/i.test(args.who)) throw new Error('--who must be 64 hex characters');
   if (!Number.isSafeInteger(args.epochSeconds) || args.epochSeconds < 60) {
     throw new Error('--epoch-seconds must be a safe integer >= 60');

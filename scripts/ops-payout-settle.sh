@@ -20,7 +20,6 @@ TAP_ENABLED="${MAYHEM_TAP_SETTLEMENT_ENABLED:-1}"
 MAX_ATTEMPTS="${MAYHEM_PAYOUT_MAX_ATTEMPTS:-8}"
 RETRY_BACKOFF_SECONDS="${MAYHEM_PAYOUT_RETRY_BACKOFF_SECONDS:-300}"
 FIAT_OPERATOR_ACCOUNT="${MAYHEM_FIAT_OPERATOR_ACCOUNT:-platform_balance}"
-FIAT_OPERATOR_CURRENCY="${MAYHEM_FIAT_OPERATOR_CURRENCY:-eur}"
 FIAT_STRIPE_ENV_FILE="${MAYHEM_FIAT_STRIPE_ENV_FILE:-}"
 FIAT_TRANSFER_MAX_ATTEMPTS="${MAYHEM_FIAT_TRANSFER_MAX_ATTEMPTS:-4}"
 FIAT_TRANSFER_RETRY_MS="${MAYHEM_FIAT_TRANSFER_RETRY_MS:-500}"
@@ -505,9 +504,9 @@ PY
 
 validate_settlement_report() {
   local report="$1" rail="$2" phase="$3"
-  python3 - "$report" "$rail" "$phase" "$applied_epoch" "$apply_hash" <<'PY'
-import json, re, sys
-path, rail, phase, expected_epoch, expected_hash = sys.argv[1:]
+  python3 - "$report" "$rail" "$phase" "$applied_epoch" "$apply_hash" "$SOURCE_DIR" <<'PY'
+import json, re, subprocess, sys
+path, rail, phase, expected_epoch, expected_hash, source_dir = sys.argv[1:]
 expected_epoch = int(expected_epoch)
 d = json.load(open(path))
 if d.get("ok") is not True or d.get("epoch") != expected_epoch:
@@ -526,6 +525,766 @@ if (
     or str(settlement.get("epoch_apply_hash", "")).lower() != expected_hash
 ):
     raise SystemExit(f"{rail} settlement payload is stale or rail-contaminated")
+
+if rail == "fiat":
+    payload_keys = {
+        "op", "epoch", "at", "rail", "processor", "source_currency",
+        "operator_to", "epoch_apply_hash", "stripe_transfers", "transfer_root",
+        "provider_count", "provider_liability_au", "provider_paid_au",
+        "operator_fee_liability_au", "operator_fee_retained_au",
+        "gross_liability_au", "gross_paid_au", "rounding_au", "dust_au",
+        "source_amount_minor", "destination_totals", "outputs",
+    }
+    state_keys = payload_keys | {"type", "settled_by", "settled_by_role"}
+    decimal_pattern = re.compile(r"^(0|[1-9][0-9]*)$")
+    rate_pattern = re.compile(r"^(0|[1-9][0-9]*)(\.[0-9]+)?$")
+    currency_pattern = re.compile(r"^[a-z]{3}$")
+    hash_pattern = re.compile(r"^[0-9a-f]{64}$")
+
+    def exact_keys(value, expected, label):
+        if not isinstance(value, dict) or set(value) != expected:
+            raise SystemExit(f"{label} does not have the exact canonical schema")
+
+    def exact_keys_with_null_optional(value, required, optional, label):
+        if (
+            not isinstance(value, dict)
+            or not required.issubset(value)
+            or not set(value).issubset(required | optional)
+            or any(value.get(key) is not None for key in optional)
+        ):
+            raise SystemExit(f"{label} does not have the exact canonical schema")
+
+    def decimal(value, label, *, positive=False):
+        if not isinstance(value, str) or not decimal_pattern.fullmatch(value):
+            raise SystemExit(f"{label} is not a canonical decimal string")
+        parsed = int(value)
+        if positive and parsed == 0:
+            raise SystemExit(f"{label} must be positive")
+        return parsed
+
+    def json_minor(value, label, *, positive=False):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise SystemExit(f"{label} is not a canonical JSON minor-unit integer")
+        if positive and value == 0:
+            raise SystemExit(f"{label} must be positive")
+        return value
+
+    def exact_rate_ratio(value, label):
+        if (
+            not isinstance(value, str)
+            or not rate_pattern.fullmatch(value)
+            or not any(character in "123456789" for character in value)
+        ):
+            raise SystemExit(f"{label} is not a positive exact decimal rate")
+        whole, separator, fraction = value.partition(".")
+        denominator = 10 ** len(fraction) if separator else 1
+        numerator = int(whole) * denominator + (int(fraction) if separator else 0)
+        return numerator, denominator
+
+    def exact_rates_equal(left, right):
+        left_numerator, left_denominator = left
+        right_numerator, right_denominator = right
+        return left_numerator * right_denominator == right_numerator * left_denominator
+
+    def currency(value, label):
+        if not isinstance(value, str) or not currency_pattern.fullmatch(value):
+            raise SystemExit(f"{label} is not a canonical currency")
+        return value
+
+    def hash32(value, label):
+        if not isinstance(value, str) or not hash_pattern.fullmatch(value):
+            raise SystemExit(f"{label} is not a canonical 32-byte hash")
+        return value
+
+    def stripe_quote_hashes(reports):
+        quotes = [
+            report.get("quote")
+            for report in reports
+            if isinstance(report, dict) and isinstance(report.get("quote"), dict)
+        ]
+        if not quotes:
+            return {}
+        canonical = [
+            json.dumps(
+                {
+                    "domain": "mayhem-stripe-fx-quote-evidence-v1",
+                    "value": quote,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            for quote in quotes
+        ]
+        helper = r'''
+const path = require("node:path");
+const { createRequire } = require("node:module");
+const sourceDir = process.argv[1];
+const requireFromRoot = createRequire(path.join(sourceDir, "scripts/ops-payout-settle.sh"));
+const { blake3 } = requireFromRoot(
+  path.join(sourceDir, "intercom/node_modules/@tracsystems/blake3")
+);
+let input = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => { input += chunk; });
+process.stdin.on("end", async () => {
+  const values = JSON.parse(input);
+  const hashes = [];
+  for (const value of values) {
+    hashes.push(Buffer.from(await blake3(Buffer.from(value, "utf8"))).toString("hex"));
+  }
+  process.stdout.write(JSON.stringify(hashes));
+});
+'''
+        try:
+            completed = subprocess.run(
+                ["node", "-e", helper, source_dir],
+                input=json.dumps(canonical, separators=(",", ":")),
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            hashes = json.loads(completed.stdout) if completed.returncode == 0 else None
+        except (OSError, json.JSONDecodeError):
+            hashes = None
+        if (
+            not isinstance(hashes, list)
+            or len(hashes) != len(quotes)
+            or any(not isinstance(value, str) or not hash_pattern.fullmatch(value) for value in hashes)
+        ):
+            raise SystemExit("fiat Stripe quote readback hashing failed")
+        return {
+            id(quote): digest
+            for quote, digest in zip(quotes, hashes)
+        }
+
+    def validate_quote_readback(quote, output, expected_hash, computed_hash):
+        exact_keys(
+            quote,
+            {
+                "id", "created", "expires_at", "lock_duration", "lock_status",
+                "to_currency", "usage", "rates",
+            },
+            "fiat Stripe FX quote readback",
+        )
+        usage = quote.get("usage")
+        rates = quote.get("rates")
+        if (
+            quote.get("id") != output.get("fx_quote_id")
+            or not isinstance(quote.get("created"), int)
+            or isinstance(quote.get("created"), bool)
+            or quote["created"] < 0
+            or not isinstance(quote.get("expires_at"), int)
+            or isinstance(quote.get("expires_at"), bool)
+            or quote["expires_at"] <= quote["created"]
+            or quote.get("lock_duration") != "five_minutes"
+            or not isinstance(quote.get("lock_status"), str)
+            or not quote["lock_status"]
+            or quote.get("to_currency") != output["destination_currency"]
+            or not isinstance(usage, dict)
+            or set(usage) != {"type", "destination"}
+            or usage.get("type") != "transfer"
+            or usage.get("destination") != output["to"]
+            or not isinstance(rates, dict)
+            or not rates
+        ):
+            raise SystemExit("fiat FX quote readback disagrees with output")
+        required_rates = {"usd"}
+        if output["source_currency"] != output["destination_currency"]:
+            required_rates.add(output["source_currency"])
+        if not required_rates.issubset(rates):
+            raise SystemExit("fiat FX quote readback lacks required valuation rates")
+        for key, rate in rates.items():
+            currency(key, "fiat FX quote rate currency")
+            exact_keys(
+                rate,
+                {"exchange_rate", "base_rate"},
+                "fiat Stripe FX quote rate",
+            )
+            for field in ("exchange_rate", "base_rate"):
+                value = rate.get(field)
+                if (
+                    not isinstance(value, str)
+                    or not rate_pattern.fullmatch(value)
+                    or not any(character in "123456789" for character in value)
+                ):
+                    raise SystemExit("fiat Stripe FX quote rate is invalid")
+        if computed_hash != expected_hash:
+            raise SystemExit("fiat FX quote readback hash disagrees with retained evidence")
+
+    def validate_base(value, *, retained=False):
+        exact_keys(value, state_keys if retained else payload_keys, "fiat settlement")
+        if (
+            value.get("op") != "settle_targeted_fiat"
+            or value.get("rail") != "fiat"
+            or value.get("processor") != "stripe"
+            or value.get("epoch") != expected_epoch
+            or not isinstance(value.get("at"), int)
+            or isinstance(value.get("at"), bool)
+            or value["at"] < 0
+            or not isinstance(value.get("operator_to"), str)
+            or not value["operator_to"]
+            or value.get("epoch_apply_hash") != expected_hash
+        ):
+            raise SystemExit("fiat settlement identity is invalid")
+        if retained:
+            if (
+                value.get("type") != "targeted_fiat_settlement"
+                or value.get("settled_by_role") != "admin"
+            ):
+                raise SystemExit("fiat retained state metadata is invalid")
+            hash32(value.get("settled_by"), "fiat retained state writer")
+
+    def validate_draft(value):
+        validate_base(value)
+        if (
+            value.get("source_currency") is not None
+            or value.get("transfer_root") is not None
+            or value.get("source_amount_minor") != "0"
+            or value.get("destination_totals") != []
+            or value.get("outputs") != []
+            or value.get("stripe_transfers") != []
+        ):
+            raise SystemExit("fiat plan is neither an exact draft nor exact settlement")
+        count = value.get("provider_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise SystemExit("fiat draft provider count is invalid")
+        for field in (
+            "provider_liability_au", "provider_paid_au",
+            "operator_fee_liability_au", "operator_fee_retained_au",
+            "gross_liability_au", "gross_paid_au", "rounding_au", "dust_au",
+        ):
+            decimal(value.get(field), f"fiat draft {field}")
+
+    def validate_exact(value, *, retained=False):
+        validate_base(value, retained=retained)
+        source_currency = currency(value.get("source_currency"), "fiat source currency")
+        source_amount_minor = decimal(
+            value.get("source_amount_minor"),
+            "fiat source amount",
+            positive=True,
+        )
+        hash32(value.get("transfer_root"), "fiat transfer root")
+        count = value.get("provider_count")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise SystemExit("fiat provider count is invalid")
+        top = {
+            field: decimal(
+                value.get(field),
+                f"fiat {field}",
+                positive=field in {"gross_liability_au", "gross_paid_au"},
+            )
+            for field in (
+                "provider_liability_au", "provider_paid_au",
+                "operator_fee_liability_au", "operator_fee_retained_au",
+                "gross_liability_au", "gross_paid_au", "rounding_au", "dust_au",
+            )
+        }
+        if (
+            top["provider_liability_au"] + top["operator_fee_liability_au"]
+                != top["gross_liability_au"]
+            or top["provider_paid_au"] + top["operator_fee_retained_au"]
+                != top["gross_paid_au"]
+            or top["gross_paid_au"] + top["dust_au"] != top["gross_liability_au"]
+            or top["rounding_au"] != top["dust_au"]
+        ):
+            raise SystemExit("fiat canonical AU totals do not balance")
+
+        outputs = value.get("outputs")
+        transfers = value.get("stripe_transfers")
+        if (
+            not isinstance(outputs, list)
+            or not outputs
+            or not isinstance(transfers, list)
+            or len(transfers) != len(outputs)
+        ):
+            raise SystemExit("fiat outputs or retained Stripe evidence is incomplete")
+
+        provider_count = 0
+        provider_liability = 0
+        provider_paid = 0
+        operator_liability = 0
+        operator_paid = 0
+        rounding = 0
+        dust = 0
+        source_minor = 0
+        destination_totals = {}
+        provider_order = []
+        operator_seen = False
+        refs = set()
+        quotes = set()
+        destination_payments = set()
+        expected_group = f"mayhem_fiat_epoch_{expected_epoch}_{expected_hash[:16]}"
+
+        for index, (output, evidence) in enumerate(zip(outputs, transfers)):
+            role = output.get("role") if isinstance(output, dict) else None
+            if role == "provider":
+                output_fields = {
+                    "role", "provider", "payout_revision", "to", "liability_au",
+                    "paid_au", "rounding_au", "dust_au", "source_currency",
+                    "source_amount_minor", "destination_currency",
+                    "destination_amount_minor",
+                }
+                quote_fields = {"fx_quote_id", "fx_quote_hash"}
+                direct_usd = (
+                    output.get("source_currency") == "usd"
+                    and output.get("destination_currency") == "usd"
+                )
+                if direct_usd:
+                    exact_keys_with_null_optional(
+                        output,
+                        output_fields,
+                        quote_fields,
+                        "fiat provider output",
+                    )
+                else:
+                    exact_keys(output, output_fields | quote_fields, "fiat provider output")
+                provider = hash32(output.get("provider"), "fiat provider identity")
+                revision = hash32(output.get("payout_revision"), "fiat payout revision")
+                provider_order.append((provider, revision))
+                if operator_seen:
+                    raise SystemExit("fiat provider output follows operator output")
+                provider_count += 1
+            elif role == "operator_fee":
+                output_fields = {
+                    "role", "to", "liability_au", "paid_au", "rounding_au",
+                    "dust_au", "source_currency", "source_amount_minor",
+                }
+                exact_keys(output, output_fields, "fiat operator output")
+                if operator_seen:
+                    raise SystemExit("fiat settlement has duplicate operator output")
+                operator_seen = True
+                if output.get("to") != value.get("operator_to"):
+                    raise SystemExit("fiat operator output target is inconsistent")
+            else:
+                raise SystemExit("fiat settlement output role is invalid")
+
+            if not isinstance(output.get("to"), str) or not output["to"]:
+                raise SystemExit("fiat settlement output target is invalid")
+            if currency(output.get("source_currency"), "fiat output source currency") != source_currency:
+                raise SystemExit("fiat output source currency disagrees with settlement")
+            output_source_minor = decimal(
+                output.get("source_amount_minor"),
+                "fiat output source amount",
+                positive=True,
+            )
+            liability = decimal(output.get("liability_au"), "fiat output liability", positive=True)
+            paid = decimal(output.get("paid_au"), "fiat output paid amount", positive=True)
+            output_rounding = decimal(output.get("rounding_au"), "fiat output rounding")
+            output_dust = decimal(output.get("dust_au"), "fiat output dust")
+            if paid + output_dust != liability or output_rounding != output_dust:
+                raise SystemExit("fiat output AU liability, paid amount, rounding, and dust do not balance")
+            source_minor += output_source_minor
+            rounding += output_rounding
+            dust += output_dust
+
+            if role == "provider":
+                provider_liability += liability
+                provider_paid += paid
+                destination_currency = currency(
+                    output.get("destination_currency"),
+                    "fiat provider destination currency",
+                )
+                destination_minor = decimal(
+                    output.get("destination_amount_minor"),
+                    "fiat provider destination amount",
+                    positive=True,
+                )
+                destination_totals[destination_currency] = (
+                    destination_totals.get(destination_currency, 0) + destination_minor
+                )
+                same_currency = destination_currency == source_currency
+                if same_currency:
+                    if destination_minor != output_source_minor:
+                        raise SystemExit(
+                            "fiat same-currency provider source and destination amounts differ"
+                        )
+                direct_usd = same_currency and source_currency == "usd"
+                if direct_usd:
+                    if (
+                        output.get("fx_quote_id") is not None
+                        or output.get("fx_quote_hash") is not None
+                    ):
+                        raise SystemExit("fiat direct-USD provider output retains an FX quote")
+                    quote_id = None
+                    quote_hash = None
+                else:
+                    quote_id = output.get("fx_quote_id")
+                    if (
+                        not isinstance(quote_id, str)
+                        or not re.fullmatch(r"fxq_[A-Za-z0-9._-]+", quote_id)
+                    ):
+                        raise SystemExit("fiat provider FX quote id is invalid")
+                    quote_hash = hash32(
+                        output.get("fx_quote_hash"),
+                        "fiat provider FX quote hash",
+                    )
+                evidence_fields = {
+                    "schema_version", "kind", "ref", "destination", "source_currency",
+                    "source_amount_minor", "destination_currency",
+                    "destination_amount_minor", "destination_payment", "transfer_group",
+                }
+                if direct_usd:
+                    exact_keys_with_null_optional(
+                        evidence,
+                        evidence_fields,
+                        quote_fields,
+                        "fiat retained Stripe transfer evidence",
+                    )
+                else:
+                    exact_keys(
+                        evidence,
+                        evidence_fields | quote_fields,
+                        "fiat retained Stripe transfer evidence",
+                    )
+            else:
+                operator_liability += liability
+                operator_paid += paid
+                evidence_fields = {
+                    "schema_version", "kind", "ref", "destination", "source_currency",
+                    "source_amount_minor", "transfer_group",
+                }
+
+                exact_keys(evidence, evidence_fields, "fiat retained Stripe transfer evidence")
+            if (
+                evidence.get("schema_version") != 2
+                or evidence.get("destination") != output.get("to")
+                or evidence.get("source_currency") != source_currency
+                or evidence.get("source_amount_minor") != output.get("source_amount_minor")
+            ):
+                raise SystemExit("fiat retained Stripe evidence disagrees with output")
+            ref = evidence.get("ref")
+            if not isinstance(ref, str) or ref in refs:
+                raise SystemExit("fiat retained Stripe transfer reference is invalid or duplicated")
+            refs.add(ref)
+            if role == "provider":
+                destination_payment = evidence.get("destination_payment")
+                if (
+                    evidence.get("kind") != "stripe_transfer"
+                    or not ref.startswith("tr_")
+                    or evidence.get("destination_currency") != output.get("destination_currency")
+                    or evidence.get("destination_amount_minor") != output.get("destination_amount_minor")
+                    or evidence.get("fx_quote_id") != quote_id
+                    or evidence.get("fx_quote_hash") != quote_hash
+                    or evidence.get("transfer_group") != expected_group
+                    or not isinstance(destination_payment, str)
+                    or not re.fullmatch(r"py_[A-Za-z0-9._-]+", destination_payment)
+                    or (quote_id is not None and quote_id in quotes)
+                    or destination_payment in destination_payments
+                ):
+                    raise SystemExit("fiat provider FX/transfer evidence is inconsistent")
+                if quote_id is not None:
+                    quotes.add(quote_id)
+                destination_payments.add(destination_payment)
+            elif (
+                evidence.get("kind") != "platform_balance"
+                or not ref.startswith("platform_balance:")
+                or evidence.get("transfer_group") is not None
+            ):
+                raise SystemExit("fiat operator retained-balance evidence is inconsistent")
+
+        if provider_order != sorted(provider_order):
+            raise SystemExit("fiat provider outputs are not canonically ordered")
+        expected_destinations = [
+            {"currency": key, "amount_minor": str(destination_totals[key])}
+            for key in sorted(destination_totals)
+        ]
+        if value.get("destination_totals") != expected_destinations:
+            raise SystemExit("fiat destination totals do not match provider outputs")
+        if (
+            count != provider_count
+            or source_amount_minor != source_minor
+            or top["provider_liability_au"] != provider_liability
+            or top["provider_paid_au"] != provider_paid
+            or top["operator_fee_liability_au"] != operator_liability
+            or top["operator_fee_retained_au"] != operator_paid
+            or top["rounding_au"] != rounding
+            or top["dust_au"] != dust
+        ):
+            raise SystemExit("fiat settlement totals do not match outputs")
+        return outputs, transfers
+
+    def validate_readback(value, outputs, transfers):
+        reports = d.get("stripe_transfers")
+        if not isinstance(reports, list) or len(reports) != len(outputs):
+            raise SystemExit("fiat Stripe readback reports do not cover every output")
+        platform = d.get("platform_account")
+        exact_keys(
+            platform,
+            {"id", "default_currency", "livemode", "attempts"},
+            "fiat Stripe platform account readback",
+        )
+        platform_attempts = platform.get("attempts")
+        if (
+            not isinstance(platform.get("id"), str)
+            or not re.fullmatch(r"acct_[A-Za-z0-9._-]+", platform["id"])
+            or currency(
+                platform.get("default_currency"),
+                "fiat Stripe platform default currency",
+            ) != value["source_currency"]
+            or not isinstance(platform.get("livemode"), bool)
+            or not isinstance(platform_attempts, int)
+            or isinstance(platform_attempts, bool)
+            or platform_attempts <= 0
+        ):
+            raise SystemExit("fiat settlement source disagrees with Stripe platform account")
+        readback_quote_hashes = stripe_quote_hashes(reports)
+        provider_reports = {}
+        provider_indexes = set()
+        operator_reports = []
+        for report in reports:
+            if not isinstance(report, dict):
+                raise SystemExit("fiat Stripe readback report is invalid")
+            index = report.get("output_index")
+            if isinstance(index, int) and not isinstance(index, bool):
+                transfer = report.get("transfer")
+                ref = transfer.get("id") if isinstance(transfer, dict) else None
+                if index < 0 or index in provider_indexes or not isinstance(ref, str) or ref in provider_reports:
+                    raise SystemExit("fiat Stripe readback has a duplicate output index")
+                provider_indexes.add(index)
+                provider_reports[ref] = report
+            elif index is None and report.get("kind") == "platform_balance":
+                operator_reports.append(report)
+            else:
+                raise SystemExit("fiat Stripe readback output index is invalid")
+
+        operator_count = 0
+        provider_source = {}
+        provider_destination = {}
+        operator_source = {}
+        for index, (output, evidence) in enumerate(zip(outputs, transfers)):
+            if output["role"] == "operator_fee":
+                operator_count += 1
+                if len(operator_reports) != operator_count:
+                    raise SystemExit("fiat operator retained-balance readback is missing")
+                report = operator_reports[operator_count - 1]
+                if (
+                    report.get("source_currency") != output["source_currency"]
+                    or report.get("source_amount_minor") != output["source_amount_minor"]
+                    or report.get("liability_au") != output["liability_au"]
+                    or report.get("retained_au") != output["paid_au"]
+                    or report.get("dust_au") != output["dust_au"]
+                ):
+                    raise SystemExit("fiat operator readback disagrees with retained output")
+                operator_source[output["source_currency"]] = (
+                    operator_source.get(output["source_currency"], 0)
+                    + int(output["source_amount_minor"])
+                )
+                continue
+
+            report = provider_reports.get(evidence["ref"])
+            if not isinstance(report, dict):
+                raise SystemExit("fiat provider Stripe readback is missing")
+            account = report.get("account")
+            fx = report.get("fx")
+            quote = report.get("quote")
+            transfer = report.get("transfer")
+            payment = report.get("destination_payment")
+            if not all(isinstance(item, dict) for item in (account, fx, transfer, payment)):
+                raise SystemExit("fiat provider Stripe readback is incomplete")
+            same_currency = output["source_currency"] == output["destination_currency"]
+            direct_usd = same_currency and output["source_currency"] == "usd"
+            if direct_usd:
+                if quote is not None:
+                    raise SystemExit("fiat direct-USD provider has an FX quote readback")
+            elif not isinstance(quote, dict):
+                raise SystemExit("fiat provider Stripe readback is incomplete")
+            if (
+                account.get("id") != output["to"]
+                or account.get("default_currency") != output["destination_currency"]
+                or account.get("ready") is not True
+                or fx.get("liability_au") != output["liability_au"]
+                or fx.get("paid_au") != output["paid_au"]
+                or fx.get("rounding_au") != output["rounding_au"]
+                or fx.get("dust_au") != output["dust_au"]
+                or fx.get("source_currency") != output["source_currency"]
+                or fx.get("source_amount_minor") != output["source_amount_minor"]
+                or fx.get("destination_currency") != output["destination_currency"]
+            ):
+                raise SystemExit("fiat provider account/FX readback disagrees with output")
+            if same_currency:
+                for field in (
+                    "target_destination_amount_minor",
+                    "maximum_destination_amount_minor",
+                ):
+                    amount = fx.get(field)
+                    if amount is not None and amount != output["destination_amount_minor"]:
+                        raise SystemExit(
+                            "fiat same-currency account/transfer readback is not exact"
+                        )
+            else:
+                target_minor = decimal(
+                    fx.get("target_destination_amount_minor"),
+                    "fiat FX target destination amount",
+                    positive=True,
+                )
+                maximum_minor = decimal(
+                    fx.get("maximum_destination_amount_minor"),
+                    "fiat FX maximum destination amount",
+                    positive=True,
+                )
+                actual_minor = int(output["destination_amount_minor"])
+                if target_minor > actual_minor or actual_minor > maximum_minor:
+                    raise SystemExit("fiat destination payment falls outside its exact FX bound")
+            if not direct_usd:
+                validate_quote_readback(
+                    quote,
+                    output,
+                    output["fx_quote_hash"],
+                    readback_quote_hashes.get(id(quote)),
+                )
+            expected_transfer_quote = None if same_currency else output["fx_quote_id"]
+            if (
+                transfer.get("id") != evidence["ref"]
+                or transfer.get("source_currency") != output["source_currency"]
+                or str(transfer.get("source_amount_minor")) != output["source_amount_minor"]
+                or transfer.get("destination") != output["to"]
+                or transfer.get("destination_payment") != evidence["destination_payment"]
+                or (same_currency and not direct_usd and "fx_quote" not in transfer)
+                or transfer.get("fx_quote") != expected_transfer_quote
+                or transfer.get("transfer_group") != evidence["transfer_group"]
+                or transfer.get("verified") is not True
+                or transfer.get("reversed") is not False
+                or transfer.get("amount_reversed") != 0
+            ):
+                raise SystemExit("fiat Stripe transfer readback disagrees with retained evidence")
+            exact_keys(
+                payment,
+                {
+                    "id", "source_amount_minor", "source_currency", "amount_minor",
+                    "gross_amount_minor", "currency", "fee_minor", "net_minor",
+                    "exchange_rate", "paid", "captured", "source_transfer",
+                    "balance_transaction",
+                },
+                "fiat Stripe destination-payment readback",
+            )
+            payment_source_minor = json_minor(
+                payment.get("source_amount_minor"),
+                "fiat destination-payment source amount",
+                positive=True,
+            )
+            payment_amount_minor = json_minor(
+                payment.get("amount_minor"),
+                "fiat destination-payment net amount",
+                positive=True,
+            )
+            payment_gross_minor = json_minor(
+                payment.get("gross_amount_minor"),
+                "fiat destination-payment gross amount",
+                positive=True,
+            )
+            payment_fee_minor = json_minor(
+                payment.get("fee_minor"),
+                "fiat destination-payment fee amount",
+            )
+            payment_net_minor = json_minor(
+                payment.get("net_minor"),
+                "fiat destination-payment net detail",
+                positive=True,
+            )
+            payment_rate = payment.get("exchange_rate")
+            if same_currency:
+                payment_rate_matches = payment_rate is None
+            else:
+                payment_rate_matches = exact_rates_equal(
+                    exact_rate_ratio(
+                        payment_rate,
+                        "fiat destination-payment exchange rate",
+                    ),
+                    exact_rate_ratio(
+                        quote["rates"][output["source_currency"]]["base_rate"],
+                        "fiat retained source-currency base rate",
+                    ),
+                )
+            if (
+                payment.get("id") != evidence["destination_payment"]
+                or payment_source_minor != int(output["source_amount_minor"])
+                or payment_source_minor != transfer.get("source_amount_minor")
+                or payment.get("source_currency") != output["source_currency"]
+                or payment_amount_minor != int(output["destination_amount_minor"])
+                or payment_net_minor != payment_amount_minor
+                or payment_gross_minor != payment_net_minor + payment_fee_minor
+                or payment.get("currency") != output["destination_currency"]
+                or not payment_rate_matches
+                or payment.get("paid") is not True
+                or payment.get("captured") is not True
+                or payment.get("source_transfer") != evidence["ref"]
+                or not isinstance(payment.get("balance_transaction"), str)
+                or not payment["balance_transaction"].startswith("txn_")
+            ):
+                raise SystemExit("fiat destination-payment readback disagrees with retained evidence")
+            provider_source[output["source_currency"]] = (
+                provider_source.get(output["source_currency"], 0)
+                + int(output["source_amount_minor"])
+            )
+            provider_destination[output["destination_currency"]] = (
+                provider_destination.get(output["destination_currency"], 0)
+                + int(output["destination_amount_minor"])
+            )
+
+        if len(operator_reports) != operator_count or set(provider_reports) != {
+            evidence["ref"]
+            for output, evidence in zip(outputs, transfers)
+            if output["role"] == "provider"
+        }:
+            raise SystemExit("fiat Stripe readback is not in one-to-one agreement with outputs")
+        reconciliation = d.get("reconciliation")
+        expected_reconciliation = {
+            "denom": "au_usd",
+            "provider_liability_au": value["provider_liability_au"],
+            "provider_paid_au": value["provider_paid_au"],
+            "operator_fee_liability_au": value["operator_fee_liability_au"],
+            "operator_fee_retained_au": value["operator_fee_retained_au"],
+            "gross_liability_au": value["gross_liability_au"],
+            "gross_paid_au": value["gross_paid_au"],
+            "rounding_au": value["rounding_au"],
+            "dust_au": value["dust_au"],
+            "provider_source_minor_by_currency": {
+                key: str(provider_source[key]) for key in sorted(provider_source)
+            },
+            "provider_destination_minor_by_currency": {
+                key: str(provider_destination[key]) for key in sorted(provider_destination)
+            },
+            "operator_retained_minor_by_currency": {
+                key: str(operator_source[key]) for key in sorted(operator_source)
+            },
+            "operator_fee_mechanism": "retained_platform_balance",
+            "provider_output_count": value["provider_count"],
+            "verified_transfer_count": value["provider_count"],
+            "all_provider_transfers_verified": True,
+        }
+        if reconciliation != expected_reconciliation:
+            raise SystemExit("fiat reconciliation does not exactly match settlement/readback evidence")
+
+    if already is not None:
+        validate_exact(settlement, retained=True)
+        if phase == "final" and d.get("submitted") is True:
+            raise SystemExit("fiat replay unexpectedly claims a new submit")
+        raise SystemExit(0)
+
+    if phase == "plan":
+        validate_draft(settlement)
+        if d.get("submitted") is True:
+            raise SystemExit("fiat plan unexpectedly claims a submit")
+        raise SystemExit(0)
+
+    if d.get("nothing_to_settle") is True:
+        validate_draft(settlement)
+        raise SystemExit(0)
+
+    outputs, transfers = validate_exact(settlement)
+    state = d.get("settlement_state")
+    if not isinstance(state, dict):
+        raise SystemExit("fiat final report has no canonical settlement state")
+    validate_exact(state, retained=True)
+    for key in payload_keys:
+        if state.get(key) != settlement.get(key):
+            raise SystemExit(f"fiat canonical state disagrees on {key}")
+    if d.get("submitted") is not True:
+        raise SystemExit("fiat final report does not prove a canonical submit")
+    validate_readback(settlement, outputs, transfers)
+    raise SystemExit(0)
+
 root = settlement.get("transfer_root")
 if not isinstance(root, str) or not re.fullmatch(r"[0-9a-f]{64}", root):
     raise SystemExit(f"{rail} settlement transfer root is invalid")
@@ -550,50 +1309,26 @@ elif phase == "final":
     if d.get("submitted") is not True or len(transfers) != len(outputs) or not transfers:
         raise SystemExit(f"{rail} final transfer evidence is incomplete")
 
-if rail == "fiat":
-    if phase == "final" and already is None and d.get("nothing_to_settle") is not True:
-        reconciliation = d.get("reconciliation") or {}
-        if reconciliation.get("all_provider_transfers_verified") is not True:
-            raise SystemExit("fiat provider transfer reconciliation is incomplete")
-        provider_outputs = [
-            (index, output) for index, output in enumerate(outputs)
-            if output.get("role") == "provider"
-        ]
-        outer = d.get("stripe_transfers")
-        if not isinstance(outer, list) or len(outer) != len(provider_outputs):
-            raise SystemExit("fiat Stripe transfer reports do not cover provider outputs")
-        by_index = {item.get("output_index"): item for item in outer}
-        for index, _ in provider_outputs:
-            report = by_index.get(index)
-            transfer = report.get("transfer") if isinstance(report, dict) else None
-            evidence = transfers[index]
-            if (
-                not isinstance(transfer, dict)
-                or transfer.get("verified") is not True
-                or transfer.get("id") != evidence.get("ref")
-            ):
-                raise SystemExit("fiat Stripe transfer report disagrees with retained evidence")
-else:
-    if phase == "final" and already is None:
-        outer_outputs = d.get("msb_outputs")
-        outer = d.get("msb_transfers")
-        if not isinstance(outer_outputs, list) or len(outer_outputs) != len(outputs):
-            raise SystemExit("TNK MSB outputs do not cover settlement outputs")
-        if not isinstance(outer, list) or len(outer) != len(outputs):
-            raise SystemExit("TNK MSB transfer journals do not cover settlement outputs")
-        by_index = {item.get("output_index"): item for item in outer}
-        for index, evidence in enumerate(transfers):
-            report = by_index.get(index)
-            transfer = report.get("transfer") if isinstance(report, dict) else None
-            if (
-                not isinstance(transfer, dict)
-                or transfer.get("tx_hash") != evidence.get("tx_hash")
-                or transfer.get("from") != evidence.get("from")
-                or transfer.get("to") != evidence.get("to")
-                or transfer.get("confirmed_length") != evidence.get("confirmed_length")
-                or transfer.get("observed_signed_length") != evidence.get("observed_signed_length")
-            ):
-                raise SystemExit("TNK MSB transfer report disagrees with retained evidence")
+if phase == "final" and already is None:
+    outer_outputs = d.get("msb_outputs")
+    outer = d.get("msb_transfers")
+    if not isinstance(outer_outputs, list) or len(outer_outputs) != len(outputs):
+        raise SystemExit("TNK MSB outputs do not cover settlement outputs")
+    if not isinstance(outer, list) or len(outer) != len(outputs):
+        raise SystemExit("TNK MSB transfer journals do not cover settlement outputs")
+    by_index = {item.get("output_index"): item for item in outer}
+    for index, evidence in enumerate(transfers):
+        report = by_index.get(index)
+        transfer = report.get("transfer") if isinstance(report, dict) else None
+        if (
+            not isinstance(transfer, dict)
+            or transfer.get("tx_hash") != evidence.get("tx_hash")
+            or transfer.get("from") != evidence.get("from")
+            or transfer.get("to") != evidence.get("to")
+            or transfer.get("confirmed_length") != evidence.get("confirmed_length")
+            or transfer.get("observed_signed_length") != evidence.get("observed_signed_length")
+        ):
+            raise SystemExit("TNK MSB transfer report disagrees with retained evidence")
 PY
 }
 
@@ -672,7 +1407,6 @@ settle_fiat() {
     --epoch "$applied_epoch"
     --at "$settlement_at"
     --operator-stripe-account "$FIAT_OPERATOR_ACCOUNT"
-    --operator-currency "$FIAT_OPERATOR_CURRENCY"
     --stripe-transfer-max-attempts "$FIAT_TRANSFER_MAX_ATTEMPTS"
     --stripe-transfer-retry-ms "$FIAT_TRANSFER_RETRY_MS"
     --json
