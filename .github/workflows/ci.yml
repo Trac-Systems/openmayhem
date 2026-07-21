@@ -19,7 +19,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.89.0 --profile minimal --component clippy,rustfmt
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.89.0
 
       - name: Sellable surface audit
         run: node scripts/i3-e15-sellable-surface-audit.mjs
@@ -41,7 +43,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        run: rustup toolchain install 1.89.0 --profile minimal
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal
+          rustup default 1.89.0
 
       - name: Install Node.js
         uses: actions/setup-node@v4
