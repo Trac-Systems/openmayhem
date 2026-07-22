@@ -3846,13 +3846,17 @@ mod stable_diffusion_cpp_backend {
     }
 
     fn server_ready(address: SocketAddr) -> bool {
+        server_ready_with_timeout(address, Duration::from_secs(1))
+    }
+
+    fn server_ready_with_timeout(address: SocketAddr, timeout: Duration) -> bool {
         let Ok(response) = http_request(
             address,
             "GET",
             "/v1/models",
             None,
             HEALTH_RESPONSE_LIMIT,
-            Some(Duration::from_secs(1)),
+            Some(timeout),
             None,
         ) else {
             return false;
@@ -3918,7 +3922,8 @@ mod stable_diffusion_cpp_backend {
         read_timeout: Option<Duration>,
         cancellation: Option<&CancellationToken>,
     ) -> Result<HttpResponse> {
-        check_http_cancellation(cancellation)?;
+        let deadline = read_timeout.map(|timeout| Instant::now() + timeout);
+        check_http_control(cancellation, deadline)?;
         let mut stream =
             TcpStream::connect_timeout(&address, Duration::from_millis(250)).map_err(|err| {
                 EngineError::StableDiffusionCpp(format!(
@@ -3926,24 +3931,22 @@ mod stable_diffusion_cpp_backend {
                 ))
             })?;
         stream.set_nodelay(true)?;
-        stream.set_read_timeout(
-            cancellation
-                .map(|_| Duration::from_millis(25))
-                .or(read_timeout),
-        )?;
-        stream.set_write_timeout(cancellation.map(|_| Duration::from_millis(25)))?;
+        let poll_timeout =
+            (cancellation.is_some() || deadline.is_some()).then_some(Duration::from_millis(25));
+        stream.set_read_timeout(poll_timeout)?;
+        stream.set_write_timeout(poll_timeout)?;
         let body = body.unwrap_or_default();
         let headers = format!(
             "{method} {path} HTTP/1.1\r\nHost: {address}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
-        write_all_cancellable(&mut stream, headers.as_bytes(), cancellation)?;
-        write_all_cancellable(&mut stream, body, cancellation)?;
-        flush_cancellable(&mut stream, cancellation)?;
+        write_all_cancellable(&mut stream, headers.as_bytes(), cancellation, deadline)?;
+        write_all_cancellable(&mut stream, body, cancellation, deadline)?;
+        flush_cancellable(&mut stream, cancellation, deadline)?;
 
         let mut reader = BufReader::new(stream);
         let mut status_line = String::new();
-        if read_line_cancellable(&mut reader, &mut status_line, cancellation)? == 0 {
+        if read_line_cancellable(&mut reader, &mut status_line, cancellation, deadline)? == 0 {
             return Err(EngineError::StableDiffusionCpp(
                 "local sd-server closed without an HTTP response".to_owned(),
             ));
@@ -3964,7 +3967,7 @@ mod stable_diffusion_cpp_backend {
         let mut chunked = false;
         loop {
             let mut line = String::new();
-            if read_line_cancellable(&mut reader, &mut line, cancellation)? == 0 {
+            if read_line_cancellable(&mut reader, &mut line, cancellation, deadline)? == 0 {
                 return Err(EngineError::StableDiffusionCpp(
                     "local sd-server closed inside HTTP headers".to_owned(),
                 ));
@@ -3996,7 +3999,7 @@ mod stable_diffusion_cpp_backend {
         }
 
         let body = if chunked {
-            read_chunked_body(&mut reader, body_limit, cancellation)?
+            read_chunked_body(&mut reader, body_limit, cancellation, deadline)?
         } else if let Some(content_length) = content_length {
             if content_length > body_limit {
                 return Err(EngineError::StableDiffusionCpp(format!(
@@ -4004,10 +4007,10 @@ mod stable_diffusion_cpp_backend {
                 )));
             }
             let mut body = vec![0_u8; content_length];
-            read_exact_cancellable(&mut reader, &mut body, cancellation)?;
+            read_exact_cancellable(&mut reader, &mut body, cancellation, deadline)?;
             body
         } else {
-            let body = read_to_end_cancellable(&mut reader, body_limit, cancellation)?;
+            let body = read_to_end_cancellable(&mut reader, body_limit, cancellation, deadline)?;
             if body.len() > body_limit {
                 return Err(EngineError::StableDiffusionCpp(format!(
                     "local sd-server response exceeds the {body_limit}-byte bound"
@@ -4022,11 +4025,12 @@ mod stable_diffusion_cpp_backend {
         reader: &mut R,
         body_limit: usize,
         cancellation: Option<&CancellationToken>,
+        deadline: Option<Instant>,
     ) -> Result<Vec<u8>> {
         let mut body = Vec::new();
         loop {
             let mut line = String::new();
-            if read_line_cancellable(reader, &mut line, cancellation)? == 0 {
+            if read_line_cancellable(reader, &mut line, cancellation, deadline)? == 0 {
                 return Err(EngineError::StableDiffusionCpp(
                     "local sd-server closed inside a chunked response".to_owned(),
                 ));
@@ -4044,7 +4048,7 @@ mod stable_diffusion_cpp_backend {
             if size == 0 {
                 loop {
                     line.clear();
-                    if read_line_cancellable(reader, &mut line, cancellation)? == 0
+                    if read_line_cancellable(reader, &mut line, cancellation, deadline)? == 0
                         || line == "\r\n"
                         || line == "\n"
                     {
@@ -4060,9 +4064,9 @@ mod stable_diffusion_cpp_backend {
             }
             let start = body.len();
             body.resize(start + size, 0);
-            read_exact_cancellable(reader, &mut body[start..], cancellation)?;
+            read_exact_cancellable(reader, &mut body[start..], cancellation, deadline)?;
             let mut terminator = [0_u8; 2];
-            read_exact_cancellable(reader, &mut terminator, cancellation)?;
+            read_exact_cancellable(reader, &mut terminator, cancellation, deadline)?;
             if terminator != *b"\r\n" {
                 return Err(EngineError::StableDiffusionCpp(
                     "local sd-server returned an invalid chunk terminator".to_owned(),
@@ -4072,15 +4076,27 @@ mod stable_diffusion_cpp_backend {
         Ok(body)
     }
 
-    fn check_http_cancellation(cancellation: Option<&CancellationToken>) -> Result<()> {
-        cancellation.map(CancellationToken::check).unwrap_or(Ok(()))
+    fn check_http_control(
+        cancellation: Option<&CancellationToken>,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        cancellation
+            .map(CancellationToken::check)
+            .unwrap_or(Ok(()))?;
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(EngineError::StableDiffusionCpp(
+                "local sd-server HTTP request exceeded its deadline".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
-    fn retry_cancellable_read(
+    fn retry_controlled_io(
         error: &std::io::Error,
         cancellation: Option<&CancellationToken>,
+        deadline: Option<Instant>,
     ) -> bool {
-        cancellation.is_some()
+        (cancellation.is_some() || deadline.is_some())
             && matches!(
                 error.kind(),
                 std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
@@ -4091,12 +4107,13 @@ mod stable_diffusion_cpp_backend {
         reader: &mut R,
         line: &mut String,
         cancellation: Option<&CancellationToken>,
+        deadline: Option<Instant>,
     ) -> Result<usize> {
         loop {
-            check_http_cancellation(cancellation)?;
+            check_http_control(cancellation, deadline)?;
             match reader.read_line(line) {
                 Ok(read) => return Ok(read),
-                Err(error) if retry_cancellable_read(&error, cancellation) => continue,
+                Err(error) if retry_controlled_io(&error, cancellation, deadline) => continue,
                 Err(error) => return Err(error.into()),
             }
         }
@@ -4106,9 +4123,10 @@ mod stable_diffusion_cpp_backend {
         writer: &mut W,
         mut bytes: &[u8],
         cancellation: Option<&CancellationToken>,
+        deadline: Option<Instant>,
     ) -> Result<()> {
         while !bytes.is_empty() {
-            check_http_cancellation(cancellation)?;
+            check_http_control(cancellation, deadline)?;
             match writer.write(bytes) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
@@ -4118,7 +4136,7 @@ mod stable_diffusion_cpp_backend {
                     .into())
                 }
                 Ok(written) => bytes = &bytes[written..],
-                Err(error) if retry_cancellable_read(&error, cancellation) => continue,
+                Err(error) if retry_controlled_io(&error, cancellation, deadline) => continue,
                 Err(error) => return Err(error.into()),
             }
         }
@@ -4128,12 +4146,13 @@ mod stable_diffusion_cpp_backend {
     fn flush_cancellable<W: Write>(
         writer: &mut W,
         cancellation: Option<&CancellationToken>,
+        deadline: Option<Instant>,
     ) -> Result<()> {
         loop {
-            check_http_cancellation(cancellation)?;
+            check_http_control(cancellation, deadline)?;
             match writer.flush() {
                 Ok(()) => return Ok(()),
-                Err(error) if retry_cancellable_read(&error, cancellation) => continue,
+                Err(error) if retry_controlled_io(&error, cancellation, deadline) => continue,
                 Err(error) => return Err(error.into()),
             }
         }
@@ -4143,9 +4162,10 @@ mod stable_diffusion_cpp_backend {
         reader: &mut R,
         mut bytes: &mut [u8],
         cancellation: Option<&CancellationToken>,
+        deadline: Option<Instant>,
     ) -> Result<()> {
         while !bytes.is_empty() {
-            check_http_cancellation(cancellation)?;
+            check_http_control(cancellation, deadline)?;
             match reader.read(bytes) {
                 Ok(0) => {
                     return Err(std::io::Error::new(
@@ -4155,7 +4175,7 @@ mod stable_diffusion_cpp_backend {
                     .into())
                 }
                 Ok(read) => bytes = &mut bytes[read..],
-                Err(error) if retry_cancellable_read(&error, cancellation) => continue,
+                Err(error) if retry_controlled_io(&error, cancellation, deadline) => continue,
                 Err(error) => return Err(error.into()),
             }
         }
@@ -4166,11 +4186,12 @@ mod stable_diffusion_cpp_backend {
         reader: &mut R,
         body_limit: usize,
         cancellation: Option<&CancellationToken>,
+        deadline: Option<Instant>,
     ) -> Result<Vec<u8>> {
         let mut body = Vec::new();
         let mut chunk = [0_u8; 16 * 1024];
         loop {
-            check_http_cancellation(cancellation)?;
+            check_http_control(cancellation, deadline)?;
             match reader.read(&mut chunk) {
                 Ok(0) => return Ok(body),
                 Ok(read) => {
@@ -4179,7 +4200,7 @@ mod stable_diffusion_cpp_backend {
                         return Ok(body);
                     }
                 }
-                Err(error) if retry_cancellable_read(&error, cancellation) => continue,
+                Err(error) if retry_controlled_io(&error, cancellation, deadline) => continue,
                 Err(error) => return Err(error.into()),
             }
         }
@@ -4200,12 +4221,58 @@ mod stable_diffusion_cpp_backend {
 
     #[cfg(test)]
     mod recovery_tests {
+        use std::sync::mpsc;
+
         use super::*;
 
         #[derive(Default)]
         struct RecoveryProbe {
             operations: usize,
             restarts: usize,
+        }
+
+        #[test]
+        fn readiness_deadline_closes_a_stalled_probe_and_allows_retry() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake sd-server");
+            let address = listener.local_addr().expect("fake sd-server address");
+            let (first_request_tx, first_request_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut first, _) = listener.accept().expect("accept stalled readiness probe");
+                let mut request = [0_u8; 4096];
+                let read = first
+                    .read(&mut request)
+                    .expect("read first readiness probe");
+                assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /v1/models"));
+                first_request_tx.send(()).expect("signal first probe");
+
+                let mut closed = [0_u8; 1];
+                assert_eq!(first.read(&mut closed).expect("observe probe close"), 0);
+
+                let (mut second, _) = listener.accept().expect("accept readiness retry");
+                let read = second.read(&mut request).expect("read readiness retry");
+                assert!(String::from_utf8_lossy(&request[..read]).starts_with("GET /v1/models"));
+                let body =
+                    br#"{"data":[{"id":"sd-cpp-local","object":"model","owned_by":"local"}]}"#;
+                write!(
+                    second,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .expect("write readiness headers");
+                second.write_all(body).expect("write readiness body");
+            });
+
+            let started = Instant::now();
+            assert!(!server_ready_with_timeout(
+                address,
+                Duration::from_millis(100)
+            ));
+            first_request_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first readiness probe arrived");
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(server_ready_with_timeout(address, Duration::from_secs(1)));
+            server.join().expect("fake sd-server exits");
         }
 
         #[test]

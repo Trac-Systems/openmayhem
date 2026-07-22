@@ -44,6 +44,7 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tower = { version = "0.5", features = ["limit", "util"] }
+url = "2.5"
 wait-timeout = "0.2"
 
 [dev-dependencies]

@@ -74,7 +74,7 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.38` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.39` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -83,7 +83,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.38
+git checkout --detach v0.2.39
 ./install.sh --from-source
 ```
 
@@ -92,7 +92,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.38
+git checkout --detach v0.2.39
 .\install.ps1 -FromSource
 ```
 
@@ -792,6 +792,14 @@ http://127.0.0.1:11435/mayhem/dashboard?token=<generated-token>
 http://127.0.0.1:11435/mayhem/dashboard/provider?token=<generated-token>
 ```
 
+Open the tokenized URL once for each gateway run. The gateway exchanges it for an
+HttpOnly browser cookie and redirects to a clean dashboard URL. That browser remains
+authenticated without an idle timeout, including after closing and reopening it, for
+as long as the same gateway process is running. Restarting the gateway rotates both
+secrets, so the newly printed URL must be opened once again. Dashboard cookies are
+transport-secure; use the documented loopback SSH forwarding flow or HTTPS for a
+remote gateway, never plain remote HTTP.
+
 When Mayhem runs on a remote machine, forward the same loopback port and then open the URL printed
 by `mayhem up`:
 
@@ -820,7 +828,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.38` is source-only. The GitHub release contains the tagged source, not
+`v0.2.39` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -828,7 +836,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.38
+git checkout --detach v0.2.39
 ./install.sh --from-source
 ```
 
@@ -837,7 +845,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.38
+git checkout --detach v0.2.39
 .\install.ps1 -FromSource
 ```
 
@@ -857,8 +865,9 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
-The `0.2.38` source release carries the current PAYOUTFREE, ATTAUTO, FLOWRATE,
-and LIVEROUTE implementation. The releases page and live signed catalog remain
+The `0.2.39` source release carries the current PAYOUTFREE, ATTAUTO, FLOWRATE,
+LIVEROUTE, bounded Z-Image readiness, and process-lifetime dashboard-auth
+implementation. The releases page and live signed catalog remain
 the user-facing truth for the current software revision and available models.
 
 ```bash

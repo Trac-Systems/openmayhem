@@ -636,81 +636,48 @@ fn route_operational_state(data: &DashboardData, entry: &ProviderTableEntry) -> 
 
 pub(super) fn render_dashboard_product_page(
     state: &GatewayState,
-    expires_in_seconds: u64,
     origin: &str,
     query: &DashboardQuery,
     page: DashboardProductPage,
 ) -> String {
     let data = DashboardData::from_state(state);
     let inner = match page {
-        DashboardProductPage::Home => home_page(&data, expires_in_seconds),
-        DashboardProductPage::Playground => {
-            playground_page(&data, expires_in_seconds, query.model.as_deref())
+        DashboardProductPage::Home => home_page(&data),
+        DashboardProductPage::Playground => playground_page(&data, query.model.as_deref()),
+        DashboardProductPage::Models => models_page(&data, query.page.as_deref()),
+        DashboardProductPage::Activity => activity_page(&data, query.page.as_deref()),
+        DashboardProductPage::Wallet => wallet_page(&data),
+        DashboardProductPage::Connect => connect_page(&data, origin, query.page.as_deref()),
+        DashboardProductPage::Earn => {
+            earn_overview_page(&data, query.provider.as_deref(), query.page.as_deref())
         }
-        DashboardProductPage::Models => {
-            models_page(&data, expires_in_seconds, query.page.as_deref())
+        DashboardProductPage::EarnJobs => {
+            earn_jobs_page(&data, query.provider.as_deref(), query.page.as_deref())
         }
-        DashboardProductPage::Activity => {
-            activity_page(&data, expires_in_seconds, query.page.as_deref())
+        DashboardProductPage::EarnMachines => {
+            earn_machines_page(&data, query.provider.as_deref(), query.page.as_deref())
         }
-        DashboardProductPage::Wallet => wallet_page(&data, expires_in_seconds),
-        DashboardProductPage::Connect => {
-            connect_page(&data, expires_in_seconds, origin, query.page.as_deref())
+        DashboardProductPage::EarnOpportunities => {
+            earn_opportunities_page(&data, query.provider.as_deref(), query.page.as_deref())
         }
-        DashboardProductPage::Earn => earn_overview_page(
-            &data,
-            expires_in_seconds,
-            query.provider.as_deref(),
-            query.page.as_deref(),
-        ),
-        DashboardProductPage::EarnJobs => earn_jobs_page(
-            &data,
-            expires_in_seconds,
-            query.provider.as_deref(),
-            query.page.as_deref(),
-        ),
-        DashboardProductPage::EarnMachines => earn_machines_page(
-            &data,
-            expires_in_seconds,
-            query.provider.as_deref(),
-            query.page.as_deref(),
-        ),
-        DashboardProductPage::EarnOpportunities => earn_opportunities_page(
-            &data,
-            expires_in_seconds,
-            query.provider.as_deref(),
-            query.page.as_deref(),
-        ),
-        DashboardProductPage::EarnEarnings => {
-            earn_earnings_page(&data, expires_in_seconds, query.provider.as_deref())
+        DashboardProductPage::EarnEarnings => earn_earnings_page(&data, query.provider.as_deref()),
+        DashboardProductPage::EarnReliability => {
+            earn_reliability_page(&data, query.provider.as_deref(), query.page.as_deref())
         }
-        DashboardProductPage::EarnReliability => earn_reliability_page(
-            &data,
-            expires_in_seconds,
-            query.provider.as_deref(),
-            query.page.as_deref(),
-        ),
-        DashboardProductPage::Network => network_overview_page(&data, expires_in_seconds),
-        DashboardProductPage::NetworkModels => {
-            network_models_page(&data, expires_in_seconds, query.page.as_deref())
-        }
+        DashboardProductPage::Network => network_overview_page(&data),
+        DashboardProductPage::NetworkModels => network_models_page(&data, query.page.as_deref()),
         DashboardProductPage::NetworkProviders => {
-            network_providers_page(&data, expires_in_seconds, query.page.as_deref())
+            network_providers_page(&data, query.page.as_deref())
         }
-        DashboardProductPage::NetworkMarkets => {
-            network_markets_page(&data, expires_in_seconds, query.page.as_deref())
-        }
+        DashboardProductPage::NetworkMarkets => network_markets_page(&data, query.page.as_deref()),
         DashboardProductPage::NetworkActivity => {
-            network_activity_page(&data, expires_in_seconds, query.page.as_deref())
+            network_activity_page(&data, query.page.as_deref())
         }
-        DashboardProductPage::NetworkEvidence => network_evidence_page(
-            &data,
-            expires_in_seconds,
-            query.page.as_deref(),
-            query.probe_page.as_deref(),
-        ),
-        DashboardProductPage::Help => help_page(&data, expires_in_seconds),
-        DashboardProductPage::Settings => settings_page(&data, expires_in_seconds),
+        DashboardProductPage::NetworkEvidence => {
+            network_evidence_page(&data, query.page.as_deref(), query.probe_page.as_deref())
+        }
+        DashboardProductPage::Help => help_page(&data),
+        DashboardProductPage::Settings => settings_page(&data),
     };
     dashboard_html_document(page.title(), &inner)
 }
@@ -1327,7 +1294,6 @@ fn volatile_page_status_marker(
 #[allow(clippy::too_many_arguments)]
 fn shell(
     data: &DashboardData,
-    expires: u64,
     page: DashboardAppPage,
     eyebrow: &str,
     heading: &str,
@@ -1338,7 +1304,7 @@ fn shell(
     content: &str,
 ) -> String {
     shell_impl(
-        data, expires, page, eyebrow, heading, summary, status, tone, actions, content, false,
+        data, page, eyebrow, heading, summary, status, tone, actions, content, false,
     )
 }
 
@@ -1347,7 +1313,6 @@ fn shell(
 #[allow(clippy::too_many_arguments)]
 fn shell_wide(
     data: &DashboardData,
-    expires: u64,
     page: DashboardAppPage,
     eyebrow: &str,
     heading: &str,
@@ -1358,14 +1323,13 @@ fn shell_wide(
     content: &str,
 ) -> String {
     shell_impl(
-        data, expires, page, eyebrow, heading, summary, status, tone, actions, content, true,
+        data, page, eyebrow, heading, summary, status, tone, actions, content, true,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn shell_impl(
     data: &DashboardData,
-    expires: u64,
     page: DashboardAppPage,
     eyebrow: &str,
     heading: &str,
@@ -1421,7 +1385,6 @@ fn shell_impl(
         settings_update_badge: &settings_update_badge,
         content: &content,
         footer: "Controls and evidence belong to this gateway process.",
-        expires_in_seconds: expires,
         wide,
     })
 }
@@ -1563,7 +1526,7 @@ fn global_update_attention(data: &DashboardData) -> String {
     )
 }
 
-fn home_page(data: &DashboardData, expires: u64) -> String {
+fn home_page(data: &DashboardData) -> String {
     let accepting_models = data.accepting_models();
     let completed = data.completed_requests();
     let incomplete = data.incomplete_session_count();
@@ -1663,7 +1626,6 @@ fn home_page(data: &DashboardData, expires: u64) -> String {
     };
     shell(
         data,
-        expires,
         DashboardAppPage::Home,
         "Overview",
         "Overview",
@@ -2639,7 +2601,7 @@ fn playground_text_parameter_schema(model: &GatewayModel) -> Value {
     })
 }
 
-fn playground_page(data: &DashboardData, expires: u64, selected_model: Option<&str>) -> String {
+fn playground_page(data: &DashboardData, selected_model: Option<&str>) -> String {
     let credential_needed = data.requires_auth() && data.active_token_count() == 0;
     let mut choices = data
         .models
@@ -2911,7 +2873,6 @@ fn playground_page(data: &DashboardData, expires: u64, selected_model: Option<&s
 
     shell(
         data,
-        expires,
         DashboardAppPage::Playground,
         "Use AI",
         "Playground",
@@ -2939,7 +2900,7 @@ fn playground_page(data: &DashboardData, expires: u64, selected_model: Option<&s
     )
 }
 
-fn models_page(data: &DashboardData, expires: u64, requested_page: Option<&str>) -> String {
+fn models_page(data: &DashboardData, requested_page: Option<&str>) -> String {
     let page = PageWindow::from_query(data.models.len(), MAX_MODEL_ROWS, requested_page);
     let rows = model_rows(data, page);
     let model_summary = page.status("catalog models");
@@ -2956,7 +2917,6 @@ fn models_page(data: &DashboardData, expires: u64, requested_page: Option<&str>)
     );
     shell_wide(
         data,
-        expires,
         DashboardAppPage::Models,
         "Use AI",
         "Model catalog",
@@ -3244,7 +3204,7 @@ fn model_catalog_price_html_with_limit(model: &GatewayModel, limit: Option<usize
     html
 }
 
-fn activity_page(data: &DashboardData, expires: u64, requested_page: Option<&str>) -> String {
+fn activity_page(data: &DashboardData, requested_page: Option<&str>) -> String {
     let records = prioritized_activity_records(data);
     let activity_count = records.len();
     let incomplete_count = data.incomplete_session_count();
@@ -3323,7 +3283,6 @@ fn activity_page(data: &DashboardData, expires: u64, requested_page: Option<&str
     };
     shell_wide(
         data,
-        expires,
         DashboardAppPage::Activity,
         "Use AI",
         "Requests and receipts",
@@ -3601,7 +3560,7 @@ fn wallet_deposit_status_command(rail: &str) -> String {
     }
 }
 
-fn wallet_page(data: &DashboardData, expires: u64) -> String {
+fn wallet_page(data: &DashboardData) -> String {
     let rail = data.rail.to_ascii_uppercase();
     let deposit_status_command = wallet_deposit_status_command(&data.rail);
     let observed = payment_freshness_markup(data);
@@ -3686,7 +3645,6 @@ fn wallet_page(data: &DashboardData, expires: u64) -> String {
     );
     shell(
         data,
-        expires,
         DashboardAppPage::Wallet,
         "Billing",
         "Billing",
@@ -3698,12 +3656,7 @@ fn wallet_page(data: &DashboardData, expires: u64) -> String {
     )
 }
 
-fn connect_page(
-    data: &DashboardData,
-    expires: u64,
-    origin: &str,
-    requested_page: Option<&str>,
-) -> String {
+fn connect_page(data: &DashboardData, origin: &str, requested_page: Option<&str>) -> String {
     let root = origin.trim_end_matches('/');
     let base_url = format!("{root}/v1");
     let token_count = data.active_token_count();
@@ -3824,7 +3777,6 @@ fn connect_page(
     );
     shell(
         data,
-        expires,
         DashboardAppPage::Connect,
         "Integrations",
         "Connect another AI app",
@@ -3945,7 +3897,6 @@ fn connect_token_rows(access: &Value, page: PageWindow) -> String {
 
 fn earn_overview_page(
     data: &DashboardData,
-    expires: u64,
     requested: Option<&str>,
     requested_page: Option<&str>,
 ) -> String {
@@ -4082,7 +4033,6 @@ fn earn_overview_page(
     );
     shell(
         data,
-        expires,
         DashboardAppPage::Earn,
         "Provider operations",
         "Provider overview",
@@ -4270,7 +4220,6 @@ fn provider_activation_panel(
 
 fn earn_jobs_page(
     data: &DashboardData,
-    expires: u64,
     requested: Option<&str>,
     requested_page: Option<&str>,
 ) -> String {
@@ -4394,7 +4343,6 @@ fn earn_jobs_page(
     );
     shell_wide(
         data,
-        expires,
         DashboardAppPage::Earn,
         "Provider work",
         "Jobs",
@@ -4426,7 +4374,6 @@ fn earn_jobs_page(
 
 fn earn_machines_page(
     data: &DashboardData,
-    expires: u64,
     requested: Option<&str>,
     requested_page: Option<&str>,
 ) -> String {
@@ -4457,7 +4404,6 @@ fn earn_machines_page(
     );
     shell_wide(
         data,
-        expires,
         DashboardAppPage::Earn,
         "Provider operations",
         "Machines and serving routes",
@@ -4471,7 +4417,6 @@ fn earn_machines_page(
 
 fn earn_opportunities_page(
     data: &DashboardData,
-    expires: u64,
     requested: Option<&str>,
     requested_page: Option<&str>,
 ) -> String {
@@ -4528,7 +4473,6 @@ fn earn_opportunities_page(
     let state = provider_page_state(data, requested, &provider_entries);
     shell_wide(
         data,
-        expires,
         DashboardAppPage::Earn,
         "Provider planning",
         "Model opportunities",
@@ -4540,7 +4484,7 @@ fn earn_opportunities_page(
     )
 }
 
-fn earn_earnings_page(data: &DashboardData, expires: u64, requested: Option<&str>) -> String {
+fn earn_earnings_page(data: &DashboardData, requested: Option<&str>) -> String {
     // Never use a query-selected provider as authority for earnings visibility.
     let provider_id = data.local_provider_id.as_deref();
     let rows = provider_earning_rows(data, provider_id);
@@ -4590,7 +4534,6 @@ fn earn_earnings_page(data: &DashboardData, expires: u64, requested: Option<&str
     );
     shell(
         data,
-        expires,
         DashboardAppPage::Earn,
         "Provider finance",
         "Earnings and payouts",
@@ -4604,7 +4547,6 @@ fn earn_earnings_page(data: &DashboardData, expires: u64, requested: Option<&str
 
 fn earn_reliability_page(
     data: &DashboardData,
-    expires: u64,
     requested: Option<&str>,
     requested_page: Option<&str>,
 ) -> String {
@@ -4653,7 +4595,6 @@ fn earn_reliability_page(
     let state = aggregate_provider_state(data, &entries);
     shell_wide(
         data,
-        expires,
         DashboardAppPage::Earn,
         "Provider quality",
         "Reliability",
@@ -4722,7 +4663,7 @@ fn provider_probation_summary(probation: Option<&ProviderProbation>) -> String {
     )
 }
 
-fn network_overview_page(data: &DashboardData, expires: u64) -> String {
+fn network_overview_page(data: &DashboardData) -> String {
     let providers = data
         .models
         .iter()
@@ -4802,10 +4743,10 @@ fn network_overview_page(data: &DashboardData, expires: u64) -> String {
     } else {
         ("Supply exceptions", "warn")
     };
-    shell_wide(data, expires, DashboardAppPage::Network, "Explore", "Network health", "Current provider capacity, route availability, market conditions, and supporting evidence.", status, tone, "", &content)
+    shell_wide(data, DashboardAppPage::Network, "Explore", "Network health", "Current provider capacity, route availability, market conditions, and supporting evidence.", status, tone, "", &content)
 }
 
-fn network_models_page(data: &DashboardData, expires: u64, requested_page: Option<&str>) -> String {
+fn network_models_page(data: &DashboardData, requested_page: Option<&str>) -> String {
     let page = PageWindow::from_query(data.models.len(), MAX_MODEL_ROWS, requested_page);
     let rows = model_rows(data, page);
     let model_summary = page.status("network models");
@@ -4828,7 +4769,6 @@ fn network_models_page(data: &DashboardData, expires: u64, requested_page: Optio
     );
     shell_wide(
         data,
-        expires,
         DashboardAppPage::Network,
         "Network analysis",
         "Models",
@@ -4848,11 +4788,7 @@ fn network_models_page(data: &DashboardData, expires: u64, requested_page: Optio
     )
 }
 
-fn network_providers_page(
-    data: &DashboardData,
-    expires: u64,
-    requested_page: Option<&str>,
-) -> String {
+fn network_providers_page(data: &DashboardData, requested_page: Option<&str>) -> String {
     let total_routes = data
         .models
         .iter()
@@ -4880,7 +4816,6 @@ fn network_providers_page(
     );
     shell_wide(
         data,
-        expires,
         DashboardAppPage::Network,
         "Network analysis",
         "Providers",
@@ -4900,11 +4835,7 @@ fn network_providers_page(
     )
 }
 
-fn network_markets_page(
-    data: &DashboardData,
-    expires: u64,
-    requested_page: Option<&str>,
-) -> String {
+fn network_markets_page(data: &DashboardData, requested_page: Option<&str>) -> String {
     let total_markets = data
         .models
         .iter()
@@ -4992,7 +4923,6 @@ fn network_markets_page(
     );
     shell_wide(
         data,
-        expires,
         DashboardAppPage::Network,
         "Network analysis",
         "Markets",
@@ -5004,11 +4934,7 @@ fn network_markets_page(
     )
 }
 
-fn network_activity_page(
-    data: &DashboardData,
-    expires: u64,
-    requested_page: Option<&str>,
-) -> String {
+fn network_activity_page(data: &DashboardData, requested_page: Option<&str>) -> String {
     let mut entries = data.entries.iter().collect::<Vec<_>>();
     entries.sort_by_key(|entry| entry.heartbeat_age_millis.unwrap_or(u64::MAX));
     let page = PageWindow::from_query(entries.len(), MAX_EVIDENCE_ROWS, requested_page);
@@ -5051,7 +4977,6 @@ fn network_activity_page(
     );
     shell_wide(
         data,
-        expires,
         DashboardAppPage::Network,
         "Network analysis",
         "Route status",
@@ -5065,7 +4990,6 @@ fn network_activity_page(
 
 fn network_evidence_page(
     data: &DashboardData,
-    expires: u64,
     requested_page: Option<&str>,
     requested_probe_page: Option<&str>,
 ) -> String {
@@ -5213,7 +5137,6 @@ fn network_evidence_page(
     );
     shell_wide(
         data,
-        expires,
         DashboardAppPage::Network,
         "Network analysis",
         "Evidence",
@@ -5225,7 +5148,7 @@ fn network_evidence_page(
     )
 }
 
-fn help_page(data: &DashboardData, expires: u64) -> String {
+fn help_page(data: &DashboardData) -> String {
     let provider_start = if data.local_provider_id.is_some() {
         r##"<a class="soft-button" href="/mayhem/dashboard/earn">Open Provider overview</a>"##
     } else {
@@ -5236,7 +5159,6 @@ fn help_page(data: &DashboardData, expires: u64) -> String {
     );
     shell(
         data,
-        expires,
         DashboardAppPage::Help,
         "Support",
         "Help",
@@ -5248,7 +5170,7 @@ fn help_page(data: &DashboardData, expires: u64) -> String {
     )
 }
 
-fn settings_page(data: &DashboardData, expires: u64) -> String {
+fn settings_page(data: &DashboardData) -> String {
     let github_update = data.github_update.update.as_ref();
     let (version_status, version_tone) = match (data.update_notice.as_ref(), github_update) {
         (Some(notice), _) if notice.level == "required" => ("Update required", "danger"),
@@ -5296,7 +5218,6 @@ fn settings_page(data: &DashboardData, expires: u64) -> String {
     );
     shell(
         data,
-        expires,
         DashboardAppPage::Settings,
         "Application",
         "Settings",
@@ -6994,7 +6915,7 @@ mod tests {
         let data = DashboardData::from_state(&state);
         assert_eq!(data.provider_heartbeat_ttl_millis, 4_321);
 
-        let html = earn_overview_page(&data, 60, None, None);
+        let html = earn_overview_page(&data, None, None);
         assert!(html.contains("Live route metrics"));
         assert!(html.contains("No routes yet"));
         assert!(!html.contains(">0 / 0<"));
@@ -7049,7 +6970,7 @@ mod tests {
             reason: "receipt co-signing stopped".to_owned(),
         });
 
-        let html = activity_page(&data, 60, None);
+        let html = activity_page(&data, None);
         let incomplete = html.find("session-incomplete").expect("incomplete receipt");
         let paused = html.find("session-paused").expect("pause record");
         let final_receipt = html.find("session-final").expect("final receipt");
@@ -7195,7 +7116,7 @@ mod tests {
             },
         );
 
-        let html = earn_machines_page(&data, 60, None, None);
+        let html = earn_machines_page(&data, None, None);
         assert!(html.contains("Setup blocked by model failure"));
         assert!(html.contains("Model preparation failed"));
         assert!(html.contains(
@@ -7209,7 +7130,7 @@ mod tests {
             r#"href="/mayhem/dashboard/earn/machines" aria-label="Refresh provider machine snapshot">Refresh snapshot"#
         ));
 
-        let overview = earn_overview_page(&data, 60, None, None);
+        let overview = earn_overview_page(&data, None, None);
         assert!(overview.contains("Setup blocked by model failure"));
         assert!(overview
             .contains("model-a: verify catalog artifact failed: artifact signature mismatch"));
@@ -7257,7 +7178,7 @@ mod tests {
             },
         );
 
-        let html = earn_machines_page(&data, 60, None, None);
+        let html = earn_machines_page(&data, None, None);
         assert!(html.contains("download progress not reported"));
         assert!(
             html.contains("<progress max=\"100\" aria-label=\"download progress not reported\">")
@@ -7271,7 +7192,6 @@ mod tests {
         let query = DashboardQuery::default();
         let home = render_dashboard_product_page(
             &state,
-            60,
             "http://127.0.0.1:11435",
             &query,
             DashboardProductPage::Home,
@@ -7281,7 +7201,6 @@ mod tests {
 
         let earn = render_dashboard_product_page(
             &state,
-            60,
             "http://127.0.0.1:11435",
             &query,
             DashboardProductPage::Earn,
@@ -7294,7 +7213,6 @@ mod tests {
 
         let opportunities = render_dashboard_product_page(
             &state,
-            60,
             "http://127.0.0.1:11435",
             &query,
             DashboardProductPage::EarnOpportunities,
@@ -7318,7 +7236,7 @@ mod tests {
             models: Vec::new(),
         });
 
-        let html = settings_page(&data, 60);
+        let html = settings_page(&data);
         assert!(html.contains("<code id=\"mayhem-update-stage-command\">mayhem update</code>"));
         assert!(html.contains("data-copy-target=\"#mayhem-update-stage-command\""));
         assert!(html.contains(
@@ -7356,7 +7274,7 @@ mod tests {
             update: Some(update),
         };
 
-        let html = settings_page(&data, 60);
+        let html = settings_page(&data);
         assert!(html.contains("Source update only."));
         assert!(html.contains("View changes on GitHub"));
         assert!(html.contains("data-update-notice"));
@@ -7392,7 +7310,7 @@ mod tests {
             update: Some(update),
         };
 
-        let html = settings_page(&data, 60);
+        let html = settings_page(&data);
         assert!(html.contains("0.3.0 available"));
         assert!(html.contains("Agent-guided update recommended."));
         assert!(html.contains("View release notes"));
@@ -7435,7 +7353,7 @@ mod tests {
         );
 
         let data = DashboardData::from_state(&GatewayState::from_models(Vec::new()));
-        let wallet = wallet_page(&data, 60);
+        let wallet = wallet_page(&data);
         assert!(wallet.contains("data-hide-amounts"));
         assert!(wallet.contains("Stripe is recommended"));
         assert!(wallet.contains("Agent-guided setup is recommended."));
@@ -7459,7 +7377,7 @@ mod tests {
 
         let tap_state = GatewayState::from_models(Vec::new()).with_receipt_rail("tap");
         let tap_data = DashboardData::from_state(&tap_state);
-        let tap_wallet = wallet_page(&tap_data, 60);
+        let tap_wallet = wallet_page(&tap_data);
         assert!(tap_wallet.contains(
             r#"data-wallet-method="tap"><input type="radio" name="wallet-funding-method" value="tap" data-wallet-funding-method checked"#
         ));
@@ -7467,7 +7385,7 @@ mod tests {
         assert!(tap_wallet.contains("Use this balance for requests"));
         assert!(tap_wallet.contains("mayhem up --rail fiat --yes"));
 
-        let settings = settings_page(&tap_data, 60);
+        let settings = settings_page(&tap_data);
         assert!(settings.contains(r#"id="wallet-security""#));
         assert!(settings.contains(r#"id="wallet-backup-command""#));
     }
@@ -7494,7 +7412,7 @@ mod tests {
     #[test]
     fn playground_no_script_explanation_precedes_and_hides_enhanced_fields() {
         let data = DashboardData::from_state(&GatewayState::fixture());
-        let html = playground_page(&data, 60, None);
+        let html = playground_page(&data, None);
         let warning = html.find("<noscript>").expect("no-JavaScript warning");
         let enhanced = html
             .find(r#"<div class="playground-interactive js-only">"#)
@@ -7508,7 +7426,7 @@ mod tests {
     #[test]
     fn playground_request_controls_match_gateway_routing_contracts() {
         let data = DashboardData::from_state(&GatewayState::fixture());
-        let html = playground_page(&data, 60, None);
+        let html = playground_page(&data, None);
 
         assert!(html.contains("data-playground-controls"));
         assert!(html.contains("Generation settings"));
@@ -7561,7 +7479,7 @@ mod tests {
         assert!(!config.sizes.values().any(|size| size == "512x512"));
 
         let data = DashboardData::from_state(&GatewayState::from_models(vec![model.clone()]));
-        let html = playground_page(&data, 60, Some(&model.id));
+        let html = playground_page(&data, Some(&model.id));
         assert!(html.contains(r#"data-image-dimension-mode="size""#));
         assert!(html.contains(r#"&quot;1:1&quot;:&quot;1024x1024&quot;"#));
         assert!(html.contains("data-playground-image-size"));
@@ -7582,7 +7500,7 @@ mod tests {
         fixed_model.mayhem.price_ref_au.per_req_au = AU_PER_USD;
         fixed_model.mayhem.price_ref_au.min_session_au = 2 * AU_PER_USD;
         let fixed_state = GatewayState::from_models(vec![fixed_model]);
-        let fixed_html = playground_page(&DashboardData::from_state(&fixed_state), 60, None);
+        let fixed_html = playground_page(&DashboardData::from_state(&fixed_state), None);
         assert!(fixed_html.contains(r#"data-price-mode="fixed""#));
 
         let mut mixed_model = GatewayState::fixture().models_snapshot()[0].clone();
@@ -7590,7 +7508,7 @@ mod tests {
         mixed_model.mayhem.price_ref_au.min_session_au = 2 * AU_PER_USD;
         assert!(!mixed_model.mayhem.price_ref_au.rate_map.is_empty());
         let mixed_state = GatewayState::from_models(vec![mixed_model]);
-        let mixed_html = playground_page(&DashboardData::from_state(&mixed_state), 60, None);
+        let mixed_html = playground_page(&DashboardData::from_state(&mixed_state), None);
         assert!(mixed_html.contains(r#"data-price-mode="rate""#));
         assert!(!mixed_html.contains(r#"data-price-mode="fixed""#));
     }
@@ -7602,13 +7520,13 @@ mod tests {
             "require_auth": true,
             "active_token_count": 0,
         });
-        let auth_html = playground_page(&credential_required, 60, None);
+        let auth_html = playground_page(&credential_required, None);
         assert!(auth_html.contains("<h1>Playground</h1>"));
         assert!(auth_html.contains("<h2>Create an access token first</h2>"));
         assert!(!auth_html.contains("<h3>Create an access token first</h3>"));
 
         let no_models = DashboardData::from_state(&GatewayState::from_models(Vec::new()));
-        let empty_html = playground_page(&no_models, 60, None);
+        let empty_html = playground_page(&no_models, None);
         assert!(empty_html.contains("<h1>Playground</h1>"));
         assert!(empty_html.contains("<h2>No compatible models available</h2>"));
         assert!(!empty_html.contains("<h3>No compatible models available</h3>"));
@@ -7668,13 +7586,13 @@ mod tests {
         }
 
         let user_only = DashboardData::from_state(&GatewayState::from_models(Vec::new()));
-        let user_html = home_page(&user_only, 60);
+        let user_html = home_page(&user_only);
         assert!(user_html.contains("<h2>Getting started</h2>"));
 
         let configured = GatewayState::from_models(Vec::new()).with_local_provider_id("provider-a");
         let provider_data = DashboardData::from_state(&configured);
         assert_eq!(provider_data.completed_requests(), 0);
-        let provider_html = home_page(&provider_data, 60);
+        let provider_html = home_page(&provider_data);
         assert!(provider_html.contains("<h2>Your provider</h2>"));
         assert!(!provider_html.contains("<h2>Getting started</h2>"));
     }
@@ -7697,7 +7615,7 @@ mod tests {
             },
         );
 
-        let html = home_page(&data, 60);
+        let html = home_page(&data);
         assert!(html.contains("Your provider"));
         assert!(html.contains("Setup blocked by model failure"));
         assert!(html.contains("artifact signature mismatch"));
@@ -7707,7 +7625,7 @@ mod tests {
     #[test]
     fn model_fit_keeps_its_evidence_limit_in_one_visible_consequence_statement() {
         let data = DashboardData::from_state(&GatewayState::fixture());
-        let html = earn_opportunities_page(&data, 60, None, None);
+        let html = earn_opportunities_page(&data, None, None);
 
         assert!(html.contains("<strong>Gateway-host evidence only.</strong>"));
         assert_eq!(html.matches("remote worker").count(), 1);
@@ -7750,7 +7668,7 @@ mod tests {
         assert!(omitted_abilities > 0);
         let state = GatewayState::from_models(vec![model]);
         let data = DashboardData::from_state(&state);
-        let html = models_page(&data, 60, None);
+        let html = models_page(&data, None);
 
         assert!(html.contains(&format!(
             r#"data-collapsed-label="+{omitted_abilities} more""#
@@ -7804,7 +7722,7 @@ mod tests {
         }];
         let mut data = DashboardData::from_state(&GatewayState::fixture());
         data.models = Arc::new(vec![model.clone()]);
-        let html = network_markets_page(&data, 60, None);
+        let html = network_markets_page(&data, None);
 
         assert!(html.contains(&format!(
             r#"data-export-value="{} / enclave {}""#,
@@ -7859,10 +7777,10 @@ mod tests {
     fn empty_tables_do_not_render_dead_subset_filters() {
         let data = DashboardData::from_state(&GatewayState::from_models(Vec::new()));
         for html in [
-            models_page(&data, 60, None),
-            activity_page(&data, 60, None),
-            network_providers_page(&data, 60, None),
-            network_markets_page(&data, 60, None),
+            models_page(&data, None),
+            activity_page(&data, None),
+            network_providers_page(&data, None),
+            network_markets_page(&data, None),
         ] {
             assert!(!html.contains("data-table-filter"));
             assert!(!html.contains("Filter shown page"));
@@ -7923,7 +7841,6 @@ mod tests {
 
         let current = connect_page(
             &DashboardData::from_state(&state),
-            60,
             "http://127.0.0.1:11435",
             None,
         );
@@ -7936,7 +7853,6 @@ mod tests {
         write_store(&token);
         let revoked = connect_page(
             &DashboardData::from_state(&state),
-            60,
             "http://127.0.0.1:11435",
             None,
         );
@@ -8022,7 +7938,6 @@ mod tests {
             .with_provider_earnings(vec![earnings_fixture("provider-from-url", amount)]);
         let html = render_dashboard_product_page(
             &unscoped,
-            60,
             "http://127.0.0.1:11435",
             &query,
             DashboardProductPage::EarnEarnings,
@@ -8036,7 +7951,6 @@ mod tests {
             .with_local_provider_id("provider-from-url");
         let html = render_dashboard_product_page(
             &scoped,
-            60,
             "http://127.0.0.1:11435",
             &query,
             DashboardProductPage::EarnEarnings,
@@ -8072,7 +7986,6 @@ mod tests {
 
         let html = render_dashboard_product_page(
             &state,
-            60,
             "http://127.0.0.1:11435",
             &DashboardQuery::default(),
             DashboardProductPage::Models,

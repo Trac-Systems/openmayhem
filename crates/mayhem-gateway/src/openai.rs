@@ -58,8 +58,8 @@ use crate::{
 };
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    extract::{DefaultBodyLimit, Multipart, OriginalUri, Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{
         sse::{Event, Sse},
         IntoResponse, Response,
@@ -225,8 +225,12 @@ const CONTEXT_NEEDLE_FILLER_WORDS_PER_LINE: usize = 32;
 const DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS: u64 = 1_000;
 const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
 const TPM_ACTIVATION_CACHE_TTL_MILLIS: u64 = 24 * 60 * 60 * 1_000;
-const DASHBOARD_SESSION_TTL_SECONDS: u64 = 15 * 60;
-const DASHBOARD_COOKIE_NAME: &str = "mayhem_dashboard";
+const DASHBOARD_COOKIE_PREFIX: &str = "__Secure-mayhem_dashboard_";
+// Browsers require persistent cookies to carry a finite lifetime. Keep the
+// cookie for the longest broadly supported window and refresh it on every
+// authenticated dashboard response. The in-memory gateway token remains the
+// authority, so restarting the gateway invalidates the cookie immediately.
+const DASHBOARD_COOKIE_MAX_AGE_SECONDS: u64 = 400 * 24 * 60 * 60;
 const DASHBOARD_PROVIDER_PROGRESS_ONLY_TTL_MS: u64 = 5 * 60 * 1000;
 const DASHBOARD_CSP: &str = "default-src 'self'; connect-src 'self' http://127.0.0.1:*; img-src 'self' data:; font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'";
 #[derive(Clone, Debug)]
@@ -587,17 +591,10 @@ fn push_bounded<T>(items: &mut VecDeque<T>, item: T, max_items: usize) {
     items.push_back(item);
 }
 
-#[derive(Clone)]
 struct DashboardSession {
     bootstrap_token: String,
-    browser: Arc<Mutex<DashboardBrowserSession>>,
-    ttl: Duration,
-}
-
-#[derive(Debug)]
-struct DashboardBrowserSession {
-    token: String,
-    last_seen: Instant,
+    browser_token: String,
+    bootstrap_consumed: Mutex<bool>,
 }
 
 impl fmt::Debug for DashboardSession {
@@ -605,8 +602,7 @@ impl fmt::Debug for DashboardSession {
         f.debug_struct("DashboardSession")
             .field("bootstrap_token", &"<redacted>")
             .field("browser_token", &"<redacted>")
-            .field("ttl", &self.ttl)
-            .field("expires_in", &self.expires_in())
+            .field("bootstrap_consumed", &"<redacted>")
             .finish()
     }
 }
@@ -615,42 +611,34 @@ impl DashboardSession {
     fn new() -> Self {
         Self {
             bootstrap_token: new_dashboard_token(),
-            browser: Arc::new(Mutex::new(DashboardBrowserSession {
-                token: new_dashboard_token(),
-                last_seen: Instant::now(),
-            })),
-            ttl: Duration::from_secs(DASHBOARD_SESSION_TTL_SECONDS),
+            browser_token: new_dashboard_token(),
+            bootstrap_consumed: Mutex::new(false),
         }
-    }
-
-    fn expires_in(&self) -> Duration {
-        self.ttl.saturating_sub(
-            self.browser
-                .lock_recover("dashboard browser session")
-                .last_seen
-                .elapsed(),
-        )
     }
 
     fn authorize_bootstrap(&self, token: &str) -> Option<String> {
         if token != self.bootstrap_token {
             return None;
         }
-        let mut browser = self.browser.lock_recover("dashboard browser session");
-        if browser.last_seen.elapsed() >= self.ttl {
-            browser.token = new_dashboard_token();
+        let mut consumed = self
+            .bootstrap_consumed
+            .lock_recover("dashboard bootstrap state");
+        if *consumed {
+            return None;
         }
-        browser.last_seen = Instant::now();
-        Some(browser.token.clone())
+        *consumed = true;
+        Some(self.browser_token.clone())
+    }
+
+    fn bootstrap_matches(&self, token: &str) -> bool {
+        token == self.bootstrap_token
     }
 
     fn authorize_browser(&self, token: &str) -> Option<String> {
-        let mut browser = self.browser.lock_recover("dashboard browser session");
-        if browser.last_seen.elapsed() >= self.ttl || token != browser.token {
+        if token != self.browser_token {
             return None;
         }
-        browser.last_seen = Instant::now();
-        Some(browser.token.clone())
+        Some(self.browser_token.clone())
     }
 }
 
@@ -3849,10 +3837,6 @@ impl GatewayState {
             gateway_root.trim_end_matches('/'),
             self.dashboard_session.bootstrap_token
         )
-    }
-
-    pub fn dashboard_session_expires_in(&self) -> Duration {
-        self.dashboard_session.expires_in()
     }
 
     pub fn with_hardware_quote_verifier_command(
@@ -8537,10 +8521,17 @@ struct DashboardQuery {
 
 async fn mayhem_dashboard(
     State(state): State<SharedState>,
+    OriginalUri(original_uri): OriginalUri,
     Query(query): Query<DashboardQuery>,
     headers: HeaderMap,
 ) -> Response {
-    dashboard_product_response(&state, &query, &headers, DashboardProductPage::Home)
+    dashboard_product_response(
+        &state,
+        &original_uri,
+        &query,
+        &headers,
+        DashboardProductPage::Home,
+    )
 }
 
 async fn mayhem_dashboard_root_redirect(
@@ -8548,14 +8539,17 @@ async fn mayhem_dashboard_root_redirect(
     Query(query): Query<DashboardQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let browser_token = dashboard_request_authorized(&state, &headers, query.token.as_deref());
+    let authorization = dashboard_request_authorized(&state, &headers, query.token.as_deref());
     let mut response = StatusCode::PERMANENT_REDIRECT.into_response();
     response.headers_mut().insert(
         header::LOCATION,
         HeaderValue::from_static("/mayhem/dashboard"),
     );
-    if let Some(browser_token) = browser_token {
-        if let Ok(value) = HeaderValue::from_str(&dashboard_cookie_value(&browser_token)) {
+    if let Some(authorization) = authorization {
+        if let Ok(value) = HeaderValue::from_str(&dashboard_cookie_value(
+            &authorization.cookie_name,
+            &authorization.browser_token,
+        )) {
             response.headers_mut().append(header::SET_COOKIE, value);
         }
     }
@@ -8564,33 +8558,34 @@ async fn mayhem_dashboard_root_redirect(
 
 async fn mayhem_dashboard_evidence(
     State(state): State<SharedState>,
+    OriginalUri(original_uri): OriginalUri,
     Query(query): Query<DashboardQuery>,
     headers: HeaderMap,
 ) -> Response {
     let wants_json = dashboard_wants_json(&headers);
-    let Some(browser_token) =
+    let Some(authorization) =
         dashboard_request_authorized(&state, &headers, query.token.as_deref())
     else {
         return if wants_json {
-            dashboard_json_response(
+            dashboard_unauthorized_json_response(
                 StatusCode::UNAUTHORIZED,
                 json!({"ok": false, "error": "dashboard_session_required"}),
-                None,
+                &headers,
             )
         } else {
-            dashboard_html_response(
-                StatusCode::UNAUTHORIZED,
-                dashboard_locked_html(state.dashboard_session.expires_in().as_secs()),
-                None,
-            )
+            dashboard_unauthorized_html_response(dashboard_locked_html(), &headers)
         };
     };
+    if let Some(response) = dashboard_bootstrap_redirect(&original_uri, &authorization) {
+        return response;
+    }
+    let browser_token = authorization.browser_token;
     let Some(payload) = dashboard_evidence_payload(&state, &query) else {
         return if wants_json {
             dashboard_json_response(
                 StatusCode::NOT_FOUND,
                 json!({"ok": false, "error": "dashboard_evidence_not_found"}),
-                Some(&browser_token),
+                Some((&authorization.cookie_name, &browser_token)),
             )
         } else {
             dashboard_html_response(
@@ -8599,17 +8594,21 @@ async fn mayhem_dashboard_evidence(
                     "Evidence not found",
                     r#"<main class="evidence-standalone"><section class="panel"><div class="empty-block"><div class="empty-block-inner"><div class="empty-symbol" aria-hidden="true">&mdash;</div><h1>Evidence not found</h1><p>The requested snapshot is no longer present in this gateway process.</p><a class="primary-button" href="/mayhem/dashboard">Return home</a></div></div></section></main>"#,
                 ),
-                Some(&browser_token),
+                Some((&authorization.cookie_name, &browser_token)),
             )
         };
     };
     if wants_json {
-        dashboard_json_response(StatusCode::OK, payload, Some(&browser_token))
+        dashboard_json_response(
+            StatusCode::OK,
+            payload,
+            Some((&authorization.cookie_name, &browser_token)),
+        )
     } else {
         dashboard_html_response(
             StatusCode::OK,
             render_dashboard_evidence_page(&payload),
-            Some(&browser_token),
+            Some((&authorization.cookie_name, &browser_token)),
         )
     }
 }
@@ -8627,98 +8626,110 @@ fn dashboard_wants_json(headers: &HeaderMap) -> bool {
 
 async fn mayhem_dashboard_provider(
     State(state): State<SharedState>,
+    OriginalUri(original_uri): OriginalUri,
     Query(query): Query<DashboardQuery>,
     headers: HeaderMap,
 ) -> Response {
-    dashboard_product_response(&state, &query, &headers, DashboardProductPage::Earn)
+    dashboard_product_response(
+        &state,
+        &original_uri,
+        &query,
+        &headers,
+        DashboardProductPage::Earn,
+    )
 }
 
 async fn mayhem_dashboard_network(
     State(state): State<SharedState>,
+    OriginalUri(original_uri): OriginalUri,
     Query(query): Query<DashboardQuery>,
     headers: HeaderMap,
 ) -> Response {
-    dashboard_product_response(&state, &query, &headers, DashboardProductPage::Network)
+    dashboard_product_response(
+        &state,
+        &original_uri,
+        &query,
+        &headers,
+        DashboardProductPage::Network,
+    )
 }
 
 async fn mayhem_dashboard_subpage(
     State(state): State<SharedState>,
+    OriginalUri(original_uri): OriginalUri,
     Path(page): Path<String>,
     Query(query): Query<DashboardQuery>,
     headers: HeaderMap,
 ) -> Response {
     let Some(page) = DashboardProductPage::from_path(&page) else {
-        let Some(browser_token) =
+        let Some(authorization) =
             dashboard_request_authorized(&state, &headers, query.token.as_deref())
         else {
-            return dashboard_html_response(
-                StatusCode::UNAUTHORIZED,
-                dashboard_locked_html(state.dashboard_session.expires_in().as_secs()),
-                None,
-            );
+            return dashboard_unauthorized_html_response(dashboard_locked_html(), &headers);
         };
+        if let Some(response) = dashboard_bootstrap_redirect(&original_uri, &authorization) {
+            return response;
+        }
         return dashboard_html_response(
             StatusCode::NOT_FOUND,
             dashboard_html_document(
                 "Not found",
                 r#"<main class="evidence-standalone"><section class="panel"><div class="empty-block"><div class="empty-block-inner"><div class="empty-symbol" aria-hidden="true">&mdash;</div><h1>Dashboard page not found</h1><p>The requested dashboard route does not exist.</p><a class="primary-button" href="/mayhem/dashboard">Return home</a></div></div></section></main>"#,
             ),
-            Some(&browser_token),
+            Some((&authorization.cookie_name, &authorization.browser_token)),
         );
     };
-    dashboard_product_response(&state, &query, &headers, page)
+    dashboard_product_response(&state, &original_uri, &query, &headers, page)
 }
 
 fn dashboard_product_response(
     state: &GatewayState,
+    original_uri: &Uri,
     query: &DashboardQuery,
     headers: &HeaderMap,
     page: DashboardProductPage,
 ) -> Response {
-    let Some(browser_token) = dashboard_request_authorized(state, headers, query.token.as_deref())
+    let Some(authorization) = dashboard_request_authorized(state, headers, query.token.as_deref())
     else {
-        return dashboard_html_response(
-            StatusCode::UNAUTHORIZED,
-            dashboard_locked_html(state.dashboard_session.expires_in().as_secs()),
-            None,
-        );
+        return dashboard_unauthorized_html_response(dashboard_locked_html(), headers);
     };
+    if let Some(response) = dashboard_bootstrap_redirect(original_uri, &authorization) {
+        return response;
+    }
     let origin = dashboard_origin_from_headers(headers);
     dashboard_html_response(
         StatusCode::OK,
-        render_dashboard_product_page(
-            state,
-            state.dashboard_session.expires_in().as_secs(),
-            &origin,
-            query,
-            page,
-        ),
-        Some(&browser_token),
+        render_dashboard_product_page(state, &origin, query, page),
+        Some((&authorization.cookie_name, &authorization.browser_token)),
     )
 }
 
 async fn mayhem_dashboard_session(
     State(state): State<SharedState>,
+    OriginalUri(original_uri): OriginalUri,
     Query(query): Query<DashboardQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(browser_token) =
+    let Some(authorization) =
         dashboard_request_authorized(&state, &headers, query.token.as_deref())
     else {
-        return dashboard_json_response(
+        return dashboard_unauthorized_json_response(
             StatusCode::UNAUTHORIZED,
             json!({
                 "ok": false,
                 "error": "dashboard_session_required",
             }),
-            None,
+            &headers,
         );
     };
+    if let Some(response) = dashboard_bootstrap_redirect(&original_uri, &authorization) {
+        return response;
+    }
     dashboard_json_response(
         StatusCode::OK,
         json!({
             "ok": true,
-            "expires_in_seconds": state.dashboard_session.expires_in().as_secs(),
+            "session_scope": "gateway_process",
             "paths": {
                 "dashboard": "/mayhem/dashboard",
                 "network_dashboard": "/mayhem/dashboard/network",
@@ -8729,7 +8740,7 @@ async fn mayhem_dashboard_session(
                 "balance": "/mayhem/balance",
             },
         }),
-        Some(&browser_token),
+        Some((&authorization.cookie_name, &authorization.browser_token)),
     )
 }
 
@@ -8853,20 +8864,97 @@ async fn mayhem_balance(State(state): State<SharedState>, headers: HeaderMap) ->
     .into_response()
 }
 
+#[derive(Debug)]
+struct DashboardAuthorization {
+    browser_token: String,
+    cookie_name: String,
+    bootstrapped_from_query: bool,
+}
+
 fn dashboard_request_authorized(
     state: &GatewayState,
     headers: &HeaderMap,
     query_token: Option<&str>,
-) -> Option<String> {
-    let bootstrap = query_token
+) -> Option<DashboardAuthorization> {
+    let cookie_name = dashboard_cookie_name(headers);
+    let browser_cookie = dashboard_cookie_named(headers, &cookie_name)
+        .and_then(|token| state.dashboard_session.authorize_browser(token));
+    if let Some(query_token) = query_token {
+        if let Some(browser_token) = state.dashboard_session.authorize_bootstrap(query_token) {
+            return Some(DashboardAuthorization {
+                browser_token,
+                cookie_name,
+                bootstrapped_from_query: true,
+            });
+        }
+        if state.dashboard_session.bootstrap_matches(query_token) {
+            if let Some(browser_token) = browser_cookie.clone() {
+                return Some(DashboardAuthorization {
+                    browser_token,
+                    cookie_name,
+                    bootstrapped_from_query: true,
+                });
+            }
+        }
+    }
+    let browser_token = dashboard_header_token(headers)
         .into_iter()
-        .chain(dashboard_header_token(headers))
         .chain(dashboard_bearer_token(headers))
-        .find_map(|token| state.dashboard_session.authorize_bootstrap(token));
-    bootstrap.or_else(|| {
-        dashboard_cookie_token(headers)
-            .and_then(|token| state.dashboard_session.authorize_browser(token))
+        .find_map(|token| {
+            state
+                .dashboard_session
+                .authorize_browser(token)
+                .or_else(|| state.dashboard_session.authorize_bootstrap(token))
+        })
+        .or(browser_cookie)?;
+    Some(DashboardAuthorization {
+        browser_token,
+        cookie_name,
+        bootstrapped_from_query: false,
     })
+}
+
+fn dashboard_bootstrap_redirect(
+    original_uri: &Uri,
+    authorization: &DashboardAuthorization,
+) -> Option<Response> {
+    if !authorization.bootstrapped_from_query {
+        return None;
+    }
+    let location = dashboard_uri_without_token(original_uri);
+    let mut response = StatusCode::SEE_OTHER.into_response();
+    response.headers_mut().insert(
+        header::LOCATION,
+        HeaderValue::from_str(&location)
+            .unwrap_or_else(|_| HeaderValue::from_static("/mayhem/dashboard")),
+    );
+    if let Ok(value) = HeaderValue::from_str(&dashboard_cookie_value(
+        &authorization.cookie_name,
+        &authorization.browser_token,
+    )) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    Some(with_dashboard_security_headers(response))
+}
+
+fn dashboard_uri_without_token(uri: &Uri) -> String {
+    let path = if uri.path().is_empty() {
+        "/mayhem/dashboard"
+    } else {
+        uri.path()
+    };
+    let query = uri.query().map(|query| {
+        let mut encoded = url::form_urlencoded::Serializer::new(String::new());
+        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+            if key != "token" {
+                encoded.append_pair(&key, &value);
+            }
+        }
+        encoded.finish()
+    });
+    query
+        .filter(|query| !query.is_empty())
+        .map_or_else(|| path.to_owned(), |query| format!("{path}?{query}"))
 }
 
 fn dashboard_header_token(headers: &HeaderMap) -> Option<&str> {
@@ -8886,8 +8974,16 @@ fn dashboard_bearer_token(headers: &HeaderMap) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-fn dashboard_cookie_token(headers: &HeaderMap) -> Option<&str> {
-    dashboard_cookie_named(headers, DASHBOARD_COOKIE_NAME)
+fn dashboard_cookie_name(headers: &HeaderMap) -> String {
+    let scope = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("loopback")
+        .to_ascii_lowercase();
+    let digest = blake3_hex(format!("mayhem-dashboard-cookie-v1\0{scope}").as_bytes());
+    format!("{DASHBOARD_COOKIE_PREFIX}{}", &digest[..16])
 }
 
 fn dashboard_cookie_named<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str> {
@@ -8903,34 +8999,70 @@ fn dashboard_cookie_named<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Opti
         .filter(|value| !value.is_empty())
 }
 
-fn dashboard_html_response(status: StatusCode, body: String, token: Option<&str>) -> Response {
+fn dashboard_html_response(
+    status: StatusCode,
+    body: String,
+    cookie: Option<(&str, &str)>,
+) -> Response {
     let mut response = (status, body).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
     );
-    if let Some(token) = token {
-        if let Ok(value) = HeaderValue::from_str(&dashboard_cookie_value(token)) {
+    if let Some((cookie_name, token)) = cookie {
+        if let Ok(value) = HeaderValue::from_str(&dashboard_cookie_value(cookie_name, token)) {
             response.headers_mut().append(header::SET_COOKIE, value);
         }
     }
     with_dashboard_security_headers(response)
 }
 
-fn dashboard_json_response(status: StatusCode, body: Value, token: Option<&str>) -> Response {
+fn dashboard_json_response(
+    status: StatusCode,
+    body: Value,
+    cookie: Option<(&str, &str)>,
+) -> Response {
     let mut response = (status, Json(body)).into_response();
-    if let Some(token) = token {
-        if let Ok(value) = HeaderValue::from_str(&dashboard_cookie_value(token)) {
+    if let Some((cookie_name, token)) = cookie {
+        if let Ok(value) = HeaderValue::from_str(&dashboard_cookie_value(cookie_name, token)) {
             response.headers_mut().insert(header::SET_COOKIE, value);
         }
     }
     with_dashboard_security_headers(response)
 }
 
-fn dashboard_cookie_value(token: &str) -> String {
+fn dashboard_unauthorized_html_response(body: String, headers: &HeaderMap) -> Response {
+    let mut response = dashboard_html_response(StatusCode::UNAUTHORIZED, body, None);
+    if let Ok(value) = HeaderValue::from_str(&dashboard_clear_cookie_value(&dashboard_cookie_name(
+        headers,
+    ))) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
+}
+
+fn dashboard_unauthorized_json_response(
+    status: StatusCode,
+    body: Value,
+    headers: &HeaderMap,
+) -> Response {
+    let mut response = dashboard_json_response(status, body, None);
+    if let Ok(value) = HeaderValue::from_str(&dashboard_clear_cookie_value(&dashboard_cookie_name(
+        headers,
+    ))) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
+    response
+}
+
+fn dashboard_cookie_value(cookie_name: &str, token: &str) -> String {
     format!(
-        "{DASHBOARD_COOKIE_NAME}={token}; Path=/mayhem/dashboard; Max-Age={DASHBOARD_SESSION_TTL_SECONDS}; HttpOnly; SameSite=Strict"
+        "{cookie_name}={token}; Path=/mayhem/dashboard; Max-Age={DASHBOARD_COOKIE_MAX_AGE_SECONDS}; HttpOnly; Secure; SameSite=Strict"
     )
+}
+
+fn dashboard_clear_cookie_value(cookie_name: &str) -> String {
+    format!("{cookie_name}=; Path=/mayhem/dashboard; Max-Age=0; HttpOnly; Secure; SameSite=Strict")
 }
 
 fn with_dashboard_security_headers(mut response: Response) -> Response {
@@ -8985,12 +9117,10 @@ fn dashboard_host_is_loopback(host: &str) -> bool {
     false
 }
 
-fn dashboard_locked_html(expires_in_seconds: u64) -> String {
+fn dashboard_locked_html() -> String {
     dashboard_html_document(
         "Locked",
-        &format!(
-            r#"<main class="evidence-standalone"><section class="panel"><div class="empty-block"><div class="empty-block-inner"><div class="empty-symbol" aria-hidden="true">M</div><h1>Dashboard locked</h1><p>Reopen the copy-and-paste dashboard URL printed by <code>mayhem up</code> to start a fresh browser session.</p><span class="status-badge warn mono">Browser idle window {expires_in_seconds}s</span></div></div></section></main>"#
-        ),
+        r#"<main class="evidence-standalone"><section class="panel"><div class="empty-block"><div class="empty-block-inner"><div class="empty-symbol" aria-hidden="true">M</div><h1>Dashboard access required</h1><p>Open the copy-and-paste dashboard URL printed when Mayhem started.</p><span class="status-badge warn mono">Token required for this gateway run</span></div></div></section></main>"#,
     )
 }
 
@@ -32680,7 +32810,6 @@ mod tests {
         ]);
         let user_html = render_dashboard_product_page(
             &state,
-            60,
             "http://127.0.0.1:11435",
             &DashboardQuery::default(),
             DashboardProductPage::Home,
@@ -32691,7 +32820,6 @@ mod tests {
 
         let provider_html = render_dashboard_product_page(
             &state,
-            60,
             "http://127.0.0.1:11435",
             &DashboardQuery::default(),
             DashboardProductPage::Earn,
@@ -36824,43 +36952,63 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_session_slides_and_bootstrap_recovers_after_idle_expiry() {
+    fn dashboard_session_lasts_for_one_gateway_process() {
         let session = DashboardSession::new();
         let bootstrap_token = session.bootstrap_token.clone();
-        let first_browser_token = session
+        let browser_token = session
             .authorize_bootstrap(&bootstrap_token)
             .expect("bootstrap token opens a browser session");
-        assert_ne!(first_browser_token, bootstrap_token);
-
-        {
-            let mut browser = session.browser.lock_recover("dashboard browser session");
-            browser.last_seen = Instant::now()
-                .checked_sub(Duration::from_secs(30))
-                .expect("test clock can move backwards");
-        }
-        let before_refresh = session.expires_in();
+        assert_ne!(browser_token, bootstrap_token);
         assert_eq!(
-            session.authorize_browser(&first_browser_token),
-            Some(first_browser_token.clone())
+            session.authorize_browser(&browser_token),
+            Some(browser_token.clone())
         );
-        assert!(session.expires_in() > before_refresh);
+        assert_eq!(session.authorize_bootstrap(&bootstrap_token), None);
 
-        {
-            let mut browser = session.browser.lock_recover("dashboard browser session");
-            browser.last_seen = Instant::now()
-                .checked_sub(session.ttl + Duration::from_secs(1))
-                .expect("test clock can move beyond the idle timeout");
-        }
-        assert_eq!(session.authorize_browser(&first_browser_token), None);
-
-        let reopened_browser_token = session
-            .authorize_bootstrap(&bootstrap_token)
-            .expect("bootstrap token reopens an expired browser session");
-        assert_ne!(reopened_browser_token, first_browser_token);
-        assert_eq!(session.authorize_browser(&first_browser_token), None);
+        let restarted = DashboardSession::new();
+        assert_eq!(restarted.authorize_bootstrap(&bootstrap_token), None);
+        assert_eq!(restarted.authorize_browser(&browser_token), None);
+        let restarted_browser_token = restarted
+            .authorize_bootstrap(&restarted.bootstrap_token)
+            .expect("new gateway process opens a new browser session");
+        assert_ne!(restarted_browser_token, browser_token);
         assert_eq!(
-            session.authorize_browser(&reopened_browser_token),
-            Some(reopened_browser_token)
+            restarted.authorize_bootstrap(&restarted.bootstrap_token),
+            None
+        );
+        assert_eq!(
+            restarted
+                .authorize_browser(&restarted_browser_token)
+                .as_deref(),
+            Some(restarted_browser_token.as_str())
+        );
+        assert_eq!(session.authorize_bootstrap(&bootstrap_token), None);
+    }
+
+    #[test]
+    fn dashboard_cookie_names_are_port_scoped_and_secure() {
+        let mut one = HeaderMap::new();
+        one.insert(header::HOST, HeaderValue::from_static("127.0.0.1:11435"));
+        let mut two = HeaderMap::new();
+        two.insert(header::HOST, HeaderValue::from_static("127.0.0.1:11436"));
+        let one_name = dashboard_cookie_name(&one);
+        let two_name = dashboard_cookie_name(&two);
+        assert_ne!(one_name, two_name);
+        assert!(one_name.starts_with(DASHBOARD_COOKIE_PREFIX));
+        let cookie = dashboard_cookie_value(&one_name, "browser-token");
+        assert!(cookie.contains("; Secure;"));
+        assert!(cookie.contains("; HttpOnly;"));
+        assert!(cookie.contains("; SameSite=Strict"));
+    }
+
+    #[test]
+    fn dashboard_redirect_removes_encoded_token_keys() {
+        let uri: Uri = "/mayhem/dashboard?%74oken=secret&page=2&model=a%2Fb"
+            .parse()
+            .expect("dashboard URI");
+        assert_eq!(
+            dashboard_uri_without_token(&uri),
+            "/mayhem/dashboard?page=2&model=a%2Fb"
         );
     }
 
@@ -36874,7 +37022,8 @@ mod tests {
         assert!(DASHBOARD_APP_CSS.contains(".app-shell{min-height:100vh"));
         assert!(DASHBOARD_APP_CSS.contains("@media(max-width:780px)"));
         assert!(DASHBOARD_APP_CSS.contains(".data-table-wrap{width:100%;overflow:auto"));
-        assert!(DASHBOARD_APP_JS.contains("recordDashboardSessionActivity"));
+        assert!(!DASHBOARD_APP_JS.contains("recordDashboardSessionActivity"));
+        assert!(!DASHBOARD_APP_JS.contains("data-session-seconds"));
         assert!(!DASHBOARD_APP_JS.contains("document.addEventListener('visibilitychange'"));
     }
 

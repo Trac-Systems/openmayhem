@@ -104,7 +104,6 @@ pub(super) struct DashboardShell<'a> {
     pub settings_update_badge: &'a str,
     pub content: &'a str,
     pub footer: &'a str,
-    pub expires_in_seconds: u64,
     pub wide: bool,
 }
 
@@ -178,7 +177,7 @@ pub(super) fn dashboard_app_shell(shell: DashboardShell<'_>) -> String {
   <div class="app-frame">
     <header class="app-topbar"><div class="topbar-context"><button class="icon-button mobile-menu-button js-only" type="button" data-nav-toggle aria-label="Open navigation" aria-controls="app-navigation" aria-expanded="false"><span aria-hidden="true">&#9776;</span></button><button class="icon-button sidebar-collapse-button js-only" type="button" data-sidebar-toggle aria-label="Collapse navigation" aria-controls="app-navigation" aria-expanded="true"><span aria-hidden="true">&#8592;</span></button><strong>{page_label}</strong><span class="topbar-status"><span class="state-indicator {status_tone}" aria-hidden="true"></span><span data-page-status-text>{status}</span></span></div><div class="topbar-actions">{topbar_update}{amount_control}</div></header>
     <main class="app-main{wide_class}{page_class}" id="main-content" tabindex="-1"><header class="page-head"><div><p class="page-eyebrow">{eyebrow}</p><h1>{heading}</h1><p class="page-summary">{summary}</p></div><div class="page-head-actions">{actions}</div></header>{content}</main>
-    <footer class="app-footer"><div class="app-footer-inner{wide_class_footer}"><span>{footer}</span><span class="mono" data-session-seconds="{expires}" data-session-status>Browser session active</span></div></footer>
+    <footer class="app-footer"><div class="app-footer-inner{wide_class_footer}"><span>{footer}</span><span class="mono">Authenticated for this gateway run</span></div></footer>
   </div>
 </div>
 <nav class="mobile-bottom-nav" aria-label="Mobile primary"><a href="/mayhem/dashboard"{mobile_home}>Home</a><a href="/mayhem/dashboard/playground"{mobile_playground}>Playground</a><a href="/mayhem/dashboard/activity"{mobile_activity}>Activity</a><a href="/mayhem/dashboard/earn"{mobile_earn}>Earn</a><a href="/mayhem/dashboard/wallet"{mobile_wallet}>Billing</a></nav>
@@ -227,7 +226,6 @@ pub(super) fn dashboard_app_shell(shell: DashboardShell<'_>) -> String {
         actions = shell.actions,
         content = shell.content,
         footer = html_escape(shell.footer),
-        expires = shell.expires_in_seconds,
         wide_class = if shell.wide { " app-main--wide" } else { "" },
         page_class = page_class,
         wide_class_footer = if shell.wide {
@@ -934,9 +932,6 @@ html.motion-reduced .pg-page *{animation-duration:.01ms!important;animation-iter
 .provider-scope{margin:-10px 0 18px}
 .provider-scope strong{color:var(--app-text-soft)}
 .table-action{white-space:nowrap}
-.session-expired{position:fixed;left:50%;bottom:max(24px,env(safe-area-inset-bottom));z-index:120;width:min(620px,calc(100vw - 28px));transform:translateX(-50%);padding:13px 14px;border:1px solid rgba(245,184,92,.44);border-radius:15px;background:#211b12;box-shadow:var(--app-shadow);color:var(--app-text);font-size:13px;display:flex;align-items:center;justify-content:space-between;gap:14px;pointer-events:none}
-.session-expired-copy{min-width:0}.session-expired-copy strong,.session-expired-copy span{display:block}.session-expired-copy span{margin-top:2px;color:var(--app-text-soft)}
-.session-expired-actions{display:flex;align-items:center;gap:8px;flex:0 0 auto}.session-expired-actions button{pointer-events:auto}
 
 .empty-block{min-height:190px;padding:28px;display:grid;place-items:center;text-align:center}
 .empty-block-inner{max-width:420px}
@@ -1031,7 +1026,6 @@ html.motion-reduced .pg-page *{animation-duration:.01ms!important;animation-iter
 .evidence-page-body .verify-level h2{margin:0 0 10px;font-size:15px}
 
 .toast-region{position:fixed;right:max(18px,env(safe-area-inset-right));bottom:max(18px,env(safe-area-inset-bottom));z-index:100;display:grid;gap:8px;pointer-events:none}
-body.session-expired-visible .toast-region{bottom:max(112px,calc(env(safe-area-inset-bottom) + 96px))}
 .app-toast{padding:11px 13px;border:1px solid var(--app-border-strong);border-radius:12px;background:var(--app-panel-strong);box-shadow:var(--app-shadow);color:var(--app-text);font-size:13px;animation:toast-in var(--app-standard) cubic-bezier(.2,0,.38,.9) both}
 @keyframes toast-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 
@@ -1101,8 +1095,7 @@ body.session-expired-visible .toast-region{bottom:max(112px,calc(env(safe-area-i
   .app-footer{padding-inline:max(14px,env(safe-area-inset-left)) max(14px,env(safe-area-inset-right));padding-bottom:calc(max(18px,env(safe-area-inset-bottom)) + 78px)}
   .app-footer-inner{align-items:flex-start;flex-direction:column}
   html.js-ready .mobile-bottom-nav{position:fixed;left:max(10px,env(safe-area-inset-left));right:max(10px,env(safe-area-inset-right));bottom:max(10px,env(safe-area-inset-bottom));z-index:18;min-height:60px;padding:6px;border:1px solid var(--app-border);border-radius:18px;background:rgba(18,20,25,.95);box-shadow:0 16px 50px rgba(0,0,0,.38);backdrop-filter:blur(18px);display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:3px}
-  .session-expired,.toast-region{bottom:calc(max(10px,env(safe-area-inset-bottom)) + 72px)}
-  body.session-expired-visible .toast-region{bottom:calc(max(10px,env(safe-area-inset-bottom)) + 206px)}
+  .toast-region{bottom:calc(max(10px,env(safe-area-inset-bottom)) + 72px)}
   .mobile-bottom-nav a,.mobile-bottom-nav button{min-width:0;border:0;border-radius:12px;background:transparent;color:var(--app-text-muted);display:grid;place-items:center;padding:8px 3px;text-decoration:none;font-size:12px;font-weight:700}
   .mobile-bottom-nav a[aria-current="page"],.mobile-bottom-nav button[aria-current="page"]{background:rgba(255,107,122,.11);color:var(--app-accent-strong)}
   html.js-ready .mobile-bottom-nav .js-only{display:grid!important}
@@ -1143,8 +1136,6 @@ body.session-expired-visible .toast-region{bottom:max(112px,calc(env(safe-area-i
   .launch-path-card>a{grid-column:1/-1;width:100%}
   .usage-bars{height:145px;gap:4px}
   .settings-row{grid-template-columns:1fr;align-items:start}
-  .session-expired{align-items:stretch;flex-direction:column}
-  .session-expired-actions{justify-content:flex-end}
   .verify-dialog{width:calc(100vw - 12px);max-height:calc(100dvh - 12px);border-radius:18px}
   .verify-head{padding:19px 62px 16px 18px}
   .verify-close{top:14px;right:14px}
@@ -1257,9 +1248,6 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
     const playgroundConversation = [];
     let drawerTrigger = null;
     let playgroundController = null;
-    let refreshDashboardSession = null;
-    let recordDashboardSessionActivity = null;
-
     const safeQuery = (selector, scope = document) => {
       if (!selector) return null;
       try { return scope.querySelector(selector); } catch (_) { return null; }
@@ -2259,13 +2247,10 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
           setConnectionResult(target, 'Workbench dashboard session is reachable. Production API credentials and inference are intentionally not exercised in preview.', 'good');
         } else {
           const response = await fetch('/mayhem/dashboard/session', { credentials: 'same-origin', cache: 'no-store' });
-          if (response.status === 401) throw new Error('Dashboard session expired');
+          if (response.status === 401) throw new Error('Dashboard access is not valid for this gateway run');
           if (!response.ok) throw new Error(`Gateway returned ${response.status}`);
           const data = await response.json();
           if (!data.ok) throw new Error('Gateway did not confirm readiness');
-          if (recordDashboardSessionActivity) {
-            recordDashboardSessionActivity(data.expires_in_seconds);
-          }
           setConnectionResult(target, 'Dashboard session is valid. Run an inference request from Playground to test the displayed API base URL, credential, and model route.', 'good');
         }
       } catch (error) {
@@ -3115,10 +3100,9 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         try { payload = await response.json(); } catch (_) {}
         if (!response.ok || !payload || typeof payload !== 'object') {
           throw new Error(response.status === 401
-            ? 'This dashboard session expired. Reload the dashboard to continue.'
+            ? 'Dashboard access is not valid for this gateway run. Open the URL printed when Mayhem started.'
             : 'This evidence is no longer available in the current gateway snapshot.');
         }
-        if (recordDashboardSessionActivity) recordDashboardSessionActivity();
         title.textContent = typeof payload.title === 'string' ? payload.title : 'Evidence';
         const evidenceSummary = typeof payload.summary === 'string' ? payload.summary : 'Requested dashboard evidence';
         const evidenceInterpretation = typeof payload.interpretation === 'string' ? payload.interpretation : '';
@@ -3688,61 +3672,6 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         return;
       }
 
-      if (event.target.closest('[data-session-extend]')) {
-        const button = event.target.closest('[data-session-extend]');
-        if (typeof refreshDashboardSession !== 'function') return;
-        button.disabled = true;
-        button.setAttribute('aria-busy', 'true');
-        refreshDashboardSession()
-          .then((renewed) => {
-            announce(
-              renewed
-                ? 'Dashboard session extended. You can continue on this page.'
-                : 'The session could not be extended. Your current page remains open.',
-              !renewed,
-              false
-            );
-          })
-          .finally(() => {
-            button.disabled = false;
-            button.removeAttribute('aria-busy');
-          });
-        return;
-      }
-
-      if (event.target.closest('[data-session-reload]')) {
-        const button = event.target.closest('[data-session-reload]');
-        if (typeof refreshDashboardSession !== 'function') {
-          window.location.reload();
-          return;
-        }
-        button.disabled = true;
-        button.setAttribute('aria-busy', 'true');
-        refreshDashboardSession()
-          .then((renewed) => {
-            if (!renewed) announce('Session still locked. Reopen the dashboard URL printed by mayhem up.', true);
-          })
-          .finally(() => {
-            button.disabled = false;
-            button.removeAttribute('aria-busy');
-          });
-        return;
-      }
-
-      if (event.target.closest('[data-session-dismiss]')) {
-        event.target.closest('[data-session-expired]')?.remove();
-        body.classList.remove('session-expired-visible');
-        body.dataset.sessionNoticeDismissed = 'true';
-        announce('Session notice dismissed');
-        return;
-      }
-
-      if (event.target.closest('[data-session-warning-dismiss]')) {
-        event.target.closest('[data-session-warning]')?.remove();
-        body.classList.remove('session-expired-visible');
-        body.dataset.sessionWarningDismissed = 'true';
-        announce('Session warning dismissed', false, false);
-      }
     });
 
     document.addEventListener('submit', (event) => {
@@ -3921,130 +3850,6 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
     mobileQuery.addEventListener('change', (event) => {
       if (!event.matches) setDrawer(false);
     });
-
-    const session = safeQuery('[data-session-seconds]');
-    if (session) {
-      const initial = Number.parseInt(session.getAttribute('data-session-seconds') || '', 10);
-      if (Number.isFinite(initial) && initial >= 0) {
-        let deadline = Date.now() + initial * 1000;
-        const clearSessionNotices = () => {
-          safeQuery('[data-session-expired]')?.remove();
-          safeQuery('[data-session-warning]')?.remove();
-          body.classList.remove('session-expired-visible');
-          delete body.dataset.sessionNoticeDismissed;
-          delete body.dataset.sessionWarningDismissed;
-        };
-        const showExpiryWarning = () => {
-          if (safeQuery('[data-session-warning]') || safeQuery('[data-session-expired]') || body.dataset.sessionWarningDismissed === 'true') return;
-          const notice = document.createElement('div');
-          notice.className = 'session-expired';
-          notice.dataset.sessionWarning = '';
-          notice.setAttribute('role', 'status');
-          notice.setAttribute('aria-live', 'polite');
-          notice.setAttribute('aria-atomic', 'true');
-          const copy = document.createElement('div');
-          copy.className = 'session-expired-copy';
-          const title = document.createElement('strong');
-          title.textContent = 'Dashboard session ends soon';
-          const help = document.createElement('span');
-          help.textContent = 'Extend access without reloading; this page, draft, filters, and scroll position stay in place.';
-          copy.append(title, help);
-          const actions = document.createElement('div');
-          actions.className = 'session-expired-actions';
-          const extend = document.createElement('button');
-          extend.className = 'soft-button';
-          extend.type = 'button';
-          extend.dataset.sessionExtend = '';
-          extend.textContent = 'Extend session';
-          const dismiss = document.createElement('button');
-          dismiss.className = 'quiet-button';
-          dismiss.type = 'button';
-          dismiss.dataset.sessionWarningDismiss = '';
-          dismiss.textContent = 'Dismiss';
-          actions.append(extend, dismiss);
-          notice.append(copy, actions);
-          body.classList.add('session-expired-visible');
-          document.body.appendChild(notice);
-        };
-        const showExpiredNotice = () => {
-          if (safeQuery('[data-session-expired]') || body.classList.contains('has-workbench') || body.dataset.sessionNoticeDismissed === 'true') return;
-          const notice = document.createElement('div');
-          notice.className = 'session-expired';
-          notice.dataset.sessionExpired = '';
-          notice.setAttribute('role', 'alert');
-          const copy = document.createElement('div');
-          copy.className = 'session-expired-copy';
-          const title = document.createElement('strong');
-          title.textContent = 'Dashboard session expired';
-          const help = document.createElement('span');
-          help.textContent = 'Reopen the dashboard URL printed by mayhem up, or retry after access was renewed in another tab.';
-          copy.append(title, help);
-          const actions = document.createElement('div');
-          actions.className = 'session-expired-actions';
-          const retry = document.createElement('button');
-          retry.className = 'soft-button';
-          retry.type = 'button';
-          retry.dataset.sessionReload = '';
-          retry.textContent = 'Retry access';
-          const dismiss = document.createElement('button');
-          dismiss.className = 'quiet-button';
-          dismiss.type = 'button';
-          dismiss.dataset.sessionDismiss = '';
-          dismiss.textContent = 'Dismiss';
-          actions.append(retry, dismiss);
-          notice.append(copy, actions);
-          body.classList.add('session-expired-visible');
-          document.body.appendChild(notice);
-        };
-        const tick = () => {
-          const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
-          const status = remaining > 60
-            ? 'Browser session active'
-            : remaining > 0
-              ? `Browser session · ${remaining}s remaining`
-              : 'Browser session expired';
-          if (session.textContent !== status) session.textContent = status;
-          if (remaining === 0) {
-            safeQuery('[data-session-warning]')?.remove();
-            body.classList.remove('session-expired-visible');
-            showExpiredNotice();
-          } else if (remaining <= 60) {
-            showExpiryWarning();
-          }
-        };
-        recordDashboardSessionActivity = (expiresInSeconds = initial) => {
-          const expires = Number.parseInt(String(expiresInSeconds), 10);
-          if (!Number.isFinite(expires) || expires <= 0) return;
-          deadline = Date.now() + expires * 1000;
-          session.setAttribute('data-session-seconds', String(expires));
-          clearSessionNotices();
-          tick();
-        };
-        refreshDashboardSession = async () => {
-          if (body.classList.contains('has-workbench')) {
-            recordDashboardSessionActivity(initial);
-            return true;
-          }
-          try {
-            const response = await fetch('/mayhem/dashboard/session', {
-              credentials: 'same-origin',
-              cache: 'no-store',
-              headers: { accept: 'application/json' }
-            });
-            if (!response.ok) return false;
-            const payload = await response.json();
-            const expires = Number.parseInt(String(payload?.expires_in_seconds ?? ''), 10);
-            if (!payload?.ok || !Number.isFinite(expires) || expires <= 0) return false;
-            recordDashboardSessionActivity(expires);
-            return true;
-          } catch (_) {
-            return false;
-          }
-        };
-        window.setInterval(tick, 1000);
-        tick();
-      }
-    }
 
     // Volatile evidence freshness: degrade only source-backed capacity/status
     // claims. Immutable receipt and catalog facts deliberately have no markers.

@@ -32817,7 +32817,6 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     );
     let dashboard_url = state.dashboard_url(&gateway_url);
     let provider_dashboard_url = provider_dashboard_url_from_user(&dashboard_url);
-    let dashboard_browser_idle_timeout_seconds = state.dashboard_session_expires_in().as_secs();
     let report = json!({
         "ok": true,
         "home": home,
@@ -32826,7 +32825,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "openai_base_url": openai_base_url,
         "dashboard_url": dashboard_url,
         "provider_dashboard_url": provider_dashboard_url,
-        "dashboard_browser_idle_timeout_seconds": dashboard_browser_idle_timeout_seconds,
+        "dashboard_browser_session_scope": "gateway_process",
         "source": source,
         "backend": backend,
         "epoch_seconds": state.epoch_seconds(),
@@ -32877,9 +32876,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         if let Some(notice) = shared_gateway_notice {
             println!("{notice}");
         }
-        println!(
-            "Dashboard browser idle timeout: {dashboard_browser_idle_timeout_seconds}s (the copy/paste URL remains valid while this gateway runs)."
-        );
+        println!("Dashboard access: token required once per gateway run.");
         if args.dev_embedded_catalog {
             println!("Model source: development embedded catalog (non-canonical).");
             println!("Backend: local OpenAI-shape smoke backend (unbillable dev output).");
