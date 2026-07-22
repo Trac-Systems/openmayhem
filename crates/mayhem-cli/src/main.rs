@@ -76962,7 +76962,7 @@ mod tests {
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 15);
+        assert_eq!(CONTRACT_VERSION, 16);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 9);
     }
@@ -77204,7 +77204,7 @@ mod tests {
         let tx = admin_contract_tx_digest(&prepared_command, &admin, &nonce, false, &context);
         assert_eq!(
             tx,
-            "556fefeccdf1a04ffcdacbe03e454da44c57145374002d3bda9bbb7cb9ffeb17"
+            "59921aa499ce06befca12bcda721ec905deb3a4ed6f4cb73764fb25ebf8c6459"
         );
         assert_eq!(
             admin_contract_tx_feature(
