@@ -3156,8 +3156,16 @@ mod stable_diffusion_cpp_backend {
     const HTTP_HEADER_LIMIT: usize = 64 * 1024;
     const HEALTH_RESPONSE_LIMIT: usize = 1024 * 1024;
     const SERVER_EXIT_CLASSIFICATION_TIMEOUT: Duration = Duration::from_millis(250);
+    const APPLE_METAL_CPU_TEXT_ENCODER_BACKEND: &str = "te=cpu,diffusion=metal,vae=metal";
 
     type OutputTail = Arc<Mutex<Vec<u8>>>;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    enum StableDiffusionDevicePlacement {
+        #[default]
+        Preferred,
+        AppleMetalCpuTextEncoder,
+    }
 
     #[derive(Debug)]
     struct StableDiffusionServerProcess {
@@ -3230,6 +3238,7 @@ mod stable_diffusion_cpp_backend {
         config: Option<LoadConfig>,
         server_address: Option<SocketAddr>,
         server: Option<StableDiffusionServerProcess>,
+        device_placement: StableDiffusionDevicePlacement,
     }
 
     impl StableDiffusionCppBackend {
@@ -3256,6 +3265,7 @@ mod stable_diffusion_cpp_backend {
                 config: None,
                 server_address: None,
                 server: None,
+                device_placement: StableDiffusionDevicePlacement::Preferred,
             }
         }
 
@@ -3294,6 +3304,7 @@ mod stable_diffusion_cpp_backend {
             };
 
             let config = self.config.clone().ok_or(EngineError::NotLoaded)?;
+            self.select_recovery_device_placement(&config, &output);
             self.stop_server();
             let (address, server) = self.start_server(&config).map_err(|restart_error| {
                 EngineError::StableDiffusionCpp(format!(
@@ -3303,6 +3314,21 @@ mod stable_diffusion_cpp_backend {
             self.server_address = Some(address);
             self.server = Some(server);
             Ok(true)
+        }
+
+        fn select_recovery_device_placement(
+            &mut self,
+            config: &LoadConfig,
+            server_output: &str,
+        ) -> bool {
+            let selected = recovery_device_placement(
+                self.device_placement,
+                requested_stable_diffusion_backend(config).as_deref(),
+                server_output,
+            );
+            let changed = selected != self.device_placement;
+            self.device_placement = selected;
+            changed
         }
 
         fn request_images_once(
@@ -3388,10 +3414,10 @@ mod stable_diffusion_cpp_backend {
                 .as_ref()
                 .map(|artifact| stable_diffusion_payload_path(&artifact.path))
                 .transpose()?;
-            let backend = env::var("MAYHEM_STABLE_DIFFUSION_CPP_BACKEND")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| config.stable_diffusion_backend.clone());
+            let backend = stable_diffusion_backend_for_placement(
+                requested_stable_diffusion_backend(config),
+                self.device_placement,
+            );
 
             let mut command = Command::new(&self.server_binary);
             if config.stable_diffusion_cpp.separate_diffusion_model {
@@ -3477,6 +3503,7 @@ mod stable_diffusion_cpp_backend {
                 config: Some(config),
                 server_address: Some(address),
                 server: None,
+                device_placement: StableDiffusionDevicePlacement::Preferred,
             })
         }
 
@@ -3510,6 +3537,7 @@ mod stable_diffusion_cpp_backend {
             validate_stable_diffusion_config(&config)?;
             let info = loaded_model_info(&config);
             self.stop_server();
+            self.device_placement = StableDiffusionDevicePlacement::Preferred;
             let (address, server) = self.start_server(&config)?;
             self.loaded = Some(info.clone());
             self.config = Some(config);
@@ -3675,6 +3703,51 @@ mod stable_diffusion_cpp_backend {
             return Err(first_error);
         }
         operation(state)
+    }
+
+    fn requested_stable_diffusion_backend(config: &LoadConfig) -> Option<String> {
+        env::var("MAYHEM_STABLE_DIFFUSION_CPP_BACKEND")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| config.stable_diffusion_backend.clone())
+    }
+
+    fn stable_diffusion_backend_for_placement(
+        requested: Option<String>,
+        placement: StableDiffusionDevicePlacement,
+    ) -> Option<String> {
+        match placement {
+            StableDiffusionDevicePlacement::Preferred => requested,
+            StableDiffusionDevicePlacement::AppleMetalCpuTextEncoder => {
+                Some(APPLE_METAL_CPU_TEXT_ENCODER_BACKEND.to_owned())
+            }
+        }
+    }
+
+    fn is_plain_metal_backend(backend: &str) -> bool {
+        backend.trim().eq_ignore_ascii_case("metal")
+    }
+
+    fn recovery_device_placement(
+        current: StableDiffusionDevicePlacement,
+        requested_backend: Option<&str>,
+        server_output: &str,
+    ) -> StableDiffusionDevicePlacement {
+        if current == StableDiffusionDevicePlacement::Preferred
+            && requested_backend.is_some_and(is_plain_metal_backend)
+            && is_metal_text_encoder_empty_state_failure(server_output)
+        {
+            StableDiffusionDevicePlacement::AppleMetalCpuTextEncoder
+        } else {
+            current
+        }
+    }
+
+    fn is_metal_text_encoder_empty_state_failure(output: &str) -> bool {
+        let output = output.to_ascii_lowercase();
+        (output.contains("conditioner.hpp") || output.contains("conditioner.cpp"))
+            && output.contains("hidden_states.empty")
+            && (output.contains("assert") || output.contains("ggml_abort"))
     }
 
     fn validate_stable_diffusion_config(config: &LoadConfig) -> Result<()> {
@@ -4207,6 +4280,69 @@ mod stable_diffusion_cpp_backend {
             assert!(error.to_string().contains("worker failure 2"));
             assert_eq!(probe.operations, 2);
             assert_eq!(probe.restarts, 1);
+        }
+
+        #[test]
+        fn healthy_apple_metal_path_remains_full_metal() {
+            let placement = recovery_device_placement(
+                StableDiffusionDevicePlacement::Preferred,
+                Some("metal"),
+                "generation completed normally",
+            );
+
+            assert_eq!(placement, StableDiffusionDevicePlacement::Preferred);
+            assert_eq!(
+                stable_diffusion_backend_for_placement(Some("metal".to_owned()), placement)
+                    .as_deref(),
+                Some("metal")
+            );
+        }
+
+        #[test]
+        fn apple_metal_prompt_encoder_assertion_selects_cpu_text_encoder() {
+            let placement = recovery_device_placement(
+                StableDiffusionDevicePlacement::Preferred,
+                Some("metal"),
+                "GGML_ASSERT(!hidden_states.empty()) failed at src/conditioning/conditioner.hpp:1972",
+            );
+
+            assert_eq!(
+                placement,
+                StableDiffusionDevicePlacement::AppleMetalCpuTextEncoder
+            );
+            assert_eq!(
+                stable_diffusion_backend_for_placement(Some("metal".to_owned()), placement)
+                    .as_deref(),
+                Some(APPLE_METAL_CPU_TEXT_ENCODER_BACKEND)
+            );
+        }
+
+        #[test]
+        fn prompt_encoder_assertion_does_not_override_other_or_explicit_placements() {
+            let failure =
+                "assertion !hidden_states.empty() failed in src/conditioning/conditioner.cpp";
+            for backend in ["cuda", "cpu", "te=metal,diffusion=metal,vae=metal"] {
+                assert_eq!(
+                    recovery_device_placement(
+                        StableDiffusionDevicePlacement::Preferred,
+                        Some(backend),
+                        failure,
+                    ),
+                    StableDiffusionDevicePlacement::Preferred,
+                    "backend {backend} must remain authoritative"
+                );
+            }
+        }
+
+        #[test]
+        fn unrelated_apple_metal_worker_exit_does_not_select_split_placement() {
+            let placement = recovery_device_placement(
+                StableDiffusionDevicePlacement::Preferred,
+                Some("metal"),
+                "sd-server exited after receiving SIGTERM",
+            );
+
+            assert_eq!(placement, StableDiffusionDevicePlacement::Preferred);
         }
     }
 }
