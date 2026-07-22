@@ -18,7 +18,7 @@ members = [
 exclude = ["third_party/xet-core"]
 
 [workspace.package]
-version = "0.2.35"
+version = "0.2.36"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
@@ -30,6 +30,10 @@ panic = "unwind"
 panic = "unwind"
 
 [patch.crates-io]
+# Keep the existing llama-cpp-rs API while pinning the reviewed ternary Q2_0
+# engine source used by the Bonsai artifact family.
+llama-cpp-2 = { git = "https://github.com/Trac-Systems/openmayhem-llama-cpp-rs", rev = "7f15e87e3cb0f636e236243e6ee4fc2a4c357277" }
+llama-cpp-sys-2 = { git = "https://github.com/Trac-Systems/openmayhem-llama-cpp-rs", rev = "7f15e87e3cb0f636e236243e6ee4fc2a4c357277" }
 # Includes bounded reconstruction-only retries for intermittent CAS 401s and
 # suffix-resume for truncated range responses. See third_party/xet-core/UPSTREAM.
 xet-client = { path = "third_party/xet-core/xet_client" }

@@ -818,6 +818,9 @@ async def async_handle_generate(request_id, payload):
 
     if completion_tokens == 0 and text:
         completion_tokens = 1
+    media_token_delta = max(0, actual_prompt_tokens - len(prompt_tokens))
+    has_visual_media = "image" in mm_data or "video" in mm_data
+    has_audio_media = "audio" in mm_data
     return {
         "text": text,
         "usage": {
@@ -825,7 +828,10 @@ async def async_handle_generate(request_id, payload):
             "completion_tokens": completion_tokens,
             "total_tokens": actual_prompt_tokens + completion_tokens,
             "reasoning_tokens": min(reasoning_tokens, completion_tokens),
-            "vision_tokens": max(0, actual_prompt_tokens - len(prompt_tokens)) if mm_data else 0,
+            "vision_tokens": media_token_delta if has_visual_media else 0,
+            "audio_tokens": (
+                media_token_delta if has_audio_media and not has_visual_media else 0
+            ),
         },
         "finish_reason": finish_reason,
     }

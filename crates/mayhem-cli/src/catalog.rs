@@ -270,6 +270,10 @@ pub(crate) struct CatalogArtifact {
     pub(crate) engine: String,
     #[serde(default)]
     pub(crate) stable_diffusion_cpp: Option<mayhem_engine::StableDiffusionCppConfig>,
+    #[serde(default)]
+    pub(crate) mlx_runtime: mayhem_engine::MlxRuntimeConfig,
+    #[serde(default)]
+    pub(crate) kv_cache: Option<CatalogKvCacheProfile>,
     pub(crate) source: SourceRef,
     #[serde(default)]
     pub(crate) upstream_source: Option<SourceRef>,
@@ -291,6 +295,18 @@ pub(crate) struct CatalogArtifact {
     pub(crate) notes: Option<String>,
     #[serde(default)]
     pub(crate) sidecars: BTreeMap<String, CatalogArtifactSidecar>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct CatalogKvCacheProfile {
+    pub(crate) dtype: String,
+    pub(crate) bits: u8,
+    pub(crate) group_size: u32,
+    pub(crate) quantized_start_tokens: u32,
+    pub(crate) full_attention_layers: u32,
+    pub(crate) total_layers: u32,
+    pub(crate) bytes_per_token: u64,
+    pub(crate) measurement_source: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -3141,6 +3157,82 @@ fn validate_artifact(
             }
         }
     }
+    if let Some(profile) = &artifact.kv_cache {
+        if profile.full_attention_layers == 0
+            || profile.total_layers == 0
+            || profile.full_attention_layers > profile.total_layers
+        {
+            errors.push(format!(
+                "{model_id}/{name} KV-cache profile requires 0 < full_attention_layers <= total_layers"
+            ));
+        }
+        if profile.bytes_per_token == 0 {
+            errors.push(format!(
+                "{model_id}/{name} KV-cache profile bytes_per_token must be positive"
+            ));
+        }
+        if profile.measurement_source.trim().is_empty() || profile.measurement_source.len() > 256 {
+            errors.push(format!(
+                "{model_id}/{name} KV-cache profile measurement_source must be 1..=256 bytes"
+            ));
+        }
+        match artifact.engine.as_str() {
+            "llama.cpp" => {
+                let expected_bits = match profile.dtype.as_str() {
+                    "f32" => Some(32),
+                    "f16" => Some(16),
+                    "q4_0" | "q4_1" | "iq4_nl" => Some(4),
+                    "q5_0" | "q5_1" => Some(5),
+                    "q8_0" => Some(8),
+                    _ => None,
+                };
+                match expected_bits {
+                    Some(bits) if bits == profile.bits => {}
+                    Some(bits) => errors.push(format!(
+                        "{model_id}/{name} llama.cpp KV-cache dtype {} requires bits={bits}, got {}",
+                        profile.dtype, profile.bits
+                    )),
+                    None => errors.push(format!(
+                        "{model_id}/{name} has unsupported llama.cpp KV-cache dtype {}",
+                        profile.dtype
+                    )),
+                }
+            }
+            "mlx" => {
+                let expected_bits = match profile.dtype.as_str() {
+                    "q4" => Some(4),
+                    "q8" => Some(8),
+                    _ => None,
+                };
+                match expected_bits {
+                    Some(bits) if bits == profile.bits => {}
+                    Some(bits) => errors.push(format!(
+                        "{model_id}/{name} MLX KV-cache dtype {} requires bits={bits}, got {}",
+                        profile.dtype, profile.bits
+                    )),
+                    None => errors.push(format!(
+                        "{model_id}/{name} has unsupported MLX KV-cache dtype {}",
+                        profile.dtype
+                    )),
+                }
+                if !matches!(profile.group_size, 32 | 64 | 128) {
+                    errors.push(format!(
+                        "{model_id}/{name} MLX KV-cache group_size must be 32, 64, or 128"
+                    ));
+                }
+            }
+            _ => errors.push(format!(
+                "{model_id}/{name} declares a KV-cache profile for unsupported engine {}",
+                artifact.engine
+            )),
+        }
+    }
+    if artifact.mlx_runtime.multimodal && artifact.engine != "mlx" {
+        errors.push(format!(
+            "{model_id}/{name} declares MLX multimodal runtime semantics for engine {}",
+            artifact.engine
+        ));
+    }
     match (&artifact.stable_diffusion_cpp, artifact.engine.as_str()) {
         (Some(config), "stable-diffusion.cpp") => {
             if let Err(error) = config.validate() {
@@ -4378,6 +4470,8 @@ mod tests {
         let mut artifact = CatalogArtifact {
             engine: "llama.cpp".to_owned(),
             stable_diffusion_cpp: None,
+            mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
+            kv_cache: None,
             source: SourceRef {
                 kind: "huggingface".to_owned(),
                 repo: "admin/model".to_owned(),
@@ -4607,6 +4701,108 @@ mod tests {
                 "launch model_class music-generation requires output canary method audio_fingerprint"
             )
         }));
+    }
+
+    #[test]
+    fn artifact_kv_cache_profile_is_validated_as_signed_runtime_data() {
+        let mut artifact = CatalogArtifact {
+            engine: "llama.cpp".to_owned(),
+            stable_diffusion_cpp: None,
+            mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
+            kv_cache: Some(CatalogKvCacheProfile {
+                dtype: "q4_0".to_owned(),
+                bits: 4,
+                group_size: 32,
+                quantized_start_tokens: 0,
+                full_attention_layers: 16,
+                total_layers: 64,
+                bytes_per_token: 18_432,
+                measurement_source: "exact runtime allocation and model configuration".to_owned(),
+            }),
+            source: SourceRef {
+                kind: "huggingface".to_owned(),
+                repo: "admin/model".to_owned(),
+                revision: "2".repeat(40),
+                publisher_key: None,
+            },
+            upstream_source: None,
+            path: "model.gguf".to_owned(),
+            artifact_root: "b".repeat(64),
+            artifact_root_kind: "blake3_merkle_v1".to_owned(),
+            weights_bytes: 1,
+            source_sha256: Some("c".repeat(64)),
+            tokenizer_sha256: None,
+            chat_template_sha256: None,
+            min_compute_cap: None,
+            download_check: false,
+            notes: None,
+            sidecars: BTreeMap::new(),
+        };
+
+        let mut errors = Vec::new();
+        validate_artifact("admin/model", "launch", "gguf", &artifact, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        artifact.engine = "mlx".to_owned();
+        artifact.kv_cache.as_mut().expect("KV-cache profile").dtype = "q4".to_owned();
+        artifact
+            .kv_cache
+            .as_mut()
+            .expect("KV-cache profile")
+            .group_size = 64;
+        let mut mlx_errors = Vec::new();
+        validate_artifact(
+            "admin/model",
+            "launch",
+            "mlx-2bit",
+            &artifact,
+            &mut mlx_errors,
+        );
+        assert!(mlx_errors.is_empty(), "{mlx_errors:#?}");
+
+        artifact.kv_cache.as_mut().expect("KV-cache profile").bits = 8;
+        validate_artifact(
+            "admin/model",
+            "launch",
+            "mlx-2bit",
+            &artifact,
+            &mut mlx_errors,
+        );
+        assert!(mlx_errors
+            .iter()
+            .any(|error| error.contains("requires bits=4")));
+        artifact.kv_cache.as_mut().expect("KV-cache profile").bits = 4;
+        artifact.engine = "llama.cpp".to_owned();
+        artifact.kv_cache.as_mut().expect("KV-cache profile").dtype = "q4_0".to_owned();
+        artifact
+            .kv_cache
+            .as_mut()
+            .expect("KV-cache profile")
+            .group_size = 32;
+
+        artifact.mlx_runtime.multimodal = true;
+        let mut runtime_errors = Vec::new();
+        validate_artifact(
+            "admin/model",
+            "launch",
+            "gguf",
+            &artifact,
+            &mut runtime_errors,
+        );
+        assert!(runtime_errors
+            .iter()
+            .any(|error| error.contains("MLX multimodal runtime semantics")));
+        artifact.mlx_runtime.multimodal = false;
+
+        artifact
+            .kv_cache
+            .as_mut()
+            .expect("KV-cache profile")
+            .full_attention_layers = 65;
+        validate_artifact("admin/model", "launch", "gguf", &artifact, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("full_attention_layers")));
     }
 
     #[test]
@@ -5239,6 +5435,8 @@ mod tests {
                     engine: engine.to_owned(),
                     stable_diffusion_cpp: (engine == "stable-diffusion.cpp")
                         .then_some(mayhem_engine::StableDiffusionCppConfig::default()),
+                    mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
+                    kv_cache: None,
                     source: SourceRef {
                         kind: "huggingface".to_owned(),
                         repo: "admin/model".to_owned(),

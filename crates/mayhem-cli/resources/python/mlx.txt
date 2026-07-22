@@ -1,5 +1,8 @@
 mlx-lm==0.31.3
+mlx-vlm==0.6.3
 mlx==0.32.0
+llguidance==1.7.6
+av==18.0.0
 transformers==5.12.1
 tokenizers==0.22.2
 safetensors==0.8.0

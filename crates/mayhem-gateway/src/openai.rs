@@ -11325,7 +11325,24 @@ fn normalize_quant_bucket(value: &str) -> Result<String, String> {
     }
     if matches!(
         normalized.as_str(),
-        "unknown" | "fp32" | "fp16" | "bf16" | "fp8" | "nvfp4" | "int8" | "int4"
+        "unknown"
+            | "fp64"
+            | "fp32"
+            | "tf32"
+            | "fp16"
+            | "bf16"
+            | "mxfp8"
+            | "fp8"
+            | "mxfp6"
+            | "fp6"
+            | "nvfp4"
+            | "mxfp4"
+            | "fp4"
+            | "nf4"
+            | "int8"
+            | "int4"
+            | "int2"
+            | "int1"
     ) {
         return Ok(normalized);
     }
@@ -11333,8 +11350,11 @@ fn normalize_quant_bucket(value: &str) -> Result<String, String> {
     if inferred != DEFAULT_QUANT_BUCKET {
         return Ok(inferred);
     }
+    if is_canonical_quant_bucket(&normalized) {
+        return Ok(normalized);
+    }
     Err(
-        "X-Mayhem-Quant must be one of fp32, fp16, bf16, fp8, nvfp4, int8, int4, unknown"
+        "X-Mayhem-Quant must be a lowercase canonical identifier of at most 32 ASCII characters"
             .to_owned(),
     )
 }
@@ -28518,28 +28538,68 @@ fn quant_bucket_from_catalog_artifact(name: &str, artifact: &Value) -> String {
 }
 
 fn quant_bucket_from_descriptor(descriptor: &str) -> String {
-    let descriptor = descriptor.replace('_', "-");
+    let descriptor = descriptor.to_ascii_lowercase().replace('_', "-");
     if descriptor.contains("nvfp4") {
         "nvfp4".to_owned()
+    } else if descriptor.contains("mxfp8") {
+        "mxfp8".to_owned()
+    } else if descriptor.contains("mxfp6") {
+        "mxfp6".to_owned()
+    } else if descriptor.contains("mxfp4") {
+        "mxfp4".to_owned()
+    } else if descriptor_quant_tokens(&descriptor).any(|token| token == "nf4") {
+        "nf4".to_owned()
     } else if descriptor.contains("fp8") {
         "fp8".to_owned()
+    } else if descriptor.contains("fp6") {
+        "fp6".to_owned()
+    } else if descriptor.contains("fp4") {
+        "fp4".to_owned()
     } else if descriptor.contains("bf16") {
         "bf16".to_owned()
     } else if descriptor.contains("fp16") || descriptor.contains("f16") {
         "fp16".to_owned()
-    } else if descriptor.contains("int8")
-        || descriptor.contains("8bit")
-        || descriptor.contains("q8")
-    {
-        "int8".to_owned()
-    } else if descriptor.contains("int4")
-        || descriptor.contains("4bit")
-        || descriptor.contains("q4")
-    {
-        "int4".to_owned()
+    } else if descriptor.contains("tf32") {
+        "tf32".to_owned()
+    } else if descriptor.contains("fp32") || descriptor.contains("f32") {
+        "fp32".to_owned()
+    } else if descriptor.contains("fp64") || descriptor.contains("f64") {
+        "fp64".to_owned()
+    } else if let Some(bucket) = descriptor_integer_quant_bucket(&descriptor) {
+        bucket.to_owned()
     } else {
         DEFAULT_QUANT_BUCKET.to_owned()
     }
+}
+
+fn descriptor_quant_tokens(descriptor: &str) -> impl Iterator<Item = &str> {
+    descriptor.split(|value: char| !value.is_ascii_alphanumeric())
+}
+
+fn descriptor_integer_quant_bucket(descriptor: &str) -> Option<&'static str> {
+    descriptor_quant_tokens(descriptor).find_map(|token| match token {
+        "int8" | "8bit" | "q8" | "iq8" | "tq8" => Some("int8"),
+        "int7" | "7bit" | "q7" | "iq7" | "tq7" => Some("int7"),
+        "int6" | "6bit" | "q6" | "iq6" | "tq6" => Some("int6"),
+        "int5" | "5bit" | "q5" | "iq5" | "tq5" => Some("int5"),
+        "int4" | "4bit" | "q4" | "iq4" | "tq4" => Some("int4"),
+        "int3" | "3bit" | "q3" | "iq3" | "tq3" => Some("int3"),
+        "int2" | "2bit" | "q2" | "iq2" | "tq2" => Some("int2"),
+        "int1" | "1bit" | "q1" | "iq1" | "tq1" => Some("int1"),
+        _ => None,
+    })
+}
+
+fn is_canonical_quant_bucket(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 32
+        && bytes[0].is_ascii_lowercase()
+        && bytes.last().is_some_and(|value| *value != b'-')
+        && bytes
+            .iter()
+            .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || *value == b'-')
+        && !bytes.windows(2).any(|pair| pair == b"--")
 }
 
 fn attestation_tier_labels_from_catalog_value(model: &Value) -> Option<BTreeMap<String, String>> {
@@ -30626,6 +30686,27 @@ mod tests {
         assert_eq!(options.max_price_au, Some(1_234));
         assert_eq!(options.max_wait_ms, 0);
         assert_eq!(options.quant.as_deref(), Some("int4"));
+
+        headers.insert("x-mayhem-quant", HeaderValue::from_static("Q2_0"));
+        let options = GatewayRequestOptions::from_headers(&headers).expect("Q2 header parses");
+        assert_eq!(options.quant.as_deref(), Some("int2"));
+        headers.insert("x-mayhem-quant", HeaderValue::from_static("Q1_0"));
+        let options = GatewayRequestOptions::from_headers(&headers).expect("Q1 header parses");
+        assert_eq!(options.quant.as_deref(), Some("int1"));
+        headers.insert("x-mayhem-quant", HeaderValue::from_static("Q5_K_M"));
+        let options = GatewayRequestOptions::from_headers(&headers).expect("Q5 header parses");
+        assert_eq!(options.quant.as_deref(), Some("int5"));
+        headers.insert("x-mayhem-quant", HeaderValue::from_static("future-quant7"));
+        let options = GatewayRequestOptions::from_headers(&headers).expect("future bucket parses");
+        assert_eq!(options.quant.as_deref(), Some("future-quant7"));
+        assert_eq!(
+            quant_bucket_from_descriptor("Qwen2.5-7B-Instruct.gguf"),
+            DEFAULT_QUANT_BUCKET
+        );
+        assert_eq!(
+            quant_bucket_from_descriptor("Qwen1.5-7B-Instruct.gguf"),
+            DEFAULT_QUANT_BUCKET
+        );
 
         headers.insert("x-mayhem-open-timeout-ms", HeaderValue::from_static("2500"));
         let err =

@@ -262,6 +262,19 @@ pub struct StableDiffusionCppConfig {
     pub steps_offset: i32,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MlxRuntimeConfig {
+    #[serde(default)]
+    pub multimodal: bool,
+}
+
+impl MlxRuntimeConfig {
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 impl StableDiffusionCppConfig {
     #[must_use]
     pub fn is_default(&self) -> bool {
@@ -384,6 +397,8 @@ pub struct LoadConfig {
     pub stable_diffusion_vae: Option<ModelArtifact>,
     #[serde(default, skip_serializing_if = "StableDiffusionCppConfig::is_default")]
     pub stable_diffusion_cpp: StableDiffusionCppConfig,
+    #[serde(default, skip_serializing_if = "MlxRuntimeConfig::is_default")]
+    pub mlx_runtime: MlxRuntimeConfig,
     #[serde(default = "default_context_size")]
     pub ctx_size: u32,
     #[serde(default = "default_batch_size")]
@@ -402,6 +417,14 @@ pub struct LoadConfig {
     pub trt_kv_cache_dtype: Option<String>,
     #[serde(default)]
     pub trt_require_engine_dir: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_cache_dtype: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_cache_bits: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_cache_group_size: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_cache_quantized_start_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vllm_tensor_parallel: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -496,6 +519,7 @@ impl Default for LoadConfig {
             stable_diffusion_llm: None,
             stable_diffusion_vae: None,
             stable_diffusion_cpp: StableDiffusionCppConfig::default(),
+            mlx_runtime: MlxRuntimeConfig::default(),
             ctx_size: DEFAULT_CONTEXT_SIZE,
             batch_size: DEFAULT_BATCH_SIZE,
             ubatch_size: DEFAULT_UBATCH_SIZE,
@@ -505,6 +529,10 @@ impl Default for LoadConfig {
             trt_tensor_parallel: None,
             trt_kv_cache_dtype: None,
             trt_require_engine_dir: false,
+            kv_cache_dtype: None,
+            kv_cache_bits: None,
+            kv_cache_group_size: None,
+            kv_cache_quantized_start_tokens: None,
             vllm_tensor_parallel: None,
             vllm_dtype: None,
             vllm_gpu_memory_utilization_pct: None,
@@ -597,6 +625,8 @@ pub struct GenerateSpecialityParameter {
     pub target: GenerateSpecialityTarget,
     pub native_path: String,
     pub value: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_reasoning_tokens: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1596,6 +1626,37 @@ fn validate_load_config(config: &LoadConfig) -> Result<()> {
     if config.ubatch_size == 0 {
         return Err(EngineError::InvalidConfig(
             "ubatch_size must be greater than zero".to_owned(),
+        ));
+    }
+
+    let kv_fields = [
+        config.kv_cache_dtype.is_some(),
+        config.kv_cache_bits.is_some(),
+        config.kv_cache_group_size.is_some(),
+        config.kv_cache_quantized_start_tokens.is_some(),
+    ];
+    if kv_fields.iter().any(|value| *value) && !kv_fields.iter().all(|value| *value) {
+        return Err(EngineError::InvalidConfig(
+            "KV-cache runtime configuration must include dtype, bits, group size, and quantized start"
+                .to_owned(),
+        ));
+    }
+    if config
+        .kv_cache_bits
+        .is_some_and(|bits| bits == 0 || bits > 32)
+    {
+        return Err(EngineError::InvalidConfig(
+            "KV-cache bits must be between 1 and 32".to_owned(),
+        ));
+    }
+    if config.kv_cache_group_size == Some(0) {
+        return Err(EngineError::InvalidConfig(
+            "KV-cache group size must be greater than zero".to_owned(),
+        ));
+    }
+    if config.mlx_runtime.multimodal && config.artifact.format != ArtifactFormat::MlxSafetensors {
+        return Err(EngineError::InvalidConfig(
+            "MLX multimodal runtime semantics require an MLX safetensors artifact".to_owned(),
         ));
     }
 
@@ -3094,6 +3155,7 @@ mod stable_diffusion_cpp_backend {
     const SERVER_CAPTURE_LIMIT: usize = 16 * 1024;
     const HTTP_HEADER_LIMIT: usize = 64 * 1024;
     const HEALTH_RESPONSE_LIMIT: usize = 1024 * 1024;
+    const SERVER_EXIT_CLASSIFICATION_TIMEOUT: Duration = Duration::from_millis(250);
 
     type OutputTail = Arc<Mutex<Vec<u8>>>;
 
@@ -3206,6 +3268,108 @@ mod stable_diffusion_cpp_backend {
             if let Some(mut server) = self.server.take() {
                 server.shutdown();
             }
+        }
+
+        fn restart_exited_server(&mut self, request_error: &EngineError) -> Result<bool> {
+            let Some(server) = self.server.as_mut() else {
+                return Ok(false);
+            };
+            let started = Instant::now();
+            let (status, output) = loop {
+                match server.child.try_wait().map_err(|err| {
+                    EngineError::StableDiffusionCpp(format!(
+                        "checking {} after a failed request failed: {err}",
+                        self.server_binary.display()
+                    ))
+                })? {
+                    Some(status) => {
+                        server.join_capture_threads();
+                        break (status, server.output_summary());
+                    }
+                    None if started.elapsed() < SERVER_EXIT_CLASSIFICATION_TIMEOUT => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    None => return Ok(false),
+                }
+            };
+
+            let config = self.config.clone().ok_or(EngineError::NotLoaded)?;
+            self.stop_server();
+            let (address, server) = self.start_server(&config).map_err(|restart_error| {
+                EngineError::StableDiffusionCpp(format!(
+                    "sd-server exited with {status} after request failure ({request_error}); {output}; restarting it once failed: {restart_error}"
+                ))
+            })?;
+            self.server_address = Some(address);
+            self.server = Some(server);
+            Ok(true)
+        }
+
+        fn request_images_once(
+            &mut self,
+            encoded_body: &[u8],
+            image_count: u32,
+            width: u32,
+            height: u32,
+            cancellation: &CancellationToken,
+        ) -> Result<Vec<Vec<u8>>> {
+            let address = self.server_address.ok_or(EngineError::NotLoaded)?;
+            let response = http_request(
+                address,
+                "POST",
+                "/sdapi/v1/txt2img",
+                Some(encoded_body),
+                max_image_response_bytes(image_count, width, height)?,
+                None,
+                Some(cancellation),
+            )?;
+            if !(200..300).contains(&response.status) {
+                return Err(EngineError::StableDiffusionCpp(format!(
+                    "sd-server returned HTTP {}: {}",
+                    response.status,
+                    response_snippet(&response.body)
+                )));
+            }
+            let response: Value = serde_json::from_slice(&response.body)?;
+            let images = response
+                .get("images")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    EngineError::StableDiffusionCpp(
+                        "sd-server response is missing the images array".to_owned(),
+                    )
+                })?;
+            if images.len() != image_count as usize {
+                return Err(EngineError::StableDiffusionCpp(format!(
+                    "sd-server returned {} images for requested batch of {image_count}",
+                    images.len()
+                )));
+            }
+            images
+                .iter()
+                .enumerate()
+                .map(|(image_index, image)| {
+                    let encoded = image.as_str().ok_or_else(|| {
+                        EngineError::StableDiffusionCpp(format!(
+                            "sd-server image {} is not base64 text",
+                            image_index + 1
+                        ))
+                    })?;
+                    let bytes = general_purpose::STANDARD.decode(encoded).map_err(|err| {
+                        EngineError::StableDiffusionCpp(format!(
+                            "decoding sd-server image {} failed: {err}",
+                            image_index + 1
+                        ))
+                    })?;
+                    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                        return Err(EngineError::StableDiffusionCpp(format!(
+                            "sd-server image {} is not a PNG",
+                            image_index + 1
+                        )));
+                    }
+                    Ok(bytes)
+                })
+                .collect()
         }
 
         fn build_server_command(
@@ -3427,7 +3591,6 @@ mod stable_diffusion_cpp_backend {
                 )));
             }
             let seed_base = request.seed.unwrap_or(DEFAULT_SEED);
-            let address = self.server_address.ok_or(EngineError::NotLoaded)?;
             let mut body = json!({
                 "prompt": request.prompt,
                 "width": width,
@@ -3465,63 +3628,27 @@ mod stable_diffusion_cpp_backend {
                 );
             }
             let encoded_body = serde_json::to_vec(&body)?;
-            let response = match http_request(
-                address,
-                "POST",
-                "/sdapi/v1/txt2img",
-                Some(&encoded_body),
-                max_image_response_bytes(image_count, width, height)?,
-                None,
-                Some(cancellation),
+            let images = match retry_once_after_worker_exit(
+                self,
+                |backend| {
+                    backend.request_images_once(
+                        &encoded_body,
+                        image_count,
+                        width,
+                        height,
+                        cancellation,
+                    )
+                },
+                |backend, request_error| backend.restart_exited_server(request_error),
             ) {
                 Err(EngineError::Cancelled) => {
                     self.stop_server();
                     return Err(EngineError::Cancelled);
                 }
-                response => response?,
+                result => result?,
             };
-            if !(200..300).contains(&response.status) {
-                return Err(EngineError::StableDiffusionCpp(format!(
-                    "sd-server returned HTTP {}: {}",
-                    response.status,
-                    response_snippet(&response.body)
-                )));
-            }
-            let response: Value = serde_json::from_slice(&response.body)?;
-            let images = response
-                .get("images")
-                .and_then(Value::as_array)
-                .ok_or_else(|| {
-                    EngineError::StableDiffusionCpp(
-                        "sd-server response is missing the images array".to_owned(),
-                    )
-                })?;
-            if images.len() != image_count as usize {
-                return Err(EngineError::StableDiffusionCpp(format!(
-                    "sd-server returned {} images for requested batch of {image_count}",
-                    images.len()
-                )));
-            }
-            for (image_index, image) in images.iter().enumerate() {
+            for (image_index, bytes) in images.into_iter().enumerate() {
                 cancellation.check()?;
-                let encoded = image.as_str().ok_or_else(|| {
-                    EngineError::StableDiffusionCpp(format!(
-                        "sd-server image {} is not base64 text",
-                        image_index + 1
-                    ))
-                })?;
-                let bytes = general_purpose::STANDARD.decode(encoded).map_err(|err| {
-                    EngineError::StableDiffusionCpp(format!(
-                        "decoding sd-server image {} failed: {err}",
-                        image_index + 1
-                    ))
-                })?;
-                if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-                    return Err(EngineError::StableDiffusionCpp(format!(
-                        "sd-server image {} is not a PNG",
-                        image_index + 1
-                    )));
-                }
                 artifact_sink.on_artifact_chunk(ArtifactChunk {
                     artifact_id: format!("image-{}", image_index + 1),
                     index: 0,
@@ -3533,6 +3660,21 @@ mod stable_diffusion_cpp_backend {
 
             Ok(ImageGenerationOutput { image_count, steps })
         }
+    }
+
+    fn retry_once_after_worker_exit<S, T>(
+        state: &mut S,
+        mut operation: impl FnMut(&mut S) -> Result<T>,
+        mut restart: impl FnMut(&mut S, &EngineError) -> Result<bool>,
+    ) -> Result<T> {
+        let first_error = match operation(state) {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        if !restart(state, &first_error)? {
+            return Err(first_error);
+        }
+        operation(state)
     }
 
     fn validate_stable_diffusion_config(config: &LoadConfig) -> Result<()> {
@@ -3981,6 +4123,91 @@ mod stable_diffusion_cpp_backend {
                 }
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    mod recovery_tests {
+        use super::*;
+
+        #[derive(Default)]
+        struct RecoveryProbe {
+            operations: usize,
+            restarts: usize,
+        }
+
+        #[test]
+        fn confirmed_worker_exit_retries_the_request_exactly_once() {
+            let mut probe = RecoveryProbe::default();
+            let value = retry_once_after_worker_exit(
+                &mut probe,
+                |probe| {
+                    probe.operations += 1;
+                    if probe.operations == 1 {
+                        Err(EngineError::StableDiffusionCpp(
+                            "worker closed without a response".to_owned(),
+                        ))
+                    } else {
+                        Ok("ready")
+                    }
+                },
+                |probe, _| {
+                    probe.restarts += 1;
+                    Ok(true)
+                },
+            )
+            .expect("confirmed exit restarts and reruns readiness request");
+
+            assert_eq!(value, "ready");
+            assert_eq!(probe.operations, 2);
+            assert_eq!(probe.restarts, 1);
+        }
+
+        #[test]
+        fn live_worker_error_is_not_retried() {
+            let mut probe = RecoveryProbe::default();
+            let error = retry_once_after_worker_exit(
+                &mut probe,
+                |probe| {
+                    probe.operations += 1;
+                    Err::<(), _>(EngineError::StableDiffusionCpp(
+                        "sd-server returned HTTP 500".to_owned(),
+                    ))
+                },
+                |probe, _| {
+                    probe.restarts += 1;
+                    Ok(false)
+                },
+            )
+            .expect_err("a live worker error must be returned");
+
+            assert!(error.to_string().contains("HTTP 500"));
+            assert_eq!(probe.operations, 1);
+            assert_eq!(probe.restarts, 1);
+        }
+
+        #[test]
+        fn failed_retry_does_not_start_a_recovery_loop() {
+            let mut probe = RecoveryProbe::default();
+            let error = retry_once_after_worker_exit(
+                &mut probe,
+                |probe| {
+                    probe.operations += 1;
+                    Err::<(), _>(EngineError::StableDiffusionCpp(format!(
+                        "worker failure {}",
+                        probe.operations
+                    )))
+                },
+                |probe, _| {
+                    probe.restarts += 1;
+                    Ok(true)
+                },
+            )
+            .expect_err("the single retry also fails");
+
+            assert!(error.to_string().contains("worker failure 2"));
+            assert_eq!(probe.operations, 2);
+            assert_eq!(probe.restarts, 1);
+        }
     }
 }
 
@@ -4618,7 +4845,7 @@ cp "{}" "$out"
 mod llama_cpp_backend {
     use base64::{engine::general_purpose, Engine as _};
     use encoding_rs::UTF_8;
-    use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
+    use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams, LlamaPoolingType};
     use llama_cpp_2::llama_backend::LlamaBackend;
     use llama_cpp_2::llama_batch::LlamaBatch;
     use llama_cpp_2::model::params::LlamaModelParams;
@@ -4639,8 +4866,21 @@ mod llama_cpp_backend {
     };
     use std::collections::VecDeque;
     use std::ffi::CString;
+    use std::io::{Read, Write};
     use std::num::NonZeroU32;
     use std::ops::Range;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, ExitStatus, Stdio};
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use wait_timeout::ChildExt;
+
+    const LLAMA_VIDEO_MAX_FRAMES: u32 = 64;
+    const LLAMA_VIDEO_MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
+    const LLAMA_VIDEO_MAX_DECODED_BYTES: usize = 64 * 1024 * 1024;
+    const LLAMA_VIDEO_MAX_DIMENSION: u32 = 4096;
+    const LLAMA_VIDEO_DECODE_TIMEOUT: Duration = Duration::from_secs(30);
+    const LLAMA_VIDEO_STDERR_LIMIT: usize = 16 * 1024;
 
     #[derive(Debug)]
     pub struct LlamaCppBackend {
@@ -4650,10 +4890,18 @@ mod llama_cpp_backend {
         mtmd_image_token_budget: Option<i32>,
         loaded: Option<LoadedModelInfo>,
         config: Option<LoadConfig>,
+        media_python: PathBuf,
     }
 
     impl LlamaCppBackend {
         pub fn new() -> Result<Self> {
+            let python = std::env::var_os("MAYHEM_LLAMA_MEDIA_PYTHON")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("python3"));
+            Self::with_media_python(python)
+        }
+
+        pub fn with_media_python(python: impl AsRef<Path>) -> Result<Self> {
             let mut backend = LlamaBackend::init()?;
             if std::env::var_os("MAYHEM_LLAMA_LOGS").is_none() {
                 backend.void_logs();
@@ -4665,6 +4913,7 @@ mod llama_cpp_backend {
                 mtmd_image_token_budget: None,
                 loaded: None,
                 config: None,
+                media_python: python.as_ref().to_path_buf(),
             })
         }
 
@@ -4677,7 +4926,26 @@ mod llama_cpp_backend {
         }
     }
 
-    fn llama_context_params(config: &LoadConfig, ctx_size: NonZeroU32) -> LlamaContextParams {
+    fn llama_kv_cache_type(value: &str) -> Result<KvCacheType> {
+        match value {
+            "f32" => Ok(KvCacheType::F32),
+            "f16" => Ok(KvCacheType::F16),
+            "q4_0" => Ok(KvCacheType::Q4_0),
+            "q4_1" => Ok(KvCacheType::Q4_1),
+            "q5_0" => Ok(KvCacheType::Q5_0),
+            "q5_1" => Ok(KvCacheType::Q5_1),
+            "q8_0" => Ok(KvCacheType::Q8_0),
+            "iq4_nl" => Ok(KvCacheType::IQ4_NL),
+            other => Err(EngineError::InvalidConfig(format!(
+                "unsupported llama.cpp KV-cache dtype {other}"
+            ))),
+        }
+    }
+
+    fn llama_context_params(
+        config: &LoadConfig,
+        ctx_size: NonZeroU32,
+    ) -> Result<LlamaContextParams> {
         // llama.cpp's CLI defaults to the compact SWA cache; its low-level API default does not.
         let mut params = LlamaContextParams::default()
             .with_n_ctx(Some(ctx_size))
@@ -4689,7 +4957,11 @@ mod llama_cpp_backend {
         if let Some(threads) = config.threads {
             params = params.with_n_threads(threads).with_n_threads_batch(threads);
         }
-        params
+        if let Some(dtype) = config.kv_cache_dtype.as_deref() {
+            let dtype = llama_kv_cache_type(dtype)?;
+            params = params.with_type_k(dtype).with_type_v(dtype);
+        }
+        Ok(params)
     }
 
     fn llama_prompt_batch_ranges(token_count: usize, n_batch: u32) -> Result<Vec<Range<usize>>> {
@@ -4804,6 +5076,7 @@ mod llama_cpp_backend {
             request.validate_sampling()?;
             let mut request = request;
             apply_llama_speciality_parameters(&mut request)?;
+            let reasoning_budget = llama_reasoning_budget(&request)?;
             if request.max_new_tokens == 0 {
                 return Ok(GenerateOutput {
                     text: String::new(),
@@ -4820,7 +5093,7 @@ mod llama_cpp_backend {
             let ctx_size = NonZeroU32::new(config.ctx_size).ok_or_else(|| {
                 EngineError::InvalidConfig("ctx_size must be greater than zero".to_owned())
             })?;
-            let ctx_params = llama_context_params(&config, ctx_size);
+            let ctx_params = llama_context_params(&config, ctx_size)?;
             let mut ctx = model.new_context(&self.backend, ctx_params)?;
             let prompt_tokens = model.str_to_token(&request.prompt, AddBos::Always)?;
             if prompt_tokens.len() >= ctx.n_ctx() as usize {
@@ -4860,13 +5133,27 @@ mod llama_cpp_backend {
             let mut stop_stream = StopSequenceStream::new(&request.stop);
             let mut completion_tokens = 0_u32;
             let mut finish_reason = FinishReason::Length;
+            let mut reasoning_text = String::new();
+            let mut forced_reasoning_tokens = VecDeque::new();
             let mut next_pos = i32::try_from(prompt_tokens.len()).map_err(|err| {
                 EngineError::InvalidConfig(format!("prompt token count overflow: {err}"))
             })?;
 
             while completion_tokens < request.max_new_tokens {
                 cancellation.check()?;
-                let token = sampler.sample(&ctx, batch.n_tokens() - 1);
+                if forced_reasoning_tokens.is_empty()
+                    && reasoning_budget.is_some_and(|budget| completion_tokens >= budget)
+                    && !llama_reasoning_has_closed(&reasoning_text)
+                {
+                    forced_reasoning_tokens
+                        .extend(model.str_to_token("</think>\n\n", AddBos::Never)?);
+                }
+                let token = if let Some(token) = forced_reasoning_tokens.pop_front() {
+                    sampler.accept(token);
+                    token
+                } else {
+                    sampler.sample(&ctx, batch.n_tokens() - 1)
+                };
                 if model.is_eog_token(token) && !request.ignore_eos {
                     stop_stream.finish(sink)?;
                     finish_reason = FinishReason::Stop;
@@ -4874,6 +5161,7 @@ mod llama_cpp_backend {
                 }
 
                 let text = model.token_to_piece(token, &mut decoder, true, None)?;
+                reasoning_text.push_str(&text);
                 let stopped = stop_stream.push(
                     TokenChunk {
                         index: completion_tokens,
@@ -4951,7 +5239,7 @@ mod llama_cpp_backend {
                 prompt_tokens = prompt_tokens
                     .saturating_add(u32::try_from(input_tokens.len()).unwrap_or(u32::MAX));
 
-                let ctx_params = llama_context_params(&config, ctx_size)
+                let ctx_params = llama_context_params(&config, ctx_size)?
                     .with_pooling_type(LlamaPoolingType::Mean)
                     .with_embeddings(true);
 
@@ -5003,6 +5291,7 @@ mod llama_cpp_backend {
         ) -> Result<GenerateOutput> {
             cancellation.check()?;
             let image_token_budget = llama_mtmd_image_token_budget(&request)?;
+            let reasoning_budget = llama_reasoning_budget(&request)?;
             self.ensure_mtmd_image_token_budget(image_token_budget)?;
             let config = self.config()?.clone();
             let model = self.model()?;
@@ -5015,9 +5304,9 @@ mod llama_cpp_backend {
             let ctx_size = NonZeroU32::new(config.ctx_size).ok_or_else(|| {
                 EngineError::InvalidConfig("ctx_size must be greater than zero".to_owned())
             })?;
-            let ctx_params = llama_context_params(&config, ctx_size);
+            let ctx_params = llama_context_params(&config, ctx_size)?;
             let mut ctx = model.new_context(&self.backend, ctx_params)?;
-            let bitmaps = media_bitmaps(mtmd, &request.media)?;
+            let bitmaps = media_bitmaps(mtmd, &request.media, &self.media_python, cancellation)?;
             cancellation.check()?;
             let bitmap_refs = bitmaps.iter().collect::<Vec<_>>();
             let marker_count = request.prompt.matches(MTMD_MEDIA_MARKER).count();
@@ -5069,11 +5358,25 @@ mod llama_cpp_backend {
             let mut stop_stream = StopSequenceStream::new(&request.stop);
             let mut completion_tokens = 0_u32;
             let mut finish_reason = FinishReason::Length;
+            let mut reasoning_text = String::new();
+            let mut forced_reasoning_tokens = VecDeque::new();
             let mut batch = LlamaBatch::new(1, 1);
 
             while completion_tokens < request.max_new_tokens {
                 cancellation.check()?;
-                let token = sampler.sample(&ctx, -1);
+                if forced_reasoning_tokens.is_empty()
+                    && reasoning_budget.is_some_and(|budget| completion_tokens >= budget)
+                    && !llama_reasoning_has_closed(&reasoning_text)
+                {
+                    forced_reasoning_tokens
+                        .extend(model.str_to_token("</think>\n\n", AddBos::Never)?);
+                }
+                let token = if let Some(token) = forced_reasoning_tokens.pop_front() {
+                    sampler.accept(token);
+                    token
+                } else {
+                    sampler.sample(&ctx, -1)
+                };
                 if model.is_eog_token(token) && !request.ignore_eos {
                     stop_stream.finish(sink)?;
                     finish_reason = FinishReason::Stop;
@@ -5081,6 +5384,7 @@ mod llama_cpp_backend {
                 }
 
                 let text = model.token_to_piece(token, &mut decoder, true, None)?;
+                reasoning_text.push_str(&text);
                 let stopped = stop_stream.push(
                     TokenChunk {
                         index: completion_tokens,
@@ -5231,24 +5535,32 @@ mod llama_cpp_backend {
                     request.prompt.push_str(suffix);
                 }
                 GenerateSpecialityTarget::ChatTemplateKwarg => {
-                    if speciality.native_path != "enable_thinking" {
-                        return Err(EngineError::InvalidConfig(format!(
-                            "llama.cpp artifact cannot apply chat-template speciality {} ({}) through this backend",
-                            speciality.name, speciality.native_path
-                        )));
-                    }
                     let enabled = speciality.value.as_bool().ok_or_else(|| {
                         EngineError::InvalidConfig(format!(
-                            "llama.cpp enable_thinking speciality {} must map to a boolean",
-                            speciality.name
+                            "llama.cpp chat-template speciality {} ({}) must map to a boolean",
+                            speciality.name, speciality.native_path
                         ))
                     })?;
-                    let prompt_enables_thinking = request.prompt.contains("<|think|>");
-                    if enabled != prompt_enables_thinking {
-                        return Err(EngineError::InvalidConfig(format!(
-                            "llama.cpp prompt did not apply enable_thinking={} for speciality {}",
-                            enabled, speciality.name
-                        )));
+                    match speciality.native_path.as_str() {
+                        "enable_thinking" => {
+                            let prompt_enables_thinking =
+                                llama_prompt_enables_thinking(&request.prompt);
+                            if enabled != prompt_enables_thinking {
+                                return Err(EngineError::InvalidConfig(format!(
+                                    "llama.cpp prompt did not apply enable_thinking={} for speciality {}",
+                                    enabled, speciality.name
+                                )));
+                            }
+                        }
+                        "preserve_thinking" => {
+                            validate_llama_thinking_history(request, enabled, &speciality.name)?;
+                        }
+                        _ => {
+                            return Err(EngineError::InvalidConfig(format!(
+                                "llama.cpp artifact cannot apply chat-template speciality {} ({}) through this backend",
+                                speciality.name, speciality.native_path
+                            )));
+                        }
                     }
                 }
                 GenerateSpecialityTarget::SamplingParameter => {
@@ -5270,6 +5582,111 @@ mod llama_cpp_backend {
             }
         }
         Ok(())
+    }
+
+    fn llama_prompt_enables_thinking(prompt: &str) -> bool {
+        let trimmed_prompt = prompt.trim_end();
+        trimmed_prompt.ends_with("<think>")
+            || trimmed_prompt.ends_with("<|think|>")
+            || prompt.starts_with("<|turn>system\n<|think|>\n")
+    }
+
+    fn validate_llama_thinking_history(
+        request: &GenerateRequest,
+        preserve: bool,
+        speciality_name: &str,
+    ) -> Result<()> {
+        let fragments = llama_prior_reasoning_fragments(request);
+        let prompt_preserves = fragments
+            .iter()
+            .all(|fragment| request.prompt.contains(fragment));
+        let prompt_strips = fragments
+            .iter()
+            .all(|fragment| !request.prompt.contains(fragment));
+        if !fragments.is_empty()
+            && ((preserve && !prompt_preserves) || (!preserve && !prompt_strips))
+        {
+            return Err(EngineError::InvalidConfig(format!(
+                "llama.cpp prompt did not apply preserve_thinking={preserve} for speciality {speciality_name}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn llama_prior_reasoning_fragments(request: &GenerateRequest) -> Vec<String> {
+        let mut fragments = Vec::new();
+        for message in &request.messages {
+            if message.get("role").and_then(serde_json::Value::as_str) != Some("assistant") {
+                continue;
+            }
+            for field in ["reasoning_content", "reasoning"] {
+                if let Some(value) = message
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    fragments.push(value.to_owned());
+                }
+            }
+            let Some(content) = message.get("content").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            for (open, close) in [("<think>", "</think>"), ("<|think|>", "<|/think|>")] {
+                let mut rest = content;
+                while let Some(start) = rest.find(open) {
+                    let after_open = &rest[start + open.len()..];
+                    let Some(end) = after_open.find(close) else {
+                        break;
+                    };
+                    let value = after_open[..end].trim();
+                    if !value.is_empty() {
+                        fragments.push(value.to_owned());
+                    }
+                    rest = &after_open[end + close.len()..];
+                }
+            }
+        }
+        fragments
+    }
+
+    fn llama_reasoning_budget(request: &GenerateRequest) -> Result<Option<u32>> {
+        let mut budget = None;
+        for speciality in &request.speciality_parameters {
+            let name = speciality.name.to_ascii_lowercase();
+            let native_path = speciality.native_path.to_ascii_lowercase();
+            let relevant = (name.contains("reason")
+                || name.contains("think")
+                || native_path.contains("reason")
+                || native_path.contains("think"))
+                && !["preserve", "history", "retain"]
+                    .iter()
+                    .any(|marker| name.contains(marker) || native_path.contains(marker));
+            let Some(limit) = speciality.max_reasoning_tokens else {
+                continue;
+            };
+            if !relevant {
+                continue;
+            }
+            let enabled = !matches!(
+                speciality.level.to_ascii_lowercase().as_str(),
+                "none" | "off" | "disabled"
+            ) && speciality.value != serde_json::Value::Bool(false)
+                && speciality.value.as_u64() != Some(0);
+            if !enabled {
+                continue;
+            }
+            if budget.replace(limit).is_some() {
+                return Err(EngineError::InvalidConfig(
+                    "llama.cpp received duplicate reasoning-budget specialities".to_owned(),
+                ));
+            }
+        }
+        Ok(budget)
+    }
+
+    fn llama_reasoning_has_closed(text: &str) -> bool {
+        text.contains("</think>") || text.contains("<|channel|>")
     }
 
     fn llama_reasoning_tokens(
@@ -5314,10 +5731,19 @@ mod llama_cpp_backend {
             .str_to_token(&format!("{prefix}{marker}"), AddBos::Never)
             .map(|tokens| u32::try_from(tokens.len()).unwrap_or(u32::MAX))
             .unwrap_or(completion_tokens);
-        attributed.min(completion_tokens)
+        let attributed = attributed.min(completion_tokens);
+        llama_reasoning_budget(request)
+            .ok()
+            .flatten()
+            .map_or(attributed, |budget| attributed.min(budget))
     }
 
-    fn media_bitmaps(mtmd: &MtmdContext, media: &[MediaInput]) -> Result<Vec<MtmdBitmap>> {
+    fn media_bitmaps(
+        mtmd: &MtmdContext,
+        media: &[MediaInput],
+        media_python: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<MtmdBitmap>> {
         let mut bitmaps = Vec::new();
         for input in media {
             match input.kind.as_str() {
@@ -5353,28 +5779,45 @@ mod llama_cpp_backend {
                                 .to_owned(),
                         ));
                     }
-                    if input.frames.is_empty() || input.data.is_some() || input.url.is_some() {
+                    if !input.frames.is_empty() && (input.data.is_some() || input.url.is_some()) {
                         return Err(EngineError::InvalidConfig(
-                            "llama.cpp video input requires bounded decoded frames, not a container"
+                            "llama.cpp video must use decoded frames or a container, not both"
                                 .to_owned(),
                         ));
                     }
-                    if input.num_frames.is_some_and(|declared| {
-                        usize::try_from(declared).ok() != Some(input.frames.len())
-                    }) {
-                        return Err(EngineError::InvalidConfig(
-                            "llama.cpp video frame count does not match decoded frames".to_owned(),
-                        ));
-                    }
-                    for frame in &input.frames {
-                        let bytes = decode_data_url(frame)?;
-                        bitmaps.push(MtmdBitmap::from_buffer(mtmd, &bytes, false).map_err(
-                            |err| {
-                                EngineError::InvalidConfig(format!(
-                                    "llama.cpp mtmd video-frame decode failed: {err}"
-                                ))
-                            },
-                        )?);
+                    if input.frames.is_empty() {
+                        let frames =
+                            decode_llama_video_container(input, media_python, cancellation)?;
+                        for (width, height, pixels) in frames {
+                            bitmaps.push(
+                                MtmdBitmap::from_image_data(width, height, &pixels).map_err(
+                                    |err| {
+                                        EngineError::InvalidConfig(format!(
+                                        "llama.cpp mtmd decoded video-frame import failed: {err}"
+                                    ))
+                                    },
+                                )?,
+                            );
+                        }
+                    } else {
+                        if input.num_frames.is_some_and(|declared| {
+                            usize::try_from(declared).ok() != Some(input.frames.len())
+                        }) {
+                            return Err(EngineError::InvalidConfig(
+                                "llama.cpp video frame count does not match decoded frames"
+                                    .to_owned(),
+                            ));
+                        }
+                        for frame in &input.frames {
+                            let bytes = decode_data_url(frame)?;
+                            bitmaps.push(MtmdBitmap::from_buffer(mtmd, &bytes, false).map_err(
+                                |err| {
+                                    EngineError::InvalidConfig(format!(
+                                        "llama.cpp mtmd video-frame decode failed: {err}"
+                                    ))
+                                },
+                            )?);
+                        }
                     }
                 }
                 other => {
@@ -5385,6 +5828,260 @@ mod llama_cpp_backend {
             }
         }
         Ok(bitmaps)
+    }
+
+    fn decode_llama_video_container(
+        input: &MediaInput,
+        media_python: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<(u32, u32, Vec<u8>)>> {
+        let requested = input.num_frames.ok_or_else(|| {
+            EngineError::InvalidConfig(
+                "llama.cpp video container requires an explicit num_frames bound".to_owned(),
+            )
+        })?;
+        if !(1..=LLAMA_VIDEO_MAX_FRAMES).contains(&requested) {
+            return Err(EngineError::InvalidConfig(format!(
+                "llama.cpp video num_frames must be between 1 and {LLAMA_VIDEO_MAX_FRAMES}"
+            )));
+        }
+        let fps = input.fps.unwrap_or(1.0);
+        if !fps.is_finite() || fps <= 0.0 {
+            return Err(EngineError::InvalidConfig(
+                "llama.cpp video fps must be a positive finite number".to_owned(),
+            ));
+        }
+        let encoded_limit = LLAMA_VIDEO_MAX_INPUT_BYTES
+            .saturating_mul(4)
+            .saturating_div(3)
+            .saturating_add(1024);
+        if input
+            .data
+            .as_ref()
+            .is_some_and(|value| value.len() > encoded_limit)
+            || input
+                .url
+                .as_ref()
+                .is_some_and(|value| value.len() > encoded_limit)
+        {
+            return Err(EngineError::InvalidConfig(
+                "llama.cpp video container exceeds the bounded input size".to_owned(),
+            ));
+        }
+        let payload = media_input_bytes(input)?;
+        if payload.is_empty() || payload.len() > LLAMA_VIDEO_MAX_INPUT_BYTES {
+            return Err(EngineError::InvalidConfig(
+                "llama.cpp video container exceeds the bounded input size".to_owned(),
+            ));
+        }
+        cancellation.check()?;
+
+        let mut child = Command::new(media_python)
+            .args([
+                "-I",
+                "-B",
+                "-c",
+                include_str!("llama_video_decode.py"),
+                &requested.to_string(),
+                &fps.to_string(),
+                &LLAMA_VIDEO_MAX_INPUT_BYTES.to_string(),
+                &LLAMA_VIDEO_MAX_DECODED_BYTES.to_string(),
+                &LLAMA_VIDEO_MAX_DIMENSION.to_string(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                EngineError::InvalidConfig(format!(
+                    "starting the managed llama.cpp video decoder {} failed: {error}",
+                    media_python.display()
+                ))
+            })?;
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            EngineError::InvalidConfig("opening llama.cpp video decoder stdin failed".to_owned())
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            EngineError::InvalidConfig("opening llama.cpp video decoder stdout failed".to_owned())
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            EngineError::InvalidConfig("opening llama.cpp video decoder stderr failed".to_owned())
+        })?;
+        let input_writer = thread::spawn(move || stdin.write_all(&payload));
+        let output_limit =
+            LLAMA_VIDEO_MAX_DECODED_BYTES.saturating_add(12 * LLAMA_VIDEO_MAX_FRAMES as usize);
+        let stdout_reader = thread::spawn(move || read_bounded(stdout, output_limit));
+        let stderr_reader = thread::spawn(move || read_bounded(stderr, LLAMA_VIDEO_STDERR_LIMIT));
+
+        enum WaitOutcome {
+            Completed(ExitStatus),
+            Cancelled,
+            TimedOut,
+        }
+        let started = Instant::now();
+        let outcome = loop {
+            if cancellation.is_cancelled() {
+                break WaitOutcome::Cancelled;
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= LLAMA_VIDEO_DECODE_TIMEOUT {
+                break WaitOutcome::TimedOut;
+            }
+            let remaining = LLAMA_VIDEO_DECODE_TIMEOUT.saturating_sub(elapsed);
+            match child
+                .wait_timeout(remaining.min(Duration::from_millis(50)))
+                .map_err(|error| {
+                    EngineError::InvalidConfig(format!(
+                        "waiting for the managed llama.cpp video decoder failed: {error}"
+                    ))
+                })? {
+                Some(status) => break WaitOutcome::Completed(status),
+                None => continue,
+            }
+        };
+        if !matches!(&outcome, WaitOutcome::Completed(_)) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let input_result = input_writer.join().map_err(|_| {
+            EngineError::InvalidConfig("llama.cpp video decoder input thread panicked".to_owned())
+        })?;
+        let output = stdout_reader.join().map_err(|_| {
+            EngineError::InvalidConfig("llama.cpp video decoder output thread panicked".to_owned())
+        })??;
+        let stderr = stderr_reader.join().map_err(|_| {
+            EngineError::InvalidConfig("llama.cpp video decoder stderr thread panicked".to_owned())
+        })??;
+
+        match outcome {
+            WaitOutcome::Cancelled => return Err(EngineError::Cancelled),
+            WaitOutcome::TimedOut => {
+                return Err(EngineError::InvalidConfig(format!(
+                    "llama.cpp video decode exceeded {} seconds",
+                    LLAMA_VIDEO_DECODE_TIMEOUT.as_secs()
+                )))
+            }
+            WaitOutcome::Completed(status) => {
+                if output.len() > output_limit {
+                    return Err(EngineError::InvalidConfig(
+                        "llama.cpp video decoder exceeded the bounded output size".to_owned(),
+                    ));
+                }
+                if stderr.len() > LLAMA_VIDEO_STDERR_LIMIT {
+                    return Err(EngineError::InvalidConfig(
+                        "llama.cpp video decoder exceeded the bounded diagnostic size".to_owned(),
+                    ));
+                }
+                if !status.success() {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "llama.cpp video container decode failed: {}",
+                        bounded_diagnostic(&stderr)
+                    )));
+                }
+                if let Err(error) = input_result {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "writing the llama.cpp video container to the decoder failed: {error}"
+                    )));
+                }
+            }
+        }
+        cancellation.check()?;
+        parse_llama_video_frames(&output, requested)
+    }
+
+    fn read_bounded(mut reader: impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        reader
+            .by_ref()
+            .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn bounded_diagnostic(bytes: &[u8]) -> String {
+        let text = String::from_utf8_lossy(bytes);
+        let text = text
+            .chars()
+            .map(|character| {
+                if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
+                    '\u{fffd}'
+                } else {
+                    character
+                }
+            })
+            .collect::<String>();
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            "decoder exited without diagnostics".to_owned()
+        } else {
+            trimmed.to_owned()
+        }
+    }
+
+    fn parse_llama_video_frames(bytes: &[u8], expected: u32) -> Result<Vec<(u32, u32, Vec<u8>)>> {
+        let mut cursor = 0usize;
+        let mut frames = Vec::new();
+        while cursor < bytes.len() {
+            if frames.len() >= LLAMA_VIDEO_MAX_FRAMES as usize
+                || bytes.len().saturating_sub(cursor) < 12
+            {
+                return Err(EngineError::InvalidConfig(
+                    "llama.cpp video decoder returned a malformed frame stream".to_owned(),
+                ));
+            }
+            let width = u32::from_be_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+            let height = u32::from_be_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap());
+            let length =
+                u32::from_be_bytes(bytes[cursor + 8..cursor + 12].try_into().unwrap()) as usize;
+            cursor += 12;
+            if width == 0
+                || height == 0
+                || width > LLAMA_VIDEO_MAX_DIMENSION
+                || height > LLAMA_VIDEO_MAX_DIMENSION
+            {
+                return Err(EngineError::InvalidConfig(
+                    "llama.cpp video decoder returned invalid frame dimensions".to_owned(),
+                ));
+            }
+            let expected_length = usize::try_from(width)
+                .ok()
+                .and_then(|width| {
+                    usize::try_from(height)
+                        .ok()
+                        .and_then(|height| width.checked_mul(height))
+                })
+                .and_then(|pixels| pixels.checked_mul(3))
+                .ok_or_else(|| {
+                    EngineError::InvalidConfig(
+                        "llama.cpp video decoder frame dimensions overflow".to_owned(),
+                    )
+                })?;
+            if length != expected_length
+                || length > LLAMA_VIDEO_MAX_DECODED_BYTES
+                || cursor.saturating_add(length) > bytes.len()
+            {
+                return Err(EngineError::InvalidConfig(
+                    "llama.cpp video decoder returned an invalid RGB frame".to_owned(),
+                ));
+            }
+            frames.push((width, height, bytes[cursor..cursor + length].to_vec()));
+            cursor += length;
+        }
+        if frames.len() != expected as usize {
+            return Err(EngineError::InvalidConfig(format!(
+                "llama.cpp video decoder returned {} frames, expected {expected}",
+                frames.len()
+            )));
+        }
+        let total = frames.iter().try_fold(0usize, |total, (_, _, pixels)| {
+            total.checked_add(pixels.len())
+        });
+        if total.is_none_or(|total| total > LLAMA_VIDEO_MAX_DECODED_BYTES) {
+            return Err(EngineError::InvalidConfig(
+                "llama.cpp video decoder exceeded the bounded decoded size".to_owned(),
+            ));
+        }
+        Ok(frames)
     }
 
     fn media_input_bytes(input: &MediaInput) -> Result<Vec<u8>> {
@@ -5621,15 +6318,98 @@ mod llama_cpp_backend {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::GenerateSpecialityParameter;
 
         #[test]
         fn context_params_use_standard_compact_swa_cache() {
             let config = LoadConfig::gguf("model.gguf");
             let ctx_size = NonZeroU32::new(131_072).expect("context is nonzero");
 
-            let params = llama_context_params(&config, ctx_size);
+            let params = llama_context_params(&config, ctx_size).expect("context params");
 
             assert!(!params.swa_full());
+        }
+
+        #[test]
+        fn context_params_apply_explicit_quantized_kv_cache() {
+            let mut config = LoadConfig::gguf("model.gguf");
+            config.kv_cache_dtype = Some("q4_0".to_owned());
+            config.kv_cache_bits = Some(4);
+            config.kv_cache_group_size = Some(32);
+            config.kv_cache_quantized_start_tokens = Some(0);
+            let ctx_size = NonZeroU32::new(262_144).expect("context is nonzero");
+
+            let params = llama_context_params(&config, ctx_size).expect("context params");
+
+            assert_eq!(params.type_k(), KvCacheType::Q4_0);
+            assert_eq!(params.type_v(), KvCacheType::Q4_0);
+            assert!(!params.swa_full());
+        }
+
+        #[test]
+        fn reasoning_effort_carries_the_signed_budget_into_llama_generation() {
+            let mut request = GenerateRequest::new("<|im_start|>assistant\n<think>\n");
+            request.speciality_parameters = vec![GenerateSpecialityParameter {
+                name: "reasoning_effort".to_owned(),
+                level: "low".to_owned(),
+                target: GenerateSpecialityTarget::ChatTemplateKwarg,
+                native_path: "enable_thinking".to_owned(),
+                value: serde_json::Value::Bool(true),
+                max_reasoning_tokens: Some(512),
+            }];
+
+            apply_llama_speciality_parameters(&mut request).expect("thinking prompt matches");
+            assert_eq!(llama_reasoning_budget(&request).unwrap(), Some(512));
+            assert!(llama_reasoning_has_closed("private</think>\nanswer"));
+
+            request.prompt = "<|im_start|>assistant\n<think>\n\n</think>\n\n".to_owned();
+            request.speciality_parameters[0].level = "off".to_owned();
+            request.speciality_parameters[0].value = serde_json::Value::Bool(false);
+            request.speciality_parameters[0].max_reasoning_tokens = Some(0);
+            apply_llama_speciality_parameters(&mut request).expect("disabled prompt matches");
+            assert_eq!(llama_reasoning_budget(&request).unwrap(), None);
+
+            request.messages = vec![serde_json::json!({
+                "role": "assistant",
+                "content": "<think>copper-signal-731</think>Noted."
+            })];
+            request.prompt = "<|im_start|>assistant\nNoted.<|im_end|>\n".to_owned();
+            request.speciality_parameters = vec![GenerateSpecialityParameter {
+                name: "thinking_history".to_owned(),
+                level: "latest_only".to_owned(),
+                target: GenerateSpecialityTarget::ChatTemplateKwarg,
+                native_path: "preserve_thinking".to_owned(),
+                value: serde_json::Value::Bool(false),
+                max_reasoning_tokens: None,
+            }];
+            apply_llama_speciality_parameters(&mut request).expect("prior thinking is stripped");
+
+            request.prompt =
+                "<|im_start|>assistant\n<think>copper-signal-731</think>Noted.<|im_end|>\n"
+                    .to_owned();
+            let error = apply_llama_speciality_parameters(&mut request)
+                .expect_err("latest-only history must reject leaked reasoning");
+            assert!(error.to_string().contains("preserve_thinking=false"));
+
+            request.speciality_parameters[0].level = "preserve".to_owned();
+            request.speciality_parameters[0].value = serde_json::Value::Bool(true);
+            apply_llama_speciality_parameters(&mut request).expect("prior thinking is preserved");
+        }
+
+        #[test]
+        fn thinking_validation_accepts_canonical_qwen_and_gemma_template_positions() {
+            assert!(llama_prompt_enables_thinking(
+                "<|im_start|>assistant\n<think>\n"
+            ));
+            assert!(!llama_prompt_enables_thinking(
+                "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            ));
+            assert!(llama_prompt_enables_thinking(
+                "<|turn>system\n<|think|>\nBe concise.<turn|>\n<|turn>model\n"
+            ));
+            assert!(!llama_prompt_enables_thinking(
+                "<|turn>user\nType <|think|> literally.<turn|>\n<|turn>model\n"
+            ));
         }
 
         #[test]
@@ -5643,6 +6423,37 @@ mod llama_cpp_backend {
             );
             assert!(llama_prompt_batch_ranges(1, 0).is_err());
             assert!(llama_prompt_batch_ranges(0, 512).is_err());
+        }
+
+        #[test]
+        fn decoded_video_frame_stream_is_strict_and_bounded() {
+            let mut stream = Vec::new();
+            stream.extend_from_slice(&2u32.to_be_bytes());
+            stream.extend_from_slice(&1u32.to_be_bytes());
+            stream.extend_from_slice(&6u32.to_be_bytes());
+            stream.extend_from_slice(&[255, 0, 0, 0, 255, 0]);
+
+            let frames = parse_llama_video_frames(&stream, 1).expect("one RGB frame");
+            assert_eq!(frames, vec![(2, 1, vec![255, 0, 0, 0, 255, 0])]);
+            assert!(parse_llama_video_frames(&stream, 2).is_err());
+
+            let mut malformed = stream.clone();
+            malformed[11] = 5;
+            assert!(parse_llama_video_frames(&malformed, 1).is_err());
+            assert!(parse_llama_video_frames(&[0; 11], 1).is_err());
+        }
+
+        #[test]
+        fn managed_video_decoder_stays_offline_and_bounded() {
+            let decoder = include_str!("llama_video_decode.py");
+            assert!(decoder.contains("import av"));
+            assert!(decoder.contains("sys.stdin.buffer.read(max_input_bytes + 1)"));
+            assert!(decoder.contains("requested < 1 or requested > 64"));
+            assert!(decoder.contains("decoded_bytes > max_decoded_bytes"));
+            assert!(!decoder.contains("requests"));
+            assert!(!decoder.contains("urllib"));
+            assert!(!decoder.contains("http://"));
+            assert!(!decoder.contains("https://"));
         }
     }
 }
@@ -5806,6 +6617,10 @@ mod mlx_backend {
                 json!({
                     "path": model_path,
                     "ctx_size": config.ctx_size,
+                    "multimodal": config.mlx_runtime.multimodal,
+                    "kv_cache_bits": config.kv_cache_bits,
+                    "kv_cache_group_size": config.kv_cache_group_size,
+                    "kv_cache_quantized_start_tokens": config.kv_cache_quantized_start_tokens,
                 }),
             )?;
             let loaded = LoadedModelInfo {
@@ -6166,6 +6981,126 @@ printf '%s\n' '{"id":3,"type":"response","ok":true,"result":{"text":"second","us
 
             drop(backend);
             let _ = fs::remove_dir_all(root);
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn mlx_worker_streams_each_generated_token_once_and_keeps_terminal_text() {
+            let test = r#"
+import ast
+import sys
+import types
+from collections import deque
+
+tree = ast.parse(sys.stdin.read(), "mlx_worker.py")
+nodes = [
+    node
+    for node in tree.body
+    if (
+        isinstance(node, ast.ClassDef)
+        and node.name in {"StopSequenceStream", "MlxGenerationEvents"}
+    ) or (
+        isinstance(node, ast.FunctionDef)
+        and node.name in {
+            "tool_call_schema",
+            "structured_logits_processor",
+            "reasoning_enabled",
+        }
+    )
+]
+sent = []
+namespace = {"deque": deque, "send": sent.append, "tokenizer": object()}
+exec(compile(ast.Module(body=nodes, type_ignores=[]), "mlx_worker.py", "exec"), namespace)
+
+structured = types.ModuleType("mlx_vlm.structured")
+structured.build_json_schema_logits_processor = lambda tokenizer, schema: ("schema", schema)
+structured.ThinkingAwareLogitsProcessor = (
+    lambda constrained, tokenizer, enable_thinking: ("thinking", constrained)
+)
+mlx_vlm = types.ModuleType("mlx_vlm")
+mlx_vlm.__path__ = []
+sys.modules["mlx_vlm"] = mlx_vlm
+sys.modules["mlx_vlm.structured"] = structured
+
+thinking = [{"name": "thinking_mode", "native_path": "enable_thinking", "value": True}]
+tool_processor = namespace["structured_logits_processor"]({
+    "grammar": {"kind": "tool_call", "tools": [{"name": "lookup"}]},
+    "speciality_parameters": thinking,
+})
+assert tool_processor[0] == "schema"
+assert tool_processor[1]["properties"]["tool"]["enum"] == ["lookup"]
+json_processor = namespace["structured_logits_processor"]({
+    "grammar": {"kind": "json_schema", "schema": {"type": "object"}},
+    "speciality_parameters": thinking,
+})
+assert json_processor[0] == "thinking"
+
+class Response:
+    def __init__(self, text, token, generated, finish_reason=None):
+        self.text = text
+        self.token = token
+        self.generation_tokens = generated
+        self.finish_reason = finish_reason
+
+events = namespace["MlxGenerationEvents"](7, [])
+assert events.push(Response("", 101, 1)) == (True, False, None)
+assert sent == []
+assert events.push(Response("A", 102, 2)) == (True, False, None)
+assert [item["chunk"]["token_id"] for item in sent] == [101]
+assert events.push(Response("B", 102, 2, "length")) == (False, False, "length")
+events.finish()
+assert [item["chunk"]["token_id"] for item in sent] == [101, 102]
+assert "".join(item["chunk"]["text"] for item in sent) == "AB"
+assert events.stream.output == "AB"
+assert events.completion_tokens == 2
+
+sent.clear()
+events = namespace["MlxGenerationEvents"](8, [])
+events.push(Response("", 201, 1))
+assert events.push(Response("tail", 202, 2, "stop")) == (True, False, "stop")
+events.finish()
+assert [item["chunk"]["token_id"] for item in sent] == [201, 202]
+assert "".join(item["chunk"]["text"] for item in sent) == "tail"
+
+sent.clear()
+events = namespace["MlxGenerationEvents"](9, ["<STOP>"])
+events.push(Response("hello<", 301, 1))
+assert events.push(Response("STOP>ignored", 302, 2)) == (True, True, None)
+events.finish()
+assert [item["chunk"]["token_id"] for item in sent] == [301, 302]
+assert events.stream.output == "hello"
+
+events = namespace["MlxGenerationEvents"](10, [])
+events.push(Response("", 401, 1))
+try:
+    events.push(Response("", 401, 1))
+except RuntimeError as error:
+    assert "before the terminal event" in str(error)
+else:
+    raise AssertionError("non-terminal duplicate generation counter was accepted")
+print("ok")
+"#;
+            let mut child = std::process::Command::new("python3")
+                .arg("-c")
+                .arg(test)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start Python stream-contract test");
+            child
+                .stdin
+                .take()
+                .expect("Python stdin")
+                .write_all(WORKER.as_bytes())
+                .expect("write embedded MLX worker");
+            let output = child.wait_with_output().expect("wait for Python test");
+            assert!(
+                output.status.success(),
+                "MLX stream-contract test failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
         }
 
         fn safetensors_fixture() -> Vec<u8> {
@@ -7110,6 +8045,7 @@ mod vllm_backend {
             assert!(WORKER.contains("num_frames must be between 1 and 64"));
             assert!(WORKER.contains("\"frames_indices\": frame_indices"));
             assert!(WORKER.contains("\"video_backend\": \"pyav\""));
+            assert!(WORKER.contains("\"audio_tokens\""));
         }
 
         #[test]
@@ -8394,6 +9330,35 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn mlx_worker_multimodal_path_is_local_bounded_and_processor_backed() {
+        let worker = include_str!("mlx_worker.py");
+        assert!(worker.contains("processor_chat_messages"));
+        assert!(worker.contains("processor.apply_chat_template"));
+        assert!(worker.contains("remote media URLs are forbidden"));
+        assert!(worker.contains("num_frames must be between 1 and 64"));
+        assert!(worker.contains("np.transpose(np.stack"));
+        assert!(worker.contains("av.open"));
+        assert!(worker.contains("generation_kwargs[\"thinking_budget\"]"));
+        assert!(worker.contains("generation_kwargs[\"enable_thinking\"]"));
+        assert!(worker.contains("if images or videos"));
+        assert!(worker.contains("if audios and not images and not videos"));
+        assert!(worker.contains("build_json_schema_logits_processor"));
+        assert!(worker.contains("ThinkingAwareLogitsProcessor"));
+        assert!(worker.contains("class StopSequenceStream"));
+        assert!(worker.contains("class MlxGenerationEvents"));
+        assert!(worker.contains("len(self.pending) > 1"));
+        assert!(worker.contains("effective_top_k"));
+        assert!(worker.contains("snapshot_mlx_random_state"));
+        assert!(worker.contains("restore_mlx_random_state"));
+        assert!(worker.contains("install_qwen35_mixed_visual_support"));
+        assert!(worker.contains("pixel_values_videos"));
+        assert!(worker.contains("image_grid_thw"));
+        assert!(worker.contains("video_grid_thw"));
+        assert!(!worker.contains("advertise caps.tools=false"));
+    }
+
     use std::io::Write;
 
     #[cfg(any(feature = "trt-llm", feature = "vllm"))]
@@ -8642,6 +9607,20 @@ mod tests {
         verify_artifact(&ModelArtifact::mlx_safetensors(&path)).expect("valid safetensors file");
         verify_artifact(&ModelArtifact::mlx_safetensors(&dir)).expect("valid safetensors dir");
         std::fs::remove_dir_all(dir).expect("remove temp mlx dir");
+    }
+
+    #[test]
+    fn mlx_multimodal_runtime_is_bound_to_mlx_artifacts() {
+        let mut mlx = LoadConfig::mlx_safetensors("/tmp/model.safetensors");
+        mlx.mlx_runtime.multimodal = true;
+        validate_load_config(&mlx).expect("MLX artifact accepts MLX multimodal semantics");
+
+        let mut gguf = LoadConfig::gguf("/tmp/model.gguf");
+        gguf.mlx_runtime.multimodal = true;
+        let error = validate_load_config(&gguf).expect_err("GGUF must reject MLX semantics");
+        assert!(error
+            .to_string()
+            .contains("require an MLX safetensors artifact"));
     }
 
     #[test]

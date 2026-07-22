@@ -618,6 +618,7 @@ mod tests {
             target: GenerateSpecialityTarget::ChatTemplateKwarg,
             native_path: "enable_thinking".to_owned(),
             value: Value::Bool(enabled),
+            max_reasoning_tokens: None,
         }
     }
 

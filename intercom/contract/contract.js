@@ -5,7 +5,7 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 14;
+export const CONTRACT_VERSION = 15;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -261,7 +261,19 @@ const ENCLAVE_QUANT_BUCKETS = new Set([
   'nvfp4',
   'int8',
   'int4',
+  'int2',
+  'int1',
+  'fp64',
+  'tf32',
+  'mxfp8',
+  'mxfp6',
+  'mxfp4',
+  'fp6',
+  'fp4',
+  'nf4',
 ]);
+const ENCLAVE_QUANT_BUCKET_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
+const ENCLAVE_QUANT_BUCKET_MAX_LENGTH = 32;
 const DEFAULT_MODEL_CLASS = 'text-generation';
 const MODEL_CLASSES = new Set([
   DEFAULT_MODEL_CLASS,
@@ -11168,20 +11180,33 @@ class MayhemContract extends Contract {
   }
 
   quantBucketFromDescriptor(descriptor) {
-    if (descriptor.includes('nvfp4')) return 'nvfp4';
-    if (descriptor.includes('fp8')) return 'fp8';
-    if (descriptor.includes('bf16')) return 'bf16';
-    if (descriptor.includes('fp16') || descriptor.includes('f16')) return 'fp16';
-    if (descriptor.includes('int8') || descriptor.includes('8bit') || descriptor.includes('q8')) return 'int8';
-    if (descriptor.includes('int4') || descriptor.includes('4bit') || descriptor.includes('q4')) return 'int4';
-    return descriptor;
+    const normalized = String(descriptor).toLowerCase().replace(/_/g, '-');
+    const tokens = normalized.split(/[^a-z0-9]+/);
+    if (normalized.includes('nvfp4')) return 'nvfp4';
+    if (normalized.includes('mxfp8')) return 'mxfp8';
+    if (normalized.includes('mxfp6')) return 'mxfp6';
+    if (normalized.includes('mxfp4')) return 'mxfp4';
+    if (tokens.includes('nf4')) return 'nf4';
+    if (normalized.includes('fp8')) return 'fp8';
+    if (normalized.includes('fp6')) return 'fp6';
+    if (normalized.includes('fp4')) return 'fp4';
+    if (normalized.includes('bf16')) return 'bf16';
+    if (normalized.includes('fp16') || normalized.includes('f16')) return 'fp16';
+    if (normalized.includes('tf32')) return 'tf32';
+    if (normalized.includes('fp32') || normalized.includes('f32')) return 'fp32';
+    if (normalized.includes('fp64') || normalized.includes('f64')) return 'fp64';
+    for (let bits = 8; bits >= 1; bits -= 1) {
+      const aliases = new Set([`int${bits}`, `${bits}bit`, `q${bits}`, `iq${bits}`, `tq${bits}`]);
+      if (tokens.some((token) => aliases.has(token))) return `int${bits}`;
+    }
+    return normalized;
   }
 
   validateEnclaveQuant(value) {
     if (typeof value !== 'string') return new Error('Enclave quant must be a string.');
     const quant = this.normalizeEnclaveQuant(value);
-    if (!ENCLAVE_QUANT_BUCKETS.has(quant)) {
-      return new Error('Enclave quant must be one of unknown, fp32, fp16, bf16, fp8, nvfp4, int8, int4.');
+    if (quant.length > ENCLAVE_QUANT_BUCKET_MAX_LENGTH || !ENCLAVE_QUANT_BUCKET_PATTERN.test(quant)) {
+      return new Error('Enclave quant must be a lowercase canonical identifier of at most 32 ASCII characters.');
     }
     return null;
   }

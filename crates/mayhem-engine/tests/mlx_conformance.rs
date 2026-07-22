@@ -69,22 +69,20 @@ fn mlx_dev_model_smoke_generates_constrains_and_canaries() -> TestResult {
     assert!(!chunks.is_empty(), "streaming sink received no tokens");
     assert!(!output.text.trim().is_empty(), "model returned empty text");
     assert_usage(&output);
+    assert_stream_matches_output(&chunks, &output);
 
-    let err = backend
-        .generate(
-            GenerateRequest::new("Return the lookup tool call.")
-                .with_max_new_tokens(96)
-                .with_grammar(GrammarSpec::ToolCall {
-                    tools: vec![ToolSpec::new("lookup", json!({"type": "object"}))],
-                }),
-            &mut |_chunk| Ok(()),
-            &CancellationToken::new(),
-        )
-        .expect_err("MLX must not fake grammar-constrained tool calls");
-    assert!(
-        format!("{err}").contains("does not support grammar-constrained tool calls"),
-        "{err}"
-    );
+    let tool_call = backend.generate(
+        GenerateRequest::new("Return the lookup tool call.")
+            .with_max_new_tokens(96)
+            .with_grammar(GrammarSpec::ToolCall {
+                tools: vec![ToolSpec::new("lookup", json!({"type": "object"}))],
+            }),
+        &mut |_chunk| Ok(()),
+        &CancellationToken::new(),
+    )?;
+    let tool_call: serde_json::Value = serde_json::from_str(tool_call.text.trim())?;
+    assert_eq!(tool_call["tool"], json!("lookup"));
+    assert!(tool_call["arguments"].is_object());
 
     let mut canary_chunks = Vec::new();
     let canary = backend.generate(
@@ -100,6 +98,7 @@ fn mlx_dev_model_smoke_generates_constrains_and_canaries() -> TestResult {
     )?;
     assert_usage(&canary);
     assert!(!canary_chunks.is_empty(), "canary produced no token chunks");
+    assert_stream_matches_output(&canary_chunks, &canary);
     println!(
         "MLX dev canary fingerprint: {}",
         token_fingerprint(canary_chunks.iter().map(|chunk| chunk.token_id))
@@ -210,6 +209,22 @@ fn assert_usage(output: &GenerateOutput) {
     assert_eq!(
         output.usage.total_tokens,
         output.usage.prompt_tokens + output.usage.completion_tokens
+    );
+}
+
+fn assert_stream_matches_output(chunks: &[mayhem_engine::TokenChunk], output: &GenerateOutput) {
+    assert_eq!(
+        chunks.len(),
+        output.usage.completion_tokens as usize,
+        "streamed token ids must exactly match billed completion tokens"
+    );
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<String>(),
+        output.text,
+        "streamed text must exactly match the final generated output"
     );
 }
 

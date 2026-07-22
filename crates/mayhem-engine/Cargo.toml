@@ -11,7 +11,7 @@ path = "src/lib.rs"
 [features]
 default = ["llama-cpp"]
 ace-step = ["dep:flate2", "dep:mayhem-enclave", "dep:tar"]
-llama-cpp = ["dep:encoding_rs", "dep:llama-cpp-2", "llama-cpp-2/llguidance", "llama-cpp-2/mtmd"]
+llama-cpp = ["dep:encoding_rs", "dep:llama-cpp-2", "dep:wait-timeout", "llama-cpp-2/llguidance", "llama-cpp-2/mtmd"]
 llama-cpp-cuda = ["llama-cpp", "llama-cpp-2/cuda"]
 llama-cpp-metal = ["llama-cpp", "llama-cpp-2/metal"]
 llama-cpp-openmp = ["llama-cpp", "llama-cpp-2/openmp"]
@@ -34,6 +34,7 @@ serde_json = "1"
 sha2 = "0.10"
 tar = { version = "0.4", optional = true }
 thiserror = "2"
+wait-timeout = { version = "0.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 win32job = "2.0.3"

@@ -732,8 +732,16 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
+| `ACE-Step/Ace-Step1.5` | Music generation | B/C | **live** |
+| `nvidia/parakeet-tdt-0.6b-v3` | ASR | A | **live** |
+| `Tongyi-MAI/Z-Image-Turbo` | Image | B/C | **live** |
+| `google/gemma-4-E4B-it` | LLM, small + vision, laptop/CPU-friendly | A/B | **live** |
 | `HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive` (`@nvfp4`) | LLM, uncensored, 262K ctx | C | **live** |
-| `google/gemma-4-E4B-it` | LLM, small + vision, laptop/CPU-friendly | A/B | onboarding next |
+| `prism-ml/Ternary-Bonsai-27B` | LLM, reasoning, 262K ctx, 2-bit ternary | B | onboarding now |
+| `SulphurAI/Sulphur-2-base` | Video with synchronized audio, uncensored | C/D | onboarding next |
+| `huihui-ai/Huihui-Agents-A1-abliterated` | LLM, vision input, uncensored | C | onboarding |
+| `Cactus-Compute/needle` | Tool-calling specialist, 26M, CPU | A | onboarding |
+| `NousResearch/Hermes-3-Llama-3.1-70B` (`@mlx-4bit`) | LLM, 70B, 128K ctx | D | onboarding |
 | `openai/gpt-oss-20b` | LLM, agentic | B | onboarding |
 | `Qwen/Qwen3.6-35B-A3B` | LLM, MoE, 262K ctx | C | onboarding |
 | `deepreinforce-ai/Ornith-1.0-9B` | LLM, agentic | B | onboarding |
@@ -741,19 +749,18 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 | `openai/gpt-oss-120b` | LLM, flagship | D | onboarding |
 | `HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive` | LLM, uncensored | B | onboarding |
 | `wepiqx/Qwythos-9B-Claude-Mythos-5-1M-MTP-SHQ8-GGUF` | LLM, 1M ctx, MTP | B | onboarding |
-| `Tongyi-MAI/Z-Image-Turbo` | Image | B/C | onboarding |
+| `baidu/Unlimited-OCR` | OCR, vision-language | A/B | onboarding |
 | `black-forest-labs/FLUX.2-klein-4B` | Image | B/C | onboarding |
 | `lodestones/Chroma1-HD` | Image, uncensored | C | onboarding |
 | `Qwen/Qwen-Image-2512` | Image, text rendering | C | onboarding |
 | `hexgrad/Kokoro-82M` | TTS (CPU-friendly) | A | onboarding |
+| `ResembleAI/chatterbox` | TTS | A/B | onboarding |
 | `openai/whisper-large-v3-turbo` | ASR | A/B | onboarding |
-| `nvidia/parakeet-tdt-0.6b-v3` | ASR | A | onboarding |
-| `ACE-Step/Ace-Step1.5` | Music generation | B/C | onboarding |
 | `BAAI/bge-m3` | Embeddings (CPU-friendly) | A | onboarding |
 | `Qwen/Qwen3-Embedding-0.6B` | Embeddings (CPU-friendly) | A | onboarding |
 | `BAAI/bge-reranker-v2-m3` | Reranker (CPU-friendly) | A | onboarding |
 
-Class = smallest machine class that serves it well: **A** CPU/laptop, **B** consumer GPU 8–12GB, **C** enthusiast GPU 16–24GB, **D** pro 48–80GB. Many models ship multiple artifacts (GGUF for llama.cpp, MLX for Apple Silicon, NVFP4 for Blackwell), so the same model can serve from very different hardware. All launch models are Apache/MIT/CC-BY licensed. Larger flagships join after launch as capable hardware comes online.
+Class = smallest machine class that serves it well: **A** CPU/laptop, **B** consumer GPU 8–12GB, **C** enthusiast GPU 16–24GB, **D** pro 48–80GB or big-memory Apple Silicon. Many models ship multiple artifacts (GGUF for llama.cpp, MLX for Apple Silicon, NVFP4 for Blackwell), so the same model can serve from very different hardware. Most launch models are Apache, MIT, or CC-BY licensed; models under a vendor license (Gemma, Llama, LTX-2) carry that license in their signed catalog entry. Larger flagships join after launch as capable hardware comes online.
 
 **Routes:**
 

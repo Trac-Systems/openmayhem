@@ -29,7 +29,7 @@ const versioningLockedRateMap = [
 const versioningBillingId = 'bb'.repeat(32);
 
 test('launch version gates cover A16/A17/D6/D7/M5/M6/M8 deterministic changes', () => {
-  assert.equal(CONTRACT_VERSION, 14);
+  assert.equal(CONTRACT_VERSION, 15);
   assert.deepEqual(signingMessageVersions(), [2]);
   assert.equal(SESSION_RECEIPT_SCHEMA_VERSION, 9);
 });
@@ -42,6 +42,23 @@ test('contract reports the exported contract version', async () => {
 
   const result = await contract.noop(storage);
   assert.equal(result.version, CONTRACT_VERSION);
+});
+
+test('contract recognizes canonical two-bit quant descriptors without treating Qwen2 as Q2', () => {
+  const contract = new MayhemContract({}, {});
+  assert.equal(contract.normalizeEnclaveQuant('int2'), 'int2');
+  assert.equal(contract.normalizeEnclaveQuant('2bit'), 'int2');
+  assert.equal(contract.normalizeEnclaveQuant('Q2_0'), 'int2');
+  assert.equal(contract.normalizeEnclaveQuant('Q1_0'), 'int1');
+  assert.equal(contract.normalizeEnclaveQuant('Q5_K_M'), 'int5');
+  assert.equal(contract.normalizeEnclaveQuant('IQ3_XXS'), 'int3');
+  assert.equal(contract.normalizeEnclaveQuant('MXFP4'), 'mxfp4');
+  assert.equal(contract.normalizeEnclaveQuant('NF4'), 'nf4');
+  assert.equal(contract.validateEnclaveQuant('future-quant7'), null);
+  assert.match(contract.validateEnclaveQuant('bad--bucket').message, /canonical identifier/);
+  assert.equal(contract.quantBucketFromDescriptor('Ternary-Bonsai-27B-Q2_0.gguf'), 'int2');
+  assert.notEqual(contract.quantBucketFromDescriptor('Qwen2.5-7B-Instruct.gguf'), 'int2');
+  assert.notEqual(contract.quantBucketFromDescriptor('Qwen1.5-7B-Instruct.gguf'), 'int1');
 });
 
 test('contract accepts only the current consent signing version', async () => {

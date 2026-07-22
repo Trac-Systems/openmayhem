@@ -15,6 +15,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 const VLLM_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/vllm.txt");
 const TRT_LLM_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/trt-llm.txt");
 const MLX_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/mlx.txt");
+const LLAMA_MEDIA_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/llama-media.txt");
 const TRANSFORMERS_ASR_REQUIREMENTS: &[u8] =
     include_bytes!("../resources/python/transformers-asr.txt");
 const ACE_STEP_UV_VERSION: &str = "0.11.29";
@@ -652,12 +653,32 @@ fn python_runtime_spec(backend: &str) -> Option<PythonRuntimeSpec> {
             backend: "mlx",
             override_env: "MAYHEM_MLX_PYTHON",
             distribution: "mlx-lm",
-            required_imports: &["mlx_lm", "mlx", "transformers", "tokenizers", "safetensors"],
+            required_imports: &[
+                "mlx_lm",
+                "mlx_vlm",
+                "mlx",
+                "llguidance",
+                "av",
+                "transformers",
+                "tokenizers",
+                "safetensors",
+            ],
             version: "0.31.3",
             requirements: MLX_REQUIREMENTS,
-            requirements_sha256: "d3167fca548be3265d62c6397f6ded6a688017b3d37de1ed4eed5eabf16b9747",
+            requirements_sha256: "6274d7958feccb4152cb6aa2494d6a59b4ba1966ce2eff7df6b245b5e272d111",
             extra_index_urls: &[],
             min_free_bytes: 2 * GIB,
+        }),
+        "llama-media" => Some(PythonRuntimeSpec {
+            backend: "llama-media",
+            override_env: "MAYHEM_LLAMA_MEDIA_PYTHON",
+            distribution: "av",
+            required_imports: &["av"],
+            version: "18.0.0",
+            requirements: LLAMA_MEDIA_REQUIREMENTS,
+            requirements_sha256: "24cede85ce0cf7759803ac67fce16c071a42dd71625a87e7af7393ea52679c78",
+            extra_index_urls: &[],
+            min_free_bytes: GIB,
         }),
         "transformers-asr" => Some(PythonRuntimeSpec {
             backend: "transformers-asr",
@@ -886,7 +907,7 @@ mod tests {
 
     #[test]
     fn backend_requirements_are_exact_and_checksummed() {
-        for backend in ["vllm", "trt-llm", "mlx", "transformers-asr"] {
+        for backend in ["vllm", "trt-llm", "mlx", "llama-media", "transformers-asr"] {
             let spec = python_runtime_spec(backend).expect("known backend");
             verify_requirements(&spec).expect("requirements verify");
             let pairs = exact_requirement_pairs(std::str::from_utf8(spec.requirements).unwrap())
@@ -899,6 +920,27 @@ mod tests {
             exact_requirement_pairs(std::str::from_utf8(vllm.requirements).unwrap())
                 .unwrap()
                 .contains(&("av".to_owned(), "18.0.0".to_owned()))
+        );
+        let mlx = python_runtime_spec("mlx").expect("MLX runtime");
+        assert!(mlx.required_imports.contains(&"mlx_vlm"));
+        assert!(
+            exact_requirement_pairs(std::str::from_utf8(mlx.requirements).unwrap())
+                .unwrap()
+                .contains(&("mlx-vlm".to_owned(), "0.6.3".to_owned()))
+        );
+        assert!(mlx.required_imports.contains(&"llguidance"));
+        assert!(
+            exact_requirement_pairs(std::str::from_utf8(mlx.requirements).unwrap())
+                .unwrap()
+                .contains(&("llguidance".to_owned(), "1.7.6".to_owned()))
+        );
+
+        let llama_media = python_runtime_spec("llama-media").expect("llama media runtime");
+        assert_eq!(llama_media.required_imports, &["av"]);
+        assert_eq!(
+            exact_requirement_pairs(std::str::from_utf8(llama_media.requirements).unwrap())
+                .unwrap(),
+            vec![("av".to_owned(), "18.0.0".to_owned())]
         );
 
         let transformers_asr =
@@ -965,6 +1007,10 @@ mod tests {
             python_runtime_spec("transformers-asr").map(|spec| spec.override_env),
             Some("MAYHEM_TRANSFORMERS_ASR_PYTHON")
         );
+        assert_eq!(
+            python_runtime_spec("llama-media").map(|spec| spec.override_env),
+            Some("MAYHEM_LLAMA_MEDIA_PYTHON")
+        );
         assert!(python_runtime_spec("llama.cpp").is_none());
     }
 
@@ -979,6 +1025,10 @@ mod tests {
             .extra_index_urls
             .is_empty());
         assert!(python_runtime_spec("transformers-asr")
+            .unwrap()
+            .extra_index_urls
+            .is_empty());
+        assert!(python_runtime_spec("llama-media")
             .unwrap()
             .extra_index_urls
             .is_empty());

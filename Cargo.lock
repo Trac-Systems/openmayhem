@@ -2262,8 +2262,7 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 [[package]]
 name = "llama-cpp-2"
 version = "0.1.150"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e82ec86fd73aaa7d8f4898cc4693410c217431506ba3237ea5c856127f49d84d"
+source = "git+https://github.com/Trac-Systems/openmayhem-llama-cpp-rs?rev=7f15e87e3cb0f636e236243e6ee4fc2a4c357277#7f15e87e3cb0f636e236243e6ee4fc2a4c357277"
 dependencies = [
  "encoding_rs",
  "enumflags2",
@@ -2278,8 +2277,7 @@ dependencies = [
 [[package]]
 name = "llama-cpp-sys-2"
 version = "0.1.150"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f67dab3ed2b68e4fc4a42471eac73e128ed2ee97bd10de66ddcc609dd5d838a0"
+source = "git+https://github.com/Trac-Systems/openmayhem-llama-cpp-rs?rev=7f15e87e3cb0f636e236243e6ee4fc2a4c357277#7f15e87e3cb0f636e236243e6ee4fc2a4c357277"
 dependencies = [
  "bindgen",
  "cc",
@@ -2353,7 +2351,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mayhem-attestation"
-version = "0.2.35"
+version = "0.2.36"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -2375,7 +2373,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-attestation-verifier"
-version = "0.2.35"
+version = "0.2.36"
 dependencies = [
  "base64 0.22.1",
  "dcap-qvl",
@@ -2398,7 +2396,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-bridge"
-version = "0.2.35"
+version = "0.2.36"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -2413,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-cli"
-version = "0.2.35"
+version = "0.2.36"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2446,7 +2444,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-enclave"
-version = "0.2.35"
+version = "0.2.36"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -2470,7 +2468,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-engine"
-version = "0.2.35"
+version = "0.2.36"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -2483,12 +2481,13 @@ dependencies = [
  "sha2 0.10.9",
  "tar",
  "thiserror 2.0.18",
+ "wait-timeout",
  "win32job",
 ]
 
 [[package]]
 name = "mayhem-gateway"
-version = "0.2.35"
+version = "0.2.36"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2526,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-hwprobe"
-version = "0.2.35"
+version = "0.2.36"
 dependencies = [
  "serde",
  "serde_json",
@@ -2535,7 +2534,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-pay"
-version = "0.2.35"
+version = "0.2.36"
 dependencies = [
  "anyhow",
  "clap",
@@ -2545,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-paygate"
-version = "0.2.35"
+version = "0.2.36"
 dependencies = [
  "axum",
  "blake3",
@@ -2568,7 +2567,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-proto"
-version = "0.2.35"
+version = "0.2.36"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -2580,7 +2579,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-windows-sandbox"
-version = "0.2.35"
+version = "0.2.36"
 dependencies = [
  "thiserror 2.0.18",
  "windows-sys 0.60.2",
@@ -2588,7 +2587,7 @@ dependencies = [
 
 [[package]]
 name = "mayhemd"
-version = "0.2.35"
+version = "0.2.36"
 dependencies = [
  "anyhow",
  "clap",

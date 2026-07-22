@@ -9961,7 +9961,9 @@ fn validate_additive_catalog_update(
             removed.push(model_id.clone());
             continue;
         };
-        if candidate_model != base_model && !allowed_model_changes.contains(model_id) {
+        if !catalog_values_semantically_equal(candidate_model, base_model)
+            && !allowed_model_changes.contains(model_id)
+        {
             changed.push(model_id.clone());
         }
     }
@@ -9976,6 +9978,60 @@ fn validate_additive_catalog_update(
         changed.join(", ")
     );
     Ok(())
+}
+
+fn catalog_values_semantically_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::Number(left), Value::Number(right)) => {
+            if left == right {
+                return true;
+            }
+            match (json_integer(left), json_integer(right)) {
+                (Some(left), Some(right)) => left == right,
+                (Some(integer), None) => right
+                    .as_f64()
+                    .is_some_and(|float| exactly_equal_integer_and_float(integer, float)),
+                (None, Some(integer)) => left
+                    .as_f64()
+                    .is_some_and(|float| exactly_equal_integer_and_float(integer, float)),
+                (None, None) => false,
+            }
+        }
+        (Value::String(left), Value::String(right)) => left == right,
+        (Value::Array(left), Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| catalog_values_semantically_equal(left, right))
+        }
+        (Value::Object(left), Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, left)| {
+                    right
+                        .get(key)
+                        .is_some_and(|right| catalog_values_semantically_equal(left, right))
+                })
+        }
+        _ => false,
+    }
+}
+
+fn json_integer(number: &serde_json::Number) -> Option<i128> {
+    number
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| number.as_u64().map(i128::from))
+}
+
+fn exactly_equal_integer_and_float(integer: i128, float: f64) -> bool {
+    if !float.is_finite() || float.fract() != 0.0 {
+        return false;
+    }
+    let converted = float as i128;
+    converted == integer && converted as f64 == float
 }
 
 #[derive(Debug)]
@@ -14840,8 +14896,13 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
             Ok::<_, anyhow::Error>(report)
         })
         .transpose()?;
-    let mut backend =
-        catalog_calibration_backend(artifact, &artifact_path, &artifact_sidecar_paths, &args)?;
+    let mut backend = catalog_calibration_backend(
+        model,
+        artifact,
+        &artifact_path,
+        &artifact_sidecar_paths,
+        &args,
+    )?;
     let report = if let Some(mut report) = resume_core_report {
         let behavioral_witness = resumed_endpoint_behavioral_witness(
             resume_core_report_path
@@ -17200,6 +17261,7 @@ fn calibration_memory_context(
         disk_bench_mib: 1,
         fixture: None,
     });
+    calibration_accelerator_preflight(artifact, args, &hardware)?;
     let verdict = hardware
         .backend_verdicts
         .iter()
@@ -17250,6 +17312,44 @@ fn calibration_memory_context(
         ),
         probe,
     })
+}
+
+fn calibration_accelerator_preflight(
+    artifact: &catalog::CatalogArtifact,
+    args: &CatalogCalibrateCanaryArgs,
+    hardware: &HardwareReport,
+) -> Result<()> {
+    calibration_accelerator_preflight_for_build(
+        &artifact.engine,
+        args.gpu_layers,
+        hardware,
+        cfg!(feature = "llama-cpp-cuda"),
+        cfg!(feature = "llama-cpp-metal"),
+        cfg!(feature = "llama-cpp-vulkan"),
+    )
+}
+
+fn calibration_accelerator_preflight_for_build(
+    engine: &str,
+    gpu_layers: Option<u32>,
+    hardware: &HardwareReport,
+    cuda_enabled: bool,
+    metal_enabled: bool,
+    vulkan_enabled: bool,
+) -> Result<()> {
+    if engine != "llama.cpp" {
+        return Ok(());
+    }
+    provider_llama_accelerator_preflight_for_build(
+        gpu_layers,
+        hardware,
+        cuda_enabled,
+        metal_enabled,
+        vulkan_enabled,
+    )
+    .context(
+        "catalog calibrate-canary requested llama.cpp GPU layers that this build cannot execute",
+    )
 }
 
 fn calibration_memory_bytes(
@@ -20353,6 +20453,7 @@ fn canary_set_file_sha256(
 }
 
 fn catalog_calibration_backend(
+    model: &catalog::CatalogModel,
     artifact: &catalog::CatalogArtifact,
     artifact_path: &Path,
     sidecar_paths: &BTreeMap<String, PathBuf>,
@@ -20374,6 +20475,27 @@ fn catalog_calibration_backend(
                 )
             })?;
         Some((runtime, home.join("cache").join(&artifact.engine)))
+    } else {
+        None
+    };
+    let llama_media_runtime = if artifact.engine == "llama.cpp"
+        && model
+            .adapter
+            .modality_set
+            .iter()
+            .any(|value| value == "video")
+    {
+        let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+        let home = absolutize(home)?;
+        fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
+        Some(
+            python_runtime::ensure_backend_python(&home, "llama-media").with_context(|| {
+                format!(
+                    "preparing the managed llama.cpp media runtime under {}",
+                    home.display()
+                )
+            })?,
+        )
     } else {
         None
     };
@@ -20422,6 +20544,8 @@ fn catalog_calibration_backend(
         "piper" => LoadConfig::piper_voice(artifact_path),
         other => bail!("unsupported canary calibration engine {other}"),
     };
+    apply_catalog_kv_cache_profile(&mut config, artifact);
+    config.mlx_runtime = artifact.mlx_runtime;
     if let Some((_, cache_dir)) = &managed_runtime {
         fs::create_dir_all(cache_dir)
             .with_context(|| format!("creating calibration cache {}", cache_dir.display()))?;
@@ -20483,8 +20607,11 @@ fn catalog_calibration_backend(
 
     match artifact.engine.as_str() {
         "llama.cpp" => {
-            let mut backend =
-                mayhem_engine::LlamaCppBackend::new().context("initializing llama.cpp backend")?;
+            let mut backend = match llama_media_runtime.as_ref() {
+                Some(runtime) => mayhem_engine::LlamaCppBackend::with_media_python(&runtime.python),
+                None => mayhem_engine::LlamaCppBackend::new(),
+            }
+            .context("initializing llama.cpp backend")?;
             backend
                 .load(config)
                 .context("loading llama.cpp canary calibration artifact")?;
@@ -24383,7 +24510,24 @@ fn normalize_quant_bucket(value: &str) -> Result<String> {
     }
     if matches!(
         normalized.as_str(),
-        "unknown" | "fp32" | "fp16" | "bf16" | "fp8" | "nvfp4" | "int8" | "int4"
+        "unknown"
+            | "fp64"
+            | "fp32"
+            | "tf32"
+            | "fp16"
+            | "bf16"
+            | "mxfp8"
+            | "fp8"
+            | "mxfp6"
+            | "fp6"
+            | "nvfp4"
+            | "mxfp4"
+            | "fp4"
+            | "nf4"
+            | "int8"
+            | "int4"
+            | "int2"
+            | "int1"
     ) {
         return Ok(normalized);
     }
@@ -24391,7 +24535,10 @@ fn normalize_quant_bucket(value: &str) -> Result<String> {
     if inferred != DEFAULT_QUANT_BUCKET {
         return Ok(inferred);
     }
-    bail!("quant bucket must be one of fp32, fp16, bf16, fp8, nvfp4, int8, int4, unknown")
+    if is_canonical_quant_bucket(&normalized) {
+        return Ok(normalized);
+    }
+    bail!("quant bucket must be a lowercase canonical identifier of at most 32 ASCII characters")
 }
 
 fn default_quant_bucket() -> String {
@@ -24409,28 +24556,68 @@ fn quant_bucket_from_catalog_artifact(name: &str, artifact: &catalog::CatalogArt
 }
 
 fn quant_bucket_from_descriptor(descriptor: &str) -> String {
-    let descriptor = descriptor.replace('_', "-");
+    let descriptor = descriptor.to_ascii_lowercase().replace('_', "-");
     if descriptor.contains("nvfp4") {
         "nvfp4".to_owned()
+    } else if descriptor.contains("mxfp8") {
+        "mxfp8".to_owned()
+    } else if descriptor.contains("mxfp6") {
+        "mxfp6".to_owned()
+    } else if descriptor.contains("mxfp4") {
+        "mxfp4".to_owned()
+    } else if descriptor_quant_tokens(&descriptor).any(|token| token == "nf4") {
+        "nf4".to_owned()
     } else if descriptor.contains("fp8") {
         "fp8".to_owned()
+    } else if descriptor.contains("fp6") {
+        "fp6".to_owned()
+    } else if descriptor.contains("fp4") {
+        "fp4".to_owned()
     } else if descriptor.contains("bf16") {
         "bf16".to_owned()
     } else if descriptor.contains("fp16") || descriptor.contains("f16") {
         "fp16".to_owned()
-    } else if descriptor.contains("int8")
-        || descriptor.contains("8bit")
-        || descriptor.contains("q8")
-    {
-        "int8".to_owned()
-    } else if descriptor.contains("int4")
-        || descriptor.contains("4bit")
-        || descriptor.contains("q4")
-    {
-        "int4".to_owned()
+    } else if descriptor.contains("tf32") {
+        "tf32".to_owned()
+    } else if descriptor.contains("fp32") || descriptor.contains("f32") {
+        "fp32".to_owned()
+    } else if descriptor.contains("fp64") || descriptor.contains("f64") {
+        "fp64".to_owned()
+    } else if let Some(bucket) = descriptor_integer_quant_bucket(&descriptor) {
+        bucket.to_owned()
     } else {
         DEFAULT_QUANT_BUCKET.to_owned()
     }
+}
+
+fn descriptor_quant_tokens(descriptor: &str) -> impl Iterator<Item = &str> {
+    descriptor.split(|value: char| !value.is_ascii_alphanumeric())
+}
+
+fn descriptor_integer_quant_bucket(descriptor: &str) -> Option<&'static str> {
+    descriptor_quant_tokens(descriptor).find_map(|token| match token {
+        "int8" | "8bit" | "q8" | "iq8" | "tq8" => Some("int8"),
+        "int7" | "7bit" | "q7" | "iq7" | "tq7" => Some("int7"),
+        "int6" | "6bit" | "q6" | "iq6" | "tq6" => Some("int6"),
+        "int5" | "5bit" | "q5" | "iq5" | "tq5" => Some("int5"),
+        "int4" | "4bit" | "q4" | "iq4" | "tq4" => Some("int4"),
+        "int3" | "3bit" | "q3" | "iq3" | "tq3" => Some("int3"),
+        "int2" | "2bit" | "q2" | "iq2" | "tq2" => Some("int2"),
+        "int1" | "1bit" | "q1" | "iq1" | "tq1" => Some("int1"),
+        _ => None,
+    })
+}
+
+fn is_canonical_quant_bucket(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 32
+        && bytes[0].is_ascii_lowercase()
+        && bytes.last().is_some_and(|value| *value != b'-')
+        && bytes
+            .iter()
+            .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || *value == b'-')
+        && !bytes.windows(2).any(|pair| pair == b"--")
 }
 
 fn admin_open_room_payload(args: &AdminOpenRoomArgs) -> Result<Value> {
@@ -46728,6 +46915,9 @@ fn provider_backend_runtime_child_env(
         }
     };
     match backend {
+        "llama.cpp" => {
+            insert_path("MAYHEM_LLAMA_MEDIA_PYTHON", runtime.python.as_deref());
+        }
         "vllm" => {
             insert_path("MAYHEM_VLLM_PYTHON", runtime.python.as_deref());
             insert_path("MAYHEM_VLLM_CACHE_DIR", runtime.cache_dir.as_deref());
@@ -47000,13 +47190,32 @@ fn provider_backend_runtime_preflight(
     hardware: &HardwareReport,
 ) -> Result<ProviderBackendRuntime> {
     let backend = selected.artifact.engine.as_str();
-    provider_backend_runtime_preflight_for_backend(home, backend, Some(&selected.verdict), hardware)
-        .with_context(|| {
-            format!(
-                "preparing the {backend} runtime for {}",
-                selected.model.model_id
-            )
-        })
+    let mut runtime = provider_backend_runtime_preflight_for_backend(
+        home,
+        backend,
+        Some(&selected.verdict),
+        hardware,
+    )
+    .with_context(|| {
+        format!(
+            "preparing the {backend} runtime for {}",
+            selected.model.model_id
+        )
+    })?;
+    if backend == "llama.cpp"
+        && selected
+            .served_modalities
+            .iter()
+            .any(|modality| modality == "video")
+    {
+        let python = python_runtime::ensure_backend_python(home, "llama-media")
+            .context("preparing the managed llama.cpp media runtime")?;
+        runtime.python = Some(python.python);
+        runtime.python_source = Some(python.source);
+        runtime.requirements_sha256 = Some(python.requirements_sha256);
+        runtime.cache_dir = Some(home.join("cache").join("llama-media"));
+    }
+    Ok(runtime)
 }
 
 fn provider_backend_runtime_preflight_for_backend(
@@ -55591,6 +55800,9 @@ fn provider_kv_bytes_per_token(
             .filter(|value| *value > 0)
             .context("enclave caps kv_bytes_per_token must be a positive integer");
     }
+    if let Some(profile) = &artifact.kv_cache {
+        return Ok(profile.bytes_per_token);
+    }
     let base_per_billion = if matches!(artifact.engine.as_str(), "trt-llm" | "vllm")
         && matches!(enclave.quant.as_str(), "nvfp4" | "fp8" | "int4")
     {
@@ -55599,6 +55811,16 @@ fn provider_kv_bytes_per_token(
         24 * 1024
     };
     Ok(((model.params_b.max(0.1) * base_per_billion as f64).ceil() as u64).max(1024))
+}
+
+fn apply_catalog_kv_cache_profile(config: &mut LoadConfig, artifact: &catalog::CatalogArtifact) {
+    let Some(profile) = &artifact.kv_cache else {
+        return;
+    };
+    config.kv_cache_dtype = Some(profile.dtype.clone());
+    config.kv_cache_bits = Some(profile.bits);
+    config.kv_cache_group_size = Some(profile.group_size);
+    config.kv_cache_quantized_start_tokens = Some(profile.quantized_start_tokens);
 }
 
 fn provider_modality_capacities(
@@ -64731,8 +64953,11 @@ fn provider_session_responder(
     )?;
     match ctx.selected.artifact.engine.as_str() {
         "llama.cpp" => {
-            let mut backend = mayhem_engine::LlamaCppBackend::new()
-                .context("initializing llama.cpp provider session engine")?;
+            let mut backend = match ctx.backend_runtime.python.as_ref() {
+                Some(python) => mayhem_engine::LlamaCppBackend::with_media_python(python),
+                None => mayhem_engine::LlamaCppBackend::new(),
+            }
+            .context("initializing llama.cpp provider session engine")?;
             with_provider_progress_spinner(ctx.args, "llama.cpp engine load", || {
                 backend
                     .load(load_config)
@@ -65381,6 +65606,8 @@ fn provider_engine_load_config(
         materialized_trt_engine_dir = Some(layout.engine_dir);
     } else if selected.artifact.engine == "vllm" {
         artifact_path_buf = materialize_vllm_artifacts(selected, artifact_paths)?;
+    } else if selected.artifact.engine == "mlx" {
+        artifact_path_buf = materialize_mlx_artifacts(selected, artifact_paths)?;
     } else if selected.artifact.engine == "ace-step" {
         let cache_dir = backend_runtime
             .cache_dir
@@ -65420,6 +65647,8 @@ fn provider_engine_load_config(
         "piper" => LoadConfig::piper_voice(artifact_path),
         other => bail!("unsupported local provider session engine {other}"),
     };
+    apply_catalog_kv_cache_profile(&mut config, &selected.artifact);
+    config.mlx_runtime = selected.artifact.mlx_runtime;
     config.artifact = artifact;
     config.ctx_size = ctx_size.max(1);
     config.gpu_layers = if selected.artifact.engine == "llama.cpp" {
@@ -65711,6 +65940,60 @@ fn materialize_vllm_artifacts(
         })?;
     }
     Ok(checkpoint_dir)
+}
+
+fn materialize_mlx_artifacts(
+    selected: &ProviderCandidate,
+    artifact_paths: &ProviderArtifactPaths,
+) -> Result<PathBuf> {
+    materialize_mlx_layout(
+        &format!("{}/{}", selected.model.model_id, selected.artifact_name),
+        &selected.artifact_name,
+        &selected.artifact,
+        artifact_paths,
+    )
+}
+
+fn materialize_mlx_layout(
+    label: &str,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    artifact_paths: &ProviderArtifactPaths,
+) -> Result<PathBuf> {
+    let model_dir = mlx_model_cache_dir(&artifact_paths.primary, artifact_name, artifact);
+    fs::create_dir_all(&model_dir)
+        .with_context(|| format!("creating MLX model layout {}", model_dir.display()))?;
+
+    let primary_relative = validate_catalog_artifact_relative_path(&artifact.path)?;
+    let primary = model_dir.join(&primary_relative);
+    link_or_copy_file(&artifact_paths.primary, &primary).with_context(|| {
+        format!(
+            "materializing MLX primary artifact {label} at {}",
+            primary.display()
+        )
+    })?;
+
+    let mut occupied_paths = BTreeSet::from([primary_relative]);
+    for (sidecar_name, sidecar) in &artifact.sidecars {
+        let relative = validate_catalog_artifact_relative_path(&sidecar.path)?;
+        ensure!(
+            occupied_paths.insert(relative.clone()),
+            "MLX artifact {label} declares duplicate path {}",
+            sidecar.path
+        );
+        let source = artifact_paths.sidecars.get(sidecar_name).with_context(|| {
+            format!("downloaded MLX artifact {label} is missing admin sidecar {sidecar_name}")
+        })?;
+        let destination = model_dir.join(relative);
+        link_or_copy_file(source, &destination).with_context(|| {
+            format!(
+                "materializing MLX sidecar {} at {}",
+                sidecar_name,
+                destination.display()
+            )
+        })?;
+    }
+    Ok(primary)
 }
 
 fn materialize_transformers_asr_artifacts(
@@ -66185,6 +66468,36 @@ fn vllm_checkpoint_cache_dir(artifact_path: &Path, artifact_name: &str) -> PathB
     };
     base.join(".vllm-checkpoints")
         .join(safe_path_component(artifact_name))
+}
+
+fn mlx_model_cache_dir(
+    artifact_path: &Path,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+) -> PathBuf {
+    let base = if artifact_path.is_dir() {
+        artifact_path.to_path_buf()
+    } else {
+        artifact_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+    let mut identity = blake3::Hasher::new();
+    identity.update(b"mayhem/mlx/materialized-layout/v2\0");
+    identity.update(artifact.artifact_root.as_bytes());
+    identity.update(&(artifact.path.len() as u64).to_be_bytes());
+    identity.update(artifact.path.as_bytes());
+    for (name, sidecar) in &artifact.sidecars {
+        identity.update(&(name.len() as u64).to_be_bytes());
+        identity.update(name.as_bytes());
+        identity.update(sidecar.artifact_root.as_bytes());
+        identity.update(&(sidecar.path.len() as u64).to_be_bytes());
+        identity.update(sidecar.path.as_bytes());
+    }
+    base.join(".mlx-models")
+        .join(safe_path_component(artifact_name))
+        .join(identity.finalize().to_hex().as_str())
 }
 
 fn transformers_asr_checkpoint_cache_dir(artifact_path: &Path, artifact_name: &str) -> PathBuf {
@@ -67674,6 +67987,45 @@ fn provider_reasoning_delimiters(adapter: &catalog::CatalogAdapter) -> ProviderR
     }
 }
 
+fn provider_engine_tool_parse_text(
+    text: &str,
+    output_mode: ProviderReasoningOutputMode,
+    reasoning_enabled: Option<bool>,
+    delimiters: ProviderReasoningDelimiters,
+) -> String {
+    let parse_mode = if output_mode == ProviderReasoningOutputMode::Preserve {
+        if reasoning_enabled == Some(true) {
+            ProviderReasoningOutputMode::StripPrefilled
+        } else {
+            ProviderReasoningOutputMode::StripTagged
+        }
+    } else {
+        output_mode
+    };
+    provider_reasoning_visible_output_with_delimiters(text, parse_mode, delimiters)
+}
+
+fn provider_engine_tool_call_outputs_after_reasoning(
+    text: &str,
+    output_mode: ProviderReasoningOutputMode,
+    reasoning_enabled: Option<bool>,
+    delimiters: ProviderReasoningDelimiters,
+    strategy: ProviderEngineToolStrategy,
+    tools: &[ToolSpec],
+) -> Option<Vec<Value>> {
+    let visible = provider_engine_tool_parse_text(text, output_mode, reasoning_enabled, delimiters);
+    if let Some(calls) = provider_engine_tool_call_outputs(&visible, strategy, tools) {
+        return Some(calls);
+    }
+    if visible == text {
+        return None;
+    }
+    // A tool grammar may return only the canonical call without the reasoning
+    // close marker prefilled by the chat template. Keep the raw fallback
+    // fail-closed through the same advertised-tool parser and validator.
+    provider_engine_tool_call_outputs(text, strategy, tools)
+}
+
 #[cfg(test)]
 fn provider_test_seal_contract_request(
     body: &Value,
@@ -68119,6 +68471,7 @@ fn provider_engine_session_response_with_sampling_bounded(
     if let Some(cap) = output_token_cap {
         request.max_new_tokens = request.max_new_tokens.min(cap.max(1));
     }
+    let reasoning_speciality_enabled = provider_reasoning_speciality_enabled(&request);
     let reasoning_output_mode = provider_reasoning_output_mode(adapter, &request);
     let reasoning_delimiters = provider_reasoning_delimiters(adapter);
     let mut reasoning_stream_filter =
@@ -68168,7 +68521,14 @@ fn provider_engine_session_response_with_sampling_bounded(
     let tools = tool_mode
         .as_ref()
         .and_then(|mode| {
-            provider_engine_tool_call_outputs(&output.text, mode.strategy, &mode.tools)
+            provider_engine_tool_call_outputs_after_reasoning(
+                &output.text,
+                reasoning_output_mode,
+                reasoning_speciality_enabled,
+                reasoning_delimiters,
+                mode.strategy,
+                &mode.tools,
+            )
         })
         .unwrap_or_default();
     if tool_mode
@@ -68995,6 +69355,7 @@ fn provider_engine_speciality_parameters(
             target,
             native_path: mapping.native_path.clone(),
             value: level.native_value.clone(),
+            max_reasoning_tokens: level.max_reasoning_tokens,
         });
         if descriptor.name == "reasoning_effort" {
             reasoning_output_cap = level.default_max_output_tokens;
@@ -69270,14 +69631,183 @@ fn provider_engine_prompt(
     adapter: &catalog::CatalogAdapter,
 ) -> Result<String> {
     match adapter.chat_template_id.as_str() {
-        "generic_chatml" | "qwen2.5-instruct" | "qwen3.5-instruct" => {
+        "generic_chatml" | "qwen2.5-instruct" => {
             Ok(provider_engine_generic_chatml_prompt(messages, adapter))
         }
+        "qwen3.5-instruct" => provider_engine_qwen3_prompt(messages, tools, specialities, adapter),
         "llama3-instruct" => Ok(provider_engine_llama3_prompt(messages, adapter)),
         "smolvlm2-instruct" => Ok(provider_engine_smolvlm2_prompt(messages, adapter)),
         "gemma4-instruct" => gemma4::render_prompt(messages, tools, specialities),
         other => bail!("unsupported catalog adapter.chat_template_id: {other}"),
     }
+}
+
+fn provider_engine_qwen3_prompt(
+    messages: &[Value],
+    tools: &[Value],
+    specialities: &[GenerateSpecialityParameter],
+    adapter: &catalog::CatalogAdapter,
+) -> Result<String> {
+    let enable_thinking = provider_engine_speciality_bool(specialities, "enable_thinking", true)?;
+    let preserve_thinking =
+        provider_engine_speciality_bool(specialities, "preserve_thinking", false)?;
+    let mut prompt = String::new();
+    let first_system = messages
+        .first()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"));
+    if tools.is_empty() {
+        if let Some(system) = first_system {
+            let content = provider_message_to_text_for_adapter(system, adapter);
+            let _ = write!(prompt, "<|im_start|>system\n{content}<|im_end|>\n");
+        }
+    } else {
+        prompt.push_str(
+            "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>",
+        );
+        for tool in tools {
+            let encoded = serde_json::to_string(tool)
+                .context("serializing qwen tool definition for the native chat template")?;
+            let _ = write!(prompt, "\n{encoded}");
+        }
+        prompt.push_str(
+            "\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>",
+        );
+        if let Some(system) = first_system {
+            let content = provider_message_to_text_for_adapter(system, adapter);
+            if !content.trim().is_empty() {
+                let _ = write!(prompt, "\n\n{content}");
+            }
+        }
+        prompt.push_str("<|im_end|>\n");
+    }
+
+    let mut tool_group_open = false;
+    for (index, message) in messages.iter().enumerate() {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        if role == "system" {
+            ensure!(index == 0, "qwen system message must be first");
+            continue;
+        }
+        let content = provider_message_to_text_for_adapter(message, adapter);
+        match role {
+            "user" => {
+                if tool_group_open {
+                    prompt.push_str("<|im_end|>\n");
+                    tool_group_open = false;
+                }
+                let _ = write!(prompt, "<|im_start|>user\n{content}<|im_end|>\n");
+            }
+            "assistant" => {
+                if tool_group_open {
+                    prompt.push_str("<|im_end|>\n");
+                    tool_group_open = false;
+                }
+                prompt.push_str("<|im_start|>assistant\n");
+                if preserve_thinking {
+                    if let Some(reasoning) = message
+                        .get("reasoning_content")
+                        .or_else(|| message.get("reasoning"))
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                    {
+                        let _ = write!(prompt, "<think>\n{}\n</think>\n\n", reasoning.trim());
+                    }
+                }
+                if preserve_thinking {
+                    prompt.push_str(&content);
+                } else {
+                    prompt.push_str(qwen_visible_assistant_content(&content));
+                }
+                provider_engine_qwen3_tool_calls(&mut prompt, message)?;
+                prompt.push_str("<|im_end|>\n");
+            }
+            "tool" => {
+                if !tool_group_open {
+                    prompt.push_str("<|im_start|>user");
+                    tool_group_open = true;
+                }
+                let _ = write!(prompt, "\n<tool_response>\n{content}\n</tool_response>");
+            }
+            other => bail!("unsupported qwen chat role {other}"),
+        }
+    }
+    if tool_group_open {
+        prompt.push_str("<|im_end|>\n");
+    }
+    prompt.push_str("<|im_start|>assistant\n");
+    if enable_thinking {
+        prompt.push_str("<think>\n");
+    } else {
+        prompt.push_str("<think>\n\n</think>\n\n");
+    }
+    Ok(prompt)
+}
+
+fn qwen_visible_assistant_content(content: &str) -> &str {
+    let mut last_close = None;
+    for close in ["</think>", "<|/think|>"] {
+        if let Some(index) = content.rfind(close) {
+            let end = index + close.len();
+            if last_close.is_none_or(|current| end > current) {
+                last_close = Some(end);
+            }
+        }
+    }
+    if let Some(end) = last_close {
+        return content[end..].trim_start();
+    }
+    if content.contains("<think>") || content.contains("<|think|>") {
+        return "";
+    }
+    content
+}
+
+fn provider_engine_speciality_bool(
+    specialities: &[GenerateSpecialityParameter],
+    native_path: &str,
+    default: bool,
+) -> Result<bool> {
+    let Some(parameter) = specialities
+        .iter()
+        .find(|parameter| parameter.native_path == native_path)
+    else {
+        return Ok(default);
+    };
+    parameter.value.as_bool().with_context(|| {
+        format!(
+            "speciality {} native path {native_path} must map to a boolean",
+            parameter.name
+        )
+    })
+}
+
+fn provider_engine_qwen3_tool_calls(prompt: &mut String, message: &Value) -> Result<()> {
+    let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for tool_call in tool_calls {
+        let call = tool_call.get("function").unwrap_or(tool_call);
+        let name = call
+            .get("name")
+            .and_then(Value::as_str)
+            .context("qwen assistant tool call is missing function.name")?;
+        let _ = write!(prompt, "\n<tool_call>\n<function={name}>\n");
+        if let Some(arguments) = call.get("arguments").and_then(Value::as_object) {
+            for (name, value) in arguments {
+                let value = match value {
+                    Value::String(value) => value.clone(),
+                    value => serde_json::to_string(value)
+                        .context("serializing qwen assistant tool-call argument")?,
+                };
+                let _ = write!(prompt, "<parameter={name}>\n{value}\n</parameter>\n");
+            }
+        }
+        prompt.push_str("</function>\n</tool_call>");
+    }
+    Ok(())
 }
 
 fn provider_engine_generic_chatml_prompt(
@@ -69977,7 +70507,14 @@ fn provider_content_part_to_text_for_adapter(
                 .get("video")
                 .and_then(|video| video.get("frames"))
                 .and_then(Value::as_array)
-                .map_or(1, Vec::len);
+                .map(Vec::len)
+                .or_else(|| {
+                    part.get("video")
+                        .and_then(|video| video.get("num_frames"))
+                        .and_then(Value::as_u64)
+                        .and_then(|value| usize::try_from(value).ok())
+                })
+                .unwrap_or(1);
             return MTMD_MEDIA_MARKER.repeat(frame_count);
         }
         _ => {}
@@ -74881,6 +75418,36 @@ mod tests {
     }
 
     #[test]
+    fn quant_bucket_normalization_recognizes_two_bit_artifacts_without_qwen_false_positives() {
+        assert_eq!(normalize_quant_bucket("int2").unwrap(), "int2");
+        assert_eq!(normalize_quant_bucket("2bit").unwrap(), "int2");
+        assert_eq!(normalize_quant_bucket("Q2_0").unwrap(), "int2");
+        assert_eq!(normalize_quant_bucket("Q1_0").unwrap(), "int1");
+        assert_eq!(normalize_quant_bucket("Q5_K_M").unwrap(), "int5");
+        assert_eq!(normalize_quant_bucket("IQ3_XXS").unwrap(), "int3");
+        assert_eq!(normalize_quant_bucket("MXFP4").unwrap(), "mxfp4");
+        assert_eq!(normalize_quant_bucket("NF4").unwrap(), "nf4");
+        assert_eq!(
+            normalize_quant_bucket("future-quant7").unwrap(),
+            "future-quant7"
+        );
+        assert_eq!(
+            quant_bucket_from_descriptor("prism-ml/Ternary-Bonsai-27B-Q2_0.gguf"),
+            "int2"
+        );
+        assert_eq!(
+            quant_bucket_from_descriptor("Qwen2.5-7B-Instruct.gguf"),
+            DEFAULT_QUANT_BUCKET
+        );
+        assert_eq!(
+            quant_bucket_from_descriptor("Qwen1.5-7B-Instruct.gguf"),
+            DEFAULT_QUANT_BUCKET
+        );
+        assert!(normalize_quant_bucket("bad--bucket").is_err());
+        assert!(normalize_quant_bucket("bad/bucket").is_err());
+    }
+
+    #[test]
     fn admin_register_enclave_requires_greenlit_catalog_artifact() {
         let temp = env::temp_dir().join(format!(
             "mayhem-cli-admin-catalog-gate-{}-{}",
@@ -76323,7 +76890,7 @@ mod tests {
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 14);
+        assert_eq!(CONTRACT_VERSION, 15);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 9);
     }
@@ -78382,6 +78949,37 @@ mod tests {
             Some("/managed/cache")
         );
         assert!(!child_env.contains_key("MAYHEM_TRTLLM_PYTHON"));
+
+        let llama_runtime = ProviderBackendRuntime {
+            python: Some(PathBuf::from("/managed/llama-media/bin/python")),
+            ..ProviderBackendRuntime::default()
+        };
+        let llama_env = provider_backend_runtime_child_env("llama.cpp", &llama_runtime);
+        assert_eq!(
+            llama_env
+                .get("MAYHEM_LLAMA_MEDIA_PYTHON")
+                .map(String::as_str),
+            Some("/managed/llama-media/bin/python")
+        );
+    }
+
+    #[test]
+    fn llama_video_container_prompt_has_one_marker_per_requested_frame() {
+        let mut adapter = catalog::CatalogAdapter::default();
+        adapter.modality_set.push("video".to_owned());
+        let part = json!({
+            "type": "video",
+            "video": {
+                "data": "AAAA",
+                "content_type": "video/mp4",
+                "num_frames": 16,
+                "fps": 8.0
+            }
+        });
+
+        let rendered = provider_content_part_to_text_for_adapter(&part, &adapter);
+
+        assert_eq!(rendered.matches(MTMD_MEDIA_MARKER).count(), 16);
     }
 
     fn test_modality_capacities(modality: &str) -> BTreeMap<String, HeartbeatModalityCapacity> {
@@ -78882,6 +79480,47 @@ mod tests {
         .unwrap();
 
         assert_eq!(estimate.kv_bytes, 262_144 * 20_480);
+    }
+
+    #[test]
+    fn provider_memory_estimate_uses_signed_artifact_kv_profile() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0].caps.ctx_max = 262_144;
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].caps = json!({
+            "tools": true,
+            "json": true,
+            "ctx": 262_144,
+        });
+        catalog.models[0]
+            .artifacts
+            .get_mut("gguf-q4_k_m")
+            .unwrap()
+            .kv_cache = Some(catalog::CatalogKvCacheProfile {
+            dtype: "q4_0".to_owned(),
+            bits: 4,
+            group_size: 32,
+            quantized_start_tokens: 0,
+            full_attention_layers: 16,
+            total_layers: 64,
+            bytes_per_token: 18_432,
+            measurement_source: "exact runtime allocation".to_owned(),
+        });
+        let artifact = catalog.models[0].artifacts.get("gguf-q4_k_m").unwrap();
+
+        let estimate = provider_memory_estimate(
+            &contract.enclaves[0],
+            &catalog.models[0],
+            "gguf-q4_k_m",
+            artifact,
+            &["text".to_owned()],
+            &BTreeMap::new(),
+            262_144,
+        )
+        .unwrap();
+
+        assert_eq!(estimate.kv_bytes, 262_144 * 18_432);
     }
 
     #[test]
@@ -79646,6 +80285,58 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("lacks llama-cpp-metal"));
+    }
+
+    #[test]
+    fn calibration_llama_preflight_rejects_silent_cpu_fallback() {
+        let hardware = test_hardware(FixtureProfile::LinuxNvidia);
+
+        let err = calibration_accelerator_preflight_for_build(
+            "llama.cpp",
+            Some(999),
+            &hardware,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("catalog calibrate-canary requested llama.cpp GPU layers"));
+        assert!(message.contains("lacks llama-cpp-cuda"));
+
+        calibration_accelerator_preflight_for_build(
+            "llama.cpp",
+            Some(999),
+            &hardware,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+        calibration_accelerator_preflight_for_build(
+            "llama.cpp",
+            Some(0),
+            &hardware,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn calibration_accelerator_preflight_ignores_non_llama_engines() {
+        let hardware = test_hardware(FixtureProfile::LinuxNvidia);
+
+        calibration_accelerator_preflight_for_build(
+            "vllm",
+            Some(999),
+            &hardware,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -83074,11 +83765,98 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             request.messages[0]["tool_calls"][0]["function"]["arguments"],
             json!({"value": 7})
         );
+        assert!(request.prompt.ends_with("<|im_start|>assistant\n<think>\n"));
 
         let mut malformed = body;
         malformed["messages"][0]["tool_calls"][0]["function"]["arguments"] = json!("not-json");
         let error = provider_engine_request_from_body(&malformed, &adapter).unwrap_err();
         assert!(error.to_string().contains("are not valid JSON"));
+    }
+
+    #[test]
+    fn qwen_native_prompt_honors_reasoning_effort_and_tool_schema() {
+        let messages = vec![json!({"role": "user", "content": "Call the clock"})];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "clock",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let adapter = catalog::CatalogAdapter {
+            chat_template_id: "qwen3.5-instruct".to_owned(),
+            tool_call_strategy: "qwen_function_xml".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let enabled = GenerateSpecialityParameter {
+            name: "reasoning_effort".to_owned(),
+            level: "low".to_owned(),
+            target: GenerateSpecialityTarget::ChatTemplateKwarg,
+            native_path: "enable_thinking".to_owned(),
+            value: json!(true),
+            max_reasoning_tokens: Some(512),
+        };
+
+        let prompt = provider_engine_qwen3_prompt(
+            &messages,
+            &tools,
+            std::slice::from_ref(&enabled),
+            &adapter,
+        )
+        .unwrap();
+        assert!(prompt.contains("<tools>"));
+        assert!(prompt.contains("\"name\":\"clock\""));
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n"));
+
+        let disabled = GenerateSpecialityParameter {
+            level: "off".to_owned(),
+            value: json!(false),
+            max_reasoning_tokens: Some(0),
+            ..enabled
+        };
+        let prompt = provider_engine_qwen3_prompt(
+            &messages,
+            &tools,
+            std::slice::from_ref(&disabled),
+            &adapter,
+        )
+        .unwrap();
+        assert!(prompt.ends_with("<think>\n\n</think>\n\n"));
+
+        let history = vec![
+            json!({"role": "user", "content": "Choose a private marker"}),
+            json!({
+                "role": "assistant",
+                "content": "<think>copper-signal-731</think>Noted."
+            }),
+            json!({"role": "user", "content": "Continue"}),
+        ];
+        let latest_only = GenerateSpecialityParameter {
+            name: "thinking_history".to_owned(),
+            level: "latest_only".to_owned(),
+            target: GenerateSpecialityTarget::ChatTemplateKwarg,
+            native_path: "preserve_thinking".to_owned(),
+            value: json!(false),
+            max_reasoning_tokens: None,
+        };
+        let prompt = provider_engine_qwen3_prompt(
+            &history,
+            &[],
+            &[disabled.clone(), latest_only.clone()],
+            &adapter,
+        )
+        .unwrap();
+        assert!(!prompt.contains("copper-signal-731"));
+        assert!(prompt.contains("Noted."));
+
+        let preserve = GenerateSpecialityParameter {
+            level: "preserve".to_owned(),
+            value: json!(true),
+            ..latest_only
+        };
+        let prompt =
+            provider_engine_qwen3_prompt(&history, &[], &[disabled, preserve], &adapter).unwrap();
+        assert!(prompt.contains("copper-signal-731"));
     }
 
     #[test]
@@ -85158,6 +85936,84 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn mlx_provider_materializes_downloaded_catalog_layout() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        let mut artifact = catalog
+            .models
+            .remove(0)
+            .artifacts
+            .remove("gguf-q4_k_m")
+            .unwrap();
+        artifact.engine = "mlx".to_owned();
+        artifact.path = "model.safetensors".to_owned();
+        artifact.artifact_root = "11".repeat(32);
+        artifact.sidecars.clear();
+
+        let source = catalog::SourceRef {
+            kind: "huggingface".to_owned(),
+            repo: "test/mlx-model".to_owned(),
+            revision: "1".repeat(40),
+            publisher_key: None,
+        };
+        for (name, path, root) in [
+            ("config", "config.json", "22"),
+            ("tokenizer", "tokenizer/tokenizer.json", "33"),
+        ] {
+            artifact.sidecars.insert(
+                name.to_owned(),
+                catalog::CatalogArtifactSidecar {
+                    source: source.clone(),
+                    upstream_source: None,
+                    path: path.to_owned(),
+                    artifact_root: root.repeat(32),
+                    artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                    weights_bytes: 7,
+                    source_sha256: "44".repeat(32),
+                },
+            );
+        }
+
+        let temp = test_temp_dir("mayhem-mlx-layout");
+        let primary = temp.join("cached-primary");
+        let config = temp.join("cached-config");
+        let tokenizer = temp.join("cached-tokenizer");
+        fs::write(&primary, b"weights").unwrap();
+        fs::write(&config, b"config").unwrap();
+        fs::write(&tokenizer, b"tokenizer").unwrap();
+        let paths = ProviderArtifactPaths {
+            primary,
+            sidecars: BTreeMap::from([
+                ("config".to_owned(), config),
+                ("tokenizer".to_owned(), tokenizer),
+            ]),
+        };
+
+        let materialized =
+            materialize_mlx_layout("test/model@mlx", "mlx-2bit", &artifact, &paths).unwrap();
+        let model_dir = materialized.parent().unwrap();
+        assert_eq!(fs::read(&materialized).unwrap(), b"weights");
+        assert_eq!(fs::read(model_dir.join("config.json")).unwrap(), b"config");
+        assert_eq!(
+            fs::read(model_dir.join("tokenizer/tokenizer.json")).unwrap(),
+            b"tokenizer"
+        );
+        assert!(model_dir
+            .to_string_lossy()
+            .contains(".mlx-models/mlx-2bit/"));
+
+        let original_layout = mlx_model_cache_dir(&paths.primary, "mlx-2bit", &artifact);
+        let mut relocated = artifact.clone();
+        relocated.sidecars.get_mut("tokenizer").unwrap().path = "tokenizer.json".to_owned();
+        assert_ne!(
+            original_layout,
+            mlx_model_cache_dir(&paths.primary, "mlx-2bit", &relocated),
+            "signed layout paths must participate in the materialized-cache identity"
+        );
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn provider_engine_load_config_wires_admin_vision_projector_sidecar() {
         let root = "aa".repeat(32);
         let sidecar_root = "bc".repeat(32);
@@ -86744,6 +87600,60 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(tool["name"], "write");
         assert_eq!(tool["arguments"], r#"{"filePath":"ok.txt"}"#);
         assert!(tool["id"].as_str().unwrap().starts_with("call-"));
+    }
+
+    #[test]
+    fn provider_engine_tool_parse_text_removes_private_reasoning() {
+        let parsed = provider_engine_tool_parse_text(
+            "private reasoning</think>\n{\"tool\":\"write\",\"arguments\":{}}",
+            ProviderReasoningOutputMode::Preserve,
+            Some(true),
+            PROVIDER_QWEN_REASONING_DELIMITERS,
+        );
+        assert_eq!(parsed, "{\"tool\":\"write\",\"arguments\":{}}");
+    }
+
+    #[test]
+    fn provider_tool_parser_accepts_grammar_only_call_without_reasoning_close() {
+        let tools = vec![ToolSpec::new("write", json!({ "type": "object" }))];
+
+        let calls = provider_engine_tool_call_outputs_after_reasoning(
+            r#"{"tool":"write","arguments":{"path":"README.md"}}"#,
+            ProviderReasoningOutputMode::StripPrefilled,
+            Some(true),
+            PROVIDER_QWEN_REASONING_DELIMITERS,
+            ProviderEngineToolStrategy::QwenFunctionXml,
+            &tools,
+        )
+        .expect("grammar-constrained tool call");
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["name"], "write");
+        assert_eq!(calls[0]["arguments"], r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
+    fn provider_tool_parser_rejects_unclosed_reasoning_without_advertised_call() {
+        let tools = vec![ToolSpec::new("write", json!({ "type": "object" }))];
+
+        assert!(provider_engine_tool_call_outputs_after_reasoning(
+            "private reasoning without a structured call",
+            ProviderReasoningOutputMode::StripPrefilled,
+            Some(true),
+            PROVIDER_QWEN_REASONING_DELIMITERS,
+            ProviderEngineToolStrategy::QwenFunctionXml,
+            &tools,
+        )
+        .is_none());
+        assert!(provider_engine_tool_call_outputs_after_reasoning(
+            r#"{"tool":"unadvertised","arguments":{}}"#,
+            ProviderReasoningOutputMode::StripPrefilled,
+            Some(true),
+            PROVIDER_QWEN_REASONING_DELIMITERS,
+            ProviderEngineToolStrategy::QwenFunctionXml,
+            &tools,
+        )
+        .is_none());
     }
 
     #[test]
@@ -91131,6 +92041,8 @@ State initialization...
             catalog::CatalogArtifact {
                 engine: "mlx".to_owned(),
                 stable_diffusion_cpp: None,
+                mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
+                kv_cache: None,
                 source: catalog::SourceRef {
                     kind: "huggingface".to_owned(),
                     repo: "test/model-mlx".to_owned(),
@@ -91243,6 +92155,8 @@ State initialization...
             catalog::CatalogArtifact {
                 engine: "trt-llm".to_owned(),
                 stable_diffusion_cpp: None,
+                mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
+                kv_cache: None,
                 source: catalog::SourceRef {
                     kind: "huggingface".to_owned(),
                     repo: "test/model-nvfp4".to_owned(),
@@ -91431,6 +92345,8 @@ State initialization...
             catalog::CatalogArtifact {
                 engine: "mlx".to_owned(),
                 stable_diffusion_cpp: None,
+                mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
+                kv_cache: None,
                 source: catalog::SourceRef {
                     kind: "huggingface".to_owned(),
                     repo: "test/model-mlx".to_owned(),
@@ -93060,6 +93976,37 @@ State initialization...
         )
         .unwrap_err();
         assert!(unknown.to_string().contains("absent from the base catalog"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn catalog_signing_guard_ignores_lossless_json_number_reserialization() {
+        let temp = test_temp_dir("mayhem-catalog-number-reserialization");
+        let base_path = temp.join("base.json");
+        let candidate_path = temp.join("candidate.json");
+        fs::write(
+            &base_path,
+            r#"{"models":[{"model_id":"test/keep","zero":0.0,"limit":4294967295.0,"fraction":0.5}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &candidate_path,
+            r#"{"models":[{"model_id":"test/keep","zero":0,"limit":4294967295,"fraction":0.5},{"model_id":"test/new","value":1}]}"#,
+        )
+        .unwrap();
+
+        validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new()).unwrap();
+
+        fs::write(
+            &candidate_path,
+            r#"{"models":[{"model_id":"test/keep","zero":0,"limit":4294967295,"fraction":1}]}"#,
+        )
+        .unwrap();
+        let changed =
+            validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new())
+                .unwrap_err();
+        assert!(changed.to_string().contains("unapproved changes"));
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -95990,6 +96937,8 @@ State initialization...
             catalog::CatalogArtifact {
                 engine: "llama.cpp".to_owned(),
                 stable_diffusion_cpp: None,
+                mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
+                kv_cache: None,
                 source: catalog::SourceRef {
                     kind: "huggingface".to_owned(),
                     repo: "test/model".to_owned(),
@@ -96274,6 +97223,8 @@ State initialization...
         catalog::CatalogArtifact {
             engine: "vllm".to_owned(),
             stable_diffusion_cpp: None,
+            mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
+            kv_cache: None,
             source,
             upstream_source: None,
             path: "model.safetensors".to_owned(),
