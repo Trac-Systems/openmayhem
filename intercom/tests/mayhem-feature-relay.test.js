@@ -384,6 +384,7 @@ test('read-only participant relays a signed feature to the sole admin writer', a
   assert.equal(writer.flushes.length, 1);
   assert.equal(participant.appended.length, 0);
   assert.equal(writer.appended[0].value.dispatch.address, adminKey);
+  assert.equal(writer.appended[0].value.dispatch.contract_version, CONTRACT_VERSION);
   assert.deepEqual(writer.appended[0].value.dispatch.value, value);
   assert.equal(writer.appended[0].value.dispatch.nonce, requestIdFor('mayhem', key, value));
 });

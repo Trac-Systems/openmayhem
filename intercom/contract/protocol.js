@@ -1,4 +1,5 @@
 import { Protocol } from 'trac-peer';
+import { CONTRACT_VERSION } from './contract.js';
 
 const DEFAULT_MAYHEM_TX_MAX_BYTES = 64_000;
 const DEFAULT_MAYHEM_FEATURE_MAX_BYTES = 64_000;
@@ -17,6 +18,36 @@ class MayhemProtocol extends Protocol {
 
   txMaxBytes() {
     return positiveEnvInteger('MAYHEM_TX_MAX_BYTES', DEFAULT_MAYHEM_TX_MAX_BYTES);
+  }
+
+  versionedTransactionObject(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value) ||
+        !value.value || typeof value.value !== 'object' || Array.isArray(value.value)) {
+      return value;
+    }
+    return {
+      ...value,
+      value: {
+        ...value.value,
+        contract_version: CONTRACT_VERSION,
+      },
+    };
+  }
+
+  async simulateTransaction(validatorPublicKey, value, surrogate = null) {
+    return await super.simulateTransaction(
+      validatorPublicKey,
+      this.versionedTransactionObject(value),
+      surrogate
+    );
+  }
+
+  async broadcastTransaction(value, sim = false, surrogate = null) {
+    return await super.broadcastTransaction(
+      this.versionedTransactionObject(value),
+      sim,
+      surrogate
+    );
   }
 
   featMaxBytes() {

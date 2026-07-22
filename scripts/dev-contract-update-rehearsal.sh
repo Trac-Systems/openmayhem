@@ -68,7 +68,10 @@ CONTRACT_VERSION="$(
 log "running JS contract versioning and activation-delay tests"
 (
   cd "$ROOT_DIR"
-  node --test intercom/tests/contract-versioning.test.js intercom/tests/contract-params.test.js
+  node --test \
+    intercom/tests/contract-versioning.test.js \
+    intercom/tests/contract-params.test.js \
+    intercom/tests/sparse-contract-transition.test.js
 )
 
 if [[ "$SKIP_CARGO" != "1" ]]; then
@@ -187,6 +190,7 @@ fs.writeFileSync(reportPath, JSON.stringify({
   checks: [
     'contract-versioning.test.js',
     'contract-params.test.js',
+    'sparse-contract-transition.test.js',
     rustCheck,
     'pear-dev-net-noop-version'
   ],

@@ -2845,6 +2845,10 @@ struct CatalogSignArgs {
     #[arg(long, value_name = "MODEL_ID")]
     allow_model_change: Vec<String>,
 
+    /// Permit reviewed authority output produced by `catalog apply-attestation-authority`.
+    #[arg(long)]
+    allow_attestation_authority_change: bool,
+
     /// Sign the first catalog for a new network, where no base catalog exists.
     #[arg(long, conflicts_with = "base_catalog_path")]
     initial_catalog: bool,
@@ -9850,6 +9854,10 @@ fn catalog_sign(args: CatalogSignArgs) -> Result<()> {
             args.allow_model_change.is_empty(),
             "--allow-model-change cannot be used with --initial-catalog"
         );
+        ensure!(
+            !args.allow_attestation_authority_change,
+            "--allow-attestation-authority-change cannot be used with --initial-catalog"
+        );
     } else {
         let base_catalog_path = args
             .base_catalog_path
@@ -9864,6 +9872,7 @@ fn catalog_sign(args: CatalogSignArgs) -> Result<()> {
             &base_catalog_path,
             &catalog_path,
             &args.allow_model_change.into_iter().collect(),
+            args.allow_attestation_authority_change,
         )?;
     }
 
@@ -9940,7 +9949,10 @@ fn validate_additive_catalog_update(
     base_path: &Path,
     candidate_path: &Path,
     allowed_model_changes: &BTreeSet<String>,
+    allow_attestation_authority_change: bool,
 ) -> Result<()> {
+    let base_document = read_json_file(base_path)?;
+    let candidate_document = read_json_file(candidate_path)?;
     let base = catalog_models_by_id(base_path)?;
     let candidate = catalog_models_by_id(candidate_path)?;
     let unknown_allowances = allowed_model_changes
@@ -9976,6 +9988,26 @@ fn validate_additive_catalog_update(
         changed.is_empty(),
         "catalog signing refuses unapproved changes to existing model(s): {}; review and repeat --allow-model-change for each intentional update",
         changed.join(", ")
+    );
+
+    let changed_authority_fields = ["attestation_policy_chain", "enclave_attestation_bindings"]
+        .into_iter()
+        .filter(|field| {
+            let base_value = base_document.get(*field);
+            let candidate_value = candidate_document.get(*field);
+            match (base_value, candidate_value) {
+                (Some(base_value), Some(candidate_value)) => {
+                    !catalog_values_semantically_equal(base_value, candidate_value)
+                }
+                (None, None) => false,
+                _ => true,
+            }
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        changed_authority_fields.is_empty() || allow_attestation_authority_change,
+        "catalog signing refuses changes to attestation authority field(s): {}; produce and review the change with `mayhem catalog apply-attestation-authority`, then repeat with --allow-attestation-authority-change",
+        changed_authority_fields.join(", ")
     );
     Ok(())
 }
@@ -72044,6 +72076,22 @@ mod tests {
 
     static TEST_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    fn hydrated_intercom_runtime_available_for_test() -> bool {
+        let node_modules = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("intercom")
+            .join("node_modules");
+        let available = ["fs", "http", "path"]
+            .into_iter()
+            .all(|package| node_modules.join(package).join("package.json").is_file());
+        if !available {
+            eprintln!(
+                "skipping hydrated Pear wallet integration; run the source installer or npm ci in intercom first"
+            );
+        }
+        available
+    }
+
     #[test]
     fn ace_step_materialization_reuses_and_repairs_read_only_files() {
         let temp = test_temp_dir("mayhem-ace-materialized-readonly");
@@ -74379,6 +74427,9 @@ mod tests {
 
     #[tokio::test]
     async fn wallet_backup_import_round_trips_mnemonic() {
+        if !hydrated_intercom_runtime_available_for_test() {
+            return;
+        }
         let temp = test_temp_dir("mayhem-wallet-roundtrip");
         let keypair_path = temp.join("main").join("db").join("keypair.json");
         let restored_path = temp.join("restored").join("db").join("keypair.json");
@@ -74414,6 +74465,9 @@ mod tests {
 
     #[tokio::test]
     async fn wallet_ethereum_account_signs_tap_binding_messages() {
+        if !hydrated_intercom_runtime_available_for_test() {
+            return;
+        }
         let temp = test_temp_dir("mayhem-wallet-tap-binding");
         let keypair_path = temp.join("main").join("db").join("keypair.json");
         fs::create_dir_all(keypair_path.parent().unwrap()).unwrap();
@@ -74440,6 +74494,9 @@ mod tests {
 
     #[tokio::test]
     async fn wallet_imported_ethereum_key_survives_password_rotation() {
+        if !hydrated_intercom_runtime_available_for_test() {
+            return;
+        }
         let temp = test_temp_dir("mayhem-wallet-ethereum-import");
         let keypair_path = temp.join("main").join("db").join("keypair.json");
         fs::create_dir_all(keypair_path.parent().unwrap()).unwrap();
@@ -74484,6 +74541,9 @@ mod tests {
 
     #[tokio::test]
     async fn wallet_signing_seed_derives_wallet_public_key() {
+        if !hydrated_intercom_runtime_available_for_test() {
+            return;
+        }
         let temp = test_temp_dir("mayhem-wallet-seed");
         let keypair_path = temp.join("main").join("db").join("keypair.json");
         fs::create_dir_all(keypair_path.parent().unwrap()).unwrap();
@@ -74504,6 +74564,9 @@ mod tests {
 
     #[tokio::test]
     async fn wallet_passwd_reencrypts_existing_keypair() {
+        if !hydrated_intercom_runtime_available_for_test() {
+            return;
+        }
         let temp = test_temp_dir("mayhem-wallet-passwd");
         let keypair_path = temp.join("main").join("db").join("keypair.json");
         fs::create_dir_all(keypair_path.parent().unwrap()).unwrap();
@@ -77141,7 +77204,7 @@ mod tests {
         let tx = admin_contract_tx_digest(&prepared_command, &admin, &nonce, false, &context);
         assert_eq!(
             tx,
-            "6438227adf3f54e80514752ea3ffd94e201d00f72ac7a79ceab8f975593f2338"
+            "556fefeccdf1a04ffcdacbe03e454da44c57145374002d3bda9bbb7cb9ffeb17"
         );
         assert_eq!(
             admin_contract_tx_feature(
@@ -93945,7 +94008,8 @@ State initialization...
             }),
         )
         .unwrap();
-        validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new()).unwrap();
+        validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), false)
+            .unwrap();
 
         write_json_file(
             &candidate_path,
@@ -93953,7 +94017,7 @@ State initialization...
         )
         .unwrap();
         let removed =
-            validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new())
+            validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), false)
                 .unwrap_err();
         assert!(removed.to_string().contains("remove existing model"));
 
@@ -93968,13 +94032,14 @@ State initialization...
         )
         .unwrap();
         let changed =
-            validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new())
+            validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), false)
                 .unwrap_err();
         assert!(changed.to_string().contains("unapproved changes"));
         validate_additive_catalog_update(
             &base_path,
             &candidate_path,
             &BTreeSet::from(["test/change".to_owned()]),
+            false,
         )
         .unwrap();
 
@@ -93982,6 +94047,7 @@ State initialization...
             &base_path,
             &candidate_path,
             &BTreeSet::from(["test/missing".to_owned()]),
+            false,
         )
         .unwrap_err();
         assert!(unknown.to_string().contains("absent from the base catalog"));
@@ -94005,7 +94071,8 @@ State initialization...
         )
         .unwrap();
 
-        validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new()).unwrap();
+        validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), false)
+            .unwrap();
 
         fs::write(
             &candidate_path,
@@ -94013,9 +94080,54 @@ State initialization...
         )
         .unwrap();
         let changed =
-            validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new())
+            validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), false)
                 .unwrap_err();
         assert!(changed.to_string().contains("unapproved changes"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn catalog_signing_guard_requires_explicit_review_for_authority_changes() {
+        let temp = test_temp_dir("mayhem-catalog-authority-signing");
+        let base_path = temp.join("base.json");
+        let candidate_path = temp.join("candidate.json");
+        let base = json!({
+            "models": [{"model_id": "test/keep", "value": 1}],
+            "attestation_policy_chain": [{"sequence": 1}],
+            "enclave_attestation_bindings": [{"enclave_id": "aa"}]
+        });
+        write_json_file(&base_path, &base).unwrap();
+
+        let mut candidate = base.clone();
+        candidate["models"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"model_id": "test/new", "value": 1}));
+        write_json_file(&candidate_path, &candidate).unwrap();
+        validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), false)
+            .unwrap();
+
+        candidate
+            .as_object_mut()
+            .unwrap()
+            .remove("attestation_policy_chain");
+        write_json_file(&candidate_path, &candidate).unwrap();
+        let removed =
+            validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), false)
+                .unwrap_err();
+        assert!(removed.to_string().contains("attestation_policy_chain"));
+
+        candidate["attestation_policy_chain"] = base["attestation_policy_chain"].clone();
+        candidate["enclave_attestation_bindings"] =
+            json!([{"enclave_id": "aa"}, {"enclave_id": "bb"}]);
+        write_json_file(&candidate_path, &candidate).unwrap();
+        let changed =
+            validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), false)
+                .unwrap_err();
+        assert!(changed.to_string().contains("enclave_attestation_bindings"));
+        validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), true)
+            .unwrap();
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -94321,6 +94433,7 @@ State initialization...
             catalog_path: Some(catalog_path),
             base_catalog_path: None,
             allow_model_change: Vec::new(),
+            allow_attestation_authority_change: false,
             initial_catalog: false,
             signature_output,
             keys_dir: Some(temp.join("keys")),
@@ -96809,6 +96922,9 @@ State initialization...
 
     #[tokio::test]
     async fn up_identity_init_preserves_preseeded_network_manifest() {
+        if !hydrated_intercom_runtime_available_for_test() {
+            return;
+        }
         let home = test_temp_dir("mayhem-up-identity-config");
         let config_path = home.join("config.toml");
         let bootstrap = "e".repeat(64);

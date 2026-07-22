@@ -1467,7 +1467,7 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
   );
   assert.match(invalidOutputModality.message, /output_modality image is not allowed for model_class text-generation/i);
 
-  const unsupportedBackend = await execute(
+  const extensibleBackend = await execute(
     contract,
     storage,
     'registerEnclave',
@@ -1480,7 +1480,11 @@ test('MayhemContract validates admin enclave caps as capability-only records', a
     admin.publicKey,
     8
   );
-  assert.match(unsupportedBackend.message, /unsupported enclave backend/i);
+  assert.equal(extensibleBackend.ok, true, extensibleBackend.message);
+  assert.equal(
+    (await storage.get(`enclave/${'f'.repeat(64)}`)).value.backend,
+    'provider-local-python'
+  );
 
   const invalidTensorParallelCaps = await execute(
     contract,

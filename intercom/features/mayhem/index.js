@@ -382,6 +382,7 @@ class MayhemFeature extends Feature {
       value: {
         dispatch: {
           type: `${this.key}_feature`,
+          contract_version: CONTRACT_VERSION,
           key,
           hash,
           value,

@@ -5,7 +5,7 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 15;
+export const CONTRACT_VERSION = 16;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -592,6 +592,68 @@ export const deriveRoomId = async (modelId, creator, nonce) => {
 
 const cloneValue = (value) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
 const hasOwn = (value, key) => Object.prototype.hasOwnProperty.call(value, key);
+
+const versionedMayhemOperation = (op) => {
+  const dispatch = op?.value?.dispatch;
+  if (!dispatch || typeof dispatch !== 'object' || Array.isArray(dispatch)) {
+    return { present: false, version: null, operation: op };
+  }
+
+  if (op.type === 'feature' && dispatch.type === 'mayhem_feature' &&
+      hasOwn(dispatch, 'contract_version')) {
+    const normalizedDispatch = { ...dispatch };
+    const version = normalizedDispatch.contract_version;
+    delete normalizedDispatch.contract_version;
+    return {
+      present: true,
+      version,
+      operation: {
+        ...op,
+        value: { ...op.value, dispatch: normalizedDispatch },
+      },
+    };
+  }
+
+  if (op.type === 'tx' && dispatch.value && typeof dispatch.value === 'object' &&
+      !Array.isArray(dispatch.value) && hasOwn(dispatch.value, 'contract_version')) {
+    const normalizedValue = { ...dispatch.value };
+    const version = normalizedValue.contract_version;
+    delete normalizedValue.contract_version;
+    return {
+      present: true,
+      version,
+      operation: {
+        ...op,
+        value: {
+          ...op.value,
+          dispatch: { ...dispatch, value: normalizedValue },
+        },
+      },
+    };
+  }
+
+  return { present: false, version: null, operation: op };
+};
+
+export const validateMayhemOperationContractVersion = (
+  op,
+  expectedVersion = CONTRACT_VERSION
+) => {
+  if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) {
+    throw new Error('Expected contract version must be a positive safe integer.');
+  }
+  const versioned = versionedMayhemOperation(op);
+  if (versioned.present &&
+      (!Number.isSafeInteger(versioned.version) || versioned.version !== expectedVersion)) {
+    const actual = Number.isSafeInteger(versioned.version)
+      ? versioned.version
+      : 'invalid';
+    throw new Error(
+      `Contract upgrade required: expected CONTRACT_VERSION ${expectedVersion}, got ${actual}.`
+    );
+  }
+  return versioned.operation;
+};
 const compareCodepoint = (left, right) => {
   const a = String(left);
   const b = String(right);
@@ -677,6 +739,10 @@ const ctxBracketForTokens = (tokens, table = CTX_BRACKETS) => {
 };
 
 class MayhemContract extends Contract {
+  async execute(op, storage) {
+    return await super.execute(validateMayhemOperationContractVersion(op), storage);
+  }
+
   constructor(protocol, options = {}) {
     super(protocol, options);
     const self = this;
