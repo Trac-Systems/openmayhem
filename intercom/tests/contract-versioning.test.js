@@ -62,6 +62,31 @@ test('contract recognizes canonical two-bit quant descriptors without treating Q
   assert.notEqual(contract.quantBucketFromDescriptor('Qwen1.5-7B-Instruct.gguf'), 'int1');
 });
 
+test('contract keeps descriptive backends extensible while routing semantics stay closed', () => {
+  const contract = new MayhemContract({}, {});
+  assert.equal(contract.validateEnclaveBackend('llama.cpp'), null);
+  assert.equal(contract.validateEnclaveBackend('cactus'), null);
+  assert.equal(contract.validateEnclaveBackend('transformers-v2'), null);
+  assert.match(contract.validateEnclaveBackend('Native Node').message, /canonical identifier/);
+  assert.match(contract.validateEnclaveBackend('../escape').message, /canonical identifier/);
+
+  assert.equal(contract.validateEnclaveCaps({
+    chat: false,
+    tools: false,
+    json: false,
+    vision: false,
+    image: false,
+    video: true,
+    audio: true,
+    ctx: 1024,
+    ctx_max: 1024,
+    output_modality: 'video',
+    output_modalities: ['video', 'audio'],
+    modality_set: ['text', 'video', 'audio'],
+    speciality_levels: {},
+  }, 'video-generation'), null);
+});
+
 test('contract accepts only the current consent signing version', async () => {
   assert.throws(() => consentMessage(1, rulesHash, 1), /Unsupported signing message version/);
   assert.match(consentMessage(1, rulesHash), /"signing_version":2/);
@@ -347,6 +372,7 @@ test('receipt normalization rejects old schemas and non-canonical usage', async 
     usage_attribution: {
       reasoning_output_tokens: 15,
       vision_input_tokens: 4,
+      audio_input_tokens: 3,
     },
   };
   const attributedMessage = b4a.from(receiptMessage(attributedBody));
@@ -383,6 +409,16 @@ test('receipt normalization rejects old schemas and non-canonical usage', async 
   });
   assert.equal(excessiveVision instanceof Error, true);
   assert.match(excessiveVision.message, /vision attribution exceeds billed input/i);
+
+  const excessiveAudio = await contract.normalizeReceiptEnvelope({
+    ...attributedEnvelope,
+    body: {
+      ...attributedBody,
+      usage_attribution: { audio_input_tokens: 11 },
+    },
+  });
+  assert.equal(excessiveAudio instanceof Error, true);
+  assert.match(excessiveAudio.message, /audio attribution exceeds billed input/i);
 
   const unknownAttribution = await contract.normalizeReceiptEnvelope({
     ...attributedEnvelope,

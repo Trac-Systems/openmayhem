@@ -125,6 +125,7 @@ impl CatalogAttestationAuthority {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CatalogModel {
     pub(crate) model_id: String,
     #[serde(default = "default_model_class")]
@@ -266,6 +267,7 @@ pub(crate) struct ConversionRef {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CatalogArtifact {
     pub(crate) engine: String,
     #[serde(default)]
@@ -350,6 +352,7 @@ pub(crate) struct CatalogRequirements {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CatalogAdapter {
     pub(crate) endpoint_families: Vec<EndpointFamilyContract>,
     #[serde(default = "default_chat_template_id")]
@@ -1203,6 +1206,16 @@ fn validate_required_modality_price_units(model: &CatalogModel, errors: &mut Vec
 
 fn validate_price_rate_map(model: &CatalogModel, errors: &mut Vec<String>) {
     let mut units = BTreeSet::new();
+    let allowed_units: &[&str] = match model.model_class.as_str() {
+        MODEL_CLASS_IMAGE_GENERATION => &[USAGE_IMAGE, USAGE_STEP],
+        MODEL_CLASS_VIDEO_GENERATION => &[USAGE_VIDEO_SECOND, USAGE_FRAME],
+        MODEL_CLASS_EMBEDDING => &[USAGE_INPUT_TOKEN, "embedding"],
+        MODEL_CLASS_STT => &[USAGE_AUDIO_SECOND],
+        MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION => {
+            &[USAGE_INPUT_CHARACTER, USAGE_AUDIO_SECOND]
+        }
+        _ => &["input_token", "cached_input_token", "output_token"],
+    };
     for entry in &model.price_ref_au.rate_map {
         if entry.unit.trim().is_empty() {
             errors.push(format!(
@@ -1215,6 +1228,12 @@ fn validate_price_rate_map(model: &CatalogModel, errors: &mut Vec<String>) {
             errors.push(format!(
                 "{} price_ref_au.rate_map duplicates unit {}",
                 model.model_id, entry.unit
+            ));
+        }
+        if !allowed_units.contains(&entry.unit.as_str()) {
+            errors.push(format!(
+                "{} price_ref_au.rate_map unit {} is not allowed for model_class {}",
+                model.model_id, entry.unit, model.model_class
             ));
         }
         if entry.per_unit_au == 0 {
@@ -1874,7 +1893,7 @@ fn output_modality_allowed_for_class(model_class: &str, modality: &str) -> bool 
         (DEFAULT_MODEL_CLASS, "text")
             | (MODEL_CLASS_EMBEDDING, "embedding")
             | (MODEL_CLASS_IMAGE_GENERATION, "image")
-            | (MODEL_CLASS_VIDEO_GENERATION, "video")
+            | (MODEL_CLASS_VIDEO_GENERATION, "video" | "audio")
             | (
                 MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION,
                 "audio"
@@ -3007,14 +3026,11 @@ fn validate_artifact(
             | "mlx"
             | "trt-llm"
             | "vllm"
-            | "diffusers"
             | "stable-diffusion.cpp"
-            | "comfyui"
             | "ace-step"
             | "transformers-asr"
             | "whisper.cpp"
             | "piper"
-            | "kokoro"
     ) {
         errors.push(format!(
             "{model_id}/{name} has unsupported engine {}",
@@ -4541,7 +4557,7 @@ mod tests {
         let image = verification_test_model(
             "admin/image@fixture",
             "image-generation",
-            "diffusers",
+            "stable-diffusion.cpp",
             CanaryRef {
                 set_id: "canary-image-v1".to_owned(),
                 match_min: 0.95,
@@ -4650,7 +4666,7 @@ mod tests {
         let audio = verification_test_model(
             "admin/music@fixture",
             MODEL_CLASS_MUSIC_GENERATION,
-            "comfyui",
+            "piper",
             CanaryRef {
                 set_id: "canary-music-v1".to_owned(),
                 match_min: 0.9,
@@ -4742,6 +4758,20 @@ mod tests {
         let mut errors = Vec::new();
         validate_artifact("admin/model", "launch", "gguf", &artifact, &mut errors);
         assert!(errors.is_empty(), "{errors:#?}");
+
+        let mut unavailable = artifact.clone();
+        unavailable.engine = "diffusers".to_owned();
+        let mut unavailable_errors = Vec::new();
+        validate_artifact(
+            "admin/model",
+            "launch",
+            "diffusers",
+            &unavailable,
+            &mut unavailable_errors,
+        );
+        assert!(unavailable_errors
+            .iter()
+            .any(|error| error.contains("unsupported engine diffusers")));
 
         artifact.engine = "mlx".to_owned();
         artifact.kv_cache.as_mut().expect("KV-cache profile").dtype = "q4".to_owned();
@@ -5252,6 +5282,18 @@ mod tests {
             validate_price_rate_map(&model, &mut errors);
             assert!(errors.is_empty(), "{model_class}: {errors:#?}");
         }
+
+        model.model_class = DEFAULT_MODEL_CLASS.to_owned();
+        model.price_ref_au.rate_map = vec![
+            rate(USAGE_INPUT_TOKEN, 1, 1),
+            rate(USAGE_OUTPUT_TOKEN, 1, 1),
+            rate(USAGE_AUDIO_SECOND, 1, 1),
+        ];
+        let mut errors = Vec::new();
+        validate_price_rate_map(&model, &mut errors);
+        assert!(errors.iter().any(|error| {
+            error.contains("unit audio_second is not allowed for model_class text-generation")
+        }));
     }
 
     #[test]
@@ -5259,7 +5301,7 @@ mod tests {
         let mut model = verification_test_model(
             "admin/video@small",
             MODEL_CLASS_VIDEO_GENERATION,
-            "diffusers",
+            "stable-diffusion.cpp",
             CanaryRef {
                 set_id: "canary-video-v1".to_owned(),
                 match_min: 0.9,

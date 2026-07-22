@@ -197,6 +197,9 @@ const PROBE_VERIFICATION_METHODS = new Set([
   'token_fingerprint',
   'context_needle',
   'seed_perceptual_hash',
+  'embedding_cosine',
+  'transcript_match',
+  'audio_fingerprint',
   'attestation_of_compute',
 ]);
 const AUDITOR_SLASH_REASONS = new Set(['collusion', 'false_report']);
@@ -238,20 +241,8 @@ const ENCLAVE_ARTIFACT_SIDECARS_MAX = 64;
 const ENCLAVE_APPROVED_BINARY_HASHES_MAX = 64;
 const TIER3_MEASUREMENT_MAX_NAMES = 32;
 const TIER3_MEASUREMENT_MAX_VALUES = 128;
-const ENCLAVE_BACKENDS = new Set([
-  'llama.cpp',
-  'mlx',
-  'trt-llm',
-  'vllm',
-  'diffusers',
-  'stable-diffusion.cpp',
-  'comfyui',
-  'ace-step',
-  'transformers-asr',
-  'whisper.cpp',
-  'piper',
-  'kokoro',
-]);
+const ENCLAVE_BACKEND_PATTERN = /^[a-z][a-z0-9]*(?:[.-][a-z0-9]+)*$/;
+const ENCLAVE_BACKEND_MAX_LENGTH = 64;
 const ENCLAVE_QUANT_BUCKETS = new Set([
   'unknown',
   'fp32',
@@ -306,7 +297,7 @@ const MODEL_CLASS_OUTPUT_MODALITIES = Object.freeze({
   [DEFAULT_MODEL_CLASS]: new Set(['text']),
   embedding: new Set(['embedding']),
   'image-generation': new Set(['image']),
-  'video-generation': new Set(['video']),
+  'video-generation': new Set(['video', 'audio']),
   tts: new Set(['audio']),
   stt: new Set(['text']),
   'audio-generation': new Set(['audio']),
@@ -10928,7 +10919,8 @@ class MayhemContract extends Contract {
   validateEnclaveArtifactBinding(value) {
     const classError = this.validateModelClass(this.modelClassFor(value), 'Enclave model_class');
     if (classError) return classError;
-    if (!ENCLAVE_BACKENDS.has(value.backend)) return new Error('Unsupported enclave backend.');
+    const backendError = this.validateEnclaveBackend(value.backend);
+    if (backendError) return backendError;
     if (!this.isHexBytes(value.artifact_root, 32)) {
       return new Error('Enclave artifact_root must be a 32-byte hex Merkle root.');
     }
@@ -10951,6 +10943,18 @@ class MayhemContract extends Contract {
     const sourceError = this.validateHuggingFaceArtifactSource(value.artifact_source, 'enclave artifact_source');
     if (sourceError) return sourceError;
     return this.validateEnclaveArtifactSidecars(value.artifact_sidecars ?? {});
+  }
+
+  validateEnclaveBackend(value) {
+    if (
+      typeof value !== 'string' ||
+      value.length === 0 ||
+      value.length > ENCLAVE_BACKEND_MAX_LENGTH ||
+      !ENCLAVE_BACKEND_PATTERN.test(value)
+    ) {
+      return new Error('Enclave backend must be a lowercase canonical identifier of at most 64 ASCII characters.');
+    }
+    return null;
   }
 
   normalizeApprovedBinaryHashes(primary, values) {
@@ -14240,7 +14244,11 @@ class MayhemContract extends Contract {
     if (!source || typeof source !== 'object' || Array.isArray(source)) {
       return new Error('Receipt usage attribution must be an object.');
     }
-    const allowed = new Set(['reasoning_output_tokens', 'vision_input_tokens']);
+    const allowed = new Set([
+      'reasoning_output_tokens',
+      'vision_input_tokens',
+      'audio_input_tokens',
+    ]);
     const normalized = {};
     for (const [axis, count] of Object.entries(source)) {
       if (!allowed.has(axis)) return new Error(`Unsupported receipt usage attribution ${axis}.`);
@@ -14412,6 +14420,9 @@ class MayhemContract extends Contract {
     }
     if ((usageAttribution.vision_input_tokens ?? 0) > (usage.input_token ?? 0)) {
       return new Error('Receipt vision attribution exceeds billed input tokens.');
+    }
+    if ((usageAttribution.audio_input_tokens ?? 0) > (usage.input_token ?? 0)) {
+      return new Error('Receipt audio attribution exceeds billed input tokens.');
     }
     const auOwedCum = this.normalizeAu(body.au_owed_cum, 'receipt cumulative amount');
     if (auOwedCum instanceof Error) {

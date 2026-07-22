@@ -279,6 +279,17 @@ test('MayhemContract auditor probes write evidence, uptime ticks, and canary vio
   );
   assert.match(unsupportedVerificationMethod.message, /unsupported canary verification_method/i);
 
+  for (const verificationMethod of ['embedding_cosine', 'transcript_match', 'audio_fingerprint']) {
+    assert.equal(
+      contract.validateProbeResult(canaryProbe(provider, auditor, {
+        probe_id: `canary-${verificationMethod}`,
+        verification_method: verificationMethod,
+      })),
+      null,
+      `${verificationMethod} should be accepted by the ledger verifier`
+    );
+  }
+
   const unsigned = await execute(
     contract,
     storage,
