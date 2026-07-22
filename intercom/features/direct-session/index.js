@@ -120,10 +120,13 @@ class DirectSession extends Feature {
       { min: 1 }
     );
     this.sessions = new Map();
+    this.preparedConnections = new WeakMap();
     this.pairedConnections = new WeakSet();
+    this.featureOwnedConnections = new WeakSet();
     this.connectionErrors = new WeakMap();
     this.connectionReceiveLimiters = new WeakMap();
     this.connectionHealth = new Map();
+    this.preferredConnections = new Map();
     this.explicitPeers = new Set();
     this.reconnectSuspended = new Set();
     this.lastConnectAttempt = null;
@@ -169,6 +172,7 @@ class DirectSession extends Feature {
       healthTimeoutMs: this.healthTimeoutMs,
       maxSessions: this.maxSessions,
       maxSessionsPerConnection: this.maxSessionsPerConnection,
+      preferredConnections: Array.from(this.preferredConnections.keys()),
       reconnectSuspended: Array.from(this.reconnectSuspended),
       sessionCount: this.sessions.size,
       sessions: Array.from(this.sessions.values()).map((session) => ({
@@ -372,6 +376,27 @@ class DirectSession extends Feature {
     return resumed;
   }
 
+  async proveConnection(connection, waitMs) {
+    const remote = this._normalizeRemote(this._remoteKey(connection));
+    if (!remote) throw new Error('Connection is missing a valid remote peer key.');
+    if (connection?.destroyed === true || connection?.closed === true) {
+      throw new Error('Connection closed before health proof.');
+    }
+    const mux = this._prepareHealthConnectionUnchecked(connection, true);
+    if (!mux || !this.connectionHealth.has(connection)) {
+      throw new Error('Connection health channel is unavailable.');
+    }
+    const boundedWaitMs = safeIntegerOr(waitMs, this.healthTimeoutMs || this.healthFreshMs, {
+      min: 1,
+    });
+    await this._ensureConnectionHealthy(connection, boundedWaitMs);
+    const health = this.connectionHealth.get(connection);
+    if (!health?.proven || !this._healthIsFresh(health)) {
+      throw new Error('Connection did not complete a fresh bidirectional health proof.');
+    }
+    return { remote, proven: true };
+  }
+
   _normalizeRemote(remote) {
     const normalized = normalizeKeyHex(remote);
     return normalized && /^[0-9a-f]{64}$/.test(normalized) ? normalized : null;
@@ -387,14 +412,9 @@ class DirectSession extends Feature {
   }
 
   _prepareConnectionUnchecked(connection) {
-    if (!connection || this.pairedConnections.has(connection)) return;
-    const mux = this._muxForConnection(connection);
-    if (!mux) return;
+    const mux = this._prepareHealthConnectionUnchecked(connection);
+    if (!mux || this.pairedConnections.has(connection)) return;
     this.pairedConnections.add(connection);
-    connection.on('error', (error) => {
-      this.connectionErrors.set(connection, error);
-    });
-    this._prepareHealthChannel(connection, mux);
     mux.pair({ protocol: SESSION_PROTOCOL }, (id) => {
       const sessionId = id ? b4a.toString(id, 'hex') : null;
       if (!normalizeSessionId(sessionId)) return;
@@ -408,12 +428,30 @@ class DirectSession extends Feature {
         this._reportEventError(`inbound session ${sessionId}`, error);
       }
     });
+  }
+
+  _prepareHealthConnectionUnchecked(connection, featureOwned = false) {
+    if (!connection) return null;
+    if (featureOwned) this.featureOwnedConnections.add(connection);
+    const prepared = this.preparedConnections.get(connection);
+    if (prepared) return prepared;
+    const mux = this._muxForConnection(connection);
+    if (!mux) return;
+    this.preparedConnections.set(connection, mux);
+    connection.on('error', (error) => {
+      this.connectionErrors.set(connection, error);
+    });
+    this._prepareHealthChannel(connection, mux);
     connection.on('close', () => {
       const remote = this._remoteKey(connection);
+      const wasPreferred = this.clearPreferredConnection(remote, connection);
       this._dropConnection(connection);
       this._dropHealthConnection(connection);
-      this._rejoinExplicitPeer(remote);
+      if (!wasPreferred && !this.featureOwnedConnections.has(connection)) {
+        this._rejoinExplicitPeer(remote);
+      }
     });
+    return mux;
   }
 
   _rejoinExplicitPeer(remote) {
@@ -445,6 +483,12 @@ class DirectSession extends Feature {
   }
 
   _findConnection(remote) {
+    const preferred = this.preferredConnections.get(remote) ?? null;
+    if (preferred?.destroyed === true || preferred?.closed === true) {
+      this.preferredConnections.delete(remote);
+    } else if (preferred && this._remoteKey(preferred) === remote) {
+      return preferred;
+    }
     return this._connectionsForRemote(remote)[0] ?? null;
   }
 
@@ -461,6 +505,34 @@ class DirectSession extends Feature {
         const rightAck = this.connectionHealth.get(right)?.lastAckAt ?? 0;
         return rightAck - leftAck;
       });
+  }
+
+  preferConnection(remote, connection) {
+    const normalizedRemote = this._normalizeRemote(remote);
+    if (!normalizedRemote) throw new Error('Invalid remote peer key.');
+    if (!connection || this._remoteKey(connection) !== normalizedRemote) {
+      throw new Error('Preferred connection does not match the remote peer.');
+    }
+    if (connection.destroyed === true || connection.closed === true) {
+      throw new Error('Preferred connection is closed.');
+    }
+    const health = this.connectionHealth.get(connection);
+    if (!health?.proven || !this._healthIsFresh(health)) {
+      throw new Error('Preferred connection lacks a fresh bidirectional health proof.');
+    }
+    this._prepareConnectionUnchecked(connection);
+    const previous = this.preferredConnections.get(normalizedRemote) ?? null;
+    this.preferredConnections.set(normalizedRemote, connection);
+    return previous;
+  }
+
+  clearPreferredConnection(remote, connection = null) {
+    const normalizedRemote = this._normalizeRemote(remote);
+    if (!normalizedRemote) return false;
+    const current = this.preferredConnections.get(normalizedRemote);
+    if (!current || (connection && current !== connection)) return false;
+    this.preferredConnections.delete(normalizedRemote);
+    return true;
   }
 
   _prepareHealthChannel(connection, mux) {
@@ -527,10 +599,11 @@ class DirectSession extends Feature {
     }
     const remote = this._remoteKey(health.connection);
     const explicitlyPinned = remote && this.explicitPeers.has(remote);
+    const preferred = remote && this.preferredConnections.get(remote) === health.connection;
     if (this._healthIsFresh(health)) {
       health.unhealthySince = 0;
     } else if (
-      explicitlyPinned
+      (explicitlyPinned || preferred)
       && health.proven === true
       && this.healthTimeoutMs > 0
     ) {

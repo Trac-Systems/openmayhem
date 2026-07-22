@@ -116,7 +116,8 @@ class InferenceRelay extends Feature {
     this.wrappedServerFirewall = null;
     this.originalServerRelayConnection = null;
     this.wrappedServerRelayConnection = null;
-    this.onServerConnection = (connection) => this._claimInboundRelay(connection);
+    this.originalServerEmit = null;
+    this.wrappedServerEmit = null;
     this.relayCursor = 0;
     this.sweepTimer = null;
     this.onConnection = (connection, peerInfo) => this._handleConnection(connection, peerInfo);
@@ -196,15 +197,15 @@ class InferenceRelay extends Feature {
     this.peer?.swarm?.off?.('connection', this.onConnection);
     this._removeInboundRelayTracking();
     for (const connection of this.outboundRelayConnections) {
+      const remote = normalizeKey(connection?.remotePublicKey);
+      const owner = remote ? this.relayOwners.get(remote) || this.peer?.directSession : null;
+      owner?.clearPreferredConnection?.(remote, connection);
       connection.on?.('error', () => {});
       connection.destroy?.(new Error('Inference relay stopped.'));
     }
     this.outboundRelayConnections.clear();
     this.relayConnections.clear();
     this.relayConnects.clear();
-    for (const [remote, directSession] of this.relayOwners) {
-      directSession?.resumeReconnect?.(remote, false);
-    }
     this.relayOwners.clear();
     this.forcedPeers.clear();
     for (const state of this.streams.values()) {
@@ -274,8 +275,6 @@ class InferenceRelay extends Feature {
     const key = normalizeKey(remote);
     if (!key) return;
     this.forcedPeers.delete(key);
-    const directSession = this.relayOwners.get(key) || this.peer?.directSession;
-    directSession?.resumeReconnect?.(key);
     this.relayOwners.delete(key);
   }
 
@@ -287,39 +286,24 @@ class InferenceRelay extends Feature {
         .some((session) => session.remote === key && session.closed !== true);
       if (stillActive) return;
       if (!this.forcedPeers.has(key)) return;
-      const swarm = this.peer?.swarm;
       const directSession = this.relayOwners.get(key) || this.peer?.directSession;
-      const relayConnections = new Set();
       const ownedConnection = this.relayConnections.get(key);
-      if (ownedConnection) relayConnections.add(ownedConnection);
-      for (const connection of swarm?.connections || []) {
-        if (normalizeKey(connection?.remotePublicKey) !== key) continue;
-        if (this.connectionRoutes.get(connection)?.relayed !== true) continue;
-        relayConnections.add(connection);
-      }
       this.forcedPeers.delete(key);
       this.relayOwners.delete(key);
-      let pendingCloses = relayConnections.size;
-      const resumeDirect = () => {
-        if (pendingCloses > 0 && --pendingCloses > 0) return;
-        directSession?.resumeReconnect?.(key);
+      if (!ownedConnection) {
         this.counters.relay_releases += 1;
-      };
-      if (pendingCloses === 0) {
-        resumeDirect();
         return;
       }
-      for (const connection of relayConnections) {
-        this.outboundRelayConnections.delete(connection);
-        swarm?.connections?.delete?.(connection);
-        swarm?._allConnections?.delete?.(connection);
-        if (this.relayConnections.get(key) === connection) {
-          this.relayConnections.delete(key);
-        }
-        connection.on?.('error', () => {});
-        connection.once?.('close', resumeDirect);
-        connection.destroy?.(new Error('Relay session complete; returning to direct-first mode.'));
+      directSession?.clearPreferredConnection?.(key, ownedConnection);
+      this.outboundRelayConnections.delete(ownedConnection);
+      if (this.relayConnections.get(key) === ownedConnection) {
+        this.relayConnections.delete(key);
       }
+      ownedConnection.on?.('error', () => {});
+      ownedConnection.destroy?.(
+        new Error('Relay session complete; returning to direct-first mode.')
+      );
+      this.counters.relay_releases += 1;
     }, 0);
     return true;
   }
@@ -440,7 +424,6 @@ class InferenceRelay extends Feature {
     const deadline = Date.now() + this.relayWaitMs;
     let lastError = null;
     this.relayOwners.set(remote, directSession);
-    directSession?.suspendReconnect?.(remote);
     for (let index = 0; index < this.relays.length; index += 1) {
       const relay = this.relays[(this.relayCursor + index) % this.relays.length];
       const relaysLeft = this.relays.length - index;
@@ -473,21 +456,8 @@ class InferenceRelay extends Feature {
       keyPair: swarm.keyPair,
       relayThrough: b4a.from(relay, 'hex'),
     });
-    const trackedConnections = swarm._allConnections;
-    if (
-      !trackedConnections
-      || typeof trackedConnections.get !== 'function'
-      || typeof trackedConnections.add !== 'function'
-      || typeof trackedConnections.delete !== 'function'
-    ) {
-      connection.on?.('error', () => {});
-      connection.destroy?.(new Error('Peer connection registry is unavailable.'));
-      throw new Error('Peer connection registry is unavailable for safe relay fallback.');
-    }
-    const priorConnection = trackedConnections.get(b4a.from(remote, 'hex'));
-    trackedConnections.add(connection);
     this.outboundRelayConnections.add(connection);
-    this.connectionRoutes.set(connection, { relayed: true, relay });
+    this.connectionRoutes.set(connection, { relayed: true, relay, authoritative: false });
     let connectionError = null;
     connection.on?.('error', (error) => {
       connectionError = error;
@@ -499,6 +469,7 @@ class InferenceRelay extends Feature {
       }
     });
 
+    const deadline = Date.now() + waitMs;
     try {
       await new Promise((resolve, reject) => {
         let settled = false;
@@ -516,6 +487,10 @@ class InferenceRelay extends Feature {
         const onOpen = () => finish();
         const onError = (error) => finish(error);
         const onClose = () => finish(new Error('Relay connection closed before opening.'));
+        if (connection.opened === true) {
+          finish();
+          return;
+        }
         timer = setTimeout(
           () => finish(new Error(`Relay connection timed out after ${waitMs} ms.`)),
           waitMs
@@ -524,20 +499,22 @@ class InferenceRelay extends Feature {
         connection.once?.('error', onError);
         connection.once?.('close', onClose);
       });
+      if (
+        typeof directSession?.proveConnection !== 'function'
+        || typeof directSession?.preferConnection !== 'function'
+      ) {
+        throw new Error('Direct session relay handover support is unavailable.');
+      }
+      const remaining = Math.max(1, deadline - Date.now());
+      await directSession.proveConnection(connection, remaining);
     } catch (error) {
       this.outboundRelayConnections.delete(connection);
-      trackedConnections.delete(connection);
+      directSession?._dropHealthConnection?.(connection);
       connection.destroy?.(error);
       throw error;
     }
 
-    if (priorConnection && priorConnection !== connection) {
-      priorConnection.on?.('error', () => {});
-      priorConnection.destroy?.(new Error('Direct attempt superseded by official relay fallback.'));
-    }
-    this.relayConnections.set(remote, connection);
-    directSession?.explicitPeers?.add?.(remote);
-    swarm.connections?.add?.(connection);
+    const previous = this.relayConnections.get(remote) ?? null;
     connection.once?.('close', () => {
       if (this.debug) {
         const reason = connectionError?.code
@@ -548,19 +525,28 @@ class InferenceRelay extends Feature {
         );
       }
       this.outboundRelayConnections.delete(connection);
-      swarm.connections?.delete?.(connection);
-      trackedConnections.delete(connection);
+      directSession?.clearPreferredConnection?.(remote, connection);
       if (this.relayConnections.get(remote) === connection) {
         this.relayConnections.delete(remote);
       }
-      swarm.emit?.('update');
     });
-    swarm.emit?.('connection', connection, {
-      forceRelaying: true,
-      inferenceRelay: true,
-      relay,
-    });
-    swarm.emit?.('update');
+    try {
+      this.connectionRoutes.set(connection, { relayed: true, relay, authoritative: true });
+      directSession.preferConnection(remote, connection);
+    } catch (error) {
+      this.outboundRelayConnections.delete(connection);
+      directSession.clearPreferredConnection?.(remote, connection);
+      directSession._dropHealthConnection?.(connection);
+      connection.destroy?.(error);
+      throw error;
+    }
+    directSession.explicitPeers?.add?.(remote);
+    this.relayConnections.set(remote, connection);
+    if (previous && previous !== connection) {
+      this.outboundRelayConnections.delete(previous);
+      previous.on?.('error', () => {});
+      previous.destroy?.(new Error('Replaced by a proven official relay connection.'));
+    }
     return {
       remote,
       connected: true,
@@ -577,7 +563,7 @@ class InferenceRelay extends Feature {
       !server
       || typeof server.firewall !== 'function'
       || typeof server._relayConnection !== 'function'
-      || typeof server.prependListener !== 'function'
+      || typeof server.emit !== 'function'
     ) {
       throw new Error('Peer transport cannot track official inbound relay ownership.');
     }
@@ -604,13 +590,20 @@ class InferenceRelay extends Feature {
       );
     };
     server._relayConnection = this.wrappedServerRelayConnection;
-    server.prependListener('connection', this.onServerConnection);
+    this.originalServerEmit = server.emit;
+    this.wrappedServerEmit = (event, ...args) => {
+      if (event === 'connection' && this._claimInboundRelay(args[0])) return true;
+      return this.originalServerEmit.call(server, event, ...args);
+    };
+    server.emit = this.wrappedServerEmit;
   }
 
   _removeInboundRelayTracking() {
     const server = this.peer?.swarm?.server;
     if (server) {
-      server.off?.('connection', this.onServerConnection);
+      if (server.emit === this.wrappedServerEmit && this.originalServerEmit) {
+        server.emit = this.originalServerEmit;
+      }
       if (server.firewall === this.wrappedServerFirewall && this.originalServerFirewall) {
         server.firewall = this.originalServerFirewall;
       }
@@ -625,10 +618,17 @@ class InferenceRelay extends Feature {
     this.wrappedServerFirewall = null;
     this.originalServerRelayConnection = null;
     this.wrappedServerRelayConnection = null;
+    this.originalServerEmit = null;
+    this.wrappedServerEmit = null;
     for (const [remote, state] of this.inboundRelays) {
       for (const pending of state.pending) clearTimeout(pending.timer);
       if (state.releaseTimer) clearTimeout(state.releaseTimer);
-      this._resumePeerReconnect(remote, false);
+      for (const timer of state.retireTimers.values()) clearTimeout(timer);
+      for (const connection of state.connections) {
+        this.peer?.directSession?.clearPreferredConnection?.(remote, connection);
+        connection.on?.('error', () => {});
+        connection.destroy?.(new Error('Inference relay stopped.'));
+      }
     }
     this.inboundRelays.clear();
   }
@@ -650,7 +650,6 @@ class InferenceRelay extends Feature {
     }, this.relayWaitMs);
     pending.timer.unref?.();
     state.pending.push(pending);
-    this._suspendPeerReconnect(remote);
     return true;
   }
 
@@ -665,42 +664,112 @@ class InferenceRelay extends Feature {
     if (pendingIndex === -1) return false;
     const [pending] = state.pending.splice(pendingIndex, 1);
     clearTimeout(pending.timer);
-    state.connections.add(connection);
-    this.connectionRoutes.set(connection, { relayed: true, relay: pending.relay });
-    this._suspendPeerReconnect(remote);
-    const swarm = this.peer?.swarm;
-    const existing = swarm?._allConnections?.get?.(connection.remotePublicKey);
-    if (existing && existing !== connection) {
-      swarm._allConnections.delete?.(existing);
-      swarm.connections?.delete?.(existing);
-      existing.on?.('error', () => {});
-      existing.destroy?.(new Error('Direct attempt superseded by official inbound relay.'));
+    if (state.candidate?.destroyed === true || state.candidate?.closed === true) {
+      state.candidate = null;
     }
+    if (state.candidate || state.retiring.size > 0) {
+      connection.on?.('error', () => {});
+      connection.destroy?.(new Error('Duplicate official inbound relay connection.'));
+      return true;
+    }
+    state.candidate = connection;
+    state.connections.add(connection);
+    this.connectionRoutes.set(connection, {
+      relayed: true,
+      relay: pending.relay,
+      authoritative: false,
+    });
     connection.once?.('close', () => {
+      this.peer?.directSession?.clearPreferredConnection?.(remote, connection);
+      if (state.active === connection) state.active = null;
+      if (state.candidate === connection) state.candidate = null;
+      state.retiring.delete(connection);
+      const retireTimer = state.retireTimers.get(connection);
+      if (retireTimer) clearTimeout(retireTimer);
+      state.retireTimers.delete(connection);
       state.connections.delete(connection);
       this._scheduleInboundReconnect(remote, state);
     });
+    void this._admitInboundRelay(remote, state, connection, pending.relay);
     return true;
+  }
+
+  async _admitInboundRelay(remote, state, connection, relay) {
+    const directSession = this.peer?.directSession;
+    try {
+      if (
+        typeof directSession?.proveConnection !== 'function'
+        || typeof directSession?.preferConnection !== 'function'
+      ) {
+        throw new Error('Direct session relay handover support is unavailable.');
+      }
+      await directSession.proveConnection(connection, this.relayWaitMs);
+      if (connection.destroyed === true || connection.closed === true) {
+        throw new Error('Inbound relay connection closed during admission.');
+      }
+      this.connectionRoutes.set(connection, {
+        relayed: true,
+        relay,
+        authoritative: true,
+      });
+      const previous = state.active;
+      directSession.preferConnection(remote, connection);
+      state.active = connection;
+      if (state.candidate === connection) state.candidate = null;
+      if (previous && previous !== connection) {
+        this._retireInboundConnection(remote, state, previous, directSession);
+      }
+    } catch (error) {
+      if (state.active === connection) state.active = null;
+      if (state.candidate === connection) state.candidate = null;
+      state.connections.delete(connection);
+      directSession?._dropHealthConnection?.(connection);
+      connection.on?.('error', () => {});
+      connection.destroy?.(error);
+      this._scheduleInboundReconnect(remote, state);
+    }
   }
 
   _inboundRelayState(remote) {
     let state = this.inboundRelays.get(remote);
     if (state) return state;
-    state = { pending: [], connections: new Set(), releaseTimer: null };
+    state = {
+      pending: [],
+      connections: new Set(),
+      active: null,
+      candidate: null,
+      retiring: new Set(),
+      retireTimers: new Map(),
+      releaseTimer: null,
+    };
     this.inboundRelays.set(remote, state);
     return state;
   }
 
-  _suspendPeerReconnect(remote) {
-    const peerInfo = this.peer?.swarm?.peers?.get?.(remote);
-    peerInfo?.reconnect?.(false);
-    this.peer?.directSession?.suspendReconnect?.(remote);
-  }
-
-  _resumePeerReconnect(remote, reconnect = true) {
-    const peerInfo = this.peer?.swarm?.peers?.get?.(remote);
-    peerInfo?.reconnect?.(true);
-    this.peer?.directSession?.resumeReconnect?.(remote, reconnect);
+  _retireInboundConnection(remote, state, connection, directSession) {
+    const hasActiveSessions = () => Array.from(directSession?.sessions?.values?.() || [])
+      .some((session) => session.connection === connection && session.closed !== true);
+    const retire = () => {
+      state.retireTimers.delete(connection);
+      if (connection.destroyed === true || connection.closed === true) {
+        state.retiring.delete(connection);
+        state.connections.delete(connection);
+        this._scheduleInboundReconnect(remote, state);
+        return;
+      }
+      if (hasActiveSessions()) {
+        const timer = setTimeout(retire, this.inboundReleaseGraceMs);
+        timer.unref?.();
+        state.retireTimers.set(connection, timer);
+        return;
+      }
+      state.retiring.delete(connection);
+      state.connections.delete(connection);
+      connection.on?.('error', () => {});
+      connection.destroy?.(new Error('Replaced by a proven official relay connection.'));
+    };
+    state.retiring.add(connection);
+    retire();
   }
 
   _scheduleInboundReconnect(remote, state) {
@@ -709,7 +778,6 @@ class InferenceRelay extends Feature {
       state.releaseTimer = null;
       if (state.pending.length > 0 || state.connections.size > 0) return;
       this.inboundRelays.delete(remote);
-      this._resumePeerReconnect(remote);
     }, this.inboundReleaseGraceMs);
     state.releaseTimer.unref?.();
   }

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { Duplex } from 'node:stream';
 import test from 'node:test';
 import b4a from 'b4a';
@@ -968,6 +969,103 @@ test('DirectSession prefers the most recently bidirectionally healthy connection
   assert.equal(directSession._findConnection(remote), healthy);
 });
 
+test('DirectSession selects a proven feature-owned connection without replacing swarm transport', () => {
+  const direct = { remotePublicKey: b4a.from(remote, 'hex') };
+  const relayed = { remotePublicKey: b4a.from(remote, 'hex'), destroyed: false, closed: false };
+  const unrelated = { remotePublicKey: b4a.from(remote, 'hex') };
+  const swarmConnections = new Set([direct]);
+  const directSession = new DirectSession({
+    swarm: { connections: swarmConnections },
+  }, {});
+  directSession.connectionHealth.set(direct, { connection: direct, lastAckAt: Date.now() });
+  directSession.connectionHealth.set(relayed, {
+    connection: relayed,
+    lastAckAt: Date.now(),
+    proven: true,
+  });
+  directSession._prepareConnectionUnchecked = () => {};
+
+  assert.equal(directSession.preferConnection(remote, relayed), null);
+  assert.equal(directSession._findConnection(remote), relayed);
+  assert.deepEqual(directSession._connectionsForRemote(remote), [direct]);
+  assert.deepEqual(Array.from(swarmConnections), [direct]);
+  assert.equal(directSession.clearPreferredConnection(remote, unrelated), false);
+  assert.equal(directSession._findConnection(remote), relayed);
+  assert.equal(directSession.clearPreferredConnection(remote, relayed), true);
+  assert.equal(directSession._findConnection(remote), direct);
+  assert.deepEqual(Array.from(swarmConnections), [direct]);
+});
+
+test('DirectSession keeps application sessions disabled until feature-owned health proof succeeds', async () => {
+  const connection = new EventEmitter();
+  connection.remotePublicKey = b4a.from(remote, 'hex');
+  connection.destroyed = false;
+  connection.closed = false;
+  const pairedProtocols = [];
+  const mux = {
+    pair({ protocol }) {
+      pairedProtocols.push(protocol);
+    },
+    createChannel({ protocol }) {
+      return {
+        protocol,
+        opened: false,
+        closed: false,
+        destroyed: false,
+        addMessage: () => ({ send: () => true }),
+        open() {},
+        fullyOpened: async () => true,
+      };
+    },
+  };
+  const directSession = new DirectSession({ swarm: { connections: new Set() } }, {});
+  directSession._muxForConnection = () => mux;
+  let releaseProof = null;
+  directSession._ensureConnectionHealthy = async (candidate) => {
+    await new Promise((resolve) => { releaseProof = resolve; });
+    const health = directSession.connectionHealth.get(candidate);
+    health.proven = true;
+    health.lastAckAt = Date.now();
+  };
+
+  const proving = directSession.proveConnection(connection, 1_000);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(pairedProtocols, ['mx/s-health']);
+  assert.equal(directSession.pairedConnections.has(connection), false);
+
+  releaseProof();
+  await proving;
+  assert.equal(directSession.pairedConnections.has(connection), false);
+  directSession.preferConnection(remote, connection);
+  assert.deepEqual(pairedProtocols, ['mx/s-health', 'mx/s']);
+  assert.equal(directSession.pairedConnections.has(connection), true);
+  directSession._dropHealthConnection(connection);
+});
+
+test('DirectSession refuses unproven and stale preferred connections', () => {
+  const connection = { remotePublicKey: b4a.from(remote, 'hex') };
+  const directSession = new DirectSession({}, { healthFreshMs: 5_000 });
+  directSession.connectionHealth.set(connection, {
+    connection,
+    proven: false,
+    lastAckAt: Date.now(),
+  });
+  assert.throws(
+    () => directSession.preferConnection(remote, connection),
+    /fresh bidirectional health proof/
+  );
+
+  directSession.connectionHealth.set(connection, {
+    connection,
+    proven: true,
+    lastAckAt: Date.now() - 5_001,
+  });
+  assert.throws(
+    () => directSession.preferConnection(remote, connection),
+    /fresh bidirectional health proof/
+  );
+});
+
 test('DirectSession health frames prove both transport directions', async () => {
   const sent = [];
   const directSession = new DirectSession({}, {});
@@ -1163,6 +1261,34 @@ test('DirectSession retires a verified dead connection despite stale active sess
     closed: false,
   });
   directSession._healthTick(health);
+  assert.equal(destroyed, 1);
+  assert.equal(directSession.connectionHealth.has(connection), false);
+});
+
+test('DirectSession retires a stale preferred relay without requiring explicit-peer ownership', () => {
+  let destroyed = 0;
+  const connection = {
+    remotePublicKey: b4a.from(remote, 'hex'),
+    destroy: () => { destroyed += 1; },
+  };
+  const directSession = new DirectSession({}, { healthTimeoutMs: 10 });
+  const health = {
+    connection,
+    channel: { closed: false, destroyed: false },
+    message: null,
+    opened: false,
+    lastAckAt: 0,
+    unhealthySince: Date.now() - 11,
+    proven: true,
+    timer: null,
+    probes: new Map(),
+    waiters: new Map(),
+  };
+  directSession.preferredConnections.set(remote, connection);
+  directSession.connectionHealth.set(connection, health);
+
+  directSession._healthTick(health);
+
   assert.equal(destroyed, 1);
   assert.equal(directSession.connectionHealth.has(connection), false);
 });
