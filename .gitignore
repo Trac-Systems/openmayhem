@@ -50,10 +50,23 @@ htmlcov/
 tmp/
 temp/
 coverage/
+.coverage.*
+coverage-final.json
+lcov.info
+*.profraw
+*.profdata
 .nyc_output/
 playwright-report/
 test-results/
+test-reports/
+test-artifacts/
 blob-report/
+allure-results/
+allure-report/
+junit.xml
+junit-*.xml
+cobertura.xml
+*.snap.new
 
 # Local runtime state
 stores/
