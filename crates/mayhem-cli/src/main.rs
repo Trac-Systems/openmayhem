@@ -24609,15 +24609,27 @@ fn descriptor_integer_quant_bucket(descriptor: &str) -> Option<&'static str> {
 }
 
 fn is_canonical_quant_bucket(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= 32
-        && bytes[0].is_ascii_lowercase()
-        && bytes.last().is_some_and(|value| *value != b'-')
-        && bytes
-            .iter()
-            .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || *value == b'-')
-        && !bytes.windows(2).any(|pair| pair == b"--")
+    if value.len() > 32 {
+        return false;
+    }
+    if matches!(value, "unknown" | "binary" | "ternary" | "tf32") {
+        return true;
+    }
+    let (head, suffix) = value.split_once('-').unwrap_or((value, ""));
+    let prefixes = ["mxfp", "nvfp", "uint", "int", "fp", "bf", "nf"];
+    let Some(width) = prefixes.iter().find_map(|prefix| head.strip_prefix(prefix)) else {
+        return false;
+    };
+    !width.is_empty()
+        && width.len() <= 2
+        && width.as_bytes()[0] != b'0'
+        && width.bytes().all(|value| value.is_ascii_digit())
+        && (suffix.is_empty()
+            || (suffix.bytes().all(|value| {
+                value.is_ascii_lowercase() || value.is_ascii_digit() || value == b'-'
+            }) && !suffix.starts_with('-')
+                && !suffix.ends_with('-')
+                && !suffix.contains("--")))
 }
 
 fn admin_open_room_payload(args: &AdminOpenRoomArgs) -> Result<Value> {
@@ -75427,10 +75439,7 @@ mod tests {
         assert_eq!(normalize_quant_bucket("IQ3_XXS").unwrap(), "int3");
         assert_eq!(normalize_quant_bucket("MXFP4").unwrap(), "mxfp4");
         assert_eq!(normalize_quant_bucket("NF4").unwrap(), "nf4");
-        assert_eq!(
-            normalize_quant_bucket("future-quant7").unwrap(),
-            "future-quant7"
-        );
+        assert_eq!(normalize_quant_bucket("BF8").unwrap(), "bf8");
         assert_eq!(
             quant_bucket_from_descriptor("prism-ml/Ternary-Bonsai-27B-Q2_0.gguf"),
             "int2"

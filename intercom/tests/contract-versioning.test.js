@@ -54,7 +54,8 @@ test('contract recognizes canonical two-bit quant descriptors without treating Q
   assert.equal(contract.normalizeEnclaveQuant('IQ3_XXS'), 'int3');
   assert.equal(contract.normalizeEnclaveQuant('MXFP4'), 'mxfp4');
   assert.equal(contract.normalizeEnclaveQuant('NF4'), 'nf4');
-  assert.equal(contract.validateEnclaveQuant('future-quant7'), null);
+  assert.equal(contract.validateEnclaveQuant('BF8'), null);
+  assert.match(contract.validateEnclaveQuant('potato').message, /canonical identifier/);
   assert.match(contract.validateEnclaveQuant('bad--bucket').message, /canonical identifier/);
   assert.equal(contract.quantBucketFromDescriptor('Ternary-Bonsai-27B-Q2_0.gguf'), 'int2');
   assert.notEqual(contract.quantBucketFromDescriptor('Qwen2.5-7B-Instruct.gguf'), 'int2');

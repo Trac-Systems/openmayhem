@@ -28591,15 +28591,27 @@ fn descriptor_integer_quant_bucket(descriptor: &str) -> Option<&'static str> {
 }
 
 fn is_canonical_quant_bucket(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= 32
-        && bytes[0].is_ascii_lowercase()
-        && bytes.last().is_some_and(|value| *value != b'-')
-        && bytes
-            .iter()
-            .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || *value == b'-')
-        && !bytes.windows(2).any(|pair| pair == b"--")
+    if value.len() > 32 {
+        return false;
+    }
+    if matches!(value, "unknown" | "binary" | "ternary" | "tf32") {
+        return true;
+    }
+    let (head, suffix) = value.split_once('-').unwrap_or((value, ""));
+    let prefixes = ["mxfp", "nvfp", "uint", "int", "fp", "bf", "nf"];
+    let Some(width) = prefixes.iter().find_map(|prefix| head.strip_prefix(prefix)) else {
+        return false;
+    };
+    !width.is_empty()
+        && width.len() <= 2
+        && width.as_bytes()[0] != b'0'
+        && width.bytes().all(|value| value.is_ascii_digit())
+        && (suffix.is_empty()
+            || (suffix.bytes().all(|value| {
+                value.is_ascii_lowercase() || value.is_ascii_digit() || value == b'-'
+            }) && !suffix.starts_with('-')
+                && !suffix.ends_with('-')
+                && !suffix.contains("--")))
 }
 
 fn attestation_tier_labels_from_catalog_value(model: &Value) -> Option<BTreeMap<String, String>> {
@@ -30696,9 +30708,9 @@ mod tests {
         headers.insert("x-mayhem-quant", HeaderValue::from_static("Q5_K_M"));
         let options = GatewayRequestOptions::from_headers(&headers).expect("Q5 header parses");
         assert_eq!(options.quant.as_deref(), Some("int5"));
-        headers.insert("x-mayhem-quant", HeaderValue::from_static("future-quant7"));
+        headers.insert("x-mayhem-quant", HeaderValue::from_static("BF8"));
         let options = GatewayRequestOptions::from_headers(&headers).expect("future bucket parses");
-        assert_eq!(options.quant.as_deref(), Some("future-quant7"));
+        assert_eq!(options.quant.as_deref(), Some("bf8"));
         assert_eq!(
             quant_bucket_from_descriptor("Qwen2.5-7B-Instruct.gguf"),
             DEFAULT_QUANT_BUCKET

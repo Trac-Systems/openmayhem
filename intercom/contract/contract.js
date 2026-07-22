@@ -272,7 +272,7 @@ const ENCLAVE_QUANT_BUCKETS = new Set([
   'fp4',
   'nf4',
 ]);
-const ENCLAVE_QUANT_BUCKET_PATTERN = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/;
+const ENCLAVE_QUANT_BUCKET_PATTERN = /^(?:unknown|binary|ternary|tf32|(?:mxfp|nvfp|uint|int|fp|bf|nf)[1-9][0-9]?(?:-[a-z0-9]+)*)$/;
 const ENCLAVE_QUANT_BUCKET_MAX_LENGTH = 32;
 const DEFAULT_MODEL_CLASS = 'text-generation';
 const MODEL_CLASSES = new Set([
