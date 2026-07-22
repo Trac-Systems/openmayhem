@@ -1,6 +1,6 @@
 use axum::{
     body::{to_bytes, Body},
-    http::{HeaderMap, Method, Request, StatusCode},
+    http::{header, HeaderMap, Method, Request, StatusCode},
     Router,
 };
 use base64::Engine as _;
@@ -1587,6 +1587,35 @@ async fn raw_request_with_headers(
     (parts.status, parts.headers, bytes)
 }
 
+async fn dashboard_request_with_headers(
+    app: Router,
+    method: Method,
+    uri: &str,
+    body: Option<Value>,
+    request_headers: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let (status, headers, bytes) =
+        raw_request_with_headers(app.clone(), method, uri, body, request_headers).await;
+    if status != StatusCode::SEE_OTHER {
+        return (status, headers, bytes);
+    }
+
+    let location = headers
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .expect("dashboard bootstrap redirect location")
+        .to_owned();
+    let cookie = headers
+        .get(header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .expect("dashboard bootstrap cookie")
+        .to_owned();
+    let mut redirected_headers = request_headers.to_vec();
+    redirected_headers.push(("cookie", cookie.as_str()));
+    raw_request_with_headers(app, Method::GET, &location, None, &redirected_headers).await
+}
+
 async fn raw_bytes_request_with_headers(
     app: Router,
     method: Method,
@@ -1998,7 +2027,7 @@ async fn av3_ready_source_built_route_and_dashboard_report_local_policy_truth() 
         vec![provider.clone()]
     );
 
-    let (status, _, evidence_bytes) = raw_request_with_headers(
+    let (status, _, evidence_bytes) = dashboard_request_with_headers(
         app,
         Method::GET,
         &evidence_path,
@@ -2378,7 +2407,7 @@ async fn models_api_and_market_dashboard_share_selector_live_counts() {
     assert_eq!(market["route_count"], 1);
     assert_eq!(market["availability"], "routable");
 
-    let (status, _, bytes) = raw_request_with_headers(
+    let (status, _, bytes) = dashboard_request_with_headers(
         app.clone(),
         Method::GET,
         &market_path,
@@ -2412,7 +2441,7 @@ async fn models_api_and_market_dashboard_share_selector_live_counts() {
     assert_eq!(market["route_count"], 0);
     assert_eq!(market["availability"], "no_eligible_provider_yet");
 
-    let (status, _, bytes) = raw_request_with_headers(
+    let (status, _, bytes) = dashboard_request_with_headers(
         app,
         Method::GET,
         &market_path,
@@ -2550,7 +2579,7 @@ async fn models_endpoint_and_progressive_evidence_expose_speciality_cost_and_ava
         json!(["low"])
     );
 
-    let (status, _, user_bytes) = raw_request_with_headers(
+    let (status, _, user_bytes) = dashboard_request_with_headers(
         app.clone(),
         Method::GET,
         &user_path,
@@ -2563,7 +2592,7 @@ async fn models_endpoint_and_progressive_evidence_expose_speciality_cost_and_ava
     assert!(user_html.contains("reasoning_effort:low|high|xhigh"));
     assert!(user_html.contains("data-evidence-url"));
 
-    let (status, _, provider_bytes) = raw_request_with_headers(
+    let (status, _, provider_bytes) = dashboard_request_with_headers(
         app.clone(),
         Method::GET,
         &provider_path,
@@ -2577,7 +2606,7 @@ async fn models_endpoint_and_progressive_evidence_expose_speciality_cost_and_ava
     assert!(provider_html.contains("No machine routes yet"));
     assert!(!provider_html.contains("mayhem/routed-test"));
 
-    let (status, _, network_bytes) = raw_request_with_headers(
+    let (status, _, network_bytes) = dashboard_request_with_headers(
         app.clone(),
         Method::GET,
         &network_path,
@@ -2590,7 +2619,7 @@ async fn models_endpoint_and_progressive_evidence_expose_speciality_cost_and_ava
     assert!(network_html.contains("reasoning_effort:low|high|xhigh"));
     assert!(network_html.contains("data-evidence-url"));
 
-    let (status, _, evidence_bytes) = raw_request_with_headers(
+    let (status, _, evidence_bytes) = dashboard_request_with_headers(
         app,
         Method::GET,
         &evidence_path,
@@ -7512,22 +7541,59 @@ async fn dashboard_requires_token_sets_csp_and_serves_no_external_assets() {
     let locked = String::from_utf8(bytes).expect("locked dashboard html");
     assert_no_external_urls(&locked);
 
-    let (status, headers, bytes) =
-        raw_request(app.clone(), Method::GET, dashboard_path, None).await;
+    let (status, headers, _) = raw_request(app.clone(), Method::GET, dashboard_path, None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        headers
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/mayhem/dashboard")
+    );
+    let set_cookie = headers
+        .get(header::SET_COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .expect("dashboard session cookie");
+    assert!(set_cookie.contains("Max-Age=34560000"));
+    assert!(set_cookie.contains("HttpOnly"));
+    assert!(set_cookie.contains("SameSite=Strict"));
+    let cookie = set_cookie
+        .split(';')
+        .next()
+        .expect("dashboard cookie pair")
+        .to_owned();
+
+    let (status, _, bytes) = raw_request_with_headers(
+        app.clone(),
+        Method::GET,
+        "/mayhem/dashboard",
+        None,
+        &[("cookie", &cookie)],
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(headers.get("set-cookie").is_some());
-    let body = String::from_utf8(bytes).expect("dashboard html");
+    let body = String::from_utf8(bytes).expect("dashboard html after bootstrap redirect");
     assert!(body.contains(r#"class="app-shell""#));
     assert!(body.contains(r#"href="/mayhem/dashboard/models""#));
     assert!(body.contains(r#"href="/mayhem/dashboard/network""#));
-    assert!(body.contains("Browser session"));
+    assert!(body.contains("Authenticated for this gateway run"));
     assert_no_external_urls(&body);
 
-    let cookie = headers
-        .get("set-cookie")
+    let filtered_path = format!("{dashboard_path}&page=2");
+    let (status, filtered_headers, _) =
+        raw_request(app.clone(), Method::GET, &filtered_path, None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        filtered_headers
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+        Some("/mayhem/dashboard?page=2")
+    );
+    assert!(!filtered_headers
+        .get(header::LOCATION)
         .and_then(|value| value.to_str().ok())
-        .expect("dashboard session cookie")
-        .to_owned();
+        .unwrap_or_default()
+        .contains("token="));
+
     let (status, _, _) = raw_request_with_headers(
         app.clone(),
         Method::GET,
@@ -7562,13 +7628,29 @@ async fn dashboard_requires_token_sets_csp_and_serves_no_external_assets() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let session_path = format!("/mayhem/dashboard/session{query}");
-    let (status, body) = json_request(app, Method::GET, &session_path, Value::Null).await;
+    let (status, body) = json_request_with_headers(
+        app.clone(),
+        Method::GET,
+        "/mayhem/dashboard/session",
+        Value::Null,
+        &[("cookie", &cookie)],
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ok"], true);
-    let expires = body["expires_in_seconds"].as_u64().expect("expiry seconds");
-    assert!(expires > 0);
-    assert!(expires <= 900);
+    assert_eq!(body["session_scope"], "gateway_process");
+    assert!(body.get("expires_in_seconds").is_none());
+
+    let restarted = openai_router(GatewayState::from_embedded_catalog());
+    let (status, _, _) = raw_request_with_headers(
+        restarted,
+        Method::GET,
+        "/mayhem/dashboard",
+        None,
+        &[("cookie", &cookie)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -7581,7 +7663,7 @@ async fn dashboard_uses_local_design_system_and_font_asset() {
     let app = openai_router(state);
 
     let (status, headers, bytes) =
-        raw_request(app.clone(), Method::GET, dashboard_path, None).await;
+        dashboard_request_with_headers(app.clone(), Method::GET, dashboard_path, None, &[]).await;
     assert_eq!(status, StatusCode::OK);
     let body = String::from_utf8(bytes).expect("dashboard html");
     for expected in [
@@ -7590,7 +7672,7 @@ async fn dashboard_uses_local_design_system_and_font_asset() {
         r#"class="app-shell""#,
         r#"class="app-brand""#,
         r#"class="state-indicator"#,
-        "data-session-status",
+        "Authenticated for this gateway run",
     ] {
         assert!(body.contains(expected), "missing {expected}");
     }
@@ -7688,7 +7770,7 @@ async fn user_dashboard_renders_live_gateway_data() {
         json_request(app.clone(), Method::POST, "/v1/chat/completions", request).await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, _, bytes) = raw_request_with_headers(
+    let (status, _, bytes) = dashboard_request_with_headers(
         app.clone(),
         Method::GET,
         dashboard_path,
@@ -7706,7 +7788,7 @@ async fn user_dashboard_renders_live_gateway_data() {
     assert!(!body.contains("1,240.00 TAP"));
     assert_no_external_urls(&body);
 
-    let (status, _, bytes) = raw_request_with_headers(
+    let (status, _, bytes) = dashboard_request_with_headers(
         app.clone(),
         Method::GET,
         &connect_path,
@@ -7721,7 +7803,7 @@ async fn user_dashboard_renders_live_gateway_data() {
     assert!(connect.contains("OPENAI_BASE_URL=http://127.0.0.1:11435/v1"));
     assert_no_external_urls(&connect);
 
-    let (status, _, bytes) = raw_request_with_headers(
+    let (status, _, bytes) = dashboard_request_with_headers(
         app,
         Method::GET,
         &models_path,
@@ -7749,7 +7831,7 @@ async fn models_dashboard_shows_canonical_route_count() {
     let models_path = dashboard_path.replacen("/mayhem/dashboard?", "/mayhem/dashboard/models?", 1);
     let app = openai_router(state);
 
-    let (status, _, bytes) = raw_request_with_headers(
+    let (status, _, bytes) = dashboard_request_with_headers(
         app,
         Method::GET,
         &models_path,
@@ -7789,7 +7871,7 @@ async fn dashboard_page_query_reaches_later_models_and_clamps_invalid_values() {
     let out_of_range_path = format!("{first_path}&page=999");
     let app = openai_router(state);
 
-    let (first_status, _, first_bytes) = raw_request_with_headers(
+    let (first_status, _, first_bytes) = dashboard_request_with_headers(
         app.clone(),
         Method::GET,
         &first_path,
@@ -7804,7 +7886,7 @@ async fn dashboard_page_query_reaches_later_models_and_clamps_invalid_values() {
     assert!(first.contains("Showing rows 1&ndash;25 of 82 catalog models. Page 1 of 4."));
     assert!(first.contains(r#"rel="next" href="/mayhem/dashboard/models?page=2""#));
 
-    let (status, _, second_bytes) = raw_request_with_headers(
+    let (status, _, second_bytes) = dashboard_request_with_headers(
         app.clone(),
         Method::GET,
         &second_path,
@@ -7820,7 +7902,7 @@ async fn dashboard_page_query_reaches_later_models_and_clamps_invalid_values() {
     assert!(second.contains("Showing rows 76&ndash;82 of 82 catalog models. Page 4 of 4."));
     assert!(second.contains(r#"rel="prev" href="/mayhem/dashboard/models?page=3""#));
 
-    let (_, _, invalid_bytes) = raw_request_with_headers(
+    let (_, _, invalid_bytes) = dashboard_request_with_headers(
         app.clone(),
         Method::GET,
         &invalid_path,
@@ -7832,7 +7914,7 @@ async fn dashboard_page_query_reaches_later_models_and_clamps_invalid_values() {
     assert!(invalid.contains("mayhem/page-000"));
     assert!(invalid.contains("Page 1 of 4."));
 
-    let (_, _, clamped_bytes) = raw_request_with_headers(
+    let (_, _, clamped_bytes) = dashboard_request_with_headers(
         app,
         Method::GET,
         &out_of_range_path,
@@ -7888,7 +7970,7 @@ async fn provider_dashboard_renders_routes_receipts_and_earnings() {
     assert_eq!(state.receipts().len(), 1);
     assert_eq!(state.receipts()[0].receipt.body.provider, provider);
 
-    let (status, _, bytes) = raw_request_with_headers(
+    let (status, _, bytes) = dashboard_request_with_headers(
         app.clone(),
         Method::GET,
         &earn_path,
@@ -7905,7 +7987,7 @@ async fn provider_dashboard_renders_routes_receipts_and_earnings() {
     assert!(body.contains("$1.75"));
     assert_no_external_urls(&body);
 
-    let (status, _, bytes) = raw_request_with_headers(
+    let (status, _, bytes) = dashboard_request_with_headers(
         app.clone(),
         Method::GET,
         &activity_path,
@@ -7920,7 +8002,7 @@ async fn provider_dashboard_renders_routes_receipts_and_earnings() {
     assert!(activity.contains("Final receipt"));
     assert_no_external_urls(&activity);
 
-    let (status, _, bytes) = raw_request_with_headers(
+    let (status, _, bytes) = dashboard_request_with_headers(
         app,
         Method::GET,
         &earnings_path,
@@ -7966,7 +8048,7 @@ async fn network_provider_dashboard_counts_multi_enclave_routes() {
     let provider_path = format!("/mayhem/dashboard/network/providers?{query}");
     let app = openai_router(state);
 
-    let (status, _, bytes) = raw_request_with_headers(
+    let (status, _, bytes) = dashboard_request_with_headers(
         app,
         Method::GET,
         &provider_path,
@@ -8023,7 +8105,7 @@ async fn provider_dashboard_renders_local_load_progress() {
     let provider_path = format!("/mayhem/dashboard/earn/machines?{query}");
     let app = openai_router(state);
 
-    let (status, _, bytes) = raw_request_with_headers(
+    let (status, _, bytes) = dashboard_request_with_headers(
         app,
         Method::GET,
         &provider_path,
@@ -8078,7 +8160,7 @@ async fn provider_dashboard_renders_progress_before_route_exists() {
     let provider_path = format!("/mayhem/dashboard/earn/machines?{query}");
     let app = openai_router(state);
 
-    let (status, _, bytes) = raw_request_with_headers(
+    let (status, _, bytes) = dashboard_request_with_headers(
         app,
         Method::GET,
         &provider_path,
@@ -8134,7 +8216,7 @@ async fn provider_dashboard_hides_stale_progress_before_route_exists() {
     let provider_path = format!("/mayhem/dashboard/earn?{query}");
     let app = openai_router(state);
 
-    let (status, _, bytes) = raw_request_with_headers(
+    let (status, _, bytes) = dashboard_request_with_headers(
         app,
         Method::GET,
         &provider_path,
@@ -8198,7 +8280,7 @@ async fn network_dashboard_renders_live_catalog_and_provider_state() {
     );
     let app = openai_router(state);
 
-    let (status, _, bytes) = raw_request_with_headers(
+    let (status, _, bytes) = dashboard_request_with_headers(
         app.clone(),
         Method::GET,
         &network_path,
@@ -8216,7 +8298,7 @@ async fn network_dashboard_renders_live_catalog_and_provider_state() {
     assert!(body.contains("mayhem/unavailable-test"));
     assert_no_external_urls(&body);
 
-    let (status, _, bytes) = raw_request_with_headers(
+    let (status, _, bytes) = dashboard_request_with_headers(
         app.clone(),
         Method::GET,
         &network_models_path,
@@ -8233,7 +8315,7 @@ async fn network_dashboard_renders_live_catalog_and_provider_state() {
     assert!(models.contains("No provider route"));
     assert_no_external_urls(&models);
 
-    let (status, _, bytes) = raw_request_with_headers(
+    let (status, _, bytes) = dashboard_request_with_headers(
         app,
         Method::GET,
         &network_providers_path,

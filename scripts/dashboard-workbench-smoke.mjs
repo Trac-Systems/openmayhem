@@ -1267,33 +1267,14 @@ async function exerciseWorkbench(baseUrl, options) {
   } catch (error) {
     report.check(false, 'app script', 'executes focused Playground contract helpers', error.message);
   }
-  report.includes(appJs.text, '[data-session-seconds]', 'app script', 'wires the live session timer');
-  report.includes(appJs.text, 'Dashboard session ends soon', 'app script', 'announces session expiry before access is lost');
-  report.includes(appJs.text, "extend.dataset.sessionExtend = ''", 'app script', 'offers a low-noise session extension action');
-  report.includes(
-    appJs.text,
-    'recordDashboardSessionActivity(initial);',
-    'app script',
-    'renews the fixture session in place so the warning path is behaviorally testable',
-  );
-  report.includes(
-    appJs.text,
-    'this page, draft, filters, and scroll position stay in place',
-    'app script',
-    'explains that extension preserves task context',
-  );
+  report.check(!appJs.text.includes('[data-session-seconds]'), 'app script', 'does not run an idle authentication timer');
+  report.check(!appJs.text.includes('recordDashboardSessionActivity'), 'app script', 'does not require in-place session renewal');
   report.includes(appJs.text, 'Export shown page', 'app script', 'labels CSV export as page-local');
   report.includes(appJs.text, 'tableToolParameter', 'app script', 'isolates query state for multiple tables on one page');
-  report.includes(
-    appJs.text,
-    'recordDashboardSessionActivity',
-    'app script',
-    'synchronizes the timer after user-triggered authenticated requests',
-  );
   report.check(
     !appJs.text.includes("document.addEventListener('visibilitychange'"),
     'app script',
-    'does not keep an idle browser session alive through passive visibility polling',
+    'does not add passive authentication polling',
   );
   report.includes(appJs.text, '[data-preference]', 'app script', 'wires saved presentation preferences');
 
@@ -1374,8 +1355,8 @@ async function exerciseWorkbench(baseUrl, options) {
           : 'omits the no-op amount-visibility control when no monetary values are present',
       );
       report.includes(response.text, `<strong>${route.pageLabel}</strong>`, scope, 'labels the current product area');
-      report.includes(response.text, 'data-session-seconds', scope, 'renders the session timer hook');
-      report.includes(response.text, 'data-session-status', scope, 'renders the session status hook');
+      report.includes(response.text, 'Authenticated for this gateway run', scope, 'labels the process-scoped browser session');
+      report.check(!response.text.includes('data-session-seconds'), scope, 'does not render an idle session timer');
       report.includes(response.text, 'aria-label="Mobile primary"', scope, 'renders labeled mobile navigation');
       if (MOBILE_MORE_ROUTE_IDS.has(route.id)) {
         report.includes(

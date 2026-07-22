@@ -333,7 +333,6 @@ async fn workbench_user(
     let origin = dashboard_origin_from_headers(&headers);
     let html = render_dashboard_product_page(
         &gateway,
-        3_600,
         &origin,
         &dashboard_query,
         DashboardProductPage::Home,
@@ -401,7 +400,6 @@ async fn workbench_provider(
     let origin = dashboard_origin_from_headers(&headers);
     let html = render_dashboard_product_page(
         &gateway,
-        3_600,
         &origin,
         &dashboard_query,
         DashboardProductPage::Earn,
@@ -420,7 +418,6 @@ async fn workbench_network(
     let origin = dashboard_origin_from_headers(&headers);
     let html = render_dashboard_product_page(
         &gateway,
-        3_600,
         &origin,
         &dashboard_query,
         DashboardProductPage::Network,
@@ -448,8 +445,7 @@ async fn workbench_product_page(
     let gateway = gateway_for_query(&state, scenario, &query);
     let dashboard_query = query.dashboard_query();
     let origin = dashboard_origin_from_headers(&headers);
-    let html =
-        render_dashboard_product_page(&gateway, 3_600, &origin, &dashboard_query, product_page);
+    let html = render_dashboard_product_page(&gateway, &origin, &dashboard_query, product_page);
     let base_path = format!("/mayhem/dashboard/{}", page.trim_matches('/'));
     workbench_product_response(html, scenario, &base_path)
 }

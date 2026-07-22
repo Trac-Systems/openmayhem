@@ -732,17 +732,11 @@ try {
   await sessionPage.clock.install({ time: Date.now() });
   await sessionPage.goto(`${baseUrl}/mayhem/dashboard/playground?scenario=showcase`, { waitUntil: 'domcontentloaded' });
   await waitForDashboardReady(sessionPage);
-  const sessionSeconds = Number.parseInt(await sessionPage.locator('[data-session-seconds]').getAttribute('data-session-seconds') || '', 10);
-  check(Number.isFinite(sessionSeconds) && sessionSeconds > 60, 'session renewal', 'starts with a renewable browser session');
-  await sessionPage.locator('[data-playground-prompt]').fill('Keep this draft while extending the session.');
-  await sessionPage.clock.fastForward(Math.max(1, sessionSeconds - 59) * 1000);
-  const sessionWarning = sessionPage.locator('[data-session-warning]');
-  await sessionWarning.waitFor();
-  check(await sessionWarning.getByRole('button', { name: 'Extend session' }).isVisible(), 'session renewal', 'warns before the authentication cliff with an in-place action');
-  await sessionWarning.getByRole('button', { name: 'Extend session' }).click();
-  await sessionWarning.waitFor({ state: 'detached' });
-  equal(await sessionPage.locator('[data-playground-prompt]').inputValue(), 'Keep this draft while extending the session.', 'session renewal', 'preserves the active draft during renewal');
-  check((await sessionPage.locator('[data-session-seconds]').innerText()).includes('active'), 'session renewal', 'returns the visible session state to active');
+  check((await sessionPage.locator('.app-footer .mono').innerText()).includes('Authenticated for this gateway run'), 'gateway session', 'labels authentication as gateway-process scoped');
+  await sessionPage.locator('[data-playground-prompt]').fill('Keep this draft while the provider dashboard stays open.');
+  await sessionPage.clock.fastForward(2 * 24 * 60 * 60 * 1000);
+  check(await sessionPage.locator('[data-session-warning], [data-session-expired]').count() === 0, 'gateway session', 'does not introduce an idle authentication warning after two days');
+  equal(await sessionPage.locator('[data-playground-prompt]').inputValue(), 'Keep this draft while the provider dashboard stays open.', 'gateway session', 'preserves the active draft without session renewal');
   await sessionContext.close();
 
   const freshnessContext = await browser.newContext();

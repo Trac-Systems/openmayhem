@@ -792,6 +792,12 @@ http://127.0.0.1:11435/mayhem/dashboard?token=<generated-token>
 http://127.0.0.1:11435/mayhem/dashboard/provider?token=<generated-token>
 ```
 
+Open the tokenized URL once for each gateway run. The gateway exchanges it for an
+HttpOnly browser cookie and redirects to a clean dashboard URL. That browser remains
+authenticated without an idle timeout, including after closing and reopening it, for
+as long as the same gateway process is running. Restarting the gateway rotates both
+secrets, so the newly printed URL must be opened once again.
+
 When Mayhem runs on a remote machine, forward the same loopback port and then open the URL printed
 by `mayhem up`:
 
