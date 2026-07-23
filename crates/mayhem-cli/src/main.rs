@@ -87,10 +87,10 @@ use mayhem_gateway::{
     },
     rate_gate_basis_au, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_au,
     HardwareQuoteVerifierCommand, HeartbeatModalityCapacity, HeartbeatReceiver,
-    ModalityRequestLoad, ProviderProbation, RateMapEntry,
-    DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS, DEFAULT_OPEN_TIMEOUT_MILLIS,
-    DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, HEARTBEAT_SCHEMA_VERSION, INPUT_TOKEN_UNIT,
-    MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS, OUTPUT_TOKEN_UNIT,
+    ModalityRequestLoad, ProviderProbation, RateMapEntry, ADMIN_RELAY_CONNECT_BUDGET_MILLIS,
+    ADMIN_RELAY_RESULT_BUDGET_MILLIS, DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS,
+    DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, HEARTBEAT_SCHEMA_VERSION,
+    INPUT_TOKEN_UNIT, MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS, OUTPUT_TOKEN_UNIT,
 };
 use mayhem_hwprobe::{
     human_report, model_memory_fit, probe, BackendVerdict, FixtureProfile, GpuBackend, GpuInfo,
@@ -271,6 +271,9 @@ const DEFAULT_PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT_MILLIS: u64 = 15_000;
 const DEFAULT_PROVIDER_SC_BRIDGE_LIVENESS_INTERVAL_MILLIS: u64 = 10_000;
 const DEFAULT_PROVIDER_ADMISSION_RELAY_RETRY_WINDOW_MILLIS: u64 = 30_000;
 const DEFAULT_PROVIDER_ADMISSION_RELAY_RETRY_INTERVAL_MILLIS: u64 = 2_000;
+const DEFAULT_PROVIDER_ADMISSION_TIMEOUT_MILLIS: u64 =
+    ADMIN_RELAY_CONNECT_BUDGET_MILLIS + ADMIN_RELAY_RESULT_BUDGET_MILLIS;
+const DEFAULT_PROVIDER_SESSION_REJECT_REPLAY_MAX: usize = 4_096;
 const DEFAULT_PROVIDER_HEARTBEAT_INTERVAL_MILLIS: u64 = 2_000;
 const DEFAULT_PROVIDER_HEARTBEAT_RECONNECT_INITIAL_MILLIS: u64 = 250;
 const DEFAULT_PROVIDER_HEARTBEAT_RECONNECT_MAX_MILLIS: u64 = 5_000;
@@ -45851,6 +45854,14 @@ struct ProviderSessionAcceptReplay {
     accept_frame: Value,
 }
 
+#[derive(Clone, Debug)]
+struct ProviderSessionRejectReplay {
+    remote: String,
+    open_head: String,
+    reject_frame: Value,
+    expires_at: Instant,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum ProviderSessionReplayDecision {
     Cached(Value),
@@ -45894,6 +45905,60 @@ fn provider_session_replay_decision(
         Some(_) => ProviderSessionReplayDecision::Conflict,
         None => ProviderSessionReplayDecision::Pending,
     })
+}
+
+fn provider_session_reject_replay_decision(
+    replay: &ProviderSessionRejectReplay,
+    remote: &str,
+    open_frame: &Value,
+) -> Result<ProviderSessionReplayDecision> {
+    let replay_head =
+        session_frame_head(open_frame).context("hashing replayed rejected s.open frame")?;
+    Ok(
+        if replay.remote != remote || replay.open_head != replay_head {
+            ProviderSessionReplayDecision::Conflict
+        } else {
+            ProviderSessionReplayDecision::Cached(replay.reject_frame.clone())
+        },
+    )
+}
+
+fn prune_provider_session_reject_replays(
+    replays: &mut HashMap<String, ProviderSessionRejectReplay>,
+    now: Instant,
+) {
+    replays.retain(|_, replay| replay.expires_at > now);
+}
+
+fn cache_provider_session_reject(
+    replays: &mut HashMap<String, ProviderSessionRejectReplay>,
+    session_id: String,
+    remote: String,
+    open_frame: &Value,
+    reject_frame: Value,
+    expires_at: Instant,
+) -> Result<()> {
+    prune_provider_session_reject_replays(replays, Instant::now());
+    if replays.len() >= DEFAULT_PROVIDER_SESSION_REJECT_REPLAY_MAX {
+        if let Some(oldest) = replays
+            .iter()
+            .min_by_key(|(_, replay)| replay.expires_at)
+            .map(|(session_id, _)| session_id.clone())
+        {
+            replays.remove(&oldest);
+        }
+    }
+    replays.insert(
+        session_id,
+        ProviderSessionRejectReplay {
+            remote,
+            open_head: session_frame_head(open_frame)
+                .context("hashing rejected s.open frame for replay")?,
+            reject_frame,
+            expires_at,
+        },
+    );
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -60345,6 +60410,7 @@ async fn serve_provider_sessions(
     let component_poll_interval =
         provider_heartbeat_reconnect_initial.min(bridge_liveness_interval);
     let request_stall_timeout = provider_session_request_timeout()?;
+    let admission_timeout = provider_session_admission_timeout()?;
     let session_bridge_operation_deadline = provider_session_bridge_operation_deadline()?;
     let (max_request_bytes, max_payload_chunks) = provider_session_request_limits(&terms)?;
     let mut bridge = reconnect_provider_session_bridge(
@@ -60423,6 +60489,7 @@ async fn serve_provider_sessions(
     let deadline = (ctx.args.serve_sessions_seconds > 0)
         .then(|| Instant::now() + Duration::from_secs(ctx.args.serve_sessions_seconds));
     let mut sessions = HashMap::new();
+    let mut rejected_sessions = HashMap::new();
     let mut pending_requests = HashMap::new();
     let mut pending_payloads = HashMap::new();
     let mut protection = ProviderProtectionState::new(protection_config);
@@ -60709,6 +60776,7 @@ async fn serve_provider_sessions(
                     if let Err(err) = handle_provider_session_frame(
                         &mut bridge,
                         &mut sessions,
+                        &mut rejected_sessions,
                         &mut pending_requests,
                         &mut pending_payloads,
                         &heartbeat_load,
@@ -60719,6 +60787,7 @@ async fn serve_provider_sessions(
                         &sc_bridge_url,
                         &sc_bridge_token,
                         session_bridge_operation_deadline,
+                        admission_timeout,
                         responder.as_mut(),
                         &mut engine_recovery,
                         session_reject,
@@ -61833,6 +61902,28 @@ fn provider_session_request_timeout() -> Result<Duration> {
     provider_session_request_timeout_from(configured.as_deref())
 }
 
+fn provider_session_admission_timeout() -> Result<Duration> {
+    provider_session_admission_timeout_from(
+        std::env::var("MAYHEM_PROVIDER_ADMISSION_TIMEOUT_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn provider_session_admission_timeout_from(configured: Option<&str>) -> Result<Duration> {
+    let millis = match configured {
+        Some(value) => value.trim().parse::<u64>().with_context(|| {
+            "MAYHEM_PROVIDER_ADMISSION_TIMEOUT_MS must be a positive integer in milliseconds"
+        })?,
+        None => DEFAULT_PROVIDER_ADMISSION_TIMEOUT_MILLIS,
+    };
+    ensure!(
+        millis > 0,
+        "MAYHEM_PROVIDER_ADMISSION_TIMEOUT_MS must be positive"
+    );
+    Ok(Duration::from_millis(millis))
+}
+
 /// Deadline for one loopback SC-Bridge request/reply on the provider session bridge.
 /// This bounds control operations (session_send/session_open/peer_connect acks), NOT
 /// inference or streaming duration; a reply that never arrives means the local
@@ -61951,6 +62042,7 @@ fn record_provider_session_request_progress(
 async fn handle_provider_session_frame(
     bridge: &mut ScBridgeClient,
     sessions: &mut HashMap<String, ActiveProviderSession>,
+    rejected_sessions: &mut HashMap<String, ProviderSessionRejectReplay>,
     pending_requests: &mut HashMap<String, Instant>,
     pending_payloads: &mut HashMap<String, PendingProviderPayload>,
     heartbeat_load: &ProviderHeartbeatLoad,
@@ -61961,6 +62053,7 @@ async fn handle_provider_session_frame(
     sc_bridge_url: &str,
     sc_bridge_token: &str,
     bridge_operation_deadline: Option<Duration>,
+    admission_timeout: Duration,
     responder: &mut dyn ProviderSessionResponder,
     engine_recovery: &mut ProviderEngineRecovery,
     runtime_floor_reject: Option<ProviderRuntimeFloorRejection>,
@@ -62061,6 +62154,33 @@ async fn handle_provider_session_frame(
             send_result?;
         }
         "s.open" => {
+            prune_provider_session_reject_replays(rejected_sessions, Instant::now());
+            if let Some(replay) = rejected_sessions.get(&session_id) {
+                match provider_session_reject_replay_decision(replay, &remote, &frame)? {
+                    ProviderSessionReplayDecision::Cached(reject_frame) => {
+                        provider_session_debug(format!(
+                            "replaying cached s.reject for terminal session {session_id} after transport reconnect"
+                        ));
+                        open_provider_direct_session(bridge, &remote, &session_id)
+                            .await
+                            .context("reopening rejected provider session for replay")?;
+                        let send_result = bridge
+                            .session_send(&remote, &session_id, reject_frame)
+                            .await
+                            .context("replaying cached s.reject");
+                        let _ = bridge.session_close(&remote, &session_id).await;
+                        send_result?;
+                    }
+                    ProviderSessionReplayDecision::Conflict
+                    | ProviderSessionReplayDecision::Pending => {
+                        provider_session_debug(format!(
+                            "refusing changed s.open replay for terminal session {session_id} from {remote}"
+                        ));
+                        let _ = bridge.session_close(&remote, &session_id).await;
+                    }
+                }
+                return Ok(());
+            }
             if let Some(existing) = sessions.get(&session_id) {
                 if existing.remote != remote {
                     provider_session_debug(format!(
@@ -62161,15 +62281,28 @@ async fn handle_provider_session_frame(
                         );
                         match live_decision {
                             ProviderSessionDecision::Accept => {
-                                provider_session_spend_reservation_decision(
-                                    runtime.rpc,
-                                    runtime.keypair_path,
-                                    runtime.password,
-                                    terms,
-                                    &frame,
-                                    &session_rail,
+                                match tokio::time::timeout(
+                                    admission_timeout,
+                                    provider_session_spend_reservation_decision(
+                                        runtime.rpc,
+                                        runtime.keypair_path,
+                                        runtime.password,
+                                        terms,
+                                        &frame,
+                                        &session_rail,
+                                    ),
                                 )
-                                .await?
+                                .await
+                                {
+                                    Ok(decision) => decision?,
+                                    Err(_) => ProviderSessionDecision::Reject {
+                                        code: "BALANCE",
+                                        reason: format!(
+                                            "spend reservation did not complete within the {} ms provider admission budget; no work was served",
+                                            admission_timeout.as_millis()
+                                        ),
+                                    },
+                                }
                             }
                             reject => reject,
                         }
@@ -62296,21 +62429,26 @@ async fn handle_provider_session_frame(
                     provider_session_debug(format!(
                         "sending s.reject {code} for session {session_id}: {reason}"
                     ));
+                    let reject_frame = json!({
+                        "t": "s.reject",
+                        "v": 1,
+                        "expected_contract_version": terms.contract_version,
+                        "session_id": session_id,
+                        "code": code,
+                        "reason": reason,
+                        "retry_after_ms": 0,
+                        "alt_rooms": [],
+                    });
+                    cache_provider_session_reject(
+                        rejected_sessions,
+                        session_id.clone(),
+                        remote.clone(),
+                        &frame,
+                        reject_frame.clone(),
+                        Instant::now() + request_stall_timeout,
+                    )?;
                     bridge
-                        .session_send(
-                            &remote,
-                            &session_id,
-                            json!({
-                                "t": "s.reject",
-                                "v": 1,
-                                "expected_contract_version": terms.contract_version,
-                                "session_id": session_id,
-                                "code": code,
-                                "reason": reason,
-                                "retry_after_ms": 0,
-                                "alt_rooms": [],
-                            }),
-                        )
+                        .session_send(&remote, &session_id, reject_frame)
                         .await
                         .context("sending s.reject")?;
                     bridge
@@ -82054,6 +82192,78 @@ esac
             provider_session_replay_decision(&active, &open_frame).unwrap(),
             ProviderSessionReplayDecision::Pending
         );
+    }
+
+    #[test]
+    fn provider_session_replays_only_the_identical_cached_reject() {
+        let terms = test_provider_session_terms();
+        let open_frame = test_session_open_frame(&terms);
+        let session_id = open_frame["session_id"].as_str().unwrap().to_owned();
+        let remote = "22".repeat(32);
+        let reject_frame = json!({
+            "t": "s.reject",
+            "session_id": session_id,
+            "code": "BALANCE",
+        });
+        let now = Instant::now();
+        let mut rejected = HashMap::new();
+        cache_provider_session_reject(
+            &mut rejected,
+            session_id.clone(),
+            remote.clone(),
+            &open_frame,
+            reject_frame.clone(),
+            now + Duration::from_secs(30),
+        )
+        .unwrap();
+
+        assert_eq!(
+            provider_session_reject_replay_decision(
+                rejected.get(&session_id).unwrap(),
+                &remote,
+                &open_frame,
+            )
+            .unwrap(),
+            ProviderSessionReplayDecision::Cached(reject_frame)
+        );
+
+        let mut changed = open_frame.clone();
+        changed["nonce"] = json!("changed");
+        assert_eq!(
+            provider_session_reject_replay_decision(
+                rejected.get(&session_id).unwrap(),
+                &remote,
+                &changed,
+            )
+            .unwrap(),
+            ProviderSessionReplayDecision::Conflict
+        );
+        assert_eq!(
+            provider_session_reject_replay_decision(
+                rejected.get(&session_id).unwrap(),
+                &"33".repeat(32),
+                &open_frame,
+            )
+            .unwrap(),
+            ProviderSessionReplayDecision::Conflict
+        );
+
+        prune_provider_session_reject_replays(&mut rejected, now + Duration::from_secs(31));
+        assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn provider_admission_timeout_uses_the_gateway_open_budget() {
+        assert_eq!(
+            provider_session_admission_timeout_from(None).unwrap(),
+            Duration::from_millis(DEFAULT_PROVIDER_ADMISSION_TIMEOUT_MILLIS)
+        );
+        assert!(DEFAULT_PROVIDER_ADMISSION_TIMEOUT_MILLIS < DEFAULT_OPEN_TIMEOUT_MILLIS);
+        assert_eq!(
+            provider_session_admission_timeout_from(Some("1234")).unwrap(),
+            Duration::from_millis(1_234)
+        );
+        assert!(provider_session_admission_timeout_from(Some("0")).is_err());
     }
 
     #[test]
