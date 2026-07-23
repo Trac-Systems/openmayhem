@@ -203,6 +203,7 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
             .arg("venv")
             .arg("--python")
             .arg(MANAGED_PYTHON_VERSION)
+            .arg("--seed")
             .arg(&venv)
             .env("UV_PYTHON_INSTALL_DIR", &python_install_dir)
             .env("UV_CACHE_DIR", &uv_cache)
@@ -242,12 +243,13 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
             )
         })?;
         let managed_python = venv_python(&venv);
-        let mut install_command = Command::new(&uv);
+        let mut install_command = Command::new(&managed_python);
         install_command
+            .arg("-m")
             .arg("pip")
             .arg("install")
-            .arg("--python")
-            .arg(&managed_python);
+            .arg("--disable-pip-version-check")
+            .arg("--no-input");
         for extra_index_url in spec.extra_index_urls {
             install_command
                 .arg("--extra-index-url")
@@ -256,12 +258,12 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
         let install = install_command
             .arg("--requirement")
             .arg(&requirements_path)
-            .env("UV_CACHE_DIR", &uv_cache)
-            .env("UV_NO_PROGRESS", "1")
+            .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+            .env("PIP_NO_INPUT", "1")
             .output()
             .with_context(|| {
                 format!(
-                    "starting uv pip for managed {} runtime {}",
+                    "starting pip for managed {} runtime {}",
                     spec.backend,
                     managed_python.display()
                 )
