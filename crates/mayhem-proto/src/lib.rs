@@ -387,11 +387,28 @@ pub enum EndpointSpecialityTarget {
     BackendParameter,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointSpecialitySelector {
+    #[default]
+    Exact,
+    NonEmpty,
+}
+
+impl EndpointSpecialitySelector {
+    #[must_use]
+    pub fn is_exact(&self) -> bool {
+        *self == Self::Exact
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EndpointSpecialityMapping {
     pub request_path: String,
     pub target: EndpointSpecialityTarget,
     pub native_path: String,
+    #[serde(default, skip_serializing_if = "EndpointSpecialitySelector::is_exact")]
+    pub selector: EndpointSpecialitySelector,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -414,6 +431,40 @@ pub struct ModelSpecialityLevel {
     pub default_max_output_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_reasoning_tokens: Option<u32>,
+}
+
+#[must_use]
+pub fn endpoint_speciality_effective_native_value(
+    mapping: &EndpointSpecialityMapping,
+    submitted: Option<&Value>,
+) -> Option<Value> {
+    match mapping.selector {
+        EndpointSpecialitySelector::Exact => submitted.cloned(),
+        EndpointSpecialitySelector::NonEmpty => Some(Value::Bool(match submitted {
+            None | Some(Value::Null) => false,
+            Some(Value::String(value)) => !value.is_empty(),
+            Some(Value::Array(value)) => !value.is_empty(),
+            Some(Value::Object(value)) => !value.is_empty(),
+            Some(_) => true,
+        })),
+    }
+}
+
+#[must_use]
+pub fn endpoint_speciality_level_for_request<'a>(
+    descriptor: &'a ModelSpecialityDescriptor,
+    mapping: &EndpointSpecialityMapping,
+    submitted: Option<&Value>,
+) -> Option<&'a ModelSpecialityLevel> {
+    match endpoint_speciality_effective_native_value(mapping, submitted) {
+        Some(submitted) => descriptor.levels.iter().find(|level| {
+            submitted.as_str() == Some(level.name.as_str()) || submitted == level.native_value
+        }),
+        None => descriptor
+            .levels
+            .iter()
+            .find(|level| level.name == descriptor.default_level),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2268,6 +2319,78 @@ mod tests {
     #[test]
     fn exposes_crate_name() {
         assert_eq!(CRATE_NAME, "mayhem-proto");
+    }
+
+    fn binary_speciality_descriptor() -> ModelSpecialityDescriptor {
+        ModelSpecialityDescriptor {
+            name: "optional_capability".to_owned(),
+            mechanism: "boolean".to_owned(),
+            default_level: "off".to_owned(),
+            levels: vec![
+                ModelSpecialityLevel {
+                    name: "off".to_owned(),
+                    rank: 0,
+                    native_value: json!(false),
+                    default_max_output_tokens: None,
+                    max_reasoning_tokens: None,
+                },
+                ModelSpecialityLevel {
+                    name: "on".to_owned(),
+                    rank: 1,
+                    native_value: json!(true),
+                    default_max_output_tokens: None,
+                    max_reasoning_tokens: None,
+                },
+            ],
+            calibration_modalities: Vec::new(),
+            research_evidence: vec!["test fixture".to_owned()],
+        }
+    }
+
+    #[test]
+    fn exact_speciality_selector_keeps_existing_mapping_json_byte_identical() {
+        let original = r#"{"request_path":"reasoning_effort","target":"chat_template_kwarg","native_path":"reasoning_effort"}"#;
+        let mapping: EndpointSpecialityMapping = serde_json::from_str(original).unwrap();
+
+        assert_eq!(mapping.selector, EndpointSpecialitySelector::Exact);
+        assert_eq!(serde_json::to_string(&mapping).unwrap(), original);
+    }
+
+    #[test]
+    fn non_empty_speciality_selector_maps_presence_to_binary_native_values() {
+        let descriptor = binary_speciality_descriptor();
+        let mapping = EndpointSpecialityMapping {
+            request_path: "negative_prompt".to_owned(),
+            target: EndpointSpecialityTarget::BackendParameter,
+            native_path: "negative_prompt".to_owned(),
+            selector: EndpointSpecialitySelector::NonEmpty,
+        };
+        for empty in [
+            None,
+            Some(&Value::Null),
+            Some(&json!("")),
+            Some(&json!([])),
+            Some(&json!({})),
+        ] {
+            assert_eq!(
+                endpoint_speciality_level_for_request(&descriptor, &mapping, empty)
+                    .map(|level| level.name.as_str()),
+                Some("off")
+            );
+        }
+        for non_empty in [
+            Some(&json!("detail")),
+            Some(&json!(["detail"])),
+            Some(&json!({"value": "detail"})),
+            Some(&json!(0)),
+            Some(&json!(false)),
+        ] {
+            assert_eq!(
+                endpoint_speciality_level_for_request(&descriptor, &mapping, non_empty)
+                    .map(|level| level.name.as_str()),
+                Some("on")
+            );
+        }
     }
 
     #[test]

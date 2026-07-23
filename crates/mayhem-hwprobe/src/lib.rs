@@ -20,6 +20,9 @@ const ACE_STEP_CUDA_FULL_OFFLOAD_FLOOR: u64 = 20 * GIB;
 const ACE_STEP_APPLE_UNIFIED_MEMORY_FLOOR: u64 = 16 * GIB;
 const TRANSFORMERS_ASR_RAM_FLOOR: u64 = 8 * GIB;
 const TRANSFORMERS_ASR_CUDA_MEMORY_FLOOR: u64 = 4 * GIB;
+const SULPHUR_NVIDIA_PARTIAL_OFFLOAD_FLOOR: u64 = 16 * GIB;
+const SULPHUR_NVIDIA_FULL_OFFLOAD_FLOOR: u64 = 24 * GIB;
+const SULPHUR_APPLE_UNIFIED_MEMORY_FLOOR: u64 = 64 * GIB;
 
 #[derive(Debug, Clone)]
 pub struct ProbeOptions {
@@ -318,6 +321,7 @@ fn compute_backend_verdicts(profile: &HardwareProfile) -> Vec<BackendVerdict> {
         transformers_asr_verdict(profile),
         whisper_cpp_verdict(profile),
         piper_verdict(profile),
+        sulphur_verdict(profile),
     ]
 }
 
@@ -459,6 +463,127 @@ fn nvidia_memory_reason_suffix(profile: &HardwareProfile, gpus: &[&GpuInfo]) -> 
 
 fn nvidia_gpu_uses_host_unified_memory(profile: &HardwareProfile, gpu: &GpuInfo) -> bool {
     gpu.unified_memory || nvidia_host_unified_memory_signal(&profile.host, gpu)
+}
+
+fn sulphur_verdict(profile: &HardwareProfile) -> BackendVerdict {
+    if profile.host.os == "macos" && profile.host.arch == "aarch64" {
+        let has_apple_mlx = profile.gpus.iter().any(|gpu| {
+            gpu.vendor == GpuVendor::Apple
+                && gpu.backend == GpuBackend::Metal
+                && gpu.unified_memory
+                && profile.memory.unified_memory
+        });
+        if !has_apple_mlx {
+            return insufficient(
+                "sulphur",
+                "Sulphur on macOS arm64 requires Apple Silicon Metal with unified memory; no CPU fallback is claimed",
+            );
+        }
+
+        let available = profile
+            .memory
+            .available_bytes
+            .unwrap_or(profile.memory.total_bytes);
+        if available < SULPHUR_APPLE_UNIFIED_MEMORY_FLOOR {
+            return insufficient(
+                "sulphur",
+                &format!(
+                    "Sulphur MLX requires at least 64 GiB available unified memory; {} is available, and no CPU fallback is claimed",
+                    format_bytes(available)
+                ),
+            );
+        }
+
+        return BackendVerdict {
+            backend: "sulphur".to_owned(),
+            status: VerdictStatus::FullOffload,
+            reason: Some(format!(
+                "Apple Silicon MLX hardware path has {} available unified memory; admission remains artifact-calibration-gated",
+                format_bytes(available)
+            )),
+            est_tok_s: None,
+            n_layers_gpu: None,
+            max_sessions: 1,
+            kv_cache_bytes_budget: 0,
+        };
+    }
+
+    let nvidia_platform = matches!(
+        (profile.host.os.as_str(), profile.host.arch.as_str()),
+        ("windows", "x86_64") | ("linux", "x86_64") | ("linux", "aarch64")
+    );
+    if !nvidia_platform {
+        return insufficient(
+            "sulphur",
+            &format!(
+                "Sulphur has no supported accelerator runtime for {}/{} and no CPU fallback is claimed",
+                profile.host.os, profile.host.arch
+            ),
+        );
+    }
+
+    let nvidia = profile
+        .gpus
+        .iter()
+        .filter(|gpu| gpu.vendor == GpuVendor::Nvidia && gpu.backend == GpuBackend::Nvml)
+        .collect::<Vec<_>>();
+    let best_cuda_memory = nvidia
+        .iter()
+        .map(|gpu| {
+            let unified = nvidia_gpu_uses_host_unified_memory(profile, gpu);
+            let memory = if unified {
+                profile
+                    .memory
+                    .available_bytes
+                    .unwrap_or(profile.memory.total_bytes)
+            } else {
+                gpu.dedicated_memory_bytes.or(gpu.memory_bytes).unwrap_or(0)
+            };
+            (memory, unified)
+        })
+        .max();
+    let Some((cuda_memory, unified)) = best_cuda_memory else {
+        return insufficient(
+            "sulphur",
+            "Sulphur on this platform requires an NVIDIA CUDA GPU; no CPU fallback is claimed",
+        );
+    };
+
+    let memory_kind = if unified {
+        "available unified memory"
+    } else {
+        "dedicated device memory"
+    };
+    let status = if cuda_memory >= SULPHUR_NVIDIA_FULL_OFFLOAD_FLOOR {
+        VerdictStatus::FullOffload
+    } else if cuda_memory >= SULPHUR_NVIDIA_PARTIAL_OFFLOAD_FLOOR {
+        VerdictStatus::PartialOffload
+    } else {
+        return insufficient(
+            "sulphur",
+            &format!(
+                "Sulphur CUDA GGUF requires at least 16 GiB usable accelerator memory for conservative partial offload and 24 GiB for full offload; {} {} is detected, and no CPU fallback is claimed{}",
+                format_bytes(cuda_memory),
+                memory_kind,
+                nvidia_memory_reason_suffix(profile, &nvidia)
+            ),
+        );
+    };
+
+    BackendVerdict {
+        backend: "sulphur".to_owned(),
+        status,
+        reason: Some(format!(
+            "NVIDIA CUDA GGUF hardware path has {} {}; admission remains artifact-calibration-gated{}",
+            format_bytes(cuda_memory),
+            memory_kind,
+            nvidia_memory_reason_suffix(profile, &nvidia)
+        )),
+        est_tok_s: None,
+        n_layers_gpu: None,
+        max_sessions: 1,
+        kv_cache_bytes_budget: 0,
+    }
 }
 
 fn os_memory_reserve_bytes(memory_bytes: u64, unified: bool) -> u64 {
@@ -2523,6 +2648,133 @@ mod tests {
             .unwrap();
 
         assert!(large_layers > small_layers);
+    }
+
+    #[test]
+    fn sulphur_verdict_is_appended_without_changing_backend_precedence() {
+        for (fixture, selected) in [
+            (FixtureProfile::AppleSilicon, "mlx"),
+            (FixtureProfile::LinuxNvidia, "vllm"),
+            (FixtureProfile::LinuxNvidiaArm64, "vllm"),
+            (FixtureProfile::WindowsNvidia, "llama.cpp"),
+        ] {
+            let report = fixture_report(fixture);
+            assert_eq!(report.selected_backend.as_deref(), Some(selected));
+            assert_eq!(
+                report
+                    .backend_verdicts
+                    .last()
+                    .map(|verdict| verdict.backend.as_str()),
+                Some("sulphur")
+            );
+        }
+    }
+
+    #[test]
+    fn sulphur_windows_x86_64_cuda_uses_only_dedicated_memory() {
+        let profile = fixture_profile(FixtureProfile::WindowsNvidia, Path::new("."));
+        let verdict = sulphur_verdict(&profile);
+
+        assert_eq!(verdict.status, VerdictStatus::FullOffload);
+        assert_eq!(verdict.est_tok_s, None);
+        assert_eq!(verdict.n_layers_gpu, None);
+        assert_eq!(verdict.max_sessions, 1);
+        assert_eq!(verdict.kv_cache_bytes_budget, 0);
+        let reason = verdict.reason.unwrap_or_default();
+        assert!(reason.contains("CUDA GGUF"));
+        assert!(reason.contains("24.0 GiB dedicated device memory"));
+        assert!(reason.contains("artifact-calibration-gated"));
+
+        let mut partial = fixture_profile(FixtureProfile::WindowsNvidia, Path::new("."));
+        partial.gpus[0].memory_bytes = Some(20 * GIB);
+        partial.gpus[0].dedicated_memory_bytes = Some(20 * GIB);
+        partial.gpus[0].shared_memory_bytes = Some(128 * GIB);
+        assert_eq!(
+            sulphur_verdict(&partial).status,
+            VerdictStatus::PartialOffload
+        );
+
+        let mut insufficient = partial;
+        insufficient.gpus[0].memory_bytes = Some(12 * GIB);
+        insufficient.gpus[0].dedicated_memory_bytes = Some(12 * GIB);
+        let verdict = sulphur_verdict(&insufficient);
+        assert_eq!(verdict.status, VerdictStatus::Insufficient);
+        let reason = verdict.reason.unwrap_or_default();
+        assert!(reason.contains("12.0 GiB dedicated device memory"));
+        assert!(reason.contains("WDDM shared GPU memory"));
+        assert!(reason.contains("no CPU fallback"));
+    }
+
+    #[test]
+    fn sulphur_linux_cuda_supports_x86_64_and_gb10_aarch64() {
+        for fixture in [
+            FixtureProfile::LinuxNvidia,
+            FixtureProfile::LinuxNvidiaArm64,
+        ] {
+            let profile = fixture_profile(fixture, Path::new("."));
+            let verdict = sulphur_verdict(&profile);
+            assert_eq!(verdict.status, VerdictStatus::FullOffload);
+            assert_eq!(verdict.est_tok_s, None);
+            assert_eq!(verdict.max_sessions, 1);
+            assert!(verdict
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("artifact-calibration-gated"));
+
+            let mut insufficient = profile;
+            for gpu in &mut insufficient.gpus {
+                gpu.memory_bytes = Some(12 * GIB);
+                gpu.dedicated_memory_bytes = Some(12 * GIB);
+            }
+            insufficient.memory.available_bytes = Some(12 * GIB);
+            let verdict = sulphur_verdict(&insufficient);
+            assert_eq!(verdict.status, VerdictStatus::Insufficient);
+            assert!(verdict
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no CPU fallback"));
+        }
+    }
+
+    #[test]
+    fn sulphur_macos_arm64_mlx_requires_64_gib_available_unified_memory() {
+        let insufficient = fixture_profile(FixtureProfile::AppleSilicon, Path::new("."));
+        let verdict = sulphur_verdict(&insufficient);
+        assert_eq!(verdict.status, VerdictStatus::Insufficient);
+        assert!(verdict
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("52.0 GiB is available"));
+
+        let mut viable = insufficient;
+        viable.memory.total_bytes = 96 * GIB;
+        viable.memory.available_bytes = Some(64 * GIB);
+        viable.gpus[0].memory_bytes = Some(96 * GIB);
+        let verdict = sulphur_verdict(&viable);
+        assert_eq!(verdict.status, VerdictStatus::FullOffload);
+        assert_eq!(verdict.est_tok_s, None);
+        assert_eq!(verdict.max_sessions, 1);
+        let reason = verdict.reason.unwrap_or_default();
+        assert!(reason.contains("Apple Silicon MLX"));
+        assert!(reason.contains("64.0 GiB available unified memory"));
+        assert!(reason.contains("artifact-calibration-gated"));
+    }
+
+    #[test]
+    fn sulphur_never_claims_a_cpu_fallback() {
+        let profile = fixture_profile(FixtureProfile::CpuOnly, Path::new("."));
+        let verdict = sulphur_verdict(&profile);
+
+        assert_eq!(verdict.status, VerdictStatus::Insufficient);
+        assert_eq!(verdict.max_sessions, 0);
+        assert!(verdict
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no CPU fallback"));
     }
 
     #[test]

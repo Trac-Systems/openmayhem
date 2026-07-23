@@ -214,6 +214,7 @@ pub enum SandboxPlatform {
 #[derive(Clone, Debug)]
 pub struct SandboxConfig {
     pub read_only_dirs: Vec<PathBuf>,
+    pub materialized_read_only_dirs: Vec<PathBuf>,
     pub writable_dirs: Vec<PathBuf>,
 }
 
@@ -571,8 +572,30 @@ impl SandboxConfig {
     pub fn new(read_only_dirs: Vec<PathBuf>, writable_dirs: Vec<PathBuf>) -> Self {
         Self {
             read_only_dirs,
+            materialized_read_only_dirs: Vec::new(),
             writable_dirs,
         }
+    }
+
+    pub fn materialized_read_only_dir(&mut self, path: impl Into<PathBuf>) -> &mut Self {
+        self.materialized_read_only_dirs.push(path.into());
+        self
+    }
+}
+
+#[cfg(test)]
+mod sandbox_config_tests {
+    use super::SandboxConfig;
+    use std::path::PathBuf;
+
+    #[test]
+    fn materialized_read_only_trees_are_explicit() {
+        let model = PathBuf::from("model");
+        let mut config = SandboxConfig::new(vec![model.clone()], vec![PathBuf::from("cache")]);
+
+        assert!(config.materialized_read_only_dirs.is_empty());
+        config.materialized_read_only_dir(&model);
+        assert_eq!(config.materialized_read_only_dirs, vec![model]);
     }
 }
 
@@ -2354,15 +2377,13 @@ fn bounded_ratio_f64(numerator: f64, denominator: f64) -> f64 {
 
 fn macos_sandbox_exec_profile(config: &SandboxConfig) -> String {
     let mut profile = String::from("(version 1)\n(allow default)\n(deny network*)\n");
-    if config.writable_dirs.is_empty() {
-        profile.push_str("(deny file-write*)\n");
-    } else {
-        profile.push_str("(deny file-write*\n  (require-not\n    (require-any\n");
-        for path in &config.writable_dirs {
-            profile.push_str(&format!("      (subpath {})\n", sandbox_quote_path(path)));
-        }
-        profile.push_str("    )))\n");
+    profile.push_str("(deny file-write*\n  (require-not\n    (require-any\n");
+    profile.push_str("      (literal \"/dev/null\")\n");
+    for path in &config.writable_dirs {
+        profile.push_str(&format!("      (subpath {})\n", sandbox_quote_path(path)));
     }
+    profile.push_str("    )))\n");
+    profile.push_str("(allow file-read* file-write* (literal \"/dev/null\"))\n");
     for path in &config.read_only_dirs {
         let path = sandbox_quote_path(path);
         profile.push_str(&format!(
@@ -2475,6 +2496,7 @@ fn spawn_platform_sandboxed_child(
         let child = mayhem_windows_sandbox::spawn_appcontainer(
             &mayhem_windows_sandbox::WindowsSandboxConfig {
                 read_only_dirs: config.read_only_dirs.clone(),
+                materialized_read_only_dirs: config.materialized_read_only_dirs.clone(),
                 writable_dirs: config.writable_dirs.clone(),
                 memory_limit_bytes: command.memory_limit_bytes,
             },
@@ -2669,6 +2691,7 @@ fn run_platform_sandbox(config: &SandboxConfig, command: &[String]) -> Result<Ex
         let report = mayhem_windows_sandbox::run_appcontainer(
             &mayhem_windows_sandbox::WindowsSandboxConfig {
                 read_only_dirs: config.read_only_dirs.clone(),
+                materialized_read_only_dirs: config.materialized_read_only_dirs.clone(),
                 writable_dirs: config.writable_dirs.clone(),
                 memory_limit_bytes: None,
             },
@@ -3525,6 +3548,9 @@ mod tests {
         assert!(profile.policy.contains("source-root"));
         assert!(profile.policy.contains("worker-cache"));
         assert!(profile.policy.contains("(require-not"));
+        assert!(profile
+            .policy
+            .contains("(allow file-read* file-write* (literal \"/dev/null\"))"));
         Ok(())
     }
 

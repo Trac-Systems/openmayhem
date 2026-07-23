@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -25,6 +25,7 @@ const JOB_ID_DOMAIN: &[u8] = b"mayhem-gateway-job-id-v1";
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum GatewayJobStatus {
+    ReconciliationPending,
     Completed,
     Cancelled,
     Failed,
@@ -33,6 +34,7 @@ pub(crate) enum GatewayJobStatus {
 impl GatewayJobStatus {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::ReconciliationPending => "reconciliation_pending",
             Self::Completed => "completed",
             Self::Cancelled => "cancelled",
             Self::Failed => "failed",
@@ -163,6 +165,7 @@ pub(crate) struct GatewayJobStore {
     records: BTreeMap<String, StoredGatewayJob>,
     sealed_sizes: BTreeMap<String, usize>,
     active: BTreeMap<String, ActiveGatewayJob>,
+    reconciling: BTreeSet<String>,
     total_bytes: usize,
     max_jobs: usize,
     max_bytes: usize,
@@ -182,6 +185,7 @@ impl GatewayJobStore {
             records: BTreeMap::new(),
             sealed_sizes: BTreeMap::new(),
             active: BTreeMap::new(),
+            reconciling: BTreeSet::new(),
             total_bytes: 0,
             max_jobs: max_jobs.max(1),
             max_bytes: max_bytes.max(1),
@@ -256,12 +260,15 @@ impl GatewayJobStore {
             let Some(evict) = self
                 .records
                 .values()
+                .filter(|job| !self.reconciling.contains(&job.id))
                 .min_by_key(|job| (job.finished_at, job.id.clone()))
                 .map(|job| job.id.clone())
             else {
                 return Err(format!(
-                    "gateway job vault already has {} active job(s), at its configured limit of {}",
-                    self.active.len(),
+                    "gateway job vault has {} active job(s) or reconciliation-pending job(s), at its configured limit of {}",
+                    self.active.len().saturating_add(
+                        self.reconciling.len()
+                    ),
                     self.max_jobs
                 ));
             };
@@ -288,7 +295,11 @@ impl GatewayJobStore {
                 && existing.receipt == receipt
                 && existing.error == error
             {
-                return Ok(existing.clone());
+                let existing = existing.clone();
+                if status == GatewayJobStatus::ReconciliationPending {
+                    self.reconciling.insert(id.to_owned());
+                }
+                return Ok(existing);
             }
             return Err(format!("job {id} already has a different terminal result"));
         }
@@ -322,10 +333,75 @@ impl GatewayJobStore {
                 self.max_bytes
             ));
         }
+        self.make_room_for_bytes(sealed.len(), None)?;
         self.persist_new(&job.id, &sealed)?;
         self.active.remove(id);
         self.total_bytes = self.total_bytes.saturating_add(sealed.len());
         self.sealed_sizes.insert(job.id.clone(), sealed.len());
+        self.records.insert(job.id.clone(), job.clone());
+        if job.status == GatewayJobStatus::ReconciliationPending {
+            self.reconciling.insert(job.id.clone());
+        }
+        self.enforce_bounds(Some(&job.id))?;
+        Ok(job)
+    }
+
+    pub(crate) fn finish_reconciliation(
+        &mut self,
+        id: &str,
+        status: GatewayJobStatus,
+        error: Option<String>,
+        now: u64,
+    ) -> Result<StoredGatewayJob, String> {
+        if !matches!(
+            status,
+            GatewayJobStatus::Completed | GatewayJobStatus::Cancelled
+        ) {
+            return Err(format!(
+                "job {id} reconciliation cannot finish as {}",
+                status.as_str()
+            ));
+        }
+        let existing = self
+            .records
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("job {id} has no durable reconciliation state"))?;
+        if existing.status == status && existing.error == error {
+            self.reconciling.remove(id);
+            return Ok(existing);
+        }
+        if existing.status != GatewayJobStatus::ReconciliationPending {
+            return Err(format!(
+                "job {id} cannot finish reconciliation from {}",
+                existing.status.as_str()
+            ));
+        }
+        let mut job = existing;
+        job.status = status;
+        job.finished_at = now;
+        job.expires_at = now.saturating_add(self.ttl_seconds);
+        job.error = error;
+        let sealed = seal_job(&self.key, &job)?;
+        if sealed.len() > self.max_bytes {
+            return Err(format!(
+                "job {} needs {} encrypted bytes, above the {}-byte job-vault limit",
+                job.id,
+                sealed.len(),
+                self.max_bytes
+            ));
+        }
+        self.make_room_for_bytes(sealed.len(), Some(id))?;
+        self.persist_replace(&job.id, &sealed)?;
+        let previous_size = self
+            .sealed_sizes
+            .insert(job.id.clone(), sealed.len())
+            .unwrap_or(0);
+        self.total_bytes = self
+            .total_bytes
+            .saturating_sub(previous_size)
+            .saturating_add(sealed.len());
+        self.reconciling.remove(id);
         self.records.insert(job.id.clone(), job.clone());
         self.enforce_bounds(Some(&job.id))?;
         Ok(job)
@@ -412,6 +488,11 @@ impl GatewayJobStore {
         if job.owner_token_id.as_deref() != owner_token_id {
             return Ok(None);
         }
+        if self.reconciling.contains(id) {
+            return Err(format!(
+                "job {id} cannot be removed while receipt reconciliation is pending"
+            ));
+        }
         let job = self.records.remove(id).expect("checked job exists");
         self.remove_sealed_record(id)?;
         Ok(Some(job))
@@ -445,6 +526,9 @@ impl GatewayJobStore {
             if job.schema_version != JOB_SCHEMA_VERSION || job.id != id {
                 return Err(format!("encrypted job {id} has invalid identity or schema"));
             }
+            if job.status == GatewayJobStatus::ReconciliationPending {
+                self.reconciling.insert(id.to_owned());
+            }
             self.total_bytes = self.total_bytes.saturating_add(sealed.len());
             self.sealed_sizes.insert(id.to_owned(), sealed.len());
             self.records.insert(id.to_owned(), job);
@@ -462,6 +546,7 @@ impl GatewayJobStore {
             .collect::<Vec<_>>();
         for id in expired {
             self.records.remove(&id);
+            self.reconciling.remove(&id);
             self.remove_sealed_record(&id)?;
         }
         Ok(())
@@ -473,6 +558,7 @@ impl GatewayJobStore {
                 .records
                 .values()
                 .filter(|job| Some(job.id.as_str()) != preserve)
+                .filter(|job| !self.reconciling.contains(&job.id))
                 .min_by_key(|job| (job.finished_at, job.id.clone()))
                 .map(|job| job.id.clone())
             else {
@@ -484,14 +570,60 @@ impl GatewayJobStore {
         Ok(())
     }
 
+    fn make_room_for_bytes(
+        &mut self,
+        incoming_bytes: usize,
+        replacing: Option<&str>,
+    ) -> Result<(), String> {
+        let replaced_bytes = replacing
+            .and_then(|id| self.sealed_sizes.get(id))
+            .copied()
+            .unwrap_or(0);
+        while self
+            .total_bytes
+            .saturating_sub(replaced_bytes)
+            .saturating_add(incoming_bytes)
+            > self.max_bytes
+        {
+            let Some(evict) = self
+                .records
+                .values()
+                .filter(|job| Some(job.id.as_str()) != replacing)
+                .filter(|job| !self.reconciling.contains(&job.id))
+                .min_by_key(|job| (job.finished_at, job.id.clone()))
+                .map(|job| job.id.clone())
+            else {
+                return Err(format!(
+                    "gateway job vault cannot fit {incoming_bytes} encrypted bytes without evicting an active or reconciliation-pending job"
+                ));
+            };
+            self.records.remove(&evict);
+            self.remove_sealed_record(&evict)?;
+        }
+        Ok(())
+    }
+
     fn persist_new(&self, id: &str, sealed: &[u8]) -> Result<(), String> {
+        self.persist(id, sealed, false)
+    }
+
+    fn persist_replace(&self, id: &str, sealed: &[u8]) -> Result<(), String> {
+        self.persist(id, sealed, true)
+    }
+
+    fn persist(&self, id: &str, sealed: &[u8], replace: bool) -> Result<(), String> {
         let Some(directory) = self.directory.as_ref() else {
             return Ok(());
         };
         validate_job_id(id)?;
         let destination = job_path(directory, id);
-        if destination.exists() {
+        if !replace && destination.exists() {
             return Err(format!("encrypted job file already exists for {id}"));
+        }
+        if replace && !destination.exists() {
+            return Err(format!(
+                "encrypted reconciliation-pending job file is missing for {id}"
+            ));
         }
         let mut random = [0_u8; 8];
         getrandom::fill(&mut random)
@@ -831,7 +963,7 @@ mod tests {
         let seed = [7_u8; 32];
         let id = gateway_job_id(seed, Some("buyer-a"), "image", Some("idem-a")).unwrap();
         let mut store =
-            GatewayJobStore::durable(seed, directory.clone(), 8, 1024 * 1024, 60, 10).unwrap();
+            GatewayJobStore::durable(seed, directory.clone(), 1, 1024 * 1024, 60, 10).unwrap();
         assert_eq!(
             store
                 .begin(
@@ -873,6 +1005,223 @@ mod tests {
         );
         assert!(reopened.get(&id, 71).unwrap().is_none());
         assert!(!job_path(&directory, &id).exists());
+    }
+
+    #[test]
+    fn reconciliation_pending_payload_survives_restart_and_promotes_in_place() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("jobs");
+        let seed = [13_u8; 32];
+        let id = gateway_job_id(seed, Some("buyer"), "video", Some("ack-retry")).unwrap();
+        let artifact = GatewayJobArtifact {
+            id: "artifact".to_owned(),
+            content_type: "video/mp4".to_owned(),
+            bytes: b"finished-video".to_vec(),
+            blake3: blake3::hash(b"finished-video").to_hex().to_string(),
+        };
+        let result = serde_json::json!({"kind": "video_generation", "frames": 24});
+        let receipt = serde_json::json!({
+            "body": {"session_id": "session-ack-retry"},
+            "receipt_ack": {"seq": 1}
+        });
+        let mut store =
+            GatewayJobStore::durable(seed, directory.clone(), 8, 1024 * 1024, 60, 10).unwrap();
+        store
+            .begin(
+                id.clone(),
+                "video".to_owned(),
+                "model".to_owned(),
+                Some("buyer".to_owned()),
+                "request".to_owned(),
+                10,
+            )
+            .unwrap();
+        store
+            .complete(
+                &id,
+                GatewayJobStatus::ReconciliationPending,
+                Some(result.clone()),
+                vec![artifact.clone()],
+                Some(receipt.clone()),
+                Some("signed receipt acknowledgement is pending".to_owned()),
+                11,
+            )
+            .unwrap();
+        drop(store);
+
+        let mut reopened =
+            GatewayJobStore::durable(seed, directory.clone(), 1, 1024 * 1024, 60, 12).unwrap();
+        let pending = reopened.get(&id, 12).unwrap().unwrap();
+        assert_eq!(pending.status, GatewayJobStatus::ReconciliationPending);
+        assert_eq!(pending.result, Some(result.clone()));
+        assert_eq!(pending.artifacts, vec![artifact.clone()]);
+        assert_eq!(pending.receipt, Some(receipt.clone()));
+        let pressure_error = reopened
+            .begin(
+                "job_restart_pressure".to_owned(),
+                "video".to_owned(),
+                "model".to_owned(),
+                Some("buyer".to_owned()),
+                "request-pressure".to_owned(),
+                12,
+            )
+            .expect_err("restarted pending reconciliation must remain protected");
+        assert!(pressure_error.contains("reconciliation-pending"));
+        assert_eq!(
+            reopened.get(&id, 12).unwrap().unwrap().artifacts,
+            vec![artifact.clone()]
+        );
+        let completed = reopened
+            .finish_reconciliation(&id, GatewayJobStatus::Completed, None, 13)
+            .unwrap();
+        assert_eq!(completed.status, GatewayJobStatus::Completed);
+        assert_eq!(completed.result, Some(result.clone()));
+        assert_eq!(completed.artifacts, vec![artifact.clone()]);
+        assert_eq!(completed.receipt, Some(receipt.clone()));
+        assert_eq!(
+            reopened
+                .finish_reconciliation(&id, GatewayJobStatus::Completed, None, 14)
+                .unwrap(),
+            completed
+        );
+        drop(reopened);
+
+        let mut reopened =
+            GatewayJobStore::durable(seed, directory, 1, 1024 * 1024, 60, 14).unwrap();
+        let restored = reopened.get(&id, 14).unwrap().unwrap();
+        assert_eq!(restored.status, GatewayJobStatus::Completed);
+        assert_eq!(restored.result, Some(result));
+        assert_eq!(restored.artifacts, vec![artifact]);
+        assert_eq!(restored.receipt, Some(receipt));
+    }
+
+    #[test]
+    fn reconciliation_pending_job_is_not_evicted_for_new_work() {
+        let mut store = GatewayJobStore::in_memory([14_u8; 32], 1, 1024 * 1024, 60);
+        store
+            .begin(
+                "job_pending".to_owned(),
+                "image".to_owned(),
+                "model".to_owned(),
+                None,
+                "request-pending".to_owned(),
+                1,
+            )
+            .unwrap();
+        store
+            .complete(
+                "job_pending",
+                GatewayJobStatus::ReconciliationPending,
+                Some(serde_json::json!({"kind": "image_generation"})),
+                Vec::new(),
+                Some(serde_json::json!({"receipt_ack": {"seq": 1}})),
+                Some("signed receipt acknowledgement is pending".to_owned()),
+                2,
+            )
+            .unwrap();
+
+        let error = store
+            .begin(
+                "job_new".to_owned(),
+                "image".to_owned(),
+                "model".to_owned(),
+                None,
+                "request-new".to_owned(),
+                3,
+            )
+            .expect_err("pending reconciliation must not be evicted");
+        assert!(error.contains("reconciliation-pending"));
+        assert_eq!(
+            store.get("job_pending", 3).unwrap().unwrap().status,
+            GatewayJobStatus::ReconciliationPending
+        );
+
+        store
+            .finish_reconciliation("job_pending", GatewayJobStatus::Completed, None, 4)
+            .unwrap();
+        assert_eq!(
+            store
+                .begin(
+                    "job_new".to_owned(),
+                    "image".to_owned(),
+                    "model".to_owned(),
+                    None,
+                    "request-new".to_owned(),
+                    5,
+                )
+                .unwrap(),
+            BeginGatewayJob::Started
+        );
+        assert!(store.get("job_pending", 5).unwrap().is_none());
+    }
+
+    #[test]
+    fn protected_pending_jobs_keep_the_aggregate_byte_limit_hard() {
+        let mut store = GatewayJobStore::in_memory([15_u8; 32], 2, 1024 * 1024, 60);
+        store
+            .begin(
+                "job_large_pending".to_owned(),
+                "image".to_owned(),
+                "model".to_owned(),
+                None,
+                "request-large".to_owned(),
+                1,
+            )
+            .unwrap();
+        store
+            .complete(
+                "job_large_pending",
+                GatewayJobStatus::ReconciliationPending,
+                Some(serde_json::json!({"kind": "image_generation"})),
+                vec![GatewayJobArtifact {
+                    id: "artifact".to_owned(),
+                    content_type: "image/png".to_owned(),
+                    bytes: vec![7_u8; 4096],
+                    blake3: blake3::hash(&vec![7_u8; 4096]).to_hex().to_string(),
+                }],
+                Some(serde_json::json!({"receipt_ack": {"seq": 1}})),
+                Some("signed receipt acknowledgement is pending".to_owned()),
+                2,
+            )
+            .unwrap();
+        let pending_bytes = store.total_bytes;
+        store.max_bytes = pending_bytes.saturating_add(64);
+        store
+            .begin(
+                "job_byte_pressure".to_owned(),
+                "image".to_owned(),
+                "model".to_owned(),
+                None,
+                "request-pressure".to_owned(),
+                3,
+            )
+            .unwrap();
+
+        let error = store
+            .complete(
+                "job_byte_pressure",
+                GatewayJobStatus::ReconciliationPending,
+                Some(serde_json::json!({"kind": "image_generation"})),
+                Vec::new(),
+                Some(serde_json::json!({"receipt_ack": {"seq": 1}})),
+                Some("signed receipt acknowledgement is pending".to_owned()),
+                4,
+            )
+            .expect_err("byte pressure must fail closed");
+        assert!(error.contains("cannot fit"));
+        assert_eq!(store.total_bytes, pending_bytes);
+        assert!(store.total_bytes <= store.max_bytes);
+        assert_eq!(
+            store
+                .get("job_large_pending", 4)
+                .unwrap()
+                .unwrap()
+                .artifacts[0]
+                .bytes
+                .len(),
+            4096
+        );
+        assert!(store.is_active("job_byte_pressure"));
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub const CRATE_NAME: &str = "mayhem-windows-sandbox";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WindowsSandboxConfig {
     pub read_only_dirs: Vec<PathBuf>,
+    pub materialized_read_only_dirs: Vec<PathBuf>,
     pub writable_dirs: Vec<PathBuf>,
     pub memory_limit_bytes: Option<u64>,
 }

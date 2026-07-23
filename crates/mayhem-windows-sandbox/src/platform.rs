@@ -18,14 +18,14 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-    GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    GRANT_ACCESS, REVOKE_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
 };
 use windows_sys::Win32::Security::{
     CopySid, DeriveCapabilitySidsFromName, FreeSid, GetLengthSid, GetTokenInformation,
-    InitializeSecurityDescriptor, SetSecurityDescriptorDacl, TokenUser, ACL,
+    InitializeSecurityDescriptor, SetSecurityDescriptorDacl, TokenUser, ACL, CONTAINER_INHERIT_ACE,
     DACL_SECURITY_INFORMATION, NO_INHERITANCE, OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID,
     SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR, SID_AND_ATTRIBUTES,
     SUB_CONTAINERS_AND_OBJECTS_INHERIT, TOKEN_QUERY, TOKEN_USER,
@@ -97,6 +97,7 @@ pub struct WindowsSandboxChild {
 
 struct ResolvedWindowsSandboxConfig {
     read_only_dirs: Vec<PathBuf>,
+    materialized_read_only_dirs: Vec<PathBuf>,
     writable_dirs: Vec<PathBuf>,
     memory_limit_bytes: Option<u64>,
 }
@@ -160,20 +161,15 @@ pub fn spawn_appcontainer(
     let profile_name = unique_profile_name(&config.read_only_dirs[0]);
     let mut profile_capability_sids = command_capability_sids(command)?;
     let mut profile_capabilities = capability_attributes(&mut profile_capability_sids);
-    let profile = AppContainerProfile::create(&profile_name, &mut profile_capabilities)?;
+    let mut profile = AppContainerProfile::create(&profile_name, &mut profile_capabilities)?;
     drop(profile_capabilities);
     drop(profile_capability_sids);
 
-    grant_configured_directory_access(&profile.sid, &config)?;
-    grant_command_executable_access(&profile.sid, &config, command)?;
+    grant_configured_directory_access(&mut profile, &config)?;
+    grant_command_executable_access(&mut profile, &config, command)?;
     if let Some(exe) = command_executable_path_os(&command.program, command.current_dir.as_deref())
     {
-        grant_appcontainer_access(
-            &profile.sid,
-            &exe,
-            false,
-            AppContainerFileAccess::Executable,
-        )?;
+        profile.grant_access(&exe, false, AppContainerFileAccess::Executable)?;
     }
 
     let desktop = PrivateDesktop::create(&profile.sid)?;
@@ -192,14 +188,9 @@ pub fn run_appcontainer(
     let profile_name = unique_profile_name(&config.read_only_dirs[0]);
     let mut profile = AppContainerProfile::create(&profile_name, &mut [])?;
 
-    grant_configured_directory_access(&profile.sid, &config)?;
+    grant_configured_directory_access(&mut profile, &config)?;
     if let Some(exe) = command_executable_path(&command[0]) {
-        grant_appcontainer_access(
-            &profile.sid,
-            &exe,
-            false,
-            AppContainerFileAccess::Executable,
-        )?;
+        profile.grant_access(&exe, false, AppContainerFileAccess::Executable)?;
     }
 
     let mut desktop = PrivateDesktop::create(&profile.sid)?;
@@ -227,10 +218,23 @@ fn resolve_windows_sandbox_config(
         ));
     }
     let read_only_dirs = resolve_windows_sandbox_dirs("read_only_dirs", &config.read_only_dirs)?;
+    let materialized_read_only_dirs = resolve_windows_sandbox_dirs(
+        "materialized_read_only_dirs",
+        &config.materialized_read_only_dirs,
+    )?;
     let writable_dirs = resolve_windows_sandbox_dirs("writable_dirs", &config.writable_dirs)?;
     reject_windows_sandbox_overlaps(&read_only_dirs, &writable_dirs)?;
+    for (index, path) in materialized_read_only_dirs.iter().enumerate() {
+        if !read_only_dirs.contains(path) {
+            return Err(WindowsSandboxError::InvalidConfig(format!(
+                "materialized_read_only_dirs[{index}] {} must exactly match a configured read-only directory",
+                path.display()
+            )));
+        }
+    }
     Ok(ResolvedWindowsSandboxConfig {
         read_only_dirs,
+        materialized_read_only_dirs,
         writable_dirs,
         memory_limit_bytes: config.memory_limit_bytes,
     })
@@ -337,7 +341,7 @@ fn reject_windows_sandbox_overlaps(read_only: &[PathBuf], writable: &[PathBuf]) 
 }
 
 fn grant_configured_directory_access(
-    sid: &SidGuard,
+    profile: &mut AppContainerProfile,
     config: &ResolvedWindowsSandboxConfig,
 ) -> Result<()> {
     let mut granted_ancestors = Vec::new();
@@ -353,21 +357,63 @@ fn grant_configured_directory_access(
             {
                 continue;
             }
-            grant_appcontainer_access(sid, ancestor, false, AppContainerFileAccess::Traverse)?;
+            profile.grant_access(ancestor, false, AppContainerFileAccess::Traverse)?;
             granted_ancestors.push(ancestor.to_path_buf());
         }
     }
     for path in &config.read_only_dirs {
-        grant_appcontainer_access(sid, path, true, AppContainerFileAccess::ReadOnly)?;
+        profile.grant_access(path, true, AppContainerFileAccess::ReadOnly)?;
     }
     for path in &config.writable_dirs {
-        grant_appcontainer_access(sid, path, true, AppContainerFileAccess::Writable)?;
+        profile.grant_access(path, true, AppContainerFileAccess::Writable)?;
+    }
+    for path in &config.materialized_read_only_dirs {
+        grant_materialized_read_only_descendants(profile, path)?;
+    }
+    Ok(())
+}
+
+fn grant_materialized_read_only_descendants(
+    profile: &mut AppContainerProfile,
+    path: &Path,
+) -> Result<()> {
+    for entry in fs::read_dir(path).map_err(|err| {
+        WindowsSandboxError::InvalidConfig(format!(
+            "materialized read-only tree {} could not be inspected: {err}",
+            path.display()
+        ))
+    })? {
+        let entry = entry.map_err(|err| {
+            WindowsSandboxError::InvalidConfig(format!(
+                "materialized read-only tree {} could not be inspected: {err}",
+                path.display()
+            ))
+        })?;
+        let child = entry.path();
+        let metadata = fs::symlink_metadata(&child).map_err(|err| {
+            WindowsSandboxError::InvalidConfig(format!(
+                "materialized read-only entry {} could not be inspected: {err}",
+                child.display()
+            ))
+        })?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(WindowsSandboxError::InvalidConfig(format!(
+                "materialized read-only tree must not contain symlink or reparse point {}",
+                child.display()
+            )));
+        }
+        if metadata.is_dir() {
+            profile.grant_access(&child, false, AppContainerFileAccess::ReadOnlyDirectory)?;
+            grant_materialized_read_only_descendants(profile, &child)?;
+        } else {
+            profile.grant_access(&child, false, AppContainerFileAccess::ReadOnly)?;
+        }
     }
     Ok(())
 }
 
 fn grant_command_executable_access(
-    sid: &SidGuard,
+    profile: &mut AppContainerProfile,
     config: &ResolvedWindowsSandboxConfig,
     command: &WindowsSandboxCommand,
 ) -> Result<()> {
@@ -388,7 +434,7 @@ fn grant_command_executable_access(
         if granted.contains(&canonical) {
             continue;
         }
-        grant_appcontainer_access(sid, &canonical, true, AppContainerFileAccess::Executable)?;
+        profile.grant_access(&canonical, true, AppContainerFileAccess::Executable)?;
         granted.push(canonical);
     }
     Ok(())
@@ -992,8 +1038,59 @@ fn create_job_handle(memory_limit_bytes: Option<u64>) -> Result<HandleGuard> {
 enum AppContainerFileAccess {
     Traverse,
     ReadOnly,
+    ReadOnlyDirectory,
     Writable,
     Executable,
+}
+
+fn appcontainer_access_entries(
+    appcontainer_sid: PSID,
+    inherit: bool,
+    file_access: AppContainerFileAccess,
+) -> Vec<EXPLICIT_ACCESS_W> {
+    let permissions = match file_access {
+        // Python resolves directory roots through handles, which also requires
+        // read-attributes and synchronization rights on each parent.
+        AppContainerFileAccess::Traverse => FILE_GENERIC_EXECUTE,
+        AppContainerFileAccess::ReadOnly => FILE_GENERIC_READ,
+        AppContainerFileAccess::ReadOnlyDirectory => FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+        // Traverse must inherit too: workers commonly create a cache directory
+        // and then create and remove request-scoped children beneath it.
+        AppContainerFileAccess::Writable => {
+            FILE_GENERIC_READ
+                | FILE_GENERIC_WRITE
+                | FILE_GENERIC_EXECUTE
+                | FILE_DELETE_CHILD
+                | DELETE
+        }
+        AppContainerFileAccess::Executable => FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+    };
+    let mut accesses = vec![EXPLICIT_ACCESS_W {
+        grfAccessPermissions: permissions,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: if inherit {
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT | OBJECT_INHERIT_ACE
+        } else {
+            NO_INHERITANCE
+        },
+        ..Default::default()
+    }];
+    if inherit && matches!(file_access, AppContainerFileAccess::ReadOnly) {
+        accesses.push(EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_GENERIC_EXECUTE,
+            grfAccessMode: GRANT_ACCESS,
+            // Read-only trees need FILE_TRAVERSE on directories, but model
+            // files must not inherit executable access.
+            grfInheritance: CONTAINER_INHERIT_ACE,
+            ..Default::default()
+        });
+    }
+    for access in &mut accesses {
+        access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+        access.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+        access.Trustee.ptstrName = appcontainer_sid as PWSTR;
+    }
+    accesses
 }
 
 fn grant_appcontainer_access(
@@ -1021,30 +1118,68 @@ fn grant_appcontainer_access(
         return Err(win32_error("GetNamedSecurityInfoW", err));
     }
 
-    let permissions = match file_access {
-        // Python resolves directory roots through handles, which also requires
-        // read-attributes and synchronization rights on each parent.
-        AppContainerFileAccess::Traverse => FILE_GENERIC_EXECUTE,
-        AppContainerFileAccess::ReadOnly => FILE_GENERIC_READ,
-        // Traverse must inherit too: workers commonly create a cache directory
-        // and then create and remove request-scoped children beneath it.
-        AppContainerFileAccess::Writable => {
-            FILE_GENERIC_READ
-                | FILE_GENERIC_WRITE
-                | FILE_GENERIC_EXECUTE
-                | FILE_DELETE_CHILD
-                | DELETE
-        }
-        AppContainerFileAccess::Executable => FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+    let mut accesses = appcontainer_access_entries(appcontainer_sid.as_ptr(), inherit, file_access);
+
+    let mut new_dacl: *mut ACL = null_mut();
+    let err = unsafe {
+        SetEntriesInAclW(
+            u32::try_from(accesses.len()).expect("ACL entry count fits u32"),
+            accesses.as_mut_ptr(),
+            old_dacl,
+            &mut new_dacl,
+        )
     };
+    if err != 0 {
+        unsafe {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Err(win32_error("SetEntriesInAclW", err));
+    }
+
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            path_w.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            new_dacl,
+            null_mut(),
+        )
+    };
+    unsafe {
+        LocalFree(new_dacl as HLOCAL);
+        LocalFree(security_descriptor as HLOCAL);
+    }
+    if err != 0 {
+        return Err(win32_error("SetNamedSecurityInfoW", err));
+    }
+    Ok(())
+}
+
+fn revoke_appcontainer_access(appcontainer_sid: &SidGuard, path: &Path) -> Result<()> {
+    let path_w = to_wide_null(path.as_os_str());
+    let mut old_dacl: *mut ACL = null_mut();
+    let mut security_descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    let err = unsafe {
+        GetNamedSecurityInfoW(
+            path_w.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut old_dacl,
+            null_mut(),
+            &mut security_descriptor,
+        )
+    };
+    if err != 0 {
+        return Err(win32_error("GetNamedSecurityInfoW", err));
+    }
+
     let mut access = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: permissions,
-        grfAccessMode: GRANT_ACCESS,
-        grfInheritance: if inherit {
-            SUB_CONTAINERS_AND_OBJECTS_INHERIT | OBJECT_INHERIT_ACE
-        } else {
-            NO_INHERITANCE
-        },
+        grfAccessMode: REVOKE_ACCESS,
+        grfInheritance: NO_INHERITANCE,
         ..Default::default()
     };
     access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
@@ -1052,7 +1187,7 @@ fn grant_appcontainer_access(
     access.Trustee.ptstrName = appcontainer_sid.as_ptr() as PWSTR;
 
     let mut new_dacl: *mut ACL = null_mut();
-    let err = unsafe { SetEntriesInAclW(1, &access, old_dacl, &mut new_dacl) };
+    let err = unsafe { SetEntriesInAclW(1, &mut access, old_dacl, &mut new_dacl) };
     if err != 0 {
         unsafe {
             LocalFree(security_descriptor as HLOCAL);
@@ -1084,6 +1219,7 @@ fn grant_appcontainer_access(
 struct AppContainerProfile {
     name: Vec<u16>,
     sid: SidGuard,
+    granted_paths: Vec<PathBuf>,
     deleted: bool,
 }
 
@@ -1124,17 +1260,46 @@ impl AppContainerProfile {
         Ok(Self {
             name: name_w,
             sid: SidGuard::new(sid),
+            granted_paths: Vec::new(),
             deleted: false,
         })
     }
 
+    fn grant_access(
+        &mut self,
+        path: &Path,
+        inherit: bool,
+        file_access: AppContainerFileAccess,
+    ) -> Result<()> {
+        grant_appcontainer_access(&self.sid, path, inherit, file_access)?;
+        if !self.granted_paths.iter().any(|granted| granted == path) {
+            self.granted_paths.push(path.to_path_buf());
+        }
+        Ok(())
+    }
+
+    fn revoke_granted_access(&mut self) -> Result<()> {
+        let mut first_error = None;
+        for path in &self.granted_paths {
+            if let Err(error) = revoke_appcontainer_access(&self.sid, path) {
+                first_error.get_or_insert(error);
+            }
+        }
+        self.granted_paths.clear();
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     fn delete(&mut self) -> Result<()> {
+        let revoke_result = self.revoke_granted_access();
         let hr = unsafe { DeleteAppContainerProfile(self.name.as_ptr()) };
         if hr_failed(hr) {
             return Err(hresult_error("DeleteAppContainerProfile", hr));
         }
         self.deleted = true;
-        Ok(())
+        revoke_result
     }
 }
 
@@ -1553,6 +1718,9 @@ fn last_error(api: &str) -> WindowsSandboxError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Security::{
+        CreateWellKnownSid, GetAce, WinWorldSid, ACCESS_ALLOWED_ACE, SECURITY_MAX_SID_SIZE,
+    };
 
     #[test]
     fn windows_command_line_quotes_spaces_and_quotes() {
@@ -1563,5 +1731,98 @@ mod tests {
             ]),
             r#""C:\Program Files\Mayhem\mayhem.exe" "hello \"world\"""#
         );
+    }
+
+    #[test]
+    fn read_only_acl_traverses_directories_without_making_files_executable() {
+        let accesses =
+            appcontainer_access_entries(null_mut(), true, AppContainerFileAccess::ReadOnly);
+
+        assert_eq!(accesses.len(), 2);
+        assert_eq!(accesses[0].grfAccessPermissions, FILE_GENERIC_READ);
+        assert_ne!(accesses[0].grfInheritance & OBJECT_INHERIT_ACE, 0);
+        assert_eq!(accesses[1].grfAccessPermissions, FILE_GENERIC_EXECUTE);
+        assert_eq!(accesses[1].grfInheritance, CONTAINER_INHERIT_ACE);
+        assert_eq!(accesses[1].grfInheritance & OBJECT_INHERIT_ACE, 0);
+    }
+
+    #[test]
+    fn non_inheriting_read_only_acl_does_not_add_directory_traverse_entry() {
+        let accesses =
+            appcontainer_access_entries(null_mut(), false, AppContainerFileAccess::ReadOnly);
+
+        assert_eq!(accesses.len(), 1);
+        assert_eq!(accesses[0].grfAccessPermissions, FILE_GENERIC_READ);
+        assert_eq!(accesses[0].grfInheritance, NO_INHERITANCE);
+    }
+
+    #[test]
+    fn materialized_directory_acl_is_readable_and_traversable_without_inheritance() {
+        let accesses = appcontainer_access_entries(
+            null_mut(),
+            false,
+            AppContainerFileAccess::ReadOnlyDirectory,
+        );
+
+        assert_eq!(accesses.len(), 1);
+        assert_eq!(
+            accesses[0].grfAccessPermissions,
+            FILE_GENERIC_READ | FILE_GENERIC_EXECUTE
+        );
+        assert_eq!(accesses[0].grfInheritance, NO_INHERITANCE);
+    }
+
+    #[test]
+    fn windows_acl_keeps_read_and_directory_traverse_as_distinct_aces() {
+        let mut sid = [0_u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut sid_size = sid.len() as u32;
+        assert_ne!(
+            unsafe {
+                CreateWellKnownSid(
+                    WinWorldSid,
+                    null_mut(),
+                    sid.as_mut_ptr().cast(),
+                    &mut sid_size,
+                )
+            },
+            0
+        );
+
+        let mut accesses = appcontainer_access_entries(
+            sid.as_mut_ptr().cast(),
+            true,
+            AppContainerFileAccess::ReadOnly,
+        );
+        let mut acl: *mut ACL = null_mut();
+        assert_eq!(
+            unsafe {
+                SetEntriesInAclW(
+                    u32::try_from(accesses.len()).unwrap(),
+                    accesses.as_mut_ptr(),
+                    null_mut(),
+                    &mut acl,
+                )
+            },
+            0
+        );
+        assert!(!acl.is_null());
+        assert_eq!(unsafe { (*acl).AceCount }, 2);
+
+        let mut actual = Vec::new();
+        for index in 0..2 {
+            let mut raw_ace = null_mut();
+            assert_ne!(unsafe { GetAce(acl, index, &mut raw_ace) }, 0);
+            let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
+            actual.push((ace.Mask, u32::from(ace.Header.AceFlags)));
+        }
+        unsafe {
+            LocalFree(acl as HLOCAL);
+        }
+
+        assert!(actual.contains(&(
+            FILE_GENERIC_READ,
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT | OBJECT_INHERIT_ACE
+        )));
+        assert!(actual.contains(&(FILE_GENERIC_EXECUTE, CONTAINER_INHERIT_ACE)));
     }
 }

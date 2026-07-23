@@ -564,6 +564,26 @@ mod tests {
             10_000_000_000_000_000
         );
 
+        let sulphur_rate_map = vec![
+            RateMapEntry {
+                unit: USAGE_VIDEO_SECOND.to_owned(),
+                per_unit_au: 30_000_000_000_000_000,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_FRAME.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+        ];
+        assert_eq!(
+            usage_units_au(
+                &sulphur_rate_map,
+                &[(USAGE_VIDEO_SECOND, 5), (USAGE_FRAME, 121)]
+            ),
+            150_000_000_000_000_121
+        );
+
         let embedding_rate_map = vec![RateMapEntry {
             unit: USAGE_INPUT_TOKEN.to_owned(),
             per_unit_au: 4_000_000_000_000_000,

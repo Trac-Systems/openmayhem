@@ -23,6 +23,7 @@ pub const DEFAULT_SEED: u32 = 0x4d415948;
 pub const MTMD_MEDIA_MARKER: &str = "<__media__>";
 #[cfg(any(
     feature = "ace-step",
+    feature = "sulphur",
     feature = "mlx",
     feature = "vllm",
     feature = "trt-llm",
@@ -66,6 +67,8 @@ pub enum EngineError {
     TransformersAsr(String),
     #[error("ACE-Step backend error: {0}")]
     AceStep(String),
+    #[error("Sulphur backend error: {0}")]
+    Sulphur(String),
     #[error("stable-diffusion.cpp backend error: {0}")]
     StableDiffusionCpp(String),
     #[error("whisper.cpp backend error: {0}")]
@@ -250,6 +253,8 @@ pub struct ModelArtifact {
     pub format: ArtifactFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -302,6 +307,7 @@ impl ModelArtifact {
             path: path.into(),
             format: ArtifactFormat::Gguf,
             sha256: None,
+            sha256_path: None,
         }
     }
 
@@ -310,6 +316,7 @@ impl ModelArtifact {
             path: path.into(),
             format: ArtifactFormat::MlxSafetensors,
             sha256: None,
+            sha256_path: None,
         }
     }
 
@@ -318,6 +325,7 @@ impl ModelArtifact {
             path: path.into(),
             format: ArtifactFormat::TensorRtLlmCheckpoint,
             sha256: None,
+            sha256_path: None,
         }
     }
 
@@ -326,6 +334,7 @@ impl ModelArtifact {
             path: path.into(),
             format: ArtifactFormat::VllmSafetensors,
             sha256: None,
+            sha256_path: None,
         }
     }
 
@@ -334,6 +343,7 @@ impl ModelArtifact {
             path: path.into(),
             format: ArtifactFormat::TransformersSafetensors,
             sha256: None,
+            sha256_path: None,
         }
     }
 
@@ -342,6 +352,7 @@ impl ModelArtifact {
             path: path.into(),
             format: ArtifactFormat::AceStepSafetensors,
             sha256: None,
+            sha256_path: None,
         }
     }
 
@@ -350,6 +361,7 @@ impl ModelArtifact {
             path: path.into(),
             format: ArtifactFormat::StableDiffusionCheckpoint,
             sha256: None,
+            sha256_path: None,
         }
     }
 
@@ -358,6 +370,7 @@ impl ModelArtifact {
             path: path.into(),
             format: ArtifactFormat::WhisperGgml,
             sha256: None,
+            sha256_path: None,
         }
     }
 
@@ -366,6 +379,7 @@ impl ModelArtifact {
             path: path.into(),
             format: ArtifactFormat::PiperVoice,
             sha256: None,
+            sha256_path: None,
         }
     }
 
@@ -374,12 +388,19 @@ impl ModelArtifact {
             path: path.into(),
             format: ArtifactFormat::PiperConfig,
             sha256: None,
+            sha256_path: None,
         }
     }
 
     #[must_use]
     pub fn with_sha256(mut self, sha256: impl Into<String>) -> Self {
         self.sha256 = Some(sha256.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_sha256_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.sha256_path = Some(path.into());
         self
     }
 }
@@ -389,6 +410,10 @@ pub struct LoadConfig {
     pub artifact: ModelArtifact,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision_projector: Option<ModelArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_enhancer_model: Option<ModelArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_enhancer_projector: Option<ModelArtifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub piper_config: Option<ModelArtifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -515,6 +540,8 @@ impl Default for LoadConfig {
         Self {
             artifact: ModelArtifact::gguf(PathBuf::new()),
             vision_projector: None,
+            prompt_enhancer_model: None,
+            prompt_enhancer_projector: None,
             piper_config: None,
             stable_diffusion_llm: None,
             stable_diffusion_vae: None,
@@ -1534,7 +1561,7 @@ pub fn verify_artifact(artifact: &ModelArtifact) -> Result<()> {
         return Err(EngineError::ModelPathMissing(artifact.path.clone()));
     }
 
-    let hash_path = match artifact.format {
+    let format_hash_path = match artifact.format {
         ArtifactFormat::Gguf => {
             verify_magic_header(&artifact.path, &artifact.format)?;
             artifact.path.clone()
@@ -1593,11 +1620,39 @@ pub fn verify_artifact(artifact: &ModelArtifact) -> Result<()> {
         }
     };
 
+    if artifact.sha256_path.is_some() && artifact.sha256.is_none() {
+        return Err(EngineError::InvalidConfig(
+            "artifact sha256_path requires an expected sha256".to_owned(),
+        ));
+    }
     if let Some(expected) = &artifact.sha256 {
-        let actual = file_sha256_hex(&hash_path)?;
+        let hash_path = artifact.sha256_path.as_ref().unwrap_or(&format_hash_path);
+        if !hash_path.is_file() {
+            return Err(EngineError::ModelPathMissing(hash_path.clone()));
+        }
+        if artifact.sha256_path.is_some() {
+            let canonical_artifact = std::fs::canonicalize(&artifact.path)?;
+            let canonical_hash_path = std::fs::canonicalize(hash_path)?;
+            let hash_path_is_bound = if canonical_artifact.is_dir() {
+                canonical_hash_path.starts_with(&canonical_artifact)
+            } else {
+                canonical_hash_path == canonical_artifact
+            };
+            if !hash_path_is_bound {
+                return Err(EngineError::InvalidConfig(format!(
+                    "artifact sha256_path {} is outside load artifact {}",
+                    hash_path.display(),
+                    artifact.path.display()
+                )));
+            }
+        }
+        if artifact.format == ArtifactFormat::MlxSafetensors && hash_path != &format_hash_path {
+            verify_safetensors_header_as(hash_path, artifact.format.label())?;
+        }
+        let actual = file_sha256_hex(hash_path)?;
         if !actual.eq_ignore_ascii_case(expected) {
             return Err(EngineError::ArtifactHashMismatch {
-                path: hash_path,
+                path: hash_path.clone(),
                 expected: expected.clone(),
                 actual,
             });
@@ -2147,6 +2202,14 @@ mod ace_step_backend;
 pub use ace_step_backend::{
     ensure_ace_step_source, AceStepBackend, AceStepExecutionConfig, ACE_STEP_SOURCE_COMMIT,
     ACE_STEP_SOURCE_SHA256,
+};
+
+#[cfg(feature = "sulphur")]
+mod sulphur_backend;
+
+#[cfg(feature = "sulphur")]
+pub use sulphur_backend::{
+    SulphurBackend, SulphurExecutionConfig, LTX_RUNTIME_COMMIT, SULPHUR_SOURCE_COMMIT,
 };
 
 #[cfg(feature = "vllm")]
@@ -9809,6 +9872,36 @@ mod tests {
 
         verify_artifact(&ModelArtifact::mlx_safetensors(&path)).expect("valid safetensors file");
         verify_artifact(&ModelArtifact::mlx_safetensors(&dir)).expect("valid safetensors dir");
+        std::fs::remove_dir_all(dir).expect("remove temp mlx dir");
+    }
+
+    #[test]
+    fn verifies_explicit_primary_hash_path_in_multi_file_mlx_layout() {
+        let dir = std::env::temp_dir().join(format!(
+            "mayhem-engine-test-{}-{}",
+            std::process::id(),
+            "mlx-explicit-primary"
+        ));
+        std::fs::create_dir_all(&dir).expect("temp mlx dir");
+        let header = br#"{"__metadata__":{}}"#;
+        let write_safetensors = |path: &Path, body: &[u8]| {
+            let mut file = File::create(path).expect("temp safetensors");
+            file.write_all(&(header.len() as u64).to_le_bytes())
+                .expect("write header length");
+            file.write_all(header).expect("write header");
+            file.write_all(body).expect("write body");
+        };
+        let auxiliary = dir.join("audio_vae.safetensors");
+        let primary = dir.join("transformer-distilled.safetensors");
+        write_safetensors(&auxiliary, b"auxiliary");
+        write_safetensors(&primary, b"primary");
+        let primary_sha256 = file_sha256_hex(&primary).expect("primary sha256");
+
+        let artifact = ModelArtifact::mlx_safetensors(&dir)
+            .with_sha256(primary_sha256)
+            .with_sha256_path(&primary);
+        verify_artifact(&artifact).expect("explicit primary hash path");
+
         std::fs::remove_dir_all(dir).expect("remove temp mlx dir");
     }
 

@@ -1316,7 +1316,8 @@ impl AceStepWorker {
         let executable_runtime_roots = runtime_roots.clone();
         let mut read_only_dirs = vec![model_root.to_path_buf(), source_root.to_path_buf()];
         read_only_dirs.extend(runtime_roots);
-        let sandbox = SandboxConfig::new(read_only_dirs, vec![cache_root.to_path_buf()]);
+        let mut sandbox = SandboxConfig::new(read_only_dirs, vec![cache_root.to_path_buf()]);
+        sandbox.materialized_read_only_dir(model_root);
         let mut command = SandboxedCommand::new(&python);
         if let Some(memory_limit_bytes) = memory_limit_bytes {
             command.memory_limit_bytes(memory_limit_bytes);

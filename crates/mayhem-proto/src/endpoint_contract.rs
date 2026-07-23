@@ -380,7 +380,22 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
             &["audio", "content_type", "usage", "mayhem"],
         ),
         ENDPOINT_OPENAI_VIDEOS => (
-            &["model", "prompt", "input_reference", "seconds", "size"],
+            &[
+                "model",
+                "prompt",
+                "input_reference",
+                "conditions",
+                "negative_prompt",
+                "n",
+                "seconds",
+                "size",
+                "width",
+                "height",
+                "num_frames",
+                "fps",
+                "seed",
+                "enhance_prompt",
+            ],
             &["model", "prompt"],
             &[
                 "id",
@@ -403,13 +418,16 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
             &[
                 "inputs",
                 "parameters.num_frames",
+                "parameters.conditions",
                 "parameters.guidance_scale",
                 "parameters.negative_prompt",
+                "parameters.n",
                 "parameters.num_inference_steps",
                 "parameters.seed",
                 "parameters.width",
                 "parameters.height",
                 "parameters.fps",
+                "parameters.enhance_prompt",
             ],
             &["inputs"],
             &["video", "content_type", "usage", "mayhem"],
@@ -708,12 +726,68 @@ fn endpoint_interaction_groups(family: &str) -> Vec<Vec<String>> {
             "instructions",
             "stream_format",
         ]],
-        ENDPOINT_OPENAI_VIDEOS => &[&["input_reference", "seconds", "size"]],
+        ENDPOINT_OPENAI_VIDEOS => &[
+            &[
+                "input_reference",
+                "size",
+                "num_frames",
+                "fps",
+                "seed",
+                "negative_prompt",
+                "n",
+            ],
+            &[
+                "conditions",
+                "size",
+                "num_frames",
+                "fps",
+                "seed",
+                "negative_prompt",
+                "n",
+            ],
+            &[
+                "input_reference",
+                "seconds",
+                "size",
+                "fps",
+                "seed",
+                "negative_prompt",
+                "n",
+            ],
+            &[
+                "conditions",
+                "width",
+                "height",
+                "num_frames",
+                "fps",
+                "seed",
+                "negative_prompt",
+                "n",
+            ],
+            &[
+                "input_reference",
+                "seconds",
+                "width",
+                "height",
+                "fps",
+                "seed",
+                "negative_prompt",
+                "n",
+            ],
+        ],
         ENDPOINT_HF_TEXT_TO_VIDEO => &[
-            &["parameters.num_frames", "parameters.num_inference_steps"],
+            &[
+                "parameters.num_frames",
+                "parameters.conditions",
+                "parameters.width",
+                "parameters.height",
+                "parameters.fps",
+                "parameters.num_inference_steps",
+            ],
             &[
                 "parameters.guidance_scale",
                 "parameters.negative_prompt",
+                "parameters.n",
                 "parameters.seed",
             ],
         ],
@@ -899,7 +973,15 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
         "instructions" => string_spec(1, 4096, json!("Speak clearly")),
         "negative_prompt" | "parameters.negative_prompt" => {
             if family == ENDPOINT_HF_TEXT_TO_VIDEO {
-                array_spec(1, 32, json!(["blur"]))
+                let mut spec = union_spec(
+                    &[EndpointValueType::String, EndpointValueType::Array],
+                    &[json!("blur"), json!(["blur"])],
+                );
+                spec.min_length = Some(0);
+                spec.max_length = Some(32_000);
+                spec.min_items = Some(1);
+                spec.max_items = Some(1);
+                spec
             } else {
                 string_spec(0, 32_000, json!("blur"))
             }
@@ -911,6 +993,16 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
         "input_reference" => union_spec(
             &[EndpointValueType::String, EndpointValueType::Object],
             &[json!("$IMAGE_FILE"), json!({"image_url":"$IMAGE_DATA_URL"})],
+        ),
+        "conditions" | "parameters.conditions" => array_spec(
+            0,
+            16,
+            json!([{
+                "image_url": "$IMAGE_DATA_URL",
+                "frame_index": 0,
+                "strength": 1.0,
+                "crf": 33
+            }]),
         ),
         "voice" => union_spec(
             &[EndpointValueType::String, EndpointValueType::Object],
@@ -960,10 +1052,11 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
         "messages.content.video.content_type" => {
             enum_spec(None, &[json!("video/mp4"), json!("video/webm")])
         }
-        "messages.content.video.num_frames" | "parameters.num_frames" => {
+        "messages.content.video.num_frames" | "num_frames" | "parameters.num_frames" => {
             integer_spec(1.0, 4096.0, 16)
         }
-        "messages.content.video.fps" | "parameters.fps" => number_spec(0.01, 240.0, 8.0),
+        "messages.content.video.fps" | "fps" | "parameters.fps" => number_spec(0.01, 240.0, 8.0),
+        "enhance_prompt" | "parameters.enhance_prompt" => boolean_spec(Some(false)),
         "encoding_format" => enum_spec(Some(json!("float")), &[json!("float"), json!("base64")]),
         "truncation_direction" => enum_spec(Some(json!("right")), &[json!("left"), json!("right")]),
         "background" => enum_spec(
@@ -1030,13 +1123,31 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
                 &[json!(false), json!(true), json!("word"), json!("segment")],
             )
         }
-        "size" if family == ENDPOINT_OPENAI_VIDEOS => enum_spec(
-            Some(json!("720x1280")),
-            &[
+        "size" if family == ENDPOINT_OPENAI_VIDEOS => {
+            let mut spec = EndpointAttributeSpec::new(EndpointValueType::String);
+            spec.calibration_values = vec![
                 json!("720x1280"),
                 json!("1280x720"),
                 json!("1024x1792"),
                 json!("1792x1024"),
+            ];
+            spec
+        }
+        "seconds" if family == ENDPOINT_OPENAI_VIDEOS => enum_spec(
+            None,
+            &[
+                json!("1"),
+                json!("2"),
+                json!("3"),
+                json!("4"),
+                json!("5"),
+                json!("6"),
+                json!("7"),
+                json!("8"),
+                json!("9"),
+                json!("10"),
+                json!("11"),
+                json!("12"),
             ],
         ),
         "seconds" => enum_spec(Some(json!("4")), &[json!("4"), json!("8"), json!("12")]),
@@ -1062,6 +1173,12 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
             &[json!(false), json!(true), json!("never")],
         ),
         "n" if family == ENDPOINT_OPENAI_IMAGE_GENERATIONS => integer_spec(1.0, 4.0, 1),
+        "n" if family == ENDPOINT_OPENAI_VIDEOS => {
+            with_default(integer_spec(1.0, 1.0, 1), json!(1))
+        }
+        "parameters.n" if family == ENDPOINT_HF_TEXT_TO_VIDEO => {
+            with_default(integer_spec(1.0, 1.0, 1), json!(1))
+        }
         "parameters.num_images_per_prompt" if family == ENDPOINT_HF_TEXT_TO_IMAGE => {
             integer_spec(1.0, 4.0, 1)
         }
@@ -1072,8 +1189,14 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
         "width" | "height" if family == ENDPOINT_OPENAI_IMAGE_GENERATIONS => {
             integer_spec(64.0, 2_048.0, 1_024)
         }
+        "width" | "height" if family == ENDPOINT_OPENAI_VIDEOS => {
+            integer_spec(64.0, 16_384.0, 1_024)
+        }
         "parameters.width" | "parameters.height" if family == ENDPOINT_HF_TEXT_TO_IMAGE => {
             integer_spec(64.0, 2_048.0, 1_024)
+        }
+        "parameters.width" | "parameters.height" if family == ENDPOINT_HF_TEXT_TO_VIDEO => {
+            integer_spec(64.0, 16_384.0, 1_024)
         }
         "cfg_scale" if family == ENDPOINT_OPENAI_IMAGE_GENERATIONS => number_spec(0.0, 50.0, 1.0),
         "parameters.guidance_scale" if family == ENDPOINT_HF_TEXT_TO_IMAGE => {
@@ -2126,7 +2249,10 @@ pub fn materialize_endpoint_request_defaults(
     } else {
         request.clone()
     };
-    let image_aliases = if contract.family == ENDPOINT_OPENAI_IMAGE_GENERATIONS {
+    let dimension_aliases = if matches!(
+        contract.family.as_str(),
+        ENDPOINT_OPENAI_IMAGE_GENERATIONS | ENDPOINT_OPENAI_VIDEOS
+    ) {
         let object = normalized
             .as_object()
             .ok_or_else(|| "endpoint request must be an object".to_owned())?;
@@ -2134,17 +2260,21 @@ pub fn materialize_endpoint_request_defaults(
         let has_width = object.contains_key("width");
         let has_height = object.contains_key("height");
         if has_size && (has_width || has_height) {
-            return Err("image request cannot combine size with width/height".to_owned());
+            return Err("request cannot combine size with width/height".to_owned());
         }
         if has_width != has_height {
-            return Err("image request width and height must be supplied together".to_owned());
+            return Err("request width and height must be supplied together".to_owned());
         }
-        Some((has_size, has_width))
+        Some((
+            has_size,
+            has_width,
+            contract.family == ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+        ))
     } else {
         None
     };
     for path in &contract.request_attributes {
-        if image_aliases.is_some_and(|(has_size, has_dimensions)| {
+        if dimension_aliases.is_some_and(|(has_size, has_dimensions, _)| {
             (has_size && matches!(path.as_str(), "width" | "height"))
                 || (has_dimensions && path == "size")
         }) {
@@ -2184,14 +2314,19 @@ pub fn materialize_endpoint_request_defaults(
         }
         set_endpoint_path(&mut normalized, path, default)?;
     }
-    if image_aliases.is_some() {
+    if let Some((_, _, require_dimensions)) = dimension_aliases {
         let object = normalized
             .as_object()
             .ok_or_else(|| "normalized endpoint request must be an object".to_owned())?;
         let has_size = object.contains_key("size");
         let has_width = object.contains_key("width");
         let has_height = object.contains_key("height");
-        if has_width != has_height || has_size == has_width {
+        if has_width != has_height || (has_size && has_width) {
+            return Err(
+                "signed endpoint contract cannot combine size with width/height".to_owned(),
+            );
+        }
+        if require_dimensions && !has_size && !has_width {
             return Err(
                 "signed image endpoint contract must resolve exactly one of size or width/height"
                     .to_owned(),
@@ -2565,6 +2700,27 @@ fn endpoint_calibration_companion_baseline(
         .unwrap_or(fallback)
 }
 
+fn endpoint_calibration_companion_maximum(
+    contract: &EndpointFamilyContract,
+    path: &str,
+    fallback: Value,
+) -> Value {
+    contract
+        .request_attribute_specs
+        .get(path)
+        .and_then(|spec| {
+            spec.calibration_values
+                .iter()
+                .chain(spec.enum_values.iter())
+                .chain(spec.default.iter())
+                .filter(|value| validate_endpoint_attribute_value(spec, value).is_ok())
+                .filter_map(|value| value.as_f64().map(|number| (number, value)))
+                .max_by(|(left, _), (right, _)| left.total_cmp(right))
+                .map(|(_, value)| value.clone())
+        })
+        .unwrap_or(fallback)
+}
+
 fn add_calibration_companion_mutations(
     contract: &EndpointFamilyContract,
     path: &str,
@@ -2593,6 +2749,9 @@ fn add_calibration_companion_mutations(
             .request_attributes
             .iter()
             .any(|declared| declared == companion_path)
+            && !(contract.family == ENDPOINT_OPENAI_VIDEOS
+                && companion_path == "num_frames"
+                && mutations.iter().any(|mutation| mutation.path == "seconds"))
             && !mutations
                 .iter()
                 .any(|mutation| mutation.path == companion_path)
@@ -2823,13 +2982,55 @@ fn add_calibration_companion_mutations(
                 ),
             );
         }
-        "width" if contract.family == ENDPOINT_OPENAI_IMAGE_GENERATIONS => add(
-            "height",
-            endpoint_calibration_companion_baseline(contract, "height", json!(1024)),
+        "seconds" if contract.family == ENDPOINT_OPENAI_VIDEOS => add(
+            "fps",
+            endpoint_calibration_companion_baseline(contract, "fps", json!(8.0)),
         ),
-        "height" if contract.family == ENDPOINT_OPENAI_IMAGE_GENERATIONS => add(
-            "width",
-            endpoint_calibration_companion_baseline(contract, "width", json!(1024)),
+        "fps" if contract.family == ENDPOINT_OPENAI_VIDEOS => add(
+            "num_frames",
+            endpoint_calibration_companion_baseline(contract, "num_frames", json!(9)),
+        ),
+        "num_frames" if contract.family == ENDPOINT_OPENAI_VIDEOS => add(
+            "fps",
+            endpoint_calibration_companion_maximum(contract, "fps", json!(8.0)),
+        ),
+        "parameters.fps" if contract.family == ENDPOINT_HF_TEXT_TO_VIDEO => add(
+            "parameters.num_frames",
+            endpoint_calibration_companion_baseline(contract, "parameters.num_frames", json!(9)),
+        ),
+        "parameters.num_frames" if contract.family == ENDPOINT_HF_TEXT_TO_VIDEO => add(
+            "parameters.fps",
+            endpoint_calibration_companion_maximum(contract, "parameters.fps", json!(8.0)),
+        ),
+        "width"
+            if matches!(
+                contract.family.as_str(),
+                ENDPOINT_OPENAI_IMAGE_GENERATIONS | ENDPOINT_OPENAI_VIDEOS
+            ) =>
+        {
+            add(
+                "height",
+                endpoint_calibration_companion_baseline(contract, "height", json!(1024)),
+            )
+        }
+        "height"
+            if matches!(
+                contract.family.as_str(),
+                ENDPOINT_OPENAI_IMAGE_GENERATIONS | ENDPOINT_OPENAI_VIDEOS
+            ) =>
+        {
+            add(
+                "width",
+                endpoint_calibration_companion_baseline(contract, "width", json!(1024)),
+            )
+        }
+        "parameters.width" if contract.family == ENDPOINT_HF_TEXT_TO_VIDEO => add(
+            "parameters.height",
+            endpoint_calibration_companion_baseline(contract, "parameters.height", json!(1024)),
+        ),
+        "parameters.height" if contract.family == ENDPOINT_HF_TEXT_TO_VIDEO => add(
+            "parameters.width",
+            endpoint_calibration_companion_baseline(contract, "parameters.width", json!(1024)),
         ),
         _ => {}
     }
@@ -3414,8 +3615,14 @@ pub fn validate_endpoint_request(
     )
     .err()
     .unwrap_or_default();
-    if contract.family == ENDPOINT_OPENAI_IMAGE_GENERATIONS {
-        validate_openai_image_dimension_aliases(contract, request, &mut violations);
+    if matches!(
+        contract.family.as_str(),
+        ENDPOINT_OPENAI_IMAGE_GENERATIONS | ENDPOINT_OPENAI_VIDEOS
+    ) {
+        validate_openai_dimension_aliases(contract, request, &mut violations);
+    }
+    if contract.family == ENDPOINT_OPENAI_VIDEOS {
+        validate_openai_video_duration_aliases(request, &mut violations);
     }
     if contract.family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
         validate_music_alias_attribute_specs(contract, raw_request, &mut violations);
@@ -4326,7 +4533,7 @@ fn base64_sextet(byte: u8) -> Option<u8> {
     }
 }
 
-fn validate_openai_image_dimension_aliases(
+fn validate_openai_dimension_aliases(
     contract: &EndpointFamilyContract,
     request: &Value,
     violations: &mut Vec<EndpointContractViolation>,
@@ -4384,6 +4591,21 @@ fn validate_openai_image_dimension_aliases(
                 reason: format!("size {path} violates the signed {path} constraint: {reason}"),
             });
         }
+    }
+}
+
+fn validate_openai_video_duration_aliases(
+    request: &Value,
+    violations: &mut Vec<EndpointContractViolation>,
+) {
+    let Some(object) = request.as_object() else {
+        return;
+    };
+    if object.contains_key("seconds") && object.contains_key("num_frames") {
+        violations.push(EndpointContractViolation {
+            path: "seconds".to_owned(),
+            reason: "seconds cannot be combined with num_frames".to_owned(),
+        });
     }
 }
 
@@ -4540,6 +4762,7 @@ fn validate_nested_endpoint_attributes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn endpoint_request_fingerprint_survives_javascript_number_serialization() {
@@ -4635,7 +4858,7 @@ mod tests {
         let seconds = &contract.request_attribute_specs["seconds"];
         assert!(validate_endpoint_attribute_value(seconds, &json!("8")).is_ok());
         assert!(validate_endpoint_attribute_value(seconds, &json!(8)).is_err());
-        assert!(validate_endpoint_attribute_value(seconds, &json!("5")).is_err());
+        assert!(validate_endpoint_attribute_value(seconds, &json!("13")).is_err());
 
         let prompt = &contract.request_attribute_specs["prompt"];
         assert!(validate_endpoint_attribute_value(prompt, &json!("")).is_err());
@@ -4733,6 +4956,208 @@ mod tests {
         assert!(conflicting
             .iter()
             .any(|violation| violation.reason.contains("cannot be combined")));
+    }
+
+    #[test]
+    fn openai_video_aliases_share_signed_dimension_constraints() {
+        let mut contract = endpoint_family_contract_template(ENDPOINT_OPENAI_VIDEOS)
+            .expect("OpenAI video endpoint contract");
+        for (path, default) in [("width", 768), ("height", 512)] {
+            let spec = contract.request_attribute_specs.get_mut(path).unwrap();
+            spec.default = Some(json!(default));
+            spec.minimum = Some(256.0);
+            spec.maximum = Some(2_048.0);
+            spec.multiple_of = Some(64.0);
+        }
+
+        let normalized = materialize_endpoint_request_defaults(
+            &contract,
+            &json!({"model":"test/video", "prompt":"a compass"}),
+        )
+        .unwrap();
+        assert_eq!(normalized["width"], json!(768));
+        assert_eq!(normalized["height"], json!(512));
+        assert!(normalized.get("size").is_none());
+
+        let explicit_size = json!({
+            "model":"test/video",
+            "prompt":"a compass",
+            "size":"512x256"
+        });
+        assert!(validate_endpoint_request(&contract, &explicit_size).is_ok());
+        let normalized = materialize_endpoint_request_defaults(&contract, &explicit_size).unwrap();
+        assert_eq!(normalized["size"], json!("512x256"));
+        assert!(normalized.get("width").is_none());
+        assert!(normalized.get("height").is_none());
+
+        let malformed = validate_endpoint_request(
+            &contract,
+            &json!({"model":"test/video", "prompt":"a compass", "size":"512-wide"}),
+        )
+        .unwrap_err();
+        assert!(malformed
+            .iter()
+            .any(|violation| violation.reason.contains("WIDTHxHEIGHT")));
+
+        let invalid_multiple = validate_endpoint_request(
+            &contract,
+            &json!({"model":"test/video", "prompt":"a compass", "size":"500x512"}),
+        )
+        .unwrap_err();
+        assert!(invalid_multiple
+            .iter()
+            .any(|violation| violation.reason.contains("multiple of 64")));
+    }
+
+    #[test]
+    fn video_calibration_pairs_dimensions_and_duration_controls() {
+        let mut contract = endpoint_family_contract_template(ENDPOINT_OPENAI_VIDEOS)
+            .expect("OpenAI video endpoint contract");
+        contract
+            .request_attribute_specs
+            .get_mut("fps")
+            .unwrap()
+            .calibration_values = vec![json!(1), json!(24), json!(50)];
+        contract
+            .request_attribute_specs
+            .get_mut("num_frames")
+            .unwrap()
+            .calibration_values = vec![json!(9), json!(497)];
+        let cases = generate_endpoint_calibration_cases(&contract).expect("video matrix");
+
+        let width_case = cases
+            .iter()
+            .find(|case| {
+                case.expect_accept
+                    && case.case_kind.starts_with("accepted_value_")
+                    && case
+                        .mutations
+                        .first()
+                        .is_some_and(|mutation| mutation.path == "width")
+            })
+            .expect("accepted width case");
+        assert!(width_case
+            .mutations
+            .iter()
+            .any(|mutation| mutation.path == "height"));
+
+        let seconds_case = cases
+            .iter()
+            .find(|case| {
+                case.expect_accept
+                    && case.case_kind.starts_with("accepted_value_")
+                    && case
+                        .mutations
+                        .first()
+                        .is_some_and(|mutation| mutation.path == "seconds")
+            })
+            .expect("accepted seconds case");
+        assert!(seconds_case
+            .mutations
+            .iter()
+            .any(|mutation| mutation.path == "fps"));
+
+        let fps_case = cases
+            .iter()
+            .find(|case| {
+                case.expect_accept
+                    && case.case_kind.starts_with("accepted_value_")
+                    && case
+                        .mutations
+                        .first()
+                        .is_some_and(|mutation| mutation.path == "fps")
+            })
+            .expect("accepted fps case");
+        assert!(fps_case
+            .mutations
+            .iter()
+            .any(|mutation| mutation.path == "num_frames"));
+
+        let frame_case = cases
+            .iter()
+            .find(|case| {
+                case.expect_accept
+                    && case.case_kind.starts_with("accepted_value_")
+                    && case.mutations.first().is_some_and(|mutation| {
+                        mutation.path == "num_frames"
+                            && mutation.value
+                                == (EndpointCalibrationValue::Literal { value: json!(497) })
+                    })
+            })
+            .expect("accepted maximum frame case");
+        assert!(frame_case.mutations.iter().any(|mutation| {
+            mutation.path == "fps"
+                && mutation.value == (EndpointCalibrationValue::Literal { value: json!(50) })
+        }));
+
+        let mut hf_contract = endpoint_family_contract_template(ENDPOINT_HF_TEXT_TO_VIDEO)
+            .expect("HF video endpoint contract");
+        hf_contract
+            .request_attribute_specs
+            .get_mut("parameters.fps")
+            .unwrap()
+            .calibration_values = vec![json!(1), json!(24), json!(50)];
+        hf_contract
+            .request_attribute_specs
+            .get_mut("parameters.num_frames")
+            .unwrap()
+            .calibration_values = vec![json!(9), json!(497)];
+        let hf_cases = generate_endpoint_calibration_cases(&hf_contract).expect("HF video matrix");
+        let hf_fps_case = hf_cases
+            .iter()
+            .find(|case| {
+                case.expect_accept
+                    && case.case_kind.starts_with("accepted_value_")
+                    && case
+                        .mutations
+                        .first()
+                        .is_some_and(|mutation| mutation.path == "parameters.fps")
+            })
+            .expect("accepted HF fps case");
+        assert!(hf_fps_case
+            .mutations
+            .iter()
+            .any(|mutation| mutation.path == "parameters.num_frames"));
+        let hf_frame_case = hf_cases
+            .iter()
+            .find(|case| {
+                case.expect_accept
+                    && case.case_kind.starts_with("accepted_value_")
+                    && case.mutations.first().is_some_and(|mutation| {
+                        mutation.path == "parameters.num_frames"
+                            && mutation.value
+                                == (EndpointCalibrationValue::Literal { value: json!(497) })
+                    })
+            })
+            .expect("accepted HF maximum frame case");
+        assert!(hf_frame_case.mutations.iter().any(|mutation| {
+            mutation.path == "parameters.fps"
+                && mutation.value == (EndpointCalibrationValue::Literal { value: json!(50) })
+        }));
+
+        assert!(cases.iter().all(|case| {
+            let paths = case
+                .mutations
+                .iter()
+                .map(|mutation| mutation.path.as_str())
+                .collect::<BTreeSet<_>>();
+            !(paths.contains("seconds") && paths.contains("num_frames"))
+        }));
+
+        let conflicting_duration = json!({
+            "model": "test/video",
+            "prompt": "a compass",
+            "seconds": "10",
+            "num_frames": 9,
+            "fps": 8
+        });
+        let violations = validate_endpoint_request(&contract, &conflicting_duration).unwrap_err();
+        assert!(violations.iter().any(|violation| {
+            violation.path == "seconds"
+                && violation
+                    .reason
+                    .contains("cannot be combined with num_frames")
+        }));
     }
 
     #[test]

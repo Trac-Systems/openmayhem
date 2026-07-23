@@ -33,11 +33,12 @@ use mayhem_proto::{
     AdminAttestationPolicy, AdminEnclaveAttestationBinding, AttestationQuoteKindPolicy,
     AttestationTrustDataKind, AttestationTrustDataRef, AttestationVerifierProfile,
     CatalogEnclaveIdentity, EndpointAttributeSpec, EndpointSpecialityMapping,
-    EndpointSpecialityTarget, EndpointValueType, HardwareQuoteKind, ModelSpecialityDescriptor,
-    ModelSpecialityLevel, ReceiptBody, ReceiptUsage, TranscriptionResult, TranscriptionTimestamp,
-    ATTESTATION_POLICY_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
-    SESSION_RECEIPT_SCHEMA_VERSION, TRANSCRIPTION_RESULT_SCHEMA_VERSION, USAGE_AUDIO_SECOND,
-    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_STEP, USAGE_VIDEO_SECOND,
+    EndpointSpecialitySelector, EndpointSpecialityTarget, EndpointValueType, HardwareQuoteKind,
+    ModelSpecialityDescriptor, ModelSpecialityLevel, ReceiptBody, ReceiptUsage,
+    TranscriptionResult, TranscriptionTimestamp, ATTESTATION_POLICY_SCHEMA_VERSION,
+    CONTRACT_VERSION, DEFAULT_MODEL_CLASS, SESSION_RECEIPT_SCHEMA_VERSION,
+    TRANSCRIPTION_RESULT_SCHEMA_VERSION, USAGE_AUDIO_SECOND, USAGE_FRAME, USAGE_IMAGE,
+    USAGE_INPUT_CHARACTER, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -1738,6 +1739,7 @@ async fn production_gateway_without_live_provider_refuses_local_chat_shim() {
     let (status, body) = json_request(app, Method::GET, "/mayhem/status", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["backend"], "no-live-provider");
+    assert_eq!(body["rail"], "fiat");
     assert_eq!(body["dev_session_shim"], false);
 }
 
@@ -2540,6 +2542,7 @@ async fn models_endpoint_and_progressive_evidence_expose_speciality_cost_and_ava
                     "low".to_owned(),
                     GatewaySpecialityCalibration {
                         fingerprint: "11".repeat(32),
+                        verification_method: None,
                         token_prefixes: BTreeMap::new(),
                         output_tokens_min: 1_000,
                         output_tokens_max: 1_000,
@@ -2551,6 +2554,7 @@ async fn models_endpoint_and_progressive_evidence_expose_speciality_cost_and_ava
                     "high".to_owned(),
                     GatewaySpecialityCalibration {
                         fingerprint: "22".repeat(32),
+                        verification_method: None,
                         token_prefixes: BTreeMap::new(),
                         output_tokens_min: 2_000,
                         output_tokens_max: 2_000,
@@ -2562,6 +2566,7 @@ async fn models_endpoint_and_progressive_evidence_expose_speciality_cost_and_ava
                     "xhigh".to_owned(),
                     GatewaySpecialityCalibration {
                         fingerprint: "33".repeat(32),
+                        verification_method: None,
                         token_prefixes: BTreeMap::new(),
                         output_tokens_min: 3_000,
                         output_tokens_max: 3_000,
@@ -5102,6 +5107,7 @@ async fn automatic_speciality_canary_binds_each_served_level_and_catches_substit
                     "low".to_owned(),
                     GatewaySpecialityCalibration {
                         fingerprint: expected_for(&[4]),
+                        verification_method: None,
                         token_prefixes: BTreeMap::from([("fixed-probe".to_owned(), vec![4])]),
                         output_tokens_min: 1,
                         output_tokens_max: 1,
@@ -5113,6 +5119,7 @@ async fn automatic_speciality_canary_binds_each_served_level_and_catches_substit
                     "high".to_owned(),
                     GatewaySpecialityCalibration {
                         fingerprint: expected_for(&[5, 5]),
+                        verification_method: None,
                         token_prefixes: BTreeMap::from([("fixed-probe".to_owned(), vec![5, 5])]),
                         output_tokens_min: 2,
                         output_tokens_max: 2,
@@ -6505,6 +6512,7 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                 embedding_vectors_by_artifact_root: BTreeMap::new(),
                 transcripts_by_artifact_root: BTreeMap::new(),
                 audio_fingerprints_by_artifact_root: BTreeMap::new(),
+                video_fingerprints_by_artifact_root: BTreeMap::new(),
                 speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
@@ -6512,6 +6520,7 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                 default_embedding_vectors: None,
                 default_transcripts: None,
                 default_audio_fingerprints: None,
+                default_video_fingerprints: None,
             },
         )]),
     }
@@ -6567,6 +6576,7 @@ fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
                 embedding_vectors_by_artifact_root: BTreeMap::new(),
                 transcripts_by_artifact_root: BTreeMap::new(),
                 audio_fingerprints_by_artifact_root: BTreeMap::new(),
+                video_fingerprints_by_artifact_root: BTreeMap::new(),
                 speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
@@ -6574,6 +6584,7 @@ fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
                 default_embedding_vectors: None,
                 default_transcripts: None,
                 default_audio_fingerprints: None,
+                default_video_fingerprints: None,
             },
         )]),
     }
@@ -6629,6 +6640,7 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
                 )]),
                 transcripts_by_artifact_root: BTreeMap::new(),
                 audio_fingerprints_by_artifact_root: BTreeMap::new(),
+                video_fingerprints_by_artifact_root: BTreeMap::new(),
                 speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
@@ -6636,6 +6648,7 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
                 default_embedding_vectors: None,
                 default_transcripts: None,
                 default_audio_fingerprints: None,
+                default_video_fingerprints: None,
             },
         )]),
     }
@@ -6701,6 +6714,7 @@ fn test_transcript_canary_registry(audio: Vec<u8>) -> GatewayCanaryRegistry {
                     ]),
                 )]),
                 audio_fingerprints_by_artifact_root: BTreeMap::new(),
+                video_fingerprints_by_artifact_root: BTreeMap::new(),
                 speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
@@ -6708,6 +6722,7 @@ fn test_transcript_canary_registry(audio: Vec<u8>) -> GatewayCanaryRegistry {
                 default_embedding_vectors: None,
                 default_transcripts: None,
                 default_audio_fingerprints: None,
+                default_video_fingerprints: None,
             },
         )]),
     }
@@ -6763,6 +6778,7 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
                     "aa".repeat(32),
                     BTreeMap::from([("fixed-tts".to_owned(), expected_fingerprint)]),
                 )]),
+                video_fingerprints_by_artifact_root: BTreeMap::new(),
                 speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
@@ -6770,6 +6786,7 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
                 default_embedding_vectors: None,
                 default_transcripts: None,
                 default_audio_fingerprints: None,
+                default_video_fingerprints: None,
             },
         )]),
     }
@@ -6841,6 +6858,7 @@ fn test_music_audio_fingerprint_canary_registry(
                     "aa".repeat(32),
                     BTreeMap::from([("fixed-music".to_owned(), expected_fingerprint)]),
                 )]),
+                video_fingerprints_by_artifact_root: BTreeMap::new(),
                 speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
@@ -6848,6 +6866,7 @@ fn test_music_audio_fingerprint_canary_registry(
                 default_embedding_vectors: None,
                 default_transcripts: None,
                 default_audio_fingerprints: None,
+                default_video_fingerprints: None,
             },
         )]),
     }
@@ -6999,6 +7018,7 @@ fn routed_test_model_with_specialities(providers: &[String]) -> GatewayModel {
                 request_path: descriptor.name.clone(),
                 target,
                 native_path: native_path.to_owned(),
+                selector: EndpointSpecialitySelector::Exact,
             },
         );
     }

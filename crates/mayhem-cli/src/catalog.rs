@@ -10,10 +10,10 @@ use mayhem_attestation::AttestationPolicyChain;
 use mayhem_gateway::MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS;
 use mayhem_proto::{
     default_model_class, AdminAttestationPolicy, AdminEnclaveAttestationBinding,
-    EndpointFamilyContract, EndpointSpecialityTarget, EndpointValueType, ModelSpecialityDescriptor,
-    MoneyAu, DEFAULT_MODEL_CLASS, ENDPOINT_OPENAI_CHAT_COMPLETIONS, USAGE_AUDIO_SECOND,
-    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
-    USAGE_STEP, USAGE_VIDEO_SECOND,
+    EndpointFamilyContract, EndpointSpecialitySelector, EndpointSpecialityTarget,
+    EndpointValueType, ModelSpecialityDescriptor, MoneyAu, DEFAULT_MODEL_CLASS,
+    ENDPOINT_OPENAI_CHAT_COMPLETIONS, USAGE_AUDIO_SECOND, USAGE_FRAME, USAGE_IMAGE,
+    USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,6 +23,7 @@ const VERIFICATION_SEED_PERCEPTUAL_HASH: &str = "seed_perceptual_hash";
 const VERIFICATION_EMBEDDING_COSINE: &str = "embedding_cosine";
 const VERIFICATION_TRANSCRIPT_MATCH: &str = "transcript_match";
 const VERIFICATION_AUDIO_FINGERPRINT: &str = "audio_fingerprint";
+const VERIFICATION_VIDEO_AV_FINGERPRINT: &str = "video_av_fingerprint";
 const VERIFICATION_ATTESTATION_OF_COMPUTE: &str = "attestation_of_compute";
 const MODEL_CLASS_EMBEDDING: &str = "embedding";
 const MODEL_CLASS_IMAGE_GENERATION: &str = "image-generation";
@@ -222,6 +223,8 @@ pub(crate) struct CatalogSpecialityAssessment {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct CatalogSpecialityCalibration {
     pub(crate) fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verification_method: Option<String>,
     pub(crate) token_prefixes: BTreeMap<String, Vec<i32>>,
     pub(crate) output_tokens_min: u64,
     pub(crate) output_tokens_max: u64,
@@ -266,7 +269,7 @@ pub(crate) struct ConversionRef {
     pub(crate) output_sha256: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CatalogArtifact {
     pub(crate) engine: String,
@@ -276,6 +279,8 @@ pub(crate) struct CatalogArtifact {
     pub(crate) mlx_runtime: mayhem_engine::MlxRuntimeConfig,
     #[serde(default)]
     pub(crate) kv_cache: Option<CatalogKvCacheProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) speciality_levels: Option<BTreeMap<String, Vec<String>>>,
     pub(crate) source: SourceRef,
     #[serde(default)]
     pub(crate) upstream_source: Option<SourceRef>,
@@ -297,6 +302,29 @@ pub(crate) struct CatalogArtifact {
     pub(crate) notes: Option<String>,
     #[serde(default)]
     pub(crate) sidecars: BTreeMap<String, CatalogArtifactSidecar>,
+}
+
+pub(crate) fn artifact_effective_speciality_levels(
+    model: &CatalogModel,
+    artifact: &CatalogArtifact,
+) -> BTreeMap<String, Vec<String>> {
+    artifact.speciality_levels.clone().unwrap_or_else(|| {
+        model
+            .adapter
+            .specialities
+            .iter()
+            .map(|descriptor| {
+                (
+                    descriptor.name.clone(),
+                    descriptor
+                        .levels
+                        .iter()
+                        .map(|level| level.name.clone())
+                        .collect(),
+                )
+            })
+            .collect()
+    })
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -423,6 +451,8 @@ pub(crate) struct CanaryRef {
     pub(crate) transcripts: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     pub(crate) audio_fingerprints: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default)]
+    pub(crate) video_fingerprints: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -500,6 +530,8 @@ struct CanarySetPrompt {
     seed: Option<u64>,
     #[serde(default)]
     max_tokens: Option<u32>,
+    #[serde(flatten)]
+    endpoint_attributes: BTreeMap<String, Value>,
 }
 
 fn default_canary_verification_method() -> String {
@@ -1309,6 +1341,7 @@ fn validate_canary_verification(model: &CatalogModel, errors: &mut Vec<String>) 
         VERIFICATION_EMBEDDING_COSINE => validate_embedding_cosine_canary(model, errors),
         VERIFICATION_TRANSCRIPT_MATCH => validate_transcript_match_canary(model, errors),
         VERIFICATION_AUDIO_FINGERPRINT => validate_audio_fingerprint_canary(model, errors),
+        VERIFICATION_VIDEO_AV_FINGERPRINT => validate_video_av_fingerprint_canary(model, errors),
         VERIFICATION_ATTESTATION_OF_COMPUTE => {
             validate_attestation_of_compute_canary(model, errors)
         }
@@ -1505,6 +1538,7 @@ fn valid_canary_verification_method(method: &str) -> bool {
             | VERIFICATION_EMBEDDING_COSINE
             | VERIFICATION_TRANSCRIPT_MATCH
             | VERIFICATION_AUDIO_FINGERPRINT
+            | VERIFICATION_VIDEO_AV_FINGERPRINT
             | VERIFICATION_ATTESTATION_OF_COMPUTE
     )
 }
@@ -1515,8 +1549,12 @@ fn canary_verification_method_allowed_for_class(model_class: &str, method: &str)
         (DEFAULT_MODEL_CLASS, VERIFICATION_TOKEN_FINGERPRINT)
             | (MODEL_CLASS_EMBEDDING, VERIFICATION_EMBEDDING_COSINE)
             | (
-                MODEL_CLASS_IMAGE_GENERATION | MODEL_CLASS_VIDEO_GENERATION,
+                MODEL_CLASS_IMAGE_GENERATION,
                 VERIFICATION_SEED_PERCEPTUAL_HASH
+            )
+            | (
+                MODEL_CLASS_VIDEO_GENERATION,
+                VERIFICATION_VIDEO_AV_FINGERPRINT
             )
             | (MODEL_CLASS_STT, VERIFICATION_TRANSCRIPT_MATCH)
             | (
@@ -1531,9 +1569,8 @@ fn required_launch_output_canary_method(model_class: &str) -> Option<&'static st
     match model_class {
         DEFAULT_MODEL_CLASS => Some(VERIFICATION_TOKEN_FINGERPRINT),
         MODEL_CLASS_EMBEDDING => Some(VERIFICATION_EMBEDDING_COSINE),
-        MODEL_CLASS_IMAGE_GENERATION | MODEL_CLASS_VIDEO_GENERATION => {
-            Some(VERIFICATION_SEED_PERCEPTUAL_HASH)
-        }
+        MODEL_CLASS_IMAGE_GENERATION => Some(VERIFICATION_SEED_PERCEPTUAL_HASH),
+        MODEL_CLASS_VIDEO_GENERATION => Some(VERIFICATION_VIDEO_AV_FINGERPRINT),
         MODEL_CLASS_STT => Some(VERIFICATION_TRANSCRIPT_MATCH),
         MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION => {
             Some(VERIFICATION_AUDIO_FINGERPRINT)
@@ -1682,7 +1719,10 @@ fn validate_seed_perceptual_hash_canary(model: &CatalogModel, errors: &mut Vec<S
 
 fn validate_embedding_cosine_canary(model: &CatalogModel, errors: &mut Vec<String>) {
     validate_text_and_image_blobs_absent(model, "embedding_cosine", errors);
-    if !model.canary.transcripts.is_empty() || !model.canary.audio_fingerprints.is_empty() {
+    if !model.canary.transcripts.is_empty()
+        || !model.canary.audio_fingerprints.is_empty()
+        || !model.canary.video_fingerprints.is_empty()
+    {
         errors.push(format!(
             "{} embedding_cosine canary must use embedding_vectors only",
             model.model_id
@@ -1716,7 +1756,10 @@ fn validate_transcript_match_canary(model: &CatalogModel, errors: &mut Vec<Strin
         ));
     }
     validate_text_and_image_blobs_absent(model, "transcript_match", errors);
-    if !model.canary.embedding_vectors.is_empty() || !model.canary.audio_fingerprints.is_empty() {
+    if !model.canary.embedding_vectors.is_empty()
+        || !model.canary.audio_fingerprints.is_empty()
+        || !model.canary.video_fingerprints.is_empty()
+    {
         errors.push(format!(
             "{} transcript_match canary must use transcripts only",
             model.model_id
@@ -1755,7 +1798,10 @@ fn validate_audio_fingerprint_canary(model: &CatalogModel, errors: &mut Vec<Stri
         )),
     }
     validate_text_and_image_blobs_absent(model, "audio_fingerprint", errors);
-    if !model.canary.embedding_vectors.is_empty() || !model.canary.transcripts.is_empty() {
+    if !model.canary.embedding_vectors.is_empty()
+        || !model.canary.transcripts.is_empty()
+        || !model.canary.video_fingerprints.is_empty()
+    {
         errors.push(format!(
             "{} audio_fingerprint canary must use audio_fingerprints only",
             model.model_id
@@ -1781,6 +1827,48 @@ fn validate_audio_fingerprint_canary(model: &CatalogModel, errors: &mut Vec<Stri
     );
 }
 
+fn validate_video_av_fingerprint_canary(model: &CatalogModel, errors: &mut Vec<String>) {
+    match model.canary.verification_tolerance_bps {
+        Some(0..=2_500) => {}
+        Some(_) => errors.push(format!(
+            "{} video_av_fingerprint canary verification_tolerance_bps must be between 0 and 2500",
+            model.model_id
+        )),
+        None => errors.push(format!(
+            "{} video_av_fingerprint canary requires verification_tolerance_bps",
+            model.model_id
+        )),
+    }
+    validate_text_and_image_blobs_absent(model, "video_av_fingerprint", errors);
+    if !model.canary.embedding_vectors.is_empty()
+        || !model.canary.transcripts.is_empty()
+        || !model.canary.audio_fingerprints.is_empty()
+    {
+        errors.push(format!(
+            "{} video_av_fingerprint canary must use video_fingerprints only",
+            model.model_id
+        ));
+    }
+    validate_prompt_map_complete(
+        model,
+        "video_fingerprints",
+        &model.canary.video_fingerprints,
+        errors,
+        |model_id, artifact, prompt_id, fingerprint, errors| {
+            if prompt_id.trim().is_empty() {
+                errors.push(format!(
+                    "{model_id} canary video_fingerprints for {artifact} has empty prompt id"
+                ));
+            }
+            if !mayhem_gateway::valid_video_av_fingerprint(fingerprint) {
+                errors.push(format!(
+                    "{model_id} canary video_fingerprints for {artifact} prompt {prompt_id} must be a valid videoav-v1 decoded A/V fingerprint"
+                ));
+            }
+        },
+    );
+}
+
 fn validate_attestation_of_compute_canary(model: &CatalogModel, errors: &mut Vec<String>) {
     if model.canary.verification_tolerance_bps.is_some() {
         errors.push(format!(
@@ -1794,6 +1882,7 @@ fn validate_attestation_of_compute_canary(model: &CatalogModel, errors: &mut Vec
         || !model.canary.embedding_vectors.is_empty()
         || !model.canary.transcripts.is_empty()
         || !model.canary.audio_fingerprints.is_empty()
+        || !model.canary.video_fingerprints.is_empty()
     {
         errors.push(format!(
             "{} attestation_of_compute canary must not carry output calibration blobs",
@@ -1822,9 +1911,10 @@ fn validate_no_non_text_canary_blobs(model: &CatalogModel, method: &str, errors:
     if !model.canary.embedding_vectors.is_empty()
         || !model.canary.transcripts.is_empty()
         || !model.canary.audio_fingerprints.is_empty()
+        || !model.canary.video_fingerprints.is_empty()
     {
         errors.push(format!(
-            "{} {method} canary must not set embedding_vectors, transcripts, or audio_fingerprints",
+            "{} {method} canary must not set embedding_vectors, transcripts, audio_fingerprints, or video_fingerprints",
             model.model_id
         ));
     }
@@ -2098,6 +2188,8 @@ fn validate_model_specialities(model: &CatalogModel, errors: &mut Vec<String>) {
         }
     }
 
+    validate_artifact_speciality_levels(model, &descriptors, errors);
+
     for contract in &model.adapter.endpoint_families {
         for (name, mapping) in &contract.speciality_mappings {
             let Some(descriptor) = descriptors.get(name.as_str()) else {
@@ -2149,11 +2241,42 @@ fn validate_model_specialities(model: &CatalogModel, errors: &mut Vec<String>) {
                 && expected_native_values
                     .iter()
                     .all(|value| spec.calibration_values.contains(value));
-            if !level_name_contract && !native_value_contract {
-                errors.push(format!(
-                    "{} endpoint family {} speciality {} request spec must expose exactly its signed level names or native values, default, and calibration values",
-                    model.model_id, contract.family, name
-                ));
+            match mapping.selector {
+                EndpointSpecialitySelector::Exact => {
+                    if !level_name_contract && !native_value_contract {
+                        errors.push(format!(
+                            "{} endpoint family {} speciality {} request spec must expose exactly its signed level names or native values, default, and calibration values",
+                            model.model_id, contract.family, name
+                        ));
+                    }
+                }
+                EndpointSpecialitySelector::NonEmpty => {
+                    let native_bools = descriptor
+                        .levels
+                        .iter()
+                        .filter_map(|level| level.native_value.as_bool())
+                        .collect::<BTreeSet<_>>();
+                    if descriptor.levels.len() != 2
+                        || native_bools != BTreeSet::from([false, true])
+                        || default_native_value.and_then(Value::as_bool) != Some(false)
+                    {
+                        errors.push(format!(
+                            "{} endpoint family {} speciality {} non_empty selector requires exactly false/true native levels with false as the default",
+                            model.model_id, contract.family, name
+                        ));
+                    }
+                    if spec.default.as_ref().is_some_and(|default| {
+                        mayhem_proto::endpoint_speciality_effective_native_value(
+                            mapping,
+                            Some(default),
+                        ) != Some(Value::Bool(false))
+                    }) {
+                        errors.push(format!(
+                            "{} endpoint family {} speciality {} non_empty selector default must be absent or empty",
+                            model.model_id, contract.family, name
+                        ));
+                    }
+                }
             }
             if mapping.target == EndpointSpecialityTarget::PromptSuffix
                 && descriptor
@@ -2178,6 +2301,64 @@ fn validate_model_specialities(model: &CatalogModel, errors: &mut Vec<String>) {
     }
 
     validate_speciality_calibrations(model, &descriptors, errors);
+}
+
+fn validate_artifact_speciality_levels(
+    model: &CatalogModel,
+    descriptors: &BTreeMap<&str, &ModelSpecialityDescriptor>,
+    errors: &mut Vec<String>,
+) {
+    for (artifact_name, artifact) in &model.artifacts {
+        let effective = artifact_effective_speciality_levels(model, artifact);
+        for name in effective.keys() {
+            if !descriptors.contains_key(name.as_str()) {
+                errors.push(format!(
+                    "{} artifact {} speciality_levels references unknown speciality {}",
+                    model.model_id, artifact_name, name
+                ));
+            }
+        }
+        for descriptor in descriptors.values() {
+            let Some(levels) = effective.get(&descriptor.name) else {
+                errors.push(format!(
+                    "{} artifact {} speciality_levels omits speciality {}",
+                    model.model_id, artifact_name, descriptor.name
+                ));
+                continue;
+            };
+            if levels.is_empty() || levels.len() > 16 {
+                errors.push(format!(
+                    "{} artifact {} speciality {} must support 1..=16 levels",
+                    model.model_id, artifact_name, descriptor.name
+                ));
+                continue;
+            }
+            let mut unique = BTreeSet::new();
+            for level in levels {
+                if !unique.insert(level.as_str()) {
+                    errors.push(format!(
+                        "{} artifact {} speciality {} duplicates level {}",
+                        model.model_id, artifact_name, descriptor.name, level
+                    ));
+                } else if !descriptor
+                    .levels
+                    .iter()
+                    .any(|declared| declared.name == *level)
+                {
+                    errors.push(format!(
+                        "{} artifact {} speciality {} references unknown level {}",
+                        model.model_id, artifact_name, descriptor.name, level
+                    ));
+                }
+            }
+            if !unique.contains(descriptor.default_level.as_str()) {
+                errors.push(format!(
+                    "{} artifact {} speciality {} must include default level {}",
+                    model.model_id, artifact_name, descriptor.name, descriptor.default_level
+                ));
+            }
+        }
+    }
 }
 
 fn validate_speciality_descriptor(
@@ -2284,12 +2465,14 @@ fn validate_speciality_calibrations(
     errors: &mut Vec<String>,
 ) {
     for (artifact, specialities) in &model.speciality_assessment.calibrated {
-        if !model.artifacts.contains_key(artifact) {
+        let Some(catalog_artifact) = model.artifacts.get(artifact) else {
             errors.push(format!(
                 "{} speciality calibration references unknown artifact {}",
                 model.model_id, artifact
             ));
-        }
+            continue;
+        };
+        let effective = artifact_effective_speciality_levels(model, catalog_artifact);
         for (name, levels) in specialities {
             let Some(descriptor) = descriptors.get(name.as_str()) else {
                 errors.push(format!(
@@ -2298,6 +2481,13 @@ fn validate_speciality_calibrations(
                 ));
                 continue;
             };
+            let supported = effective.get(name);
+            if supported.is_none() {
+                errors.push(format!(
+                    "{} speciality calibration for {} contains unsupported speciality {}",
+                    model.model_id, artifact, name
+                ));
+            }
             for (level_name, calibration) in levels {
                 if !descriptor
                     .levels
@@ -2308,43 +2498,92 @@ fn validate_speciality_calibrations(
                         "{} speciality calibration for {}/{}/{} references an unknown level",
                         model.model_id, artifact, name, level_name
                     ));
+                } else if supported.is_none_or(|levels| !levels.contains(level_name)) {
+                    errors.push(format!(
+                        "{} speciality calibration for {}/{}/{} is not supported by that artifact",
+                        model.model_id, artifact, name, level_name
+                    ));
                 }
                 let stable_tokens = calibration
                     .token_prefixes
                     .values()
                     .map(Vec::len)
                     .sum::<usize>();
-                if !is_hex_len(&calibration.fingerprint, 64)
-                    || calibration.token_prefixes.is_empty()
-                    || calibration.token_prefixes.values().any(Vec::is_empty)
-                    || calibration.output_tokens_min == 0
-                    || calibration.output_tokens_max < calibration.output_tokens_min
-                    || calibration.reasoning_tokens_max < calibration.reasoning_tokens_min
-                    || calibration.reasoning_tokens_max > calibration.output_tokens_max
-                    || (model.tier == "launch"
-                        && stable_tokens < MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS)
-                {
+                let verification_method = calibration
+                    .verification_method
+                    .as_deref()
+                    .unwrap_or("token_fingerprint");
+                let valid = if verification_method == "token_fingerprint" {
+                    !calibration.token_prefixes.is_empty()
+                        && calibration
+                            .token_prefixes
+                            .values()
+                            .all(|tokens| !tokens.is_empty())
+                        && calibration.output_tokens_min > 0
+                        && calibration.output_tokens_max >= calibration.output_tokens_min
+                        && calibration.reasoning_tokens_max >= calibration.reasoning_tokens_min
+                        && calibration.reasoning_tokens_max <= calibration.output_tokens_max
+                        && (model.tier != "launch"
+                            || stable_tokens >= MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS)
+                } else {
+                    verification_method == model.canary.verification_method
+                        && matches!(
+                            verification_method,
+                            "seed_perceptual_hash"
+                                | "embedding_cosine"
+                                | "transcript_match"
+                                | "audio_fingerprint"
+                                | "video_av_fingerprint"
+                        )
+                        && calibration.token_prefixes.is_empty()
+                        && calibration.output_tokens_min == 0
+                        && calibration.output_tokens_max == 0
+                        && calibration.reasoning_tokens_min == 0
+                        && calibration.reasoning_tokens_max == 0
+                };
+                if !is_hex_len(&calibration.fingerprint, 64) || !valid {
                     errors.push(format!(
-                        "{} speciality calibration for {}/{}/{} requires exact stable prefixes, valid output/reasoning ranges, and at least {} launch token positions",
-                        model.model_id, artifact, name, level_name
-                        , MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS
+                        "{} speciality calibration for {}/{}/{} is invalid for verification method {}",
+                        model.model_id, artifact, name, level_name, verification_method
                     ));
                 }
             }
         }
     }
-    for artifact in model.artifacts.keys() {
+    for (artifact_name, artifact) in &model.artifacts {
+        let effective = artifact_effective_speciality_levels(model, artifact);
+        let calibrated_specialities = model.speciality_assessment.calibrated.get(artifact_name);
         for descriptor in descriptors.values() {
-            let calibrated = model
-                .speciality_assessment
-                .calibrated
-                .get(artifact)
-                .and_then(|specialities| specialities.get(&descriptor.name));
-            for level in &descriptor.levels {
-                if !calibrated.is_some_and(|levels| levels.contains_key(&level.name)) {
+            let supported = effective.get(&descriptor.name);
+            let calibrated =
+                calibrated_specialities.and_then(|specialities| specialities.get(&descriptor.name));
+            if let Some(supported) = supported {
+                for level in supported {
+                    if !calibrated.is_some_and(|levels| levels.contains_key(level)) {
+                        errors.push(format!(
+                            "{} speciality calibration for {}/{} missing level {}",
+                            model.model_id, artifact_name, descriptor.name, level
+                        ));
+                    }
+                }
+            }
+            if let Some(calibrated) = calibrated {
+                for level in calibrated.keys() {
+                    if supported.is_none_or(|levels| !levels.contains(level)) {
+                        errors.push(format!(
+                            "{} speciality calibration for {}/{} has unsupported extra level {}",
+                            model.model_id, artifact_name, descriptor.name, level
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(calibrated_specialities) = calibrated_specialities {
+            for name in calibrated_specialities.keys() {
+                if !effective.contains_key(name) {
                     errors.push(format!(
-                        "{} speciality calibration for {}/{} missing level {}",
-                        model.model_id, artifact, descriptor.name, level.name
+                        "{} speciality calibration for {} has unsupported extra speciality {}",
+                        model.model_id, artifact_name, name
                     ));
                 }
             }
@@ -2549,6 +2788,50 @@ fn validate_image_endpoint_defaults(
                         model.model_id, contract.family, path
                     ));
                 }
+            }
+        }
+        mayhem_proto::ENDPOINT_OPENAI_VIDEOS => {
+            let has_width = contract
+                .request_attributes
+                .iter()
+                .any(|path| path == "width");
+            let has_height = contract
+                .request_attributes
+                .iter()
+                .any(|path| path == "height");
+            if has_width != has_height {
+                errors.push(format!(
+                    "{} endpoint family {} must declare width and height together",
+                    model.model_id, contract.family
+                ));
+            }
+            if has_default("width") != has_default("height") {
+                errors.push(format!(
+                    "{} endpoint family {} must default width and height together",
+                    model.model_id, contract.family
+                ));
+            }
+        }
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO => {
+            let has_width = contract
+                .request_attributes
+                .iter()
+                .any(|path| path == "parameters.width");
+            let has_height = contract
+                .request_attributes
+                .iter()
+                .any(|path| path == "parameters.height");
+            if has_width != has_height {
+                errors.push(format!(
+                    "{} endpoint family {} must declare parameters.width and parameters.height together",
+                    model.model_id, contract.family
+                ));
+            }
+            if has_default("parameters.width") != has_default("parameters.height") {
+                errors.push(format!(
+                    "{} endpoint family {} must default parameters.width and parameters.height together",
+                    model.model_id, contract.family
+                ));
             }
         }
         mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE => {
@@ -3028,6 +3311,7 @@ fn validate_artifact(
             | "vllm"
             | "stable-diffusion.cpp"
             | "ace-step"
+            | "sulphur"
             | "transformers-asr"
             | "whisper.cpp"
             | "piper"
@@ -3170,6 +3454,68 @@ fn validate_artifact(
                 errors.push(format!(
                     "{model_id}/{name} ace-step artifact has unapproved sidecar {sidecar_name}"
                 ));
+            }
+        }
+    }
+    if artifact.engine == "sulphur" {
+        let lower_path = artifact.path.to_ascii_lowercase();
+        let is_gguf = lower_path.ends_with(".gguf");
+        let is_mlx = lower_path.ends_with(".safetensors");
+        if !is_gguf && !is_mlx {
+            errors.push(format!(
+                "{model_id}/{name} sulphur primary artifact must be GGUF or safetensors, got {}",
+                artifact.path
+            ));
+        }
+        let has_parent = Path::new(&artifact.path)
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty());
+        if is_gguf && has_parent {
+            errors.push(format!(
+                "{model_id}/{name} sulphur GGUF primary artifact must be at the signed bundle root, got {}",
+                artifact.path
+            ));
+        }
+        if is_mlx && !has_parent {
+            errors.push(format!(
+                "{model_id}/{name} sulphur MLX primary artifact must be inside its signed artifact directory, got {}",
+                artifact.path
+            ));
+        }
+        let expected_manifest_path = if is_mlx {
+            SULPHUR_MLX_MANIFEST_PATH
+        } else {
+            SULPHUR_CUDA_MANIFEST_PATH
+        };
+        match artifact.sidecars.get(SULPHUR_MANIFEST_SIDECAR) {
+            Some(sidecar) if sidecar.path == expected_manifest_path => {}
+            Some(sidecar) => errors.push(format!(
+                "{model_id}/{name} sulphur sidecar {SULPHUR_MANIFEST_SIDECAR} must use path {expected_manifest_path}, got {}",
+                sidecar.path
+            )),
+            None => errors.push(format!(
+                "{model_id}/{name} sulphur artifact needs sidecar {SULPHUR_MANIFEST_SIDECAR}"
+            )),
+        }
+        for (sidecar_name, expected_path) in [
+            (
+                SULPHUR_PROMPT_ENHANCER_MODEL_SIDECAR,
+                SULPHUR_PROMPT_ENHANCER_MODEL_PATH,
+            ),
+            (
+                SULPHUR_PROMPT_ENHANCER_PROJECTOR_SIDECAR,
+                SULPHUR_PROMPT_ENHANCER_PROJECTOR_PATH,
+            ),
+        ] {
+            match artifact.sidecars.get(sidecar_name) {
+                Some(sidecar) if sidecar.path == expected_path => {}
+                Some(sidecar) => errors.push(format!(
+                    "{model_id}/{name} sulphur sidecar {sidecar_name} must use path {expected_path}, got {}",
+                    sidecar.path
+                )),
+                None => errors.push(format!(
+                    "{model_id}/{name} sulphur artifact needs sidecar {sidecar_name}"
+                )),
             }
         }
     }
@@ -3338,6 +3684,16 @@ const ACE_STEP_REQUIRED_SIDECARS: &[(&str, &str)] = &[
     ("ace_vae_config", "vae/config.json"),
     ("ace_vae_model", "vae/diffusion_pytorch_model.safetensors"),
 ];
+
+const SULPHUR_MANIFEST_SIDECAR: &str = "sulphur_runtime_manifest";
+const SULPHUR_CUDA_MANIFEST_PATH: &str = "mayhem-sulphur-runtime.json";
+const SULPHUR_MLX_MANIFEST_PATH: &str = "mayhem-sulphur-mlx-runtime.json";
+const SULPHUR_PROMPT_ENHANCER_MODEL_SIDECAR: &str = "prompt_enhancer_model";
+const SULPHUR_PROMPT_ENHANCER_PROJECTOR_SIDECAR: &str = "prompt_enhancer_mmproj";
+const SULPHUR_PROMPT_ENHANCER_MODEL_PATH: &str =
+    "prompt_enhancer_uncensored/prompt_enhancer_uncensored-q8_0.gguf";
+const SULPHUR_PROMPT_ENHANCER_PROJECTOR_PATH: &str =
+    "prompt_enhancer_uncensored/mmproj-prompt_enhancer_uncensored.gguf";
 
 fn validate_artifact_sidecar(
     model_id: &str,
@@ -3693,9 +4049,37 @@ fn canary_prompt_modalities<'a>(
         VERIFICATION_AUDIO_FINGERPRINT if prompt.input.is_some() || prompt.prompt.is_some() => {
             modalities.insert("audio");
         }
+        VERIFICATION_VIDEO_AV_FINGERPRINT => {
+            modalities.insert("video");
+            modalities.insert("audio");
+            if contains_conditioning_image(&Value::Object(
+                prompt.endpoint_attributes.clone().into_iter().collect(),
+            )) {
+                modalities.insert("image");
+            }
+        }
         _ => {}
     }
     modalities
+}
+
+fn contains_conditioning_image(value: &Value) -> bool {
+    const IMAGE_FIELDS: &[&str] = &[
+        "input_reference",
+        "input_image",
+        "conditioning_image",
+        "init_image",
+        "image",
+    ];
+
+    match value {
+        Value::Object(object) => object.iter().any(|(field, value)| {
+            (IMAGE_FIELDS.contains(&field.as_str()) && !value.is_null())
+                || contains_conditioning_image(value)
+        }),
+        Value::Array(values) => values.iter().any(contains_conditioning_image),
+        _ => false,
+    }
 }
 
 fn run_download_checks(
@@ -4017,6 +4401,21 @@ mod tests {
     use super::*;
     use ed25519_dalek::Signer;
 
+    fn test_video_av_fingerprint() -> String {
+        let encoded = serde_json::to_vec(&serde_json::json!({
+            "width": 512,
+            "height": 320,
+            "frame_count": 9,
+            "fps_milli": 8000,
+            "video_duration_ms": 1125,
+            "audio_duration_ms": 1125,
+            "frame_hashes": ["0f".repeat(32), "0f".repeat(32)],
+            "audio_fingerprint": format!("audiospec-v1:1125:{}", "01".repeat(256)),
+        }))
+        .unwrap();
+        format!("videoav-v1:{}", hex_string(&encoded))
+    }
+
     #[test]
     fn signature_verification_rejects_tampering() {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
@@ -4174,6 +4573,7 @@ mod tests {
                         format!("audiospec-v1:1000:{}", "01".repeat(256)),
                     )]),
                 )]),
+                video_fingerprints: BTreeMap::new(),
             },
         );
         let artifact = model.artifacts.get_mut("fixture").unwrap();
@@ -4241,6 +4641,153 @@ mod tests {
     }
 
     #[test]
+    fn sulphur_artifact_requires_a_fixed_signed_runtime_manifest() {
+        let mut model = verification_test_model(
+            "admin/sulphur@gguf",
+            DEFAULT_MODEL_CLASS,
+            "llama.cpp",
+            CanaryRef {
+                set_id: "canary-launch-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::from([("fixture".to_owned(), "a".repeat(64))]),
+                token_prefixes: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([(
+                        "fixed-text".to_owned(),
+                        vec![1; MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS],
+                    )]),
+                )]),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
+            },
+        );
+        let artifact = model.artifacts.get_mut("fixture").unwrap();
+        artifact.engine = "sulphur".to_owned();
+        artifact.path = "transformer-q4_k_m.gguf".to_owned();
+        artifact.sidecars.insert(
+            SULPHUR_MANIFEST_SIDECAR.to_owned(),
+            CatalogArtifactSidecar {
+                source: artifact.source.clone(),
+                upstream_source: None,
+                path: SULPHUR_CUDA_MANIFEST_PATH.to_owned(),
+                artifact_root: "b".repeat(64),
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 2,
+                source_sha256: "c".repeat(64),
+            },
+        );
+        for (sidecar_name, path) in [
+            (
+                SULPHUR_PROMPT_ENHANCER_MODEL_SIDECAR,
+                SULPHUR_PROMPT_ENHANCER_MODEL_PATH,
+            ),
+            (
+                SULPHUR_PROMPT_ENHANCER_PROJECTOR_SIDECAR,
+                SULPHUR_PROMPT_ENHANCER_PROJECTOR_PATH,
+            ),
+        ] {
+            artifact.sidecars.insert(
+                sidecar_name.to_owned(),
+                CatalogArtifactSidecar {
+                    source: artifact.source.clone(),
+                    upstream_source: None,
+                    path: path.to_owned(),
+                    artifact_root: "d".repeat(64),
+                    artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                    weights_bytes: 2,
+                    source_sha256: "e".repeat(64),
+                },
+            );
+        }
+
+        let mut errors = Vec::new();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            model.artifacts.get("fixture").unwrap(),
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        let mut missing = model.artifacts["fixture"].clone();
+        missing.sidecars.remove(SULPHUR_MANIFEST_SIDECAR);
+        errors.clear();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            &missing,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| { error.contains("needs sidecar sulphur_runtime_manifest") }));
+
+        let mut wrong_path = model.artifacts["fixture"].clone();
+        wrong_path
+            .sidecars
+            .get_mut(SULPHUR_MANIFEST_SIDECAR)
+            .unwrap()
+            .path = "runtime.json".to_owned();
+        errors.clear();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            &wrong_path,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| { error.contains("must use path mayhem-sulphur-runtime.json") }));
+
+        let mut mlx = model.artifacts["fixture"].clone();
+        mlx.path = "sulphur/transformer-distilled.safetensors".to_owned();
+        mlx.sidecars.get_mut(SULPHUR_MANIFEST_SIDECAR).unwrap().path =
+            SULPHUR_MLX_MANIFEST_PATH.to_owned();
+        errors.clear();
+        validate_artifact(&model.model_id, &model.tier, "fixture", &mlx, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        let mut mlx_at_root = mlx.clone();
+        mlx_at_root.path = "transformer-distilled.safetensors".to_owned();
+        errors.clear();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            &mlx_at_root,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| { error.contains("must be inside its signed artifact directory") }));
+
+        let mut nested_primary = model.artifacts["fixture"].clone();
+        nested_primary.path = "transformer/weights.gguf".to_owned();
+        errors.clear();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            &nested_primary,
+            &mut errors,
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error
+                    .contains("GGUF primary artifact must be at the signed bundle root"))
+        );
+    }
+
+    #[test]
     fn model_min_app_version_must_be_semver_when_present() {
         let mut model = verification_test_model(
             "admin/model@4bit",
@@ -4263,6 +4810,7 @@ mod tests {
                 embedding_vectors: BTreeMap::new(),
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
             },
         );
         model.min_app_version = Some("0.1.0".to_owned());
@@ -4304,6 +4852,7 @@ mod tests {
                 embedding_vectors: BTreeMap::new(),
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
             },
         );
         let descriptor = ModelSpecialityDescriptor {
@@ -4349,6 +4898,7 @@ mod tests {
                     request_path: "reasoning_effort".to_owned(),
                     target: EndpointSpecialityTarget::ChatTemplateKwarg,
                     native_path: "reasoning_effort".to_owned(),
+                    selector: EndpointSpecialitySelector::Exact,
                 },
             );
         }
@@ -4364,6 +4914,7 @@ mod tests {
                         "low".to_owned(),
                         CatalogSpecialityCalibration {
                             fingerprint: "b".repeat(64),
+                            verification_method: None,
                             token_prefixes: BTreeMap::from([(
                                 "fixed-text".to_owned(),
                                 vec![1; MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS],
@@ -4378,6 +4929,7 @@ mod tests {
                         "high".to_owned(),
                         CatalogSpecialityCalibration {
                             fingerprint: "c".repeat(64),
+                            verification_method: None,
                             token_prefixes: BTreeMap::from([(
                                 "fixed-text".to_owned(),
                                 vec![2; MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS],
@@ -4391,6 +4943,31 @@ mod tests {
                 ]),
             )]),
         );
+        let legacy_artifact = model.artifacts["fixture"].clone();
+        assert!(legacy_artifact.speciality_levels.is_none());
+        assert!(serde_json::to_value(&legacy_artifact)
+            .unwrap()
+            .get("speciality_levels")
+            .is_none());
+
+        let mut subset_artifact = legacy_artifact;
+        subset_artifact.artifact_root = "d".repeat(64);
+        subset_artifact.speciality_levels = Some(BTreeMap::from([(
+            "reasoning_effort".to_owned(),
+            vec!["low".to_owned()],
+        )]));
+        model
+            .artifacts
+            .insert("fixture-low-only".to_owned(), subset_artifact);
+        let low_calibration =
+            model.speciality_assessment.calibrated["fixture"]["reasoning_effort"]["low"].clone();
+        model.speciality_assessment.calibrated.insert(
+            "fixture-low-only".to_owned(),
+            BTreeMap::from([(
+                "reasoning_effort".to_owned(),
+                BTreeMap::from([("low".to_owned(), low_calibration)]),
+            )]),
+        );
 
         let mut errors = Vec::new();
         validate_model(&model, &mut errors);
@@ -4398,6 +4975,85 @@ mod tests {
             !errors.iter().any(|error| error.contains("speciality")),
             "{errors:?}"
         );
+
+        let high_calibration =
+            model.speciality_assessment.calibrated["fixture"]["reasoning_effort"]["high"].clone();
+        model
+            .speciality_assessment
+            .calibrated
+            .get_mut("fixture-low-only")
+            .unwrap()
+            .get_mut("reasoning_effort")
+            .unwrap()
+            .insert("high".to_owned(), high_calibration);
+        errors.clear();
+        validate_model(&model, &mut errors);
+        assert!(errors.iter().any(|error| {
+            error.contains("fixture-low-only/reasoning_effort/high")
+                && error.contains("not supported")
+        }));
+        model
+            .speciality_assessment
+            .calibrated
+            .get_mut("fixture-low-only")
+            .unwrap()
+            .get_mut("reasoning_effort")
+            .unwrap()
+            .remove("high");
+
+        model
+            .artifacts
+            .get_mut("fixture-low-only")
+            .unwrap()
+            .speciality_levels = Some(BTreeMap::from([(
+            "reasoning_effort".to_owned(),
+            vec!["high".to_owned()],
+        )]));
+        errors.clear();
+        validate_model(&model, &mut errors);
+        assert!(errors.iter().any(|error| {
+            error.contains("fixture-low-only") && error.contains("must include default level low")
+        }));
+        for (levels, expected) in [
+            (
+                BTreeMap::from([("unknown_speciality".to_owned(), vec!["low".to_owned()])]),
+                "references unknown speciality unknown_speciality",
+            ),
+            (
+                BTreeMap::from([(
+                    "reasoning_effort".to_owned(),
+                    vec!["low".to_owned(), "low".to_owned()],
+                )]),
+                "duplicates level low",
+            ),
+            (
+                BTreeMap::from([(
+                    "reasoning_effort".to_owned(),
+                    vec!["low".to_owned(), "unknown".to_owned()],
+                )]),
+                "references unknown level unknown",
+            ),
+        ] {
+            model
+                .artifacts
+                .get_mut("fixture-low-only")
+                .unwrap()
+                .speciality_levels = Some(levels);
+            errors.clear();
+            validate_model(&model, &mut errors);
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "missing {expected:?} in {errors:?}"
+            );
+        }
+        model
+            .artifacts
+            .get_mut("fixture-low-only")
+            .unwrap()
+            .speciality_levels = Some(BTreeMap::from([(
+            "reasoning_effort".to_owned(),
+            vec!["low".to_owned()],
+        )]));
 
         model
             .speciality_assessment
@@ -4475,6 +5131,7 @@ mod tests {
                 embedding_vectors: BTreeMap::new(),
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
             },
             price_ref_au: PriceRef {
                 denom: "au_usd".to_owned(),
@@ -4488,6 +5145,7 @@ mod tests {
             stable_diffusion_cpp: None,
             mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
             kv_cache: None,
+            speciality_levels: None,
             source: SourceRef {
                 kind: "huggingface".to_owned(),
                 repo: "admin/model".to_owned(),
@@ -4548,6 +5206,7 @@ mod tests {
                 embedding_vectors: BTreeMap::new(),
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
             },
         );
         let mut errors = Vec::new();
@@ -4572,6 +5231,7 @@ mod tests {
                 embedding_vectors: BTreeMap::new(),
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
             },
         );
         let mut errors = Vec::new();
@@ -4620,6 +5280,7 @@ mod tests {
                 )]),
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
             },
         );
         let mut errors = Vec::new();
@@ -4657,6 +5318,7 @@ mod tests {
                     BTreeMap::from([("fixed-audio".to_owned(), "hello mayhem".to_owned())]),
                 )]),
                 audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
             },
         );
         let mut errors = Vec::new();
@@ -4684,6 +5346,7 @@ mod tests {
                         format!("audiospec-v1:1000:{}", "01".repeat(256)),
                     )]),
                 )]),
+                video_fingerprints: BTreeMap::new(),
             },
         );
         let mut errors = Vec::new();
@@ -4720,6 +5383,51 @@ mod tests {
     }
 
     #[test]
+    fn launch_video_requires_decoded_av_fingerprint_and_rejects_image_hash_method() {
+        let mut video = verification_test_model(
+            "admin/video@fixture",
+            MODEL_CLASS_VIDEO_GENERATION,
+            "sulphur",
+            CanaryRef {
+                set_id: "canary-video-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_VIDEO_AV_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: Some(1_000),
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([("fixed-video".to_owned(), test_video_av_fingerprint())]),
+                )]),
+            },
+        );
+        let mut errors = Vec::new();
+        validate_canary_verification(&video, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        video.canary.verification_method = VERIFICATION_SEED_PERCEPTUAL_HASH.to_owned();
+        video.canary.video_fingerprints.clear();
+        video.canary.perceptual_hashes = BTreeMap::from([(
+            "fixture".to_owned(),
+            BTreeMap::from([("fixed-video".to_owned(), "f".repeat(16))]),
+        )]);
+        let mut errors = Vec::new();
+        validate_canary_verification(&video, &mut errors);
+        assert!(errors.iter().any(|error| error.contains(
+            "canary.verification_method seed_perceptual_hash is not allowed for model_class video-generation"
+        )));
+        assert!(errors.iter().any(|error| {
+            error.contains(
+            "launch model_class video-generation requires output canary method video_av_fingerprint"
+        )
+        }));
+    }
+
+    #[test]
     fn artifact_kv_cache_profile_is_validated_as_signed_runtime_data() {
         let mut artifact = CatalogArtifact {
             engine: "llama.cpp".to_owned(),
@@ -4735,6 +5443,7 @@ mod tests {
                 bytes_per_token: 18_432,
                 measurement_source: "exact runtime allocation and model configuration".to_owned(),
             }),
+            speciality_levels: None,
             source: SourceRef {
                 kind: "huggingface".to_owned(),
                 repo: "admin/model".to_owned(),
@@ -4858,6 +5567,7 @@ mod tests {
                 embedding_vectors: BTreeMap::new(),
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
             },
         );
         model.adapter.tool_call_strategy = "openai_tool_calls".to_owned();
@@ -4977,6 +5687,7 @@ mod tests {
                 embedding_vectors: BTreeMap::new(),
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
             },
         );
         let prompt = CanarySetPrompt {
@@ -5000,11 +5711,58 @@ mod tests {
             presence_penalty: None,
             seed: None,
             max_tokens: Some(8),
+            endpoint_attributes: BTreeMap::new(),
         };
 
         assert_eq!(
             canary_prompt_modalities(&model, &prompt),
             BTreeSet::from(["text", "video"])
+        );
+    }
+
+    #[test]
+    fn video_av_canary_counts_generated_av_and_optional_image_conditioning() {
+        let model = verification_test_model(
+            "admin/video-generation@fixture",
+            MODEL_CLASS_VIDEO_GENERATION,
+            "sulphur",
+            CanaryRef {
+                set_id: "canary-video-generation-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_VIDEO_AV_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: Some(1_000),
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
+            },
+        );
+        let text_to_video: CanarySetPrompt = serde_json::from_value(serde_json::json!({
+            "id": "text-to-video",
+            "inputs": "joint audio and video"
+        }))
+        .expect("parse text-to-video prompt");
+        assert_eq!(
+            canary_prompt_modalities(&model, &text_to_video),
+            BTreeSet::from(["audio", "video"])
+        );
+
+        let image_to_video: CanarySetPrompt = serde_json::from_value(serde_json::json!({
+            "id": "image-to-video",
+            "prompt": "animate this image",
+            "request": {
+                "input_reference": {
+                    "image_url": "data:image/png;base64,AAAA"
+                }
+            }
+        }))
+        .expect("parse image-to-video prompt");
+        assert_eq!(
+            canary_prompt_modalities(&model, &image_to_video),
+            BTreeSet::from(["audio", "image", "video"])
         );
     }
 
@@ -5028,6 +5786,7 @@ mod tests {
                 )]),
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
             },
         );
         model.price_ref_au.out_per_1k = 0;
@@ -5062,6 +5821,7 @@ mod tests {
                 embedding_vectors: BTreeMap::new(),
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
             },
         );
         text_with_zero_output.price_ref_au.out_per_1k = 0;
@@ -5091,6 +5851,7 @@ mod tests {
                 embedding_vectors: BTreeMap::new(),
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
             },
         );
         model.adapter.tool_call_strategy = "none".to_owned();
@@ -5193,6 +5954,7 @@ mod tests {
                 embedding_vectors: BTreeMap::new(),
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
             },
         );
         text_with_image_shape.adapter.endpoint_families =
@@ -5224,6 +5986,7 @@ mod tests {
                 embedding_vectors: BTreeMap::new(),
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
             },
         );
         let rate = |unit: &str, per_unit_au, granularity| CatalogRateMapEntry {
@@ -5305,17 +6068,18 @@ mod tests {
             CanaryRef {
                 set_id: "canary-video-v1".to_owned(),
                 match_min: 0.9,
-                verification_method: VERIFICATION_SEED_PERCEPTUAL_HASH.to_owned(),
-                verification_tolerance_bps: Some(128),
+                verification_method: VERIFICATION_VIDEO_AV_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: Some(1_000),
                 fingerprints: BTreeMap::new(),
                 token_prefixes: BTreeMap::new(),
-                perceptual_hashes: BTreeMap::from([(
-                    "fixture".to_owned(),
-                    BTreeMap::from([("fixed-video".to_owned(), "a".repeat(16))]),
-                )]),
+                perceptual_hashes: BTreeMap::new(),
                 embedding_vectors: BTreeMap::new(),
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([("fixed-video".to_owned(), test_video_av_fingerprint())]),
+                )]),
             },
         );
         model.price_ref_au.in_per_1k = 0;
@@ -5479,6 +6243,7 @@ mod tests {
                         .then_some(mayhem_engine::StableDiffusionCppConfig::default()),
                     mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
                     kv_cache: None,
+                    speciality_levels: None,
                     source: SourceRef {
                         kind: "huggingface".to_owned(),
                         repo: "admin/model".to_owned(),

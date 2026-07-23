@@ -7,7 +7,10 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,11 +22,13 @@ use crate::{
         evaluate_catalog_canary_audio_fingerprint_probe,
         evaluate_catalog_canary_embedding_cosine_probe,
         evaluate_catalog_canary_perceptual_hash_probe, evaluate_catalog_canary_token_prefix_probe,
-        evaluate_catalog_canary_transcript_match_probe, image_average_hash_hex,
-        supported_canary_verification_method, token_fingerprint, CanaryProbeEvaluation,
-        CanaryProbeSpec, CANARY_VERIFICATION_AUDIO_FINGERPRINT, CANARY_VERIFICATION_CONTEXT_NEEDLE,
-        CANARY_VERIFICATION_EMBEDDING_COSINE, CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH,
-        CANARY_VERIFICATION_TOKEN_FINGERPRINT, CANARY_VERIFICATION_TRANSCRIPT_MATCH,
+        evaluate_catalog_canary_transcript_match_probe,
+        evaluate_catalog_canary_video_av_fingerprint_probe, image_average_hash_hex,
+        supported_canary_verification_method, token_fingerprint, video_av_fingerprint,
+        CanaryProbeEvaluation, CanaryProbeSpec, CANARY_VERIFICATION_AUDIO_FINGERPRINT,
+        CANARY_VERIFICATION_CONTEXT_NEEDLE, CANARY_VERIFICATION_EMBEDDING_COSINE,
+        CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH, CANARY_VERIFICATION_TOKEN_FINGERPRINT,
+        CANARY_VERIFICATION_TRANSCRIPT_MATCH, CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT,
         DEFAULT_CANARY_MATCH_MIN_BPS, MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS,
     },
     failover::{
@@ -243,6 +248,7 @@ pub struct GatewayState {
     reputation_events: Arc<Mutex<Vec<StoredReputationEvent>>>,
     paused_sessions: Arc<Mutex<VecDeque<PausedSession>>>,
     jobs: Arc<Mutex<GatewayJobStore>>,
+    active_job_cancellations: Arc<Mutex<BTreeMap<String, GatewayRequestCancellation>>>,
     retention_limits: GatewayRetentionLimits,
     receipt_config: ReceiptConfig,
     wallet_spend: Arc<Mutex<GatewayWalletSpendState>>,
@@ -701,6 +707,8 @@ pub struct GatewayMarketInfo {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct GatewaySpecialityCalibration {
     pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_method: Option<String>,
     pub token_prefixes: BTreeMap<String, Vec<i32>>,
     pub output_tokens_min: u64,
     pub output_tokens_max: u64,
@@ -1656,6 +1664,7 @@ pub struct GatewayCanaryModelConfig {
     pub embedding_vectors_by_artifact_root: BTreeMap<String, BTreeMap<String, Vec<f32>>>,
     pub transcripts_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
     pub audio_fingerprints_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
+    pub video_fingerprints_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
     pub speciality_calibrations_by_artifact_root:
         BTreeMap<String, BTreeMap<String, BTreeMap<String, GatewaySpecialityCalibration>>>,
     pub default_fingerprint: Option<String>,
@@ -1664,6 +1673,7 @@ pub struct GatewayCanaryModelConfig {
     pub default_embedding_vectors: Option<BTreeMap<String, Vec<f32>>>,
     pub default_transcripts: Option<BTreeMap<String, String>>,
     pub default_audio_fingerprints: Option<BTreeMap<String, String>>,
+    pub default_video_fingerprints: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -2122,12 +2132,18 @@ pub struct ArtifactGenerationRequest {
     pub prompt: String,
     pub endpoint_family: String,
     pub contract_request: Value,
+    pub effective_specialities: BTreeMap<String, String>,
     pub output_modality: String,
     pub transport_kind: String,
     pub duration_seconds: u64,
+    pub requested_frame_count: u64,
     pub frame_count: u64,
+    pub frame_rate: f64,
     pub step_count: u64,
     pub artifact_count: u64,
+    pub input_image_count: u32,
+    pub input_image_max_bytes: u64,
+    pub input_image_max_pixels: u64,
     pub input_audio_count: u32,
     pub input_audio_max_bytes: u64,
     pub input_audio_max_seconds: u64,
@@ -2185,6 +2201,7 @@ struct HfRawAudio {
 struct HfInferencePayload {
     contract_request: Value,
     raw_audio: Option<HfRawAudio>,
+    video: VideoRequestPreparation,
 }
 
 #[derive(Clone, Debug)]
@@ -2622,12 +2639,40 @@ pub struct ProviderSignedReceipt {
 struct GatewayJobHandle {
     id: String,
     store: Arc<Mutex<GatewayJobStore>>,
+    cancellation: GatewayRequestCancellation,
+    active_cancellations: Arc<Mutex<BTreeMap<String, GatewayRequestCancellation>>>,
+    settlement_reconciliation_started: Arc<AtomicBool>,
 }
 
 impl GatewayJobHandle {
-    async fn persist_terminal(
+    fn cancellation(&self) -> GatewayRequestCancellation {
+        self.cancellation.clone()
+    }
+
+    fn unregister_cancellation(&self) {
+        self.active_cancellations
+            .lock_recover("active gateway job cancellations")
+            .remove(&self.id);
+    }
+
+    fn mark_settlement_reconciliation_started(&self) {
+        self.settlement_reconciliation_started
+            .store(true, Ordering::Release);
+    }
+
+    fn settlement_reconciliation_started(&self) -> bool {
+        self.settlement_reconciliation_started
+            .load(Ordering::Acquire)
+    }
+
+    fn is_active(&self) -> bool {
+        self.store
+            .lock_recover("gateway job vault")
+            .is_active(&self.id)
+    }
+
+    async fn persist_reconciliation_pending(
         &self,
-        status: GatewayJobStatus,
         result: Option<Value>,
         artifacts: Vec<GatewayJobArtifact>,
         receipt: Option<Value>,
@@ -2638,7 +2683,7 @@ impl GatewayJobHandle {
         tokio::task::spawn_blocking(move || {
             store.lock_recover("gateway job vault").complete(
                 &id,
-                status,
+                GatewayJobStatus::ReconciliationPending,
                 result,
                 artifacts,
                 receipt,
@@ -2651,8 +2696,35 @@ impl GatewayJobHandle {
             GatewaySessionError::new(format!("gateway job persistence task failed: {err}"))
         })?
         .map_err(|err| {
-            GatewaySessionError::new(format!("persisting encrypted gateway job failed: {err}"))
+            GatewaySessionError::new(format!(
+                "persisting reconciliation-pending gateway job failed: {err}"
+            ))
         })
+    }
+
+    async fn finish_reconciliation(
+        &self,
+        status: GatewayJobStatus,
+        error: Option<String>,
+    ) -> Result<StoredGatewayJob, GatewaySessionError> {
+        let id = self.id.clone();
+        let store = self.store.clone();
+        let stored = tokio::task::spawn_blocking(move || {
+            store
+                .lock_recover("gateway job vault")
+                .finish_reconciliation(&id, status, error, now_secs())
+        })
+        .await
+        .map_err(|err| {
+            GatewaySessionError::new(format!("gateway job persistence task failed: {err}"))
+        })?
+        .map_err(|err| {
+            GatewaySessionError::new(format!(
+                "finishing gateway job reconciliation failed: {err}"
+            ))
+        })?;
+        self.unregister_cancellation();
+        Ok(stored)
     }
 
     async fn persist_failure_if_active(&self, error: String) {
@@ -2675,11 +2747,52 @@ impl GatewayJobHandle {
             Ok::<_, String>(())
         })
         .await;
-        if let Err(error) = persisted
+        let persisted = persisted
             .map_err(|error| error.to_string())
-            .and_then(|result| result)
-        {
-            eprintln!("persisting failed gateway job {} failed: {error}", self.id);
+            .and_then(|result| result);
+        match persisted {
+            Ok(()) => self.unregister_cancellation(),
+            Err(error) => {
+                eprintln!("persisting failed gateway job {} failed: {error}", self.id);
+            }
+        }
+    }
+
+    async fn persist_cancelled_if_active(&self, reason: &str) {
+        let id = self.id.clone();
+        let store = self.store.clone();
+        let reason = reason.to_owned();
+        let persisted = tokio::task::spawn_blocking(move || {
+            let mut store = store.lock_recover("gateway job vault");
+            if !store.is_active(&id) {
+                return Ok(());
+            }
+            store.complete(
+                &id,
+                GatewayJobStatus::Cancelled,
+                Some(json!({
+                    "kind": "cancelled",
+                    "reason": reason,
+                })),
+                Vec::new(),
+                None,
+                Some("job cancellation requested before a deliverable result".to_owned()),
+                now_secs(),
+            )?;
+            Ok::<_, String>(())
+        })
+        .await;
+        let persisted = persisted
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+        match persisted {
+            Ok(()) => self.unregister_cancellation(),
+            Err(error) => {
+                eprintln!(
+                    "persisting cancelled gateway job {} failed: {error}",
+                    self.id
+                );
+            }
         }
     }
 
@@ -2691,7 +2804,7 @@ impl GatewayJobHandle {
     ) -> Result<StoredGatewayJob, ApiError> {
         let id = self.id.clone();
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || {
+        let stored = tokio::task::spawn_blocking(move || {
             let mut store = store.lock_recover("gateway job vault");
             if store.is_active(&id) {
                 return store.complete(
@@ -2710,7 +2823,9 @@ impl GatewayJobHandle {
         })
         .await
         .map_err(|err| ApiError::internal_message(format!("gateway job task failed: {err}")))?
-        .map_err(ApiError::internal_message)
+        .map_err(ApiError::internal_message)?;
+        self.unregister_cancellation();
+        Ok(stored)
     }
 }
 
@@ -2750,7 +2865,7 @@ fn gateway_job_settled_receipt(receipt: &ProviderSignedReceipt, receipt_ack: &Re
     })
 }
 
-async fn persist_completed_invocation_job(
+async fn stage_completed_invocation_job(
     invocation: &GatewaySessionInvocation,
     result: Value,
     artifacts: &[GatewayArtifactOutput],
@@ -2760,18 +2875,28 @@ async fn persist_completed_invocation_job(
     let Some(job) = invocation.job.as_ref() else {
         return Ok(());
     };
-    job.persist_terminal(
-        GatewayJobStatus::Completed,
+    job.persist_reconciliation_pending(
         Some(result),
         gateway_job_artifacts(artifacts),
         Some(gateway_job_settled_receipt(provider_receipt, receipt_ack)),
-        None,
+        Some("signed receipt acknowledgement is pending".to_owned()),
     )
     .await?;
     Ok(())
 }
 
-async fn persist_cancelled_invocation_job(
+async fn finish_completed_invocation_job(
+    invocation: &GatewaySessionInvocation,
+) -> Result<(), GatewaySessionError> {
+    let Some(job) = invocation.job.as_ref() else {
+        return Ok(());
+    };
+    job.finish_reconciliation(GatewayJobStatus::Completed, None)
+        .await?;
+    Ok(())
+}
+
+async fn stage_cancelled_invocation_job(
     invocation: &GatewaySessionInvocation,
     provider_receipt: &ProviderSignedReceipt,
     receipt_ack: &ReceiptAck,
@@ -2779,8 +2904,7 @@ async fn persist_cancelled_invocation_job(
     let Some(job) = invocation.job.as_ref() else {
         return Ok(());
     };
-    job.persist_terminal(
-        GatewayJobStatus::Cancelled,
+    job.persist_reconciliation_pending(
         Some(json!({
             "kind": "cancelled",
             "reason": "client_disconnect",
@@ -2793,6 +2917,76 @@ async fn persist_cancelled_invocation_job(
     )
     .await?;
     Ok(())
+}
+
+async fn finish_cancelled_invocation_job(
+    invocation: &GatewaySessionInvocation,
+) -> Result<(), GatewaySessionError> {
+    let Some(job) = invocation.job.as_ref() else {
+        return Ok(());
+    };
+    job.finish_reconciliation(
+        GatewayJobStatus::Cancelled,
+        Some("client disconnected before the result became deliverable".to_owned()),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn reconcile_and_persist_completed_invocation_job_with_ack<F>(
+    invocation: &GatewaySessionInvocation,
+    result: Value,
+    artifacts: &[GatewayArtifactOutput],
+    provider_receipt: &ProviderSignedReceipt,
+    receipt_ack: &ReceiptAck,
+    ack_delivery: F,
+) -> Result<(), GatewaySessionError>
+where
+    F: Future<Output = Result<(), GatewaySessionError>>,
+{
+    if let Some(job) = invocation.job.as_ref() {
+        job.mark_settlement_reconciliation_started();
+    }
+    stage_completed_invocation_job(invocation, result, artifacts, provider_receipt, receipt_ack)
+        .await?;
+    record_direct_session_receipt(invocation, provider_receipt, receipt_ack)?;
+    ack_delivery.await?;
+    finish_completed_invocation_job(invocation).await
+}
+
+async fn reconcile_and_persist_completed_invocation_job(
+    bridge: &mut ScBridgeClient,
+    direct_peer: &str,
+    invocation: &GatewaySessionInvocation,
+    result: Value,
+    artifacts: &[GatewayArtifactOutput],
+    provider_receipt: &ProviderSignedReceipt,
+    receipt_ack: &ReceiptAck,
+    ack_context: &str,
+) -> Result<(), GatewaySessionError> {
+    let ack_delivery = send_direct_session_frame_with_peer_reconnect(
+        bridge,
+        direct_peer,
+        &invocation.session_id,
+        json!({
+            "t": "s.receipt_ack",
+            "v": 1,
+            "session_id": &receipt_ack.session_id,
+            "seq": receipt_ack.seq,
+            "user_sig": &receipt_ack.user_sig,
+        }),
+        invocation.failover.open_timeout(),
+        ack_context,
+    );
+    reconcile_and_persist_completed_invocation_job_with_ack(
+        invocation,
+        result,
+        artifacts,
+        provider_receipt,
+        receipt_ack,
+        ack_delivery,
+    )
+    .await
 }
 
 fn chat_job_result(output: &ChatOutput) -> Value {
@@ -2852,7 +3046,9 @@ fn artifact_generation_job_result(
         "prompt": request.prompt,
         "size": request.contract_request.get("size").cloned().unwrap_or(Value::Null),
         "seconds": request.duration_seconds,
+        "requested_frames": request.requested_frame_count,
         "frames": request.frame_count,
+        "fps": request.frame_rate,
         "steps": request.step_count,
         "artifacts_requested": request.artifact_count,
         "usage": output.usage,
@@ -3258,6 +3454,7 @@ impl GatewayState {
                 retention_limits.job_bytes,
                 retention_limits.job_ttl_seconds,
             ))),
+            active_job_cancellations: Arc::new(Mutex::new(BTreeMap::new())),
             retention_limits,
             receipt_config,
             wallet_spend: Arc::new(Mutex::new(GatewayWalletSpendState {
@@ -5238,6 +5435,13 @@ fn gateway_speciality_volume_estimate(
         .values()
         .filter_map(|specialities| specialities.get(speciality))
         .filter_map(|levels| levels.get(level))
+        .filter(|calibration| {
+            calibration
+                .verification_method
+                .as_deref()
+                .unwrap_or(CANARY_VERIFICATION_TOKEN_FINGERPRINT)
+                == CANARY_VERIFICATION_TOKEN_FINGERPRINT
+        })
         .collect::<Vec<_>>();
     let output_tokens_min = calibrations.iter().map(|row| row.output_tokens_min).min()?;
     let output_tokens_max = calibrations.iter().map(|row| row.output_tokens_max).max()?;
@@ -5313,6 +5517,48 @@ const ARTIFACT_GENERATION_STEP_ALIASES: &[&str] = &[
 const ARTIFACT_GENERATION_FORMAT_ALIASES: &[&str] =
     &["response_format", "audio_format", "audioFormat"];
 const ARTIFACT_GENERATION_COUNT_ALIASES: &[&str] = &["n", "batch", "batch_size", "batchSize"];
+
+const VIDEO_GENERATION_FRAME_ALIASES: &[&str] =
+    &["num_frames", "frame_count", "frameCount", "frames"];
+const VIDEO_GENERATION_FPS_ALIASES: &[&str] = &["fps", "frame_rate", "frameRate"];
+const VIDEO_GENERATION_IMAGE_ALIASES: &[&str] = &[
+    "input_reference",
+    "input_image",
+    "conditioning_image",
+    "init_image",
+    "image",
+];
+const VIDEO_GENERATION_STRENGTH_ALIASES: &[&str] =
+    &["conditioning_strength", "image_strength", "strength"];
+const VIDEO_GENERATION_CRF_ALIASES: &[&str] = &["image_conditional_crf", "crf"];
+const VIDEO_GENERATION_PROMPT_ENHANCEMENT_ALIASES: &[&str] =
+    &["enhance_prompt", "prompt_enhancement", "promptEnhancement"];
+const VIDEO_GENERATION_SERVER_IMAGE_PATH_FIELDS: &[&str] = &[
+    "image_path",
+    "input_image_path",
+    "conditioning_image_path",
+    "init_image_path",
+    "reference_image_path",
+];
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct VideoRequestPreparation {
+    requested_frames: Option<u64>,
+    inline_image: InlineImageLoad,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedCatalogEndpointRequest {
+    normalized: Value,
+    video: VideoRequestPreparation,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct InlineImageLoad {
+    item_count: u32,
+    max_item_bytes: u64,
+    max_item_pixels: u64,
+}
 
 const ARTIFACT_GENERATION_ALIAS_GROUPS: &[&[&str]] = &[
     ARTIFACT_GENERATION_PROMPT_ALIASES,
@@ -5484,29 +5730,52 @@ fn normalize_catalog_endpoint_request(
     endpoint_family: &str,
     raw_request: &Value,
 ) -> Result<Value, ApiError> {
+    normalize_catalog_endpoint_request_with_metadata(state, model_id, endpoint_family, raw_request)
+        .map(|prepared| prepared.normalized)
+}
+
+fn normalize_catalog_endpoint_request_with_metadata(
+    state: &GatewayState,
+    model_id: &str,
+    endpoint_family: &str,
+    raw_request: &Value,
+) -> Result<PreparedCatalogEndpointRequest, ApiError> {
     let contract = catalog_endpoint_contract(state, model_id, endpoint_family)?;
-    let prepared_request = uses_audio_generation_aliases(endpoint_family)
-        .then(|| {
-            canonicalize_artifact_generation_request(
-                &contract,
-                endpoint_family,
-                raw_request,
-                state.media_limits.max_audio_bytes,
-            )
-        })
-        .transpose()
-        .map_err(|err| ApiError::bad_request(err, Some("request")))?;
-    normalize_endpoint_request_for_provider(
-        &contract,
-        prepared_request.as_ref().unwrap_or(raw_request),
-    )
-    .map(|normalized| normalized.normalized_request)
-    .map_err(|err| {
-        ApiError::bad_request(
-            format!("request normalization failed: {err}"),
-            Some("request"),
+    let (prepared_request, video) = if uses_video_generation_aliases(endpoint_family) {
+        let (request, video) = canonicalize_video_generation_request(
+            &contract,
+            endpoint_family,
+            raw_request,
+            &state.media_limits,
         )
-    })
+        .map_err(|err| ApiError::bad_request(err, Some("request")))?;
+        (Some(request), video)
+    } else if uses_audio_generation_aliases(endpoint_family) {
+        let request = canonicalize_artifact_generation_request(
+            &contract,
+            endpoint_family,
+            raw_request,
+            state.media_limits.max_audio_bytes,
+        )
+        .map_err(|err| ApiError::bad_request(err, Some("request")))?;
+        (Some(request), VideoRequestPreparation::default())
+    } else {
+        (None, VideoRequestPreparation::default())
+    };
+    let prepared_request = prepared_request.as_ref().unwrap_or(raw_request);
+    let normalized = normalize_endpoint_request_for_provider(&contract, prepared_request)
+        .map(|normalized| normalized.normalized_request)
+        .map_err(|err| {
+            ApiError::bad_request(
+                format!("request normalization failed: {err}"),
+                Some("request"),
+            )
+        })?;
+    if uses_video_generation_aliases(endpoint_family) {
+        validate_video_prompt_enhancement_opt_in(&contract, prepared_request, &normalized)
+            .map_err(|err| ApiError::bad_request(err, Some("prompt_enhancement")))?;
+    }
+    Ok(PreparedCatalogEndpointRequest { normalized, video })
 }
 
 fn uses_audio_generation_aliases(endpoint_family: &str) -> bool {
@@ -5516,6 +5785,498 @@ fn uses_audio_generation_aliases(endpoint_family: &str) -> bool {
             | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
             | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
     )
+}
+
+fn uses_video_generation_aliases(endpoint_family: &str) -> bool {
+    matches!(
+        endpoint_family,
+        mayhem_proto::ENDPOINT_OPENAI_VIDEOS | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+    )
+}
+
+fn canonicalize_video_generation_request(
+    contract: &EndpointFamilyContract,
+    endpoint_family: &str,
+    raw_request: &Value,
+    limits: &GatewayMediaLimits,
+) -> Result<(Value, VideoRequestPreparation), String> {
+    if let Some(path) = video_generation_server_image_path(raw_request, "") {
+        return Err(format!(
+            "{path} is forbidden; image conditioning must use bounded inline base64 or a base64 data URL"
+        ));
+    }
+    let mut request = raw_request.clone();
+    for aliases in [
+        ARTIFACT_GENERATION_PROMPT_ALIASES,
+        &["seed"][..],
+        &["width"][..],
+        &["height"][..],
+        &["size"][..],
+        VIDEO_GENERATION_FPS_ALIASES,
+        VIDEO_GENERATION_FRAME_ALIASES,
+        &["seconds", "duration_seconds", "duration", "target_duration"][..],
+        VIDEO_GENERATION_PROMPT_ENHANCEMENT_ALIASES,
+    ] {
+        canonicalize_signed_video_generation_alias_group(
+            contract,
+            endpoint_family,
+            &mut request,
+            aliases,
+        )?;
+    }
+
+    let inline_image =
+        canonicalize_video_generation_conditions(contract, endpoint_family, &mut request, limits)?;
+
+    let frame_candidates =
+        artifact_generation_alias_candidates(endpoint_family, VIDEO_GENERATION_FRAME_ALIASES);
+    let frame_resolution = artifact_generation_alias_target(contract, &frame_candidates)
+        .map(|path| {
+            let spec = contract.request_attribute_specs.get(&path).ok_or_else(|| {
+                format!("signed frame attribute {path} is missing its specification")
+            })?;
+            let supplied = json_path_value(&request, &path)
+                .map(|value| {
+                    endpoint_positive_integer(value)
+                        .ok_or_else(|| format!("{path} must be a positive integer"))
+                })
+                .transpose()?;
+            let signed_default = spec
+                .default
+                .as_ref()
+                .map(|value| {
+                    endpoint_positive_integer(value).ok_or_else(|| {
+                        format!("signed frame default for {path} must be a positive integer")
+                    })
+                })
+                .transpose()?;
+            Ok::<_, String>((path, spec, supplied, signed_default))
+        })
+        .transpose()?;
+    let requested_frames = if let Some((path, spec, supplied, signed_default)) =
+        frame_resolution.as_ref()
+    {
+        if let Some(requested) = supplied.or(*signed_default) {
+            let actual = if supplied.is_some() {
+                canonical_video_frame_count(requested, spec)?
+            } else {
+                requested
+            };
+            set_json_path(&mut request, path, json!(actual))?;
+            Some(requested)
+        } else if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO {
+            return Err(format!(
+                    "signed HF text-to-video contract must resolve {path} from the request or a default"
+                ));
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok((
+        request,
+        VideoRequestPreparation {
+            requested_frames,
+            inline_image,
+        },
+    ))
+}
+
+fn canonicalize_signed_video_generation_alias_group(
+    contract: &EndpointFamilyContract,
+    endpoint_family: &str,
+    request: &mut Value,
+    aliases: &[&str],
+) -> Result<(), String> {
+    let candidates = artifact_generation_alias_candidates(endpoint_family, aliases);
+    let signed = candidates
+        .iter()
+        .filter(|path| endpoint_contract_supports_request_path(contract, path))
+        .collect::<Vec<_>>();
+    let Some(target) = signed.first().map(|path| (*path).clone()) else {
+        return Ok(());
+    };
+    let supplied = signed
+        .iter()
+        .filter_map(|path| json_path_value(request, path).map(|value| (*path, value)))
+        .collect::<Vec<_>>();
+    let Some((_, value)) = supplied.first() else {
+        return Ok(());
+    };
+    if supplied.len() > 1 {
+        return Err(format!(
+            "conflicting signed aliases supplied for {}",
+            aliases.join("/")
+        ));
+    }
+    let value = (*value).clone();
+    for path in signed {
+        remove_json_path(request, path);
+    }
+    set_json_path(request, &target, value)
+}
+
+fn signed_video_alias_value(
+    contract: &EndpointFamilyContract,
+    endpoint_family: &str,
+    request: &Value,
+    aliases: &[&str],
+) -> Result<Option<(String, Value)>, String> {
+    let supplied = artifact_generation_alias_candidates(endpoint_family, aliases)
+        .into_iter()
+        .filter(|path| endpoint_contract_supports_request_path(contract, path))
+        .filter_map(|path| {
+            json_path_value(request, &path)
+                .cloned()
+                .map(|value| (path, value))
+        })
+        .filter(|(_, value)| !value.is_null())
+        .collect::<Vec<_>>();
+    if supplied.len() > 1 {
+        return Err(format!(
+            "conflicting signed aliases supplied for {}",
+            aliases.join("/")
+        ));
+    }
+    Ok(supplied.into_iter().next())
+}
+
+fn remove_signed_video_aliases(
+    contract: &EndpointFamilyContract,
+    endpoint_family: &str,
+    request: &mut Value,
+    aliases: &[&str],
+) {
+    for path in artifact_generation_alias_candidates(endpoint_family, aliases) {
+        if endpoint_contract_supports_request_path(contract, &path) {
+            remove_json_path(request, &path);
+        }
+    }
+}
+
+fn canonicalize_video_generation_conditions(
+    contract: &EndpointFamilyContract,
+    endpoint_family: &str,
+    request: &mut Value,
+    limits: &GatewayMediaLimits,
+) -> Result<InlineImageLoad, String> {
+    let conditions_path = artifact_generation_alias_target(
+        contract,
+        &artifact_generation_alias_candidates(endpoint_family, &["conditions"]),
+    );
+    let image = signed_video_alias_value(
+        contract,
+        endpoint_family,
+        request,
+        VIDEO_GENERATION_IMAGE_ALIASES,
+    )?;
+    let strength = signed_video_alias_value(
+        contract,
+        endpoint_family,
+        request,
+        VIDEO_GENERATION_STRENGTH_ALIASES,
+    )?;
+    let crf = signed_video_alias_value(
+        contract,
+        endpoint_family,
+        request,
+        VIDEO_GENERATION_CRF_ALIASES,
+    )?;
+
+    if image.is_none() && (strength.is_some() || crf.is_some()) {
+        return Err("video conditioning strength/crf requires a signed image alias".to_owned());
+    }
+    let Some((image_path, image_value)) = image else {
+        let Some(conditions_path) = conditions_path else {
+            return Ok(InlineImageLoad::default());
+        };
+        return canonicalize_signed_video_conditions(request, &conditions_path, limits);
+    };
+    let conditions_path = conditions_path.ok_or_else(|| {
+        format!("signed image alias {image_path} requires a signed canonical conditions attribute")
+    })?;
+    if json_path_value(request, &conditions_path).is_some_and(|value| !value.is_null()) {
+        return Err(format!(
+            "{image_path} cannot be combined with {conditions_path}"
+        ));
+    }
+    let strength = strength
+        .as_ref()
+        .map(|(path, value)| {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+                .ok_or_else(|| format!("{path} must be a finite number between 0 and 1"))
+        })
+        .transpose()?
+        .unwrap_or(1.0);
+    let crf = crf
+        .as_ref()
+        .map(|(path, value)| {
+            value
+                .as_u64()
+                .filter(|value| *value <= 51)
+                .ok_or_else(|| format!("{path} must be an integer between 0 and 51"))
+        })
+        .transpose()?
+        .unwrap_or(33);
+    let (data_url, bytes, pixels) =
+        canonical_inline_image_data_url(&image_value, &image_path, limits)?;
+
+    remove_signed_video_aliases(
+        contract,
+        endpoint_family,
+        request,
+        VIDEO_GENERATION_IMAGE_ALIASES,
+    );
+    remove_signed_video_aliases(
+        contract,
+        endpoint_family,
+        request,
+        VIDEO_GENERATION_STRENGTH_ALIASES,
+    );
+    remove_signed_video_aliases(
+        contract,
+        endpoint_family,
+        request,
+        VIDEO_GENERATION_CRF_ALIASES,
+    );
+    set_json_path(
+        request,
+        &conditions_path,
+        json!([{
+            "image_url": data_url,
+            "frame_index": 0,
+            "strength": strength,
+            "crf": crf,
+        }]),
+    )?;
+    Ok(InlineImageLoad {
+        item_count: 1,
+        max_item_bytes: bytes,
+        max_item_pixels: pixels,
+    })
+}
+
+fn canonicalize_signed_video_conditions(
+    request: &mut Value,
+    conditions_path: &str,
+    limits: &GatewayMediaLimits,
+) -> Result<InlineImageLoad, String> {
+    let Some(value) = json_path_value(request, conditions_path).cloned() else {
+        return Ok(InlineImageLoad::default());
+    };
+    let conditions = value
+        .as_array()
+        .ok_or_else(|| format!("{conditions_path} must be an ordered array"))?;
+    let mut normalized = Vec::with_capacity(conditions.len());
+    let mut load = InlineImageLoad::default();
+    for (index, condition) in conditions.iter().enumerate() {
+        let mut condition = condition
+            .as_object()
+            .cloned()
+            .ok_or_else(|| format!("{conditions_path}[{index}] must be an object"))?;
+        let image = condition
+            .get("image_url")
+            .cloned()
+            .ok_or_else(|| format!("{conditions_path}[{index}] must contain image_url"))?;
+        let (data_url, bytes, pixels) = canonical_inline_image_data_url(
+            &image,
+            &format!("{conditions_path}[{index}].image_url"),
+            limits,
+        )?;
+        condition.insert("image_url".to_owned(), json!(data_url));
+        normalized.push(Value::Object(condition));
+        load.item_count = load.item_count.saturating_add(1);
+        load.max_item_bytes = load.max_item_bytes.max(bytes);
+        load.max_item_pixels = load.max_item_pixels.max(pixels);
+    }
+    set_json_path(request, conditions_path, Value::Array(normalized))?;
+    Ok(load)
+}
+
+fn video_generation_server_image_path(value: &Value, parent: &str) -> Option<String> {
+    let object = value.as_object()?;
+    for (key, child) in object {
+        let path = if parent.is_empty() {
+            key.clone()
+        } else {
+            format!("{parent}.{key}")
+        };
+        if VIDEO_GENERATION_SERVER_IMAGE_PATH_FIELDS.contains(&key.as_str()) && !child.is_null() {
+            return Some(path);
+        }
+        if let Some(path) = video_generation_server_image_path(child, &path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn canonical_inline_image_data_url(
+    value: &Value,
+    path: &str,
+    limits: &GatewayMediaLimits,
+) -> Result<(String, u64, u64), String> {
+    let (encoded, declared_content_type) = match value {
+        Value::String(value) => (value.as_str(), None),
+        Value::Object(image) => {
+            if let Some(unsupported) = image.keys().find(|key| {
+                !matches!(
+                    key.as_str(),
+                    "image_url" | "url" | "data" | "encoding" | "content_type"
+                )
+            }) {
+                return Err(format!(
+                    "{path}.{unsupported} is not a supported inline image field"
+                ));
+            }
+            if image
+                .get("encoding")
+                .is_some_and(|encoding| encoding.as_str() != Some("base64"))
+            {
+                return Err(format!("{path}.encoding must be the string base64"));
+            }
+            let encoded = image
+                .get("image_url")
+                .or_else(|| image.get("url"))
+                .or_else(|| image.get("data"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{path} must contain image_url, url, or base64 data"))?;
+            let content_type = image
+                .get("content_type")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .ok_or_else(|| format!("{path}.content_type must be a string"))
+                })
+                .transpose()?;
+            (encoded, content_type)
+        }
+        _ => {
+            return Err(format!(
+                "{path} must be inline base64, a base64 image data URL, or an inline image object"
+            ))
+        }
+    };
+
+    let data_url = if encoded.starts_with("data:") {
+        if declared_content_type.is_some() {
+            return Err(format!(
+                "{path}.content_type must be omitted when a data URL supplies the media type"
+            ));
+        }
+        encoded.to_owned()
+    } else {
+        if encoded.contains("://") || encoded.starts_with('/') || encoded.contains("\\\\") {
+            return Err(format!(
+                "{path} cannot fetch URLs or read server paths; use inline base64 image data"
+            ));
+        }
+        let encoded_limit = usize::try_from(limits.max_image_bytes)
+            .unwrap_or(usize::MAX / 4)
+            .saturating_mul(4)
+            .div_ceil(3)
+            .saturating_add(4);
+        if encoded.is_empty() || encoded.len() > encoded_limit {
+            return Err(format!(
+                "{path} exceeds the {}-byte gateway image limit",
+                limits.max_image_bytes
+            ));
+        }
+        let bytes = BASE64_STANDARD
+            .decode(encoded)
+            .map_err(|_| format!("{path} contains invalid base64 image data"))?;
+        let detected = match image::guess_format(&bytes) {
+            Ok(image::ImageFormat::Png) => "image/png",
+            Ok(image::ImageFormat::Jpeg) => "image/jpeg",
+            _ => return Err(format!("{path} must contain a PNG or JPEG image")),
+        };
+        if declared_content_type.is_some_and(|content_type| content_type != detected) {
+            return Err(format!(
+                "{path}.content_type does not match the decoded image"
+            ));
+        }
+        format!("data:{detected};base64,{encoded}")
+    };
+    let (bytes, pixels) = validate_chat_image_data_url(&data_url, limits)
+        .map_err(|error| format!("{path}: {}", error.message))?;
+    Ok((data_url, bytes, pixels))
+}
+
+fn endpoint_positive_integer(value: &Value) -> Option<u64> {
+    value.as_u64().filter(|value| *value > 0).or_else(|| {
+        value
+            .as_str()?
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+    })
+}
+
+fn canonical_video_frame_count(
+    requested: u64,
+    spec: &mayhem_proto::EndpointAttributeSpec,
+) -> Result<u64, String> {
+    let mut allowed = spec
+        .enum_values
+        .iter()
+        .filter_map(endpoint_positive_integer)
+        .collect::<Vec<_>>();
+    allowed.sort_unstable();
+    allowed.dedup();
+    if !allowed.is_empty() {
+        return allowed
+            .into_iter()
+            .min_by_key(|candidate| (candidate.abs_diff(requested), *candidate))
+            .ok_or_else(|| "signed frame set is empty".to_owned());
+    }
+
+    let minimum = spec.minimum.unwrap_or(1.0).ceil().max(1.0) as u64;
+    let maximum = spec.maximum.unwrap_or(u64::MAX as f64).floor().max(1.0) as u64;
+    if minimum > maximum {
+        return Err("signed frame range has minimum greater than maximum".to_owned());
+    }
+    let mut actual = requested.clamp(minimum, maximum);
+    if let Some(multiple) = spec
+        .multiple_of
+        .filter(|value| value.is_finite() && *value >= 1.0)
+        .map(|value| value.round() as u64)
+        .filter(|value| *value > 1)
+    {
+        let lower = actual / multiple * multiple;
+        let upper = lower.saturating_add(multiple);
+        actual = [lower, upper]
+            .into_iter()
+            .filter(|candidate| *candidate >= minimum && *candidate <= maximum)
+            .min_by_key(|candidate| (candidate.abs_diff(actual), *candidate))
+            .ok_or_else(|| "signed frame range contains no valid multiple".to_owned())?;
+    }
+    Ok(actual)
+}
+
+fn validate_video_prompt_enhancement_opt_in(
+    contract: &EndpointFamilyContract,
+    prepared_request: &Value,
+    normalized_request: &Value,
+) -> Result<(), String> {
+    let candidates = artifact_generation_alias_candidates(
+        &contract.family,
+        VIDEO_GENERATION_PROMPT_ENHANCEMENT_ALIASES,
+    );
+    let Some(path) = artifact_generation_alias_target(contract, &candidates) else {
+        return Ok(());
+    };
+    if json_path_value(normalized_request, &path).and_then(Value::as_bool) == Some(true)
+        && json_path_value(prepared_request, &path).and_then(Value::as_bool) != Some(true)
+    {
+        return Err(format!(
+            "{path} must be explicitly enabled by the request; signed defaults may not silently rewrite prompts"
+        ));
+    }
+    Ok(())
 }
 
 fn canonicalize_artifact_generation_request(
@@ -6028,6 +6789,27 @@ async fn prepare_gateway_job(
     normalized_request: &Value,
     access_token: &Option<GatewayTokenAttribution>,
 ) -> Result<PreparedGatewayJob, ApiError> {
+    prepare_gateway_job_with_cancellation(
+        state,
+        headers,
+        endpoint_family,
+        model,
+        normalized_request,
+        access_token,
+        None,
+    )
+    .await
+}
+
+async fn prepare_gateway_job_with_cancellation(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    endpoint_family: &str,
+    model: &str,
+    normalized_request: &Value,
+    access_token: &Option<GatewayTokenAttribution>,
+    cancellation: Option<GatewayRequestCancellation>,
+) -> Result<PreparedGatewayJob, ApiError> {
     let idempotency_key = headers
         .get("idempotency-key")
         .map(|value| {
@@ -6050,19 +6832,45 @@ async fn prepare_gateway_job(
     )
     .map_err(|err| ApiError::bad_request(err, Some("Idempotency-Key")))?;
     let request_fingerprint = stable_value_hash(normalized_request);
+    let cancellation = cancellation.unwrap_or_else(GatewayRequestCancellation::new);
     let store = state.jobs.clone();
+    let active_cancellations = state.active_job_cancellations.clone();
     let begin_id = id.clone();
     let begin_endpoint = endpoint_family.to_owned();
     let begin_model = model.to_owned();
+    let begin_cancellation = cancellation.clone();
     let begin = tokio::task::spawn_blocking(move || {
-        store.lock_recover("gateway job vault").begin(
-            begin_id,
+        let mut store = store.lock_recover("gateway job vault");
+        if store.is_active(&begin_id) {
+            return store.begin(
+                begin_id,
+                begin_endpoint,
+                begin_model,
+                owner_token_id,
+                request_fingerprint,
+                now_secs(),
+            );
+        }
+
+        let mut cancellations =
+            active_cancellations.lock_recover("active gateway job cancellations");
+        cancellations.insert(begin_id.clone(), begin_cancellation.clone());
+        let begin = store.begin(
+            begin_id.clone(),
             begin_endpoint,
             begin_model,
             owner_token_id,
             request_fingerprint,
             now_secs(),
-        )
+        );
+        if !matches!(begin, Ok(BeginGatewayJob::Started))
+            && cancellations
+                .get(&begin_id)
+                .is_some_and(|registered| registered == &begin_cancellation)
+        {
+            cancellations.remove(&begin_id);
+        }
+        begin
     })
     .await
     .map_err(|err| ApiError::internal_message(format!("gateway job task failed: {err}")))?
@@ -6071,6 +6879,9 @@ async fn prepare_gateway_job(
         BeginGatewayJob::Started => PreparedGatewayJob::Started(GatewayJobHandle {
             id,
             store: state.jobs.clone(),
+            cancellation,
+            active_cancellations: state.active_job_cancellations.clone(),
+            settlement_reconciliation_started: Arc::new(AtomicBool::new(false)),
         }),
         BeginGatewayJob::InProgress => PreparedGatewayJob::InProgress(id),
         BeginGatewayJob::Existing(job) => PreparedGatewayJob::Existing(job),
@@ -6119,11 +6930,41 @@ fn gateway_job_pending_response(id: &str) -> Response {
     response
 }
 
-fn gateway_existing_job_response(job: StoredGatewayJob) -> Response {
-    let status = if job.status == GatewayJobStatus::Completed {
-        StatusCode::OK
+fn request_gateway_job_cancellation(state: &GatewayState, id: &str) -> bool {
+    let cancellation = state
+        .active_job_cancellations
+        .lock_recover("active gateway job cancellations")
+        .get(id)
+        .cloned();
+    if let Some(cancellation) = cancellation {
+        cancellation.cancel();
+        true
     } else {
-        StatusCode::CONFLICT
+        false
+    }
+}
+
+fn gateway_job_cancelling_response(id: &str) -> Response {
+    let mut response = (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "id": id,
+            "object": "mayhem.job",
+            "status": "cancelling",
+            "deleted": false,
+            "status_url": format!("/v1/jobs/{id}"),
+        })),
+    )
+        .into_response();
+    attach_gateway_job_headers(&mut response, id);
+    response
+}
+
+fn gateway_existing_job_response(job: StoredGatewayJob) -> Response {
+    let status = match job.status {
+        GatewayJobStatus::Completed => StatusCode::OK,
+        GatewayJobStatus::ReconciliationPending => StatusCode::ACCEPTED,
+        GatewayJobStatus::Cancelled | GatewayJobStatus::Failed => StatusCode::CONFLICT,
     };
     let id = job.id.clone();
     let mut response = (status, Json(gateway_job_metadata(&job))).into_response();
@@ -6371,7 +7212,12 @@ async fn retrieve_gateway_job(
     if let Err(err) = authorize_gateway_job(&state, &headers, &job) {
         return err.into_response();
     }
-    let status = if matches!(job, GatewayJobLookup::InProgress { .. }) {
+    let status = if matches!(job, GatewayJobLookup::InProgress { .. })
+        || matches!(
+            &job,
+            GatewayJobLookup::Terminal(job)
+                if job.status == GatewayJobStatus::ReconciliationPending
+        ) {
         StatusCode::ACCEPTED
     } else {
         StatusCode::OK
@@ -6399,7 +7245,10 @@ async fn retrieve_gateway_job_result(
     let GatewayJobLookup::Terminal(job) = job else {
         return gateway_job_pending_response(&job_id);
     };
-    if job.status != GatewayJobStatus::Completed {
+    if !matches!(
+        job.status,
+        GatewayJobStatus::Completed | GatewayJobStatus::ReconciliationPending
+    ) {
         return gateway_existing_job_response(job);
     }
     let mut response = Json(json!({
@@ -6432,7 +7281,10 @@ async fn retrieve_gateway_job_artifact(
     let GatewayJobLookup::Terminal(job) = job else {
         return gateway_job_pending_response(&job_id);
     };
-    if job.status != GatewayJobStatus::Completed {
+    if !matches!(
+        job.status,
+        GatewayJobStatus::Completed | GatewayJobStatus::ReconciliationPending
+    ) {
         return gateway_existing_job_response(job);
     }
     let Some(artifact) = job
@@ -6482,8 +7334,22 @@ async fn delete_gateway_job(
         Err(err) => return err.into_response(),
     };
     if matches!(job, GatewayJobLookup::InProgress { .. }) {
+        if request_gateway_job_cancellation(&state, &job_id) {
+            return gateway_job_cancelling_response(&job_id);
+        }
         return ApiError::conflict(
-            "an in-progress job cannot be deleted; disconnect or cancellation must settle first",
+            "the in-progress job no longer has a live execution to cancel",
+            Some("job_id"),
+        )
+        .into_response();
+    }
+    if matches!(
+        &job,
+        GatewayJobLookup::Terminal(job)
+            if job.status == GatewayJobStatus::ReconciliationPending
+    ) {
+        return ApiError::conflict(
+            "the completed result is still reconciling its signed receipt acknowledgement",
             Some("job_id"),
         )
         .into_response();
@@ -6580,6 +7446,8 @@ async fn create_chat_completion(
         Err(err) => return err.into_response(),
     };
     options.job = Some(job.clone());
+    let cancellation = job.cancellation();
+    options.client_cancellation = Some(cancellation.clone());
     if gateway_prefers_async_response(&headers) {
         let job_id = job.id.clone();
         spawn_gateway_job_request(job, async move {
@@ -6587,8 +7455,6 @@ async fn create_chat_completion(
         });
         return gateway_job_pending_response(&job_id);
     }
-    let cancellation = GatewayRequestCancellation::new();
-    options.client_cancellation = Some(cancellation.clone());
     let result = run_detached_gateway_job_request(cancellation, job.clone(), async move {
         build_chat_completion(state, request, options).await
     })
@@ -6707,6 +7573,8 @@ async fn create_completion(
         Err(err) => return err.into_response(),
     };
     options.job = Some(job.clone());
+    let cancellation = job.cancellation();
+    options.client_cancellation = Some(cancellation.clone());
     if gateway_prefers_async_response(&headers) {
         let job_id = job.id.clone();
         spawn_gateway_job_request(job, async move {
@@ -6714,8 +7582,6 @@ async fn create_completion(
         });
         return gateway_job_pending_response(&job_id);
     }
-    let cancellation = GatewayRequestCancellation::new();
-    options.client_cancellation = Some(cancellation.clone());
     let result = run_detached_gateway_job_request(cancellation, job.clone(), async move {
         build_completion(state, request, normalized_request, options).await
     })
@@ -6788,6 +7654,8 @@ async fn create_response(
         Err(err) => return err.into_response(),
     };
     options.job = Some(job.clone());
+    let cancellation = job.cancellation();
+    options.client_cancellation = Some(cancellation.clone());
     if gateway_prefers_async_response(&headers) {
         let job_id = job.id.clone();
         spawn_gateway_job_request(job, async move {
@@ -6795,8 +7663,6 @@ async fn create_response(
         });
         return gateway_job_pending_response(&job_id);
     }
-    let cancellation = GatewayRequestCancellation::new();
-    options.client_cancellation = Some(cancellation.clone());
     let result = run_detached_gateway_job_request(cancellation, job.clone(), async move {
         build_response(state, request, normalized_request, options).await
     })
@@ -6866,6 +7732,8 @@ async fn create_embedding(
         Err(err) => return err.into_response(),
     };
     options.job = Some(job.clone());
+    let cancellation = job.cancellation();
+    options.client_cancellation = Some(cancellation.clone());
     if gateway_prefers_async_response(&headers) {
         let job_id = job.id.clone();
         let request_state = state.clone();
@@ -6874,8 +7742,6 @@ async fn create_embedding(
         });
         return gateway_job_pending_response(&job_id);
     }
-    let cancellation = GatewayRequestCancellation::new();
-    options.client_cancellation = Some(cancellation.clone());
     let request_state = state.clone();
     let result = run_detached_gateway_job_request(cancellation, job.clone(), async move {
         build_embedding(&request_state, request, options).await
@@ -6945,6 +7811,8 @@ async fn create_image_generation(
         Err(err) => return err.into_response(),
     };
     options.job = Some(job.clone());
+    let cancellation = job.cancellation();
+    options.client_cancellation = Some(cancellation.clone());
     if gateway_prefers_async_response(&headers) {
         let job_id = job.id.clone();
         let request_state = state.clone();
@@ -6953,8 +7821,6 @@ async fn create_image_generation(
         });
         return gateway_job_pending_response(&job_id);
     }
-    let cancellation = GatewayRequestCancellation::new();
-    options.client_cancellation = Some(cancellation.clone());
     let request_state = state.clone();
     let result = run_detached_gateway_job_request(cancellation, job.clone(), async move {
         build_image_generation(&request_state, request, options).await
@@ -6996,27 +7862,19 @@ async fn create_video_generation(
     .await
     {
         Ok(ArtifactEndpointOutcome::Immediate(response)) => response,
-        Ok(ArtifactEndpointOutcome::Completed { request, run, job }) => {
-            let stored = match job
-                .persist_completed_if_active(
-                    artifact_generation_job_result(&request, &run.output),
-                    gateway_job_artifacts(&run.output.artifacts),
-                    run.receipt.clone(),
-                )
-                .await
-            {
-                Ok(stored) => stored,
-                Err(err) => return err.into_response(),
-            };
-            match video_generation_metadata_from_job(&stored) {
-                Ok(metadata) => {
-                    let mut response = Json(metadata).into_response();
-                    attach_gateway_job_headers(&mut response, &job.id);
-                    response
-                }
-                Err(err) => err.into_response(),
+        Ok(ArtifactEndpointOutcome::Completed {
+            request: _,
+            run: _,
+            job,
+            stored,
+        }) => match video_generation_metadata_from_job(&stored) {
+            Ok(metadata) => {
+                let mut response = Json(metadata).into_response();
+                attach_gateway_job_headers(&mut response, &job.id);
+                response
             }
-        }
+            Err(err) => err.into_response(),
+        },
         Err(err) => err.into_response(),
     }
 }
@@ -7041,17 +7899,12 @@ async fn create_audio_generation(
     .await
     {
         Ok(ArtifactEndpointOutcome::Immediate(response)) => response,
-        Ok(ArtifactEndpointOutcome::Completed { request, run, job }) => {
-            if let Err(err) = job
-                .persist_completed_if_active(
-                    artifact_generation_job_result(&request, &run.output),
-                    gateway_job_artifacts(&run.output.artifacts),
-                    run.receipt.clone(),
-                )
-                .await
-            {
-                return err.into_response();
-            }
+        Ok(ArtifactEndpointOutcome::Completed {
+            request,
+            run,
+            job,
+            stored: _,
+        }) => {
             let mut response =
                 Json(artifact_generation_response_value(&request, &run)).into_response();
             attach_gateway_job_headers(&mut response, &job.id);
@@ -7081,17 +7934,12 @@ async fn create_music_generation(
     .await
     {
         Ok(ArtifactEndpointOutcome::Immediate(response)) => response,
-        Ok(ArtifactEndpointOutcome::Completed { request, run, job }) => {
-            if let Err(err) = job
-                .persist_completed_if_active(
-                    artifact_generation_job_result(&request, &run.output),
-                    gateway_job_artifacts(&run.output.artifacts),
-                    run.receipt.clone(),
-                )
-                .await
-            {
-                return err.into_response();
-            }
+        Ok(ArtifactEndpointOutcome::Completed {
+            request,
+            run,
+            job,
+            stored: _,
+        }) => {
             let mut response =
                 Json(artifact_generation_response_value(&request, &run)).into_response();
             attach_gateway_job_headers(&mut response, &job.id);
@@ -7107,6 +7955,7 @@ enum ArtifactEndpointOutcome {
         request: ArtifactGenerationRequest,
         run: CompletedArtifactGeneration,
         job: GatewayJobHandle,
+        stored: StoredGatewayJob,
     },
 }
 
@@ -7119,19 +7968,29 @@ async fn execute_artifact_generation_endpoint(
 ) -> Result<ArtifactEndpointOutcome, ApiError> {
     let model_id = endpoint_request_model(&raw_request)?.to_owned();
     let access_token = state.authorize_gateway_request(headers, Some(&model_id))?;
-    let normalized =
-        normalize_catalog_endpoint_request(state, &model_id, endpoint_family, &raw_request)?;
-    let request = artifact_generation_request(&model_id, endpoint_family, normalized.clone())?;
+    let prepared = normalize_catalog_endpoint_request_with_metadata(
+        state,
+        &model_id,
+        endpoint_family,
+        &raw_request,
+    )?;
+    let normalized = prepared.normalized;
+    let request = artifact_generation_request(
+        &model_id,
+        endpoint_family,
+        normalized.clone(),
+        prepared.video,
+    )?;
     let mut options = state.request_options_from_headers(headers)?;
     options.access_token = access_token;
-    options.client_cancellation = client_cancellation;
-    let job = match prepare_gateway_job(
+    let job = match prepare_gateway_job_with_cancellation(
         state,
         headers,
         endpoint_family,
         &model_id,
         &normalized,
         &options.access_token,
+        client_cancellation,
     )
     .await?
     {
@@ -7148,8 +8007,8 @@ async fn execute_artifact_generation_endpoint(
         }
     };
     options.job = Some(job.clone());
+    options.client_cancellation = Some(job.cancellation());
     if gateway_prefers_async_response(headers) {
-        options.client_cancellation = None;
         let job_id = job.id.clone();
         let request_state = state.clone();
         let task_request = request.clone();
@@ -7160,14 +8019,30 @@ async fn execute_artifact_generation_endpoint(
             gateway_job_pending_response(&job_id),
         ));
     }
-    let run = match build_artifact_generation(state, request.clone(), options).await {
-        Ok(run) => run,
-        Err(error) => {
-            job.persist_failure_if_active(error.message.clone()).await;
-            return Err(error);
-        }
-    };
-    Ok(ArtifactEndpointOutcome::Completed { request, run, job })
+    let task_state = state.clone();
+    let task_request = request.clone();
+    let task_job = job.clone();
+    let (run, stored) = spawn_owned_gateway_job_request(job.clone(), async move {
+        let run = build_artifact_generation(&task_state, task_request.clone(), options).await?;
+        let stored = task_job
+            .persist_completed_if_active(
+                artifact_generation_job_result(&task_request, &run.output),
+                gateway_job_artifacts(&run.output.artifacts),
+                run.receipt.clone(),
+            )
+            .await?;
+        Ok((run, stored))
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal_message(format!("gateway job owner task failed: {error}"))
+    })??;
+    Ok(ArtifactEndpointOutcome::Completed {
+        request,
+        run,
+        job,
+        stored,
+    })
 }
 
 fn video_generation_metadata_from_job(job: &StoredGatewayJob) -> Result<Value, ApiError> {
@@ -7207,7 +8082,10 @@ fn video_generation_metadata_from_summary(
         "object": "video",
         "model": job.model,
         "status": status,
-        "progress": if job.status == GatewayJobStatus::Completed { 100 } else { 0 },
+        "progress": if matches!(
+            job.status,
+            GatewayJobStatus::Completed | GatewayJobStatus::ReconciliationPending
+        ) { 100 } else { 0 },
         "created_at": job.created_at,
         "completed_at": job.finished_at,
         "expires_at": job.expires_at,
@@ -7382,9 +8260,22 @@ async fn delete_video_generation(
         Err(err) => return err.into_response(),
     };
     let GatewayJobLookup::Terminal(job) = job else {
-        return ApiError::conflict("an in-progress video cannot be deleted", Some("video_id"))
-            .into_response();
+        if request_gateway_job_cancellation(&state, &video_id) {
+            return gateway_job_cancelling_response(&video_id);
+        }
+        return ApiError::conflict(
+            "the in-progress video no longer has a live execution to cancel",
+            Some("video_id"),
+        )
+        .into_response();
     };
+    if job.status == GatewayJobStatus::ReconciliationPending {
+        return ApiError::conflict(
+            "the completed video is still reconciling its signed receipt acknowledgement",
+            Some("video_id"),
+        )
+        .into_response();
+    }
     let mut metadata = match video_generation_metadata_from_job(&job) {
         Ok(metadata) => metadata,
         Err(err) => return err.into_response(),
@@ -7442,7 +8333,10 @@ async fn retrieve_video_generation_content(
         return gateway_job_pending_response(&video_id);
     };
     if job.endpoint_family != mayhem_proto::ENDPOINT_OPENAI_VIDEOS
-        || job.status != GatewayJobStatus::Completed
+        || !matches!(
+            job.status,
+            GatewayJobStatus::Completed | GatewayJobStatus::ReconciliationPending
+        )
     {
         return ApiError::not_found("video job was not found", Some("video_id")).into_response();
     }
@@ -7522,6 +8416,8 @@ async fn create_audio_speech(
         Err(err) => return err.into_response(),
     };
     options.job = Some(job.clone());
+    let cancellation = job.cancellation();
+    options.client_cancellation = Some(cancellation.clone());
     if gateway_prefers_async_response(&headers) {
         let job_id = job.id.clone();
         let request_state = state.clone();
@@ -7530,8 +8426,6 @@ async fn create_audio_speech(
         });
         return gateway_job_pending_response(&job_id);
     }
-    let cancellation = GatewayRequestCancellation::new();
-    options.client_cancellation = Some(cancellation.clone());
     let request_state = state.clone();
     match run_detached_gateway_job_request(cancellation, job.clone(), async move {
         build_audio_speech(&request_state, request, options).await
@@ -7592,6 +8486,8 @@ async fn create_audio_transcription(
                 Err(err) => return err.into_response(),
             };
             options.job = Some(job.clone());
+            let cancellation = job.cancellation();
+            options.client_cancellation = Some(cancellation.clone());
             if gateway_prefers_async_response(&headers) {
                 let job_id = job.id.clone();
                 let request_state = state.clone();
@@ -7600,8 +8496,6 @@ async fn create_audio_transcription(
                 });
                 return gateway_job_pending_response(&job_id);
             }
-            let cancellation = GatewayRequestCancellation::new();
-            options.client_cancellation = Some(cancellation.clone());
             let request_state = state.clone();
             match run_detached_gateway_job_request(cancellation, job.clone(), async move {
                 build_audio_transcription(&request_state, request, options).await
@@ -7637,18 +8531,19 @@ async fn create_hf_inference(
         Ok(payload) => payload,
         Err(err) => return err.into_response(),
     };
-    let contract_request = match normalize_catalog_endpoint_request(
+    let prepared = match normalize_catalog_endpoint_request_with_metadata(
         &state,
         &model_id,
         &endpoint_family,
         &payload.contract_request,
     ) {
-        Ok(normalized) => normalized,
+        Ok(prepared) => prepared,
         Err(err) => return err.into_response(),
     };
     let payload = HfInferencePayload {
-        contract_request,
+        contract_request: prepared.normalized,
         raw_audio: payload.raw_audio,
+        video: prepared.video,
     };
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
@@ -7671,6 +8566,8 @@ async fn create_hf_inference(
         Err(err) => return err.into_response(),
     };
     options.job = Some(job.clone());
+    let cancellation = job.cancellation();
+    options.client_cancellation = Some(cancellation.clone());
     if gateway_prefers_async_response(&headers) {
         let job_id = job.id.clone();
         spawn_gateway_job_request(
@@ -7679,8 +8576,6 @@ async fn create_hf_inference(
         );
         return gateway_job_pending_response(&job_id);
     }
-    let cancellation = GatewayRequestCancellation::new();
-    options.client_cancellation = Some(cancellation.clone());
     let result = run_detached_gateway_job_request(
         cancellation,
         job.clone(),
@@ -7740,6 +8635,7 @@ fn parse_hf_inference_payload(
         return Ok(HfInferencePayload {
             contract_request,
             raw_audio,
+            video: VideoRequestPreparation::default(),
         });
     }
     if endpoint_family != mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION {
@@ -7771,6 +8667,7 @@ fn parse_hf_inference_payload(
             content_type: audio.content_type.to_owned(),
             filename: audio.filename.to_owned(),
         }),
+        video: VideoRequestPreparation::default(),
     })
 }
 
@@ -7781,7 +8678,11 @@ async fn execute_hf_inference_job(
     payload: HfInferencePayload,
     options: GatewayRequestOptions,
 ) -> Result<Response, ApiError> {
-    let raw_request = payload.contract_request;
+    let HfInferencePayload {
+        contract_request: raw_request,
+        raw_audio,
+        video,
+    } = payload;
     match endpoint_family.as_str() {
         mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION => {
             let request = hf_embedding_request(&model_id, raw_request)?;
@@ -7798,12 +8699,12 @@ async fn execute_hf_inference_job(
             build_audio_speech(&state, request, options).await
         }
         mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => {
-            let request =
-                hf_audio_transcription_request(&model_id, raw_request, payload.raw_audio)?;
+            let request = hf_audio_transcription_request(&model_id, raw_request, raw_audio)?;
             build_audio_transcription(&state, request, options).await
         }
         mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => {
-            let request = artifact_generation_request(&model_id, &endpoint_family, raw_request)?;
+            let request =
+                artifact_generation_request(&model_id, &endpoint_family, raw_request, video)?;
             let response_request = request.clone();
             let run = build_artifact_generation(&state, request, options).await?;
             artifact_generation_raw_response(&response_request, &run)
@@ -8146,6 +9047,7 @@ fn artifact_generation_request(
     model_id: &str,
     endpoint_family: &str,
     raw_request: Value,
+    video: VideoRequestPreparation,
 ) -> Result<ArtifactGenerationRequest, ApiError> {
     let inline_audio = artifact_generation_inline_audio_load(&raw_request).map_err(|error| {
         ApiError::bad_request(
@@ -8153,7 +9055,6 @@ fn artifact_generation_request(
             Some("request"),
         )
     })?;
-    let parameters = raw_request.get("parameters").and_then(Value::as_object);
     let prompt = artifact_generation_request_value(
         &raw_request,
         endpoint_family,
@@ -8173,79 +9074,116 @@ fn artifact_generation_request(
             .get("seconds")
             .and_then(generation_duration_seconds_ceil)
     });
-    let requested_frames = parameters
-        .and_then(|parameters| parameters.get("num_frames"))
-        .and_then(Value::as_u64);
-    let (output_modality, transport_kind, duration_seconds, frame_count, response_format) =
-        match endpoint_family {
-            mayhem_proto::ENDPOINT_OPENAI_VIDEOS => {
-                let duration = duration_seconds.unwrap_or(4).max(1);
-                (
-                    "video",
-                    "video_generation",
-                    duration,
-                    duration.saturating_mul(DEFAULT_VIDEO_GENERATION_FPS),
-                    "mp4",
+    let normalized_frames = artifact_generation_request_value(
+        &raw_request,
+        endpoint_family,
+        VIDEO_GENERATION_FRAME_ALIASES,
+    )
+    .and_then(endpoint_positive_integer);
+    let frame_rate = artifact_generation_request_value(
+        &raw_request,
+        endpoint_family,
+        VIDEO_GENERATION_FPS_ALIASES,
+    )
+    .and_then(endpoint_positive_number);
+    let (
+        output_modality,
+        transport_kind,
+        duration_seconds,
+        requested_frame_count,
+        frame_count,
+        frame_rate,
+        response_format,
+    ) = match endpoint_family {
+        mayhem_proto::ENDPOINT_OPENAI_VIDEOS => {
+            let duration = duration_seconds.unwrap_or(4).max(1);
+            let fps = frame_rate.unwrap_or(DEFAULT_VIDEO_GENERATION_FPS as f64);
+            let requested_frames = video
+                .requested_frames
+                .unwrap_or_else(|| ((duration as f64) * fps).round().max(1.0) as u64);
+            (
+                "video",
+                "video_generation",
+                duration,
+                requested_frames,
+                normalized_frames.unwrap_or(requested_frames),
+                fps,
+                "mp4",
+            )
+        }
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO => {
+            let frames = normalized_frames.ok_or_else(|| {
+                ApiError::bad_request(
+                    "signed HF text-to-video contract did not resolve num_frames",
+                    Some("request"),
                 )
-            }
-            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO => {
-                let frames = requested_frames.unwrap_or(16).max(1);
-                let duration = duration_seconds.unwrap_or_else(|| {
-                    let fps = parameters
-                        .and_then(|parameters| parameters.get("fps"))
-                        .and_then(Value::as_f64)
-                        .filter(|fps| fps.is_finite() && *fps > 0.0)
-                        .unwrap_or(8.0);
-                    ((frames as f64) / fps).ceil().max(1.0) as u64
-                });
-                ("video", "video_generation", duration, frames, "mp4")
-            }
-            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS => (
-                "audio",
-                "music_generation",
-                duration_seconds
-                    .unwrap_or(inline_audio.max_item_seconds.max(1))
-                    .max(1),
-                0,
-                artifact_generation_request_value(
-                    &raw_request,
-                    endpoint_family,
-                    ARTIFACT_GENERATION_FORMAT_ALIASES,
-                )
-                .and_then(Value::as_str)
-                .unwrap_or("wav"),
-            ),
-            mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS => (
-                "audio",
-                "audio_generation",
-                duration_seconds
-                    .unwrap_or(inline_audio.max_item_seconds.max(1))
-                    .max(1),
-                0,
-                artifact_generation_request_value(
-                    &raw_request,
-                    endpoint_family,
-                    ARTIFACT_GENERATION_FORMAT_ALIASES,
-                )
-                .and_then(Value::as_str)
-                .unwrap_or("wav"),
-            ),
-            mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => (
-                "audio",
-                "audio_generation",
-                duration_seconds
-                    .unwrap_or(inline_audio.max_item_seconds.max(1))
-                    .max(1),
-                0,
-                "wav",
-            ),
-            _ => {
-                return Err(ApiError::bad_request(
-                    format!("endpoint family {endpoint_family} is not an artifact generation API"),
-                    Some("model"),
-                ))
-            }
-        };
+            })?;
+            let requested_frames = video.requested_frames.unwrap_or(frames);
+            let fps = frame_rate.unwrap_or(8.0);
+            let duration =
+                duration_seconds.unwrap_or_else(|| ((frames as f64) / fps).ceil().max(1.0) as u64);
+            (
+                "video",
+                "video_generation",
+                duration,
+                requested_frames,
+                frames,
+                fps,
+                "mp4",
+            )
+        }
+        mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS => (
+            "audio",
+            "music_generation",
+            duration_seconds
+                .unwrap_or(inline_audio.max_item_seconds.max(1))
+                .max(1),
+            0,
+            0,
+            0.0,
+            artifact_generation_request_value(
+                &raw_request,
+                endpoint_family,
+                ARTIFACT_GENERATION_FORMAT_ALIASES,
+            )
+            .and_then(Value::as_str)
+            .unwrap_or("wav"),
+        ),
+        mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS => (
+            "audio",
+            "audio_generation",
+            duration_seconds
+                .unwrap_or(inline_audio.max_item_seconds.max(1))
+                .max(1),
+            0,
+            0,
+            0.0,
+            artifact_generation_request_value(
+                &raw_request,
+                endpoint_family,
+                ARTIFACT_GENERATION_FORMAT_ALIASES,
+            )
+            .and_then(Value::as_str)
+            .unwrap_or("wav"),
+        ),
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => (
+            "audio",
+            "audio_generation",
+            duration_seconds
+                .unwrap_or(inline_audio.max_item_seconds.max(1))
+                .max(1),
+            0,
+            0,
+            0.0,
+            "wav",
+        ),
+        _ => {
+            return Err(ApiError::bad_request(
+                format!("endpoint family {endpoint_family} is not an artifact generation API"),
+                Some("model"),
+            ))
+        }
+    };
     let step_count = artifact_generation_request_value(
         &raw_request,
         endpoint_family,
@@ -8283,12 +9221,18 @@ fn artifact_generation_request(
         prompt,
         endpoint_family: endpoint_family.to_owned(),
         contract_request: raw_request,
+        effective_specialities: BTreeMap::new(),
         output_modality: output_modality.to_owned(),
         transport_kind: transport_kind.to_owned(),
         duration_seconds,
+        requested_frame_count,
         frame_count,
+        frame_rate,
         step_count,
         artifact_count,
+        input_image_count: video.inline_image.item_count,
+        input_image_max_bytes: video.inline_image.max_item_bytes,
+        input_image_max_pixels: video.inline_image.max_item_pixels,
         input_audio_count: inline_audio.item_count,
         input_audio_max_bytes: inline_audio.max_item_bytes,
         input_audio_max_seconds: inline_audio.max_item_seconds,
@@ -8317,6 +9261,13 @@ fn generation_duration_seconds_ceil(value: &Value) -> Option<u64> {
                 .filter(|value| value.is_finite() && *value > 0.0 && *value <= u64::MAX as f64)
                 .map(|value| value.ceil() as u64)
         })
+}
+
+fn endpoint_positive_number(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0)
 }
 
 fn artifact_generation_response_value(
@@ -8435,6 +9386,11 @@ fn video_generation_metadata(
             "billable": run.billable,
             "session_id": run.session_id,
             "artifact_blake3": artifact.map(|artifact| artifact.blake3.as_str()),
+            "video": {
+                "requested_frames": request.requested_frame_count,
+                "actual_frames": request.frame_count,
+                "fps": request.frame_rate,
+            },
             "quality": run.quality.map(|quality| json!({
                 "ttft_ms": quality.ttft_ms,
                 "tok_s": quality.tok_s,
@@ -8480,6 +9436,20 @@ fn artifact_generation_raw_response(
         )
         .map_err(|err| ApiError::bad_gateway(format!("invalid usage header: {err}"), None))?,
     );
+    if request.output_modality == "video" {
+        response.headers_mut().insert(
+            "x-mayhem-video-frames-requested",
+            HeaderValue::from_str(&request.requested_frame_count.to_string()).map_err(|err| {
+                ApiError::bad_gateway(format!("invalid requested-frame header: {err}"), None)
+            })?,
+        );
+        response.headers_mut().insert(
+            "x-mayhem-video-frames-actual",
+            HeaderValue::from_str(&request.frame_count.to_string()).map_err(|err| {
+                ApiError::bad_gateway(format!("invalid actual-frame header: {err}"), None)
+            })?,
+        );
+    }
     if let Some(receipt) = &run.receipt {
         response.headers_mut().insert(
             "x-mayhem-receipt",
@@ -8800,6 +9770,7 @@ async fn mayhem_status(State(state): State<SharedState>, headers: HeaderMap) -> 
         "contract_version": CONTRACT_VERSION,
         "app_version": installed_app_version(),
         "backend": state.session_backend.name(),
+        "rail": state.receipt_config.rail,
         "dev_session_shim": state.dev_session_shim,
         "models": state.models_snapshot().len(),
         "sessions_active": 0,
@@ -9690,11 +10661,54 @@ where
     T: Send + 'static,
     F: Future<Output = Result<T, ApiError>> + Send + 'static,
 {
-    let result = run_detached_nonstreaming_request(cancellation, request).await;
-    if let Err(error) = &result {
-        job.persist_failure_if_active(error.message.clone()).await;
-    }
+    let mut lifetime = GatewayRequestLifetimeGuard::new(cancellation);
+    let result = spawn_owned_gateway_job_request(job, request)
+        .await
+        .map_err(|error| {
+            ApiError::internal_message(format!("gateway job owner task failed: {error}"))
+        })?;
+    lifetime.complete();
     result
+}
+
+fn spawn_owned_gateway_job_request<T, F>(
+    job: GatewayJobHandle,
+    request: F,
+) -> tokio::task::JoinHandle<Result<T, ApiError>>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, ApiError>> + Send + 'static,
+{
+    let cancellation = job.cancellation();
+    tokio::spawn(async move {
+        let (result, task_failed) = match tokio::spawn(request).await {
+            Ok(result) => (result, false),
+            Err(error) => (
+                Err(ApiError::internal_message(format!(
+                    "gateway request task failed: {error}"
+                ))),
+                true,
+            ),
+        };
+        if let Err(error) = &result {
+            if cancellation.is_cancelled()
+                && !task_failed
+                && !job.settlement_reconciliation_started()
+            {
+                job.persist_cancelled_if_active("cancellation_requested")
+                    .await;
+            } else {
+                job.persist_failure_if_active(error.message.clone()).await;
+            }
+        } else if job.is_active() {
+            let error = ApiError::internal_message(
+                "gateway job execution returned without publishing a terminal result",
+            );
+            job.persist_failure_if_active(error.message.clone()).await;
+            return Err(error);
+        }
+        result
+    })
 }
 
 fn spawn_gateway_job_request<T, F>(job: GatewayJobHandle, request: F)
@@ -9702,14 +10716,7 @@ where
     T: Send + 'static,
     F: Future<Output = Result<T, ApiError>> + Send + 'static,
 {
-    tokio::spawn(async move {
-        let error = match tokio::spawn(request).await {
-            Ok(Ok(_)) => return,
-            Ok(Err(error)) => error.message,
-            Err(error) => format!("gateway job task failed: {error}"),
-        };
-        job.persist_failure_if_active(error).await;
-    });
+    drop(spawn_owned_gateway_job_request(job, request));
 }
 
 #[derive(Clone)]
@@ -10051,12 +11058,19 @@ fn canary_registry_from_catalog_root(
         {
             continue;
         }
+        let video_fingerprints = canary_video_fingerprints_by_artifact(canary);
+        if verification_method == CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT
+            && video_fingerprints.is_empty()
+        {
+            continue;
+        }
         let mut fingerprints_by_artifact_root = BTreeMap::new();
         let mut token_prefixes_by_artifact_root = BTreeMap::new();
         let mut perceptual_hashes_by_artifact_root = BTreeMap::new();
         let mut embedding_vectors_by_artifact_root = BTreeMap::new();
         let mut transcripts_by_artifact_root = BTreeMap::new();
         let mut audio_fingerprints_by_artifact_root = BTreeMap::new();
+        let mut video_fingerprints_by_artifact_root = BTreeMap::new();
         let speciality_calibrations = speciality_calibrations_from_catalog_value(model);
         let mut speciality_calibrations_by_artifact_root = BTreeMap::new();
         if let Some(artifacts) = model.get("artifacts").and_then(Value::as_object) {
@@ -10094,6 +11108,9 @@ fn canary_registry_from_catalog_root(
                     } else if let Some(expected) = audio_fingerprints.get(artifact_name.as_str()) {
                         audio_fingerprints_by_artifact_root
                             .insert(artifact_root.to_owned(), expected.clone());
+                    } else if let Some(expected) = video_fingerprints.get(artifact_name.as_str()) {
+                        video_fingerprints_by_artifact_root
+                            .insert(artifact_root.to_owned(), expected.clone());
                     }
                 }
             }
@@ -10104,6 +11121,7 @@ fn canary_registry_from_catalog_root(
         let default_embedding_vectors = embedding_vectors.values().next().cloned();
         let default_transcripts = transcripts.values().next().cloned();
         let default_audio_fingerprints = audio_fingerprints.values().next().cloned();
+        let default_video_fingerprints = video_fingerprints.values().next().cloned();
         models.insert(
             model_id.to_owned(),
             GatewayCanaryModelConfig {
@@ -10119,6 +11137,7 @@ fn canary_registry_from_catalog_root(
                 embedding_vectors_by_artifact_root,
                 transcripts_by_artifact_root,
                 audio_fingerprints_by_artifact_root,
+                video_fingerprints_by_artifact_root,
                 speciality_calibrations_by_artifact_root,
                 default_fingerprint,
                 default_token_prefixes,
@@ -10126,6 +11145,7 @@ fn canary_registry_from_catalog_root(
                 default_embedding_vectors,
                 default_transcripts,
                 default_audio_fingerprints,
+                default_video_fingerprints,
             },
         );
     }
@@ -10252,6 +11272,30 @@ fn canary_audio_fingerprints_by_artifact(
                     fingerprint
                         .as_str()
                         .filter(|fingerprint| crate::valid_audio_fingerprint(fingerprint))
+                        .map(|fingerprint| (prompt_id.clone(), fingerprint.to_owned()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            (!prompts.is_empty()).then(|| (artifact_name.clone(), prompts))
+        })
+        .collect()
+}
+
+fn canary_video_fingerprints_by_artifact(
+    canary: &Value,
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    canary
+        .get("video_fingerprints")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter_map(|(artifact_name, value)| {
+            let prompts = value.as_object()?;
+            let prompts = prompts
+                .iter()
+                .filter_map(|(prompt_id, fingerprint)| {
+                    fingerprint
+                        .as_str()
+                        .filter(|fingerprint| crate::valid_video_av_fingerprint(fingerprint))
                         .map(|fingerprint| (prompt_id.clone(), fingerprint.to_owned()))
                 })
                 .collect::<BTreeMap<_, _>>();
@@ -12048,27 +13092,14 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
-        persist_completed_invocation_job(
+        reconcile_and_persist_completed_invocation_job(
+            &mut bridge,
+            direct_peer,
             invocation,
             chat_job_result(&collected.output),
             &collected.output.artifacts,
             &collected.provider_receipt,
             &receipt_ack,
-        )
-        .await?;
-        record_direct_session_receipt(invocation, &collected.provider_receipt, &receipt_ack)?;
-        send_direct_session_frame_with_peer_reconnect(
-            &mut bridge,
-            direct_peer,
-            &invocation.session_id,
-            json!({
-                "t": "s.receipt_ack",
-                "v": 1,
-                "session_id": receipt_ack.session_id,
-                "seq": receipt_ack.seq,
-                "user_sig": receipt_ack.user_sig,
-            }),
-            invocation.failover.open_timeout(),
             "sending s.receipt_ack",
         )
         .await?;
@@ -12231,27 +13262,14 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
-        persist_completed_invocation_job(
+        reconcile_and_persist_completed_invocation_job(
+            &mut bridge,
+            direct_peer,
             invocation,
             embedding_job_result(&collected.output),
             &[],
             &collected.provider_receipt,
             &receipt_ack,
-        )
-        .await?;
-        record_direct_session_receipt(invocation, &collected.provider_receipt, &receipt_ack)?;
-        send_direct_session_frame_with_peer_reconnect(
-            &mut bridge,
-            direct_peer,
-            &invocation.session_id,
-            json!({
-                "t": "s.receipt_ack",
-                "v": 1,
-                "session_id": receipt_ack.session_id,
-                "seq": receipt_ack.seq,
-                "user_sig": receipt_ack.user_sig,
-            }),
-            invocation.failover.open_timeout(),
             "sending embedding s.receipt_ack",
         )
         .await?;
@@ -12411,27 +13429,14 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
-        persist_completed_invocation_job(
+        reconcile_and_persist_completed_invocation_job(
+            &mut bridge,
+            direct_peer,
             invocation,
             image_job_result(&collected.output),
             &collected.output.artifacts,
             &collected.provider_receipt,
             &receipt_ack,
-        )
-        .await?;
-        record_direct_session_receipt(invocation, &collected.provider_receipt, &receipt_ack)?;
-        send_direct_session_frame_with_peer_reconnect(
-            &mut bridge,
-            direct_peer,
-            &invocation.session_id,
-            json!({
-                "t": "s.receipt_ack",
-                "v": 1,
-                "session_id": receipt_ack.session_id,
-                "seq": receipt_ack.seq,
-                "user_sig": receipt_ack.user_sig,
-            }),
-            invocation.failover.open_timeout(),
             "sending image s.receipt_ack",
         )
         .await?;
@@ -12581,27 +13586,14 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
-        persist_completed_invocation_job(
+        reconcile_and_persist_completed_invocation_job(
+            &mut bridge,
+            direct_peer,
             invocation,
             audio_speech_job_result(&collected.output),
             &collected.output.artifacts,
             &collected.provider_receipt,
             &receipt_ack,
-        )
-        .await?;
-        record_direct_session_receipt(invocation, &collected.provider_receipt, &receipt_ack)?;
-        send_direct_session_frame_with_peer_reconnect(
-            &mut bridge,
-            direct_peer,
-            &invocation.session_id,
-            json!({
-                "t": "s.receipt_ack",
-                "v": 1,
-                "session_id": receipt_ack.session_id,
-                "seq": receipt_ack.seq,
-                "user_sig": receipt_ack.user_sig,
-            }),
-            invocation.failover.open_timeout(),
             "sending audio speech s.receipt_ack",
         )
         .await?;
@@ -12751,27 +13743,14 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
-        persist_completed_invocation_job(
+        reconcile_and_persist_completed_invocation_job(
+            &mut bridge,
+            direct_peer,
             invocation,
             audio_transcription_job_result(&collected.output),
             &[],
             &collected.provider_receipt,
             &receipt_ack,
-        )
-        .await?;
-        record_direct_session_receipt(invocation, &collected.provider_receipt, &receipt_ack)?;
-        send_direct_session_frame_with_peer_reconnect(
-            &mut bridge,
-            direct_peer,
-            &invocation.session_id,
-            json!({
-                "t": "s.receipt_ack",
-                "v": 1,
-                "session_id": receipt_ack.session_id,
-                "seq": receipt_ack.seq,
-                "user_sig": receipt_ack.user_sig,
-            }),
-            invocation.failover.open_timeout(),
             "sending audio transcription s.receipt_ack",
         )
         .await?;
@@ -12920,27 +13899,14 @@ impl ScBridgeGatewaySessionBackend {
             provider,
             model,
         )?;
-        persist_completed_invocation_job(
+        reconcile_and_persist_completed_invocation_job(
+            &mut bridge,
+            direct_peer,
             invocation,
             artifact_generation_job_result(request, &collected.output),
             &collected.output.artifacts,
             &collected.provider_receipt,
             &receipt_ack,
-        )
-        .await?;
-        record_direct_session_receipt(invocation, &collected.provider_receipt, &receipt_ack)?;
-        send_direct_session_frame_with_peer_reconnect(
-            &mut bridge,
-            direct_peer,
-            &invocation.session_id,
-            json!({
-                "t": "s.receipt_ack",
-                "v": 1,
-                "session_id": receipt_ack.session_id,
-                "seq": receipt_ack.seq,
-                "user_sig": receipt_ack.user_sig,
-            }),
-            invocation.failover.open_timeout(),
             "sending artifact generation s.receipt_ack",
         )
         .await?;
@@ -16493,7 +17459,10 @@ async fn record_cancelled_direct_session_receipt(
             "cancelled provider receipt ack signing failed: {error}"
         ))
     })?;
-    persist_cancelled_invocation_job(invocation, provider_receipt, &receipt_ack).await?;
+    if let Some(job) = invocation.job.as_ref() {
+        job.mark_settlement_reconciliation_started();
+    }
+    stage_cancelled_invocation_job(invocation, provider_receipt, &receipt_ack).await?;
     record_direct_session_receipt(invocation, provider_receipt, &receipt_ack)?;
     Ok(receipt_ack)
 }
@@ -16570,6 +17539,7 @@ async fn cancel_and_settle_direct_session(
                     "sending cancelled-session s.receipt_ack",
                 )
                 .await?;
+                finish_cancelled_invocation_job(invocation).await?;
                 let _ = bridge
                     .session_close(direct_peer, &invocation.session_id)
                     .await;
@@ -18508,6 +19478,18 @@ fn apply_model_speciality_defaults(
             )
         })?;
     for descriptor in &model.mayhem.adapter.specialities {
+        let mapping = contract
+            .speciality_mappings
+            .get(&descriptor.name)
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    format!(
+                        "model {} endpoint family {} does not map speciality {}",
+                        model.id, endpoint_family, descriptor.name
+                    ),
+                    Some("speciality"),
+                )
+            })?;
         let submitted = if descriptor.name == "reasoning_effort" {
             request.reasoning_effort.as_ref().map(|value| {
                 // This temporary value is used only for matching below.
@@ -18516,15 +19498,11 @@ fn apply_model_speciality_defaults(
         } else {
             request.speciality_values.get(&descriptor.name).cloned()
         };
-        let level = match submitted.as_ref() {
-            Some(submitted) => descriptor.levels.iter().find(|level| {
-                submitted.as_str() == Some(level.name.as_str()) || submitted == &level.native_value
-            }),
-            None => descriptor
-                .levels
-                .iter()
-                .find(|level| level.name == descriptor.default_level),
-        }
+        let level = mayhem_proto::endpoint_speciality_level_for_request(
+            descriptor,
+            mapping,
+            submitted.as_ref(),
+        )
         .ok_or_else(|| {
             ApiError::bad_request(
                 format!(
@@ -18551,18 +19529,6 @@ fn apply_model_speciality_defaults(
                 request.max_completion_tokens = level.default_max_output_tokens;
             }
         } else {
-            let mapping = contract
-                .speciality_mappings
-                .get(&descriptor.name)
-                .ok_or_else(|| {
-                    ApiError::bad_request(
-                        format!(
-                            "model {} endpoint family {} does not map speciality {}",
-                            model.id, endpoint_family, descriptor.name
-                        ),
-                        Some("speciality"),
-                    )
-                })?;
             let uses_level_names = contract
                 .request_attribute_specs
                 .get(&mapping.request_path)
@@ -18579,6 +19545,67 @@ fn apply_model_speciality_defaults(
                 },
             );
         }
+        effective.insert(descriptor.name.clone(), level.name.clone());
+    }
+    request.effective_specialities = effective;
+    Ok(())
+}
+
+fn apply_artifact_generation_specialities(
+    model: &GatewayModel,
+    request: &mut ArtifactGenerationRequest,
+) -> Result<(), ApiError> {
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == request.endpoint_family)
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                format!(
+                    "model {} does not expose endpoint family {}",
+                    model.id, request.endpoint_family
+                ),
+                Some("model"),
+            )
+        })?;
+    let mut effective = BTreeMap::new();
+    for descriptor in &model.mayhem.adapter.specialities {
+        let mapping = contract
+            .speciality_mappings
+            .get(&descriptor.name)
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    format!(
+                        "model {} endpoint family {} does not map speciality {}",
+                        model.id, request.endpoint_family, descriptor.name
+                    ),
+                    Some("speciality"),
+                )
+            })?;
+        let submitted = json_path_value(&request.contract_request, &mapping.request_path);
+        let level =
+            mayhem_proto::endpoint_speciality_level_for_request(descriptor, mapping, submitted)
+                .ok_or_else(|| {
+                    ApiError::bad_request(
+                        format!(
+                    "model {} does not support speciality {} value {}; available levels: {}",
+                    model.id,
+                    descriptor.name,
+                    submitted
+                        .map(Value::to_string)
+                        .unwrap_or_else(|| descriptor.default_level.clone()),
+                    descriptor
+                        .levels
+                        .iter()
+                        .map(|level| level.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                        Some("speciality"),
+                    )
+                })?;
         effective.insert(descriptor.name.clone(), level.name.clone());
     }
     request.effective_specialities = effective;
@@ -21893,7 +22920,7 @@ fn request_requirements_for_audio_transcription(
 
 fn request_requirements_for_artifact_generation(
     state: &GatewayState,
-    _model: &GatewayModel,
+    model: &GatewayModel,
     request: &ArtifactGenerationRequest,
     now_millis: u64,
     max_price_au: Option<MoneyAu>,
@@ -21905,26 +22932,50 @@ fn request_requirements_for_artifact_generation(
     } else {
         request.duration_seconds.max(1)
     };
-    let item_count = u32::try_from(request.artifact_count)
-        .unwrap_or(u32::MAX)
-        .max(request.input_audio_count);
-    let max_item_bytes = request.input_audio_max_bytes.max(1);
-    let max_item_units = output_item_units.max(request.input_audio_max_seconds);
+    let output_item_count = u32::try_from(request.artifact_count).unwrap_or(u32::MAX);
+    let required_modalities = artifact_generation_required_modalities(model, request);
+    let mut modality_load = BTreeMap::new();
+    for modality in &required_modalities {
+        let load = match modality.as_str() {
+            "video" => ModalityRequestLoad {
+                item_count: output_item_count,
+                max_item_bytes: 1,
+                max_item_units: request.frame_count.max(1),
+            },
+            "audio" if request.output_modality == "audio" => ModalityRequestLoad {
+                item_count: output_item_count.max(request.input_audio_count),
+                max_item_bytes: request.input_audio_max_bytes.max(1),
+                max_item_units: output_item_units
+                    .max(request.input_audio_max_seconds)
+                    .max(1),
+            },
+            "audio" => ModalityRequestLoad {
+                item_count: output_item_count,
+                max_item_bytes: 1,
+                max_item_units: request.duration_seconds.max(1),
+            },
+            "image" => ModalityRequestLoad {
+                item_count: request.input_image_count,
+                max_item_bytes: request.input_image_max_bytes,
+                max_item_units: request.input_image_max_pixels,
+            },
+            _ => ModalityRequestLoad {
+                item_count: output_item_count,
+                max_item_bytes: 1,
+                max_item_units: output_item_units,
+            },
+        };
+        modality_load.insert(modality.clone(), load);
+    }
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
         requires_transport_peer: !state.dev_session_shim,
         requires_tools: false,
         requires_json: false,
         requires_vision: false,
-        required_modalities: vec![request.output_modality.clone()],
-        modality_load: BTreeMap::from([(
-            request.output_modality.clone(),
-            ModalityRequestLoad {
-                item_count,
-                max_item_bytes,
-                max_item_units,
-            },
-        )]),
+        required_modalities,
+        required_specialities: request.effective_specialities.clone(),
+        modality_load,
         // Artifact endpoints bound prompt size through their calibrated endpoint
         // contract. Provider `ctx` is a text-generation capacity and is only a
         // sentinel for image, audio, music, and video routes.
@@ -21938,6 +22989,33 @@ fn request_requirements_for_artifact_generation(
         heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
         ..RequestRequirements::default()
     }
+}
+
+fn artifact_generation_required_modalities(
+    model: &GatewayModel,
+    request: &ArtifactGenerationRequest,
+) -> Vec<String> {
+    let mut required = Vec::new();
+    if request.output_modality == "video" {
+        for modality in ["video", "audio"] {
+            if modality == "video"
+                || model
+                    .mayhem
+                    .caps
+                    .output_modalities
+                    .iter()
+                    .any(|declared| declared == modality)
+            {
+                required.push(modality.to_owned());
+            }
+        }
+        if request.input_image_count > 0 {
+            required.push("image".to_owned());
+        }
+    } else {
+        required.push(request.output_modality.clone());
+    }
+    required
 }
 
 fn route_selection_seed(
@@ -22978,6 +24056,8 @@ async fn build_artifact_generation(
     options: GatewayRequestOptions,
 ) -> Result<CompletedArtifactGeneration, ApiError> {
     let model = require_model(state, &request.model)?;
+    let mut request = request;
+    apply_artifact_generation_specialities(&model, &mut request)?;
     let signed_endpoint_capability = model
         .mayhem
         .adapter
@@ -24352,6 +25432,11 @@ impl GatewayState {
                     return;
                 }
             }
+            CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT => {
+                if model.mayhem.model_class != "video-generation" {
+                    return;
+                }
+            }
             _ => return,
         }
         let route_key = canary_route_key(model, invocation);
@@ -24381,6 +25466,10 @@ impl GatewayState {
                 .map(|probe| vec![probe]),
             CANARY_VERIFICATION_AUDIO_FINGERPRINT => self
                 .run_audio_fingerprint_probe_for_route(model, invocation, &config)
+                .await
+                .map(|probe| vec![probe]),
+            CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT => self
+                .run_video_av_fingerprint_probe_for_route(model, invocation, &config)
                 .await
                 .map(|probe| vec![probe]),
             _ => return,
@@ -25735,6 +26824,149 @@ impl GatewayState {
         ))
     }
 
+    async fn run_video_av_fingerprint_probe_for_route(
+        &self,
+        model: &GatewayModel,
+        served_invocation: &GatewaySessionInvocation,
+        config: &GatewayCanaryModelConfig,
+    ) -> Result<StoredProbeEvent, ApiError> {
+        let expected_fingerprints = canary_expected_video_fingerprints(config, served_invocation)
+            .ok_or_else(|| {
+            ApiError::bad_gateway(
+                "no catalog canary video A/V fingerprints for served artifact",
+                Some("model"),
+            )
+        })?;
+        let route = canary_served_route(model, served_invocation);
+        let mut prompt_reports = Vec::with_capacity(config.prompts.len());
+        let mut receipt_hashes = Vec::with_capacity(config.prompts.len());
+        let mut stored_receipts = Vec::with_capacity(config.prompts.len());
+        let mut observed_fingerprints = BTreeMap::new();
+
+        for prompt in &config.prompts {
+            if !expected_fingerprints.contains_key(&prompt.id) {
+                continue;
+            }
+            if prompt.seed.is_none() {
+                return Err(ApiError::bad_gateway(
+                    format!("video canary prompt {} has no fixed seed", prompt.id),
+                    Some("model"),
+                ));
+            }
+            let request = canary_artifact_generation_request(self, model, prompt)?;
+            let request_body = request.contract_request.clone();
+            let invocation = self.prepare_artifact_generation_invocation_for_route(
+                model,
+                &request,
+                route.as_ref(),
+                &GatewayRequestOptions::default(),
+            )?;
+            let result = self
+                .session_backend
+                .run_artifact_generation(model, &request, &invocation)
+                .await
+                .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+            let expected_artifacts = usize::try_from(request.artifact_count).map_err(|_| {
+                ApiError::bad_gateway(
+                    "signed video canary artifact count exceeds this gateway platform",
+                    Some("model"),
+                )
+            })?;
+            if expected_artifacts != 1 || result.output.artifacts.len() != 1 {
+                return Err(ApiError::bad_gateway(
+                    format!(
+                        "video canary must return exactly one artifact, got {}",
+                        result.output.artifacts.len()
+                    ),
+                    Some("model"),
+                ));
+            }
+            let artifact = result.output.artifacts.first().ok_or_else(|| {
+                ApiError::bad_gateway("provider returned no video canary artifact", Some("model"))
+            })?;
+            if artifact.content_type != "video/mp4" {
+                return Err(ApiError::bad_gateway(
+                    format!(
+                        "provider returned video canary content type {}, expected video/mp4",
+                        artifact.content_type
+                    ),
+                    Some("model"),
+                ));
+            }
+            let observed = video_av_fingerprint(&artifact.bytes)
+                .map_err(|err| ApiError::bad_gateway(err, Some("model")))?;
+            let receipt = self.meter_artifact_generation_session(
+                model,
+                &request,
+                &result.output,
+                &invocation,
+                result.provider_receipt.as_ref(),
+            )?;
+            let receipt_hash = stable_value_hash(&json!(receipt));
+            receipt_hashes.push(receipt_hash.clone());
+            stored_receipts.push(receipt);
+            observed_fingerprints.insert(prompt.id.clone(), observed.clone());
+            prompt_reports.push(json!({
+                "prompt_id": prompt.id,
+                "request": request_body,
+                "artifact": artifact_summaries(std::slice::from_ref(artifact)),
+                "observed_video_av_fingerprint": observed,
+                "session_id": invocation.session_id,
+                "receipt_hash": receipt_hash,
+            }));
+        }
+
+        if observed_fingerprints.is_empty() {
+            return Err(ApiError::bad_gateway(
+                "no video canary prompts matched expected video A/V fingerprints",
+                Some("model"),
+            ));
+        }
+        let spec = CanaryProbeSpec {
+            model: model.id.clone(),
+            canary_set: config.canary_set.clone(),
+            prompt_id: format!("aggregate:{}", expected_fingerprints.len()),
+            prompt: config
+                .prompts
+                .iter()
+                .filter(|prompt| expected_fingerprints.contains_key(&prompt.id))
+                .map(|prompt| prompt.id.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            seed: self.canary_policy.seed,
+            max_tokens: 1,
+            sampling: Default::default(),
+        };
+        let evaluation = evaluate_catalog_canary_video_av_fingerprint_probe(
+            &spec,
+            &expected_fingerprints,
+            &observed_fingerprints,
+            config
+                .verification_tolerance_bps
+                .map(|tolerance| 10_000u32.saturating_sub(tolerance))
+                .unwrap_or(config.match_min_bps),
+        );
+        let evidence = json!({
+            "schema_version": 1,
+            "kind": "mayhem-automatic-video-av-canary-probe-evidence",
+            "verification_tolerance_bps": config.verification_tolerance_bps,
+            "catalog_expected_video_fingerprints": expected_fingerprints,
+            "observed_video_fingerprints": observed_fingerprints,
+            "evaluation": evaluation,
+            "prompts": prompt_reports,
+            "receipt_hashes": receipt_hashes,
+        });
+        Ok(self.content_canary_probe_event(
+            model,
+            served_invocation,
+            config,
+            evaluation,
+            evidence,
+            receipt_hashes,
+            stored_receipts,
+        ))
+    }
+
     fn content_canary_probe_event(
         &self,
         model: &GatewayModel,
@@ -26408,8 +27640,8 @@ impl GatewayState {
             locked_per_req_au: price.per_req_au,
             locked_min_session_au: price.min_session_au,
             served_ctx,
-            required_modalities: vec![request.output_modality.clone()],
-            required_specialities: BTreeMap::new(),
+            required_modalities: artifact_generation_required_modalities(model, request),
+            required_specialities: request.effective_specialities.clone(),
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
             max_spend_au,
@@ -27357,6 +28589,22 @@ fn canary_expected_audio_fingerprints(
         .or_else(|| config.default_audio_fingerprints.clone())
 }
 
+fn canary_expected_video_fingerprints(
+    config: &GatewayCanaryModelConfig,
+    invocation: &GatewaySessionInvocation,
+) -> Option<BTreeMap<String, String>> {
+    invocation
+        .attestation
+        .as_ref()
+        .and_then(|attestation| {
+            config
+                .video_fingerprints_by_artifact_root
+                .get(&attestation.contract.artifact_root)
+                .cloned()
+        })
+        .or_else(|| config.default_video_fingerprints.clone())
+}
+
 #[derive(Clone, Debug)]
 struct ContextNeedleSpec {
     answer: String,
@@ -27648,42 +28896,174 @@ fn canary_artifact_generation_request(
     prompt: &GatewayCanaryPrompt,
 ) -> Result<ArtifactGenerationRequest, ApiError> {
     let endpoint_family = match model.mayhem.model_class.as_str() {
-        "music-generation" => mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
-        "audio-generation" => mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+        "video-generation" => prompt
+            .endpoint_attributes
+            .get("endpoint_family")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                [
+                    mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+                    mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+                ]
+                .into_iter()
+                .find(|family| {
+                    model
+                        .mayhem
+                        .adapter
+                        .endpoint_families
+                        .iter()
+                        .any(|contract| contract.family == *family)
+                })
+                .map(str::to_owned)
+            })
+            .ok_or_else(|| {
+                ApiError::bad_gateway(
+                    "video canary model has no signed video-generation endpoint family",
+                    Some("model"),
+                )
+            })?,
+        "music-generation" => mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS.to_owned(),
+        "audio-generation" => mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS.to_owned(),
         other => {
             return Err(ApiError::bad_gateway(
-                format!("audio fingerprint canary is not wired for model class {other}"),
+                format!("artifact fingerprint canary is not wired for model class {other}"),
                 Some("model"),
             ))
         }
     };
     let mut request = Map::from_iter(prompt.endpoint_attributes.clone());
-    request.insert("model".to_owned(), json!(model.id));
-    if let Some(value) = prompt.prompt.as_ref().or(prompt.input.as_ref()) {
-        request.insert("prompt".to_owned(), json!(value));
+    request.remove("endpoint_family");
+    match endpoint_family.as_str() {
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO => {
+            if let Some(value) = prompt.prompt.as_ref().or(prompt.input.as_ref()) {
+                request.entry("inputs").or_insert_with(|| json!(value));
+            }
+        }
+        _ => {
+            request.entry("model").or_insert_with(|| json!(model.id));
+            if let Some(value) = prompt.prompt.as_ref().or(prompt.input.as_ref()) {
+                request.entry("prompt").or_insert_with(|| json!(value));
+            }
+        }
     }
-    if let Some(value) = prompt.response_format.as_ref() {
-        request.insert("response_format".to_owned(), json!(value));
+    let video_canary = model.mayhem.model_class == "video-generation";
+    if !video_canary {
+        if let Some(value) = prompt.response_format.as_ref() {
+            request.insert("response_format".to_owned(), json!(value));
+        }
     }
-    if let Some(value) = prompt.steps {
+    let has_request_value = |request: &Map<String, Value>, aliases: &[&str]| {
+        artifact_generation_request_value(
+            &Value::Object(request.clone()),
+            &endpoint_family,
+            aliases,
+        )
+        .is_some()
+    };
+    if let Some(value) = prompt
+        .steps
+        .filter(|_| !has_request_value(&request, ARTIFACT_GENERATION_STEP_ALIASES))
+    {
         request.insert("steps".to_owned(), json!(value));
     }
-    if let Some(value) = prompt.cfg_scale {
-        request.insert("cfg_scale".to_owned(), json!(value));
+    if !video_canary {
+        if let Some(value) = prompt.cfg_scale {
+            request.insert("cfg_scale".to_owned(), json!(value));
+        }
     }
     if let Some(value) = prompt.shift {
         request.insert("shift".to_owned(), json!(value));
     }
-    if let Some(value) = prompt.seed {
-        request.insert("seed".to_owned(), json!(value));
+    let seed = prompt
+        .seed
+        .filter(|_| !has_request_value(&request, &["seed"]));
+    let mut raw_request = Value::Object(request);
+    if let Some(value) = seed {
+        if video_canary {
+            let contract = catalog_endpoint_contract(state, &model.id, &endpoint_family)?;
+            let target = artifact_generation_alias_target(
+                &contract,
+                &artifact_generation_alias_candidates(&endpoint_family, &["seed"]),
+            )
+            .ok_or_else(|| {
+                ApiError::bad_gateway(
+                    "video canary seed is not exposed by its signed endpoint contract",
+                    Some("model"),
+                )
+            })?;
+            set_json_path(&mut raw_request, &target, json!(value))
+                .map_err(|error| ApiError::bad_gateway(error, Some("model")))?;
+        } else {
+            raw_request
+                .as_object_mut()
+                .expect("artifact canary request is an object")
+                .insert("seed".to_owned(), json!(value));
+        }
     }
-    let normalized = normalize_catalog_endpoint_request(
+    if video_canary {
+        let fixed_frames = artifact_generation_request_value(
+            &raw_request,
+            &endpoint_family,
+            VIDEO_GENERATION_FRAME_ALIASES,
+        )
+        .and_then(endpoint_positive_integer);
+        let fixed_fps = artifact_generation_request_value(
+            &raw_request,
+            &endpoint_family,
+            VIDEO_GENERATION_FPS_ALIASES,
+        )
+        .and_then(endpoint_positive_number);
+        if fixed_frames.is_none() || fixed_fps.is_none() {
+            return Err(ApiError::bad_gateway(
+                "video canary must explicitly pin num_frames and fps through its signed endpoint family",
+                Some("model"),
+            ));
+        }
+    }
+    let prepared = normalize_catalog_endpoint_request_with_metadata(
         state,
         &model.id,
-        endpoint_family,
-        &Value::Object(request),
+        &endpoint_family,
+        &raw_request,
     )?;
-    artifact_generation_request(&model.id, endpoint_family, normalized)
+    let mut request = artifact_generation_request(
+        &model.id,
+        &endpoint_family,
+        prepared.normalized,
+        prepared.video,
+    )?;
+    apply_artifact_generation_specialities(model, &mut request)?;
+    if let Some(descriptor) = model
+        .mayhem
+        .adapter
+        .specialities
+        .iter()
+        .find(|descriptor| descriptor.name == "prompt_enhancer")
+    {
+        let selected = request
+            .effective_specialities
+            .get(&descriptor.name)
+            .and_then(|selected| {
+                descriptor
+                    .levels
+                    .iter()
+                    .find(|level| &level.name == selected)
+            })
+            .ok_or_else(|| {
+                ApiError::bad_gateway(
+                    "video canary could not resolve the prompt_enhancer speciality",
+                    Some("model"),
+                )
+            })?;
+        if selected.native_value != Value::Bool(false) {
+            return Err(ApiError::bad_gateway(
+                "video provenance canaries must keep prompt enhancement disabled",
+                Some("model"),
+            ));
+        }
+    }
+    Ok(request)
 }
 
 fn canary_audio_transcription_request(
@@ -32905,6 +34285,95 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canary_registry_binds_video_av_fingerprint_to_artifact_root() {
+        let encoded = serde_json::to_vec(&json!({
+            "width": 512,
+            "height": 320,
+            "frame_count": 9,
+            "fps_milli": 24000,
+            "video_duration_ms": 375,
+            "audio_duration_ms": 375,
+            "frame_hashes": ["0f".repeat(32), "0f".repeat(32)],
+            "audio_fingerprint": format!("audiospec-v1:1000:{}", "01".repeat(256)),
+        }))
+        .unwrap();
+        let fingerprint = format!("videoav-v1:{}", hex::encode(encoded));
+        let artifact_root = "cd".repeat(32);
+        let root = json!({
+            "models": [{
+                "model_id": "admin/video-fixture",
+                "tier": "launch",
+                "canary": {
+                    "set_id": "canary-video-v1",
+                    "match_min": 0.9,
+                    "verification_method": "video_av_fingerprint",
+                    "verification_tolerance_bps": 1000,
+                    "video_fingerprints": {
+                        "cuda": {
+                            "fixed-video": fingerprint
+                        }
+                    }
+                },
+                "artifacts": {
+                    "cuda": {
+                        "artifact_root": artifact_root
+                    }
+                }
+            }]
+        });
+        let prompt = GatewayCanaryPrompt {
+            id: "fixed-video".to_owned(),
+            calibration_only: false,
+            messages: Vec::new(),
+            tools: None,
+            specialities: BTreeMap::new(),
+            max_tokens: 1,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            prompt: Some("fixed joint audiovisual canary".to_owned()),
+            input: None,
+            audio_b64: None,
+            content_type: None,
+            filename: None,
+            language: None,
+            voice: None,
+            response_format: Some("mp4".to_owned()),
+            require_word_timestamps: false,
+            require_segment_timestamps: false,
+            size: Some("512x320".to_owned()),
+            steps: None,
+            cfg_scale: None,
+            shift: None,
+            seed: Some(7),
+            endpoint_attributes: BTreeMap::from([("duration_seconds".to_owned(), json!(1))]),
+        };
+        let registry = canary_registry_from_catalog_root(
+            &root,
+            &BTreeMap::from([("canary-video-v1".to_owned(), vec![prompt])]),
+        );
+        let config = registry
+            .models
+            .get("admin/video-fixture")
+            .expect("video canary config");
+
+        assert_eq!(
+            config.verification_method,
+            CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT
+        );
+        assert!(config.requires_launch_evidence);
+        assert_eq!(
+            config.video_fingerprints_by_artifact_root[&artifact_root]["fixed-video"],
+            fingerprint
+        );
+        assert!(config.audio_fingerprints_by_artifact_root.is_empty());
+    }
+
     fn test_chat_request(model_id: &str) -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: model_id.to_owned(),
@@ -35452,9 +36921,13 @@ mod tests {
             &raw,
         )
         .unwrap();
-        let request =
-            artifact_generation_request(&model.id, mayhem_proto::ENDPOINT_OPENAI_VIDEOS, raw)
-                .unwrap();
+        let request = artifact_generation_request(
+            &model.id,
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            raw,
+            VideoRequestPreparation::default(),
+        )
+        .unwrap();
         assert_eq!(request.duration_seconds, 4);
         assert_eq!(request.frame_count, 4 * DEFAULT_VIDEO_GENERATION_FPS);
 
@@ -35470,6 +36943,773 @@ mod tests {
         let response = artifact_generation_response_value(&request, &run);
         assert_eq!(response["object"], json!("video"));
         assert_eq!(response["status"], json!("completed"));
+    }
+
+    fn signed_joint_video_model() -> GatewayModel {
+        let mut model = test_model();
+        model.id = "mayhem/joint-video-test".to_owned();
+        model.mayhem.model_class = "video-generation".to_owned();
+        model.mayhem.caps.video = true;
+        model.mayhem.caps.audio = true;
+        model.mayhem.caps.vision = true;
+        model.mayhem.caps.output_modality = Some("video".to_owned());
+        model.mayhem.caps.output_modalities = vec!["video".to_owned(), "audio".to_owned()];
+        model.mayhem.adapter.modality_set =
+            vec!["video".to_owned(), "audio".to_owned(), "image".to_owned()];
+        let mut contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+        )
+        .unwrap();
+        contract
+            .request_attribute_specs
+            .get_mut("parameters.num_frames")
+            .unwrap()
+            .default = Some(json!(97));
+        contract
+            .request_attribute_specs
+            .get_mut("parameters.num_frames")
+            .unwrap()
+            .enum_values = vec![json!(97), json!(105)];
+        for path in [
+            "parameters.guidance_scale",
+            "parameters.num_inference_steps",
+        ] {
+            contract
+                .request_attributes
+                .retain(|candidate| candidate != path);
+            contract.request_attribute_specs.remove(path);
+        }
+        for (path, mut spec) in [
+            (
+                "parameters.frame_rate",
+                mayhem_proto::EndpointAttributeSpec::new(EndpointValueType::Number),
+            ),
+            (
+                "parameters.input_image",
+                mayhem_proto::EndpointAttributeSpec::new(EndpointValueType::Object),
+            ),
+            (
+                "parameters.conditioning_strength",
+                mayhem_proto::EndpointAttributeSpec::new(EndpointValueType::Number),
+            ),
+            (
+                "parameters.prompt_enhancement",
+                mayhem_proto::EndpointAttributeSpec::new(EndpointValueType::Boolean),
+            ),
+        ] {
+            if path == "parameters.frame_rate" {
+                spec.minimum = Some(1.0);
+                spec.maximum = Some(50.0);
+            } else if path == "parameters.conditioning_strength" {
+                spec.minimum = Some(0.0);
+                spec.maximum = Some(1.0);
+            }
+            contract.request_attributes.push(path.to_owned());
+            contract
+                .request_attribute_specs
+                .insert(path.to_owned(), spec);
+        }
+        let mut openai_contract =
+            mayhem_proto::endpoint_family_contract_template(mayhem_proto::ENDPOINT_OPENAI_VIDEOS)
+                .unwrap();
+        openai_contract
+            .request_attribute_specs
+            .get_mut("num_frames")
+            .unwrap()
+            .default = Some(json!(97));
+        openai_contract
+            .request_attribute_specs
+            .get_mut("num_frames")
+            .unwrap()
+            .enum_values = vec![json!(97), json!(105)];
+        let mut strength_spec = mayhem_proto::EndpointAttributeSpec::new(EndpointValueType::Number);
+        strength_spec.minimum = Some(0.0);
+        strength_spec.maximum = Some(1.0);
+        openai_contract
+            .request_attributes
+            .push("conditioning_strength".to_owned());
+        openai_contract
+            .request_attribute_specs
+            .insert("conditioning_strength".to_owned(), strength_spec);
+        model.mayhem.adapter.endpoint_families = vec![contract, openai_contract];
+        model.mayhem.price_ref_au.rate_map = vec![
+            RateMapEntry {
+                unit: USAGE_VIDEO_SECOND.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_FRAME.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+        ];
+        model
+    }
+
+    fn prompt_enhancer_video_model() -> GatewayModel {
+        let mut model = signed_joint_video_model();
+        let descriptor = mayhem_proto::ModelSpecialityDescriptor {
+            name: "prompt_enhancer".to_owned(),
+            mechanism: "boolean".to_owned(),
+            default_level: "off".to_owned(),
+            levels: vec![
+                mayhem_proto::ModelSpecialityLevel {
+                    name: "off".to_owned(),
+                    rank: 0,
+                    native_value: json!(false),
+                    default_max_output_tokens: None,
+                    max_reasoning_tokens: None,
+                },
+                mayhem_proto::ModelSpecialityLevel {
+                    name: "on".to_owned(),
+                    rank: 1,
+                    native_value: json!(true),
+                    default_max_output_tokens: None,
+                    max_reasoning_tokens: None,
+                },
+            ],
+            calibration_modalities: vec!["video".to_owned()],
+            research_evidence: vec!["pinned enhancer fixture".to_owned()],
+        };
+        let contract = &mut model.mayhem.adapter.endpoint_families[0];
+        let spec = contract
+            .request_attribute_specs
+            .get_mut("parameters.enhance_prompt")
+            .unwrap();
+        spec.default = Some(json!(false));
+        spec.enum_values = vec![json!(false), json!(true)];
+        spec.calibration_values = spec.enum_values.clone();
+        contract.speciality_mappings.insert(
+            descriptor.name.clone(),
+            mayhem_proto::EndpointSpecialityMapping {
+                request_path: "parameters.enhance_prompt".to_owned(),
+                target: mayhem_proto::EndpointSpecialityTarget::BackendParameter,
+                native_path: "enhance_prompt".to_owned(),
+                selector: mayhem_proto::EndpointSpecialitySelector::Exact,
+            },
+        );
+        model.mayhem.adapter.specialities = vec![descriptor];
+        model
+    }
+
+    fn non_empty_capability_video_model() -> GatewayModel {
+        let mut model = signed_joint_video_model();
+        let descriptor = mayhem_proto::ModelSpecialityDescriptor {
+            name: "optional_capability".to_owned(),
+            mechanism: "boolean".to_owned(),
+            default_level: "off".to_owned(),
+            levels: vec![
+                mayhem_proto::ModelSpecialityLevel {
+                    name: "off".to_owned(),
+                    rank: 0,
+                    native_value: json!(false),
+                    default_max_output_tokens: None,
+                    max_reasoning_tokens: None,
+                },
+                mayhem_proto::ModelSpecialityLevel {
+                    name: "on".to_owned(),
+                    rank: 1,
+                    native_value: json!(true),
+                    default_max_output_tokens: None,
+                    max_reasoning_tokens: None,
+                },
+            ],
+            calibration_modalities: vec!["video".to_owned()],
+            research_evidence: vec!["pinned capability fixture".to_owned()],
+        };
+        model.mayhem.adapter.endpoint_families[0]
+            .speciality_mappings
+            .insert(
+                descriptor.name.clone(),
+                mayhem_proto::EndpointSpecialityMapping {
+                    request_path: "parameters.negative_prompt".to_owned(),
+                    target: mayhem_proto::EndpointSpecialityTarget::BackendParameter,
+                    native_path: "optional_capability".to_owned(),
+                    selector: mayhem_proto::EndpointSpecialitySelector::NonEmpty,
+                },
+            );
+        model.mayhem.adapter.specialities = vec![descriptor];
+        model.mayhem.source = "contract".to_owned();
+        model.mayhem.providers_online = 2;
+        model.mayhem.rooms = 2;
+        model.mayhem.route_candidates = vec![test_route_candidate(0), test_route_candidate(1)];
+        for route in &mut model.mayhem.route_candidates {
+            route.served_modalities = vec!["audio".to_owned(), "video".to_owned()];
+        }
+        model.mayhem.route_candidates[0].served_specialities = BTreeMap::from([(
+            "optional_capability".to_owned(),
+            vec!["off".to_owned(), "on".to_owned()],
+        )]);
+        model.mayhem.route_candidates[1].served_specialities =
+            BTreeMap::from([("optional_capability".to_owned(), vec!["off".to_owned()])]);
+        model
+    }
+
+    #[test]
+    fn non_empty_speciality_routes_only_to_artifacts_supporting_the_selected_level() {
+        let model = non_empty_capability_video_model();
+        let full_capability_provider = model.mayhem.route_candidates[0].provider.clone();
+        let off_only_provider = model.mayhem.route_candidates[1].provider.clone();
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+
+        let prepared = normalize_catalog_endpoint_request_with_metadata(
+            &state,
+            &model.id,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+            &json!({
+                "inputs": "a coherent launch",
+                "parameters": {
+                    "num_frames": 97,
+                    "negative_prompt": "watermark"
+                }
+            }),
+        )
+        .unwrap();
+        let mut request = artifact_generation_request(
+            &model.id,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+            prepared.normalized,
+            prepared.video,
+        )
+        .unwrap();
+        apply_artifact_generation_specialities(&model, &mut request).unwrap();
+        assert_eq!(
+            request.effective_specialities,
+            BTreeMap::from([("optional_capability".to_owned(), "on".to_owned())])
+        );
+        let routes = ordered_route_candidates_for_artifact_generation_with_options(
+            &state,
+            &model,
+            &request,
+            &GatewayRequestOptions::default(),
+        );
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].provider, full_capability_provider);
+        assert_ne!(routes[0].provider, off_only_provider);
+
+        for parameters in [
+            json!({"num_frames": 97}),
+            json!({
+                "num_frames": 97,
+                "negative_prompt": ""
+            }),
+        ] {
+            let prepared = normalize_catalog_endpoint_request_with_metadata(
+                &state,
+                &model.id,
+                mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+                &json!({"inputs": "a coherent launch", "parameters": parameters}),
+            )
+            .unwrap();
+            let mut request = artifact_generation_request(
+                &model.id,
+                mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+                prepared.normalized,
+                prepared.video,
+            )
+            .unwrap();
+            apply_artifact_generation_specialities(&model, &mut request).unwrap();
+            assert_eq!(
+                request.effective_specialities,
+                BTreeMap::from([("optional_capability".to_owned(), "off".to_owned())])
+            );
+            let routes = ordered_route_candidates_for_artifact_generation_with_options(
+                &state,
+                &model,
+                &request,
+                &GatewayRequestOptions::default(),
+            );
+            assert_eq!(routes.len(), 2);
+        }
+    }
+
+    #[test]
+    fn artifact_speciality_opt_in_drives_routing_and_signed_voucher() {
+        let model = prompt_enhancer_video_model();
+        let state = GatewayState::from_models(vec![model.clone()]).with_dev_session_shim();
+        let prepared = normalize_catalog_endpoint_request_with_metadata(
+            &state,
+            &model.id,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+            &json!({
+                "inputs": "enhance this prompt",
+                "parameters": {
+                    "num_frames": 97,
+                    "prompt_enhancement": true
+                }
+            }),
+        )
+        .unwrap();
+        let mut request = artifact_generation_request(
+            &model.id,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+            prepared.normalized,
+            prepared.video,
+        )
+        .unwrap();
+        apply_artifact_generation_specialities(&model, &mut request).unwrap();
+
+        assert_eq!(
+            request.effective_specialities,
+            BTreeMap::from([("prompt_enhancer".to_owned(), "on".to_owned())])
+        );
+        let requirements =
+            request_requirements_for_artifact_generation(&state, &model, &request, 1, None, None);
+        assert_eq!(
+            requirements.required_specialities,
+            request.effective_specialities
+        );
+        let invocation = state
+            .prepare_artifact_generation_invocation_for_route(
+                &model,
+                &request,
+                None,
+                &GatewayRequestOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            invocation.spend_voucher.body.required_specialities,
+            request.effective_specialities
+        );
+    }
+
+    #[test]
+    fn signed_sulphur_defaults_and_aliases_normalize_before_joint_av_admission() {
+        let model = signed_joint_video_model();
+        let state = GatewayState::from_models(vec![model.clone()]).with_dev_session_shim();
+        let raw = json!({
+            "inputs": "a launch with synchronized engine sound",
+            "parameters": {
+                "frame_rate": 24.0,
+                "width": 768,
+                "height": 512,
+                "seed": 42,
+                "input_image": {"image_url": test_png_data_url()},
+                "conditioning_strength": 0.7,
+                "prompt_enhancement": true
+            }
+        });
+        let prepared = normalize_catalog_endpoint_request_with_metadata(
+            &state,
+            &model.id,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+            &raw,
+        )
+        .unwrap();
+        assert_eq!(prepared.video.requested_frames, Some(97));
+        assert_eq!(prepared.normalized["inputs"], raw["inputs"]);
+        assert_eq!(prepared.normalized["parameters"]["num_frames"], 97);
+        assert_eq!(prepared.normalized["parameters"]["fps"], 24.0);
+        assert!(prepared.normalized["parameters"]
+            .get("frame_rate")
+            .is_none());
+        for field in ["width", "height", "seed", "conditions", "enhance_prompt"] {
+            assert!(
+                prepared.normalized["parameters"].get(field).is_some(),
+                "signed field {field} was silently dropped"
+            );
+        }
+        for alias in ["input_image", "conditioning_strength", "prompt_enhancement"] {
+            assert!(
+                prepared.normalized["parameters"].get(alias).is_none(),
+                "alias {alias} was not canonicalized"
+            );
+        }
+        assert_eq!(
+            prepared.normalized["parameters"]["conditions"][0]["strength"],
+            0.7
+        );
+        assert_eq!(
+            prepared.normalized["parameters"]["conditions"][0]["frame_index"],
+            0
+        );
+        assert_eq!(
+            prepared.normalized["parameters"]["conditions"][0]["crf"],
+            33
+        );
+        assert_eq!(
+            prepared.normalized["parameters"]["conditions"][0]["image_url"],
+            json!(test_png_data_url())
+        );
+        assert_eq!(
+            prepared.normalized["parameters"]["enhance_prompt"],
+            json!(true)
+        );
+
+        let request = artifact_generation_request(
+            &model.id,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+            prepared.normalized,
+            prepared.video,
+        )
+        .unwrap();
+        assert_eq!(request.requested_frame_count, 97);
+        assert_eq!(request.frame_count, 97);
+        assert_eq!(request.frame_rate, 24.0);
+        assert_eq!(request.duration_seconds, 5);
+        assert_eq!(request.input_image_count, 1);
+        assert!(request.input_image_max_bytes > 0);
+        assert!(request.input_image_max_pixels > 0);
+
+        let requirements =
+            request_requirements_for_artifact_generation(&state, &model, &request, 1, None, None);
+        assert_eq!(
+            requirements.required_modalities,
+            vec!["video".to_owned(), "audio".to_owned(), "image".to_owned()]
+        );
+        assert_eq!(requirements.modality_load["video"].max_item_units, 97);
+        assert_eq!(requirements.modality_load["audio"].max_item_units, 5);
+        assert_eq!(
+            requirements.modality_load["image"].max_item_bytes,
+            request.input_image_max_bytes
+        );
+        assert_eq!(requirements.usage.get(USAGE_VIDEO_SECOND), 5);
+        assert_eq!(requirements.usage.get(USAGE_FRAME), 97);
+
+        let invocation = state
+            .prepare_artifact_generation_invocation_for_route(
+                &model,
+                &request,
+                None,
+                &GatewayRequestOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            invocation.spend_voucher.body.required_modalities,
+            requirements.required_modalities
+        );
+    }
+
+    #[test]
+    fn distilled_sulphur_steps_and_unsigned_video_aliases_fail_at_admission() {
+        let model = signed_joint_video_model();
+        let state = GatewayState::from_models(vec![model.clone()]);
+
+        let steps = normalize_catalog_endpoint_request_with_metadata(
+            &state,
+            &model.id,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+            &json!({
+                "inputs": "do not expose the distilled schedule",
+                "parameters": {"num_inference_steps": 8}
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            steps.message.contains("num_inference_steps"),
+            "unexpected admission error: {}",
+            steps.message
+        );
+
+        let unsigned_alias = normalize_catalog_endpoint_request_with_metadata(
+            &state,
+            &model.id,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+            &json!({
+                "inputs": "unsigned aliases stay unsupported",
+                "parameters": {"init_image": {"image_url": test_png_data_url()}}
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            unsigned_alias.message.contains("init_image"),
+            "unexpected admission error: {}",
+            unsigned_alias.message
+        );
+    }
+
+    #[test]
+    fn openai_video_image_and_strength_aliases_normalize_to_conditions() {
+        let model = signed_joint_video_model();
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let prepared = normalize_catalog_endpoint_request_with_metadata(
+            &state,
+            &model.id,
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            &json!({
+                "model": model.id,
+                "prompt": "animate the signed reference",
+                "input_reference": {"image_url": test_png_data_url()},
+                "conditioning_strength": 0.6,
+                "fps": 24
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(prepared.normalized["num_frames"], 97);
+        assert_eq!(prepared.normalized["conditions"][0]["strength"], 0.6);
+        assert_eq!(prepared.normalized["conditions"][0]["frame_index"], 0);
+        assert_eq!(prepared.normalized["conditions"][0]["crf"], 33);
+        assert_eq!(
+            prepared.normalized["conditions"][0]["image_url"],
+            json!(test_png_data_url())
+        );
+        assert!(prepared.normalized.get("input_reference").is_none());
+        assert!(prepared.normalized.get("conditioning_strength").is_none());
+        assert_eq!(prepared.video.inline_image.item_count, 1);
+    }
+
+    #[test]
+    fn video_canary_selects_signed_hf_family_with_fixed_frames_fps_and_bounded_i2v() {
+        let mut model = signed_joint_video_model();
+        model.mayhem.adapter.endpoint_families[0]
+            .request_attribute_specs
+            .get_mut("parameters.num_frames")
+            .unwrap()
+            .enum_values = vec![json!(9)];
+        model.mayhem.adapter.endpoint_families[0]
+            .request_attributes
+            .retain(|path| path != "parameters.num_inference_steps");
+        model.mayhem.adapter.endpoint_families[0]
+            .request_attribute_specs
+            .remove("parameters.num_inference_steps");
+        let state = GatewayState::from_models(vec![model.clone()]).with_dev_session_shim();
+        let prompt = GatewayCanaryPrompt {
+            id: "bounded-i2v".to_owned(),
+            calibration_only: false,
+            messages: Vec::new(),
+            tools: None,
+            specialities: BTreeMap::new(),
+            max_tokens: 1,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            prompt: Some("animate the fixed launch image".to_owned()),
+            input: None,
+            audio_b64: None,
+            content_type: None,
+            filename: None,
+            language: None,
+            voice: None,
+            response_format: None,
+            require_word_timestamps: false,
+            require_segment_timestamps: false,
+            size: None,
+            steps: None,
+            cfg_scale: None,
+            shift: None,
+            seed: Some(17),
+            endpoint_attributes: BTreeMap::from([
+                (
+                    "endpoint_family".to_owned(),
+                    json!(mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO),
+                ),
+                (
+                    "parameters".to_owned(),
+                    json!({
+                        "num_frames": 9,
+                        "fps": 8,
+                        "seed": 17,
+                        "input_image": {"image_url": test_png_data_url()}
+                    }),
+                ),
+            ]),
+        };
+
+        let request =
+            canary_artifact_generation_request(&state, &model, &prompt).expect("video canary");
+
+        assert_eq!(
+            request.endpoint_family,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+        );
+        assert_eq!(request.requested_frame_count, 9);
+        assert_eq!(request.frame_count, 9);
+        assert_eq!(request.frame_rate, 8.0);
+        assert_eq!(request.duration_seconds, 2);
+        assert_eq!(request.input_image_count, 1);
+        assert!(request.input_image_max_bytes > 0);
+        assert!(request.input_image_max_pixels > 0);
+        assert!(
+            request.contract_request["parameters"]
+                .get("num_inference_steps")
+                .is_none(),
+            "the output canary must not expose the backend-owned denoise schedule"
+        );
+    }
+
+    #[test]
+    fn video_i2v_rejects_remote_paths_and_enforces_inline_image_limits() {
+        let model = signed_joint_video_model();
+        let state = GatewayState::from_models(vec![model.clone()]);
+        for input_image in [
+            json!({"image_url": "https://example.test/frame.png"}),
+            json!({"image_url": "/srv/provider/frame.png"}),
+        ] {
+            let error = normalize_catalog_endpoint_request_with_metadata(
+                &state,
+                &model.id,
+                mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+                &json!({
+                    "inputs": "animate",
+                    "parameters": {
+                        "num_frames": 97,
+                        "num_inference_steps": 8,
+                        "input_image": input_image
+                    }
+                }),
+            )
+            .unwrap_err();
+            assert!(
+                error.message.contains("fetch") || error.message.contains("server paths"),
+                "unexpected error: {}",
+                error.message
+            );
+        }
+        let error = normalize_catalog_endpoint_request_with_metadata(
+            &state,
+            &model.id,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+            &json!({
+                "inputs": "animate",
+                "parameters": {
+                    "num_frames": 97,
+                    "num_inference_steps": 8,
+                    "input_image_path": "/srv/provider/frame.png"
+                }
+            }),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("input_image_path is forbidden"));
+
+        let limits = GatewayMediaLimits {
+            max_image_bytes: 1,
+            ..GatewayMediaLimits::default()
+        };
+        let error = canonical_inline_image_data_url(&json!(test_png_data_url()), "input", &limits)
+            .unwrap_err();
+        assert!(error.contains("gateway limit"));
+    }
+
+    #[test]
+    fn prompt_enhancement_cannot_be_silently_enabled_by_a_signed_default() {
+        let mut model = signed_joint_video_model();
+        model.mayhem.adapter.endpoint_families[0]
+            .request_attribute_specs
+            .get_mut("parameters.enhance_prompt")
+            .unwrap()
+            .default = Some(json!(true));
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let error = normalize_catalog_endpoint_request_with_metadata(
+            &state,
+            &model.id,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+            &json!({
+                "inputs": "do not rewrite me",
+                "parameters": {"num_frames": 97}
+            }),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("explicitly enabled"));
+    }
+
+    #[test]
+    fn video_provenance_canary_refuses_prompt_enhancement() {
+        let model = prompt_enhancer_video_model();
+        let state = GatewayState::from_models(vec![model.clone()]).with_dev_session_shim();
+        let prompt = GatewayCanaryPrompt {
+            id: "enhancer-off".to_owned(),
+            calibration_only: false,
+            messages: Vec::new(),
+            tools: None,
+            specialities: BTreeMap::new(),
+            max_tokens: 1,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            prompt: Some("fixed video provenance prompt".to_owned()),
+            input: None,
+            audio_b64: None,
+            content_type: None,
+            filename: None,
+            language: None,
+            voice: None,
+            response_format: None,
+            require_word_timestamps: false,
+            require_segment_timestamps: false,
+            size: None,
+            steps: None,
+            cfg_scale: None,
+            shift: None,
+            seed: Some(7),
+            endpoint_attributes: BTreeMap::from([
+                (
+                    "endpoint_family".to_owned(),
+                    json!(mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO),
+                ),
+                (
+                    "parameters".to_owned(),
+                    json!({
+                        "num_frames": 97,
+                        "fps": 24,
+                        "prompt_enhancement": true
+                    }),
+                ),
+            ]),
+        };
+
+        let error = canary_artifact_generation_request(&state, &model, &prompt).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("must keep prompt enhancement disabled"),
+            "unexpected canary error: {}",
+            error.message
+        );
+
+        let mut enhancer_off = prompt;
+        enhancer_off.endpoint_attributes.insert(
+            "parameters".to_owned(),
+            json!({
+                "num_frames": 97,
+                "fps": 24,
+                "prompt_enhancement": false
+            }),
+        );
+        let request = canary_artifact_generation_request(&state, &model, &enhancer_off).unwrap();
+        assert_eq!(
+            request.effective_specialities,
+            BTreeMap::from([("prompt_enhancer".to_owned(), "off".to_owned())])
+        );
+    }
+
+    #[test]
+    fn video_only_models_remain_compatible_with_t2v() {
+        let mut model = signed_joint_video_model();
+        model.mayhem.caps.audio = false;
+        model.mayhem.caps.output_modalities = vec!["video".to_owned()];
+        model.mayhem.adapter.modality_set = vec!["video".to_owned()];
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let prepared = normalize_catalog_endpoint_request_with_metadata(
+            &state,
+            &model.id,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+            &json!({
+                "inputs": "text to video",
+                "parameters": {"num_frames": 97}
+            }),
+        )
+        .unwrap();
+        let request = artifact_generation_request(
+            &model.id,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+            prepared.normalized,
+            prepared.video,
+        )
+        .unwrap();
+        let requirements =
+            request_requirements_for_artifact_generation(&state, &model, &request, 1, None, None);
+        assert_eq!(requirements.required_modalities, vec!["video".to_owned()]);
+        assert_eq!(requirements.modality_load.len(), 1);
     }
 
     #[test]
@@ -35504,6 +37744,416 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_progress_job_cancellation_reaches_execution_and_persists_once() {
+        use tower::ServiceExt;
+
+        let state = GatewayState::fixture();
+        let job = match prepare_gateway_job(
+            &state,
+            &HeaderMap::new(),
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            "mayhem/video-test",
+            &json!({"model": "mayhem/video-test", "prompt": "cancel me"}),
+            &None,
+        )
+        .await
+        .unwrap()
+        {
+            PreparedGatewayJob::Started(job) => job,
+            _ => panic!("fresh request must start a job"),
+        };
+        let cancellation = job.cancellation();
+        assert!(!cancellation.is_cancelled());
+        let response = openai_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/jobs/{}", job.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(cancellation.is_cancelled());
+
+        let result = run_detached_gateway_job_request::<(), _>(cancellation, job.clone(), async {
+            Err(ApiError::internal_message("request observed cancellation"))
+        })
+        .await;
+        assert!(result.is_err());
+
+        let stored = state
+            .jobs
+            .lock_recover("gateway job vault")
+            .get(&job.id, now_secs())
+            .unwrap()
+            .expect("cancelled job must be terminal");
+        assert_eq!(stored.status, GatewayJobStatus::Cancelled);
+        assert!(!state
+            .jobs
+            .lock_recover("gateway job vault")
+            .is_active(&job.id));
+        assert!(!state
+            .active_job_cancellations
+            .lock_recover("active gateway job cancellations")
+            .contains_key(&job.id));
+    }
+
+    #[tokio::test]
+    async fn dropped_outer_request_cannot_leak_a_pre_dispatch_job() {
+        let state = GatewayState::fixture();
+        let job = match prepare_gateway_job(
+            &state,
+            &HeaderMap::new(),
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            "mayhem/video-test",
+            &json!({"model": "mayhem/video-test", "prompt": "drop before route"}),
+            &None,
+        )
+        .await
+        .unwrap()
+        {
+            PreparedGatewayJob::Started(job) => job,
+            _ => panic!("fresh request must start a job"),
+        };
+        let cancellation = job.cancellation();
+        let request_cancellation = cancellation.clone();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let request_started = started.clone();
+        let outer = tokio::spawn(run_detached_gateway_job_request::<(), _>(
+            cancellation,
+            job.clone(),
+            async move {
+                request_started.notify_one();
+                request_cancellation.cancelled().await;
+                Err(ApiError::bad_gateway(
+                    "provider route failed after client disconnect",
+                    Some("model"),
+                ))
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("detached request started");
+        outer.abort();
+        let _ = outer.await;
+
+        let stored = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let stored = state
+                    .jobs
+                    .lock_recover("gateway job vault")
+                    .get(&job.id, now_secs())
+                    .expect("look up dropped request job");
+                let cancellation_registered = state
+                    .active_job_cancellations
+                    .lock_recover("active gateway job cancellations")
+                    .contains_key(&job.id);
+                if let Some(stored) = stored.filter(|_| !cancellation_registered) {
+                    break stored;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached owner finalized dropped request");
+        assert_eq!(stored.status, GatewayJobStatus::Cancelled);
+        assert!(!state
+            .jobs
+            .lock_recover("gateway job vault")
+            .is_active(&job.id));
+        assert!(!state
+            .active_job_cancellations
+            .lock_recover("active gateway job cancellations")
+            .contains_key(&job.id));
+    }
+
+    #[tokio::test]
+    async fn ack_delivery_failure_preserves_artifact_and_retry_cannot_double_bill() {
+        use tower::ServiceExt;
+
+        let mut state = GatewayState::fixture();
+        state.jobs = Arc::new(Mutex::new(GatewayJobStore::in_memory(
+            [19_u8; 32],
+            1,
+            64 * 1024 * 1024,
+            24 * 60 * 60,
+        )));
+        let job = match prepare_gateway_job(
+            &state,
+            &HeaderMap::new(),
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            "mayhem/video-test",
+            &json!({"model": "mayhem/video-test", "prompt": "ack ordering"}),
+            &None,
+        )
+        .await
+        .unwrap()
+        {
+            PreparedGatewayJob::Started(job) => job,
+            _ => panic!("fresh request must start a job"),
+        };
+        let mut invocation = test_invocation();
+        invocation.job = Some(job.clone());
+        let model = test_model();
+        let request = test_chat_request(&model.id);
+        let mut output = test_chat_output();
+        let artifact_bytes = b"completed one-shot artifact".to_vec();
+        let artifact_id = "artifact_ack_retry".to_owned();
+        output.artifacts.push(GatewayArtifactOutput {
+            id: artifact_id.clone(),
+            content_type: "application/octet-stream".to_owned(),
+            blake3: blake3_hex(&artifact_bytes),
+            bytes: artifact_bytes.clone(),
+        });
+        let provider_receipt = test_provider_receipt(&model, &request, &output, &invocation);
+        let receipt_ack =
+            receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).unwrap();
+        let result = chat_job_result(&output);
+        let receipts = invocation.receipt_recorder.receipts.clone();
+        let wallet_spend = invocation
+            .receipt_recorder
+            .spend_reservation
+            .0
+            .wallet_spend
+            .clone();
+        let initial_balance = wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .balance_au;
+        let task_invocation = invocation.clone();
+        let task_result = result.clone();
+        let task_artifacts = output.artifacts.clone();
+        let task_receipt = provider_receipt.clone();
+        let task_ack = receipt_ack.clone();
+        let outer = run_detached_gateway_job_request::<(), _>(
+            job.cancellation(),
+            job.clone(),
+            async move {
+                reconcile_and_persist_completed_invocation_job_with_ack(
+                    &task_invocation,
+                    task_result,
+                    &task_artifacts,
+                    &task_receipt,
+                    &task_ack,
+                    async {
+                        Err(GatewaySessionError::retryable(
+                            "receipt acknowledgement delivery failed",
+                        ))
+                    },
+                )
+                .await
+                .map_err(|error| ApiError::bad_gateway(error.message, Some("model")))
+            },
+        )
+        .await
+        .expect_err("receipt acknowledgement failure must surface");
+        assert!(outer.message.contains("acknowledgement"));
+        let pending = state
+            .jobs
+            .lock_recover("gateway job vault")
+            .get(&job.id, now_secs())
+            .unwrap()
+            .expect("failed acknowledgement must preserve a durable job");
+        assert_eq!(pending.status, GatewayJobStatus::ReconciliationPending);
+        assert_eq!(pending.result, Some(result.clone()));
+        assert_eq!(pending.artifacts[0].bytes, artifact_bytes);
+        assert!(pending.receipt.is_some());
+        assert_eq!(receipts.lock_recover("receipt store").len(), 1);
+        let balance_after_first_record = wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .balance_au;
+        assert_eq!(
+            initial_balance.saturating_sub(balance_after_first_record),
+            provider_receipt.body.au_owed_cum
+        );
+        assert!(!state
+            .active_job_cancellations
+            .lock_recover("active gateway job cancellations")
+            .contains_key(&job.id));
+        let pressure_error = match prepare_gateway_job(
+            &state,
+            &HeaderMap::new(),
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            "mayhem/video-test",
+            &json!({"model": "mayhem/video-test", "prompt": "vault pressure"}),
+            &None,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("ACK-pending result must remain protected under job pressure"),
+        };
+        assert!(pressure_error.message.contains("configured limit"));
+        let pressure_survivor = state
+            .jobs
+            .lock_recover("gateway job vault")
+            .get(&job.id, now_secs())
+            .unwrap()
+            .expect("job pressure must not evict the ACK-pending result");
+        assert_eq!(
+            pressure_survivor.status,
+            GatewayJobStatus::ReconciliationPending
+        );
+        assert_eq!(pressure_survivor.artifacts[0].bytes, artifact_bytes);
+
+        let artifact_response = openai_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/v1/jobs/{}/artifacts/{artifact_id}", job.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(artifact_response.status(), StatusCode::OK);
+        let retrieved = axum::body::to_bytes(artifact_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(retrieved.as_ref(), artifact_bytes.as_slice());
+
+        reconcile_and_persist_completed_invocation_job_with_ack(
+            &invocation,
+            result.clone(),
+            &output.artifacts,
+            &provider_receipt,
+            &receipt_ack,
+            async { Ok(()) },
+        )
+        .await
+        .expect("reconciliation retry succeeds");
+        let completed = state
+            .jobs
+            .lock_recover("gateway job vault")
+            .get(&job.id, now_secs())
+            .unwrap()
+            .expect("reconciliation retry must retain the job");
+        assert_eq!(completed.status, GatewayJobStatus::Completed);
+        assert_eq!(completed.result, Some(result));
+        assert_eq!(completed.artifacts[0].bytes, artifact_bytes);
+        assert_eq!(receipts.lock_recover("receipt store").len(), 1);
+        assert_eq!(
+            wallet_spend
+                .lock_recover("gateway wallet spend state")
+                .balance_au,
+            balance_after_first_record
+        );
+    }
+
+    #[tokio::test]
+    async fn active_job_visibility_waits_for_cancellation_registration() {
+        use tower::ServiceExt;
+
+        let state = GatewayState::fixture();
+        let headers = {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "idempotency-key",
+                HeaderValue::from_static("create-delete-race-proof"),
+            );
+            headers
+        };
+        let registration_guard = state
+            .active_job_cancellations
+            .lock_recover("active gateway job cancellations");
+        let prepare_state = state.clone();
+        let prepare_headers = headers.clone();
+        let prepare = tokio::spawn(async move {
+            prepare_gateway_job(
+                &prepare_state,
+                &prepare_headers,
+                mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+                "mayhem/video-test",
+                &json!({"model": "mayhem/video-test", "prompt": "race proof"}),
+                &None,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.jobs.try_lock().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("job creation reached the atomic registration section");
+        drop(registration_guard);
+
+        let job = match prepare
+            .await
+            .expect("job preparation task completed")
+            .expect("job preparation succeeded")
+        {
+            PreparedGatewayJob::Started(job) => job,
+            _ => panic!("fresh request must start a job"),
+        };
+        let response = openai_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/v1/jobs/{}", job.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(job.cancellation().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn failed_job_creation_removes_its_pre_registered_cancellation() {
+        let state = GatewayState::fixture();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "idempotency-key",
+            HeaderValue::from_static("failed-create-registration-proof"),
+        );
+        let job = match prepare_gateway_job(
+            &state,
+            &headers,
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            "mayhem/video-test",
+            &json!({"model": "mayhem/video-test", "prompt": "first request"}),
+            &None,
+        )
+        .await
+        .unwrap()
+        {
+            PreparedGatewayJob::Started(job) => job,
+            _ => panic!("fresh request must start a job"),
+        };
+        job.persist_failure_if_active("first request failed".to_owned())
+            .await;
+        assert!(!state
+            .active_job_cancellations
+            .lock_recover("active gateway job cancellations")
+            .contains_key(&job.id));
+
+        let error = match prepare_gateway_job(
+            &state,
+            &headers,
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            "mayhem/video-test",
+            &json!({"model": "mayhem/video-test", "prompt": "conflicting retry"}),
+            &None,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("conflicting idempotent retry must fail"),
+        };
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(!state
+            .active_job_cancellations
+            .lock_recover("active gateway job cancellations")
+            .contains_key(&job.id));
+    }
+
+    #[tokio::test]
     async fn panicked_detached_jobs_become_terminal_failures() {
         let store = Arc::new(Mutex::new(GatewayJobStore::in_memory(
             [6_u8; 32],
@@ -35525,27 +38175,38 @@ mod tests {
                 .unwrap();
         }
 
+        let active_cancellations = Arc::new(Mutex::new(BTreeMap::new()));
+        let sync_cancellation = GatewayRequestCancellation::new();
+        active_cancellations
+            .lock_recover("active gateway job cancellations")
+            .insert("sync_panic".to_owned(), sync_cancellation.clone());
         let sync_job = GatewayJobHandle {
             id: "sync_panic".to_owned(),
             store: store.clone(),
+            cancellation: sync_cancellation.clone(),
+            active_cancellations: active_cancellations.clone(),
+            settlement_reconciliation_started: Arc::new(AtomicBool::new(false)),
         };
-        let error = run_detached_gateway_job_request::<(), _>(
-            GatewayRequestCancellation::new(),
-            sync_job,
-            async {
-                panic!("synchronous request panic proof");
-                #[allow(unreachable_code)]
-                Ok::<(), ApiError>(())
-            },
-        )
+        let error = run_detached_gateway_job_request::<(), _>(sync_cancellation, sync_job, async {
+            panic!("synchronous request panic proof");
+            #[allow(unreachable_code)]
+            Ok::<(), ApiError>(())
+        })
         .await
         .expect_err("a panicked request must fail");
         assert!(error.message.contains("gateway request task failed"));
 
+        let async_cancellation = GatewayRequestCancellation::new();
+        active_cancellations
+            .lock_recover("active gateway job cancellations")
+            .insert("async_panic".to_owned(), async_cancellation.clone());
         spawn_gateway_job_request::<(), _>(
             GatewayJobHandle {
                 id: "async_panic".to_owned(),
                 store: store.clone(),
+                cancellation: async_cancellation,
+                active_cancellations,
+                settlement_reconciliation_started: Arc::new(AtomicBool::new(false)),
             },
             async {
                 panic!("asynchronous request panic proof");
@@ -35885,7 +38546,13 @@ mod tests {
                 "response_format": "wav",
                 "seed": 7
             });
-            let request = artifact_generation_request("mayhem/audio-test", family, raw).unwrap();
+            let request = artifact_generation_request(
+                "mayhem/audio-test",
+                family,
+                raw,
+                VideoRequestPreparation::default(),
+            )
+            .unwrap();
             assert_eq!(request.transport_kind, expected_kind);
             assert_eq!(request.duration_seconds, 3);
             let output = ArtifactGenerationOutput {
@@ -35926,6 +38593,7 @@ mod tests {
                 "duration_seconds": 10,
                 "response_format": "wav"
             }),
+            VideoRequestPreparation::default(),
         )
         .unwrap();
         let model = test_model();
@@ -35961,6 +38629,7 @@ mod tests {
                     "content_type": "audio/wav"
                 }
             }),
+            VideoRequestPreparation::default(),
         )
         .unwrap();
         assert_eq!(request.duration_seconds, 2);
