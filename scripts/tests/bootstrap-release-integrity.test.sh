@@ -6,6 +6,13 @@ MAYHEM_BIN="${MAYHEM_TEST_MAYHEM_BIN:-$ROOT_DIR/target/debug/mayhem}"
 VERSION="${MAYHEM_TEST_VERSION:-0.2.25}"
 SOURCE_GIT_SHA="0123456789abcdef0123456789abcdef01234567"
 
+IFS=. read -r version_major version_minor version_patch <<<"$VERSION"
+[[ "$version_major" =~ ^[0-9]+$ && "$version_minor" =~ ^[0-9]+$ && "$version_patch" =~ ^[0-9]+$ ]] || {
+  printf 'bootstrap-release-integrity.test: test version must be numeric semver: %s\n' "$VERSION" >&2
+  exit 1
+}
+ROLLBACK_FLOOR="$version_major.$version_minor.$((version_patch + 1))"
+
 fail() {
   printf 'bootstrap-release-integrity.test: %s\n' "$*" >&2
   exit 1
@@ -484,7 +491,7 @@ mkdir -p "$rollback/install/.mayhem-update"
 cat >"$rollback/install/.mayhem-update/release-floor.json" <<EOF
 {
   "schema": 1,
-  "version": "0.2.26"
+  "version": "$ROLLBACK_FLOOR"
 }
 EOF
 rollback_output="$rollback/output.log"

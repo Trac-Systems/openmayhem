@@ -143,6 +143,10 @@ const walletManifest = readJson(path.join(walletRoot, 'package.json'));
 if (walletManifest.name !== 'trac-wallet' || walletManifest.version !== '1.0.1') {
   fail('installed top-level wallet must be trac-wallet 1.0.1');
 }
+const walletModule = await import(pathToFileURL(path.join(walletRoot, 'index.js')).href);
+if (typeof walletModule.default?.encodeBech32mSafe !== 'function') {
+  fail('installed top-level wallet must expose PeerWallet.encodeBech32mSafe');
+}
 
 const dependencySections = [
   'dependencies',

@@ -195,7 +195,7 @@ cp \
 cat >"$topology/node_modules/trac-wallet/package.json" <<'JSON'
 {"name":"trac-wallet","version":"1.0.1","main":"index.js"}
 JSON
-printf 'module.exports = {};\n' >"$topology/node_modules/trac-wallet/index.js"
+printf 'module.exports = class PeerWallet { static encodeBech32mSafe() {} };\n' >"$topology/node_modules/trac-wallet/index.js"
 cat >"$topology/node_modules/wallet-consumer/package.json" <<'JSON'
 {"name":"wallet-consumer","version":"1.0.0","optionalDependencies":{"trac-wallet":"*"}}
 JSON
@@ -206,9 +206,17 @@ topology_output="$(
 grep -F '4 wallet resolution contexts' <<<"$topology_output" >/dev/null ||
   fail "topology verifier did not inspect every installed wallet declarer"
 
+printf 'module.exports = class PeerWallet {};\n' >"$topology/node_modules/trac-wallet/index.js"
+expect_failure "topology verifier accepted a wallet missing encodeBech32mSafe" \
+  node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$topology"
+printf 'module.exports = class PeerWallet { static encodeBech32mSafe() {} };\n' \
+  >"$topology/node_modules/trac-wallet/index.js"
+node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$topology" >/dev/null
+
 rm "$topology/node_modules/trac-msb/migration/initial_balances.csv"
 expect_failure "topology verifier accepted an npm-omitted pinned MSB runtime file" \
-  node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$topology"
+node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$topology"
+
 node "$topology/scripts/materialize-local-dependencies.mjs" "$topology" >/dev/null
 
 mkdir "$topology/trac/msb/node_modules"

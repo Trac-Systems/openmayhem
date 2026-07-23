@@ -3,6 +3,7 @@
 mod catalog;
 mod endpoint_calibration;
 mod gemma4;
+mod intercom_runtime;
 mod python_runtime;
 mod release_bundle;
 
@@ -29946,6 +29947,14 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
     let home = absolutize(home)?;
     fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
 
+    let intercom_dir = repo_path("intercom")?;
+    let intercom_readiness = intercom_runtime::ensure_ready(&intercom_dir).await?;
+    if intercom_readiness.repaired {
+        eprintln!(
+            "Repaired stale generated Intercom dependencies and verified the pinned runtime topology."
+        );
+    }
+
     let role = if args.provider {
         Role::Both
     } else {
@@ -30092,7 +30101,6 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
     let mayhemd_path = sibling_binary_path(&mayhem_path, "mayhemd");
     let paygate_path = sibling_binary_path(&mayhem_path, "mayhem-paygate");
     let pear_runtime = resolve_pear_runtime_path()?;
-    let intercom_dir = repo_path("intercom")?;
     let supervisor_config_path = home.join("mayhemd-up.toml");
     let provider_hardware_quote_command = match (
         args.provider_hardware_quote_kind.as_ref(),
