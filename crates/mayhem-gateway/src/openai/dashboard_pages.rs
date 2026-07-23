@@ -2390,6 +2390,7 @@ fn playground_numeric_parameter(
     help: &str,
 ) -> Option<Value> {
     let spec = contract.request_attribute_specs.get(key)?;
+    let default = default.or_else(|| spec.default.as_ref().and_then(Value::as_f64));
     Some(json!({
         "key": key,
         "label": label,
@@ -2404,13 +2405,41 @@ fn playground_numeric_parameter(
         "section": section,
         "minimum": spec.minimum,
         "maximum": spec.maximum,
+        "multipleOf": spec.multiple_of,
         "step": step,
-        "default": default.or_else(|| spec.default.as_ref().and_then(Value::as_f64)),
+        "default": default,
+        "defaultSource": default.map(|_| "model"),
         "help": help,
     }))
 }
 
-fn playground_text_parameter_schema(model: &GatewayModel) -> Value {
+fn playground_parameter_option_label(value: &str) -> String {
+    match value {
+        "enabled" | "on" | "true" => "On".to_owned(),
+        "disabled" | "off" | "false" => "Off".to_owned(),
+        "latest_only" => "Latest only".to_owned(),
+        "preserve" => "Preserve".to_owned(),
+        _ => value
+            .split(['_', '-'])
+            .filter(|part| !part.is_empty())
+            .enumerate()
+            .map(|(index, part)| {
+                if index == 0 {
+                    let mut chars = part.chars();
+                    chars
+                        .next()
+                        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                        .unwrap_or_default()
+                } else {
+                    part.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+fn playground_text_parameter_schema(data: &DashboardData, model: &GatewayModel) -> Value {
     let Some(contract) = model
         .mayhem
         .adapter
@@ -2419,7 +2448,7 @@ fn playground_text_parameter_schema(model: &GatewayModel) -> Value {
         .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS)
     else {
         return json!({
-            "version": 1,
+            "version": 2,
             "contextTokens": model.mayhem.caps.ctx,
             "contextLabel": format_token_count(u64::from(model.mayhem.caps.ctx)),
             "controls": [],
@@ -2428,25 +2457,96 @@ fn playground_text_parameter_schema(model: &GatewayModel) -> Value {
 
     let mut controls = Vec::new();
     if let Some(spec) = contract.request_attribute_specs.get("max_tokens") {
-        let maximum = spec.maximum.unwrap_or(4_096.0).clamp(1.0, 4_096.0);
-        let contract_minimum = spec.minimum.unwrap_or(1.0).clamp(1.0, maximum);
-        let minimum = if maximum >= 64.0 {
-            contract_minimum.max(64.0)
-        } else {
-            contract_minimum
-        };
-        let default = 512_f64.clamp(minimum, maximum);
-        controls.push(json!({
-            "key": "max_tokens",
-            "label": "Output limit",
-            "kind": "integer",
-            "section": "primary",
-            "minimum": minimum,
-            "maximum": maximum,
-            "step": if maximum >= 64.0 { 64 } else { 1 },
-            "default": default,
-            "help": "Maximum tokens generated for this response. The model can finish sooner.",
-        }));
+        let context_maximum = f64::from(model.mayhem.caps.ctx);
+        let maximum = spec
+            .maximum
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(context_maximum)
+            .min(context_maximum)
+            .min(f64::from(u32::MAX))
+            .floor();
+        let minimum = spec
+            .minimum
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(0.0)
+            .ceil();
+        if minimum <= maximum {
+            let contract_default = spec
+                .default
+                .as_ref()
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite());
+            let default = contract_default.unwrap_or(512.0).clamp(minimum, maximum);
+            controls.push(json!({
+                "key": "max_tokens",
+                "label": "Output limit",
+                "kind": "integer",
+                "section": "primary",
+                "minimum": minimum,
+                "maximum": maximum,
+                "multipleOf": spec.multiple_of,
+                "step": spec.multiple_of.unwrap_or(1.0),
+                "default": default,
+                "defaultSource": if contract_default.is_some() { "model" } else { "playground" },
+                "help": "Maximum response tokens. The model may stop sooner; conversation input and thinking share the context window.",
+            }));
+        }
+    }
+
+    if let Some(spec) = contract.request_attribute_specs.get("thinking_mode") {
+        let speciality_availability =
+            gateway_speciality_availability(model, &data.entries, &data.live_route_keys);
+        let availability = speciality_availability.get("thinking_mode");
+        let model_default = spec
+            .default
+            .as_ref()
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| availability.map(|value| value.default_level.clone()));
+        let mut options = Vec::new();
+        if let Some(default) = model_default.as_deref() {
+            let level = availability.and_then(|value| value.levels.get(default));
+            options.push(json!({
+                "value": "",
+                "label": format!("Model default ({})", playground_parameter_option_label(default)),
+                "available": level.map(|value| value.available),
+                "canonicalProviderCount": level.map(|value| value.canonical_provider_count),
+                "liveProviderCount": level.map(|value| value.live_provider_count),
+                "maxReasoningTokens": level.and_then(|value| value.max_reasoning_tokens),
+            }));
+        }
+        options.extend(
+            spec.enum_values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|value| {
+                    let level =
+                        availability.and_then(|availability| availability.levels.get(value));
+                    json!({
+                        "value": value,
+                        "label": playground_parameter_option_label(value),
+                        "available": level.map(|value| value.available),
+                        "canonicalProviderCount": level.map(|value| value.canonical_provider_count),
+                        "liveProviderCount": level.map(|value| value.live_provider_count),
+                        "maxReasoningTokens": level.and_then(|value| value.max_reasoning_tokens),
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
+        if !options.is_empty() {
+            controls.push(json!({
+                "key": "thinking_mode",
+                "label": "Thinking",
+                "kind": "select",
+                "speciality": true,
+                "section": "primary",
+                "default": if model_default.is_some() { Some("") } else { spec.default.as_ref().and_then(Value::as_str) },
+                "defaultSource": "model",
+                "modelDefault": model_default,
+                "options": options,
+                "help": "Choose the model default or require an exact thinking mode. The gateway never silently downgrades this choice.",
+            }));
+        }
     }
 
     if let Some(control) = playground_numeric_parameter(
@@ -2459,31 +2559,6 @@ fn playground_text_parameter_schema(model: &GatewayModel) -> Value {
         "Lower values are more focused. Higher values introduce more variation.",
     ) {
         controls.push(control);
-    }
-
-    if let Some(spec) = contract.request_attribute_specs.get("thinking_mode") {
-        let options = spec
-            .enum_values
-            .iter()
-            .filter_map(Value::as_str)
-            .map(|value| {
-                json!({
-                    "value": value,
-                    "label": if value == "enabled" { "On" } else { "Off" },
-                })
-            })
-            .collect::<Vec<_>>();
-        if !options.is_empty() {
-            controls.push(json!({
-                "key": "thinking_mode",
-                "label": "Thinking",
-                "kind": "select",
-                "section": "primary",
-                "default": spec.default.as_ref().and_then(Value::as_str),
-                "options": options,
-                "help": "Use the model's reasoning mode when the signed contract supports it.",
-            }));
-        }
     }
 
     for (key, label, step, default, help) in [
@@ -2522,13 +2597,6 @@ fn playground_text_parameter_schema(model: &GatewayModel) -> Value {
             model.mayhem.sampling.frequency_penalty,
             "Discourages repeating tokens in proportion to how often they appeared.",
         ),
-        (
-            "repeat_penalty",
-            "Repeat penalty",
-            0.05,
-            model.mayhem.sampling.repeat_penalty,
-            "Applies the model's native repetition penalty when supported.",
-        ),
     ] {
         if let Some(control) =
             playground_numeric_parameter(contract, key, label, "advanced", step, default, help)
@@ -2560,33 +2628,58 @@ fn playground_text_parameter_schema(model: &GatewayModel) -> Value {
             "kind": "lines",
             "section": "advanced",
             "default": Value::Null,
-            "help": "Optional. Enter one sequence per line, up to four sequences.",
+            "help": "Optional. Enter one sequence per line, up to four sequences of 1,024 characters each.",
         }));
     }
 
     if let Some(spec) = contract.request_attribute_specs.get("thinking_history") {
-        let options = spec
-            .enum_values
-            .iter()
-            .filter_map(Value::as_str)
-            .map(|value| {
-                json!({
-                    "value": value,
-                    "label": match value {
-                        "latest_only" => "Latest only",
-                        "preserve" => "Preserve",
-                        _ => value,
-                    },
+        let speciality_availability =
+            gateway_speciality_availability(model, &data.entries, &data.live_route_keys);
+        let availability = speciality_availability.get("thinking_history");
+        let model_default = spec
+            .default
+            .as_ref()
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| availability.map(|value| value.default_level.clone()));
+        let mut options = Vec::new();
+        if let Some(default) = model_default.as_deref() {
+            let level = availability.and_then(|value| value.levels.get(default));
+            options.push(json!({
+                "value": "",
+                "label": format!("Model default ({})", playground_parameter_option_label(default)),
+                "available": level.map(|value| value.available),
+                "canonicalProviderCount": level.map(|value| value.canonical_provider_count),
+                "liveProviderCount": level.map(|value| value.live_provider_count),
+            }));
+        }
+        options.extend(
+            spec.enum_values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|value| {
+                    let level =
+                        availability.and_then(|availability| availability.levels.get(value));
+                    json!({
+                        "value": value,
+                        "label": playground_parameter_option_label(value),
+                        "available": level.map(|value| value.available),
+                        "canonicalProviderCount": level.map(|value| value.canonical_provider_count),
+                        "liveProviderCount": level.map(|value| value.live_provider_count),
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>(),
+        );
         if !options.is_empty() {
             controls.push(json!({
                 "key": "thinking_history",
                 "label": "Thinking history",
                 "kind": "select",
+                "speciality": true,
                 "section": "advanced",
-                "default": spec.default.as_ref().and_then(Value::as_str),
+                "default": if model_default.is_some() { Some("") } else { spec.default.as_ref().and_then(Value::as_str) },
+                "defaultSource": "model",
+                "modelDefault": model_default,
                 "options": options,
                 "help": "Controls whether earlier reasoning state is replayed in a conversation.",
             }));
@@ -2594,7 +2687,7 @@ fn playground_text_parameter_schema(model: &GatewayModel) -> Value {
     }
 
     json!({
-        "version": 1,
+        "version": 2,
         "contextTokens": model.mayhem.caps.ctx,
         "contextLabel": format_token_count(u64::from(model.mayhem.caps.ctx)),
         "controls": controls,
@@ -2682,8 +2775,8 @@ fn playground_page(data: &DashboardData, selected_model: Option<&str>) -> String
                 )
             });
         let parameter_schema = html_escape(
-            &serde_json::to_string(&playground_text_parameter_schema(model))
-                .unwrap_or_else(|_| r#"{"version":1,"controls":[]}"#.to_owned()),
+            &serde_json::to_string(&playground_text_parameter_schema(data, model))
+                .unwrap_or_else(|_| r#"{"version":2,"controls":[]}"#.to_owned()),
         );
         options.push_str(&format!(
             r##"<option value="{}" data-playground-mode="{mode}" data-availability="{}" data-price="{}" data-price-mode="{price_mode}" data-location="Network provider route" data-protection="{}" data-context="Up to {context} catalog tokens" data-model-name="{}" data-model-lab="{}" data-model-purpose="{purpose}" data-parameter-schema="{parameter_schema}"{image_attributes}{selected}>{} &mdash; {}</option>"##,
@@ -2844,13 +2937,14 @@ fn playground_page(data: &DashboardData, selected_model: Option<&str>) -> String
 
     <button class="pg-controls-backdrop" type="button" data-playground-controls-backdrop aria-label="Close generation settings" hidden></button>
     <aside class="pg-controls" data-playground-controls aria-label="Generation settings">
-      <button class="pg-controls-toggle" type="button" data-playground-controls-toggle aria-expanded="false" aria-controls="playground-controls-body"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M14 4v6M4 17h2M10 17h10M10 14v6"/></svg><span class="pg-controls-toggle-copy"><strong>Generation settings</strong><small data-playground-controls-state>Model defaults</small></span><svg class="pg-controls-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></button>
+      <button class="pg-controls-toggle" type="button" data-playground-controls-toggle aria-expanded="false" aria-controls="playground-controls-body"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M14 4v6M4 17h2M10 17h10M10 14v6"/></svg><span class="pg-controls-toggle-copy"><strong>Generation settings</strong><small data-playground-controls-state>Defaults</small></span><svg class="pg-controls-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></button>
       <div class="pg-controls-body" id="playground-controls-body" data-playground-controls-body hidden>
         <header class="pg-controls-head"><div class="pg-controls-heading"><strong>Generation settings</strong><span><i aria-hidden="true"></i><span data-playground-controls-model>{default_model_name}</span></span></div><span class="pg-controls-head-actions"><button type="button" data-playground-reset-model aria-label="Reset generation settings for selected model" title="Reset model settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4v6h6M20 20v-6h-6"/><path d="M5.1 15a8 8 0 0 0 13.2 2M18.9 9A8 8 0 0 0 5.7 7"/></svg><span>Reset</span></button><button type="button" data-playground-controls-close aria-label="Close generation settings"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg><span class="sr-only">Close generation settings</span></button></span></header>
         <div class="pg-controls-scroll">
-          <div class="pg-context-card"><span>Context window</span><strong data-playground-context-value>Checking catalog</strong><small>Read-only model limit</small></div>
+          <div class="pg-context-card"><span>Context window</span><strong data-playground-context-value>Checking catalog</strong><span>Maximum output</span><strong data-playground-output-maximum>Checking contract</strong><small>Conversation input, history, thinking, and output share the context window. The gateway confirms the exact fit when you send.</small></div>
+          <p class="pg-settings-note" data-playground-settings-note role="status" hidden></p>
           <div class="pg-control-group" data-playground-parameter-section="primary"></div>
-          <details class="pg-control-disclosure" data-playground-more-settings><summary><span><strong>More settings</strong><small>Sampling and instructions</small></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg></summary><div class="pg-control-disclosure-body"><label class="pg-control-field span-all" for="playground-system"><span>System instructions <em>Text only</em></span><textarea id="playground-system" data-playground-system data-playground-draft rows="3" placeholder="Optional guidance for the model"></textarea><small>Saved only for this browser tab.</small></label><div class="pg-control-group pg-control-group-advanced" data-playground-parameter-section="advanced"></div></div></details>
+          <details class="pg-control-disclosure" data-playground-more-settings><summary><span><strong>Advanced</strong><small>Optional controls</small></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg></summary><div class="pg-control-disclosure-body"><label class="pg-control-field span-all" for="playground-system"><span>System instructions <em>Text only</em></span><textarea id="playground-system" data-playground-system data-playground-draft rows="3" placeholder="Optional guidance for the model"></textarea><small>Saved only for this browser tab.</small></label><div class="pg-control-group pg-control-group-advanced" data-playground-parameter-section="advanced"></div></div></details>
           <details class="pg-control-disclosure" data-playground-routing-settings><summary><span><strong>Routing and trust</strong><small>Gateway limits</small></span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg></summary><div class="pg-control-disclosure-body">{token_field}<label class="pg-control-field" for="playground-max-price"><span><span data-playground-price-label>Route price ceiling</span><em data-playground-price-unit>USD</em></span><input id="playground-max-price" data-playground-max-price data-playground-draft data-money-input type="text" inputmode="decimal" autocomplete="off" spellcheck="false" pattern="[0-9]+([.][0-9]{{1,18}})?" placeholder="Optional USD ceiling"></label><label class="pg-control-field" for="playground-min-att-tier"><span>Minimum attestation tier</span><select id="playground-min-att-tier" data-playground-min-att-tier data-playground-draft><option value="">Gateway default</option><option value="1">At least T1 numerically</option><option value="2">At least T2 numerically</option><option value="3">At least T3 numerically</option><option value="4">T4 only</option></select><small>Numeric tier does not promise confidential compute.</small></label><div class="preflight span-all" data-playground-preflight><span><strong>Capacity:</strong> <span data-preflight-value="availability">Checking</span></span><span><strong>Protection:</strong> <span data-preflight-value="protection">Checking catalog</span></span><span><strong>Context:</strong> <span data-preflight-value="context">Checking catalog</span></span><span><strong>Catalog rates:</strong> <span class="money-value" data-money data-preflight-value="price">Unavailable</span></span></div></div></details>
           <button class="pg-text-action pg-controls-reset-all" type="button" data-playground-reset-draft>Reset Playground</button>
         </div>
@@ -7432,8 +7526,10 @@ mod tests {
         assert!(html.contains("Generation settings"));
         assert!(html.contains("data-playground-parameter-section=\"primary\""));
         assert!(html.contains("data-parameter-schema="));
+        assert!(html.contains("&quot;version&quot;:2"));
         assert!(html.contains("&quot;key&quot;:&quot;max_tokens&quot;"));
-        assert!(html.contains("&quot;maximum&quot;:4096.0"));
+        assert!(html.contains("&quot;defaultSource&quot;:&quot;playground&quot;"));
+        assert!(!html.contains("&quot;key&quot;:&quot;repeat_penalty&quot;"));
         assert!(html.contains("data-playground-max-price"));
         assert!(html.contains(r#"data-price-mode="rate""#));
         assert!(html.contains("data-money-input"));
@@ -7443,9 +7539,53 @@ mod tests {
         assert!(html.contains("Numeric tier does not promise confidential compute."));
         assert!(html.contains("data-playground-controls-state"));
         assert!(html.contains("Context window"));
+        assert!(html.contains("Maximum output"));
+        assert!(html.contains("Conversation input, history, thinking, and output share"));
         assert!(html.contains("drafts and history stay in this browser tab"));
         assert!(html.contains("access tokens are never saved"));
         assert!(html.contains("data-playground-reset-draft"));
+    }
+
+    #[test]
+    fn playground_output_limit_uses_the_full_signed_model_boundary() {
+        let mut model = GatewayState::fixture().models_snapshot()[0].clone();
+        model.mayhem.caps.ctx = 262_144;
+        let contract = model
+            .mayhem
+            .adapter
+            .endpoint_families
+            .iter_mut()
+            .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS)
+            .expect("chat contract");
+        let spec = contract
+            .request_attribute_specs
+            .get_mut("max_tokens")
+            .expect("max_tokens contract");
+        spec.minimum = Some(0.0);
+        spec.maximum = Some(262_144.0);
+        spec.multiple_of = None;
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let data = DashboardData::from_state(&state);
+
+        let schema = playground_text_parameter_schema(&data, &model);
+        let controls = schema["controls"].as_array().expect("controls");
+        let output = controls
+            .iter()
+            .find(|control| control["key"] == "max_tokens")
+            .expect("output control");
+
+        assert_eq!(schema["version"], 2);
+        assert_eq!(output["minimum"], 0.0);
+        assert_eq!(output["maximum"], 262_144.0);
+        assert_eq!(output["step"], 1.0);
+        assert_eq!(output["default"], 512.0);
+        assert_eq!(output["defaultSource"], "playground");
+        assert!(controls
+            .iter()
+            .all(|control| control["key"] != "repeat_penalty"));
+        let dashboard_javascript = super::super::dashboard_ui::DASHBOARD_APP_JS;
+        assert!(!dashboard_javascript.contains("Math.min(4096"));
+        assert!(!dashboard_javascript.contains("<= 4096"));
     }
 
     #[test]
