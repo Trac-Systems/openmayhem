@@ -5,3 +5,4 @@ catalog/*.json text eol=lf
 catalog/**/*.json text eol=lf
 catalog/**/*.sig text eol=lf
 crates/mayhem-cli/resources/python/*.txt text eol=lf
+crates/mayhem-cli/resources/python/*.py text eol=lf
