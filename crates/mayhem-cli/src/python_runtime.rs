@@ -51,7 +51,8 @@ const SULPHUR_MLX_WHEELS: &[EmbeddedPythonWheel] = &[
         source_sha256: "8c3961053f43461efae12b80480343873bece9d78b745537b88036acfa4d6873",
     },
 ];
-const ACE_STEP_UV_VERSION: &str = "0.11.29";
+const MANAGED_UV_VERSION: &str = "0.11.29";
+const MANAGED_PYTHON_VERSION: &str = "3.12";
 const ACE_STEP_LOCK_SHA256: &str =
     "0a9c8067b3299bfc6881a06e097ff95e55e1b7bb8f9d1f84192ac23e59b995ab";
 const ACE_STEP_SUPPLEMENTAL_REQUIREMENTS: &[u8] = b"av==18.0.0\n";
@@ -187,19 +188,47 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
                 .with_context(|| format!("removing incomplete managed venv {}", venv.display()))?;
         }
 
-        let base_python = resolve_base_python()?;
-        let create = Command::new(&base_python)
-            .arg("-m")
+        let uv = ensure_managed_uv(home)?;
+        let python_install_dir = home.join("python");
+        let uv_cache = cache_root.join("uv");
+        fs::create_dir_all(&python_install_dir).with_context(|| {
+            format!(
+                "creating managed Python install directory {}",
+                python_install_dir.display()
+            )
+        })?;
+        fs::create_dir_all(&uv_cache)
+            .with_context(|| format!("creating uv cache directory {}", uv_cache.display()))?;
+        let create = Command::new(&uv)
             .arg("venv")
+            .arg("--python")
+            .arg(MANAGED_PYTHON_VERSION)
             .arg(&venv)
+            .env("UV_PYTHON_INSTALL_DIR", &python_install_dir)
+            .env("UV_CACHE_DIR", &uv_cache)
+            .env("UV_NO_PROGRESS", "1")
             .output()
-            .with_context(|| format!("starting {} -m venv", base_python.display()))?;
+            .with_context(|| {
+                format!(
+                    "starting {} venv for managed {} Python {}",
+                    uv.display(),
+                    spec.backend,
+                    MANAGED_PYTHON_VERSION
+                )
+            })?;
         if !create.status.success() {
+            let detail = command_output_detail(&create);
             let _ = fs::remove_dir_all(&venv);
             bail!(
-                "creating the managed {} venv failed with {}; install the OS Python venv package and retry",
+                "creating the managed {} Python {} venv failed with {}{}",
                 spec.backend,
-                create.status
+                MANAGED_PYTHON_VERSION,
+                create.status,
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
             );
         }
 
@@ -213,13 +242,12 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
             )
         })?;
         let managed_python = venv_python(&venv);
-        let mut install_command = Command::new(&managed_python);
+        let mut install_command = Command::new(&uv);
         install_command
-            .arg("-m")
             .arg("pip")
             .arg("install")
-            .arg("--disable-pip-version-check")
-            .arg("--no-input");
+            .arg("--python")
+            .arg(&managed_python);
         for extra_index_url in spec.extra_index_urls {
             install_command
                 .arg("--extra-index-url")
@@ -228,12 +256,12 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
         let install = install_command
             .arg("--requirement")
             .arg(&requirements_path)
-            .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-            .env("PIP_NO_INPUT", "1")
+            .env("UV_CACHE_DIR", &uv_cache)
+            .env("UV_NO_PROGRESS", "1")
             .output()
             .with_context(|| {
                 format!(
-                    "starting pip for managed {} runtime {}",
+                    "starting uv pip for managed {} runtime {}",
                     spec.backend,
                     managed_python.display()
                 )
@@ -356,7 +384,7 @@ fn ensure_ace_step_python(home: &Path) -> Result<PythonRuntime> {
             .arg("--no-dev")
             .arg("--no-install-project")
             .arg("--python")
-            .arg("3.12")
+            .arg(MANAGED_PYTHON_VERSION)
             .arg("--project")
             .arg(install_project.path())
             .env("UV_PROJECT_ENVIRONMENT", &venv)
@@ -524,7 +552,7 @@ fn ensure_managed_uv(home: &Path) -> Result<PathBuf> {
     let tools = home.join("tools");
     fs::create_dir_all(&tools)
         .with_context(|| format!("creating managed tools directory {}", tools.display()))?;
-    let venv = tools.join(format!("uv-{ACE_STEP_UV_VERSION}"));
+    let venv = tools.join(format!("uv-{MANAGED_UV_VERSION}"));
     let uv = venv_executable(&venv, if cfg!(windows) { "uv.exe" } else { "uv" });
     if validate_uv(&uv).is_ok() {
         return Ok(uv);
@@ -561,7 +589,7 @@ fn ensure_managed_uv(home: &Path) -> Result<PathBuf> {
         .arg("install")
         .arg("--disable-pip-version-check")
         .arg("--no-input")
-        .arg(format!("uv=={ACE_STEP_UV_VERSION}"))
+        .arg(format!("uv=={MANAGED_UV_VERSION}"))
         .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
         .env("PIP_NO_INPUT", "1")
         .output()
@@ -571,7 +599,7 @@ fn ensure_managed_uv(home: &Path) -> Result<PathBuf> {
         let _ = fs::remove_dir_all(&venv);
         bail!(
             "installing uv=={} failed with {}{}",
-            ACE_STEP_UV_VERSION,
+            MANAGED_UV_VERSION,
             install.status,
             if detail.is_empty() {
                 String::new()
@@ -598,7 +626,7 @@ fn validate_uv(uv: &Path) -> Result<()> {
             "{} is {}, expected uv {}",
             uv.display(),
             version.trim(),
-            ACE_STEP_UV_VERSION
+            MANAGED_UV_VERSION
         );
     }
     Ok(())
@@ -606,7 +634,7 @@ fn validate_uv(uv: &Path) -> Result<()> {
 
 fn uv_version_output_matches(output: &str) -> bool {
     let mut fields = output.split_whitespace();
-    fields.next() == Some("uv") && fields.next() == Some(ACE_STEP_UV_VERSION)
+    fields.next() == Some("uv") && fields.next() == Some(MANAGED_UV_VERSION)
 }
 
 fn validate_ace_step_python(python: &Path, source_root: &Path, cache_root: &Path) -> Result<()> {
