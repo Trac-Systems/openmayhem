@@ -861,7 +861,8 @@ html.js-ready .playground-interactive{min-height:clamp(520px,64vh,720px)}
 .pg-controls-toggle-copy{min-height:0;flex:1;display:flex;align-items:center;writing-mode:vertical-rl;transform:rotate(180deg);gap:.45rem}.pg-controls-toggle-copy strong{font-size:.7rem}.pg-controls-toggle-copy small{max-width:15rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--pg-dim);font-size:.58rem;font-weight:500}.pg-controls-chevron{transition:transform .22s var(--pg-ease)}.pg-controls.is-open .pg-controls-chevron{transform:rotate(180deg)}
 .pg-controls-body{min-width:0;flex:1;display:flex;flex-direction:column;border-left:1px solid var(--pg-line-soft)}.pg-controls-head{min-height:4.75rem;padding:.8rem 1rem;border-bottom:1px solid var(--pg-line-soft);display:flex;align-items:center;justify-content:space-between;gap:.8rem;background:rgba(255,255,255,.012)}.pg-controls-heading{min-width:0;display:flex;flex-direction:column;gap:.2rem}.pg-controls-heading>strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--pg-snow);font-size:.78rem;letter-spacing:-.01em}.pg-controls-heading>span{min-width:0;color:var(--pg-dim);display:flex;align-items:center;gap:.4rem;font-size:.58rem}.pg-controls-heading>span>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.pg-controls-heading i{width:.35rem;height:.35rem;flex:none;border-radius:50%;background:var(--pg-live);box-shadow:0 0 0 3px rgba(88,214,168,.08)}.pg-controls-head-actions{display:flex;gap:.4rem}.pg-controls-head button{min-height:2.45rem;padding:0 .65rem;border:1px solid var(--pg-line);border-radius:.55rem;background:rgba(13,14,17,.55);color:var(--pg-fog);display:inline-flex;align-items:center;justify-content:center;gap:.35rem;font-size:.61rem;font-weight:650}.pg-controls-head button svg{width:.9rem;height:.9rem}.pg-controls-head button:hover{border-color:rgba(229,231,235,.24);background:rgba(229,231,235,.035);color:var(--pg-snow)}.pg-controls-head [data-playground-controls-close]{display:none;width:2.45rem;padding:0}
 .pg-controls-scroll{min-height:0;flex:1;padding:1rem;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}.pg-context-card{padding:.78rem .82rem;border:1px solid rgba(229,231,235,.09);border-radius:.7rem;background:linear-gradient(145deg,rgba(13,14,17,.92),rgba(18,20,25,.82));display:grid;grid-template-columns:1fr auto;gap:.18rem .7rem;box-shadow:inset 0 1px 0 rgba(255,255,255,.025)}.pg-context-card span,.pg-context-card small{color:var(--pg-dim);font-size:.58rem}.pg-context-card strong{color:var(--pg-snow);font-size:.72rem;font-variant-numeric:tabular-nums}.pg-context-card small{grid-column:1/-1}
-.pg-control-group{margin-top:.95rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.85rem .8rem}.pg-control-field{min-width:0;display:flex;flex-direction:column;gap:.38rem}.pg-control-field.span-all,.pg-control-group .span-all{grid-column:1/-1}.pg-control-field>span{color:var(--pg-fog);display:flex;align-items:baseline;justify-content:space-between;gap:.45rem;font-size:.66rem;font-weight:680}.pg-control-field em,.pg-control-field small{color:var(--pg-dim);font-size:.58rem;line-height:1.42;font-style:normal;font-weight:500}.pg-control-field input,.pg-control-field select,.pg-control-field textarea{width:100%;min-height:2.65rem;padding:.58rem .68rem;border:1px solid rgba(229,231,235,.13);border-radius:.58rem;outline:0;background:rgba(13,14,17,.82);color:var(--pg-snow);font-size:.72rem;box-shadow:inset 0 1px 0 rgba(255,255,255,.02);transition:border-color .18s ease,box-shadow .18s ease,background .18s ease}.pg-control-field textarea{resize:vertical;line-height:1.5}.pg-control-field input:hover,.pg-control-field select:hover,.pg-control-field textarea:hover{border-color:rgba(229,231,235,.2)}.pg-control-field input:focus,.pg-control-field select:focus,.pg-control-field textarea:focus{border-color:rgba(214,120,102,.62);background:rgba(17,18,22,.96);box-shadow:0 0 0 3px rgba(197,68,89,.11)}.pg-control-field input:invalid{border-color:var(--app-danger)}
+.pg-control-group{margin-top:.95rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.85rem .8rem}.pg-control-field{min-width:0;display:flex;flex-direction:column;gap:.38rem}.pg-control-field.span-all,.pg-control-group .span-all{grid-column:1/-1}.pg-control-field>span{color:var(--pg-fog);display:flex;align-items:baseline;justify-content:space-between;gap:.45rem;font-size:.66rem;font-weight:680}.pg-control-field em,.pg-control-field small{color:var(--pg-dim);font-size:.58rem;line-height:1.42;font-style:normal;font-weight:500}.pg-control-field input,.pg-control-field select,.pg-control-field textarea{width:100%;min-height:2.65rem;padding:.58rem .68rem;border:1px solid rgba(229,231,235,.13);border-radius:.58rem;outline:0;background:rgba(13,14,17,.82);color:var(--pg-snow);font-size:.72rem;box-shadow:inset 0 1px 0 rgba(255,255,255,.02);transition:border-color .18s ease,box-shadow .18s ease,background .18s ease}.pg-control-field textarea{resize:vertical;line-height:1.5}.pg-control-field input:hover,.pg-control-field select:hover,.pg-control-field textarea:hover{border-color:rgba(229,231,235,.2)}.pg-control-field input:focus,.pg-control-field select:focus,.pg-control-field textarea:focus{border-color:rgba(214,120,102,.62);background:rgba(17,18,22,.96);box-shadow:0 0 0 3px rgba(197,68,89,.11)}.pg-control-field input:invalid,.pg-control-field select:invalid,.pg-control-field textarea:invalid{border-color:var(--app-danger)}
+.pg-settings-note{margin:.7rem 0 0;padding:.62rem .7rem;border:1px solid rgba(240,179,92,.22);border-radius:.58rem;background:rgba(240,179,92,.06);color:#e7c48d;font-size:.61rem;line-height:1.45}.pg-control-availability.is-available{color:var(--pg-live)}.pg-control-availability.is-unavailable{color:#e7a98f}.pg-control-availability.is-stale{color:#e7c48d}
 .pg-control-empty{grid-column:1/-1;margin:0!important;padding:.75rem;border:1px dashed var(--pg-line);border-radius:.55rem;color:var(--pg-dim);font-size:.62rem;line-height:1.45}
 .pg-control-slider{display:grid;grid-template-columns:minmax(0,1fr) 4.7rem;gap:.55rem;align-items:center}.pg-control-slider input[type="range"]{min-height:2rem;padding:0;border:0;background:transparent;box-shadow:none;accent-color:var(--app-accent-strong)}.pg-control-slider input[type="number"]{text-align:right;font-variant-numeric:tabular-nums}
 .pg-control-disclosure{margin-top:.9rem;border-top:1px solid var(--pg-line-soft)}.pg-control-disclosure>summary{min-height:3.5rem;padding:0 .35rem;color:var(--pg-fog);display:flex;align-items:center;justify-content:space-between;gap:.8rem;border-radius:.5rem;cursor:pointer;list-style:none;transition:background .18s ease,color .18s ease}.pg-control-disclosure>summary:hover{background:rgba(229,231,235,.025);color:var(--pg-snow)}.pg-control-disclosure>summary::-webkit-details-marker{display:none}.pg-control-disclosure>summary>span{display:flex;flex-direction:column;gap:.08rem}.pg-control-disclosure>summary strong{font-size:.68rem}.pg-control-disclosure>summary small{color:var(--pg-dim);font-size:.57rem;font-weight:500}.pg-control-disclosure>summary svg{color:var(--pg-dim);transition:transform .2s var(--pg-ease)}.pg-control-disclosure[open]>summary svg{transform:rotate(180deg)}.pg-control-disclosure-body{padding:.08rem .35rem .9rem;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.8rem}.pg-control-disclosure-body>.span-all,.pg-control-group-advanced{grid-column:1/-1}.pg-control-group-advanced{margin-top:0}.pg-control-disclosure .preflight{padding:.72rem;border:1px solid var(--pg-line-soft);border-radius:.6rem;background:rgba(13,14,17,.42)}.pg-controls-reset-all{width:100%;min-height:2.65rem;margin-top:.35rem;padding:0 .8rem;justify-content:center;border:1px solid var(--pg-line);border-radius:.55rem;background:rgba(229,231,235,.018);color:var(--pg-fog)}.pg-controls-reset-all:hover{border-color:rgba(229,231,235,.22);background:rgba(229,231,235,.04);color:var(--pg-snow)}
@@ -1232,6 +1233,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
   const playgroundParameterProfilesKey = 'mayhem.dashboard.playgroundParameters.v1';
   const playgroundControlsOpenKey = 'mayhem.dashboard.playgroundControlsOpen';
   const localProductEventsKey = 'mayhem.dashboard.localProductEvents.v1';
+  let playgroundSettingsResetNotice = { model: '', text: '' };
 
   root.classList.toggle('amounts-hidden', storage.get(preferenceKeys.amounts) === '1');
   root.classList.toggle('motion-reduced', storage.get(preferenceKeys.motion) === '1');
@@ -1315,7 +1317,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       aspectRatio: safeQuery('[data-playground-aspect-ratio][aria-pressed="true"]')?.dataset.playgroundAspectRatio || '1:1',
       voice: safeQuery('[data-playground-voice]:checked')?.value || 'af_heart',
       system: safeQuery('[data-playground-system]')?.value || '',
-      maxTokens: safeQuery('[data-playground-max-tokens]')?.value || '512',
+      maxTokens: safeQuery('[data-playground-max-tokens]')?.value || '',
       maxPrice: safeQuery('[data-playground-max-price]')?.value || '',
       maxPriceMode: selectedPlaygroundPriceMode(),
       minAttTier: safeQuery('[data-playground-min-att-tier]')?.value || ''
@@ -1343,9 +1345,9 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         const schema = JSON.parse(option?.dataset.parameterSchema || '{}');
         return schema && typeof schema === 'object'
           ? { ...schema, controls: Array.isArray(schema.controls) ? schema.controls : [] }
-          : { version: 1, controls: [] };
+          : { version: 2, controls: [] };
       } catch (_) {
-        return { version: 1, controls: [] };
+        return { version: 2, controls: [] };
       }
     };
 
@@ -1354,14 +1356,84 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         const parsed = JSON.parse(storage.get(playgroundParameterProfilesKey) || '{}');
         return parsed && typeof parsed === 'object' && parsed.models && typeof parsed.models === 'object'
           ? parsed
-          : { version: 1, models: {} };
+          : { version: 2, models: {} };
       } catch (_) {
-        return { version: 1, models: {} };
+        return { version: 2, models: {} };
       }
     };
 
     const playgroundParameterDefault = (control) =>
       control?.default === null || control?.default === undefined ? '' : String(control.default);
+
+    const playgroundOutputLimitControl = (schema = selectedPlaygroundParameterSchema()) =>
+      schema.controls.find((control) => control.key === 'max_tokens') || null;
+
+    const nextPlaygroundOutputLimit = (current) => {
+      const control = playgroundOutputLimitControl();
+      const value = Number(current);
+      if (!control || !Number.isFinite(value)) return null;
+      const minimum = Number.isFinite(Number(control.minimum)) ? Number(control.minimum) : 0;
+      const maximum = Number.isFinite(Number(control.maximum)) ? Number(control.maximum) : Number.MAX_SAFE_INTEGER;
+      const multipleOf = Number.isFinite(Number(control.multipleOf)) && Number(control.multipleOf) > 0
+        ? Number(control.multipleOf)
+        : 1;
+      const expanded = value > 0 ? value * 2 : Math.max(minimum, multipleOf);
+      const aligned = Math.ceil(Math.max(minimum, expanded) / multipleOf) * multipleOf;
+      return Math.min(maximum, aligned);
+    };
+
+    const playgroundParameterOption = (control, value) =>
+      Array.isArray(control?.options)
+        ? control.options.find((option) => String(option.value ?? '') === String(value ?? ''))
+        : null;
+
+    const playgroundParameterValueMatchesContract = (control, rawValue) => {
+      const raw = String(rawValue ?? '').trim();
+      if (control.kind === 'lines') {
+        const values = raw.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+        return values.length <= 4 && values.every((value) => Array.from(value).length <= 1024);
+      }
+      if (control.kind === 'select') return Boolean(playgroundParameterOption(control, raw));
+      if (!raw) return control.key !== 'max_tokens';
+      const value = Number(raw);
+      const minimum = control.minimum === null || control.minimum === undefined ? Number.NaN : Number(control.minimum);
+      const maximum = control.maximum === null || control.maximum === undefined ? Number.NaN : Number(control.maximum);
+      const multipleOf = control.multipleOf === null || control.multipleOf === undefined ? Number.NaN : Number(control.multipleOf);
+      if (!Number.isFinite(value) || (control.kind === 'integer' && !Number.isInteger(value))) return false;
+      if (Number.isFinite(minimum) && value < minimum) return false;
+      if (Number.isFinite(maximum) && value > maximum) return false;
+      if (Number.isFinite(multipleOf) && multipleOf > 0) {
+        const quotient = value / multipleOf;
+        if (Math.abs(quotient - Math.round(quotient)) > Number.EPSILON * Math.max(1, Math.abs(quotient)) * 16) return false;
+      }
+      return true;
+    };
+
+    const playgroundAvailabilityIsFresh = () =>
+      safeQuery('[data-page-status-freshness]')?.dataset.freshnessExpired !== 'true';
+
+    const updatePlaygroundParameterAvailability = (control, input, option) => {
+      const status = safeQuery('[data-playground-parameter-status]', input.closest('.pg-control-field'));
+      if (!status) return;
+      status.hidden = true;
+      status.classList.remove('is-available', 'is-unavailable', 'is-stale');
+      if (!control.speciality || !option || typeof option.available !== 'boolean') return;
+      const liveProviders = Number(option.liveProviderCount || 0);
+      const canonicalProviders = Number(option.canonicalProviderCount || 0);
+      status.hidden = false;
+      if (!playgroundAvailabilityIsFresh()) {
+        status.classList.add('is-stale');
+        status.textContent = 'Provider availability expired in this tab. Refresh to reconfirm.';
+      } else if (option.available) {
+        status.classList.add('is-available');
+        status.textContent = `Available now from ${liveProviders.toLocaleString()} live ${liveProviders === 1 ? 'provider' : 'providers'}.`;
+      } else {
+        status.classList.add('is-unavailable');
+        status.textContent = canonicalProviders
+          ? 'Supported by the model, but unavailable from live providers right now. The gateway will recheck when you send.'
+          : 'No catalog provider currently advertises this mode. The gateway will recheck when you send.';
+      }
+    };
 
     const playgroundParameterValues = (validate = false) => {
       const schema = selectedPlaygroundParameterSchema();
@@ -1375,11 +1447,12 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         if (control.kind === 'lines') {
           const values = raw.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
           if (values.length > 4) input.setCustomValidity('Enter no more than four stop sequences.');
-          else if (values.some((value) => value.length > 256)) input.setCustomValidity('Keep each stop sequence at 256 characters or fewer.');
+          else if (values.some((value) => Array.from(value).length > 1024)) input.setCustomValidity('Keep each stop sequence at 1,024 characters or fewer.');
           else if (values.length) parameters[control.key] = values;
         } else if (control.kind === 'select') {
-          const allowed = Array.isArray(control.options) ? control.options.map((option) => String(option.value)) : [];
-          if (raw && !allowed.includes(raw)) input.setCustomValidity('Choose a supported value.');
+          const option = playgroundParameterOption(control, raw);
+          updatePlaygroundParameterAvailability(control, input, option);
+          if (!option) input.setCustomValidity('Choose a supported value.');
           else if (raw) parameters[control.key] = raw;
         } else {
           if (!raw && control.key === 'max_tokens') input.setCustomValidity('Choose an output limit.');
@@ -1391,6 +1464,12 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
             else if (control.kind === 'integer' && !Number.isInteger(value)) input.setCustomValidity('Enter a whole number.');
             else if (Number.isFinite(minimum) && value < minimum) input.setCustomValidity(`Choose ${minimum} or higher.`);
             else if (Number.isFinite(maximum) && value > maximum) input.setCustomValidity(`Choose ${maximum} or lower.`);
+            else if (Number.isFinite(Number(control.multipleOf)) && Number(control.multipleOf) > 0) {
+              const quotient = value / Number(control.multipleOf);
+              if (Math.abs(quotient - Math.round(quotient)) > Number.EPSILON * Math.max(1, Math.abs(quotient)) * 16) {
+                input.setCustomValidity(`Choose a multiple of ${control.multipleOf}.`);
+              } else parameters[control.key] = value;
+            }
             else parameters[control.key] = value;
           }
         }
@@ -1407,15 +1486,16 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
     };
 
     const updatePlaygroundParameterState = () => {
-      const { parameters, schema } = playgroundParameterValues(false);
+      const { valid, parameters, schema } = playgroundParameterValues(false);
       const changed = schema.controls.reduce((count, control) => {
         const current = parameters[control.key];
         const expected = control.default;
         if (current === undefined && (expected === undefined || expected === null)) return count;
+        if (current === undefined && control.defaultSource === 'model') return count;
         return String(current ?? '') === String(expected ?? '') ? count : count + 1;
       }, 0);
       const state = safeQuery('[data-playground-controls-state]');
-      if (state) state.textContent = changed ? `${changed} customized` : 'Model defaults';
+      if (state) state.textContent = valid ? (changed ? `${changed} customized` : 'Defaults') : 'Review settings';
     };
 
     const savePlaygroundParameterProfile = () => {
@@ -1426,7 +1506,12 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         values[input.dataset.playgroundParameter] = input.value;
       });
       const profiles = readPlaygroundParameterProfiles();
-      profiles.models[model] = { values, updatedAt: Date.now() };
+      profiles.version = 2;
+      profiles.models[model] = {
+        schemaVersion: selectedPlaygroundParameterSchema().version || 2,
+        values,
+        updatedAt: Date.now()
+      };
       storage.set(playgroundParameterProfilesKey, JSON.stringify(profiles));
       updatePlaygroundParameterState();
     };
@@ -1440,6 +1525,21 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       }
     };
 
+    const playgroundParameterDefaultSummary = (control) => {
+      let value = control.default;
+      if (control.modelDefault) {
+        value = playgroundParameterOption(control, control.modelDefault)?.label || control.modelDefault;
+      }
+      if (value === null || value === undefined || value === '') return '';
+      const numeric = Number(value);
+      const display = typeof value === 'number' && Number.isFinite(numeric)
+        ? numeric.toLocaleString()
+        : String(value);
+      return control.defaultSource === 'playground'
+        ? `Playground default: ${display}`
+        : `Model default: ${display}`;
+    };
+
     const makePlaygroundParameterField = (control, value) => {
       const field = document.createElement('label');
       field.className = `pg-control-field${control.kind === 'lines' ? ' span-all' : ''}`;
@@ -1447,6 +1547,12 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       field.htmlFor = id;
       const title = document.createElement('span');
       title.textContent = control.label || control.key;
+      const defaultSummary = playgroundParameterDefaultSummary(control);
+      if (defaultSummary) {
+        const source = document.createElement('em');
+        source.textContent = defaultSummary;
+        title.append(source);
+      }
       field.append(title);
       let input;
       if (control.kind === 'select') {
@@ -1500,9 +1606,20 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       }
       if (control.help) {
         const help = document.createElement('small');
+        help.id = `${id}-help`;
         help.textContent = control.help;
         field.append(help);
+        input.setAttribute('aria-describedby', help.id);
       }
+      const status = document.createElement('small');
+      status.id = `${id}-status`;
+      status.dataset.playgroundParameterStatus = '';
+      status.className = 'pg-control-availability';
+      status.hidden = true;
+      field.append(status);
+      const describedBy = input.getAttribute('aria-describedby');
+      input.setAttribute('aria-describedby', [describedBy, status.id].filter(Boolean).join(' '));
+      updatePlaygroundParameterAvailability(control, input, playgroundParameterOption(control, input.value));
       return field;
     };
 
@@ -1517,10 +1634,14 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       if (!primary || !advanced) return;
       primary.replaceChildren();
       advanced.replaceChildren();
+      const controlKeys = new Set(schema.controls.map((control) => control.key));
+      let discarded = Object.keys(profile).filter((key) => !controlKeys.has(key)).length;
       for (const control of schema.controls) {
-        const value = Object.prototype.hasOwnProperty.call(profile, control.key)
-          ? String(profile[control.key])
-          : playgroundParameterDefault(control);
+        const hasSavedValue = Object.prototype.hasOwnProperty.call(profile, control.key);
+        const savedValue = hasSavedValue ? String(profile[control.key]) : '';
+        const savedValueIsValid = hasSavedValue && playgroundParameterValueMatchesContract(control, savedValue);
+        if (hasSavedValue && !savedValueIsValid) discarded += 1;
+        const value = savedValueIsValid ? savedValue : playgroundParameterDefault(control);
         const field = makePlaygroundParameterField(control, value);
         (control.section === 'advanced' ? advanced : primary).append(field);
       }
@@ -1536,6 +1657,28 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
       if (modelName) modelName.textContent = selected?.dataset.modelName || model.value;
       const context = safeQuery('[data-playground-context-value]');
       if (context) context.textContent = schema.contextLabel ? `${schema.contextLabel} tokens` : 'Not published';
+      const outputMaximum = safeQuery('[data-playground-output-maximum]');
+      const outputControl = playgroundOutputLimitControl(schema);
+      if (outputMaximum) {
+        const maximum = Number(outputControl?.maximum);
+        outputMaximum.textContent = Number.isFinite(maximum)
+          ? `${maximum.toLocaleString()} tokens`
+          : 'Not published';
+      }
+      const settingsNote = safeQuery('[data-playground-settings-note]');
+      if (settingsNote) {
+        if (discarded) {
+          playgroundSettingsResetNotice = {
+            model: model.value,
+            text: `${discarded} saved ${discarded === 1 ? 'setting no longer matches' : 'settings no longer match'} this model and ${discarded === 1 ? 'was' : 'were'} reset.`
+          };
+        } else if (playgroundSettingsResetNotice.model !== model.value) {
+          playgroundSettingsResetNotice = { model: '', text: '' };
+        }
+        settingsNote.hidden = !playgroundSettingsResetNotice.text;
+        settingsNote.textContent = playgroundSettingsResetNotice.text;
+      }
+      if (discarded) savePlaygroundParameterProfile();
       updatePlaygroundParameterState();
     };
 
@@ -2339,8 +2482,11 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         return null;
       }
       tier?.setCustomValidity('');
+      const outputControl = generation.schema.controls.find((control) => control.key === 'max_tokens');
+      const defaultOutputTokens = Number(outputControl?.default);
       return {
-        outputTokens: generation.parameters.max_tokens || 512,
+        outputTokens: generation.parameters.max_tokens
+          ?? (Number.isFinite(defaultOutputTokens) ? defaultOutputTokens : 0),
         generationParameters: generation.parameters,
         maxPriceAu,
         minAttTier,
@@ -2920,16 +3066,18 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         copy.append(copyLabel);
         resultActions.append(copy);
         if (outputLimitReached) {
-          const continuation = document.createElement('button');
-          const nextOutputLimit = Math.min(4096, Math.max(64, requestedMaxTokens * 2));
-          continuation.className = 'pg-text-action';
-          continuation.type = 'button';
-          continuation.dataset.playgroundContinue = '';
-          continuation.dataset.nextMaxTokens = String(nextOutputLimit);
-          continuation.textContent = nextOutputLimit > requestedMaxTokens
-            ? `Continue with ${nextOutputLimit.toLocaleString()}-token limit`
-            : 'Continue response';
-          resultActions.append(continuation);
+          const nextOutputLimit = nextPlaygroundOutputLimit(requestedMaxTokens);
+          if (nextOutputLimit !== null) {
+            const continuation = document.createElement('button');
+            continuation.className = 'pg-text-action';
+            continuation.type = 'button';
+            continuation.dataset.playgroundContinue = '';
+            continuation.dataset.nextMaxTokens = String(nextOutputLimit);
+            continuation.textContent = nextOutputLimit > requestedMaxTokens
+              ? `Continue with ${nextOutputLimit.toLocaleString()}-token limit`
+              : 'Continue response';
+            resultActions.append(continuation);
+          }
         }
         if (reportedSessionId) {
           const receipt = document.createElement('a');
@@ -3217,7 +3365,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         resetPlaygroundParameterProfile();
         syncPlaygroundParameterRail();
         savePlaygroundDraft();
-        announce('Generation settings reset to this model\'s defaults.', false, false);
+        announce('Generation settings reset to their defaults.', false, false);
         return;
       }
       if (!event.target.closest('[data-playground-model-picker]')) closePlaygroundModelPicker(false);
@@ -3521,7 +3669,6 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         const imagePrompt = safeQuery('[data-playground-image-prompt]');
         const speechText = safeQuery('[data-playground-speech-text]');
         const system = safeQuery('[data-playground-system]');
-        const output = safeQuery('[data-playground-max-tokens]');
         const price = safeQuery('[data-playground-max-price]');
         const tier = safeQuery('[data-playground-min-att-tier]');
         if (model) {
@@ -3534,7 +3681,6 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         if (imagePrompt) imagePrompt.value = '';
         if (speechText) speechText.value = '';
         if (system) system.value = '';
-        if (output) output.value = '512';
         if (price) price.value = '';
         if (tier) tier.value = '';
         document.querySelectorAll('[data-playground-aspect-ratio]').forEach((button) => {
@@ -3567,10 +3713,16 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         const prompt = safeQuery('[data-playground-prompt]');
         const output = safeQuery('[data-playground-max-tokens]');
         const nextOutput = Number.parseInt(continuation.dataset.nextMaxTokens || '', 10);
-        if (output && Number.isInteger(nextOutput) && nextOutput >= 64 && nextOutput <= 4096) {
+        const outputControl = playgroundOutputLimitControl();
+        if (output && Number.isInteger(nextOutput) && outputControl
+          && playgroundParameterValueMatchesContract(outputControl, String(nextOutput))) {
           output.value = String(nextOutput);
           setPlaygroundControlsOpen(true);
           savePlaygroundParameterProfile();
+        } else {
+          announce('The selected model does not support that continuation limit. Review its output setting.', true);
+          setPlaygroundControlsOpen(true);
+          return;
         }
         if (prompt) {
           prompt.value = 'Continue from where you stopped.';
@@ -3905,7 +4057,8 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
 
       const pageMarker = safeQuery('[data-page-status-freshness][data-expires-at-ms]');
       const pageExpiresAt = Number.parseInt(pageMarker?.dataset.expiresAtMs || '', 10);
-      if (pageMarker && Number.isFinite(pageExpiresAt) && now > pageExpiresAt) {
+      if (pageMarker && pageMarker.dataset.freshnessExpired !== 'true'
+        && Number.isFinite(pageExpiresAt) && now > pageExpiresAt) {
         pageMarker.dataset.freshnessExpired = 'true';
         const statusText = safeQuery('[data-page-status-text]');
         const indicator = safeQuery('.topbar-status .state-indicator');
@@ -3927,6 +4080,7 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
           playgroundAvailability.textContent = 'Refresh to reconfirm';
           playgroundAvailability.dataset.volatileExpired = 'true';
         }
+        updatePlaygroundParameterState();
       }
     };
 
@@ -3982,9 +4136,12 @@ pub(super) const DASHBOARD_APP_JS: &str = r##"
         }
       }
       if (playgroundSystem && typeof savedDraft.system === 'string') playgroundSystem.value = savedDraft.system;
-      if (playgroundMaxTokens && /^\d+$/.test(String(savedDraft.maxTokens || ''))) {
+      if (playgroundMaxTokens && /^\d+$/.test(String(savedDraft.maxTokens ?? ''))) {
         const savedOutput = Number.parseInt(String(savedDraft.maxTokens), 10);
-        if (savedOutput >= 64 && savedOutput <= 4096) playgroundMaxTokens.value = String(savedOutput);
+        const outputControl = playgroundOutputLimitControl();
+        if (outputControl && playgroundParameterValueMatchesContract(outputControl, String(savedOutput))) {
+          playgroundMaxTokens.value = String(savedOutput);
+        }
       }
       const restoredPriceMode = selectedPlaygroundPriceMode();
       const savedPriceMode = savedDraft.maxPriceMode === 'fixed' ? 'fixed' : 'rate';

@@ -472,8 +472,25 @@ try {
   check(await fixedOption.count() > 0, 'Playground price controls', 'offers a fixed-only fixture model');
   await choosePlaygroundModel(await rateOption.getAttribute('value'));
   const rateSchema = JSON.parse((await playgroundModel.locator('option:checked').getAttribute('data-parameter-schema')) || '{}');
+  const rateOutputControl = rateSchema.controls.find((control) => control.key === 'max_tokens');
+  check(Number(rateOutputControl?.maximum) > 4096, 'Playground output limit', 'publishes the selected model\'s full signed output boundary above the former UI cap');
+  const localizedOutputMaximum = await page.evaluate((value) => Number(value).toLocaleString(), rateOutputControl.maximum);
+  equal(
+    await page.locator('[data-playground-output-maximum]').innerText(),
+    `${localizedOutputMaximum} tokens`,
+    'Playground output limit',
+    'shows the exact model-derived maximum beside the shared context limit',
+  );
   const renderedParameters = await page.locator('[data-playground-parameter]').evaluateAll((inputs) => inputs.map((input) => input.dataset.playgroundParameter));
   equal(JSON.stringify(renderedParameters.sort()), JSON.stringify(rateSchema.controls.map((control) => control.key).sort()), 'Playground generation settings', 'renders exactly the settings published by the selected model contract');
+  const primaryParameters = rateSchema.controls.filter((control) => control.section === 'primary').map((control) => control.key);
+  check(primaryParameters.length <= 3 && primaryParameters.every((key) => ['max_tokens', 'thinking_mode', 'temperature'].includes(key)), 'Playground generation settings', 'keeps the visible settings focused on output, thinking, and temperature');
+  check(!renderedParameters.includes('repeat_penalty'), 'Playground generation settings', 'does not expose the server-controlled repeat penalty as an editable setting');
+  const thinkingControl = rateSchema.controls.find((control) => control.key === 'thinking_mode');
+  if (thinkingControl) {
+    equal(String(thinkingControl.options[0]?.value ?? ''), '', 'Playground thinking control', 'offers the signed model default without forcing a provider-local default');
+    check(String(thinkingControl.options[0]?.label || '').startsWith('Model default'), 'Playground thinking control', 'names the effective model-default choice clearly');
+  }
   const rateTemperature = page.locator('[data-playground-parameter="temperature"]');
   const rateTopP = page.locator('[data-playground-parameter="top_p"]');
   await rateTemperature.fill('0.4');
@@ -499,6 +516,16 @@ try {
   await page.reload({ waitUntil: 'domcontentloaded' });
   equal(await playgroundModel.inputValue(), rateModelValue, 'Playground generation settings', 'restores the selected model after refresh');
   equal(await rateTemperature.inputValue(), '0.4', 'Playground generation settings', 'restores the model profile after refresh');
+  await page.evaluate(({ model, invalidOutput }) => {
+    const key = 'mayhem.dashboard.playgroundParameters.v1';
+    const profiles = JSON.parse(localStorage.getItem(key) || '{"version":2,"models":{}}');
+    profiles.models[model].values.max_tokens = invalidOutput;
+    localStorage.setItem(key, JSON.stringify(profiles));
+  }, { model: rateModelValue, invalidOutput: String(Number(rateOutputControl.maximum) + 1) });
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  equal(await playgroundModel.inputValue(), rateModelValue, 'Playground generation settings', 'keeps the selected model while revalidating its saved profile');
+  equal(await playgroundOutput.inputValue(), String(rateOutputControl.default), 'Playground generation settings', 'resets only a saved value that no longer matches the model contract');
+  check(await page.locator('[data-playground-settings-note]').isVisible(), 'Playground generation settings', 'explains when an incompatible saved setting was reset');
   equal(await playgroundControlsToggle.getAttribute('aria-expanded'), 'true', 'Playground generation settings', 'restores the desktop rail state');
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(240);
@@ -525,12 +552,25 @@ try {
   }), 'Playground generation settings', 'gives routing evidence the full disclosure width');
   equal(await page.locator('[data-playground-price-unit]').innerText(), '$ / 1M-unit basket', 'Playground price controls', 'names the composite rate basis');
   await playgroundPrice.fill('0.50');
+  const largeOutputLimit = Math.min(100000, Number(rateOutputControl.maximum));
+  await playgroundOutput.fill(String(largeOutputLimit));
+  let selectedThinkingMode = '';
+  if (thinkingControl) {
+    selectedThinkingMode = String(thinkingControl.options.find((option) => option.value === 'enabled')?.value
+      || thinkingControl.options.find((option) => option.value)?.value
+      || '');
+    if (selectedThinkingMode) {
+      await page.locator('[data-playground-parameter="thinking_mode"]').selectOption(selectedThinkingMode);
+    }
+  }
   await playgroundPrompt.fill('Verify the rate-price request control.');
   const rateRequestPromise = page.waitForRequest((request) => request.url().endsWith('/v1/chat/completions') && request.method() === 'POST');
   await playgroundSend.click();
   const rateRequest = await rateRequestPromise;
   const rateRequestBody = rateRequest.postDataJSON();
   equal(rateRequestBody.temperature, 0.4, 'Playground generation settings', 'sends the selected temperature to the chat endpoint');
+  equal(rateRequestBody.max_tokens, largeOutputLimit, 'Playground output limit', 'submits a contract-valid output limit above the former UI cap without clamping it');
+  if (selectedThinkingMode) equal(rateRequestBody.thinking_mode, selectedThinkingMode, 'Playground thinking control', 'sends the user\'s exact thinking choice without silently changing it');
   if (await rateTopP.count()) equal(rateRequestBody.top_p, 0.8, 'Playground generation settings', 'sends advanced sampling settings to the chat endpoint');
   equal(rateRequest.headers()['x-mayhem-max-price-au'], '500000000000000', 'Playground price controls', 'converts $0.50 per 1M-unit basket to the gateway rate basis');
   // Wait on the result COUNT: a `.last()` wait would match the previous
@@ -575,7 +615,9 @@ try {
   await page.locator('[data-playground-reset-draft]').click();
   equal(await playgroundPrompt.inputValue(), '', 'Playground draft reset', 'clears the tab-scoped message draft');
   equal(await page.locator('[data-playground-system]').inputValue(), '', 'Playground draft reset', 'clears saved system instructions');
-  equal(await playgroundOutput.inputValue(), '512', 'Playground draft reset', 'restores the output limit default');
+  const resetSchema = JSON.parse((await playgroundModel.locator('option:checked').getAttribute('data-parameter-schema')) || '{}');
+  const resetOutputDefault = resetSchema.controls.find((control) => control.key === 'max_tokens')?.default;
+  equal(await playgroundOutput.inputValue(), String(resetOutputDefault), 'Playground draft reset', 'restores the selected model\'s published Playground default');
   equal(await playgroundPrice.inputValue(), '', 'Playground draft reset', 'clears the saved price ceiling');
   equal(await page.evaluate(() => sessionStorage.getItem('mayhem.dashboard.playgroundDraft')), null, 'Playground draft reset', 'removes the tab-scoped saved record');
   equal(await page.evaluate(() => localStorage.getItem('mayhem.dashboard.playgroundParameters.v1')), null, 'Playground draft reset', 'removes saved per-model generation profiles');
