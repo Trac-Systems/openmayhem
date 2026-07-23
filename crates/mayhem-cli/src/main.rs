@@ -45120,6 +45120,11 @@ impl ProviderProtectionConfig {
         })
     }
 
+    fn limit_to_execution_capacity(mut self, execution_capacity: u32) -> Self {
+        self.max_sessions = self.max_sessions.min(execution_capacity.max(1));
+        self
+    }
+
     #[cfg(test)]
     fn unlimited_for_tests(max_sessions: u32) -> Self {
         Self {
@@ -46022,6 +46027,10 @@ enum ProviderSessionDecision {
 
 trait ProviderSessionResponder {
     fn mode(&self) -> &'static str;
+    /// Independently dispatchable requests, not the engine's theoretical batch capacity.
+    fn concurrent_session_capacity(&self) -> u32 {
+        1
+    }
     fn component_healthy(&mut self) -> bool {
         true
     }
@@ -60360,7 +60369,10 @@ async fn serve_provider_sessions(
     mut responder: Box<dyn ProviderSessionResponder>,
 ) -> Result<()> {
     let terms = provider_session_terms(&ctx)?;
-    let protection_config = ProviderProtectionConfig::from_provider_args(ctx.args, ctx.selected)?;
+    let configured_protection =
+        ProviderProtectionConfig::from_provider_args(ctx.args, ctx.selected)?;
+    let protection_config =
+        configured_protection.limit_to_execution_capacity(responder.concurrent_session_capacity());
     let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
         ctx.args.home.as_ref(),
         ctx.args.sc_bridge_url.as_deref(),
@@ -60427,7 +60439,7 @@ async fn serve_provider_sessions(
     provider_log(
         ctx.args,
             &format!(
-            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {} at startup price v{} {} ctx_bracket {} table v{} min_ask ${} max_sessions {}",
+            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {} at startup price v{} {} ctx_bracket {} table v{} min_ask ${} max_sessions {}{}",
             sc_bridge_url,
             terms.enclave_id,
             ctx.rooms.len(),
@@ -60437,7 +60449,15 @@ async fn serve_provider_sessions(
             terms.ctx_bracket.as_deref().unwrap_or("base"),
             terms.ctx_bracket_table_ver.unwrap_or(0),
             au_to_usd_amount(terms.min_ask_au),
-            protection_config.max_sessions
+            protection_config.max_sessions,
+            if protection_config.max_sessions < configured_protection.max_sessions {
+                format!(
+                    " (configured {}, limited by responder execution capacity)",
+                    configured_protection.max_sessions
+                )
+            } else {
+                String::new()
+            }
         ),
     );
 
@@ -87494,6 +87514,38 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             provider_session_measured_throughput(&embedding, Duration::from_secs(2), None),
             Some(500.0)
         );
+    }
+
+    #[test]
+    fn provider_execution_capacity_limits_admission_and_heartbeat_slots() {
+        let responder = DeterministicProviderSessionResponder;
+        let config = ProviderProtectionConfig::unlimited_for_tests(8)
+            .limit_to_execution_capacity(responder.concurrent_session_capacity());
+        assert_eq!(config.max_sessions, 1);
+
+        let mut protection = ProviderProtectionState::new(config);
+        assert_eq!(
+            protection.acceptance_decision(0),
+            ProviderSessionDecision::Accept
+        );
+        assert!(matches!(
+            protection.acceptance_decision(1),
+            ProviderSessionDecision::Reject {
+                code: "CAPACITY",
+                ..
+            }
+        ));
+
+        let load = ProviderHeartbeatLoad::default();
+        assert_eq!(load.snapshot(config.max_sessions).free_slots, 1);
+        load.set_active_sessions(1);
+        let busy = load.snapshot(config.max_sessions);
+        assert_eq!(busy.free_slots, 0);
+        assert!(!busy.accepting_new);
+        load.set_active_sessions(0);
+        let idle = load.snapshot(config.max_sessions);
+        assert_eq!(idle.free_slots, 1);
+        assert!(idle.accepting_new);
     }
 
     #[test]
