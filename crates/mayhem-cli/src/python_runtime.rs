@@ -1243,11 +1243,7 @@ fn validate_python(python: &Path, spec: &PythonRuntimeSpec, cache_root: &Path) -
     }
     let expected_versions = serde_json::to_string(&expected_pairs)?;
     let required_imports = serde_json::to_string(spec.required_imports)?;
-    let embedded_module = serde_json::to_string(
-        &spec
-            .embedded_module
-            .map(|module| (module.name, module.source_sha256)),
-    )?;
+    let embedded_module = python_embedded_module_literal(spec)?;
     const VERSION_MARKER: &str = "__MAYHEM_RUNTIME_VERSION__=";
     let script = format!(
         "import hashlib,importlib,importlib.metadata as m,pathlib; expected=dict({expected_versions}); mismatched=[f'{{name}}={{m.version(name)}} (expected {{version}})' for name,version in expected.items() if not (m.version(name) == version or ('+' not in version and m.version(name).partition('+')[0] == version))]; assert not mismatched, '; '.join(mismatched); modules={{name:importlib.import_module(name) for name in {required_imports}}}; embedded={embedded_module}; embedded_ok=embedded is None or (pathlib.Path(modules[embedded[0]].__file__).is_file() and hashlib.sha256(pathlib.Path(modules[embedded[0]].__file__).read_bytes()).hexdigest()==embedded[1]); assert embedded_ok, 'embedded runtime module checksum mismatch'; print({:?} + m.version({:?}))",
@@ -1296,6 +1292,13 @@ fn validate_python(python: &Path, spec: &PythonRuntimeSpec, cache_root: &Path) -
         );
     }
     Ok(())
+}
+
+fn python_embedded_module_literal(spec: &PythonRuntimeSpec) -> Result<String> {
+    match spec.embedded_module {
+        Some(module) => Ok(serde_json::to_string(&(module.name, module.source_sha256))?),
+        None => Ok("None".to_owned()),
+    }
 }
 
 fn python_distribution_version_matches(actual: &str, expected: &str) -> bool {
@@ -1691,6 +1694,17 @@ mod tests {
             "2.9.1+cu130"
         ));
         assert!(!python_distribution_version_matches("2.9.1+", "2.9.1"));
+    }
+
+    #[test]
+    fn managed_runtime_validation_uses_python_none_without_an_embedded_module() {
+        let vllm = python_runtime_spec("vllm").expect("vLLM runtime");
+        assert_eq!(python_embedded_module_literal(&vllm).unwrap(), "None");
+
+        let sulphur = python_runtime_spec("sulphur").expect("Sulphur runtime");
+        let literal = python_embedded_module_literal(&sulphur).unwrap();
+        assert!(literal.starts_with("[\"mayhem_sulphur_runtime\","));
+        assert!(!literal.contains("null"));
     }
 
     #[test]
