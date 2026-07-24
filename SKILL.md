@@ -52,14 +52,14 @@ gateway is loopback-only; a public ledger records prices, receipts, settlements.
 ## 3. Install
 
 ### 3.1 Get the code — exact source release (MANDATORY rule)
-- `v0.2.42` is source-only. Never invent or offer a native archive URL: the release has no unsigned
+- `v0.2.44` is source-only. Never invent or offer a native archive URL: the release has no unsigned
   OpenMayhem executable assets. Clone the exact release tag and build it locally.
 
   **macOS/Linux:**
   ```bash
   git clone https://github.com/Trac-Systems/openmayhem.git
   cd openmayhem
-  git checkout --detach v0.2.42
+  git checkout --detach v0.2.44
   ./install.sh --from-source
   ```
 
@@ -67,7 +67,7 @@ gateway is loopback-only; a public ledger records prices, receipts, settlements.
   ```powershell
   git clone https://github.com/Trac-Systems/openmayhem.git
   Set-Location openmayhem
-  git checkout --detach v0.2.42
+  git checkout --detach v0.2.44
   .\install.ps1 -FromSource
   ```
 On updated source checkouts, `mayhem up` verifies and, when needed, deterministically repairs only
@@ -265,6 +265,10 @@ its managed runtime only. The exact model/artifact/enclave fit is decided by the
 | `tongyi/z-image-turbo` | `stable-diffusion.cpp` | `gguf-q4_k` + text encoder + VAE | Linux/Windows/macOS CPU fallback; CUDA, Metal, ROCm, or Vulkan selected from hwprobe when the matching `sd-cli`/`sd-server` build is installed | 16 GiB RAM, 8 GiB VRAM for full offload; no catalog CPU-flag floor | `/v1/images/generations`, `/hf-inference/models/<model-id>` |
 | `nvidia/parakeet-tdt-0.6b-v3` | `transformers-asr` | `safetensors` + processor/tokenizer | Linux, Windows, or macOS CPU; CUDA on Linux/Windows; Metal/MPS on macOS | 8 GiB RAM, 4 GiB VRAM for full offload, AVX2 or NEON | `/v1/audio/transcriptions`, `/hf-inference/models/<model-id>` |
 | `acestep/ace-step-1.5` | `ace-step` | `safetensors` composite | Linux x86_64/ARM64, Windows x86_64, or macOS x86_64/ARM64 CPU; CUDA on Linux/Windows; Metal/MPS on Apple Silicon | 16 GiB RAM, 20 GiB VRAM for full offload, AVX2 or NEON | `/v1/music/generations`, `/v1/audio/generations`, `/hf-inference/models/<model-id>` |
+| `prism-ml/Ternary-Bonsai-27B` | `llama.cpp` or `mlx` | `gguf-q2_0` or `mlx-2bit`, each with its signed vision projector | GGUF on Linux/Windows/macOS with CPU or a compiled accelerator; MLX on Apple Silicon | 16 GiB RAM, 8 GiB VRAM for full offload, AVX2 or NEON | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/hf-inference/models/<model-id>` |
+| `SulphurAI/Sulphur-2-base` | `sulphur` | `gguf-q4_k_m` CUDA composition or `mlx-q4` composition, with all signed A/V sidecars | CUDA on Linux/Windows; Metal/MPS on Apple Silicon | 64 GiB RAM; one generation in flight | `/v1/videos`, `/hf-inference/models/<model-id>` |
+| `ResembleAI/chatterbox` | `chatterbox` | original-English PyTorch safetensors plus four mandatory signed sidecars | Linux/Windows/macOS CPU; CUDA on Linux/Windows; Metal/MPS on Apple Silicon | 8 GiB RAM, 6 GiB VRAM for full offload | `/v1/audio/speech`, `/hf-inference/models/<model-id>` |
+| `huihui-ai/Huihui-Agents-A1-abliterated` | `llama.cpp` | `gguf-q4_k` + mandatory BF16 vision projector | Linux/Windows/macOS CPU; CUDA, Metal, or Vulkan when the installed build has that feature | 32 GiB RAM, 32 GiB VRAM for full offload, AVX2 or NEON | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/hf-inference/models/<model-id>` |
 
 For every published model, the managed sequence is:
 ```
@@ -394,14 +398,12 @@ serve, `heartbeat.live=true`, `gateway.ok=true`, `gateway.route_count>0`, and th
   Let Mayhem repair/recreate its exact pinned managed runtime on retry; do not `pip install`, clone
   NeMo, or substitute weights.
 
-**ACE-Step 1.5: calibrated and signed locally, not ledger-live yet**
-- **Authority/status:** `acestep/ace-step-1.5` is present in the signed five-model local catalog.
+**ACE-Step 1.5**
+- **Authority/status:** `acestep/ace-step-1.5` is live in the signed catalog with T1/T2 markets.
   The exact artifact and endpoint surface passed Windows CUDA, Linux CUDA, and Apple M5 Max MPS
-  calibration. Ledger publication, T1/T2 market creation, and the first paid provider proof are
-  still pending. Do not present it as live or run a provider until `mayhem models --gateway` shows
-  the admin-published model and active market.
-- **Future managed start:** after publication only, run `mayhem doctor --provider-backend ace-step`,
-  then `mayhem up --provider --provider-enclave acestep/ace-step-1.5 --yes`.
+  calibration.
+- **Install/start:** run `mayhem doctor --provider-backend ace-step`, then
+  `mayhem up --provider --provider-enclave acestep/ace-step-1.5 --yes`.
 - **Artifact shape:** admin mirror
   `TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT@f41443d7171a03181ada08912780b0449e8ff7fe`;
   SFT DiT `model.safetensors` is 4,787,825,604 bytes plus exactly 25 signed sidecars: measured DiT
@@ -421,13 +423,50 @@ serve, `heartbeat.live=true`, `gateway.ok=true`, `gateway.route_count>0`, and th
   `30..300`, key/time signature, ODE/SDE, Euler/Heun, cover/repaint controls, and
   `flac|opus|aac|wav|wav32|mp3`. The simpler audio/HF endpoints expose prompt, duration
   `10..600`, guidance, seed, and their narrower signed response shape.
-- **Evidence/pending publication:** `canary-music-launch-v1`, `audio_fingerprint`,
+- **Evidence:** `canary-music-launch-v1`, `audio_fingerprint`,
   `match_min=0.9`, `tolerance_bps=1500` (signed floor 8500), using
   `ace-step-text2music-seed7`. Windows/Linux similarity is 9918 bps; two fresh M5 MPS runs are
   byte-identical and score 8730 against Linux; unrelated audio scores 1666. All three endpoint
   families and 1,208 cases pass. Until ledger publication, the correct outcome is an absent gateway
-  model or no active admin-created priced enclave. Stop there; never clone ACE-Step, manually install
-  its runtime, publish local output, or substitute any component.
+  model or no active admin-created priced enclave. Never clone ACE-Step, manually install its
+  runtime, publish local output, or substitute any component.
+
+**Chatterbox original-English TTS**
+- **Install/start:** `mayhem doctor --provider-backend chatterbox`, then
+  `mayhem up --provider --provider-enclave ResembleAI/chatterbox --yes`.
+- **Artifact:** admin mirror
+  `TracNetwork/mayhem-catalog-ResembleAI-chatterbox-PyTorch@0adbad4d3515285bdcdc3d503759e7110e664201`;
+  the primary 2,129,653,744-byte model and exact `ve.safetensors`, `s3gen.safetensors`,
+  `tokenizer.json`, and `conds.pt` sidecars are mandatory. Do not substitute the multilingual or
+  turbo checkpoints.
+- **Compute:** 8 GiB RAM; 6 GiB is the full-offload target. The managed backend selects CUDA,
+  Apple MPS, or CPU from the actual host and keeps one synthesis in flight.
+- **Endpoints/controls:** OpenAI `/v1/audio/speech` and HF text-to-speech. OpenAI requires
+  `model`, `input`, and `voice`; use `voice: "default"` for the model voice. Zero-shot cloning
+  passes a bounded base64 WAV as `reference_audio: {"data":"...","encoding":"base64",
+  "content_type":"audio/wav"}`. Supported controls are `exaggeration`, `cfg_weight`,
+  `temperature`, `min_p`, `top_p`, `repetition_penalty`, and `seed`. Voice cloning replaces the
+  need for a built-in voice library; never invent a catalog voice name.
+- **Evidence:** `canary-chatterbox-launch-v1`, `audio_fingerprint`, M5/MPS and Windows/CUDA
+  endpoint matrices, ordinary TTS, and zero-shot clone proofs.
+
+**Huihui Agents A1 abliterated**
+- **Install/start:** `mayhem doctor --provider-backend llama.cpp`, then
+  `mayhem up --provider --provider-enclave huihui-ai/Huihui-Agents-A1-abliterated --yes`.
+- **Artifact:** admin mirror
+  `TracNetwork/mayhem-catalog-huihui-ai-Huihui-Agents-A1-abliterated-GGUF@59d0dfbbdb07138fb53fc8672cd04261efa3065e`;
+  `Agents-A1-abliterated-Q4_K.gguf` is 21,166,757,536 bytes and the exact mandatory
+  `mmproj-model-bf16.gguf` is 902,821,824 bytes.
+- **Compute:** 32 GiB RAM and AVX2 or NEON; 32 GiB VRAM is the full-offload target. llama.cpp
+  may run CPU-only or use an accelerator compiled into this Mayhem build.
+- **Endpoints/controls:** text output with text, image, and video input; 262,144-token context;
+  OpenAI chat/completions/responses and HF multimodal chat; JSON; automatic, required, and
+  parallel tool calls. Defaults are temperature `0.85`, top-p `0.95`, top-k `20`, min-p `0`,
+  repeat penalty `1`, and presence penalty `1.1`. `thinking_mode` supports exactly `enabled`
+  and `disabled`.
+- **Evidence:** `canary-a1-launch-v1`, cross-platform token fingerprints from M5 Metal and
+  Linux CUDA, all 604 endpoint rows per platform, image/video understanding, and two tool calls
+  retained in one turn.
 
 For any model, preserve and relay the exact `mayhem up` rejection bullets. In particular,
 `ledger artifact binding does not match signed catalog artifact`, `no local-compatible artifact`,
@@ -480,8 +519,8 @@ forwarded as-is.
 
 | Goal | Command |
 |---|---|
-| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.42 && ./install.sh --from-source` |
-| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.42; .\install.ps1 -FromSource` |
+| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.44 && ./install.sh --from-source` |
+| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.44; .\install.ps1 -FromSource` |
 | Start user gateway | `mayhem up --rail <fiat\|tap\|tnk> --yes` |
 | Start provider | `mayhem up --provider --yes` |
 | Stop and leave provider registrations | `mayhem down` |

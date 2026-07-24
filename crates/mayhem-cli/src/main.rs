@@ -985,6 +985,8 @@ enum CatalogCommands {
     ArtifactPublishPlan(CatalogArtifactPublishPlanArgs),
     /// Run catalog canaries against a local admin artifact and print catalog-ready fingerprints.
     CalibrateCanary(CatalogCalibrateCanaryArgs),
+    /// Merge independently validated cross-platform token canary reports.
+    MergeCanaryReports(CatalogMergeCanaryReportsArgs),
     /// Verify calibration report files cover the catalog canary matrix.
     CanaryEvidence(CatalogCanaryEvidenceArgs),
     /// Apply bound calibration report fingerprints into a catalog draft.
@@ -3466,6 +3468,33 @@ struct CatalogCanaryEvidenceArgs {
     include_dev: bool,
 
     /// Print a machine-readable evidence coverage report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct CatalogMergeCanaryReportsArgs {
+    /// Path to catalog/models.json. Defaults to the repo catalog.
+    #[arg(long, value_name = "PATH")]
+    catalog_path: Option<PathBuf>,
+
+    /// Directory containing canary set JSON files.
+    #[arg(long, value_name = "PATH")]
+    canaries_dir: Option<PathBuf>,
+
+    /// Cross-platform calibration report produced by `mayhem catalog calibrate-canary`.
+    #[arg(long = "report", value_name = "PATH", required = true)]
+    reports: Vec<PathBuf>,
+
+    /// Write the merged calibration report to this path.
+    #[arg(long, value_name = "PATH")]
+    output: PathBuf,
+
+    /// Include dev-tier models in addition to launch-tier models.
+    #[arg(long)]
+    include_dev: bool,
+
+    /// Print a machine-readable merge report.
     #[arg(long)]
     json: bool,
 }
@@ -6343,6 +6372,7 @@ async fn mayhem_main() -> Result<()> {
             CatalogCommands::ArtifactStagePlan(args) => catalog_artifact_stage_plan(args),
             CatalogCommands::ArtifactPublishPlan(args) => catalog_artifact_publish_plan(args),
             CatalogCommands::CalibrateCanary(args) => catalog_calibrate_canary(args),
+            CatalogCommands::MergeCanaryReports(args) => catalog_merge_canary_reports(args),
             CatalogCommands::CanaryEvidence(args) => catalog_canary_evidence(args),
             CatalogCommands::ApplyCanaryReports(args) => catalog_apply_canary_reports(args),
             CatalogCommands::CanaryMatrix(args) => catalog_canary_matrix(args),
@@ -15141,6 +15171,7 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
             endpoint_calibration,
             existing_catalog_fingerprint: existing,
             matches_existing_catalog: matches_existing,
+            merged_source_report_sha256: Vec::new(),
             prompts: reports,
         }
     };
@@ -15658,7 +15689,7 @@ fn speciality_canary_prompt_ids(
         .map(|descriptor| {
             Ok((
                 descriptor.name.clone(),
-                speciality_canary_prompts(model, prompts, descriptor)?
+                speciality_canary_candidate_prompts(model, prompts, descriptor)?
                     .into_iter()
                     .map(|prompt| prompt.id.clone())
                     .collect(),
@@ -15668,6 +15699,39 @@ fn speciality_canary_prompt_ids(
 }
 
 fn speciality_canary_prompts<'a>(
+    model: &catalog::CatalogModel,
+    prompts: &'a [CanaryPrompt],
+    descriptor: &mayhem_proto::ModelSpecialityDescriptor,
+) -> Result<Vec<&'a CanaryPrompt>> {
+    let candidates = speciality_canary_candidate_prompts(model, prompts, descriptor)?;
+    let required_modalities = descriptor
+        .calibration_modalities
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let sampled = candidates
+        .iter()
+        .copied()
+        .filter(|prompt| {
+            prompt
+                .temperature
+                .or(model.sampling.temperature)
+                .is_some_and(|temperature| temperature > 0.0)
+        })
+        .collect::<Vec<_>>();
+    let sampled_covers_required = required_modalities.iter().all(|modality| {
+        sampled
+            .iter()
+            .any(|prompt| provider_canary_prompt_modalities(model, prompt).contains(*modality))
+    });
+    if sampled.is_empty() || !sampled_covers_required {
+        Ok(candidates)
+    } else {
+        Ok(sampled)
+    }
+}
+
+fn speciality_canary_candidate_prompts<'a>(
     model: &catalog::CatalogModel,
     prompts: &'a [CanaryPrompt],
     descriptor: &mayhem_proto::ModelSpecialityDescriptor,
@@ -15706,26 +15770,7 @@ fn speciality_canary_prompts<'a>(
         model.model_id,
         descriptor.name
     );
-    let sampled = candidates
-        .iter()
-        .copied()
-        .filter(|prompt| {
-            prompt
-                .temperature
-                .or(model.sampling.temperature)
-                .is_some_and(|temperature| temperature > 0.0)
-        })
-        .collect::<Vec<_>>();
-    let sampled_covers_required = required_modalities.iter().all(|modality| {
-        sampled
-            .iter()
-            .any(|prompt| provider_canary_prompt_modalities(model, prompt).contains(*modality))
-    });
-    if sampled.is_empty() || !sampled_covers_required {
-        Ok(candidates)
-    } else {
-        Ok(sampled)
-    }
+    Ok(candidates)
 }
 
 fn warm_token_canary_probes(
@@ -16197,7 +16242,10 @@ fn catalog_endpoint_calibration_report(
                 .map_err(|error| format!("{error:#}"))
         },
         |contract, _case, request| {
-            let cache_key = (contract.family.clone(), stable_value_hash(request));
+            let cache_key = (
+                contract.family.clone(),
+                mayhem_proto::endpoint_request_fingerprint(request),
+            );
             if let Some(execution) = execution_cache.get(&cache_key) {
                 return Ok(execution.clone());
             }
@@ -17173,6 +17221,7 @@ fn calibration_endpoint_attribute_is_handled(
                 | "seed"
                 | "tools"
                 | "tool_choice"
+                | "parallel_tool_calls"
                 | "response_format"
         ),
         mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS => {
@@ -18801,6 +18850,586 @@ fn catalog_canary_evidence(args: CatalogCanaryEvidenceArgs) -> Result<()> {
     Ok(())
 }
 
+fn catalog_merge_canary_reports(args: CatalogMergeCanaryReportsArgs) -> Result<()> {
+    ensure!(
+        args.reports.len() >= 2,
+        "cross-platform canary merge requires at least two --report values"
+    );
+    let catalog_path = args
+        .catalog_path
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = absolutize(catalog_path)?;
+    let canaries_dir = args
+        .canaries_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path("catalog/canaries"))?;
+    let canaries_dir = absolutize(canaries_dir)?;
+    let output = absolutize(args.output.clone())?;
+    let report_paths = args
+        .reports
+        .iter()
+        .map(|path| absolutize(path.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        !report_paths.iter().any(|path| path == &output),
+        "merged report output must differ from every source report"
+    );
+    ensure!(
+        !output.exists(),
+        "refusing to overwrite existing merged report {}",
+        output.display()
+    );
+
+    let catalog_doc = catalog::load_document(&catalog_path)?;
+    let mut source_reports = Vec::with_capacity(report_paths.len());
+    let mut source_sha256 = Vec::with_capacity(report_paths.len());
+    for path in &report_paths {
+        let report_bytes = fs::read(path)
+            .with_context(|| format!("reading calibration report {}", path.display()))?;
+        let report_sha256 = sha256_bytes_hex(&report_bytes);
+        let report: CatalogCanaryCalibrationReport = serde_json::from_slice(&report_bytes)
+            .with_context(|| format!("parsing calibration report {}", path.display()))?;
+        ensure!(
+            report.merged_source_report_sha256.is_empty(),
+            "source calibration report {} is already a merged report",
+            path.display()
+        );
+        let evidence = catalog_canary_evidence_report(
+            &catalog_doc,
+            catalog_path.clone(),
+            canaries_dir.clone(),
+            !args.include_dev,
+            std::slice::from_ref(path),
+            CatalogCanaryReportMode::ApplyToCatalog,
+        );
+        ensure!(
+            evidence.ok,
+            "source calibration report {} failed independent validation: {}",
+            path.display(),
+            evidence.errors.join("; ")
+        );
+        ensure!(
+            file_sha256_hex(path)? == report_sha256,
+            "source calibration report {} changed while it was being validated",
+            path.display()
+        );
+        source_sha256.push(report_sha256);
+        source_reports.push(report);
+    }
+
+    let first = source_reports
+        .first()
+        .context("cross-platform canary reports disappeared during merge")?;
+    let model = catalog_doc
+        .models
+        .iter()
+        .find(|model| model.model_id == first.model_id)
+        .with_context(|| format!("model {} is absent from the catalog", first.model_id))?;
+    let canary_prompts =
+        load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, true)?;
+    let mut merged =
+        merge_token_canary_calibration_reports(model, &canary_prompts, source_reports)?;
+    merged.merged_source_report_sha256 = source_sha256.clone();
+    write_json_file(&output, &serde_json::to_value(&merged)?)?;
+
+    let merged_evidence = catalog_canary_evidence_report(
+        &catalog_doc,
+        catalog_path.clone(),
+        canaries_dir.clone(),
+        !args.include_dev,
+        std::slice::from_ref(&output),
+        CatalogCanaryReportMode::ApplyToCatalog,
+    );
+    if !merged_evidence.ok {
+        let _ = fs::remove_file(&output);
+        bail!(
+            "merged calibration report failed validation and was removed: {}",
+            merged_evidence.errors.join("; ")
+        );
+    }
+
+    let (stable_tokens, per_prompt) = stable_token_count(&merged.prompts);
+    let speciality_level_count = merged
+        .speciality_calibrations
+        .values()
+        .map(BTreeMap::len)
+        .sum::<usize>();
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "ok": true,
+                "catalog_path": catalog_path,
+                "canaries_dir": canaries_dir,
+                "output_path": output,
+                "model_id": merged.model_id,
+                "artifact": merged.artifact,
+                "engine": merged.engine,
+                "source_report_count": report_paths.len(),
+                "source_report_sha256": source_sha256,
+                "prompt_count": merged.prompt_count,
+                "stable_token_count": stable_tokens,
+                "stable_tokens_by_prompt": per_prompt,
+                "speciality_level_count": speciality_level_count,
+            }))?
+        );
+    } else {
+        println!("Cross-platform canary reports merged.");
+        println!("Model: {}", merged.model_id);
+        println!("Artifact: {} ({})", merged.artifact, merged.engine);
+        println!("Sources: {}", report_paths.len());
+        println!("Stable token positions: {stable_tokens} ({per_prompt})");
+        println!("Speciality levels: {speciality_level_count}");
+        println!("Output: {}", output.display());
+    }
+    Ok(())
+}
+
+fn merge_token_canary_calibration_reports(
+    model: &catalog::CatalogModel,
+    canary_prompts: &[CanaryPrompt],
+    reports: Vec<CatalogCanaryCalibrationReport>,
+) -> Result<CatalogCanaryCalibrationReport> {
+    ensure!(
+        reports.len() >= 2,
+        "cross-platform canary merge requires at least two reports"
+    );
+    let mut merged = reports[0].clone();
+    ensure!(
+        merged.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT,
+        "cross-platform report merge currently supports token_fingerprint evidence only"
+    );
+    ensure!(
+        merged.model_id == model.model_id,
+        "report model {} does not match catalog model {}",
+        merged.model_id,
+        model.model_id
+    );
+    ensure!(
+        merged.canary_set == model.canary.set_id,
+        "report canary set {} does not match catalog set {}",
+        merged.canary_set,
+        model.canary.set_id
+    );
+
+    for report in reports.iter().skip(1) {
+        ensure!(
+            report.model_id == merged.model_id
+                && report.artifact == merged.artifact
+                && report.engine == merged.engine,
+            "cross-platform reports must identify the same model, artifact, and engine"
+        );
+        ensure!(
+            report.verification_method == merged.verification_method,
+            "cross-platform reports use different verification methods"
+        );
+        ensure!(
+            report.artifact_binding == merged.artifact_binding,
+            "cross-platform reports bind different artifact roots or immutable sources"
+        );
+        ensure!(
+            report.canary_set == merged.canary_set
+                && report.canary_set_sha256 == merged.canary_set_sha256,
+            "cross-platform reports bind different canary sets"
+        );
+        ensure!(
+            report.runtime_config.ctx_size == merged.runtime_config.ctx_size
+                && report.runtime_config.seed == merged.runtime_config.seed,
+            "cross-platform reports must use the same context size and seed"
+        );
+        ensure!(
+            report.prompt_count == merged.prompt_count
+                && report.prompts.len() == merged.prompts.len(),
+            "cross-platform reports have different prompt coverage"
+        );
+        ensure!(
+            report.existing_catalog_fingerprint == merged.existing_catalog_fingerprint,
+            "cross-platform reports were calibrated against different catalog fingerprints"
+        );
+        ensure!(
+            report
+                .modality_fingerprints
+                .keys()
+                .eq(merged.modality_fingerprints.keys()),
+            "cross-platform reports have different modality coverage"
+        );
+        ensure!(
+            report
+                .speciality_calibrations
+                .keys()
+                .eq(merged.speciality_calibrations.keys()),
+            "cross-platform reports have different speciality coverage"
+        );
+    }
+
+    ensure!(
+        canary_prompts.len() == merged.prompts.len(),
+        "catalog canary prompt count does not match calibration reports"
+    );
+    for (index, target) in merged.prompts.iter_mut().enumerate() {
+        ensure!(
+            canary_prompts[index].id == target.prompt_id,
+            "report prompt order does not match canary set at {}",
+            target.prompt_id
+        );
+        let sources = reports
+            .iter()
+            .skip(1)
+            .map(|report| &report.prompts[index])
+            .collect::<Vec<_>>();
+        ensure!(
+            merge_cross_platform_token_prompt("base canary", target, &sources)?,
+            "base canary prompt {} has no stable token position shared by every platform",
+            target.prompt_id
+        );
+    }
+    ensure_launch_stable_token_count(model, "cross-platform base canary", &merged.prompts)?;
+
+    let speciality_names = merged
+        .speciality_calibrations
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for speciality_name in speciality_names {
+        let level_names = merged.speciality_calibrations[&speciality_name]
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for level_name in level_names {
+            let target = merged
+                .speciality_calibrations
+                .get_mut(&speciality_name)
+                .and_then(|levels| levels.get_mut(&level_name))
+                .expect("speciality keys came from merged report");
+            ensure!(
+                target.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT,
+                "speciality {speciality_name}/{level_name} is not token fingerprint evidence"
+            );
+            let source_levels = reports
+                .iter()
+                .map(|report| {
+                    report
+                        .speciality_calibrations
+                        .get(&speciality_name)
+                        .and_then(|levels| levels.get(&level_name))
+                        .with_context(|| {
+                            format!(
+                                "cross-platform report is missing speciality {speciality_name}/{level_name}"
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            ensure!(
+                source_levels.iter().all(|source| {
+                    source.verification_method == target.verification_method
+                        && source.prompts.len() == target.prompts.len()
+                }),
+                "cross-platform speciality {speciality_name}/{level_name} has incompatible evidence"
+            );
+            let mut retained = Vec::new();
+            for (index, mut prompt) in std::mem::take(&mut target.prompts).into_iter().enumerate() {
+                let sources = source_levels
+                    .iter()
+                    .skip(1)
+                    .map(|source| &source.prompts[index])
+                    .collect::<Vec<_>>();
+                if merge_cross_platform_token_prompt(
+                    &format!("speciality {speciality_name}/{level_name}"),
+                    &mut prompt,
+                    &sources,
+                )? {
+                    let canary_index = canary_prompts
+                        .iter()
+                        .position(|candidate| candidate.id == prompt.prompt_id)
+                        .with_context(|| {
+                            format!(
+                                "speciality {speciality_name}/{level_name} prompt {} is absent from the canary set",
+                                prompt.prompt_id
+                            )
+                        })?;
+                    let usage = source_levels
+                        .iter()
+                        .map(|source| {
+                            let source = &source.prompts[index];
+                            (
+                                u64::from(source.completion_tokens),
+                                u64::from(source.reasoning_tokens),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    retained.push((canary_index, prompt, usage));
+                }
+            }
+
+            let descriptor = model
+                .adapter
+                .specialities
+                .iter()
+                .find(|descriptor| descriptor.name == speciality_name)
+                .expect("speciality name came from the catalog model");
+            if retained
+                .iter()
+                .map(|(_, prompt, _)| prompt.token_prefix.len())
+                .sum::<usize>()
+                < MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS
+            {
+                for candidate in
+                    speciality_canary_candidate_prompts(model, canary_prompts, descriptor)?
+                {
+                    if candidate.specialities.get(&speciality_name) != Some(&level_name)
+                        || retained
+                            .iter()
+                            .any(|(_, prompt, _)| prompt.prompt_id == candidate.id)
+                    {
+                        continue;
+                    }
+                    let canary_index = canary_prompts
+                        .iter()
+                        .position(|prompt| prompt.id == candidate.id)
+                        .expect("candidate came from the canary prompt slice");
+                    let mut prompt = reports[0].prompts[canary_index].clone();
+                    let sources = reports
+                        .iter()
+                        .skip(1)
+                        .map(|report| &report.prompts[canary_index])
+                        .collect::<Vec<_>>();
+                    if merge_cross_platform_token_prompt(
+                        &format!("speciality {speciality_name}/{level_name}"),
+                        &mut prompt,
+                        &sources,
+                    )? {
+                        let usage = reports
+                            .iter()
+                            .map(|report| {
+                                let source = &report.prompts[canary_index];
+                                (
+                                    u64::from(source.completion_tokens),
+                                    u64::from(source.reasoning_tokens),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        retained.push((canary_index, prompt, usage));
+                    }
+                    if retained
+                        .iter()
+                        .map(|(_, prompt, _)| prompt.token_prefix.len())
+                        .sum::<usize>()
+                        >= MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS
+                    {
+                        break;
+                    }
+                }
+            }
+            retained.sort_by_key(|(canary_index, _, _)| *canary_index);
+            ensure_cross_platform_speciality_modalities_retained(
+                model,
+                descriptor,
+                canary_prompts,
+                &retained
+                    .iter()
+                    .map(|(canary_index, _, _)| *canary_index)
+                    .collect::<Vec<_>>(),
+                &level_name,
+            )?;
+            target.prompts = retained
+                .iter()
+                .map(|(_, prompt, _)| prompt.clone())
+                .collect();
+            ensure_launch_stable_token_count(
+                model,
+                &format!("cross-platform speciality {speciality_name}/{level_name}"),
+                &target.prompts,
+            )?;
+            let usage_totals = (0..reports.len())
+                .map(|platform| {
+                    retained.iter().fold((0u64, 0u64), |totals, (_, _, usage)| {
+                        (
+                            totals.0.saturating_add(usage[platform].0),
+                            totals.1.saturating_add(usage[platform].1),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            target.token_prefixes = calibration_token_prefixes(&target.prompts);
+            target.fingerprint = aggregate_canary_fingerprint_for_method(
+                &target.verification_method,
+                &target.prompts,
+            );
+            target.output_tokens_min = usage_totals
+                .iter()
+                .map(|(output, _)| *output)
+                .min()
+                .unwrap_or_default();
+            target.output_tokens_max = usage_totals
+                .iter()
+                .map(|(output, _)| *output)
+                .max()
+                .unwrap_or_default();
+            target.reasoning_tokens_min = usage_totals
+                .iter()
+                .map(|(_, reasoning)| *reasoning)
+                .min()
+                .unwrap_or_default();
+            target.reasoning_tokens_max = usage_totals
+                .iter()
+                .map(|(_, reasoning)| *reasoning)
+                .max()
+                .unwrap_or_default();
+        }
+        let levels = &merged.speciality_calibrations[&speciality_name];
+        ensure_cross_platform_speciality_levels_distinct(&speciality_name, levels)?;
+    }
+
+    merged.catalog_fingerprint =
+        aggregate_canary_fingerprint_for_method(&merged.verification_method, &merged.prompts);
+    merged.modality_fingerprints =
+        aggregate_calibrated_modality_fingerprints(model, canary_prompts, &merged.prompts)?;
+    merged.modality_resource_profiles = merge_cross_platform_resource_profiles(&reports)?;
+    merged.matches_existing_catalog = merged
+        .existing_catalog_fingerprint
+        .as_ref()
+        .map(|expected| expected == &merged.catalog_fingerprint);
+    Ok(merged)
+}
+
+fn ensure_cross_platform_speciality_modalities_retained(
+    model: &catalog::CatalogModel,
+    descriptor: &mayhem_proto::ModelSpecialityDescriptor,
+    canary_prompts: &[CanaryPrompt],
+    retained_indices: &[usize],
+    level_name: &str,
+) -> Result<()> {
+    for modality in &descriptor.calibration_modalities {
+        ensure!(
+            retained_indices.iter().any(|index| {
+                provider_canary_prompt_modalities(model, &canary_prompts[*index])
+                    .contains(modality.as_str())
+            }),
+            "cross-platform speciality {}/{} lost required {} modality evidence",
+            descriptor.name,
+            level_name,
+            modality
+        );
+    }
+    Ok(())
+}
+
+fn ensure_cross_platform_speciality_levels_distinct(
+    speciality_name: &str,
+    levels: &BTreeMap<String, CanarySpecialityCalibrationReport>,
+) -> Result<()> {
+    let levels = levels.iter().collect::<Vec<_>>();
+    for left_index in 0..levels.len() {
+        for right_index in (left_index + 1)..levels.len() {
+            let (left_name, left) = levels[left_index];
+            let (right_name, right) = levels[right_index];
+            let right_prompts = right
+                .prompts
+                .iter()
+                .map(|prompt| (prompt.prompt_id.as_str(), prompt))
+                .collect::<BTreeMap<_, _>>();
+            let mut shared_prompt_count = 0usize;
+            let mut behavior_differs = false;
+            for left_prompt in &left.prompts {
+                let Some(right_prompt) = right_prompts.get(left_prompt.prompt_id.as_str()) else {
+                    continue;
+                };
+                shared_prompt_count += 1;
+                behavior_differs |= left_prompt.fingerprint != right_prompt.fingerprint;
+            }
+            ensure!(
+                shared_prompt_count > 0,
+                "cross-platform speciality {speciality_name} levels {left_name}/{right_name} retain no common prompt"
+            );
+            ensure!(
+                behavior_differs,
+                "cross-platform speciality {speciality_name} levels {left_name}/{right_name} are not behaviorally distinguishable on their shared prompts"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn merge_cross_platform_token_prompt(
+    label: &str,
+    target: &mut CanaryCalibrationPromptReport,
+    sources: &[&CanaryCalibrationPromptReport],
+) -> Result<bool> {
+    let mut common = target.token_prefix.clone();
+    let mut reproducibility_runs = target.reproducibility_runs;
+    for source in sources {
+        ensure!(
+            source.prompt_id == target.prompt_id,
+            "{label} compared prompt {} with {}",
+            target.prompt_id,
+            source.prompt_id
+        );
+        ensure!(
+            source.max_tokens == target.max_tokens && source.prompt_tokens == target.prompt_tokens,
+            "{label} prompt {} used different request or tokenizer bounds",
+            target.prompt_id
+        );
+        let common_len = common
+            .iter()
+            .zip(&source.token_prefix)
+            .take_while(|(left, right)| left == right)
+            .count();
+        common.truncate(common_len);
+        reproducibility_runs = reproducibility_runs.min(source.reproducibility_runs);
+    }
+    if common.is_empty() {
+        return Ok(false);
+    }
+    target.token_prefix = common;
+    target.reproducibility_runs = reproducibility_runs;
+    target.fingerprint = canary_token_fingerprint(target.token_prefix.iter().copied());
+    Ok(true)
+}
+
+fn merge_cross_platform_resource_profiles(
+    reports: &[CatalogCanaryCalibrationReport],
+) -> Result<BTreeMap<String, catalog::CatalogModalityResourceProfile>> {
+    let mut merged = reports[0].modality_resource_profiles.clone();
+    for report in reports.iter().skip(1) {
+        ensure!(
+            report.modality_resource_profiles.keys().eq(merged.keys()),
+            "cross-platform reports have different modality resource profile coverage"
+        );
+    }
+    let modalities = merged.keys().cloned().collect::<Vec<_>>();
+    for modality in modalities {
+        let first = reports[0]
+            .modality_resource_profiles
+            .get(&modality)
+            .expect("resource modality came from first report");
+        let mut conservative = first;
+        for report in reports.iter().skip(1) {
+            let profile = &report.modality_resource_profiles[&modality];
+            ensure!(
+                profile.unit == first.unit
+                    && resource_measurement_probe(&profile.measurement_source)
+                        == resource_measurement_probe(&first.measurement_source)
+                    && profile.max_item_bytes == first.max_item_bytes
+                    && profile.max_item_units == first.max_item_units
+                    && profile.measured_item_bytes == first.measured_item_bytes
+                    && profile.measured_item_units == first.measured_item_units
+                    && profile.default_max_inflight_items == first.default_max_inflight_items
+                    && profile.default_max_items_per_request
+                        == first.default_max_items_per_request,
+                "cross-platform resource profiles for {modality} use incompatible units, probes, or request bounds"
+            );
+            if profile.measured_working_set_bytes > conservative.measured_working_set_bytes {
+                conservative = profile;
+            }
+        }
+        merged.insert(modality, conservative.clone());
+    }
+    Ok(merged)
+}
+
 fn catalog_apply_canary_reports(args: CatalogApplyCanaryReportsArgs) -> Result<()> {
     let catalog_path = args
         .catalog_path
@@ -19824,9 +20453,30 @@ fn validate_speciality_calibration_report(
                 .flatten()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
-            if observed_prompt_ids != expected_prompt_ids_ref {
+            let prompt_coverage_matches =
+                if model.canary.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT {
+                    !observed_prompt_ids.is_empty()
+                        && observed_prompt_ids
+                            .iter()
+                            .try_fold(0usize, |offset, observed| {
+                                expected_prompt_ids_ref[offset..]
+                                    .iter()
+                                    .position(|expected| expected == observed)
+                                    .map(|position| offset + position + 1)
+                            })
+                            .is_some()
+                        && observed_prompt_ids
+                            .iter()
+                            .copied()
+                            .collect::<BTreeSet<_>>()
+                            .len()
+                            == observed_prompt_ids.len()
+                } else {
+                    observed_prompt_ids == expected_prompt_ids_ref
+                };
+            if !prompt_coverage_matches {
                 errors.push(format!(
-                    "speciality calibration {}/{} prompt order or coverage does not match the canary set",
+                    "speciality calibration {}/{} prompt order or coverage is not a non-empty ordered subset of the canary set",
                     descriptor.name, level.name
                 ));
             }
@@ -36682,6 +37332,8 @@ struct CatalogCanaryCalibrationReport {
     endpoint_calibration: EndpointCalibrationReport,
     existing_catalog_fingerprint: Option<String>,
     matches_existing_catalog: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    merged_source_report_sha256: Vec<String>,
     prompts: Vec<CanaryCalibrationPromptReport>,
 }
 
@@ -96564,6 +97216,166 @@ State initialization...
     }
 
     #[test]
+    fn cross_platform_canary_merge_retains_only_the_shared_token_prefix() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), "test-canary", None, true).unwrap();
+        let common_len = MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS + 2;
+        let configure =
+            |report: &mut CatalogCanaryCalibrationReport, tokens: Vec<i32>, threads: i32| {
+                report.model_id = catalog.models[0].model_id.clone();
+                report.runtime_config.threads = Some(threads);
+                report.prompts[0].max_tokens = 64;
+                report.prompts[0].prompt_tokens = 4;
+                report.prompts[0].completion_tokens = u32::try_from(tokens.len()).unwrap();
+                report.prompts[0].token_count = tokens.len();
+                report.prompts[0].token_ids = tokens.clone();
+                report.prompts[0].token_prefix = tokens;
+                report.prompts[0].fingerprint =
+                    canary_token_fingerprint(report.prompts[0].token_prefix.iter().copied());
+                report.catalog_fingerprint = aggregate_canary_fingerprint(&report.prompts);
+            };
+        let mut metal = test_calibration_report("metal".to_owned(), None);
+        let mut cuda = test_calibration_report("cuda".to_owned(), None);
+        let mut metal_tokens = vec![7; common_len + 4];
+        metal_tokens[common_len] = 8;
+        let mut cuda_tokens = vec![7; common_len + 3];
+        cuda_tokens[common_len] = 9;
+        configure(&mut metal, metal_tokens, 12);
+        configure(&mut cuda, cuda_tokens, 16);
+
+        let merged = merge_token_canary_calibration_reports(
+            &catalog.models[0],
+            &prompts,
+            vec![metal.clone(), cuda.clone()],
+        )
+        .unwrap();
+
+        assert_eq!(merged.prompts[0].token_prefix, vec![7; common_len]);
+        assert_eq!(
+            merged.prompts[0].fingerprint,
+            canary_token_fingerprint(vec![7; common_len])
+        );
+        assert_eq!(
+            merged.catalog_fingerprint,
+            aggregate_canary_fingerprint(&merged.prompts)
+        );
+        assert_eq!(merged.runtime_config.threads, Some(12));
+
+        cuda.artifact_binding.artifact_root = "bb".repeat(32);
+        let error =
+            merge_token_canary_calibration_reports(&catalog.models[0], &prompts, vec![metal, cuda])
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("different artifact roots or immutable sources"));
+        let _ = fs::remove_dir_all(canaries_dir);
+    }
+
+    #[test]
+    fn cross_platform_speciality_distinction_requires_shared_prompt_behavior() {
+        let level = |entries: &[(&str, &str)]| {
+            let prompts = entries
+                .iter()
+                .map(|(prompt_id, fingerprint)| {
+                    test_calibration_prompt(prompt_id, (*fingerprint).to_owned())
+                })
+                .collect::<Vec<_>>();
+            CanarySpecialityCalibrationReport {
+                fingerprint: aggregate_canary_fingerprint(&prompts),
+                verification_method: CANARY_VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
+                token_prefixes: calibration_token_prefixes(&prompts),
+                output_tokens_min: 1,
+                output_tokens_max: 1,
+                reasoning_tokens_min: 0,
+                reasoning_tokens_max: 0,
+                prompts,
+            }
+        };
+
+        let disjoint = BTreeMap::from([
+            ("off".to_owned(), level(&[("off-only", &"aa".repeat(32))])),
+            ("on".to_owned(), level(&[("on-only", &"bb".repeat(32))])),
+        ]);
+        let error = ensure_cross_platform_speciality_levels_distinct("thinking_mode", &disjoint)
+            .unwrap_err();
+        assert!(error.to_string().contains("retain no common prompt"));
+
+        let identical = BTreeMap::from([
+            ("off".to_owned(), level(&[("shared", &"aa".repeat(32))])),
+            ("on".to_owned(), level(&[("shared", &"aa".repeat(32))])),
+        ]);
+        let error = ensure_cross_platform_speciality_levels_distinct("thinking_mode", &identical)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("not behaviorally distinguishable on their shared prompts"));
+
+        let distinct = BTreeMap::from([
+            ("off".to_owned(), level(&[("shared", &"aa".repeat(32))])),
+            ("on".to_owned(), level(&[("shared", &"bb".repeat(32))])),
+        ]);
+        ensure_cross_platform_speciality_levels_distinct("thinking_mode", &distinct).unwrap();
+    }
+
+    #[test]
+    fn cross_platform_speciality_merge_preserves_required_modalities() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        add_test_reasoning_speciality(&mut catalog.models[0]);
+        let model = &mut catalog.models[0];
+        model
+            .adapter
+            .modality_set
+            .extend(["image".to_owned(), "video".to_owned()]);
+        model.adapter.specialities[0].calibration_modalities =
+            vec!["image".to_owned(), "video".to_owned()];
+        let prompts = serde_json::from_value::<Vec<CanaryPrompt>>(json!([
+            {
+                "id": "text",
+                "messages": [{"role": "user", "content": "reason"}]
+            },
+            {
+                "id": "image",
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                    {"type": "text", "text": "describe"}
+                ]}]
+            },
+            {
+                "id": "video",
+                "messages": [{"role": "user", "content": [
+                    {"type": "video", "video": {"data": "AAAA", "num_frames": 1}},
+                    {"type": "text", "text": "describe"}
+                ]}]
+            }
+        ]))
+        .unwrap();
+        let descriptor = &model.adapter.specialities[0];
+
+        let error = ensure_cross_platform_speciality_modalities_retained(
+            model,
+            descriptor,
+            &prompts,
+            &[1],
+            "enabled",
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("lost required video modality evidence"));
+        ensure_cross_platform_speciality_modalities_retained(
+            model,
+            descriptor,
+            &prompts,
+            &[1, 2],
+            "enabled",
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn canary_evidence_rejects_cross_backend_fingerprint_swap() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
@@ -100319,6 +101131,7 @@ State initialization...
             modality_resource_profiles: BTreeMap::new(),
             speciality_calibrations: BTreeMap::new(),
             endpoint_calibration: test_endpoint_calibration_report(),
+            merged_source_report_sha256: Vec::new(),
             prompts: vec![prompt],
         }
     }

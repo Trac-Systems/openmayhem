@@ -76,7 +76,7 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.43` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.44` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -85,7 +85,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.43
+git checkout --detach v0.2.44
 ./install.sh --from-source
 ```
 
@@ -94,7 +94,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.43
+git checkout --detach v0.2.44
 .\install.ps1 -FromSource
 ```
 
@@ -738,6 +738,8 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
+| `huihui-ai/Huihui-Agents-A1-abliterated` | Multimodal LLM, vision/video input, tools, uncensored, 262K ctx | C | calibrated; publishing with `v0.2.44` |
+| `ResembleAI/chatterbox` | TTS + zero-shot voice cloning | A/B | calibrated; publishing with `v0.2.44` |
 | `SulphurAI/Sulphur-2-base` | Video with synchronized audio, uncensored | C/D | **live** |
 | `prism-ml/Ternary-Bonsai-27B` | LLM, reasoning, 262K ctx, 2-bit ternary | B | **live** |
 | `ACE-Step/Ace-Step1.5` | Music generation | B/C | **live** |
@@ -745,8 +747,6 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 | `Tongyi-MAI/Z-Image-Turbo` | Image | B/C | **live** |
 | `google/gemma-4-E4B-it` | LLM, small + vision, laptop/CPU-friendly | A/B | **live** |
 | `HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive` (`@nvfp4`) | LLM, uncensored, 262K ctx | C | **live** |
-| `ResembleAI/chatterbox` | TTS + zero-shot voice cloning | A/B | onboarding next |
-| `huihui-ai/Huihui-Agents-A1-abliterated` | LLM, vision input, uncensored | C | onboarding |
 | `Cactus-Compute/needle` | Tool-calling specialist, 26M, CPU | A | onboarding |
 | `NousResearch/Hermes-3-Llama-3.1-70B` (`@mlx-4bit`) | LLM, 70B, 128K ctx | D | onboarding |
 | `openai/gpt-oss-20b` | LLM, agentic | B | onboarding |
@@ -778,6 +778,23 @@ Class = smallest machine class that serves it well: **A** CPU/laptop, **B** cons
 | Video generation | `/v1/videos` |
 | Speech and transcription | `/v1/audio/speech`, `/v1/audio/transcriptions` |
 | Audio and music generation | `/v1/audio/generations`, `/v1/music/generations` |
+
+Chatterbox uses `voice: "default"` for ordinary speech. For zero-shot cloning, add a bounded
+base64 WAV reference:
+
+```json
+{
+  "model": "ResembleAI/chatterbox",
+  "input": "This voice was cloned from the supplied reference.",
+  "voice": "default",
+  "response_format": "wav",
+  "reference_audio": {
+    "data": "<base64-wav>",
+    "encoding": "base64",
+    "content_type": "audio/wav"
+  }
+}
+```
 
 ## Dashboards
 
@@ -834,7 +851,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.43` is source-only. The GitHub release contains the tagged source, not
+`v0.2.44` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -842,7 +859,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.43
+git checkout --detach v0.2.44
 ./install.sh --from-source
 ```
 
@@ -851,7 +868,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.43
+git checkout --detach v0.2.44
 .\install.ps1 -FromSource
 ```
 
@@ -871,7 +888,7 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
-The `0.2.43` source release carries the current PAYOUTFREE, ATTAUTO, FLOWRATE,
+The `0.2.44` source release carries the current PAYOUTFREE, ATTAUTO, FLOWRATE,
 LIVEROUTE, bounded Z-Image readiness, process-lifetime dashboard auth,
 non-destructive authenticated direct-to-relay session handover, and the
 generalized joint audio/video serving path used by Sulphur. The releases page and live signed catalog remain

@@ -235,6 +235,7 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
                 "seed",
                 "tools",
                 "tool_choice",
+                "parallel_tool_calls",
                 "response_format",
             ],
             &["model", "messages", "messages.role"],
@@ -2897,6 +2898,34 @@ fn endpoint_calibration_companion_minimum(
         .unwrap_or(fallback)
 }
 
+fn endpoint_calibration_video_frame_count(contract: &EndpointFamilyContract) -> usize {
+    let numeric_minimum = contract
+        .request_attribute_specs
+        .get("messages.content.video.num_frames")
+        .and_then(|spec| spec.minimum)
+        .filter(|minimum| minimum.is_finite() && *minimum >= 1.0)
+        .map(|minimum| minimum.ceil() as usize);
+    let calibrated_minimum = endpoint_calibration_companion_minimum(
+        contract,
+        "messages.content.video.num_frames",
+        json!(2),
+    )
+    .as_u64()
+    .and_then(|count| usize::try_from(count).ok())
+    .filter(|count| *count > 0)
+    .unwrap_or(2);
+    let decoded_frames_minimum = contract
+        .request_attribute_specs
+        .get("messages.content.video.frames")
+        .and_then(|spec| spec.min_items)
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(1);
+    numeric_minimum
+        .unwrap_or(calibrated_minimum)
+        .max(decoded_frames_minimum)
+        .max(1)
+}
+
 fn add_calibration_companion_mutations(
     contract: &EndpointFamilyContract,
     path: &str,
@@ -3069,11 +3098,12 @@ fn add_calibration_companion_mutations(
                 add("messages.content.input_audio.format", json!("wav"));
             }
             Some("video") => {
+                let frame_count = endpoint_calibration_video_frame_count(contract);
                 add(
                     "messages.content.video.frames",
-                    json!(["$IMAGE_DATA_URL", "$IMAGE_DATA_URL"]),
+                    Value::Array(vec![json!("$IMAGE_DATA_URL"); frame_count]),
                 );
-                add("messages.content.video.num_frames", json!(2));
+                add("messages.content.video.num_frames", json!(frame_count));
                 add(
                     "messages.content.video.fps",
                     endpoint_calibration_companion_baseline(
@@ -3095,10 +3125,11 @@ fn add_calibration_companion_mutations(
             add("messages.content.input_audio.format", json!("wav"));
         }
         "messages.content.video.data" | "messages.content.video.content_type" => {
+            let frame_count = endpoint_calibration_video_frame_count(contract);
             add("messages.content.type", json!("video"));
             add("messages.content.video.data", json!("$VIDEO_BASE64"));
             add("messages.content.video.content_type", json!("video/mp4"));
-            add("messages.content.video.num_frames", json!(16));
+            add("messages.content.video.num_frames", json!(frame_count));
             add(
                 "messages.content.video.fps",
                 endpoint_calibration_companion_baseline(
@@ -3126,7 +3157,12 @@ fn add_calibration_companion_mutations(
             );
         }
         "messages.content.video.num_frames" => {
-            let frame_count = value.and_then(Value::as_u64).unwrap_or(2).min(64) as usize;
+            let frame_count = value
+                .and_then(Value::as_u64)
+                .map(|count| count.min(64))
+                .and_then(|count| usize::try_from(count).ok())
+                .filter(|count| *count > 0)
+                .unwrap_or_else(|| endpoint_calibration_video_frame_count(contract));
             add("messages.content.type", json!("video"));
             add(
                 "messages.content.video.frames",
@@ -3143,12 +3179,13 @@ fn add_calibration_companion_mutations(
             );
         }
         "messages.content.video.fps" => {
+            let frame_count = endpoint_calibration_video_frame_count(contract);
             add("messages.content.type", json!("video"));
             add(
                 "messages.content.video.frames",
-                json!(["$IMAGE_DATA_URL", "$IMAGE_DATA_URL"]),
+                Value::Array(vec![json!("$IMAGE_DATA_URL"); frame_count]),
             );
-            add("messages.content.video.num_frames", json!(2));
+            add("messages.content.video.num_frames", json!(frame_count));
             add(
                 "messages.content.video.fps",
                 endpoint_calibration_companion_baseline(
@@ -6938,6 +6975,18 @@ mod tests {
         assert!(contract
             .required_request_attributes
             .contains(&"messages.role".to_owned()));
+        assert!(contract
+            .request_attributes
+            .contains(&"parallel_tool_calls".to_owned()));
+        assert!(validate_endpoint_request(
+            &contract,
+            &json!({
+                "model": "test/model",
+                "messages": [{ "role": "user", "content": "use both tools" }],
+                "parallel_tool_calls": true
+            }),
+        )
+        .is_ok());
         let cases = generate_endpoint_calibration_cases(&contract).expect("calibration matrix");
         let substitutions = BTreeMap::from([
             ("$MODEL".to_owned(), json!("test/model")),
@@ -6980,11 +7029,11 @@ mod tests {
                 .as_array()
                 .expect("decoded video frames")
                 .len(),
-            2
+            1
         );
         assert_eq!(
             request["messages"][0]["content"][0]["video"]["num_frames"],
-            2
+            1
         );
         assert_eq!(request["messages"][0]["role"], "user");
         assert!(validate_endpoint_request(&contract, &request).is_ok());
@@ -7001,6 +7050,20 @@ mod tests {
         fps.minimum = Some(1.0);
         fps.maximum = Some(1.0);
         fps.calibration_values = vec![json!(1.0)];
+        let num_frames = contract
+            .request_attribute_specs
+            .get_mut("messages.content.video.num_frames")
+            .expect("video frame-count spec");
+        num_frames.minimum = Some(4.0);
+        num_frames.maximum = Some(64.0);
+        num_frames.calibration_values = vec![json!(4)];
+        let frames = contract
+            .request_attribute_specs
+            .get_mut("messages.content.video.frames")
+            .expect("decoded video-frames spec");
+        frames.min_items = Some(4);
+        frames.max_items = Some(64);
+        frames.calibration_values = vec![Value::Array(vec![json!("$IMAGE_DATA_URL"); 4])];
 
         let cases = generate_endpoint_calibration_cases(&contract).expect("calibration matrix");
         let substitutions = BTreeMap::from([
@@ -7032,6 +7095,17 @@ mod tests {
             request["messages"][0]["content"][0]["video"]["fps"],
             json!(1.0)
         );
+        assert_eq!(
+            request["messages"][0]["content"][0]["video"]["frames"]
+                .as_array()
+                .expect("video frames")
+                .len(),
+            4
+        );
+        assert_eq!(
+            request["messages"][0]["content"][0]["video"]["num_frames"],
+            json!(4)
+        );
         assert!(validate_endpoint_request(&contract, &request).is_ok());
 
         let frame_boundaries = cases
@@ -7057,6 +7131,32 @@ mod tests {
             assert_eq!(video["fps"], json!(1.0));
             assert!(validate_endpoint_request(&contract, &request).is_ok());
         }
+    }
+
+    #[test]
+    fn chat_video_companion_count_honors_signed_decoded_frame_minimum() {
+        let mut contract = endpoint_family_contract_template(ENDPOINT_HF_MULTIMODAL_CHAT)
+            .expect("HF multimodal chat contract");
+        let num_frames = contract
+            .request_attribute_specs
+            .get_mut("messages.content.video.num_frames")
+            .expect("video frame-count spec");
+        num_frames.minimum = Some(4.0);
+        num_frames.maximum = Some(64.0);
+        num_frames.calibration_values = vec![json!(4)];
+        let frames = contract
+            .request_attribute_specs
+            .get_mut("messages.content.video.frames")
+            .expect("decoded video-frames spec");
+        frames.min_items = Some(8);
+        frames.max_items = Some(64);
+        frames.calibration_values = vec![Value::Array(vec![json!("$IMAGE_DATA_URL"); 8])];
+
+        assert_eq!(
+            endpoint_calibration_video_frame_count(&contract),
+            8,
+            "decoded-frame min_items must remain authoritative when it is stricter"
+        );
     }
 
     #[test]
