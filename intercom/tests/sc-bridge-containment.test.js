@@ -207,3 +207,63 @@ test('SC-Bridge loopback delivers to the other local subscriber but never echoes
   const recipients = sessionFrameRecipients(new Set([sender, receiver]), sessionId, sender);
   assert.deepEqual(recipients, [receiver]);
 });
+
+test('SC-Bridge keeps concurrent provider enclave lanes independent on one transport peer', () => {
+  const provider = '11'.repeat(32);
+  const remote = '22'.repeat(32);
+  const routes = Array.from({ length: 4 }, (_, index) => ({
+    provider,
+    enclaveId: (index + 1).toString(16).padStart(2, '0').repeat(32),
+    roomId: (index + 17).toString(16).padStart(2, '0').repeat(16),
+    sessionId: (index + 33).toString(16).padStart(2, '0').repeat(32),
+  }));
+  const workers = routes.map((route, index) => ({
+    id: index + 1,
+    ready: true,
+    sessionAll: true,
+    sessionIds: new Set(),
+    directSessions: new Map(),
+    route,
+  }));
+  const clients = new Set(workers);
+
+  for (const route of routes) {
+    const recipients = sessionFrameRecipients(clients, route.sessionId);
+    assert.equal(recipients.length, workers.length);
+
+    const activation = {
+      t: 'tpm.activate_credential.challenge',
+      provider: route.provider,
+      enclave_id: route.enclaveId,
+      room_id: route.roomId,
+    };
+    const handlers = recipients.filter(({ route: owned }) => (
+      activation.provider === owned.provider
+      && activation.enclave_id === owned.enclaveId
+      && activation.room_id === owned.roomId
+    ));
+    assert.deepEqual(handlers.map(({ id }) => id), [
+      routes.indexOf(route) + 1,
+    ]);
+
+    const owner = handlers[0];
+    assert.equal(canOwnSession(owner.directSessions, remote, route.sessionId, 16), true);
+    ownSession(owner.directSessions, remote, route.sessionId);
+  }
+
+  const disconnected = workers[1];
+  const closed = [];
+  closeOwnedSessions(disconnected.directSessions, (closedRemote, closedSessionId) => {
+    closed.push(`${closedRemote}:${closedSessionId}`);
+  });
+  clients.delete(disconnected);
+
+  assert.deepEqual(closed, [`${remote}:${routes[1].sessionId}`]);
+  assert.equal(
+    workers
+      .filter((worker) => worker !== disconnected)
+      .every((worker) => worker.directSessions.size === 1),
+    true
+  );
+  assert.equal(clients.size, workers.length - 1);
+});

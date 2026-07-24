@@ -259,7 +259,7 @@ pub struct GatewayState {
     heartbeat_attestation_advertisements:
         Arc<Mutex<BTreeMap<ProviderKey, LiveHeartbeatAttestationAdvertisement>>>,
     tpm_activation_cache: Arc<Mutex<BTreeMap<ProviderKey, GatewayTpmActivationCacheEntry>>>,
-    tpm_activation_inflight: Arc<Mutex<BTreeSet<ProviderKey>>>,
+    tpm_activation_inflight: Arc<Mutex<BTreeSet<GatewayTpmActivationOwnershipScope>>>,
     canary_policy: GatewayCanaryProbePolicy,
     canary_scheduler: Arc<Mutex<GatewayCanaryScheduler>>,
     dashboard_session: Arc<DashboardSession>,
@@ -1872,19 +1872,32 @@ struct GatewayTpmActivationCacheBinding {
     policy_digest: String,
     device_id: String,
     transport_peer: String,
+    ek_public_spki_der_b64: String,
+    ak_name_b64: String,
     hello_digest: String,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GatewayTpmActivationOwnershipScope {
+    provider: String,
+    policy_sequence: u64,
+    policy_digest: String,
+    device_id: String,
+    transport_peer: String,
+    ek_public_spki_der_b64: String,
+    ak_name_b64: String,
+}
+
 struct GatewayTpmActivationAttemptGuard {
-    inflight: Arc<Mutex<BTreeSet<ProviderKey>>>,
-    key: ProviderKey,
+    inflight: Arc<Mutex<BTreeSet<GatewayTpmActivationOwnershipScope>>>,
+    scope: GatewayTpmActivationOwnershipScope,
 }
 
 impl Drop for GatewayTpmActivationAttemptGuard {
     fn drop(&mut self) {
         self.inflight
             .lock_recover("TPM activation in-flight set")
-            .remove(&self.key);
+            .remove(&self.scope);
     }
 }
 
@@ -11763,10 +11776,12 @@ fn route_attestation_policy_resolution(
             policy_digest: route_binding.policy_digest.clone(),
             device_id: route_binding.device_id.clone(),
             transport_peer: transport_peer.to_owned(),
+            ek_public_spki_der_b64: hello.ek_public_spki_der_b64.clone(),
+            ak_name_b64: hello.ak_name_b64.clone(),
             hello_digest,
         });
-        let identity = tpm_activation_cache.get(&key).filter(|entry| {
-            entry.expires_at_millis > now_millis && binding.as_ref() == Some(&entry.binding)
+        let identity = binding.as_ref().and_then(|binding| {
+            reusable_tpm_activation_entry(tpm_activation_cache, &key, binding, now_millis)
         });
         let Some(identity) = identity.map(|entry| entry.identity.clone()) else {
             status.tpm_activation_pending = transport_peer.is_some();
@@ -11807,6 +11822,41 @@ fn tpm_activation_cache_entry_survives_catalog_refresh(
     now_millis: u64,
 ) -> bool {
     expires_at_millis > now_millis && valid_route_keys.contains(key)
+}
+
+fn tpm_activation_ownership_scope(
+    key: &ProviderKey,
+    binding: &GatewayTpmActivationCacheBinding,
+) -> GatewayTpmActivationOwnershipScope {
+    GatewayTpmActivationOwnershipScope {
+        provider: key.provider.clone(),
+        policy_sequence: binding.policy_sequence,
+        policy_digest: binding.policy_digest.clone(),
+        device_id: binding.device_id.clone(),
+        transport_peer: binding.transport_peer.clone(),
+        ek_public_spki_der_b64: binding.ek_public_spki_der_b64.clone(),
+        ak_name_b64: binding.ak_name_b64.clone(),
+    }
+}
+
+fn reusable_tpm_activation_entry<'a>(
+    cache: &'a BTreeMap<ProviderKey, GatewayTpmActivationCacheEntry>,
+    key: &ProviderKey,
+    binding: &GatewayTpmActivationCacheBinding,
+    now_millis: u64,
+) -> Option<&'a GatewayTpmActivationCacheEntry> {
+    if let Some(exact) = cache
+        .get(key)
+        .filter(|entry| entry.expires_at_millis > now_millis && entry.binding == *binding)
+    {
+        return Some(exact);
+    }
+    let scope = tpm_activation_ownership_scope(key, binding);
+    cache.iter().find_map(|(cached_key, entry)| {
+        (entry.expires_at_millis > now_millis
+            && tpm_activation_ownership_scope(cached_key, &entry.binding) == scope)
+            .then_some(entry)
+    })
 }
 
 fn native_gateway_attestation_capabilities() -> VerifierCapabilities {
@@ -19409,7 +19459,30 @@ async fn activate_one_pending_tpm_route(
         ) else {
             continue;
         };
-        let Some(_attempt) = state.begin_tpm_activation(key.clone()) else {
+        let (Some(policy_sequence), Some(policy_digest), Some(device_id)) = (
+            readiness.policy_sequence,
+            readiness.policy_digest.clone(),
+            route
+                .device_key
+                .clone()
+                .filter(|device_id| is_hex_len(device_id, 64)),
+        ) else {
+            continue;
+        };
+        let activation_binding = GatewayTpmActivationCacheBinding {
+            policy_sequence,
+            policy_digest,
+            device_id,
+            transport_peer: transport_peer.clone(),
+            ek_public_spki_der_b64: hello.ek_public_spki_der_b64.clone(),
+            ak_name_b64: hello.ak_name_b64.clone(),
+            hello_digest: match tpm_activation_hello_digest(&hello) {
+                Ok(digest) => digest,
+                Err(_) => continue,
+            },
+        };
+        let activation_scope = tpm_activation_ownership_scope(&key, &activation_binding);
+        let Some(_attempt) = state.begin_tpm_activation(activation_scope) else {
             continue;
         };
         let invocation = GatewayTpmActivationInvocation {
@@ -19435,7 +19508,7 @@ async fn activate_one_pending_tpm_route(
                     );
                     continue;
                 }
-                state.refresh_provider_table_routes(model);
+                state.rebuild_provider_contract_snapshot();
                 return;
             }
             Err(error) => {
@@ -22445,17 +22518,20 @@ fn ordered_route_candidates_for_requirements_with_seed<'a>(
 }
 
 impl GatewayState {
-    fn begin_tpm_activation(&self, key: ProviderKey) -> Option<GatewayTpmActivationAttemptGuard> {
+    fn begin_tpm_activation(
+        &self,
+        scope: GatewayTpmActivationOwnershipScope,
+    ) -> Option<GatewayTpmActivationAttemptGuard> {
         let mut inflight = self
             .tpm_activation_inflight
             .lock_recover("TPM activation in-flight set");
-        if !inflight.insert(key.clone()) {
+        if !inflight.insert(scope.clone()) {
             return None;
         }
         drop(inflight);
         Some(GatewayTpmActivationAttemptGuard {
             inflight: Arc::clone(&self.tpm_activation_inflight),
-            key,
+            scope,
         })
     }
 
@@ -22501,6 +22577,8 @@ impl GatewayState {
                         policy_digest,
                         device_id,
                         transport_peer,
+                        ek_public_spki_der_b64: hello.ek_public_spki_der_b64.clone(),
+                        ak_name_b64: hello.ak_name_b64.clone(),
                         hello_digest,
                     },
                     expires_at_millis: now_millis.saturating_add(TPM_ACTIVATION_CACHE_TTL_MILLIS),
@@ -31593,6 +31671,8 @@ mod tests {
             policy_digest: "11".repeat(32),
             device_id: "22".repeat(32),
             transport_peer: "44".repeat(32),
+            ek_public_spki_der_b64: "ek-public".to_owned(),
+            ak_name_b64: "ak-name".to_owned(),
             hello_digest: "55".repeat(32),
         };
         let mut mismatches = Vec::new();
@@ -31609,10 +31689,123 @@ mod tests {
         changed.transport_peer = "99".repeat(32);
         mismatches.push(changed);
         let mut changed = baseline.clone();
+        changed.ek_public_spki_der_b64 = "other-ek-public".to_owned();
+        mismatches.push(changed);
+        let mut changed = baseline.clone();
+        changed.ak_name_b64 = "other-ak-name".to_owned();
+        mismatches.push(changed);
+        let mut changed = baseline.clone();
         changed.hello_digest = "aa".repeat(32);
         mismatches.push(changed);
 
         assert!(mismatches.iter().all(|candidate| candidate != &baseline));
+    }
+
+    #[test]
+    fn one_tpm_ownership_scope_covers_arbitrary_sibling_enclaves_only() {
+        let provider = "11".repeat(32);
+        let first_key = ProviderKey {
+            provider: provider.clone(),
+            enclave_id: "21".repeat(32),
+            room_id: "31".repeat(16),
+        };
+        let second_key = ProviderKey {
+            provider: provider.clone(),
+            enclave_id: "22".repeat(32),
+            room_id: "32".repeat(16),
+        };
+        let first_binding = GatewayTpmActivationCacheBinding {
+            policy_sequence: 7,
+            policy_digest: "41".repeat(32),
+            device_id: "51".repeat(32),
+            transport_peer: "61".repeat(32),
+            ek_public_spki_der_b64: "same-ek-public".to_owned(),
+            ak_name_b64: "same-ak-name".to_owned(),
+            hello_digest: "71".repeat(32),
+        };
+        let mut second_binding = first_binding.clone();
+        second_binding.hello_digest = "72".repeat(32);
+
+        assert_ne!(first_key, second_key);
+        assert_ne!(first_binding, second_binding);
+        assert_eq!(
+            tpm_activation_ownership_scope(&first_key, &first_binding),
+            tpm_activation_ownership_scope(&second_key, &second_binding),
+            "route-specific quote bindings must share one verified EK/AK ownership scope"
+        );
+
+        let mut other_provider = second_key.clone();
+        other_provider.provider = "12".repeat(32);
+        assert_ne!(
+            tpm_activation_ownership_scope(&first_key, &first_binding),
+            tpm_activation_ownership_scope(&other_provider, &second_binding)
+        );
+
+        let mutations: [fn(&mut GatewayTpmActivationCacheBinding); 6] = [
+            |binding: &mut GatewayTpmActivationCacheBinding| binding.policy_sequence += 1,
+            |binding: &mut GatewayTpmActivationCacheBinding| {
+                binding.policy_digest = "42".repeat(32)
+            },
+            |binding: &mut GatewayTpmActivationCacheBinding| binding.device_id = "52".repeat(32),
+            |binding: &mut GatewayTpmActivationCacheBinding| {
+                binding.transport_peer = "62".repeat(32)
+            },
+            |binding: &mut GatewayTpmActivationCacheBinding| {
+                binding.ek_public_spki_der_b64 = "other-ek-public".to_owned()
+            },
+            |binding: &mut GatewayTpmActivationCacheBinding| {
+                binding.ak_name_b64 = "other-ak-name".to_owned()
+            },
+        ];
+        for mutate in mutations {
+            let mut changed = second_binding.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                tpm_activation_ownership_scope(&first_key, &first_binding),
+                tpm_activation_ownership_scope(&second_key, &changed)
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_sibling_routes_share_one_tpm_activation_attempt() {
+        let state = GatewayState::from_models(vec![test_model()]);
+        let key = ProviderKey {
+            provider: "11".repeat(32),
+            enclave_id: "21".repeat(32),
+            room_id: "31".repeat(16),
+        };
+        let binding = GatewayTpmActivationCacheBinding {
+            policy_sequence: 7,
+            policy_digest: "41".repeat(32),
+            device_id: "51".repeat(32),
+            transport_peer: "61".repeat(32),
+            ek_public_spki_der_b64: "same-ek-public".to_owned(),
+            ak_name_b64: "same-ak-name".to_owned(),
+            hello_digest: "71".repeat(32),
+        };
+        let scope = tpm_activation_ownership_scope(&key, &binding);
+
+        let first = state
+            .begin_tpm_activation(scope.clone())
+            .expect("the first sibling starts one TPM challenge");
+        assert!(
+            state.begin_tpm_activation(scope.clone()).is_none(),
+            "a concurrent sibling must wait for the shared ownership proof"
+        );
+
+        let mut other_provider_scope = scope.clone();
+        other_provider_scope.provider = "12".repeat(32);
+        let independent = state
+            .begin_tpm_activation(other_provider_scope)
+            .expect("a different provider retains an independent activation scope");
+        drop(independent);
+        drop(first);
+
+        assert!(
+            state.begin_tpm_activation(scope).is_some(),
+            "a failed or completed attempt must release the scope for recovery"
+        );
     }
 
     #[test]

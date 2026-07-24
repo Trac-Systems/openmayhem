@@ -55746,10 +55746,52 @@ async fn read_active_provider_serves(
     Ok(serves)
 }
 
-fn provider_heartbeat_cache_path(home: &Path, provider: &str) -> PathBuf {
-    home.join("provider")
-        .join("heartbeats")
-        .join(format!("{provider}.json"))
+fn provider_heartbeat_cache_dir(home: &Path, provider: &str) -> PathBuf {
+    home.join("provider").join("heartbeats").join(provider)
+}
+
+fn provider_heartbeat_cache_path(home: &Path, provider: &str, enclave_id: &str) -> PathBuf {
+    provider_heartbeat_cache_dir(home, provider).join(format!("{enclave_id}.json"))
+}
+
+fn provider_heartbeat_cache_lock_path(path: &Path) -> PathBuf {
+    path.with_extension("lock")
+}
+
+fn write_provider_heartbeat_cache_file(path: &Path, cache: &Value) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("provider heartbeat cache path has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let lock_path = provider_heartbeat_cache_lock_path(path);
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    fs2::FileExt::lock_exclusive(&lock)
+        .with_context(|| format!("locking {}", lock_path.display()))?;
+    let result = write_json_file(path, cache);
+    let unlock_result =
+        fs2::FileExt::unlock(&lock).with_context(|| format!("unlocking {}", lock_path.display()));
+    result.and(unlock_result)
+}
+
+fn read_provider_heartbeat_cache_file(path: &Path) -> Result<Value> {
+    let lock_path = provider_heartbeat_cache_lock_path(path);
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening {}", lock_path.display()))?;
+    fs2::FileExt::lock_shared(&lock).with_context(|| format!("locking {}", lock_path.display()))?;
+    let result = read_json_file(path);
+    let unlock_result =
+        fs2::FileExt::unlock(&lock).with_context(|| format!("unlocking {}", lock_path.display()));
+    unlock_result?;
+    result
 }
 
 fn write_provider_heartbeat_cache(
@@ -55761,7 +55803,7 @@ fn write_provider_heartbeat_cache(
     if heartbeats.is_empty() {
         return Ok(Value::Null);
     }
-    let path = provider_heartbeat_cache_path(home, provider);
+    let path = provider_heartbeat_cache_path(home, provider, enclave_id);
     let updated_at_ms = unix_epoch_millis()?;
     let cache = json!({
         "provider": provider,
@@ -55770,10 +55812,11 @@ fn write_provider_heartbeat_cache(
         "heartbeat_count": heartbeats.len(),
         "heartbeats": heartbeats,
     });
-    write_json_file(&path, &cache)?;
+    write_provider_heartbeat_cache_file(&path, &cache)?;
     Ok(json!({
         "ok": true,
         "path": path,
+        "enclave_id": enclave_id,
         "updated_at_ms": updated_at_ms,
         "heartbeat_count": heartbeats.len(),
     }))
@@ -55809,37 +55852,129 @@ fn normalize_provider_accepted_rails_arg(raw: &str) -> Result<Vec<String>> {
 }
 
 fn read_provider_heartbeat_cache(home: &Path, provider: &str) -> Value {
-    let path = provider_heartbeat_cache_path(home, provider);
-    match read_json_file(&path) {
-        Ok(cache) => {
-            let updated_at_ms = cache
-                .get("updated_at_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            let age_ms = unix_epoch_millis()
-                .ok()
-                .map(|now| now.saturating_sub(updated_at_ms));
-            let live = age_ms
-                .map(|age| age <= DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS)
-                .unwrap_or(false);
-            json!({
-                "ok": true,
+    let path = provider_heartbeat_cache_dir(home, provider);
+    let entries = match fs::read_dir(&path) {
+        Ok(entries) => entries,
+        Err(err) => {
+            return json!({
+                "ok": false,
                 "path": path,
-                "live": live,
-                "updated_at_ms": updated_at_ms,
-                "age_ms": age_ms,
+                "live": false,
+                "enclave_count": 0,
+                "live_enclave_count": 0,
                 "ttl_ms": DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
-                "cache": cache,
-            })
+                "error": format!("reading {}: {err}", path.display()),
+            });
         }
-        Err(err) => json!({
-            "ok": false,
-            "path": path,
-            "live": false,
-            "ttl_ms": DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
-            "error": err.to_string(),
-        }),
+    };
+    let now = unix_epoch_millis().ok();
+    let mut enclave_lanes = Vec::new();
+    let mut errors = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                errors.push(err.to_string());
+                continue;
+            }
+        };
+        let entry_path = entry.path();
+        if !entry.file_type().is_ok_and(|kind| kind.is_file())
+            || entry_path.extension().and_then(OsStr::to_str) != Some("json")
+        {
+            continue;
+        }
+        let cache = match read_provider_heartbeat_cache_file(&entry_path) {
+            Ok(cache) => cache,
+            Err(err) => {
+                errors.push(err.to_string());
+                continue;
+            }
+        };
+        if cache.get("provider").and_then(Value::as_str) != Some(provider) {
+            errors.push(format!(
+                "{} contains a heartbeat for another provider",
+                entry_path.display()
+            ));
+            continue;
+        }
+        let Some(enclave_id) = cache
+            .get("enclave_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        else {
+            errors.push(format!("{} is missing enclave_id", entry_path.display()));
+            continue;
+        };
+        let updated_at_ms = cache
+            .get("updated_at_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let age_ms = now.map(|now| now.saturating_sub(updated_at_ms));
+        let live = age_ms
+            .map(|age| age <= DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS)
+            .unwrap_or(false);
+        enclave_lanes.push(json!({
+            "enclave_id": enclave_id,
+            "path": entry_path,
+            "live": live,
+            "updated_at_ms": updated_at_ms,
+            "age_ms": age_ms,
+            "heartbeat_count": cache
+                .get("heartbeat_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            "cache": cache,
+        }));
     }
+    enclave_lanes.sort_by(|left, right| {
+        left.get("enclave_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .cmp(
+                right
+                    .get("enclave_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            )
+    });
+    let live_enclave_ids = enclave_lanes
+        .iter()
+        .filter(|lane| lane.get("live").and_then(Value::as_bool) == Some(true))
+        .filter_map(|lane| lane.get("enclave_id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let stale_enclave_ids = enclave_lanes
+        .iter()
+        .filter(|lane| lane.get("live").and_then(Value::as_bool) != Some(true))
+        .filter_map(|lane| lane.get("enclave_id").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let updated_at_ms = enclave_lanes
+        .iter()
+        .filter_map(|lane| lane.get("updated_at_ms").and_then(Value::as_u64))
+        .max();
+    let age_ms = enclave_lanes
+        .iter()
+        .filter_map(|lane| lane.get("age_ms").and_then(Value::as_u64))
+        .min();
+    let heartbeat_count = enclave_lanes
+        .iter()
+        .filter_map(|lane| lane.get("heartbeat_count").and_then(Value::as_u64))
+        .sum::<u64>();
+    json!({
+        "ok": errors.is_empty() && !enclave_lanes.is_empty(),
+        "path": path,
+        "live": !live_enclave_ids.is_empty(),
+        "updated_at_ms": updated_at_ms,
+        "age_ms": age_ms,
+        "ttl_ms": DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
+        "heartbeat_count": heartbeat_count,
+        "enclave_count": enclave_lanes.len(),
+        "live_enclave_count": live_enclave_ids.len(),
+        "live_enclave_ids": live_enclave_ids,
+        "stale_enclave_ids": stale_enclave_ids,
+        "enclaves": enclave_lanes,
+        "errors": errors,
+    })
 }
 
 fn active_provider_serves_from_contract(
@@ -81507,8 +81642,11 @@ mod tests {
             live["ttl_ms"].as_u64(),
             Some(DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS)
         );
+        assert_eq!(live["enclave_count"].as_u64(), Some(1));
+        assert_eq!(live["live_enclave_count"].as_u64(), Some(1));
+        assert_eq!(live["live_enclave_ids"], json!([&enclave]));
 
-        let path = provider_heartbeat_cache_path(&temp, &provider);
+        let path = provider_heartbeat_cache_path(&temp, &provider, &enclave);
         write_json_file(
             &path,
             &json!({
@@ -81522,6 +81660,61 @@ mod tests {
         .unwrap();
         let stale = read_provider_heartbeat_cache(&temp, &provider);
         assert_eq!(stale["live"].as_bool(), Some(false));
+        assert_eq!(stale["enclave_count"].as_u64(), Some(1));
+        assert_eq!(stale["live_enclave_count"].as_u64(), Some(0));
+        assert_eq!(stale["stale_enclave_ids"], json!([&enclave]));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn provider_heartbeat_cache_preserves_concurrent_enclave_lanes() {
+        let temp = test_temp_dir("mayhem-provider-heartbeat-cache-concurrent");
+        let provider = "55".repeat(32);
+        let enclaves = ["11".repeat(32), "22".repeat(32), "33".repeat(32)];
+        let barrier = Arc::new(std::sync::Barrier::new(enclaves.len()));
+        let workers = enclaves
+            .iter()
+            .cloned()
+            .map(|enclave| {
+                let temp = temp.clone();
+                let provider = provider.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    write_provider_heartbeat_cache(
+                        &temp,
+                        &provider,
+                        &enclave,
+                        &[json!({
+                            "t": "hb",
+                            "provider": &provider,
+                            "enclave_id": &enclave,
+                            "room_id": "aa".repeat(16),
+                        })],
+                    )
+                    .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let aggregate = read_provider_heartbeat_cache(&temp, &provider);
+        assert_eq!(aggregate["ok"].as_bool(), Some(true));
+        assert_eq!(aggregate["live"].as_bool(), Some(true));
+        assert_eq!(aggregate["enclave_count"].as_u64(), Some(3));
+        assert_eq!(aggregate["live_enclave_count"].as_u64(), Some(3));
+        assert_eq!(aggregate["heartbeat_count"].as_u64(), Some(3));
+        assert_eq!(
+            aggregate["live_enclave_ids"],
+            json!([&enclaves[0], &enclaves[1], &enclaves[2]])
+        );
+        for enclave in &enclaves {
+            let lane = provider_heartbeat_cache_path(&temp, &provider, enclave);
+            assert!(lane.is_file(), "missing heartbeat lane {}", lane.display());
+        }
 
         let _ = fs::remove_dir_all(temp);
     }
