@@ -27,6 +27,10 @@ const MAX_MUSIC_INLINE_AUDIO_BASE64_CHARS: u64 =
 const MIN_MUSIC_INLINE_AUDIO_BYTES: usize = 44 + (8_000 / 10 * 2);
 const MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS: u64 =
     (MIN_MUSIC_INLINE_AUDIO_BYTES.div_ceil(3) * 4) as u64;
+const MAX_TTS_REFERENCE_AUDIO_SECONDS: u64 = 10;
+const MAX_TTS_REFERENCE_AUDIO_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TTS_REFERENCE_AUDIO_BASE64_CHARS: u64 =
+    (MAX_TTS_REFERENCE_AUDIO_BYTES.div_ceil(3) * 4) as u64;
 const MAX_MUSIC_CUSTOM_TIMESTEPS: u64 = 200;
 const MAX_MUSIC_SEED: f64 = u32::MAX as f64;
 const MUSIC_VALID_LANGUAGES: &[&str] = &[
@@ -354,6 +358,17 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
                 "speed",
                 "instructions",
                 "stream_format",
+                "reference_audio",
+                "reference_audio.data",
+                "reference_audio.encoding",
+                "reference_audio.content_type",
+                "exaggeration",
+                "cfg_weight",
+                "temperature",
+                "min_p",
+                "top_p",
+                "repetition_penalty",
+                "seed",
             ],
             &["model", "input", "voice"],
             &["audio", "content_type", "usage", "mayhem"],
@@ -375,6 +390,15 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
                 "parameters.speed",
                 "parameters.language",
                 "parameters.speaker_id",
+                "parameters.reference_audio",
+                "parameters.reference_audio.data",
+                "parameters.reference_audio.encoding",
+                "parameters.reference_audio.content_type",
+                "parameters.exaggeration",
+                "parameters.cfg_weight",
+                "parameters.seed",
+                "parameters.generation_parameters.min_p",
+                "parameters.generation_parameters.repetition_penalty",
             ],
             &["inputs"],
             &["audio", "content_type", "usage", "mayhem"],
@@ -719,13 +743,45 @@ fn endpoint_interaction_groups(family: &str) -> Vec<Vec<String>> {
             "stream",
             "temperature",
         ]],
-        ENDPOINT_OPENAI_AUDIO_SPEECH => &[&[
-            "voice",
-            "response_format",
-            "speed",
-            "instructions",
-            "stream_format",
-        ]],
+        ENDPOINT_OPENAI_AUDIO_SPEECH => &[
+            &[
+                "voice",
+                "response_format",
+                "speed",
+                "instructions",
+                "stream_format",
+            ],
+            &[
+                "reference_audio",
+                "exaggeration",
+                "cfg_weight",
+                "temperature",
+                "min_p",
+                "top_p",
+                "repetition_penalty",
+                "seed",
+            ],
+        ],
+        ENDPOINT_HF_TEXT_TO_SPEECH => &[
+            &[
+                "parameters.generation_parameters.temperature",
+                "parameters.generation_parameters.top_k",
+                "parameters.generation_parameters.top_p",
+                "parameters.generation_parameters.typical_p",
+                "parameters.generation_parameters.do_sample",
+                "parameters.generation_parameters.max_new_tokens",
+            ],
+            &[
+                "parameters.reference_audio",
+                "parameters.exaggeration",
+                "parameters.cfg_weight",
+                "parameters.seed",
+                "parameters.generation_parameters.temperature",
+                "parameters.generation_parameters.min_p",
+                "parameters.generation_parameters.top_p",
+                "parameters.generation_parameters.repetition_penalty",
+            ],
+        ],
         ENDPOINT_OPENAI_VIDEOS => &[
             &[
                 "input_reference",
@@ -864,9 +920,7 @@ fn endpoint_interaction_groups(family: &str) -> Vec<Vec<String>> {
                 "flow_edit_n_avg",
             ],
         ],
-        ENDPOINT_HF_TEXT_TO_AUDIO
-        | ENDPOINT_HF_TEXT_TO_SPEECH
-        | ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => &[&[
+        ENDPOINT_HF_TEXT_TO_AUDIO | ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION => &[&[
             "parameters.generation_parameters.temperature",
             "parameters.generation_parameters.top_k",
             "parameters.generation_parameters.top_p",
@@ -990,6 +1044,40 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
             "data": "$AUDIO_BASE64",
             "format": "wav"
         })),
+        "reference_audio" if family == ENDPOINT_OPENAI_AUDIO_SPEECH => {
+            tts_reference_audio_object_spec()
+        }
+        "parameters.reference_audio" if family == ENDPOINT_HF_TEXT_TO_SPEECH => {
+            tts_reference_audio_object_spec()
+        }
+        "reference_audio.data" if family == ENDPOINT_OPENAI_AUDIO_SPEECH => string_spec(
+            MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS,
+            MAX_TTS_REFERENCE_AUDIO_BASE64_CHARS,
+            json!(endpoint_calibration_wav_base64_fixture(
+                MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS as usize
+            )
+            .expect("minimum speech reference-audio fixture is constructible")),
+        ),
+        "parameters.reference_audio.data" if family == ENDPOINT_HF_TEXT_TO_SPEECH => string_spec(
+            MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS,
+            MAX_TTS_REFERENCE_AUDIO_BASE64_CHARS,
+            json!(endpoint_calibration_wav_base64_fixture(
+                MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS as usize
+            )
+            .expect("minimum speech reference-audio fixture is constructible")),
+        ),
+        "reference_audio.encoding" if family == ENDPOINT_OPENAI_AUDIO_SPEECH => {
+            enum_spec(None, &[json!("base64")])
+        }
+        "parameters.reference_audio.encoding" if family == ENDPOINT_HF_TEXT_TO_SPEECH => {
+            enum_spec(None, &[json!("base64")])
+        }
+        "reference_audio.content_type" if family == ENDPOINT_OPENAI_AUDIO_SPEECH => {
+            tts_reference_audio_content_type_spec()
+        }
+        "parameters.reference_audio.content_type" if family == ENDPOINT_HF_TEXT_TO_SPEECH => {
+            tts_reference_audio_content_type_spec()
+        }
         "input_reference" => union_spec(
             &[EndpointValueType::String, EndpointValueType::Object],
             &[json!("$IMAGE_FILE"), json!({"image_url":"$IMAGE_DATA_URL"})],
@@ -1010,6 +1098,50 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
         ),
         "parameters.voice" | "parameters.speaker_id" | "scheduler" | "parameters.scheduler" => {
             string_spec(1, 256, json!("$MODEL_VALUE"))
+        }
+        "exaggeration" if family == ENDPOINT_OPENAI_AUDIO_SPEECH => {
+            with_default(number_spec(0.25, 2.0, 0.5), json!(0.5))
+        }
+        "parameters.exaggeration" if family == ENDPOINT_HF_TEXT_TO_SPEECH => {
+            with_default(number_spec(0.25, 2.0, 0.5), json!(0.5))
+        }
+        "cfg_weight" if family == ENDPOINT_OPENAI_AUDIO_SPEECH => {
+            with_default(number_spec(0.0, 1.0, 0.5), json!(0.5))
+        }
+        "parameters.cfg_weight" if family == ENDPOINT_HF_TEXT_TO_SPEECH => {
+            with_default(number_spec(0.0, 1.0, 0.5), json!(0.5))
+        }
+        "repetition_penalty" if family == ENDPOINT_OPENAI_AUDIO_SPEECH => {
+            with_default(number_spec(1.0, 2.0, 1.2), json!(1.2))
+        }
+        "parameters.generation_parameters.repetition_penalty"
+            if family == ENDPOINT_HF_TEXT_TO_SPEECH =>
+        {
+            with_default(number_spec(1.0, 2.0, 1.2), json!(1.2))
+        }
+        "temperature" if family == ENDPOINT_OPENAI_AUDIO_SPEECH => {
+            with_default(number_spec(0.05, 5.0, 0.8), json!(0.8))
+        }
+        "parameters.generation_parameters.temperature" if family == ENDPOINT_HF_TEXT_TO_SPEECH => {
+            with_default(number_spec(0.05, 5.0, 0.8), json!(0.8))
+        }
+        "min_p" if family == ENDPOINT_OPENAI_AUDIO_SPEECH => {
+            with_default(number_spec(0.0, 1.0, 0.05), json!(0.05))
+        }
+        "parameters.generation_parameters.min_p" if family == ENDPOINT_HF_TEXT_TO_SPEECH => {
+            with_default(number_spec(0.0, 1.0, 0.05), json!(0.05))
+        }
+        "top_p" if family == ENDPOINT_OPENAI_AUDIO_SPEECH => {
+            with_default(number_spec(0.0, 1.0, 1.0), json!(1.0))
+        }
+        "parameters.generation_parameters.top_p" if family == ENDPOINT_HF_TEXT_TO_SPEECH => {
+            with_default(number_spec(0.0, 1.0, 1.0), json!(1.0))
+        }
+        "seed" if family == ENDPOINT_OPENAI_AUDIO_SPEECH => {
+            with_default(integer_spec(0.0, u32::MAX as f64, 7), json!(7))
+        }
+        "parameters.seed" if family == ENDPOINT_HF_TEXT_TO_SPEECH => {
+            with_default(integer_spec(0.0, u32::MAX as f64, 7), json!(7))
         }
         "messages.content.type" => {
             let values = if family == ENDPOINT_OPENAI_CHAT_COMPLETIONS {
@@ -1458,6 +1590,20 @@ fn music_inline_audio_content_type_spec() -> EndpointAttributeSpec {
     enum_spec(None, &values)
 }
 
+fn tts_reference_audio_object_spec() -> EndpointAttributeSpec {
+    object_spec(json!({
+        "data": endpoint_calibration_wav_base64_fixture(
+            MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS as usize
+        ).expect("minimum speech reference-audio fixture is constructible"),
+        "encoding": "base64",
+        "content_type": "audio/wav"
+    }))
+}
+
+fn tts_reference_audio_content_type_spec() -> EndpointAttributeSpec {
+    enum_spec(None, &[json!("audio/wav")])
+}
+
 fn music_language_spec(default: Option<Value>) -> EndpointAttributeSpec {
     let values = MUSIC_VALID_LANGUAGES
         .iter()
@@ -1530,6 +1676,15 @@ fn music_inline_audio_child(path: &str, child: &str) -> bool {
     MUSIC_INLINE_AUDIO_ROOTS
         .iter()
         .any(|root| path == format!("{root}.{child}"))
+}
+
+fn endpoint_inline_audio_child(family: &str, path: &str, child: &str) -> bool {
+    match family {
+        ENDPOINT_MAYHEM_MUSIC_GENERATIONS => music_inline_audio_child(path, child),
+        ENDPOINT_OPENAI_AUDIO_SPEECH => path == format!("reference_audio.{child}"),
+        ENDPOINT_HF_TEXT_TO_SPEECH => path == format!("parameters.reference_audio.{child}"),
+        _ => false,
+    }
 }
 
 fn response_attribute_spec(path: &str) -> Option<EndpointAttributeSpec> {
@@ -2784,15 +2939,15 @@ fn add_calibration_companion_mutations(
     if path.starts_with("messages.content.") {
         add("messages.role", json!("user"));
     }
+    if let Some(root) = endpoint_inline_audio_root(&contract.family, path) {
+        add(&format!("{root}.data"), json!("$AUDIO_BASE64"));
+        add(&format!("{root}.encoding"), json!("base64"));
+        add(
+            &format!("{root}.content_type"),
+            json!("$AUDIO_CONTENT_TYPE"),
+        );
+    }
     if contract.family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
-        if let Some(root) = music_inline_audio_root(path) {
-            add(&format!("{root}.data"), json!("$AUDIO_BASE64"));
-            add(&format!("{root}.encoding"), json!("base64"));
-            add(
-                &format!("{root}.content_type"),
-                json!("$AUDIO_CONTENT_TYPE"),
-            );
-        }
         let semantic_path = music_alias_canonical(contract, path).unwrap_or(path);
         let empty_semantic_text = value
             .and_then(Value::as_str)
@@ -3062,11 +3217,22 @@ fn endpoint_calibration_string_fixture(
     path: &str,
     length: usize,
 ) -> String {
+    if endpoint_inline_audio_child(&case.endpoint_family, path, "content_type")
+        && length >= "audio/x".len()
+    {
+        return format!("audio/{}", "x".repeat(length - "audio/".len()));
+    }
+    if endpoint_inline_audio_child(&case.endpoint_family, path, "data")
+        && case.expect_accept
+        && length >= MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS as usize
+        && length % 4 == 0
+    {
+        if let Some(audio) = endpoint_calibration_wav_base64_fixture(length) {
+            return audio;
+        }
+    }
     if case.endpoint_family != ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
         return "x".repeat(length);
-    }
-    if music_inline_audio_child(path, "content_type") && length >= "audio/x".len() {
-        return format!("audio/{}", "x".repeat(length - "audio/".len()));
     }
     if matches!(path, "audio_codes" | "audio_code_string") {
         const TOKEN: &str = "<|audio_code_63999|>";
@@ -3084,21 +3250,15 @@ fn endpoint_calibration_string_fixture(
             _ => "C major".chars().take(length).collect(),
         };
     }
-    if music_inline_audio_child(path, "data")
-        && case.expect_accept
-        && length >= MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS as usize
-        && length % 4 == 0
-    {
-        if let Some(audio) = endpoint_calibration_wav_base64_fixture(length) {
-            return audio;
-        }
-    }
     "x".repeat(length)
 }
 
 fn endpoint_calibration_wav_base64_fixture(encoded_length: usize) -> Option<String> {
+    let is_tts_max = encoded_length == MAX_TTS_REFERENCE_AUDIO_BASE64_CHARS as usize;
     let decoded_length = if encoded_length == MAX_MUSIC_INLINE_AUDIO_BASE64_CHARS as usize {
         MAX_MUSIC_INLINE_AUDIO_BYTES
+    } else if is_tts_max {
+        MAX_TTS_REFERENCE_AUDIO_BYTES
     } else {
         encoded_length.checked_div(4)?.checked_mul(3)?
     };
@@ -3111,12 +3271,14 @@ fn endpoint_calibration_wav_base64_fixture(encoded_length: usize) -> Option<Stri
     if data_length % 4 != 0 {
         return None;
     }
-    let (channels, sample_rate, block_align) =
-        if data_length <= 600_usize.checked_mul(8_000)?.checked_mul(2)? {
-            (1_u16, 8_000_u32, 2_u16)
-        } else {
-            (2_u16, 96_000_u32, 4_u16)
-        };
+    let (channels, sample_rate, block_align) = if is_tts_max {
+        // Keep the byte-limit boundary inside the independent ten-second TTS limit.
+        (2_u16, 480_000_u32, 4_u16)
+    } else if data_length <= 600_usize.checked_mul(8_000)?.checked_mul(2)? {
+        (1_u16, 8_000_u32, 2_u16)
+    } else {
+        (2_u16, 96_000_u32, 4_u16)
+    };
     let riff_length = u32::try_from(decoded_length.checked_sub(8)?).ok()?;
     let data_length_u32 = u32::try_from(data_length).ok()?;
     let mut wav = Vec::with_capacity(decoded_length);
@@ -3146,6 +3308,31 @@ fn music_inline_audio_root(path: &str) -> Option<&str> {
                 .strip_prefix(*root)
                 .is_some_and(|suffix| suffix.starts_with('.'))
     })
+}
+
+fn endpoint_inline_audio_root(family: &str, path: &str) -> Option<&'static str> {
+    match family {
+        ENDPOINT_MAYHEM_MUSIC_GENERATIONS => {
+            MUSIC_INLINE_AUDIO_ROOTS.iter().copied().find(|root| {
+                path == *root
+                    || path
+                        .strip_prefix(*root)
+                        .is_some_and(|suffix| suffix.starts_with('.'))
+            })
+        }
+        ENDPOINT_OPENAI_AUDIO_SPEECH
+            if path == "reference_audio" || path.starts_with("reference_audio.") =>
+        {
+            Some("reference_audio")
+        }
+        ENDPOINT_HF_TEXT_TO_SPEECH
+            if path == "parameters.reference_audio"
+                || path.starts_with("parameters.reference_audio.") =>
+        {
+            Some("parameters.reference_audio")
+        }
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3649,10 +3836,47 @@ pub fn validate_endpoint_request(
         validate_music_alias_attribute_specs(contract, raw_request, &mut violations);
         validate_music_request(contract, request, &mut violations);
     }
+    if matches!(
+        contract.family.as_str(),
+        ENDPOINT_OPENAI_AUDIO_SPEECH | ENDPOINT_HF_TEXT_TO_SPEECH
+    ) {
+        validate_tts_reference_audio(contract, request, &mut violations);
+    }
     if violations.is_empty() {
         Ok(())
     } else {
         Err(violations)
+    }
+}
+
+fn validate_tts_reference_audio(
+    contract: &EndpointFamilyContract,
+    request: &Value,
+    violations: &mut Vec<EndpointContractViolation>,
+) {
+    let (path, audio) = if contract.family == ENDPOINT_HF_TEXT_TO_SPEECH {
+        (
+            "parameters.reference_audio",
+            request.pointer("/parameters/reference_audio"),
+        )
+    } else {
+        ("reference_audio", request.get("reference_audio"))
+    };
+    let Some(audio) = audio else {
+        return;
+    };
+    validate_music_inline_audio(contract, path, audio, violations);
+    if audio
+        .get("encoding")
+        .and_then(Value::as_str)
+        .is_some_and(|encoding| encoding == "base64")
+    {
+        if let Err(reason) = validated_tts_reference_audio_item(path, audio) {
+            violations.push(EndpointContractViolation {
+                path: path.to_owned(),
+                reason,
+            });
+        }
     }
 }
 
@@ -4384,6 +4608,44 @@ fn validated_music_inline_audio_item(root: &str, audio: &Value) -> Result<(u64, 
     ))
 }
 
+fn validated_tts_reference_audio_item(root: &str, audio: &Value) -> Result<(u64, u64), String> {
+    let audio = audio
+        .as_object()
+        .ok_or_else(|| format!("{root} must be an inline audio object"))?;
+    if audio.get("encoding").and_then(Value::as_str) != Some("base64") {
+        return Err(format!("{root}.encoding must be base64"));
+    }
+    if audio.get("content_type").and_then(Value::as_str) != Some("audio/wav") {
+        return Err(format!("{root}.content_type must be audio/wav"));
+    }
+    let encoded = audio
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{root}.data must contain base64 audio"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| format!("{root}.data contains invalid base64 audio"))?;
+    if bytes.len() > MAX_TTS_REFERENCE_AUDIO_BYTES {
+        return Err(format!(
+            "{root} exceeds the {MAX_TTS_REFERENCE_AUDIO_BYTES}-byte signed limit"
+        ));
+    }
+    let metadata = validated_audio_metadata(&bytes)
+        .ok_or_else(|| format!("{root} must contain valid bounded WAV audio"))?;
+    if metadata.format != ValidatedAudioFormat::Wav {
+        return Err(format!("{root} must contain WAV audio"));
+    }
+    if metadata.duration_seconds_ceil > MAX_TTS_REFERENCE_AUDIO_SECONDS {
+        return Err(format!(
+            "{root} exceeds the {MAX_TTS_REFERENCE_AUDIO_SECONDS}-second signed limit"
+        ));
+    }
+    Ok((
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        metadata.duration_seconds_ceil,
+    ))
+}
+
 fn music_audio_content_type_matches_format(
     content_type: &str,
     format: ValidatedAudioFormat,
@@ -4871,6 +5133,108 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn speech_templates_sign_and_validate_voice_cloning_controls() {
+        let reference_audio =
+            endpoint_calibration_wav_base64_fixture(MIN_MUSIC_INLINE_AUDIO_BASE64_CHARS as usize)
+                .unwrap();
+        let descriptor = json!({
+            "data": reference_audio,
+            "encoding": "base64",
+            "content_type": "audio/wav"
+        });
+
+        let openai = endpoint_family_contract_template(ENDPOINT_OPENAI_AUDIO_SPEECH).unwrap();
+        let openai_request = json!({
+            "model": "test/chatterbox",
+            "input": "Mayhem voice-cloning calibration.",
+            "voice": "default",
+            "reference_audio": descriptor,
+            "exaggeration": 0.7,
+            "cfg_weight": 0.3,
+            "temperature": 0.8,
+            "min_p": 0.05,
+            "top_p": 1.0,
+            "repetition_penalty": 1.2,
+            "seed": 7
+        });
+        assert!(validate_endpoint_request(&openai, &openai_request).is_ok());
+
+        let hf = endpoint_family_contract_template(ENDPOINT_HF_TEXT_TO_SPEECH).unwrap();
+        let hf_request = json!({
+            "inputs": "Mayhem voice-cloning calibration.",
+            "parameters": {
+                "reference_audio": openai_request["reference_audio"],
+                "exaggeration": 0.7,
+                "cfg_weight": 0.3,
+                "seed": 7,
+                "generation_parameters": {
+                    "temperature": 0.8,
+                    "min_p": 0.05,
+                    "top_p": 1.0,
+                    "repetition_penalty": 1.2
+                }
+            }
+        });
+        assert!(validate_endpoint_request(&hf, &hf_request).is_ok());
+
+        let maximum_reference =
+            endpoint_calibration_wav_base64_fixture(MAX_TTS_REFERENCE_AUDIO_BASE64_CHARS as usize)
+                .expect("maximum TTS reference fixture is constructible");
+        assert_eq!(
+            maximum_reference.len(),
+            MAX_TTS_REFERENCE_AUDIO_BASE64_CHARS as usize
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&maximum_reference)
+                .unwrap()
+                .len(),
+            MAX_TTS_REFERENCE_AUDIO_BYTES
+        );
+        let mut maximum_request = openai_request.clone();
+        maximum_request["reference_audio"]["data"] = json!(maximum_reference);
+        assert!(validate_endpoint_request(&openai, &maximum_request).is_ok());
+
+        let mut invalid = openai_request;
+        invalid["reference_audio"]["content_type"] = json!("text/plain");
+        assert!(validate_endpoint_request(&openai, &invalid)
+            .unwrap_err()
+            .iter()
+            .any(|violation| violation.path == "reference_audio.content_type"));
+
+        let mut alternate_wav_mime = invalid;
+        alternate_wav_mime["reference_audio"]["content_type"] = json!("audio/x-wav");
+        assert!(validate_endpoint_request(&openai, &alternate_wav_mime)
+            .unwrap_err()
+            .iter()
+            .any(|violation| violation.path == "reference_audio.content_type"));
+
+        let data_length = 11_u32 * 8_000 * 2;
+        let mut long_wav = Vec::with_capacity((44 + data_length) as usize);
+        long_wav.extend_from_slice(b"RIFF");
+        long_wav.extend_from_slice(&(36 + data_length).to_le_bytes());
+        long_wav.extend_from_slice(b"WAVEfmt ");
+        long_wav.extend_from_slice(&16_u32.to_le_bytes());
+        long_wav.extend_from_slice(&1_u16.to_le_bytes());
+        long_wav.extend_from_slice(&1_u16.to_le_bytes());
+        long_wav.extend_from_slice(&8_000_u32.to_le_bytes());
+        long_wav.extend_from_slice(&16_000_u32.to_le_bytes());
+        long_wav.extend_from_slice(&2_u16.to_le_bytes());
+        long_wav.extend_from_slice(&16_u16.to_le_bytes());
+        long_wav.extend_from_slice(b"data");
+        long_wav.extend_from_slice(&data_length.to_le_bytes());
+        long_wav.resize((44 + data_length) as usize, 0);
+        let mut too_long = alternate_wav_mime;
+        too_long["reference_audio"]["content_type"] = json!("audio/wav");
+        too_long["reference_audio"]["data"] =
+            json!(base64::engine::general_purpose::STANDARD.encode(long_wav));
+        assert!(validate_endpoint_request(&openai, &too_long)
+            .unwrap_err()
+            .iter()
+            .any(|violation| violation.reason.contains("10-second")));
     }
 
     #[test]

@@ -631,6 +631,57 @@ pub fn verify(options: VerifyOptions) -> Result<CatalogVerifyReport> {
     })
 }
 
+pub(crate) fn verify_signed_catalog_base(
+    catalog_path: &Path,
+    signature_path: &Path,
+    keys_dir: &Path,
+) -> Result<String> {
+    let catalog_bytes =
+        fs::read(catalog_path).with_context(|| format!("reading {}", catalog_path.display()))?;
+    let catalog_hash = blake3::hash(&catalog_bytes).to_hex().to_string();
+    let signature_text = fs::read_to_string(signature_path)
+        .with_context(|| format!("reading {}", signature_path.display()))?;
+    let signature: CatalogSignature = serde_json::from_str(&signature_text)
+        .with_context(|| format!("parsing {}", signature_path.display()))?;
+    let options = VerifyOptions {
+        catalog_path: catalog_path.to_path_buf(),
+        signature_path: signature_path.to_path_buf(),
+        keys_dir: keys_dir.to_path_buf(),
+        canaries_dir: PathBuf::new(),
+        check_dev_downloads: false,
+        check_launch_sources: false,
+        hf_token_file: None,
+    };
+    let mut errors = Vec::new();
+    validate_signature_metadata(&signature, &catalog_hash, &options, &mut errors);
+    if errors.is_empty() {
+        if let Err(err) = verify_signature_bytes(&catalog_bytes, &signature) {
+            errors.push(err.to_string());
+        }
+    }
+
+    let catalog: CatalogDocument = serde_json::from_slice(&catalog_bytes)
+        .with_context(|| format!("parsing signed base catalog {}", catalog_path.display()))?;
+    let mut model_ids = BTreeSet::new();
+    validate_catalog(&catalog, &mut errors);
+    for model in &catalog.models {
+        if !model_ids.insert(model.model_id.clone()) {
+            errors.push(format!("duplicate model_id {}", model.model_id));
+        }
+        validate_model(model, &mut errors);
+    }
+    if catalog.models.is_empty() {
+        errors.push("signed base catalog must contain at least one model".to_owned());
+    }
+    if !errors.is_empty() {
+        bail!(
+            "signed base catalog verification failed: {}",
+            errors.join("; ")
+        );
+    }
+    Ok(catalog_hash)
+}
+
 pub(crate) fn load_document(path: &Path) -> Result<CatalogDocument> {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
@@ -889,6 +940,7 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
     validate_model_caps_modalities(model, errors);
     validate_model_modality_assessment(model, errors);
     validate_model_adapter(model, errors);
+    validate_chatterbox_endpoint_surface(model, errors);
     validate_stable_diffusion_endpoint_ranges(model, errors);
     validate_model_specialities(model, errors);
     validate_model_sampling(model, errors);
@@ -953,6 +1005,197 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
         ));
     }
     validate_price_ref(model, errors);
+}
+
+fn validate_chatterbox_endpoint_surface(model: &CatalogModel, errors: &mut Vec<String>) {
+    if !model
+        .artifacts
+        .values()
+        .any(|artifact| artifact.engine == "chatterbox")
+    {
+        return;
+    }
+
+    let expected_families = BTreeSet::from([
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH,
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH,
+    ]);
+    let actual_families = model
+        .adapter
+        .endpoint_families
+        .iter()
+        .map(|contract| contract.family.as_str())
+        .collect::<BTreeSet<_>>();
+    if actual_families != expected_families {
+        errors.push(format!(
+            "{} chatterbox artifacts must expose exactly openai_audio_speech and hf_text_to_speech",
+            model.model_id
+        ));
+    }
+
+    for contract in &model.adapter.endpoint_families {
+        let (request_attributes, required_request_attributes) = match contract.family.as_str() {
+            mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH => (
+                CHATTERBOX_OPENAI_REQUEST_ATTRIBUTES,
+                CHATTERBOX_OPENAI_REQUIRED_REQUEST_ATTRIBUTES,
+            ),
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH => (
+                CHATTERBOX_HF_REQUEST_ATTRIBUTES,
+                CHATTERBOX_HF_REQUIRED_REQUEST_ATTRIBUTES,
+            ),
+            _ => continue,
+        };
+        validate_chatterbox_attribute_set(
+            model,
+            contract,
+            "request_attributes",
+            &contract.request_attributes,
+            request_attributes,
+            errors,
+        );
+        validate_chatterbox_attribute_set(
+            model,
+            contract,
+            "required_request_attributes",
+            &contract.required_request_attributes,
+            required_request_attributes,
+            errors,
+        );
+        validate_chatterbox_attribute_set(
+            model,
+            contract,
+            "response_attributes",
+            &contract.response_attributes,
+            CHATTERBOX_RESPONSE_ATTRIBUTES,
+            errors,
+        );
+        validate_chatterbox_attribute_set(
+            model,
+            contract,
+            "required_response_attributes",
+            &contract.required_response_attributes,
+            CHATTERBOX_RESPONSE_ATTRIBUTES,
+            errors,
+        );
+
+        let (voice_path, response_format_path, controls) = match contract.family.as_str() {
+            mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH => (
+                "voice",
+                Some("response_format"),
+                CHATTERBOX_OPENAI_CONTROL_SPECS,
+            ),
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH => {
+                ("parameters.voice", None, CHATTERBOX_HF_CONTROL_SPECS)
+            }
+            _ => unreachable!(),
+        };
+        validate_chatterbox_singleton_string_spec(
+            model, contract, voice_path, "default", true, errors,
+        );
+        if let Some(path) = response_format_path {
+            validate_chatterbox_singleton_string_spec(model, contract, path, "wav", true, errors);
+        }
+        for (path, value_type, default, minimum, maximum) in controls {
+            validate_chatterbox_numeric_spec(
+                model,
+                contract,
+                path,
+                *value_type,
+                *default,
+                *minimum,
+                *maximum,
+                errors,
+            );
+        }
+    }
+
+    if let Some(openai) = model
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH)
+    {
+        validate_chatterbox_singleton_string_spec(
+            model,
+            openai,
+            "model",
+            &model.model_id,
+            false,
+            errors,
+        );
+    }
+}
+
+fn validate_chatterbox_attribute_set(
+    model: &CatalogModel,
+    contract: &EndpointFamilyContract,
+    label: &str,
+    actual: &[String],
+    expected: &[&str],
+    errors: &mut Vec<String>,
+) {
+    let actual = actual.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+    if actual != expected {
+        errors.push(format!(
+            "{} chatterbox endpoint family {} {label} must match the calibrated surface exactly",
+            model.model_id, contract.family
+        ));
+    }
+}
+
+fn validate_chatterbox_singleton_string_spec(
+    model: &CatalogModel,
+    contract: &EndpointFamilyContract,
+    path: &str,
+    value: &str,
+    has_default: bool,
+    errors: &mut Vec<String>,
+) {
+    let Some(spec) = contract.request_attribute_specs.get(path) else {
+        return;
+    };
+    let value = Value::String(value.to_owned());
+    let expected_default = has_default.then_some(&value);
+    if spec.value_types != [EndpointValueType::String]
+        || spec.enum_values != [value.clone()]
+        || spec.default.as_ref() != expected_default
+        || spec.calibration_values != [value]
+    {
+        errors.push(format!(
+            "{} chatterbox endpoint family {} request spec {path} must expose only its calibrated fixed value",
+            model.model_id, contract.family
+        ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_chatterbox_numeric_spec(
+    model: &CatalogModel,
+    contract: &EndpointFamilyContract,
+    path: &str,
+    value_type: EndpointValueType,
+    default: f64,
+    minimum: f64,
+    maximum: f64,
+    errors: &mut Vec<String>,
+) {
+    let Some(spec) = contract.request_attribute_specs.get(path) else {
+        return;
+    };
+    if spec.value_types != [value_type]
+        || spec.default.as_ref().and_then(Value::as_f64) != Some(default)
+        || spec.minimum != Some(minimum)
+        || spec.maximum != Some(maximum)
+        || !spec.enum_values.is_empty()
+        || spec.calibration_values.len() != 1
+        || spec.calibration_values[0].as_f64() != Some(default)
+    {
+        errors.push(format!(
+            "{} chatterbox endpoint family {} request spec {path} must match the calibrated type, default, and range",
+            model.model_id, contract.family
+        ));
+    }
 }
 
 fn validate_stable_diffusion_endpoint_ranges(model: &CatalogModel, errors: &mut Vec<String>) {
@@ -3010,14 +3253,22 @@ fn validate_endpoint_attribute_spec(
     {
         errors.push(format!("{label} has invalid array-length bounds"));
     }
-    if standard.minimum.is_some() && spec.minimum.is_none() {
+    let scalar_enum_is_within_standard = !spec.enum_values.is_empty()
+        && !spec
+            .value_types
+            .contains(&mayhem_proto::EndpointValueType::Array)
+        && spec
+            .enum_values
+            .iter()
+            .all(|value| mayhem_proto::validate_endpoint_attribute_value(standard, value).is_ok());
+    if standard.minimum.is_some() && spec.minimum.is_none() && !scalar_enum_is_within_standard {
         errors.push(format!("{label} omits the task-standard minimum"));
     } else if let (Some(standard_minimum), Some(minimum)) = (standard.minimum, spec.minimum) {
         if minimum < standard_minimum {
             errors.push(format!("{label} widens the task-standard minimum"));
         }
     }
-    if standard.maximum.is_some() && spec.maximum.is_none() {
+    if standard.maximum.is_some() && spec.maximum.is_none() && !scalar_enum_is_within_standard {
         errors.push(format!("{label} omits the task-standard maximum"));
     } else if let (Some(standard_maximum), Some(maximum)) = (standard.maximum, spec.maximum) {
         if maximum > standard_maximum {
@@ -3026,7 +3277,10 @@ fn validate_endpoint_attribute_spec(
     }
     if let Some(standard_multiple) = standard.multiple_of {
         match spec.multiple_of {
-            None => errors.push(format!("{label} omits the task-standard multiple_of")),
+            None if !scalar_enum_is_within_standard => {
+                errors.push(format!("{label} omits the task-standard multiple_of"));
+            }
+            None => {}
             Some(multiple) if multiple.is_finite() && multiple > 0.0 => {
                 let quotient = multiple / standard_multiple;
                 let tolerance = f64::EPSILON * quotient.abs().max(1.0) * 8.0;
@@ -3039,14 +3293,16 @@ fn validate_endpoint_attribute_spec(
             Some(_) => {}
         }
     }
-    if standard.min_length.is_some() && spec.min_length.is_none() {
+    if standard.min_length.is_some() && spec.min_length.is_none() && !scalar_enum_is_within_standard
+    {
         errors.push(format!("{label} omits the task-standard minimum length"));
     } else if let (Some(standard_minimum), Some(minimum)) = (standard.min_length, spec.min_length) {
         if minimum < standard_minimum {
             errors.push(format!("{label} widens the task-standard minimum length"));
         }
     }
-    if standard.max_length.is_some() && spec.max_length.is_none() {
+    if standard.max_length.is_some() && spec.max_length.is_none() && !scalar_enum_is_within_standard
+    {
         errors.push(format!("{label} omits the task-standard maximum length"));
     } else if let (Some(standard_maximum), Some(maximum)) = (standard.max_length, spec.max_length) {
         if maximum > standard_maximum {
@@ -3311,6 +3567,7 @@ fn validate_artifact(
             | "vllm"
             | "stable-diffusion.cpp"
             | "ace-step"
+            | "chatterbox"
             | "sulphur"
             | "transformers-asr"
             | "whisper.cpp"
@@ -3453,6 +3710,63 @@ fn validate_artifact(
             if !required.contains(sidecar_name.as_str()) {
                 errors.push(format!(
                     "{model_id}/{name} ace-step artifact has unapproved sidecar {sidecar_name}"
+                ));
+            }
+        }
+    }
+    if artifact.engine == "chatterbox" {
+        let upstream = artifact
+            .upstream_source
+            .as_ref()
+            .unwrap_or(&artifact.source);
+        if artifact.source.kind != "huggingface"
+            || upstream.kind != "huggingface"
+            || upstream.repo != CHATTERBOX_MODEL_REPO
+            || upstream.revision != mayhem_engine::CHATTERBOX_MODEL_REVISION
+        {
+            errors.push(format!(
+                "{model_id}/{name} chatterbox upstream source must be huggingface {CHATTERBOX_MODEL_REPO}@{}",
+                mayhem_engine::CHATTERBOX_MODEL_REVISION
+            ));
+        }
+        if artifact.path != CHATTERBOX_PRIMARY_PATH {
+            errors.push(format!(
+                "{model_id}/{name} chatterbox primary artifact must use path {CHATTERBOX_PRIMARY_PATH}, got {}",
+                artifact.path
+            ));
+        }
+        for (required, expected_path) in CHATTERBOX_REQUIRED_SIDECARS {
+            match artifact.sidecars.get(*required) {
+                Some(sidecar) => {
+                    let upstream = sidecar.upstream_source.as_ref().unwrap_or(&sidecar.source);
+                    if sidecar.path != *expected_path
+                        || sidecar.source != artifact.source
+                        || upstream.kind != "huggingface"
+                        || upstream.repo != CHATTERBOX_MODEL_REPO
+                        || upstream.revision != mayhem_engine::CHATTERBOX_MODEL_REVISION
+                    {
+                        errors.push(format!(
+                            "{model_id}/{name} chatterbox sidecar {required} must share the primary release source and bind upstream {CHATTERBOX_MODEL_REPO}@{} path {expected_path}, got {}@{} path {}",
+                            mayhem_engine::CHATTERBOX_MODEL_REVISION,
+                            sidecar.source.repo,
+                            sidecar.source.revision,
+                            sidecar.path
+                        ));
+                    }
+                }
+                None => errors.push(format!(
+                    "{model_id}/{name} chatterbox artifact needs sidecar {required}"
+                )),
+            }
+        }
+        let required = CHATTERBOX_REQUIRED_SIDECARS
+            .iter()
+            .map(|(sidecar, _)| *sidecar)
+            .collect::<BTreeSet<_>>();
+        for sidecar_name in artifact.sidecars.keys() {
+            if !required.contains(sidecar_name.as_str()) {
+                errors.push(format!(
+                    "{model_id}/{name} chatterbox artifact has unapproved sidecar {sidecar_name}"
                 ));
             }
         }
@@ -3694,6 +4008,121 @@ const SULPHUR_PROMPT_ENHANCER_MODEL_PATH: &str =
     "prompt_enhancer_uncensored/prompt_enhancer_uncensored-q8_0.gguf";
 const SULPHUR_PROMPT_ENHANCER_PROJECTOR_PATH: &str =
     "prompt_enhancer_uncensored/mmproj-prompt_enhancer_uncensored.gguf";
+const CHATTERBOX_MODEL_REPO: &str = "ResembleAI/chatterbox";
+const CHATTERBOX_PRIMARY_PATH: &str = "t3_cfg.safetensors";
+const CHATTERBOX_OPENAI_REQUEST_ATTRIBUTES: &[&str] = &[
+    "model",
+    "input",
+    "voice",
+    "response_format",
+    "reference_audio",
+    "reference_audio.data",
+    "reference_audio.encoding",
+    "reference_audio.content_type",
+    "exaggeration",
+    "cfg_weight",
+    "temperature",
+    "min_p",
+    "top_p",
+    "repetition_penalty",
+    "seed",
+];
+const CHATTERBOX_OPENAI_REQUIRED_REQUEST_ATTRIBUTES: &[&str] = &["model", "input", "voice"];
+const CHATTERBOX_HF_REQUEST_ATTRIBUTES: &[&str] = &[
+    "inputs",
+    "parameters.generation_parameters.temperature",
+    "parameters.generation_parameters.top_p",
+    "parameters.voice",
+    "parameters.reference_audio",
+    "parameters.reference_audio.data",
+    "parameters.reference_audio.encoding",
+    "parameters.reference_audio.content_type",
+    "parameters.exaggeration",
+    "parameters.cfg_weight",
+    "parameters.seed",
+    "parameters.generation_parameters.min_p",
+    "parameters.generation_parameters.repetition_penalty",
+];
+const CHATTERBOX_HF_REQUIRED_REQUEST_ATTRIBUTES: &[&str] = &["inputs"];
+const CHATTERBOX_RESPONSE_ATTRIBUTES: &[&str] = &["audio", "content_type", "usage", "mayhem"];
+const CHATTERBOX_OPENAI_CONTROL_SPECS: &[(&str, EndpointValueType, f64, f64, f64)] = &[
+    ("exaggeration", EndpointValueType::Number, 0.5, 0.25, 2.0),
+    ("cfg_weight", EndpointValueType::Number, 0.5, 0.0, 1.0),
+    ("temperature", EndpointValueType::Number, 0.8, 0.05, 5.0),
+    ("min_p", EndpointValueType::Number, 0.05, 0.0, 1.0),
+    ("top_p", EndpointValueType::Number, 1.0, 0.0, 1.0),
+    (
+        "repetition_penalty",
+        EndpointValueType::Number,
+        1.2,
+        1.0,
+        2.0,
+    ),
+    (
+        "seed",
+        EndpointValueType::Integer,
+        7.0,
+        0.0,
+        u32::MAX as f64,
+    ),
+];
+const CHATTERBOX_HF_CONTROL_SPECS: &[(&str, EndpointValueType, f64, f64, f64)] = &[
+    (
+        "parameters.exaggeration",
+        EndpointValueType::Number,
+        0.5,
+        0.25,
+        2.0,
+    ),
+    (
+        "parameters.cfg_weight",
+        EndpointValueType::Number,
+        0.5,
+        0.0,
+        1.0,
+    ),
+    (
+        "parameters.generation_parameters.temperature",
+        EndpointValueType::Number,
+        0.8,
+        0.05,
+        5.0,
+    ),
+    (
+        "parameters.generation_parameters.min_p",
+        EndpointValueType::Number,
+        0.05,
+        0.0,
+        1.0,
+    ),
+    (
+        "parameters.generation_parameters.top_p",
+        EndpointValueType::Number,
+        1.0,
+        0.0,
+        1.0,
+    ),
+    (
+        "parameters.generation_parameters.repetition_penalty",
+        EndpointValueType::Number,
+        1.2,
+        1.0,
+        2.0,
+    ),
+    (
+        "parameters.seed",
+        EndpointValueType::Integer,
+        7.0,
+        0.0,
+        u32::MAX as f64,
+    ),
+];
+const CHATTERBOX_REQUIRED_SIDECARS: &[(&str, &str)] = &[
+    ("chatterbox_voice_encoder", "ve.safetensors"),
+    ("chatterbox_s3gen", "s3gen.safetensors"),
+    ("chatterbox_tokenizer", "tokenizer.json"),
+    ("chatterbox_default_conditionals", "conds.pt"),
+];
 
 fn validate_artifact_sidecar(
     model_id: &str,
@@ -4465,6 +4894,158 @@ mod tests {
     }
 
     #[test]
+    fn scalar_enum_can_narrow_task_standard_string_bounds() {
+        let contract =
+            endpoint_contract_template(mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH).unwrap();
+        let standard = &contract.request_attribute_specs["parameters.voice"];
+        let mut spec = standard.clone();
+        spec.min_length = None;
+        spec.max_length = None;
+        spec.enum_values = vec![serde_json::json!("default")];
+        spec.default = Some(serde_json::json!("default"));
+        spec.calibration_values = vec![serde_json::json!("default")];
+
+        let mut errors = Vec::new();
+        validate_endpoint_attribute_spec(
+            "admin/tts",
+            &contract.family,
+            "request",
+            "parameters.voice",
+            &spec,
+            standard,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        spec.enum_values = vec![serde_json::json!("")];
+        spec.default = Some(serde_json::json!(""));
+        spec.calibration_values = vec![serde_json::json!("")];
+        validate_endpoint_attribute_spec(
+            "admin/tts",
+            &contract.family,
+            "request",
+            "parameters.voice",
+            &spec,
+            standard,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("omits the task-standard minimum length")));
+    }
+
+    #[test]
+    fn chatterbox_endpoint_surface_is_exact_and_source_bound() {
+        let mut model = verification_test_model(
+            "ResembleAI/chatterbox",
+            MODEL_CLASS_TTS,
+            "chatterbox",
+            CanaryRef {
+                set_id: "canary-tts-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_AUDIO_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: Some(1_000),
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
+            },
+        );
+
+        for contract in &mut model.adapter.endpoint_families {
+            let (request_attributes, required_request_attributes, controls) =
+                match contract.family.as_str() {
+                    mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH => (
+                        CHATTERBOX_OPENAI_REQUEST_ATTRIBUTES,
+                        CHATTERBOX_OPENAI_REQUIRED_REQUEST_ATTRIBUTES,
+                        CHATTERBOX_OPENAI_CONTROL_SPECS,
+                    ),
+                    mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH => (
+                        CHATTERBOX_HF_REQUEST_ATTRIBUTES,
+                        CHATTERBOX_HF_REQUIRED_REQUEST_ATTRIBUTES,
+                        CHATTERBOX_HF_CONTROL_SPECS,
+                    ),
+                    family => panic!("unexpected TTS family {family}"),
+                };
+            contract.request_attributes = request_attributes
+                .iter()
+                .map(|attribute| (*attribute).to_owned())
+                .collect();
+            contract.required_request_attributes = required_request_attributes
+                .iter()
+                .map(|attribute| (*attribute).to_owned())
+                .collect();
+            contract.response_attributes = CHATTERBOX_RESPONSE_ATTRIBUTES
+                .iter()
+                .map(|attribute| (*attribute).to_owned())
+                .collect();
+            contract.required_response_attributes = contract.response_attributes.clone();
+            contract
+                .request_attribute_specs
+                .retain(|path, _| request_attributes.contains(&path.as_str()));
+            contract
+                .response_attribute_specs
+                .retain(|path, _| CHATTERBOX_RESPONSE_ATTRIBUTES.contains(&path.as_str()));
+
+            for (path, value_type, default, minimum, maximum) in controls {
+                let spec = contract.request_attribute_specs.get_mut(*path).unwrap();
+                spec.value_types = vec![*value_type];
+                spec.default = Some(serde_json::json!(default));
+                spec.enum_values.clear();
+                spec.minimum = Some(*minimum);
+                spec.maximum = Some(*maximum);
+                spec.calibration_values = vec![serde_json::json!(default)];
+            }
+            let voice_path = if contract.family == mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH {
+                let model_spec = contract.request_attribute_specs.get_mut("model").unwrap();
+                model_spec.default = None;
+                model_spec.enum_values = vec![serde_json::json!(model.model_id)];
+                model_spec.calibration_values = vec![serde_json::json!(model.model_id)];
+                let format_spec = contract
+                    .request_attribute_specs
+                    .get_mut("response_format")
+                    .unwrap();
+                format_spec.default = Some(serde_json::json!("wav"));
+                format_spec.enum_values = vec![serde_json::json!("wav")];
+                format_spec.calibration_values = vec![serde_json::json!("wav")];
+                "voice"
+            } else {
+                "parameters.voice"
+            };
+            let voice_spec = contract
+                .request_attribute_specs
+                .get_mut(voice_path)
+                .unwrap();
+            voice_spec.value_types = vec![EndpointValueType::String];
+            voice_spec.default = Some(serde_json::json!("default"));
+            voice_spec.enum_values = vec![serde_json::json!("default")];
+            voice_spec.min_length = None;
+            voice_spec.max_length = None;
+            voice_spec.calibration_values = vec![serde_json::json!("default")];
+        }
+
+        let mut errors = Vec::new();
+        validate_chatterbox_endpoint_surface(&model, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        model
+            .adapter
+            .endpoint_families
+            .iter_mut()
+            .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH)
+            .unwrap()
+            .request_attributes
+            .push("speed".to_owned());
+        validate_chatterbox_endpoint_surface(&model, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("request_attributes must match")));
+    }
+
+    #[test]
     fn absent_catalog_attestation_authority_is_tier1_only() {
         let authority: CatalogAttestationAuthority =
             serde_json::from_value(serde_json::json!({ "models": [] })).unwrap();
@@ -4638,6 +5219,150 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("unapproved sidecar provider_code")));
+    }
+
+    #[test]
+    fn chatterbox_artifact_requires_the_exact_pinned_model_inventory() {
+        let mut model = verification_test_model(
+            "resembleai/chatterbox@pytorch",
+            MODEL_CLASS_TTS,
+            "chatterbox",
+            CanaryRef {
+                set_id: "canary-tts-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_AUDIO_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: Some(1_000),
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
+            },
+        );
+        {
+            let artifact = model.artifacts.get_mut("fixture").unwrap();
+            artifact.engine = "chatterbox".to_owned();
+            artifact.source.kind = "huggingface".to_owned();
+            artifact.source.repo = CHATTERBOX_MODEL_REPO.to_owned();
+            artifact.source.revision = mayhem_engine::CHATTERBOX_MODEL_REVISION.to_owned();
+            artifact.path = CHATTERBOX_PRIMARY_PATH.to_owned();
+            artifact.sidecars = CHATTERBOX_REQUIRED_SIDECARS
+                .iter()
+                .enumerate()
+                .map(|(index, (name, path))| {
+                    (
+                        (*name).to_owned(),
+                        CatalogArtifactSidecar {
+                            source: artifact.source.clone(),
+                            upstream_source: None,
+                            path: (*path).to_owned(),
+                            artifact_root: format!("{index:064x}"),
+                            artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                            weights_bytes: 1,
+                            source_sha256: format!("{:064x}", index + 1),
+                        },
+                    )
+                })
+                .collect();
+        }
+        let artifact = model.artifacts["fixture"].clone();
+
+        let mut errors = Vec::new();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            &artifact,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        let mut mirrored = artifact.clone();
+        let canonical_upstream = mirrored.source.clone();
+        mirrored.upstream_source = Some(canonical_upstream.clone());
+        mirrored.source.repo = "admin/chatterbox-release".to_owned();
+        mirrored.source.revision = "a".repeat(40);
+        for sidecar in mirrored.sidecars.values_mut() {
+            sidecar.upstream_source = Some(canonical_upstream.clone());
+            sidecar.source = mirrored.source.clone();
+        }
+        errors.clear();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            &mirrored,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        let mut missing = artifact.clone();
+        missing.sidecars.remove("chatterbox_s3gen");
+        errors.clear();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            &missing,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("needs sidecar chatterbox_s3gen")));
+
+        let mut mutable_revision = artifact.clone();
+        mutable_revision.source.revision = "f".repeat(40);
+        errors.clear();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            &mutable_revision,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("chatterbox upstream source must be huggingface")));
+
+        let mut split_release = mirrored;
+        split_release
+            .sidecars
+            .get_mut("chatterbox_s3gen")
+            .unwrap()
+            .source
+            .revision = "b".repeat(40);
+        errors.clear();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            &split_release,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("must share the primary release source")));
+
+        let mut extra = artifact.clone();
+        extra.sidecars.insert(
+            "provider_local_voice".to_owned(),
+            CatalogArtifactSidecar {
+                source: artifact.source.clone(),
+                upstream_source: None,
+                path: "provider-local.pt".to_owned(),
+                artifact_root: "a".repeat(64),
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 1,
+                source_sha256: "b".repeat(64),
+            },
+        );
+        errors.clear();
+        validate_artifact(&model.model_id, &model.tier, "fixture", &extra, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unapproved sidecar provider_local_voice")));
     }
 
     #[test]

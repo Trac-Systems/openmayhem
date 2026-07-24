@@ -206,6 +206,7 @@ const DEFAULT_GATEWAY_MAX_CHAT_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
 const DEFAULT_GATEWAY_MAX_CHAT_IMAGE_PIXELS: u64 = 40_000_000;
 const DEFAULT_GATEWAY_MAX_CHAT_AUDIO_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_GATEWAY_MAX_CHAT_AUDIO_SECONDS: u64 = 3_600;
+const MAX_AUDIO_SPEECH_OUTPUT_SECONDS: u64 = 120;
 const DEFAULT_GATEWAY_MAX_CHAT_VIDEO_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_GATEWAY_MAX_CHAT_VIDEO_FRAMES: u64 = 64;
 const GATEWAY_MEDIA_SCHEMA_MAX_ITEMS: u32 = 1_024;
@@ -2120,6 +2121,22 @@ pub struct AudioSpeechRequest {
     pub instructions: Option<String>,
     #[serde(default)]
     pub stream_format: Option<String>,
+    #[serde(default)]
+    pub reference_audio: Option<Value>,
+    #[serde(default)]
+    pub exaggeration: Option<f64>,
+    #[serde(default)]
+    pub cfg_weight: Option<f64>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub min_p: Option<f64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f64>,
+    #[serde(default)]
+    pub seed: Option<u64>,
     #[serde(skip)]
     pub endpoint_family: Option<String>,
     #[serde(skip)]
@@ -8934,6 +8951,9 @@ fn hf_audio_speech_request(
         .ok_or_else(|| ApiError::bad_request("request missing inputs", Some("inputs")))?
         .to_owned();
     let parameters = raw_request.get("parameters").unwrap_or(&Value::Null);
+    let generation_parameters = parameters
+        .get("generation_parameters")
+        .unwrap_or(&Value::Null);
     let voice = parameters
         .get("voice")
         .or_else(|| parameters.get("speaker_id"))
@@ -8951,6 +8971,18 @@ fn hf_audio_speech_request(
         speed: parameters.get("speed").and_then(Value::as_f64),
         instructions: None,
         stream_format: None,
+        reference_audio: parameters.get("reference_audio").cloned(),
+        exaggeration: parameters.get("exaggeration").and_then(Value::as_f64),
+        cfg_weight: parameters.get("cfg_weight").and_then(Value::as_f64),
+        temperature: generation_parameters
+            .get("temperature")
+            .and_then(Value::as_f64),
+        min_p: generation_parameters.get("min_p").and_then(Value::as_f64),
+        top_p: generation_parameters.get("top_p").and_then(Value::as_f64),
+        repetition_penalty: generation_parameters
+            .get("repetition_penalty")
+            .and_then(Value::as_f64),
+        seed: parameters.get("seed").and_then(Value::as_u64),
         endpoint_family: Some(mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH.to_owned()),
         endpoint_request: Some(raw_request),
     })
@@ -14559,6 +14591,34 @@ fn direct_session_audio_speech_request_body(request: &AudioSpeechRequest) -> Val
         "stream_format",
         request.stream_format.as_ref().map(|value| json!(value)),
     );
+    set_optional_json(
+        &mut body,
+        "reference_audio",
+        request.reference_audio.as_ref().cloned(),
+    );
+    set_optional_json(
+        &mut body,
+        "exaggeration",
+        request.exaggeration.map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "cfg_weight",
+        request.cfg_weight.map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "temperature",
+        request.temperature.map(|value| json!(value)),
+    );
+    set_optional_json(&mut body, "min_p", request.min_p.map(|value| json!(value)));
+    set_optional_json(&mut body, "top_p", request.top_p.map(|value| json!(value)));
+    set_optional_json(
+        &mut body,
+        "repetition_penalty",
+        request.repetition_penalty.map(|value| json!(value)),
+    );
+    set_optional_json(&mut body, "seed", request.seed.map(|value| json!(value)));
     body
 }
 
@@ -15974,13 +16034,25 @@ async fn collect_direct_session_embedding_output(
     }
 
     let completed_at_millis = now_millis_u64();
+    let embeddings = embeddings.ok_or_else(|| {
+        GatewaySessionError::new(format!(
+            "provider embedding session {session_id} ended without embeddings"
+        ))
+    })?;
+    if embeddings.len() != inputs.len() {
+        return Err(GatewaySessionError::new(format!(
+            "provider embedding session {session_id} returned {} embedding(s), expected {}",
+            embeddings.len(),
+            inputs.len()
+        )));
+    }
+    let observed_usage = embedding_usage_for_inputs(inputs);
+    if let Some(reported_usage) = usage.as_ref() {
+        ensure_reported_token_usage_matches(reported_usage, &observed_usage, "embedding session")?;
+    }
     let output = EmbeddingOutput {
-        embeddings: embeddings.ok_or_else(|| {
-            GatewaySessionError::new(format!(
-                "provider embedding session {session_id} ended without embeddings"
-            ))
-        })?,
-        usage: usage.unwrap_or_else(|| embedding_usage_for_inputs(inputs)),
+        embeddings,
+        usage: observed_usage,
     };
     let quality = provider_quality.or_else(|| {
         watchdog
@@ -16107,8 +16179,22 @@ async fn collect_direct_session_image_generation_output(
             "provider image session {session_id} finished without image artifacts"
         )));
     }
-    let usage =
-        usage.unwrap_or_else(|| image_generation_usage_for_observed(request, artifacts.len()));
+    let expected_artifacts = usize::try_from(image_generation_count(request)).map_err(|_| {
+        GatewaySessionError::new("signed image count exceeds this gateway platform")
+    })?;
+    if artifacts.len() != expected_artifacts {
+        return Err(GatewaySessionError::new(format!(
+            "provider image session {session_id} returned {} artifact(s), expected {expected_artifacts}",
+            artifacts.len()
+        )));
+    }
+    let observed_usage = image_generation_usage_for_observed(request, artifacts.len());
+    ensure_optional_reported_receipt_usage_matches(
+        usage.as_ref(),
+        &observed_usage,
+        "image generation session",
+    )?;
+    let usage = observed_usage;
     let quality = provider_quality.or_else(|| {
         watchdog
             .first_delta_at_millis
@@ -16234,7 +16320,13 @@ async fn collect_direct_session_audio_speech_output(
             "provider audio speech session {session_id} finished without audio artifacts"
         )));
     }
-    let usage = usage.unwrap_or_else(|| audio_speech_usage_for_observed(request, &artifacts));
+    let observed_usage = audio_speech_usage_for_observed(request, &artifacts)?;
+    ensure_optional_reported_receipt_usage_matches(
+        usage.as_ref(),
+        &observed_usage,
+        "audio speech session",
+    )?;
+    let usage = observed_usage;
     let quality = provider_quality.or_else(|| {
         watchdog
             .first_delta_at_millis
@@ -16368,7 +16460,23 @@ async fn collect_direct_session_artifact_generation_output(
             request.output_modality, request.output_modality
         )));
     }
-    let usage = usage.unwrap_or_else(|| artifact_generation_usage_for_request(request));
+    let expected_artifacts = usize::try_from(request.artifact_count).map_err(|_| {
+        GatewaySessionError::new("signed artifact count exceeds this gateway platform")
+    })?;
+    if artifacts.len() != expected_artifacts {
+        return Err(GatewaySessionError::new(format!(
+            "provider {} generation session {session_id} returned {} artifact(s), expected {expected_artifacts}",
+            request.output_modality,
+            artifacts.len()
+        )));
+    }
+    let observed_usage = artifact_generation_usage_for_request(request);
+    ensure_optional_reported_receipt_usage_matches(
+        usage.as_ref(),
+        &observed_usage,
+        "artifact generation session",
+    )?;
+    let usage = observed_usage;
     let throughput_units = if request.output_modality == "video" {
         usage.get(USAGE_FRAME)
     } else {
@@ -16552,7 +16660,13 @@ async fn collect_direct_session_audio_transcription_output(
         }
     };
     let completed_at_millis = now_millis_u64();
-    let usage = usage.unwrap_or_else(|| audio_transcription_usage_for_request(request));
+    let observed_usage = audio_transcription_usage_for_request(request);
+    ensure_optional_reported_receipt_usage_matches(
+        usage.as_ref(),
+        &observed_usage,
+        "audio transcription session",
+    )?;
+    let usage = observed_usage;
     let quality = provider_quality.or_else(|| {
         watchdog
             .first_delta_at_millis
@@ -17286,7 +17400,9 @@ fn direct_session_embedding_receipt_ack(
             "receipt co-signing refused; session paused",
         ));
     }
-    let expected = expected_embedding_provider_receipt(model, inputs, output, provider, invocation);
+    let expected =
+        expected_embedding_provider_receipt(model, inputs, output, provider, invocation)?;
+    ensure_final_receipt_within_voucher(invocation, expected.au_owed_cum)?;
     validate_provider_receipt(model, invocation, provider_receipt, expected)?;
     receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
         GatewaySessionError::new(format!(
@@ -17309,7 +17425,8 @@ fn direct_session_image_generation_receipt_ack(
         ));
     }
     let expected =
-        expected_image_generation_provider_receipt(model, request, output, provider, invocation);
+        expected_image_generation_provider_receipt(model, request, output, provider, invocation)?;
+    ensure_final_receipt_within_voucher(invocation, expected.au_owed_cum)?;
     validate_provider_receipt(model, invocation, provider_receipt, expected)?;
     receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
         GatewaySessionError::new(format!(
@@ -17332,7 +17449,8 @@ fn direct_session_audio_speech_receipt_ack(
         ));
     }
     let expected =
-        expected_audio_speech_provider_receipt(model, request, output, provider, invocation);
+        expected_audio_speech_provider_receipt(model, request, output, provider, invocation)?;
+    ensure_final_receipt_within_voucher(invocation, expected.au_owed_cum)?;
     validate_provider_receipt(model, invocation, provider_receipt, expected)?;
     receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
         GatewaySessionError::new(format!(
@@ -17354,8 +17472,10 @@ fn direct_session_audio_transcription_receipt_ack(
             "receipt co-signing refused; session paused",
         ));
     }
-    let expected =
-        expected_audio_transcription_provider_receipt(model, request, output, provider, invocation);
+    let expected = expected_audio_transcription_provider_receipt(
+        model, request, output, provider, invocation,
+    )?;
+    ensure_final_receipt_within_voucher(invocation, expected.au_owed_cum)?;
     validate_provider_receipt(model, invocation, provider_receipt, expected)?;
     receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
         GatewaySessionError::new(format!(
@@ -17377,8 +17497,10 @@ fn direct_session_artifact_generation_receipt_ack(
             "receipt co-signing refused; session paused",
         ));
     }
-    let expected =
-        expected_artifact_generation_provider_receipt(model, request, output, provider, invocation);
+    let expected = expected_artifact_generation_provider_receipt(
+        model, request, output, provider, invocation,
+    )?;
+    ensure_final_receipt_within_voucher(invocation, expected.au_owed_cum)?;
     validate_provider_receipt(model, invocation, provider_receipt, expected)?;
     receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
         GatewaySessionError::new(format!(
@@ -17613,22 +17735,60 @@ fn direct_session_partial_receipt_ack(
     })
 }
 
+fn authoritative_embedding_usage(
+    inputs: &[String],
+    output: &EmbeddingOutput,
+) -> Result<ReceiptUsage, GatewaySessionError> {
+    if output.embeddings.len() != inputs.len() {
+        return Err(GatewaySessionError::new(format!(
+            "provider returned {} embedding(s), expected {}",
+            output.embeddings.len(),
+            inputs.len()
+        )));
+    }
+    let observed = embedding_usage_for_inputs(inputs);
+    ensure_reported_token_usage_matches(&output.usage, &observed, "embedding session")?;
+    Ok(ReceiptUsage::text(observed.prompt_tokens, 0))
+}
+
 fn expected_embedding_provider_receipt<'a>(
     _model: &GatewayModel,
     inputs: &[String],
     output: &EmbeddingOutput,
     provider: &'a str,
     invocation: &GatewaySessionInvocation,
-) -> ExpectedProviderReceipt<'a> {
-    let usage = ReceiptUsage::text(output.usage.prompt_tokens, 0);
-    ExpectedProviderReceipt {
+) -> Result<ExpectedProviderReceipt<'a>, GatewaySessionError> {
+    let usage = authoritative_embedding_usage(inputs, output)?;
+    Ok(ExpectedProviderReceipt {
         provider,
         seq: 1,
         final_receipt: true,
         au_owed_cum: calculate_locked_au_owed(invocation, &usage),
         prompt_hash: blake3_hex(embedding_prompt_text(inputs).as_bytes()),
         usage,
+    })
+}
+
+fn authoritative_image_generation_usage(
+    request: &ImageGenerationRequest,
+    output: &ImageGenerationOutput,
+) -> Result<ReceiptUsage, GatewaySessionError> {
+    let expected_artifacts = usize::try_from(image_generation_count(request)).map_err(|_| {
+        GatewaySessionError::new("signed image count exceeds this gateway platform")
+    })?;
+    if output.artifacts.len() != expected_artifacts {
+        return Err(GatewaySessionError::new(format!(
+            "provider returned {} image artifact(s), expected {expected_artifacts}",
+            output.artifacts.len()
+        )));
     }
+    let usage = image_generation_usage_for_observed(request, output.artifacts.len());
+    ensure_optional_reported_receipt_usage_matches(
+        Some(&output.usage),
+        &usage,
+        "image generation session",
+    )?;
+    Ok(usage)
 }
 
 fn expected_image_generation_provider_receipt<'a>(
@@ -17637,16 +17797,29 @@ fn expected_image_generation_provider_receipt<'a>(
     output: &ImageGenerationOutput,
     provider: &'a str,
     invocation: &GatewaySessionInvocation,
-) -> ExpectedProviderReceipt<'a> {
-    let usage = output.usage.clone();
-    ExpectedProviderReceipt {
+) -> Result<ExpectedProviderReceipt<'a>, GatewaySessionError> {
+    let usage = authoritative_image_generation_usage(request, output)?;
+    Ok(ExpectedProviderReceipt {
         provider,
         seq: 1,
         final_receipt: true,
         au_owed_cum: calculate_locked_au_owed(invocation, &usage),
         prompt_hash: image_generation_prompt_hash(request),
         usage,
-    }
+    })
+}
+
+fn authoritative_audio_speech_usage(
+    request: &AudioSpeechRequest,
+    output: &AudioSpeechOutput,
+) -> Result<ReceiptUsage, GatewaySessionError> {
+    let usage = audio_speech_usage_for_observed(request, &output.artifacts)?;
+    ensure_optional_reported_receipt_usage_matches(
+        Some(&output.usage),
+        &usage,
+        "audio speech session",
+    )?;
+    Ok(usage)
 }
 
 fn expected_audio_speech_provider_receipt<'a>(
@@ -17655,16 +17828,29 @@ fn expected_audio_speech_provider_receipt<'a>(
     output: &AudioSpeechOutput,
     provider: &'a str,
     invocation: &GatewaySessionInvocation,
-) -> ExpectedProviderReceipt<'a> {
-    let usage = output.usage.clone();
-    ExpectedProviderReceipt {
+) -> Result<ExpectedProviderReceipt<'a>, GatewaySessionError> {
+    let usage = authoritative_audio_speech_usage(request, output)?;
+    Ok(ExpectedProviderReceipt {
         provider,
         seq: 1,
         final_receipt: true,
         au_owed_cum: calculate_locked_au_owed(invocation, &usage),
         prompt_hash: audio_speech_prompt_hash(request),
         usage,
-    }
+    })
+}
+
+fn authoritative_audio_transcription_usage(
+    request: &AudioTranscriptionRequest,
+    output: &AudioTranscriptionOutput,
+) -> Result<ReceiptUsage, GatewaySessionError> {
+    let usage = audio_transcription_usage_for_request(request);
+    ensure_optional_reported_receipt_usage_matches(
+        Some(&output.usage),
+        &usage,
+        "audio transcription session",
+    )?;
+    Ok(usage)
 }
 
 fn expected_audio_transcription_provider_receipt<'a>(
@@ -17673,16 +17859,39 @@ fn expected_audio_transcription_provider_receipt<'a>(
     output: &AudioTranscriptionOutput,
     provider: &'a str,
     invocation: &GatewaySessionInvocation,
-) -> ExpectedProviderReceipt<'a> {
-    let usage = output.usage.clone();
-    ExpectedProviderReceipt {
+) -> Result<ExpectedProviderReceipt<'a>, GatewaySessionError> {
+    let usage = authoritative_audio_transcription_usage(request, output)?;
+    Ok(ExpectedProviderReceipt {
         provider,
         seq: 1,
         final_receipt: true,
         au_owed_cum: calculate_locked_au_owed(invocation, &usage),
         prompt_hash: audio_transcription_prompt_hash(request),
         usage,
+    })
+}
+
+fn authoritative_artifact_generation_usage(
+    request: &ArtifactGenerationRequest,
+    output: &ArtifactGenerationOutput,
+) -> Result<ReceiptUsage, GatewaySessionError> {
+    let expected_artifacts = usize::try_from(request.artifact_count).map_err(|_| {
+        GatewaySessionError::new("signed artifact count exceeds this gateway platform")
+    })?;
+    if output.artifacts.len() != expected_artifacts {
+        return Err(GatewaySessionError::new(format!(
+            "provider returned {} {} artifact(s), expected {expected_artifacts}",
+            output.artifacts.len(),
+            request.output_modality
+        )));
     }
+    let usage = artifact_generation_usage_for_request(request);
+    ensure_optional_reported_receipt_usage_matches(
+        Some(&output.usage),
+        &usage,
+        "artifact generation session",
+    )?;
+    Ok(usage)
 }
 
 fn expected_artifact_generation_provider_receipt<'a>(
@@ -17691,16 +17900,28 @@ fn expected_artifact_generation_provider_receipt<'a>(
     output: &ArtifactGenerationOutput,
     provider: &'a str,
     invocation: &GatewaySessionInvocation,
-) -> ExpectedProviderReceipt<'a> {
-    let usage = output.usage.clone();
-    ExpectedProviderReceipt {
+) -> Result<ExpectedProviderReceipt<'a>, GatewaySessionError> {
+    let usage = authoritative_artifact_generation_usage(request, output)?;
+    Ok(ExpectedProviderReceipt {
         provider,
         seq: 1,
         final_receipt: true,
         au_owed_cum: calculate_locked_au_owed(invocation, &usage),
         prompt_hash: artifact_generation_prompt_hash(request),
         usage,
+    })
+}
+
+fn ensure_final_receipt_within_voucher(
+    invocation: &GatewaySessionInvocation,
+    au_owed_cum: MoneyAu,
+) -> Result<(), GatewaySessionError> {
+    if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
+        return Err(GatewaySessionError::new(
+            "provider receipt exceeds signed spend voucher",
+        ));
     }
+    Ok(())
 }
 
 fn expected_text_usage_for_provider(
@@ -27859,7 +28080,8 @@ impl GatewayState {
         invocation: &GatewaySessionInvocation,
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
-        let usage = ReceiptUsage::text(output.usage.prompt_tokens, 0);
+        let usage = authoritative_embedding_usage(inputs, output)
+            .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
         if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
@@ -27960,7 +28182,8 @@ impl GatewayState {
         invocation: &GatewaySessionInvocation,
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
-        let usage = output.usage.clone();
+        let usage = authoritative_image_generation_usage(request, output)
+            .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
         if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
@@ -28061,7 +28284,8 @@ impl GatewayState {
         invocation: &GatewaySessionInvocation,
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
-        let usage = output.usage.clone();
+        let usage = authoritative_artifact_generation_usage(request, output)
+            .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
         if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
@@ -28227,7 +28451,8 @@ impl GatewayState {
         invocation: &GatewaySessionInvocation,
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
-        let usage = output.usage.clone();
+        let usage = authoritative_audio_speech_usage(request, output)
+            .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
         if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
@@ -28328,7 +28553,8 @@ impl GatewayState {
         invocation: &GatewaySessionInvocation,
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
-        let usage = output.usage.clone();
+        let usage = authoritative_audio_transcription_usage(request, output)
+            .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
         if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
@@ -28885,6 +29111,14 @@ fn canary_audio_speech_request(model_id: &str, prompt: &GatewayCanaryPrompt) -> 
         speed: None,
         instructions: None,
         stream_format: None,
+        reference_audio: None,
+        exaggeration: None,
+        cfg_weight: None,
+        temperature: None,
+        min_p: None,
+        top_p: None,
+        repetition_penalty: None,
+        seed: None,
         endpoint_family: None,
         endpoint_request: None,
     }
@@ -30776,6 +31010,32 @@ fn image_generation_usage_for_count(
     ReceiptUsage::from_units([(USAGE_IMAGE, image_count), (USAGE_STEP, billed_steps)])
 }
 
+fn ensure_reported_token_usage_matches(
+    reported: &Usage,
+    observed: &Usage,
+    context: &str,
+) -> Result<(), GatewaySessionError> {
+    if reported != observed {
+        return Err(GatewaySessionError::new(format!(
+            "provider-reported {context} usage does not match gateway-observed usage"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_optional_reported_receipt_usage_matches(
+    reported: Option<&ReceiptUsage>,
+    observed: &ReceiptUsage,
+    context: &str,
+) -> Result<(), GatewaySessionError> {
+    if reported.is_some_and(|reported| reported != observed) {
+        return Err(GatewaySessionError::new(format!(
+            "provider-reported {context} usage does not match gateway-observed usage"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_audio_speech_request(request: &AudioSpeechRequest) -> Result<(), ApiError> {
     if request.input.trim().is_empty() {
         return Err(ApiError::bad_request(
@@ -30829,18 +31089,33 @@ fn audio_speech_failover_work_units(request: &AudioSpeechRequest) -> u64 {
 fn audio_speech_usage_for_observed(
     request: &AudioSpeechRequest,
     artifacts: &[GatewayArtifactOutput],
-) -> ReceiptUsage {
+) -> Result<ReceiptUsage, GatewaySessionError> {
+    if artifacts.len() != 1 {
+        return Err(GatewaySessionError::new(format!(
+            "provider audio speech output must contain exactly one WAV artifact, got {}",
+            artifacts.len()
+        )));
+    }
+    let artifact = &artifacts[0];
+    if artifact.content_type != "audio/wav" {
+        return Err(GatewaySessionError::new(format!(
+            "provider audio speech artifact has content type {}, expected audio/wav",
+            artifact.content_type
+        )));
+    }
     let input_characters = u64::try_from(request.input.chars().count()).unwrap_or(u64::MAX);
-    let audio_seconds = artifacts
-        .iter()
-        .filter(|artifact| artifact.content_type == "audio/wav")
-        .map(|artifact| wav_duration_seconds_ceil(&artifact.bytes).unwrap_or(1))
-        .fold(0_u64, u64::saturating_add)
-        .max(1);
-    ReceiptUsage::from_units([
+    let audio_seconds = wav_duration_seconds_ceil(&artifact.bytes).ok_or_else(|| {
+        GatewaySessionError::new("provider audio speech artifact is not a valid bounded WAV")
+    })?;
+    if audio_seconds > MAX_AUDIO_SPEECH_OUTPUT_SECONDS {
+        return Err(GatewaySessionError::new(format!(
+            "provider audio speech artifact exceeds the {MAX_AUDIO_SPEECH_OUTPUT_SECONDS}-second output limit"
+        )));
+    }
+    Ok(ReceiptUsage::from_units([
         (USAGE_INPUT_CHARACTER, input_characters),
         (USAGE_AUDIO_SECOND, audio_seconds),
-    ])
+    ]))
 }
 
 fn audio_transcription_usage_for_request(request: &AudioTranscriptionRequest) -> ReceiptUsage {
@@ -31059,7 +31334,12 @@ fn estimate_image_generation_max_spend_au(
 }
 
 fn estimate_audio_speech_max_spend_au(price: &PriceRefAu, request: &AudioSpeechRequest) -> MoneyAu {
-    calculate_au_owed(price, &audio_speech_usage_for_request(request)).max(1_000)
+    let input_characters = u64::try_from(request.input.chars().count()).unwrap_or(u64::MAX);
+    let voucher_usage = ReceiptUsage::from_units([
+        (USAGE_INPUT_CHARACTER, input_characters),
+        (USAGE_AUDIO_SECOND, MAX_AUDIO_SPEECH_OUTPUT_SECONDS),
+    ]);
+    calculate_au_owed(price, &voucher_usage).max(1_000)
 }
 
 fn estimate_audio_transcription_max_spend_au(
@@ -31914,6 +32194,14 @@ mod tests {
             speed: None,
             instructions: None,
             stream_format: None,
+            reference_audio: None,
+            exaggeration: None,
+            cfg_weight: None,
+            temperature: None,
+            min_p: None,
+            top_p: None,
+            repetition_penalty: None,
+            seed: None,
             endpoint_family: None,
             endpoint_request: None,
         };
@@ -33666,6 +33954,113 @@ mod tests {
             .meter_embedding_session(&model, &inputs, &output, &invocation, Some(&wrong_amount))
             .expect_err("wrong embedding amount must be rejected");
         assert!(err.message.contains("amount"));
+    }
+
+    #[test]
+    fn audio_speech_receipt_uses_observed_wav_usage_and_enforces_voucher() {
+        let model = test_model();
+        let request = AudioSpeechRequest {
+            model: model.id.clone(),
+            input: "hello speech".to_owned(),
+            voice: None,
+            response_format: Some("wav".to_owned()),
+            speed: None,
+            instructions: None,
+            stream_format: None,
+            reference_audio: None,
+            exaggeration: None,
+            cfg_weight: None,
+            temperature: None,
+            min_p: None,
+            top_p: None,
+            repetition_penalty: None,
+            seed: None,
+            endpoint_family: None,
+            endpoint_request: None,
+        };
+        let wav = BASE64_STANDARD
+            .decode(test_wav_b64_with_samples(8_000))
+            .unwrap();
+        let observed_usage =
+            ReceiptUsage::from_units([(USAGE_INPUT_CHARACTER, 12), (USAGE_AUDIO_SECOND, 1)]);
+        let mut output = AudioSpeechOutput {
+            artifacts: vec![GatewayArtifactOutput {
+                id: "speech-1".to_owned(),
+                content_type: "audio/wav".to_owned(),
+                blake3: blake3_hex(&wav),
+                bytes: wav,
+            }],
+            usage: observed_usage.clone(),
+        };
+        let mut invocation = test_invocation();
+        invocation.spend_voucher.body.locked_rate_map = vec![
+            RateMapEntry {
+                unit: USAGE_INPUT_CHARACTER.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+            RateMapEntry {
+                unit: USAGE_AUDIO_SECOND.to_owned(),
+                per_unit_au: 100,
+                granularity: 1,
+            },
+        ];
+        invocation.spend_voucher.body.max_spend_au = 112;
+        let provider = invocation.provider_pubkey.clone().unwrap();
+        let receipt = test_signed_provider_receipt_for_usage(
+            &model,
+            &invocation,
+            observed_usage.clone(),
+            audio_speech_prompt_hash(&request),
+        );
+        direct_session_audio_speech_receipt_ack(
+            &request,
+            &output,
+            &invocation,
+            &receipt,
+            &provider,
+            &model,
+        )
+        .expect("observed one-second WAV receipt should be acknowledged");
+
+        let inflated_usage =
+            ReceiptUsage::from_units([(USAGE_INPUT_CHARACTER, 12), (USAGE_AUDIO_SECOND, 9)]);
+        output.usage = inflated_usage.clone();
+        let inflated_receipt = test_signed_provider_receipt_for_usage(
+            &model,
+            &invocation,
+            inflated_usage,
+            audio_speech_prompt_hash(&request),
+        );
+        let inflated = direct_session_audio_speech_receipt_ack(
+            &request,
+            &output,
+            &invocation,
+            &inflated_receipt,
+            &provider,
+            &model,
+        )
+        .expect_err("provider-reported duration must not override the returned WAV");
+        assert!(inflated.message.contains("gateway-observed usage"));
+
+        output.usage = observed_usage.clone();
+        invocation.spend_voucher.body.max_spend_au = 111;
+        let capped_receipt = test_signed_provider_receipt_for_usage(
+            &model,
+            &invocation,
+            observed_usage,
+            audio_speech_prompt_hash(&request),
+        );
+        let capped = direct_session_audio_speech_receipt_ack(
+            &request,
+            &output,
+            &invocation,
+            &capped_receipt,
+            &provider,
+            &model,
+        )
+        .expect_err("receipt above the buyer voucher must not be acknowledged");
+        assert!(capped.message.contains("signed spend voucher"));
     }
 
     fn assert_accept_err(frame: &Value, invocation: &GatewaySessionInvocation, needle: &str) {
@@ -35841,6 +36236,14 @@ mod tests {
             speed: None,
             instructions: None,
             stream_format: None,
+            reference_audio: None,
+            exaggeration: None,
+            cfg_weight: None,
+            temperature: None,
+            min_p: None,
+            top_p: None,
+            repetition_penalty: None,
+            seed: None,
             endpoint_family: None,
             endpoint_request: None,
         };
@@ -39759,6 +40162,47 @@ mod tests {
             usage_attribution: BTreeMap::new(),
             au_owed_cum: calculate_locked_au_owed(invocation, &usage),
             prompt_hash: blake3_hex(embedding_prompt_text(inputs).as_bytes()),
+            ts: 123,
+        };
+        ProviderSignedReceipt {
+            enclave_sig: sign_hex(&test_enclave_seed(), &receipt_signing_bytes(&body).unwrap()),
+            body,
+            enclave_pubkey: verifying_key_hex(&test_enclave_seed()),
+        }
+    }
+
+    fn test_signed_provider_receipt_for_usage(
+        model: &GatewayModel,
+        invocation: &GatewaySessionInvocation,
+        usage: ReceiptUsage,
+        prompt_hash: String,
+    ) -> ProviderSignedReceipt {
+        let body = ReceiptBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            session_id: invocation.session_id.clone(),
+            billing_id: invocation.spend_voucher.body.billing_id.clone(),
+            billing_attempt: invocation.spend_voucher.body.billing_attempt,
+            billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
+            billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
+            seq: 1,
+            final_receipt: true,
+            rail: invocation.rail.clone(),
+            user: invocation.user_pubkey.clone(),
+            provider: invocation.provider_pubkey.clone().unwrap(),
+            enclave_id: invocation.enclave_id.clone(),
+            model_id: model.id.clone(),
+            price_ver: invocation.price_ver,
+            locked_rate_map: invocation.spend_voucher.body.locked_rate_map.clone(),
+            locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
+            locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
+            served_ctx: invocation.served_ctx,
+            ctx_bracket: invocation.ctx_bracket.clone(),
+            ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
+            rules_ver: invocation.rules_ver,
+            au_owed_cum: calculate_locked_au_owed(invocation, &usage),
+            usage,
+            usage_attribution: BTreeMap::new(),
+            prompt_hash,
             ts: 123,
         };
         ProviderSignedReceipt {

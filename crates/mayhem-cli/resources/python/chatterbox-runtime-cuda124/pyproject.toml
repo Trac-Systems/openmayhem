@@ -1,0 +1,38 @@
+[project]
+name = "openmayhem-chatterbox-runtime-cuda124"
+version = "0.0.0"
+requires-python = "==3.11.*"
+dependencies = [
+    "chatterbox-tts==0.1.7",
+    "conformer==0.3.2",
+    "diffusers==0.29.0",
+    "gradio==6.8.0",
+    "librosa==0.11.0",
+    "numpy==1.26.4",
+    "omegaconf==2.3.0",
+    "pykakasi==2.3.0",
+    "pyloudnorm==0.2.0",
+    "resemble-perth @ git+https://github.com/resemble-ai/Perth.git@ce86c49d029f42272c1902eccb675556b9ed2330",
+    "s3tokenizer==0.3.0",
+    "safetensors==0.5.3",
+    "spacy-pkuseg==1.0.1",
+    "torch==2.6.0+cu124",
+    "torchaudio==2.6.0+cu124",
+    "transformers==5.2.0",
+]
+
+[tool.uv]
+package = false
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true

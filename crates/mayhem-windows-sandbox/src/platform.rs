@@ -13,12 +13,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::core::PWSTR;
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetLastError, LocalFree, SetHandleInformation,
-    DUPLICATE_SAME_ACCESS, ERROR_ALREADY_EXISTS, GENERIC_ALL, GENERIC_WRITE, HANDLE,
-    HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_TIMEOUT,
+    DUPLICATE_SAME_ACCESS, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GENERIC_ALL, GENERIC_WRITE,
+    HANDLE, HANDLE_FLAG_INHERIT, HLOCAL, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
-    GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-    GRANT_ACCESS, REVOKE_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    GetNamedSecurityInfoW, GetSecurityInfo, SetEntriesInAclW, SetNamedSecurityInfoW,
+    SetSecurityInfo, EXPLICIT_ACCESS_W, GRANT_ACCESS, REVOKE_ACCESS, SE_FILE_OBJECT,
+    SE_WINDOW_OBJECT, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
@@ -58,8 +59,8 @@ use windows_sys::Win32::System::Threading::{
     STARTUPINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    WINSTA_ACCESSCLIPBOARD, WINSTA_ACCESSGLOBALATOMS, WINSTA_CREATEDESKTOP, WINSTA_EXITWINDOWS,
-    WINSTA_READATTRIBUTES,
+    WINSTA_ACCESSCLIPBOARD, WINSTA_ACCESSGLOBALATOMS, WINSTA_CREATEDESKTOP, WINSTA_ENUMDESKTOPS,
+    WINSTA_EXITWINDOWS, WINSTA_READATTRIBUTES,
 };
 
 use crate::{
@@ -81,7 +82,10 @@ const DESKTOP_CHILD_ACCESS: u32 = READ_CONTROL_ACCESS
     | DESKTOP_HOOKCONTROL
     | DESKTOP_READOBJECTS
     | DESKTOP_WRITEOBJECTS;
+const CURRENT_WINDOW_STATION_CHILD_ACCESS: u32 =
+    READ_CONTROL_ACCESS | WINSTA_ENUMDESKTOPS as u32 | WINSTA_READATTRIBUTES as u32;
 static WINDOW_STATION_SWITCH_LOCK: Mutex<()> = Mutex::new(());
+static WINDOW_STATION_DACL_LOCK: Mutex<()> = Mutex::new(());
 
 pub struct WindowsSandboxChild {
     pub stdin: Option<File>,
@@ -355,6 +359,10 @@ fn grant_configured_directory_access(
         grant_existing_writable_descendants(profile, path)?;
     }
     for path in &config.materialized_read_only_dirs {
+        // Recursive read grants do not reliably grant the AppContainer token
+        // traverse access on the materialized tree root itself. Grant the root
+        // as a directory explicitly before walking its already-pinned files.
+        profile.grant_access(path, false, AppContainerFileAccess::ReadOnlyDirectory)?;
         grant_materialized_read_only_descendants(profile, path)?;
     }
     Ok(())
@@ -581,7 +589,8 @@ fn launch_child(
 }
 
 struct PrivateDesktop {
-    _station: WindowStationHandle,
+    _station: Option<WindowStationHandle>,
+    _station_access: Option<WindowStationAccessGrant>,
     _desktop: DesktopHandle,
     full_name: Vec<u16>,
 }
@@ -609,8 +618,13 @@ impl PrivateDesktop {
             CreateWindowStationW(station_name_w.as_ptr(), 0, GENERIC_ALL, &station_attributes)
         };
         if station.is_null() {
-            return Err(last_error(
+            let error = unsafe { GetLastError() };
+            if error == ERROR_ACCESS_DENIED {
+                return Self::create_on_current_station(current_user, appcontainer_sid, &suffix);
+            }
+            return Err(win32_error(
                 "CreateWindowStationW(private AppContainer station)",
+                error,
             ));
         }
         let station = WindowStationHandle(station);
@@ -657,11 +671,178 @@ impl PrivateDesktop {
 
         let full_name = format!("{station_name}\\{desktop_name}");
         Ok(Self {
-            _station: station,
+            _station: Some(station),
+            _station_access: None,
             _desktop: desktop,
             full_name: to_wide_null(OsStr::new(&full_name)),
         })
     }
+
+    fn create_on_current_station(
+        current_user: PSID,
+        appcontainer_sid: PSID,
+        suffix: &str,
+    ) -> Result<Self> {
+        let desktop_name = format!("mayhem-worker-{suffix}");
+        let desktop_name_w = to_wide_null(OsStr::new(&desktop_name));
+        let _switch_lock = WINDOW_STATION_SWITCH_LOCK.lock().map_err(|_| {
+            WindowsSandboxError::Windows(
+                "current window-station desktop lock was poisoned".to_owned(),
+            )
+        })?;
+        let station = unsafe { GetProcessWindowStation() };
+        if station.is_null() {
+            return Err(last_error("GetProcessWindowStation(current)"));
+        }
+        let station_access = WindowStationAccessGrant::grant(station, appcontainer_sid)?;
+        let mut desktop_security = WindowObjectSecurity::new(&[
+            (current_user, GENERIC_ALL),
+            (appcontainer_sid, DESKTOP_CHILD_ACCESS),
+        ])?;
+        let desktop_attributes = desktop_security.attributes();
+        let desktop = unsafe {
+            CreateDesktopW(
+                desktop_name_w.as_ptr(),
+                null(),
+                null(),
+                0,
+                GENERIC_ALL,
+                &desktop_attributes,
+            )
+        };
+        if desktop.is_null() {
+            return Err(last_error(
+                "CreateDesktopW(private AppContainer desktop on current station)",
+            ));
+        }
+        Ok(Self {
+            _station: None,
+            _station_access: Some(station_access),
+            _desktop: DesktopHandle(desktop),
+            full_name: desktop_name_w,
+        })
+    }
+}
+
+struct WindowStationAccessGrant {
+    station: HWINSTA,
+    appcontainer_sid: Vec<u8>,
+}
+
+impl WindowStationAccessGrant {
+    fn grant(station: HWINSTA, appcontainer_sid: PSID) -> Result<Self> {
+        let appcontainer_sid = copy_sid_bytes(appcontainer_sid)?;
+        let _lock = WINDOW_STATION_DACL_LOCK.lock().map_err(|_| {
+            WindowsSandboxError::Windows("window-station DACL lock was poisoned".to_owned())
+        })?;
+        update_window_station_access(station, appcontainer_sid.as_ptr() as PSID, true)?;
+        Ok(Self {
+            station,
+            appcontainer_sid,
+        })
+    }
+}
+
+impl Drop for WindowStationAccessGrant {
+    fn drop(&mut self) {
+        let Ok(_lock) = WINDOW_STATION_DACL_LOCK.lock() else {
+            return;
+        };
+        let _ = update_window_station_access(
+            self.station,
+            self.appcontainer_sid.as_mut_ptr() as PSID,
+            false,
+        );
+    }
+}
+
+fn update_window_station_access(
+    station: HWINSTA,
+    appcontainer_sid: PSID,
+    grant: bool,
+) -> Result<()> {
+    let mut old_dacl: *mut ACL = null_mut();
+    let mut security_descriptor: PSECURITY_DESCRIPTOR = null_mut();
+    let error = unsafe {
+        GetSecurityInfo(
+            station as HANDLE,
+            SE_WINDOW_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut old_dacl,
+            null_mut(),
+            &mut security_descriptor,
+        )
+    };
+    if error != 0 {
+        return Err(win32_error(
+            "GetSecurityInfo(current window station)",
+            error,
+        ));
+    }
+
+    let mut access = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: if grant {
+            CURRENT_WINDOW_STATION_CHILD_ACCESS
+        } else {
+            0
+        },
+        grfAccessMode: if grant { GRANT_ACCESS } else { REVOKE_ACCESS },
+        grfInheritance: NO_INHERITANCE,
+        ..Default::default()
+    };
+    access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    access.Trustee.TrusteeType = TRUSTEE_IS_UNKNOWN;
+    access.Trustee.ptstrName = appcontainer_sid as PWSTR;
+
+    let mut new_dacl: *mut ACL = null_mut();
+    let error = unsafe { SetEntriesInAclW(1, &mut access, old_dacl, &mut new_dacl) };
+    if error != 0 {
+        unsafe {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Err(win32_error(
+            "SetEntriesInAclW(current window station)",
+            error,
+        ));
+    }
+
+    let error = unsafe {
+        SetSecurityInfo(
+            station as HANDLE,
+            SE_WINDOW_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            new_dacl,
+            null_mut(),
+        )
+    };
+    unsafe {
+        LocalFree(new_dacl as HLOCAL);
+        LocalFree(security_descriptor as HLOCAL);
+    }
+    if error != 0 {
+        return Err(win32_error(
+            "SetSecurityInfo(current window station)",
+            error,
+        ));
+    }
+    Ok(())
+}
+
+fn copy_sid_bytes(sid: PSID) -> Result<Vec<u8>> {
+    let length = unsafe { GetLengthSid(sid) };
+    if length == 0 {
+        return Err(last_error("GetLengthSid"));
+    }
+    let mut copy = vec![0_u8; length as usize];
+    let ok = unsafe { CopySid(length, copy.as_mut_ptr() as PSID, sid) };
+    if ok == 0 {
+        return Err(last_error("CopySid"));
+    }
+    Ok(copy)
 }
 
 struct WindowObjectSecurity {

@@ -2230,10 +2230,26 @@ fn resolve_sandbox_config(config: &SandboxConfig) -> Result<SandboxConfig> {
     }
 
     let read_only_dirs = resolve_sandbox_dirs("read_only_dirs", &config.read_only_dirs)?;
+    let materialized_read_only_dirs = resolve_sandbox_dirs(
+        "materialized_read_only_dirs",
+        &config.materialized_read_only_dirs,
+    )?;
     let writable_dirs = resolve_sandbox_dirs("writable_dirs", &config.writable_dirs)?;
     reject_sandbox_dir_overlaps(&read_only_dirs, &writable_dirs)?;
+    for (index, path) in materialized_read_only_dirs.iter().enumerate() {
+        if !read_only_dirs.contains(path) {
+            return Err(EnclaveError::InvalidInput(format!(
+                "materialized_read_only_dirs[{index}] {} must exactly match a configured read-only directory",
+                path.display()
+            )));
+        }
+    }
 
-    Ok(SandboxConfig::new(read_only_dirs, writable_dirs))
+    Ok(SandboxConfig {
+        read_only_dirs,
+        materialized_read_only_dirs,
+        writable_dirs,
+    })
 }
 
 fn resolve_sandbox_dirs(field: &str, dirs: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -3580,6 +3596,39 @@ mod tests {
         assert!(profile.policy.contains("no internetClient"));
         assert!(profile.policy.contains("read-only ACL grants"));
         assert!(profile.policy.contains("read/write ACL grants"));
+        Ok(())
+    }
+
+    #[test]
+    fn sandbox_resolution_preserves_materialized_read_only_roots() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut config = sandbox_config(&temp)?;
+        let model_root = config.read_only_dirs[0].clone();
+        config.materialized_read_only_dir(&model_root);
+
+        let resolved = resolve_sandbox_config(&config)?;
+
+        assert_eq!(resolved.materialized_read_only_dirs.len(), 1);
+        assert_eq!(
+            resolved.materialized_read_only_dirs[0],
+            fs::canonicalize(model_root)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sandbox_resolution_rejects_unlisted_materialized_root() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut config = sandbox_config(&temp)?;
+        let unrelated = temp.path().join("unrelated-materialized-root");
+        fs::create_dir_all(&unrelated)?;
+        config.materialized_read_only_dir(unrelated);
+
+        let error = resolve_sandbox_config(&config).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("must exactly match a configured read-only directory"));
         Ok(())
     }
 

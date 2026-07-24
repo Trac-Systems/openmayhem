@@ -18,6 +18,8 @@ const ACE_STEP_RAM_FLOOR: u64 = 16 * GIB;
 const ACE_STEP_CUDA_MEMORY_FLOOR: u64 = 4 * GIB;
 const ACE_STEP_CUDA_FULL_OFFLOAD_FLOOR: u64 = 20 * GIB;
 const ACE_STEP_APPLE_UNIFIED_MEMORY_FLOOR: u64 = 16 * GIB;
+const CHATTERBOX_RAM_FLOOR: u64 = 8 * GIB;
+const CHATTERBOX_ACCELERATOR_MEMORY_FLOOR: u64 = 6 * GIB;
 const TRANSFORMERS_ASR_RAM_FLOOR: u64 = 8 * GIB;
 const TRANSFORMERS_ASR_CUDA_MEMORY_FLOOR: u64 = 4 * GIB;
 const SULPHUR_NVIDIA_PARTIAL_OFFLOAD_FLOOR: u64 = 16 * GIB;
@@ -179,6 +181,25 @@ pub enum GpuBackend {
     Vulkan,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatterboxManagedDevice {
+    Cpu,
+    Cuda,
+    Mps,
+}
+
+impl ChatterboxManagedDevice {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+            Self::Mps => "mps",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TeeInfo {
     pub tier: u8,
@@ -318,11 +339,145 @@ fn compute_backend_verdicts(profile: &HardwareProfile) -> Vec<BackendVerdict> {
         llama_cpp_verdict(profile),
         stable_diffusion_cpp_verdict(profile),
         ace_step_verdict(profile),
+        chatterbox_verdict(profile),
         transformers_asr_verdict(profile),
         whisper_cpp_verdict(profile),
         piper_verdict(profile),
         sulphur_verdict(profile),
     ]
+}
+
+fn chatterbox_verdict(profile: &HardwareProfile) -> BackendVerdict {
+    let host_supported = match profile.host.os.as_str() {
+        "linux" => matches!(profile.host.arch.as_str(), "x86_64" | "aarch64" | "arm64"),
+        "windows" => profile.host.arch == "x86_64",
+        "macos" => matches!(profile.host.arch.as_str(), "aarch64" | "arm64"),
+        _ => false,
+    };
+    if !host_supported {
+        return insufficient(
+            "chatterbox",
+            &format!(
+                "original Chatterbox has no supported PyTorch runtime path for {}/{}",
+                profile.host.os, profile.host.arch
+            ),
+        );
+    }
+
+    let host_memory = profile
+        .memory
+        .available_bytes
+        .unwrap_or(profile.memory.total_bytes);
+    if host_memory < CHATTERBOX_RAM_FLOOR {
+        return insufficient(
+            "chatterbox",
+            &format!(
+                "original Chatterbox needs at least 8 GiB available host memory; {} detected",
+                format_bytes(host_memory)
+            ),
+        );
+    }
+
+    match chatterbox_managed_device_for_parts(
+        &profile.host,
+        host_memory,
+        &profile.gpus,
+    ) {
+        ChatterboxManagedDevice::Cuda => BackendVerdict {
+            backend: "chatterbox".to_owned(),
+            status: VerdictStatus::FullOffload,
+            reason: Some(
+                "original Chatterbox can use its pinned CUDA runtime; model-specific memory checks still apply"
+                    .to_owned(),
+            ),
+            est_tok_s: None,
+            n_layers_gpu: None,
+            max_sessions: 1,
+            kv_cache_bytes_budget: host_memory / 8,
+        },
+        ChatterboxManagedDevice::Mps => BackendVerdict {
+            backend: "chatterbox".to_owned(),
+            status: VerdictStatus::FullOffload,
+            reason: Some(
+                "original Chatterbox can use its pinned Apple Metal/MPS runtime; model-specific memory checks still apply"
+                    .to_owned(),
+            ),
+            est_tok_s: None,
+            n_layers_gpu: None,
+            max_sessions: 1,
+            kv_cache_bytes_budget: host_memory / 8,
+        },
+        ChatterboxManagedDevice::Cpu => BackendVerdict {
+            backend: "chatterbox".to_owned(),
+            status: VerdictStatus::CpuOnly,
+            reason: Some(
+                "original Chatterbox will use its supported CPU fallback; model-specific memory checks still apply"
+                    .to_owned(),
+            ),
+            est_tok_s: None,
+            n_layers_gpu: Some(0),
+            max_sessions: 1,
+            kv_cache_bytes_budget: host_memory / 8,
+        },
+    }
+}
+
+#[must_use]
+pub fn chatterbox_managed_device(report: &HardwareReport) -> Option<ChatterboxManagedDevice> {
+    report
+        .backend_verdicts
+        .iter()
+        .find(|verdict| verdict.backend == "chatterbox")
+        .filter(|verdict| verdict.status != VerdictStatus::Insufficient)?;
+    Some(chatterbox_managed_device_for_parts(
+        &report.host,
+        report
+            .memory
+            .available_bytes
+            .unwrap_or(report.memory.total_bytes),
+        &report.gpus,
+    ))
+}
+
+fn chatterbox_managed_device_for_parts(
+    host: &HostInfo,
+    host_memory: u64,
+    gpus: &[GpuInfo],
+) -> ChatterboxManagedDevice {
+    let managed_cuda_runtime =
+        matches!(host.os.as_str(), "linux" | "windows") && host.arch == "x86_64";
+    let cuda_memory = managed_cuda_runtime
+        .then(|| {
+            gpus.iter()
+                .filter(|gpu| gpu.vendor == GpuVendor::Nvidia && gpu.backend == GpuBackend::Nvml)
+                .map(|gpu| {
+                    if gpu.unified_memory || nvidia_host_unified_memory_signal(host, gpu) {
+                        gpu.memory_bytes.unwrap_or(host_memory).min(host_memory)
+                    } else {
+                        gpu.dedicated_memory_bytes.or(gpu.memory_bytes).unwrap_or(0)
+                    }
+                })
+                .max()
+        })
+        .flatten();
+    if cuda_memory.is_some_and(|memory| memory >= CHATTERBOX_ACCELERATOR_MEMORY_FLOOR) {
+        return ChatterboxManagedDevice::Cuda;
+    }
+
+    let managed_mps_runtime =
+        host.os == "macos" && matches!(host.arch.as_str(), "aarch64" | "arm64");
+    if managed_mps_runtime
+        && gpus.iter().any(|gpu| {
+            gpu.vendor == GpuVendor::Apple
+                && gpu.backend == GpuBackend::Metal
+                && gpu.unified_memory
+                && gpu.memory_bytes.unwrap_or(host_memory).min(host_memory) >= CHATTERBOX_RAM_FLOOR
+        })
+    {
+        return ChatterboxManagedDevice::Mps;
+    }
+
+    ChatterboxManagedDevice::Cpu
 }
 
 fn vllm_verdict(profile: &HardwareProfile) -> BackendVerdict {
@@ -2930,6 +3085,115 @@ mod tests {
         ] {
             assert_eq!(FixtureProfile::parse(name), Some(expected), "{name}");
         }
+    }
+
+    #[test]
+    fn chatterbox_supports_cuda_mps_and_cpu_without_admin_setup() {
+        for fixture in [FixtureProfile::LinuxNvidia, FixtureProfile::WindowsNvidia] {
+            let profile = fixture_profile(fixture, Path::new("."));
+            let verdict = chatterbox_verdict(&profile);
+            assert_eq!(verdict.status, VerdictStatus::FullOffload, "{fixture:?}");
+            assert_eq!(verdict.max_sessions, 1);
+            assert!(verdict
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("CUDA"));
+        }
+
+        let linux_arm = chatterbox_verdict(&fixture_profile(
+            FixtureProfile::LinuxNvidiaArm64,
+            Path::new("."),
+        ));
+        assert_eq!(linux_arm.status, VerdictStatus::CpuOnly);
+        assert_eq!(linux_arm.n_layers_gpu, Some(0));
+        assert!(linux_arm
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("CPU fallback"));
+
+        let apple = chatterbox_verdict(&fixture_profile(
+            FixtureProfile::AppleSilicon,
+            Path::new("."),
+        ));
+        assert_eq!(apple.status, VerdictStatus::FullOffload);
+        assert!(apple
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Metal/MPS"));
+
+        let cpu = chatterbox_verdict(&fixture_profile(FixtureProfile::CpuOnly, Path::new(".")));
+        assert_eq!(cpu.status, VerdictStatus::CpuOnly);
+        assert_eq!(cpu.n_layers_gpu, Some(0));
+        assert_eq!(cpu.max_sessions, 1);
+        assert!(cpu
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("CPU fallback"));
+    }
+
+    #[test]
+    fn chatterbox_public_managed_device_matches_runtime_artifacts() {
+        for (fixture, expected) in [
+            (FixtureProfile::LinuxNvidia, ChatterboxManagedDevice::Cuda),
+            (
+                FixtureProfile::LinuxNvidiaArm64,
+                ChatterboxManagedDevice::Cpu,
+            ),
+            (FixtureProfile::WindowsNvidia, ChatterboxManagedDevice::Cuda),
+            (FixtureProfile::AppleSilicon, ChatterboxManagedDevice::Mps),
+            (FixtureProfile::CpuOnly, ChatterboxManagedDevice::Cpu),
+        ] {
+            let report = report_from_profile(fixture_profile(fixture, Path::new(".")));
+            assert_eq!(
+                chatterbox_managed_device(&report),
+                Some(expected),
+                "{fixture:?}"
+            );
+        }
+        let unsupported = report_from_profile(fixture_profile(
+            FixtureProfile::UnsupportedHost,
+            Path::new("."),
+        ));
+        assert_eq!(chatterbox_managed_device(&unsupported), None);
+    }
+
+    #[test]
+    fn chatterbox_rejects_unsupported_or_low_memory_hosts() {
+        let unsupported = chatterbox_verdict(&fixture_profile(
+            FixtureProfile::UnsupportedHost,
+            Path::new("."),
+        ));
+        assert_eq!(unsupported.status, VerdictStatus::Insufficient);
+        assert!(unsupported
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("freebsd/x86_64"));
+
+        let mut intel_macos = fixture_profile(FixtureProfile::AppleSilicon, Path::new("."));
+        intel_macos.host.arch = "x86_64".to_owned();
+        let intel_macos = chatterbox_verdict(&intel_macos);
+        assert_eq!(intel_macos.status, VerdictStatus::Insufficient);
+        assert!(intel_macos
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("macos/x86_64"));
+
+        let low_memory = chatterbox_verdict(&fixture_profile(
+            FixtureProfile::InsufficientHost,
+            Path::new("."),
+        ));
+        assert_eq!(low_memory.status, VerdictStatus::Insufficient);
+        assert!(low_memory
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("at least 8 GiB"));
     }
 
     #[test]

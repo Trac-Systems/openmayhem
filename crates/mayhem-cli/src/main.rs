@@ -69,7 +69,7 @@ use mayhem_engine::{
     EngineBackend, EngineError, GenerateRequest, GenerateSpecialityParameter,
     GenerateSpecialityTarget, GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest,
     LoadConfig, MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
-    SpeechRequest, TokenChunk, ToolSpec, MTMD_MEDIA_MARKER,
+    SpeechReferenceAudio, SpeechRequest, TokenChunk, ToolSpec, MTMD_MEDIA_MARKER,
 };
 use mayhem_gateway::{
     audio_fingerprint, cancellation_settlement_usage, embedding_vector_fingerprint,
@@ -94,8 +94,9 @@ use mayhem_gateway::{
     INPUT_TOKEN_UNIT, MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS, OUTPUT_TOKEN_UNIT,
 };
 use mayhem_hwprobe::{
-    human_report, model_memory_fit, probe, BackendVerdict, FixtureProfile, GpuBackend, GpuInfo,
-    GpuVendor, HardwareReport, ProbeOptions, VerdictStatus,
+    chatterbox_managed_device, human_report, model_memory_fit, probe, BackendVerdict,
+    ChatterboxManagedDevice, FixtureProfile, GpuBackend, GpuInfo, GpuVendor, HardwareReport,
+    ProbeOptions, VerdictStatus,
 };
 #[cfg(test)]
 use mayhem_proto::MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN;
@@ -2750,7 +2751,7 @@ struct DoctorArgs {
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
 
-    /// Also preflight one provider backend: auto, llama.cpp, mlx, vllm, trt-llm, stable-diffusion.cpp, ace-step, sulphur, transformers-asr, whisper.cpp, or piper.
+    /// Also preflight one provider backend: auto, llama.cpp, mlx, vllm, trt-llm, stable-diffusion.cpp, ace-step, chatterbox, sulphur, transformers-asr, whisper.cpp, or piper.
     #[arg(long, value_name = "BACKEND")]
     provider_backend: Option<String>,
 
@@ -2839,13 +2840,17 @@ struct CatalogVerifyArgs {
 
 #[derive(Debug, Parser)]
 struct CatalogSignArgs {
-    /// Path to the admin-reviewed catalog draft. Defaults to the repo catalog.
+    /// Path to the admin-reviewed catalog draft. Required after the initial catalog.
     #[arg(long, value_name = "PATH")]
     catalog_path: Option<PathBuf>,
 
-    /// Currently active catalog whose existing models must be preserved.
+    /// Exact active catalog whose existing models must be preserved.
     #[arg(long, value_name = "PATH")]
     base_catalog_path: Option<PathBuf>,
+
+    /// Detached signature for --base-catalog-path, verified before additive comparison.
+    #[arg(long, value_name = "PATH")]
+    base_signature_path: Option<PathBuf>,
 
     /// Permit an intentional change to this existing model. Repeat per model.
     #[arg(long, value_name = "MODEL_ID")]
@@ -2856,7 +2861,10 @@ struct CatalogSignArgs {
     allow_attestation_authority_change: bool,
 
     /// Sign the first catalog for a new network, where no base catalog exists.
-    #[arg(long, conflicts_with = "base_catalog_path")]
+    #[arg(
+        long,
+        conflicts_with_all = ["base_catalog_path", "base_signature_path"]
+    )]
     initial_catalog: bool,
 
     /// Write the detached catalog signature JSON here.
@@ -3055,6 +3063,10 @@ struct CatalogArtifactPlanArgs {
     #[arg(long, value_name = "PATH")]
     catalog_signature_output: Option<PathBuf>,
 
+    /// Detached signature for the explicit active --catalog-path used as the signing base.
+    #[arg(long, value_name = "PATH")]
+    catalog_base_signature_path: Option<PathBuf>,
+
     /// Catalog maintainer key id for an optional printed catalog sign command.
     #[arg(long)]
     catalog_key_id: Option<String>,
@@ -3144,6 +3156,10 @@ struct CatalogArtifactPublishPlanArgs {
     /// Detached signature path for an optional printed catalog sign command.
     #[arg(long, value_name = "PATH")]
     catalog_signature_output: Option<PathBuf>,
+
+    /// Detached signature for the explicit active --catalog-path used as the signing base.
+    #[arg(long, value_name = "PATH")]
+    catalog_base_signature_path: Option<PathBuf>,
 
     /// Catalog maintainer key id for an optional printed catalog sign command.
     #[arg(long)]
@@ -3349,6 +3365,10 @@ struct CatalogCanaryPlanArgs {
     /// Detached signature path for an optional printed catalog sign command.
     #[arg(long, value_name = "PATH")]
     catalog_signature_output: Option<PathBuf>,
+
+    /// Detached signature for the explicit active --catalog-path used as the signing base.
+    #[arg(long, value_name = "PATH")]
+    catalog_base_signature_path: Option<PathBuf>,
 
     /// Catalog maintainer key id for an optional printed catalog sign command.
     #[arg(long)]
@@ -5604,7 +5624,7 @@ struct ProviderServePlanArgs {
     #[arg(long, value_name = "PATH")]
     canaries_dir: Option<PathBuf>,
 
-    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, ace-step, sulphur, transformers-asr, whisper.cpp, or piper.
+    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, ace-step, chatterbox, sulphur, transformers-asr, whisper.cpp, or piper.
     #[arg(long, default_value = "auto")]
     engine_backend: String,
 
@@ -5824,7 +5844,7 @@ struct ProviderStartArgs {
     #[arg(long, value_name = "PATH")]
     hf_token_file: Option<PathBuf>,
 
-    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, ace-step, sulphur, transformers-asr, whisper.cpp, or piper.
+    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, ace-step, chatterbox, sulphur, transformers-asr, whisper.cpp, or piper.
     #[arg(long, default_value = "auto")]
     engine_backend: String,
 
@@ -7070,6 +7090,7 @@ fn resolve_doctor_provider_backend(requested: &str, report: &HardwareReport) -> 
                 | "trt-llm"
                 | "stable-diffusion.cpp"
                 | "ace-step"
+                | "chatterbox"
                 | "sulphur"
                 | "transformers-asr"
                 | "whisper.cpp"
@@ -8008,6 +8029,9 @@ fn backend_requirement_hint(backend: &str) -> &'static str {
         }
         "ace-step" => {
             "ACE-Step requires its pinned local Python runtime and enough RAM or accelerator memory for the signed artifact"
+        }
+        "chatterbox" => {
+            "Chatterbox requires its pinned offline Python runtime and enough RAM or CUDA/Metal memory for the signed five-file artifact"
         }
         "sulphur" => {
             "Sulphur requires its pinned local joint audio-video runtime and a calibrated CUDA or Apple Silicon artifact"
@@ -9842,10 +9866,13 @@ fn catalog_authority_public_path(base: &str, file_name: &str) -> Result<String> 
 }
 
 fn catalog_sign(args: CatalogSignArgs) -> Result<()> {
-    let catalog_path = args
-        .catalog_path
-        .map(Ok)
-        .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+    let catalog_path = match args.catalog_path {
+        Some(path) => path,
+        None if args.initial_catalog => repo_path("catalog/models.json")?,
+        None => bail!(
+            "--catalog-path is required for an additive release; pass the reviewed draft explicitly"
+        ),
+    };
     let catalog_path = absolutize(catalog_path)?;
     let signature_output = absolutize(args.signature_output.clone())?;
     if signature_output.exists() && !args.force {
@@ -9872,13 +9899,25 @@ fn catalog_sign(args: CatalogSignArgs) -> Result<()> {
     } else {
         let base_catalog_path = args
             .base_catalog_path
-            .map(Ok)
-            .unwrap_or_else(|| repo_path("catalog/models.json"))?;
+            .context(
+                "--base-catalog-path is required for an additive release; use the exact active catalog resolved from catalog/current",
+            )?;
         let base_catalog_path = absolutize(base_catalog_path)?;
+        let base_signature_path = absolutize(args.base_signature_path.context(
+            "--base-signature-path is required for an additive release; use the detached signature paired with the active catalog",
+        )?)?;
         ensure!(
             base_catalog_path != catalog_path,
             "refusing to sign a catalog in place; pass a separate draft with --catalog-path so the active base can be compared"
         );
+        catalog::verify_signed_catalog_base(
+            &base_catalog_path,
+            &base_signature_path,
+            &keys_dir,
+        )
+        .context(
+            "refusing additive catalog signing because the explicit active base is not validly signed",
+        )?;
         validate_additive_catalog_update(
             &base_catalog_path,
             &catalog_path,
@@ -13400,6 +13439,7 @@ fn catalog_artifact_plan_sign_options(
     args: &CatalogArtifactPlanArgs,
 ) -> Result<Option<CatalogCanaryPlanSignOptions>> {
     let requested = args.catalog_signature_output.is_some()
+        || args.catalog_base_signature_path.is_some()
         || args.catalog_key_id.is_some()
         || args.catalog_seed_file.is_some()
         || args.catalog_keys_dir.is_some()
@@ -13408,6 +13448,14 @@ fn catalog_artifact_plan_sign_options(
     if !requested {
         return Ok(None);
     }
+    let base_catalog_path = args.catalog_path.clone().context(
+        "--catalog-path is required when emitting a catalog sign command; use the exact active catalog resolved from catalog/current",
+    )?;
+    let base_catalog_path = absolutize(base_catalog_path)?;
+    let base_signature_path = args.catalog_base_signature_path.clone().context(
+        "--catalog-base-signature-path is required when emitting a catalog sign command",
+    )?;
+    let base_signature_path = absolutize(base_signature_path)?;
     let signature_output = args
         .catalog_signature_output
         .clone()
@@ -13430,6 +13478,8 @@ fn catalog_artifact_plan_sign_options(
         .unwrap_or_else(|| repo_path("catalog/keys"))?;
     let keys_dir = absolutize(keys_dir)?;
     Ok(Some(CatalogCanaryPlanSignOptions {
+        base_catalog_path,
+        base_signature_path,
         signature_output,
         key_id,
         seed_file,
@@ -13443,6 +13493,7 @@ fn catalog_artifact_publish_plan_sign_options(
     args: &CatalogArtifactPublishPlanArgs,
 ) -> Result<Option<CatalogCanaryPlanSignOptions>> {
     let requested = args.catalog_signature_output.is_some()
+        || args.catalog_base_signature_path.is_some()
         || args.catalog_key_id.is_some()
         || args.catalog_seed_file.is_some()
         || args.catalog_keys_dir.is_some()
@@ -13451,6 +13502,14 @@ fn catalog_artifact_publish_plan_sign_options(
     if !requested {
         return Ok(None);
     }
+    let base_catalog_path = args.catalog_path.clone().context(
+        "--catalog-path is required when emitting a catalog sign command; use the exact active catalog resolved from catalog/current",
+    )?;
+    let base_catalog_path = absolutize(base_catalog_path)?;
+    let base_signature_path = args.catalog_base_signature_path.clone().context(
+        "--catalog-base-signature-path is required when emitting a catalog sign command",
+    )?;
+    let base_signature_path = absolutize(base_signature_path)?;
     let signature_output = args
         .catalog_signature_output
         .clone()
@@ -13473,6 +13532,8 @@ fn catalog_artifact_publish_plan_sign_options(
         .unwrap_or_else(|| repo_path("catalog/keys"))?;
     let keys_dir = absolutize(keys_dir)?;
     Ok(Some(CatalogCanaryPlanSignOptions {
+        base_catalog_path,
+        base_signature_path,
         signature_output,
         key_id,
         seed_file,
@@ -14897,6 +14958,7 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         )
     })?;
     validate_calibration_args_for_artifact(artifact, &args)?;
+    let calibration_memory = calibration_memory_context(artifact, &artifact_path, &args)?;
     preflight_catalog_calibration_managed_runtime(artifact, &args)?;
     verify_calibration_artifact_matches_catalog(artifact, &artifact_path)?;
     verify_calibration_sidecars_match_catalog(artifact, &artifact_sidecar_paths)?;
@@ -14910,7 +14972,6 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         canary_set_file_sha256(&canaries_dir, &model.canary.set_id).map_err(anyhow::Error::msg)?;
     catalog_endpoint_calibration_preflight(model, &prompts)?;
     preflight_calibration_prompt_resources(model, &prompts)?;
-    let calibration_memory = calibration_memory_context(artifact, &artifact_path, &args)?;
     let runtime_config = catalog_canary_runtime_config(artifact, &artifact_path, &args)?;
     let existing = existing_catalog_canary_fingerprint(model, &args.artifact);
     let resume_core_report = resume_core_report_path
@@ -14946,6 +15007,7 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         &artifact_path,
         &artifact_sidecar_paths,
         &args,
+        &calibration_memory,
     )?;
     let report = if let Some(mut report) = resume_core_report {
         let superseded_artifact_declarations = retained_calibration_artifact_declarations(&report);
@@ -15327,6 +15389,7 @@ fn validate_resumed_canary_core(
             f13_budget_bytes: recorded.calibration_f13_budget_bytes,
             source: recorded.measurement_source.clone(),
             probe: calibration_memory.probe.clone(),
+            chatterbox_device: calibration_memory.chatterbox_device,
         };
         aggregate_calibrated_modality_resource_profiles(model, &report.prompts, &recorded_memory)?
     } else {
@@ -16764,6 +16827,43 @@ fn provider_engine_session_media_validation(
 ) -> Result<Option<mayhem_engine::MediaGenerationValidation>> {
     cancellation.check().context("provider request cancelled")?;
     let verified = provider_verify_endpoint_request(body, expected_model_id, adapter)?;
+    if matches!(
+        verified.family,
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH
+    ) {
+        let request = provider_speech_request_from_body(&verified.family, &verified.request)?;
+        let Some(validation) = backend.validate_speech(request, cancellation)? else {
+            return Ok(None);
+        };
+        let contract = adapter
+            .endpoint_families
+            .iter()
+            .find(|contract| contract.family == verified.family)
+            .with_context(|| {
+                format!(
+                    "signed adapter omits verified endpoint family {}",
+                    verified.family
+                )
+            })?;
+        let handled_request_attributes = contract
+            .request_attributes
+            .iter()
+            .filter(|path| calibration_value_has_path(&verified.request, path))
+            .filter(|path| {
+                path.as_str() == "model"
+                    || speech_endpoint_attribute_control(&verified.family, path)
+                        .is_some_and(|control| validation.handled_controls.contains(control))
+            })
+            .cloned()
+            .collect();
+        return Ok(Some(mayhem_engine::MediaGenerationValidation {
+            evidence: json!({
+                "handled_controls": validation.handled_controls,
+                "speech_validation": validation.evidence,
+            }),
+            handled_request_attributes,
+        }));
+    }
     if !matches!(
         verified.family,
         mayhem_proto::ENDPOINT_OPENAI_VIDEOS
@@ -16776,6 +16876,47 @@ fn provider_engine_session_media_validation(
     }
     let request = provider_media_generation_request_from_body(&verified.family, &verified.request)?;
     Ok(backend.validate_media_generation(request, cancellation)?)
+}
+
+fn speech_endpoint_attribute_control(endpoint_family: &str, path: &str) -> Option<&'static str> {
+    match endpoint_family {
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH => match path {
+            "input" => Some("input"),
+            "voice" => Some("voice"),
+            "response_format" => Some("response_format"),
+            "speed" => Some("speed"),
+            "reference_audio"
+            | "reference_audio.data"
+            | "reference_audio.encoding"
+            | "reference_audio.content_type" => Some("reference_audio"),
+            "exaggeration" => Some("exaggeration"),
+            "cfg_weight" => Some("cfg_weight"),
+            "temperature" => Some("temperature"),
+            "min_p" => Some("min_p"),
+            "top_p" => Some("top_p"),
+            "repetition_penalty" => Some("repetition_penalty"),
+            "seed" => Some("seed"),
+            _ => None,
+        },
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH => match path {
+            "inputs" => Some("input"),
+            "parameters.voice" | "parameters.speaker_id" => Some("voice"),
+            "parameters.speed" => Some("speed"),
+            "parameters.reference_audio"
+            | "parameters.reference_audio.data"
+            | "parameters.reference_audio.encoding"
+            | "parameters.reference_audio.content_type" => Some("reference_audio"),
+            "parameters.exaggeration" => Some("exaggeration"),
+            "parameters.cfg_weight" => Some("cfg_weight"),
+            "parameters.seed" => Some("seed"),
+            "parameters.generation_parameters.temperature" => Some("temperature"),
+            "parameters.generation_parameters.min_p" => Some("min_p"),
+            "parameters.generation_parameters.top_p" => Some("top_p"),
+            "parameters.generation_parameters.repetition_penalty" => Some("repetition_penalty"),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn catalog_endpoint_calibration_transport(
@@ -17085,11 +17226,40 @@ fn calibration_endpoint_attribute_is_handled(
         }
         mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH => matches!(
             path,
-            "model" | "input" | "voice" | "response_format" | "speed"
+            "model"
+                | "input"
+                | "voice"
+                | "response_format"
+                | "speed"
+                | "reference_audio"
+                | "reference_audio.data"
+                | "reference_audio.encoding"
+                | "reference_audio.content_type"
+                | "exaggeration"
+                | "cfg_weight"
+                | "temperature"
+                | "min_p"
+                | "top_p"
+                | "repetition_penalty"
+                | "seed"
         ),
         mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH => matches!(
             path,
-            "inputs" | "parameters.voice" | "parameters.speed" | "parameters.speaker_id"
+            "inputs"
+                | "parameters.voice"
+                | "parameters.speed"
+                | "parameters.speaker_id"
+                | "parameters.reference_audio"
+                | "parameters.reference_audio.data"
+                | "parameters.reference_audio.encoding"
+                | "parameters.reference_audio.content_type"
+                | "parameters.exaggeration"
+                | "parameters.cfg_weight"
+                | "parameters.seed"
+                | "parameters.generation_parameters.temperature"
+                | "parameters.generation_parameters.min_p"
+                | "parameters.generation_parameters.top_p"
+                | "parameters.generation_parameters.repetition_penalty"
         ),
         mayhem_proto::ENDPOINT_OPENAI_VIDEOS
         | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
@@ -17567,6 +17737,41 @@ fn verify_calibration_sidecars_match_catalog(
             );
         }
     }
+    if artifact.engine == "chatterbox" {
+        ensure!(
+            chatterbox_source_binds_canonical_upstream(
+                &artifact.source,
+                artifact.upstream_source.as_ref()
+            )
+                && artifact.path == CHATTERBOX_PRIMARY_PATH,
+            "Chatterbox calibration requires canonical {CHATTERBOX_MODEL_REPO}@{} path {CHATTERBOX_PRIMARY_PATH}",
+            mayhem_engine::CHATTERBOX_MODEL_REVISION
+        );
+        for (required, source_path) in CHATTERBOX_REQUIRED_SIDECARS {
+            let sidecar = artifact.sidecars.get(*required).with_context(|| {
+                format!("Chatterbox calibration requires admin catalog sidecar {required}")
+            })?;
+            ensure!(
+                sidecar.source == artifact.source
+                    && chatterbox_source_binds_canonical_upstream(
+                        &sidecar.source,
+                        sidecar.upstream_source.as_ref()
+                    )
+                    && sidecar.path == *source_path,
+                "Chatterbox sidecar {required} must share the primary release source and bind {CHATTERBOX_MODEL_REPO}@{} path {source_path}",
+                mayhem_engine::CHATTERBOX_MODEL_REVISION
+            );
+            ensure!(
+                paths.contains_key(*required),
+                "Chatterbox calibration requires --artifact-sidecar {required}=PATH"
+            );
+        }
+        ensure!(
+            paths.len() == CHATTERBOX_REQUIRED_SIDECARS.len()
+                && artifact.sidecars.len() == CHATTERBOX_REQUIRED_SIDECARS.len(),
+            "Chatterbox calibration requires its exact four signed sidecars and no extras"
+        );
+    }
     if artifact.engine == "ace-step" {
         for (required, source_path, _) in ACE_STEP_REQUIRED_SIDECARS {
             let sidecar = artifact.sidecars.get(*required).with_context(|| {
@@ -17753,16 +17958,28 @@ fn calibration_memory_context(
         human_bytes(reserve_bytes)
     );
 
+    let chatterbox_device = (artifact.engine == "chatterbox")
+        .then(|| {
+            chatterbox_managed_device(&hardware)
+                .context("hardware probe did not select a supported Chatterbox managed device")
+        })
+        .transpose()?;
+    if let Some(device) = chatterbox_device {
+        validate_chatterbox_device_request(
+            env::var("MAYHEM_CHATTERBOX_DEVICE").ok().as_deref(),
+            device,
+        )?;
+    }
     let (probe, measurement_source) = if pool.unified || pool.pool == "system_memory" {
-        (CalibrationMemoryProbe::ProcessRss, "process_rss")
+        (CalibrationMemoryProbe::ProcessRss, "process_tree_rss")
     } else if hardware
         .gpus
         .iter()
         .any(|gpu| gpu.vendor == GpuVendor::Nvidia)
     {
         (
-            CalibrationMemoryProbe::NvidiaDevice,
-            "nvidia_smi_device_memory",
+            CalibrationMemoryProbe::NvidiaProcesses,
+            "nvidia_smi_process_memory",
         )
     } else if hardware.gpus.iter().any(|gpu| gpu.vendor == GpuVendor::Amd) {
         (CalibrationMemoryProbe::AmdDevice, "rocm_smi_device_memory")
@@ -17780,6 +17997,7 @@ fn calibration_memory_context(
             pool.pool, pool.source, reserve_source
         ),
         probe,
+        chatterbox_device,
     })
 }
 
@@ -17847,14 +18065,19 @@ fn calibration_memory_bytes(
             ensure!(total > 0, "calibration process RSS probe returned zero");
             Ok(total)
         }
-        CalibrationMemoryProbe::NvidiaDevice => calibration_nvidia_memory_bytes(),
+        CalibrationMemoryProbe::NvidiaProcesses => {
+            calibration_nvidia_process_memory_bytes(process_ids)
+        }
         CalibrationMemoryProbe::AmdDevice => calibration_amd_memory_bytes(),
     }
 }
 
-fn calibration_nvidia_memory_bytes() -> Result<u64> {
+fn calibration_nvidia_process_memory_bytes(process_ids: &[u32]) -> Result<u64> {
     let output = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-compute-apps=pid,used_gpu_memory",
+            "--format=csv,noheader,nounits",
+        ])
         .output()
         .context("running nvidia-smi calibration memory probe")?;
     ensure!(
@@ -17862,21 +18085,55 @@ fn calibration_nvidia_memory_bytes() -> Result<u64> {
         "nvidia-smi calibration memory probe failed: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
+    parse_nvidia_compute_process_memory_bytes(&String::from_utf8_lossy(&output.stdout), process_ids)
+}
+
+fn parse_nvidia_compute_process_memory_bytes(output: &str, process_ids: &[u32]) -> Result<u64> {
+    let process_ids = process_ids.iter().copied().collect::<BTreeSet<_>>();
+    ensure!(
+        !process_ids.is_empty(),
+        "NVIDIA calibration memory probe has no process ids"
+    );
     let mut total_mib = 0_f64;
-    let mut count = 0_u64;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let value = line
+    let mut matched = BTreeSet::new();
+    for line in output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let (pid, value) = line
+            .split_once(',')
+            .with_context(|| format!("invalid nvidia-smi compute-app row {line:?}"))?;
+        let pid = pid
+            .trim()
+            .parse::<u32>()
+            .with_context(|| format!("invalid nvidia-smi process id in {line:?}"))?;
+        if !process_ids.contains(&pid) {
+            continue;
+        }
+        let value = value
+            .trim()
+            .strip_suffix("MiB")
+            .unwrap_or(value.trim())
             .trim()
             .parse::<f64>()
-            .with_context(|| format!("invalid nvidia-smi memory.used value {line:?}"))?;
+            .with_context(|| format!("invalid nvidia-smi process memory value in {line:?}"))?;
         ensure!(
             value.is_finite() && value >= 0.0,
             "invalid NVIDIA memory value"
         );
         total_mib += value;
-        count = count.saturating_add(1);
+        matched.insert(pid);
     }
-    ensure!(count > 0, "nvidia-smi reported no GPU memory values");
+    ensure!(
+        !matched.is_empty(),
+        "nvidia-smi reported no CUDA memory for calibration pid(s) {}",
+        process_ids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     let bytes = (total_mib * 1024.0 * 1024.0).ceil();
     ensure!(bytes <= u64::MAX as f64, "NVIDIA memory reading overflowed");
     Ok((bytes as u64).max(1))
@@ -17943,15 +18200,140 @@ fn json_u64_measurement(value: &Value) -> Option<u64> {
     })
 }
 
+fn calibration_process_scope_ids(worker_roots: &[u32]) -> Result<Vec<u32>> {
+    let parents = calibration_process_parent_rows()?;
+    Ok(process_scope_ids_from_parent_rows(
+        worker_roots,
+        std::process::id(),
+        &parents,
+    ))
+}
+
+fn process_scope_ids_from_parent_rows(
+    worker_roots: &[u32],
+    coordinator_pid: u32,
+    parents: &[(u32, u32)],
+) -> Vec<u32> {
+    let mut selected = process_tree_ids_from_parent_rows(worker_roots, parents);
+    selected.push(coordinator_pid);
+    selected.sort_unstable();
+    selected.dedup();
+    selected
+}
+
+fn process_tree_ids_from_parent_rows(roots: &[u32], parents: &[(u32, u32)]) -> Vec<u32> {
+    let mut selected = roots.iter().copied().collect::<BTreeSet<_>>();
+    loop {
+        let before = selected.len();
+        for (pid, parent) in parents {
+            if selected.contains(parent) {
+                selected.insert(*pid);
+            }
+        }
+        if selected.len() == before {
+            break;
+        }
+    }
+    selected.into_iter().collect()
+}
+
+#[cfg(target_os = "linux")]
+fn calibration_process_parent_rows() -> Result<Vec<(u32, u32)>> {
+    let mut rows = Vec::new();
+    for entry in fs::read_dir("/proc").context("reading /proc for calibration process tree")? {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(status) = fs::read_to_string(entry.path().join("status")) else {
+            continue;
+        };
+        let Some(parent) = status.lines().find_map(|line| {
+            line.strip_prefix("PPid:")
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        }) else {
+            continue;
+        };
+        rows.push((pid, parent));
+    }
+    Ok(rows)
+}
+
+#[cfg(target_os = "macos")]
+fn calibration_process_parent_rows() -> Result<Vec<(u32, u32)>> {
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()
+        .context("reading macOS calibration process tree")?;
+    ensure!(
+        output.status.success(),
+        "macOS process-tree probe failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    parse_calibration_process_parent_rows(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(target_os = "windows")]
+fn calibration_process_parent_rows() -> Result<Vec<(u32, u32)>> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process | ForEach-Object { [Console]::WriteLine(([string]$_.ProcessId) + ',' + ([string]$_.ParentProcessId)) }",
+        ])
+        .output()
+        .context("reading Windows calibration process tree")?;
+    ensure!(
+        output.status.success(),
+        "Windows process-tree probe failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    parse_calibration_process_parent_rows(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn calibration_process_parent_rows() -> Result<Vec<(u32, u32)>> {
+    Ok(Vec::new())
+}
+
+fn parse_calibration_process_parent_rows(output: &str) -> Result<Vec<(u32, u32)>> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let fields = line
+                .split(|character: char| character == ',' || character.is_ascii_whitespace())
+                .filter(|field| !field.is_empty())
+                .collect::<Vec<_>>();
+            ensure!(fields.len() == 2, "invalid process parent row {line:?}");
+            Ok((
+                fields[0]
+                    .parse::<u32>()
+                    .with_context(|| format!("invalid process id in {line:?}"))?,
+                fields[1]
+                    .parse::<u32>()
+                    .with_context(|| format!("invalid parent process id in {line:?}"))?,
+            ))
+        })
+        .collect()
+}
+
 fn measure_calibration_memory<T>(
     context: &CalibrationMemoryContext,
     process_ids: &[u32],
     operation: impl FnOnce() -> Result<T>,
 ) -> Result<(T, u64, u64)> {
-    let mut process_ids = process_ids.to_vec();
-    process_ids.push(std::process::id());
-    process_ids.sort_unstable();
-    process_ids.dedup();
+    // Descend only from managed worker roots. The CLI may share its process with
+    // unrelated test or helper children, which are not part of this calibration.
+    let process_ids = calibration_process_scope_ids(process_ids)?;
     let baseline = calibration_memory_bytes(context, &process_ids)?;
     ensure!(
         baseline <= context.f13_budget_bytes,
@@ -18279,6 +18661,7 @@ fn catalog_canary_plan_sign_options(
     args: &CatalogCanaryPlanArgs,
 ) -> Result<Option<CatalogCanaryPlanSignOptions>> {
     let requested = args.catalog_signature_output.is_some()
+        || args.catalog_base_signature_path.is_some()
         || args.catalog_key_id.is_some()
         || args.catalog_seed_file.is_some()
         || args.catalog_keys_dir.is_some()
@@ -18287,6 +18670,14 @@ fn catalog_canary_plan_sign_options(
     if !requested {
         return Ok(None);
     }
+    let base_catalog_path = args.catalog_path.clone().context(
+        "--catalog-path is required when emitting a catalog sign command; use the exact active catalog resolved from catalog/current",
+    )?;
+    let base_catalog_path = absolutize(base_catalog_path)?;
+    let base_signature_path = args.catalog_base_signature_path.clone().context(
+        "--catalog-base-signature-path is required when emitting a catalog sign command",
+    )?;
+    let base_signature_path = absolutize(base_signature_path)?;
     let signature_output = args
         .catalog_signature_output
         .clone()
@@ -18309,6 +18700,8 @@ fn catalog_canary_plan_sign_options(
         .unwrap_or_else(|| repo_path("catalog/keys"))?;
     let keys_dir = absolutize(keys_dir)?;
     Ok(Some(CatalogCanaryPlanSignOptions {
+        base_catalog_path,
+        base_signature_path,
         signature_output,
         key_id,
         seed_file,
@@ -20115,6 +20508,8 @@ struct CatalogCanaryPlanInput<'a> {
 
 #[derive(Debug, Clone)]
 struct CatalogCanaryPlanSignOptions {
+    base_catalog_path: PathBuf,
+    base_signature_path: PathBuf,
     signature_output: PathBuf,
     key_id: String,
     seed_file: PathBuf,
@@ -20200,6 +20595,7 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
                 | "mlx"
                 | "stable-diffusion.cpp"
                 | "ace-step"
+                | "chatterbox"
                 | "sulphur"
                 | "transformers-asr"
                 | "whisper.cpp"
@@ -20457,6 +20853,12 @@ fn catalog_canary_plan_sign_command(
 ) -> CatalogCanaryPlanCommand {
     let mut argv = vec!["mayhem".to_owned(), "catalog".to_owned(), "sign".to_owned()];
     push_plan_path_arg(&mut argv, "--catalog-path", catalog_output);
+    push_plan_path_arg(&mut argv, "--base-catalog-path", &sign.base_catalog_path);
+    push_plan_path_arg(
+        &mut argv,
+        "--base-signature-path",
+        &sign.base_signature_path,
+    );
     push_plan_path_arg(&mut argv, "--signature-output", &sign.signature_output);
     push_plan_value_arg(&mut argv, "--key-id", &sign.key_id);
     push_plan_path_arg(&mut argv, "--seed-file", &sign.seed_file);
@@ -21168,7 +21570,7 @@ fn preflight_catalog_calibration_managed_runtime(
 ) -> Result<()> {
     if !matches!(
         artifact.engine.as_str(),
-        "mlx" | "ace-step" | "sulphur" | "transformers-asr" | "trt-llm" | "vllm"
+        "mlx" | "ace-step" | "chatterbox" | "sulphur" | "transformers-asr" | "trt-llm" | "vllm"
     ) {
         return Ok(());
     }
@@ -21192,10 +21594,11 @@ fn catalog_calibration_backend(
     artifact_path: &Path,
     sidecar_paths: &BTreeMap<String, PathBuf>,
     args: &CatalogCalibrateCanaryArgs,
+    calibration_memory: &CalibrationMemoryContext,
 ) -> Result<Box<dyn EngineBackend>> {
     let managed_runtime = if matches!(
         artifact.engine.as_str(),
-        "mlx" | "ace-step" | "sulphur" | "transformers-asr" | "trt-llm" | "vllm"
+        "mlx" | "ace-step" | "chatterbox" | "sulphur" | "transformers-asr" | "trt-llm" | "vllm"
     ) {
         let managed_backend = managed_python_backend_for_artifact(artifact);
         let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
@@ -21264,6 +21667,23 @@ fn catalog_calibration_backend(
             cache_dir,
         )?;
         materialized_artifact_path.as_path()
+    } else if artifact.engine == "chatterbox" {
+        let cache_dir = &managed_runtime
+            .as_ref()
+            .context("Chatterbox calibration runtime cache was not resolved")?
+            .1;
+        let paths = ProviderArtifactPaths {
+            primary: artifact_path.to_path_buf(),
+            sidecars: sidecar_paths.clone(),
+        };
+        materialized_artifact_path = materialize_chatterbox_layout(
+            &format!("{}/{}", artifact.source.repo, artifact.path),
+            &artifact.artifact_root,
+            artifact,
+            &paths,
+            cache_dir,
+        )?;
+        materialized_artifact_path.as_path()
     } else if artifact.engine == "sulphur" {
         let cache_dir = &managed_runtime
             .as_ref()
@@ -21291,6 +21711,7 @@ fn catalog_calibration_backend(
         "vllm" => LoadConfig::vllm_safetensors(artifact_path),
         "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
         "ace-step" => LoadConfig::ace_step_safetensors(artifact_path),
+        "chatterbox" => LoadConfig::chatterbox_safetensors(artifact_path),
         "sulphur" => sulphur_load_config(artifact_path)?,
         "transformers-asr" => LoadConfig::transformers_safetensors(artifact_path),
         "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
@@ -21449,6 +21870,23 @@ fn catalog_calibration_backend(
             backend
                 .load(config)
                 .context("loading ACE-Step canary calibration artifact")?;
+            Ok(Box::new(backend))
+        }
+        "chatterbox" => {
+            let python = &managed_runtime
+                .as_ref()
+                .context("Chatterbox calibration runtime was not resolved")?
+                .0
+                .python;
+            let device = calibration_memory
+                .chatterbox_device
+                .context("Chatterbox calibration did not select an execution device")?;
+            let mut backend =
+                mayhem_engine::ChatterboxBackend::with_python_for_device(python, device.as_str())
+                    .context("initializing Chatterbox backend")?;
+            backend
+                .load(config)
+                .context("loading Chatterbox canary calibration artifact")?;
             Ok(Box::new(backend))
         }
         "sulphur" => {
@@ -21959,17 +22397,28 @@ fn calibrate_audio_fingerprint_prompt(
     let mut expected_artifact_count = 1_usize;
     let (output_seconds, witness_usage) = match model.model_class.as_str() {
         "tts" => {
-            let request = SpeechRequest {
-                input: canary_prompt_text(prompt)?,
-                voice: prompt.voice.clone(),
-                response_format: Some(
-                    prompt
-                        .response_format
-                        .clone()
-                        .unwrap_or_else(|| "wav".to_owned()),
-                ),
-                speed: None,
-            };
+            let body = provider_canary_self_test_body(model, prompt)?;
+            let chatterbox = model
+                .artifacts
+                .values()
+                .any(|artifact| artifact.engine == "chatterbox");
+            if chatterbox {
+                ensure_chatterbox_canary_body_coverage(prompt, &body)?;
+            }
+            let sealed =
+                provider_seal_local_contract_request(&body, &model.adapter, &model.model_id)
+                    .with_context(|| {
+                        format!(
+                            "TTS canary prompt {} violates its signed endpoint contract",
+                            prompt.id
+                        )
+                    })?;
+            let verified =
+                provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter)?;
+            let request = provider_speech_request_from_body(&verified.family, &verified.request)?;
+            if chatterbox {
+                ensure_chatterbox_canary_request_coverage(prompt, &request)?;
+            }
             let input_characters = u64::try_from(request.input.chars().count())
                 .context("TTS canary input character count overflowed u64")?;
             let output_seconds = backend
@@ -22129,6 +22578,79 @@ fn calibrate_audio_fingerprint_prompt(
         behavioral_output_fingerprint: Some(behavioral_output_fingerprint),
         behavioral_witness: Some(behavioral_witness),
     })
+}
+
+fn ensure_chatterbox_canary_body_coverage(prompt: &CanaryPrompt, body: &Value) -> Result<()> {
+    let family = body
+        .get("endpoint_family")
+        .and_then(Value::as_str)
+        .with_context(|| {
+            format!(
+                "Chatterbox canary prompt {} has no endpoint family",
+                prompt.id
+            )
+        })?;
+    let required = match family {
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH => [
+            "reference_audio",
+            "exaggeration",
+            "cfg_weight",
+            "seed",
+            "temperature",
+            "min_p",
+            "top_p",
+            "repetition_penalty",
+        ],
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH => [
+            "parameters.reference_audio",
+            "parameters.exaggeration",
+            "parameters.cfg_weight",
+            "parameters.seed",
+            "parameters.generation_parameters.temperature",
+            "parameters.generation_parameters.min_p",
+            "parameters.generation_parameters.top_p",
+            "parameters.generation_parameters.repetition_penalty",
+        ],
+        other => bail!(
+            "Chatterbox canary prompt {} uses unsupported endpoint family {other}",
+            prompt.id
+        ),
+    };
+    for path in required {
+        ensure!(
+            calibration_value_has_path(body, path),
+            "Chatterbox canary prompt {} must explicitly exercise signed control {path}",
+            prompt.id
+        );
+    }
+    Ok(())
+}
+
+fn ensure_chatterbox_canary_request_coverage(
+    prompt: &CanaryPrompt,
+    request: &SpeechRequest,
+) -> Result<()> {
+    ensure!(
+        request.reference_audio.is_some(),
+        "Chatterbox canary prompt {} must exercise a fixed inline reference WAV",
+        prompt.id
+    );
+    for (control, present) in [
+        ("exaggeration", request.exaggeration.is_some()),
+        ("cfg_weight", request.cfg_weight.is_some()),
+        ("seed", request.seed.is_some()),
+        ("temperature", request.temperature.is_some()),
+        ("min_p", request.min_p.is_some()),
+        ("top_p", request.top_p.is_some()),
+        ("repetition_penalty", request.repetition_penalty.is_some()),
+    ] {
+        ensure!(
+            present,
+            "Chatterbox canary prompt {} must exercise signed control {control}",
+            prompt.id
+        );
+    }
+    Ok(())
 }
 
 fn calibrate_video_av_fingerprint_prompt(
@@ -25455,7 +25977,7 @@ fn enforce_backend_caps(backend: &str, caps: &mut Value) -> Result<()> {
 fn backend_supports_tool_calls(backend: &str) -> bool {
     !matches!(
         backend,
-        "mlx" | "ace-step" | "sulphur" | "transformers-asr" | "trt-llm"
+        "mlx" | "ace-step" | "chatterbox" | "sulphur" | "transformers-asr" | "trt-llm"
     )
 }
 
@@ -36131,12 +36653,13 @@ struct CalibrationMemoryContext {
     f13_budget_bytes: u64,
     source: String,
     probe: CalibrationMemoryProbe,
+    chatterbox_device: Option<ChatterboxManagedDevice>,
 }
 
 #[derive(Clone, Debug)]
 enum CalibrationMemoryProbe {
     ProcessRss,
-    NvidiaDevice,
+    NvidiaProcesses,
     AmdDevice,
 }
 
@@ -46947,6 +47470,7 @@ struct ProviderBackendRuntime {
     python: Option<PathBuf>,
     python_source: Option<String>,
     requirements_sha256: Option<String>,
+    chatterbox_device: Option<ChatterboxManagedDevice>,
     cuda_home: Option<PathBuf>,
     cache_dir: Option<PathBuf>,
     external_binary: Option<PathBuf>,
@@ -48169,6 +48693,15 @@ fn provider_backend_runtime_child_env(
         }
         "mlx" => insert_path("MAYHEM_MLX_PYTHON", runtime.python.as_deref()),
         "ace-step" => insert_path("MAYHEM_ACE_STEP_PYTHON", runtime.python.as_deref()),
+        "chatterbox" => {
+            insert_path("MAYHEM_CHATTERBOX_PYTHON", runtime.python.as_deref());
+            if let Some(device) = runtime.chatterbox_device {
+                child_env.insert(
+                    "MAYHEM_CHATTERBOX_DEVICE".to_owned(),
+                    device.as_str().to_owned(),
+                );
+            }
+        }
         "sulphur" => insert_path("MAYHEM_SULPHUR_PYTHON", runtime.python.as_deref()),
         "transformers-asr" => {
             insert_path("MAYHEM_TRANSFORMERS_ASR_PYTHON", runtime.python.as_deref());
@@ -48469,8 +49002,20 @@ fn provider_backend_runtime_preflight_for_backend(
 ) -> Result<ProviderBackendRuntime> {
     let mut runtime = ProviderBackendRuntime::default();
     match backend {
-        "vllm" | "trt-llm" | "mlx" | "ace-step" | "sulphur" | "transformers-asr" => {
+        "vllm" | "trt-llm" | "mlx" | "ace-step" | "chatterbox" | "sulphur" | "transformers-asr" => {
             let python_backend = managed_backend.unwrap_or(backend);
+            let chatterbox_device = if backend == "chatterbox" {
+                let device = chatterbox_managed_device(hardware).context(
+                    "hardware probe did not select a supported Chatterbox managed device",
+                )?;
+                validate_chatterbox_device_request(
+                    env::var("MAYHEM_CHATTERBOX_DEVICE").ok().as_deref(),
+                    device,
+                )?;
+                Some(device)
+            } else {
+                None
+            };
             let python = python_runtime::ensure_backend_python(home, python_backend)
                 .with_context(|| format!("preparing the managed {backend} runtime"))?;
             let cache_dir = home.join("cache").join(backend);
@@ -48480,6 +49025,7 @@ fn provider_backend_runtime_preflight_for_backend(
             runtime.python = Some(python.python);
             runtime.python_source = Some(python.source);
             runtime.requirements_sha256 = Some(python.requirements_sha256);
+            runtime.chatterbox_device = chatterbox_device;
             if matches!(backend, "vllm" | "trt-llm") {
                 let python = runtime
                     .python
@@ -48534,6 +49080,27 @@ fn provider_backend_runtime_preflight_for_backend(
         other => bail!("unsupported local provider session backend {other}"),
     }
     Ok(runtime)
+}
+
+fn validate_chatterbox_device_request(
+    requested: Option<&str>,
+    selected: ChatterboxManagedDevice,
+) -> Result<()> {
+    let requested = requested.unwrap_or("auto").trim().to_ascii_lowercase();
+    ensure!(
+        matches!(requested.as_str(), "" | "auto" | "cpu" | "cuda" | "mps"),
+        "MAYHEM_CHATTERBOX_DEVICE must be auto, cpu, cuda, or mps"
+    );
+    if matches!(requested.as_str(), "" | "auto") {
+        return Ok(());
+    }
+    ensure!(
+        requested == selected.as_str(),
+        "MAYHEM_CHATTERBOX_DEVICE={requested} contradicts managed Chatterbox admission path {}; remove the override or use {}",
+        selected.as_str(),
+        selected.as_str()
+    );
+    Ok(())
 }
 
 fn stable_diffusion_accelerator(hardware: &HardwareReport) -> Result<Option<String>> {
@@ -57037,6 +57604,40 @@ fn provider_memory_pool(
     backend: &str,
 ) -> ProviderMemoryPool {
     match backend {
+        "chatterbox" => match chatterbox_managed_device(hardware) {
+            Some(ChatterboxManagedDevice::Cuda) => {
+                if let Some(total) =
+                    known_total_dedicated_vram_bytes(hardware).filter(|total| *total > 0)
+                {
+                    ProviderMemoryPool {
+                        pool: "nvidia_dedicated_memory".to_owned(),
+                        source: "Chatterbox CUDA dedicated memory from hwprobe".to_owned(),
+                        unified: false,
+                        total_bytes: total,
+                        available_bytes: total,
+                    }
+                } else {
+                    provider_system_memory_pool(
+                        hardware,
+                        "system_memory",
+                        "host available memory fallback for Chatterbox CUDA",
+                    )
+                }
+            }
+            Some(ChatterboxManagedDevice::Mps) => ProviderMemoryPool {
+                unified: true,
+                ..provider_system_memory_pool(
+                    hardware,
+                    "unified_memory",
+                    "Chatterbox MPS uses host unified memory",
+                )
+            },
+            Some(ChatterboxManagedDevice::Cpu) | None => provider_system_memory_pool(
+                hardware,
+                "system_memory",
+                "Chatterbox CPU uses host memory",
+            ),
+        },
         "mlx" => ProviderMemoryPool {
             unified: true,
             ..provider_system_memory_pool(
@@ -59737,6 +60338,7 @@ fn backend_rank(backend: &str) -> u8 {
         "trt-llm" => 3,
         "mlx" => 2,
         "ace-step" => 2,
+        "chatterbox" => 2,
         "sulphur" => 2,
         "transformers-asr" => 2,
         "llama.cpp" => 1,
@@ -63093,12 +63695,22 @@ fn provider_session_modality_load(
                 .unwrap_or(u64::MAX)
                 .div_ceil(12)
                 .max(1);
+            let reference_bytes = request
+                .reference_audio
+                .as_ref()
+                .map(|reference| u64::try_from(reference.data.len()).unwrap_or(u64::MAX))
+                .unwrap_or(0);
+            let reference_seconds = request
+                .reference_audio
+                .as_ref()
+                .and_then(|reference| wav_duration_seconds_ceil(&reference.data))
+                .unwrap_or(0);
             Ok(BTreeMap::from([(
                 "audio".to_owned(),
                 ModalityRequestLoad {
                     item_count: 1,
-                    max_item_bytes: 1,
-                    max_item_units: estimated_seconds,
+                    max_item_bytes: reference_bytes.max(1),
+                    max_item_units: estimated_seconds.max(reference_seconds),
                 },
             )]))
         }
@@ -66545,6 +67157,28 @@ fn provider_session_responder(
                 backend: Box::new(backend),
             }))
         }
+        "chatterbox" => {
+            let python = ctx
+                .backend_runtime
+                .python
+                .as_ref()
+                .context("Chatterbox runtime preflight did not resolve Python")?;
+            let device = ctx
+                .backend_runtime
+                .chatterbox_device
+                .context("Chatterbox runtime preflight did not select an execution device")?;
+            let mut backend =
+                mayhem_engine::ChatterboxBackend::with_python_for_device(python, device.as_str())
+                    .context("initializing Chatterbox provider session engine")?;
+            with_provider_progress_spinner(ctx.args, "Chatterbox engine load", || {
+                backend
+                    .load(load_config)
+                    .context("loading Chatterbox provider session engine")
+            })?;
+            Ok(Box::new(EngineProviderSessionResponder {
+                backend: Box::new(backend),
+            }))
+        }
         "sulphur" => {
             let python = ctx
                 .backend_runtime
@@ -66953,17 +67587,118 @@ fn provider_canary_self_test_body(
             Ok(body)
         }
         "tts" => {
-            let mut body = json!({
-                "kind": "audio_speech",
-                "input": canary_prompt_text(prompt)?,
+            let family = provider_tts_canary_endpoint_family(model, prompt)?;
+            let mut request = prompt.endpoint_attributes.clone();
+            request.remove("endpoint_family");
+            let reference_audio = prompt.audio_b64.as_ref().map(|data| {
+                json!({
+                    "data": data,
+                    "encoding": "base64",
+                    "content_type": prompt.content_type.as_deref().unwrap_or("audio/wav"),
+                })
             });
-            if let Some(voice) = &prompt.voice {
-                body["voice"] = json!(voice);
+            match family.as_str() {
+                mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH => {
+                    request
+                        .entry("input".to_owned())
+                        .or_insert(json!(canary_prompt_text(prompt)?));
+                    if let Some(voice) = &prompt.voice {
+                        request.entry("voice".to_owned()).or_insert(json!(voice));
+                    }
+                    if let Some(response_format) = &prompt.response_format {
+                        request
+                            .entry("response_format".to_owned())
+                            .or_insert(json!(response_format));
+                    }
+                    if let Some(reference_audio) = reference_audio {
+                        request
+                            .entry("reference_audio".to_owned())
+                            .or_insert(reference_audio);
+                    }
+                    for (name, value) in [
+                        ("temperature", prompt.temperature.map(Value::from)),
+                        ("min_p", prompt.min_p.map(Value::from)),
+                        ("top_p", prompt.top_p.map(Value::from)),
+                        ("repetition_penalty", prompt.repeat_penalty.map(Value::from)),
+                        ("seed", prompt.seed.map(Value::from)),
+                    ] {
+                        if let Some(value) = value {
+                            request.entry(name.to_owned()).or_insert(value);
+                        }
+                    }
+                }
+                mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH => {
+                    let top_level_reference_audio = request.remove("reference_audio");
+                    let top_level_exaggeration = request.remove("exaggeration");
+                    let top_level_cfg_weight = request.remove("cfg_weight");
+                    let top_level_temperature = request.remove("temperature");
+                    let top_level_min_p = request.remove("min_p");
+                    let top_level_top_p = request.remove("top_p");
+                    let top_level_repetition_penalty = request.remove("repetition_penalty");
+                    request
+                        .entry("inputs".to_owned())
+                        .or_insert(json!(canary_prompt_text(prompt)?));
+                    let parameters = request
+                        .entry("parameters".to_owned())
+                        .or_insert_with(|| json!({}))
+                        .as_object_mut()
+                        .context("TTS canary parameters must be an object")?;
+                    if let Some(voice) = &prompt.voice {
+                        parameters.entry("voice".to_owned()).or_insert(json!(voice));
+                    }
+                    if let Some(reference_audio) = reference_audio.or(top_level_reference_audio) {
+                        parameters
+                            .entry("reference_audio".to_owned())
+                            .or_insert(reference_audio);
+                    }
+                    if let Some(exaggeration) = top_level_exaggeration {
+                        parameters
+                            .entry("exaggeration".to_owned())
+                            .or_insert(exaggeration);
+                    }
+                    if let Some(cfg_weight) = top_level_cfg_weight {
+                        parameters
+                            .entry("cfg_weight".to_owned())
+                            .or_insert(cfg_weight);
+                    }
+                    if let Some(seed) = prompt.seed {
+                        parameters.entry("seed".to_owned()).or_insert(json!(seed));
+                    }
+                    let generation_parameters = parameters
+                        .entry("generation_parameters".to_owned())
+                        .or_insert_with(|| json!({}))
+                        .as_object_mut()
+                        .context("TTS canary generation_parameters must be an object")?;
+                    for (name, value) in [
+                        (
+                            "temperature",
+                            prompt
+                                .temperature
+                                .map(Value::from)
+                                .or(top_level_temperature),
+                        ),
+                        ("min_p", prompt.min_p.map(Value::from).or(top_level_min_p)),
+                        ("top_p", prompt.top_p.map(Value::from).or(top_level_top_p)),
+                        (
+                            "repetition_penalty",
+                            prompt
+                                .repeat_penalty
+                                .map(Value::from)
+                                .or(top_level_repetition_penalty),
+                        ),
+                    ] {
+                        if let Some(value) = value {
+                            generation_parameters
+                                .entry(name.to_owned())
+                                .or_insert(value);
+                        }
+                    }
+                }
+                _ => unreachable!("TTS canary endpoint family was validated"),
             }
-            if let Some(response_format) = &prompt.response_format {
-                body["response_format"] = json!(response_format);
-            }
-            Ok(body)
+            request.insert("kind".to_owned(), json!("audio_speech"));
+            request.insert("endpoint_family".to_owned(), json!(family));
+            Ok(Value::Object(request.into_iter().collect()))
         }
         "audio-generation" => {
             let mut body = json!({
@@ -67031,6 +67766,47 @@ fn provider_canary_self_test_body(
         }
         other => bail!("functional modality self-test is not wired for model_class {other}"),
     }
+}
+
+fn provider_tts_canary_endpoint_family(
+    model: &catalog::CatalogModel,
+    prompt: &CanaryPrompt,
+) -> Result<String> {
+    let requested = prompt
+        .endpoint_attributes
+        .get("endpoint_family")
+        .and_then(Value::as_str);
+    let family = if let Some(requested) = requested {
+        ensure!(
+            matches!(
+                requested,
+                mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH
+                    | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH
+            ),
+            "TTS canary prompt {} has unsupported endpoint_family {requested}",
+            prompt.id
+        );
+        requested
+    } else if model
+        .adapter
+        .endpoint_families
+        .iter()
+        .any(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH)
+    {
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH
+    } else {
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH
+    };
+    ensure!(
+        model
+            .adapter
+            .endpoint_families
+            .iter()
+            .any(|contract| contract.family == family),
+        "TTS canary prompt {} selects endpoint family {family}, but the signed model adapter does not expose it",
+        prompt.id
+    );
+    Ok(family.to_owned())
 }
 
 fn provider_canary_self_test_disable_reasoning(
@@ -67298,6 +68074,12 @@ fn provider_engine_load_config(
             .as_deref()
             .context("ACE-Step provider runtime cache was not resolved")?;
         artifact_path_buf = materialize_ace_step_artifacts(selected, artifact_paths, cache_dir)?;
+    } else if selected.artifact.engine == "chatterbox" {
+        let cache_dir = backend_runtime
+            .cache_dir
+            .as_deref()
+            .context("Chatterbox provider runtime cache was not resolved")?;
+        artifact_path_buf = materialize_chatterbox_artifacts(selected, artifact_paths, cache_dir)?;
     } else if selected.artifact.engine == "sulphur" {
         let cache_dir = backend_runtime
             .cache_dir
@@ -67315,6 +68097,7 @@ fn provider_engine_load_config(
         "vllm" => ModelArtifact::vllm_safetensors(artifact_path),
         "stable-diffusion.cpp" => ModelArtifact::stable_diffusion_checkpoint(artifact_path),
         "ace-step" => ModelArtifact::ace_step_safetensors(artifact_path),
+        "chatterbox" => ModelArtifact::chatterbox_safetensors(artifact_path),
         "sulphur" => sulphur_load_config(artifact_path)?.artifact,
         "transformers-asr" => ModelArtifact::transformers_safetensors(artifact_path),
         "whisper.cpp" => ModelArtifact::whisper_ggml(artifact_path),
@@ -67336,6 +68119,7 @@ fn provider_engine_load_config(
         "vllm" => LoadConfig::vllm_safetensors(artifact_path),
         "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
         "ace-step" => LoadConfig::ace_step_safetensors(artifact_path),
+        "chatterbox" => LoadConfig::chatterbox_safetensors(artifact_path),
         "sulphur" => sulphur_load_config(artifact_path)?,
         "transformers-asr" => LoadConfig::transformers_safetensors(artifact_path),
         "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
@@ -67467,6 +68251,26 @@ const TRANSFORMERS_ASR_REQUIRED_SIDECARS: &[(&str, &str)] = &[
     ("transformers_tokenizer_json", "tokenizer.json"),
     ("transformers_tokenizer_config", "tokenizer_config.json"),
 ];
+
+const CHATTERBOX_MODEL_REPO: &str = "ResembleAI/chatterbox";
+const CHATTERBOX_PRIMARY_PATH: &str = "t3_cfg.safetensors";
+const CHATTERBOX_REQUIRED_SIDECARS: &[(&str, &str)] = &[
+    ("chatterbox_voice_encoder", "ve.safetensors"),
+    ("chatterbox_s3gen", "s3gen.safetensors"),
+    ("chatterbox_tokenizer", "tokenizer.json"),
+    ("chatterbox_default_conditionals", "conds.pt"),
+];
+
+fn chatterbox_source_binds_canonical_upstream(
+    source: &catalog::SourceRef,
+    upstream_source: Option<&catalog::SourceRef>,
+) -> bool {
+    let upstream = upstream_source.unwrap_or(source);
+    source.kind == "huggingface"
+        && upstream.kind == "huggingface"
+        && upstream.repo == CHATTERBOX_MODEL_REPO
+        && upstream.revision == mayhem_engine::CHATTERBOX_MODEL_REVISION
+}
 
 const ACE_STEP_PRIMARY_DESTINATION: &str = "acestep-v15-sft/model.safetensors";
 const ACE_STEP_REQUIRED_SIDECARS: &[(&str, &str, &str)] = &[
@@ -67767,6 +68571,88 @@ fn materialize_transformers_asr_layout(
         })?;
     }
     Ok(model_dir)
+}
+
+fn materialize_chatterbox_artifacts(
+    selected: &ProviderCandidate,
+    artifact_paths: &ProviderArtifactPaths,
+    cache_dir: &Path,
+) -> Result<PathBuf> {
+    materialize_chatterbox_layout(
+        &format!("{}/{}", selected.model.model_id, selected.artifact_name),
+        &selected.artifact_name,
+        &selected.artifact,
+        artifact_paths,
+        cache_dir,
+    )
+}
+
+fn materialize_chatterbox_layout(
+    label: &str,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    artifact_paths: &ProviderArtifactPaths,
+    cache_dir: &Path,
+) -> Result<PathBuf> {
+    ensure!(
+        chatterbox_source_binds_canonical_upstream(
+            &artifact.source,
+            artifact.upstream_source.as_ref()
+        )
+            && artifact.path == CHATTERBOX_PRIMARY_PATH,
+        "Chatterbox artifact {label} must bind canonical upstream {CHATTERBOX_MODEL_REPO}@{} path {CHATTERBOX_PRIMARY_PATH}",
+        mayhem_engine::CHATTERBOX_MODEL_REVISION
+    );
+    ensure!(
+        artifact.sidecars.len() == CHATTERBOX_REQUIRED_SIDECARS.len()
+            && artifact_paths.sidecars.len() == CHATTERBOX_REQUIRED_SIDECARS.len(),
+        "Chatterbox artifact {label} requires its exact four signed sidecars and no extras"
+    );
+
+    let model_root = chatterbox_checkpoint_cache_dir(cache_dir, artifact_name, artifact);
+    fs::create_dir_all(&model_root)
+        .with_context(|| format!("creating Chatterbox model layout {}", model_root.display()))?;
+    let primary = model_root.join(CHATTERBOX_PRIMARY_PATH);
+    materialize_verified_ace_step_file(
+        &artifact_paths.primary,
+        &primary,
+        artifact.weights_bytes,
+        artifact
+            .source_sha256
+            .as_deref()
+            .context("Chatterbox primary artifact is missing source_sha256")?,
+        "Chatterbox primary artifact",
+    )?;
+
+    for (sidecar_name, expected_path) in CHATTERBOX_REQUIRED_SIDECARS {
+        let sidecar = artifact.sidecars.get(*sidecar_name).with_context(|| {
+            format!("Chatterbox artifact {label} requires sidecar {sidecar_name}")
+        })?;
+        ensure!(
+            sidecar.source == artifact.source
+                && chatterbox_source_binds_canonical_upstream(
+                    &sidecar.source,
+                    sidecar.upstream_source.as_ref()
+                )
+                && sidecar.path == *expected_path,
+            "Chatterbox artifact {label} sidecar {sidecar_name} must share the primary release source and bind {CHATTERBOX_MODEL_REPO}@{} path {expected_path}",
+            mayhem_engine::CHATTERBOX_MODEL_REVISION
+        );
+        let source = artifact_paths
+            .sidecars
+            .get(*sidecar_name)
+            .with_context(|| {
+                format!("downloaded Chatterbox artifact {label} is missing sidecar {sidecar_name}")
+            })?;
+        materialize_verified_ace_step_file(
+            source,
+            &model_root.join(expected_path),
+            sidecar.weights_bytes,
+            &sidecar.source_sha256,
+            &format!("Chatterbox sidecar {sidecar_name}"),
+        )?;
+    }
+    Ok(primary)
 }
 
 fn materialize_ace_step_artifacts(
@@ -68407,6 +69293,29 @@ fn transformers_asr_checkpoint_cache_dir(artifact_path: &Path, artifact_name: &s
     };
     base.join(".transformers-asr-models")
         .join(safe_path_component(artifact_name))
+}
+
+fn chatterbox_checkpoint_cache_dir(
+    cache_dir: &Path,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+) -> PathBuf {
+    let mut identity = blake3::Hasher::new();
+    identity.update(b"mayhem/chatterbox/materialized-layout/v1\0");
+    identity.update(artifact.artifact_root.as_bytes());
+    identity.update(&(artifact.path.len() as u64).to_be_bytes());
+    identity.update(artifact.path.as_bytes());
+    for (name, sidecar) in &artifact.sidecars {
+        identity.update(&(name.len() as u64).to_be_bytes());
+        identity.update(name.as_bytes());
+        identity.update(sidecar.artifact_root.as_bytes());
+        identity.update(&(sidecar.path.len() as u64).to_be_bytes());
+        identity.update(sidecar.path.as_bytes());
+    }
+    cache_dir
+        .join("models")
+        .join(safe_path_component(artifact_name))
+        .join(identity.finalize().to_hex().as_str())
 }
 
 fn ace_step_checkpoint_cache_dir(
@@ -70757,12 +71666,20 @@ fn provider_audio_transcription_request_from_body(
     })
 }
 
+const MAX_INLINE_SPEECH_REFERENCE_AUDIO_BYTES: usize = 16 * 1024 * 1024;
+const MAX_INLINE_SPEECH_REFERENCE_AUDIO_SECONDS: u64 = 10;
+
 fn provider_speech_request_from_body(endpoint_family: &str, body: &Value) -> Result<SpeechRequest> {
     let parameters = body.get("parameters").and_then(Value::as_object);
-    let input_key = if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH {
-        "inputs"
-    } else {
-        "input"
+    let (input_key, generation_parameters) = match endpoint_family {
+        mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH => ("input", None),
+        mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH => (
+            "inputs",
+            parameters
+                .and_then(|parameters| parameters.get("generation_parameters"))
+                .and_then(Value::as_object),
+        ),
+        other => bail!("unsupported speech endpoint family {other}"),
     };
     let input = body
         .get(input_key)
@@ -70770,26 +71687,186 @@ fn provider_speech_request_from_body(endpoint_family: &str, body: &Value) -> Res
         .filter(|input| !input.trim().is_empty())
         .context("audio_speech request missing input")?
         .to_owned();
-    Ok(SpeechRequest {
-        input,
-        voice: body
-            .get("voice")
-            .or_else(|| parameters.and_then(|parameters| parameters.get("voice")))
-            .or_else(|| parameters.and_then(|parameters| parameters.get("speaker_id")))
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned),
-        response_format: Some(
+
+    let mut request = SpeechRequest::new(input);
+    if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH {
+        request.voice = optional_nonempty_string(
+            parameters.and_then(|parameters| {
+                parameters
+                    .get("voice")
+                    .or_else(|| parameters.get("speaker_id"))
+            }),
+            "parameters.voice",
+        )?;
+        request.response_format = Some("wav".to_owned());
+        request.speed = optional_f64(
+            parameters.and_then(|parameters| parameters.get("speed")),
+            "parameters.speed",
+        )?;
+        request.reference_audio = optional_speech_reference_audio(
+            parameters.and_then(|parameters| parameters.get("reference_audio")),
+            "parameters.reference_audio",
+        )?;
+        request.exaggeration = optional_f32(
+            parameters.and_then(|parameters| parameters.get("exaggeration")),
+            "parameters.exaggeration",
+        )?;
+        request.cfg_weight = optional_f32(
+            parameters.and_then(|parameters| parameters.get("cfg_weight")),
+            "parameters.cfg_weight",
+        )?;
+        request.seed = optional_u32(
+            parameters.and_then(|parameters| parameters.get("seed")),
+            "parameters.seed",
+        )?;
+        request.temperature = optional_f32(
+            generation_parameters.and_then(|parameters| parameters.get("temperature")),
+            "parameters.generation_parameters.temperature",
+        )?;
+        request.min_p = optional_f32(
+            generation_parameters.and_then(|parameters| parameters.get("min_p")),
+            "parameters.generation_parameters.min_p",
+        )?;
+        request.top_p = optional_f32(
+            generation_parameters.and_then(|parameters| parameters.get("top_p")),
+            "parameters.generation_parameters.top_p",
+        )?;
+        request.repetition_penalty = optional_f32(
+            generation_parameters.and_then(|parameters| parameters.get("repetition_penalty")),
+            "parameters.generation_parameters.repetition_penalty",
+        )?;
+    } else {
+        request.voice = optional_nonempty_string(body.get("voice"), "voice")?;
+        request.response_format = Some(
             body.get("response_format")
-                .and_then(Value::as_str)
-                .unwrap_or("wav")
-                .to_owned(),
-        ),
-        speed: body
-            .get("speed")
-            .or_else(|| parameters.and_then(|parameters| parameters.get("speed")))
-            .and_then(Value::as_f64),
-    })
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .context("response_format must be a non-empty string")
+                        .map(str::to_owned)
+                })
+                .transpose()?
+                .unwrap_or_else(|| "wav".to_owned()),
+        );
+        request.speed = optional_f64(body.get("speed"), "speed")?;
+        request.reference_audio =
+            optional_speech_reference_audio(body.get("reference_audio"), "reference_audio")?;
+        request.exaggeration = optional_f32(body.get("exaggeration"), "exaggeration")?;
+        request.cfg_weight = optional_f32(body.get("cfg_weight"), "cfg_weight")?;
+        request.seed = optional_u32(body.get("seed"), "seed")?;
+        request.temperature = optional_f32(body.get("temperature"), "temperature")?;
+        request.min_p = optional_f32(body.get("min_p"), "min_p")?;
+        request.top_p = optional_f32(body.get("top_p"), "top_p")?;
+        request.repetition_penalty =
+            optional_f32(body.get("repetition_penalty"), "repetition_penalty")?;
+    }
+    Ok(request)
+}
+
+fn optional_nonempty_string(value: Option<&Value>, label: &str) -> Result<Option<String>> {
+    value
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .with_context(|| format!("{label} must be a non-empty string"))
+                .map(str::to_owned)
+        })
+        .transpose()
+}
+
+fn optional_f64(value: Option<&Value>, label: &str) -> Result<Option<f64>> {
+    value
+        .map(|value| {
+            value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .with_context(|| format!("{label} must be a finite number"))
+        })
+        .transpose()
+}
+
+fn optional_f32(value: Option<&Value>, label: &str) -> Result<Option<f32>> {
+    optional_f64(value, label)?
+        .map(|value| {
+            let value = value as f32;
+            ensure!(value.is_finite(), "{label} exceeds the f32 range");
+            Ok(value)
+        })
+        .transpose()
+}
+
+fn optional_u32(value: Option<&Value>, label: &str) -> Result<Option<u32>> {
+    value
+        .map(|value| {
+            let value = value
+                .as_u64()
+                .with_context(|| format!("{label} must be an unsigned integer"))?;
+            u32::try_from(value).with_context(|| format!("{label} exceeds the u32 range"))
+        })
+        .transpose()
+}
+
+fn optional_speech_reference_audio(
+    value: Option<&Value>,
+    label: &str,
+) -> Result<Option<SpeechReferenceAudio>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let reference = value
+        .as_object()
+        .with_context(|| format!("{label} must be an inline audio object"))?;
+    let encoding = reference
+        .get("encoding")
+        .and_then(Value::as_str)
+        .with_context(|| format!("{label}.encoding is required"))?;
+    ensure!(
+        encoding == "base64",
+        "{label}.encoding must be exactly base64"
+    );
+    let content_type = reference
+        .get("content_type")
+        .and_then(Value::as_str)
+        .with_context(|| format!("{label}.content_type is required"))?;
+    ensure!(
+        content_type == "audio/wav",
+        "{label}.content_type must be exactly audio/wav"
+    );
+    let encoded = reference
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("{label}.data is required"))?;
+    let max_encoded_bytes = MAX_INLINE_SPEECH_REFERENCE_AUDIO_BYTES
+        .div_ceil(3)
+        .saturating_mul(4)
+        .saturating_add(4);
+    ensure!(
+        encoded.len() <= max_encoded_bytes,
+        "{label}.data exceeds the {} byte decoded limit",
+        MAX_INLINE_SPEECH_REFERENCE_AUDIO_BYTES
+    );
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .with_context(|| format!("{label}.data is not valid base64"))?;
+    ensure!(
+        !data.is_empty() && data.len() <= MAX_INLINE_SPEECH_REFERENCE_AUDIO_BYTES,
+        "{label}.data must decode to 1..={} bytes",
+        MAX_INLINE_SPEECH_REFERENCE_AUDIO_BYTES
+    );
+    let metadata = validated_wav_audio_metadata(&data)
+        .with_context(|| format!("{label}.data does not match content_type audio/wav"))?;
+    ensure!(
+        metadata.duration_seconds_ceil <= MAX_INLINE_SPEECH_REFERENCE_AUDIO_SECONDS,
+        "{label}.data exceeds the {} second limit",
+        MAX_INLINE_SPEECH_REFERENCE_AUDIO_SECONDS
+    );
+    Ok(Some(SpeechReferenceAudio {
+        content_type: Some(content_type.to_owned()),
+        data,
+    }))
 }
 
 fn provider_image_generation_request_from_body(
@@ -74234,6 +75311,9 @@ mod tests {
         artifact_chunks: Vec<ArtifactChunk>,
         repeat_image_artifact_to_count: bool,
         image_generation_calls: usize,
+        speech_synthesis_calls: usize,
+        speech_validation_enabled: bool,
+        speech_validation_calls: usize,
         music_generation_calls: usize,
         media_validation_enabled: bool,
         media_validation_calls: usize,
@@ -74364,6 +75444,9 @@ mod tests {
                 artifact_chunks: Vec::new(),
                 repeat_image_artifact_to_count: false,
                 image_generation_calls: 0,
+                speech_synthesis_calls: 0,
+                speech_validation_enabled: false,
+                speech_validation_calls: 0,
                 music_generation_calls: 0,
                 media_validation_enabled: false,
                 media_validation_calls: 0,
@@ -74391,6 +75474,11 @@ mod tests {
 
         fn with_media_validation(mut self) -> Self {
             self.media_validation_enabled = true;
+            self
+        }
+
+        fn with_speech_validation(mut self) -> Self {
+            self.speech_validation_enabled = true;
             self
         }
     }
@@ -74494,6 +75582,7 @@ mod tests {
             artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
             _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::SpeechOutput> {
+            self.speech_synthesis_calls = self.speech_synthesis_calls.saturating_add(1);
             self.last_speech_request = Some(request);
             for chunk in self.artifact_chunks.clone() {
                 artifact_sink.on_artifact_chunk(chunk)?;
@@ -74501,6 +75590,46 @@ mod tests {
             Ok(mayhem_engine::SpeechOutput {
                 audio_seconds: self.speech_audio_seconds,
             })
+        }
+
+        fn validate_speech(
+            &mut self,
+            request: SpeechRequest,
+            _cancellation: &CancellationToken,
+        ) -> mayhem_engine::Result<Option<mayhem_engine::SpeechValidation>> {
+            if !self.speech_validation_enabled {
+                return Ok(None);
+            }
+            self.speech_validation_calls = self.speech_validation_calls.saturating_add(1);
+            let reference = request.reference_audio.as_ref().map(|reference| {
+                json!({
+                    "byte_count": reference.data.len(),
+                    "sha256": sha256_bytes_hex(&reference.data),
+                })
+            });
+            Ok(Some(mayhem_engine::SpeechValidation {
+                evidence: json!({
+                    "input_sha256": sha256_bytes_hex(request.input.as_bytes()),
+                    "reference_audio": reference,
+                }),
+                handled_controls: [
+                    "cfg_weight",
+                    "exaggeration",
+                    "input",
+                    "min_p",
+                    "reference_audio",
+                    "repetition_penalty",
+                    "response_format",
+                    "seed",
+                    "speed",
+                    "temperature",
+                    "top_p",
+                    "voice",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            }))
         }
 
         fn generate_video(
@@ -81095,6 +82224,32 @@ mod tests {
                 .map(String::as_str),
             Some("/managed/llama-media/bin/python")
         );
+
+        let chatterbox_runtime = ProviderBackendRuntime {
+            python: Some(PathBuf::from("/managed/chatterbox/bin/python")),
+            chatterbox_device: Some(ChatterboxManagedDevice::Cuda),
+            ..ProviderBackendRuntime::default()
+        };
+        let chatterbox_env = provider_backend_runtime_child_env("chatterbox", &chatterbox_runtime);
+        assert_eq!(
+            chatterbox_env
+                .get("MAYHEM_CHATTERBOX_DEVICE")
+                .map(String::as_str),
+            Some("cuda")
+        );
+    }
+
+    #[test]
+    fn chatterbox_device_override_cannot_contradict_admission() {
+        validate_chatterbox_device_request(None, ChatterboxManagedDevice::Cuda).unwrap();
+        validate_chatterbox_device_request(Some("auto"), ChatterboxManagedDevice::Mps).unwrap();
+        validate_chatterbox_device_request(Some("cpu"), ChatterboxManagedDevice::Cpu).unwrap();
+        let error = validate_chatterbox_device_request(Some("cpu"), ChatterboxManagedDevice::Cuda)
+            .expect_err("contradictory device override must fail");
+        assert!(error.to_string().contains("contradicts"));
+        assert!(
+            validate_chatterbox_device_request(Some("rocm"), ChatterboxManagedDevice::Cpu).is_err()
+        );
     }
 
     #[test]
@@ -81787,6 +82942,7 @@ mod tests {
             f13_budget_bytes: 4_000_000,
             source: "test-device-memory".to_owned(),
             probe: CalibrationMemoryProbe::ProcessRss,
+            chatterbox_device: None,
         };
 
         let profiles = aggregate_calibrated_modality_resource_profiles(
@@ -86705,8 +87861,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .filter(|case| !case.ok)
             .map(|case| {
                 format!(
-                    "{}: translation={:?}; backend={:?}; response={:?}",
+                    "{}: contract={:?}; gateway={:?}; translation={:?}; backend={:?}; response={:?}",
                     case.case_id,
+                    case.contract_validation.error,
+                    case.gateway_normalization.error,
                     case.provider_translation.error,
                     case.backend_execution.error,
                     case.response_normalization.error
@@ -86794,8 +87952,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .filter(|case| !case.ok)
             .map(|case| {
                 format!(
-                    "{}: translation={:?}; backend={:?}; response={:?}",
+                    "{}: contract={:?}; gateway={:?}; translation={:?}; backend={:?}; response={:?}",
                     case.case_id,
+                    case.contract_validation.error,
+                    case.gateway_normalization.error,
                     case.provider_translation.error,
                     case.backend_execution.error,
                     case.response_normalization.error
@@ -86806,6 +87966,204 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(report.ok, "{failures:#?}");
         assert!(backend.media_validation_calls > 100);
         assert_eq!(backend.music_generation_calls, 0);
+        assert!(report
+            .families
+            .iter()
+            .flat_map(|family| &family.cases)
+            .filter(|case| case.expect_accept)
+            .all(|case| {
+                case.backend_proof.as_ref().is_some_and(|proof| {
+                    proof.kind == EndpointCalibrationBackendProofKind::WorkerSemanticValidation
+                        && proof.behavioral_witness_fingerprint.is_some()
+                })
+            }));
+    }
+
+    #[test]
+    fn chatterbox_endpoint_matrix_uses_one_audio_witness_without_resynthesizing_rows() {
+        let reference = tiny_wav_bytes(8_000);
+        let prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "chatterbox-endpoint-matrix",
+            "input": "A fixed Chatterbox endpoint calibration sentence.",
+            "voice": "default",
+            "response_format": "wav",
+            "audio_b64": base64::engine::general_purpose::STANDARD.encode(&reference),
+            "content_type": "audio/wav",
+            "temperature": 0.8,
+            "min_p": 0.05,
+            "top_p": 0.95,
+            "repeat_penalty": 1.2,
+            "seed": 7,
+            "exaggeration": 0.5,
+            "cfg_weight": 0.5
+        }))
+        .unwrap();
+        let mut model = test_catalog(&"aa".repeat(32)).models[0].clone();
+        model.model_class = "tts".to_owned();
+        model.artifacts.get_mut("gguf-q4_k_m").unwrap().engine = "chatterbox".to_owned();
+        model.adapter.endpoint_families = [
+            mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH,
+        ]
+        .into_iter()
+        .map(|family| {
+            mayhem_proto::endpoint_family_contract_template(family)
+                .unwrap_or_else(|| panic!("missing {family} endpoint template"))
+        })
+        .collect();
+        let model_id = model.model_id.clone();
+        for contract in &mut model.adapter.endpoint_families {
+            let allowed = match contract.family.as_str() {
+                mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH => [
+                    "model",
+                    "input",
+                    "voice",
+                    "response_format",
+                    "reference_audio",
+                    "reference_audio.data",
+                    "reference_audio.encoding",
+                    "reference_audio.content_type",
+                    "exaggeration",
+                    "cfg_weight",
+                    "temperature",
+                    "min_p",
+                    "top_p",
+                    "repetition_penalty",
+                    "seed",
+                ]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+                mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH => [
+                    "inputs",
+                    "parameters.voice",
+                    "parameters.reference_audio",
+                    "parameters.reference_audio.data",
+                    "parameters.reference_audio.encoding",
+                    "parameters.reference_audio.content_type",
+                    "parameters.exaggeration",
+                    "parameters.cfg_weight",
+                    "parameters.seed",
+                    "parameters.generation_parameters.temperature",
+                    "parameters.generation_parameters.min_p",
+                    "parameters.generation_parameters.top_p",
+                    "parameters.generation_parameters.repetition_penalty",
+                ]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+                other => panic!("unexpected speech endpoint {other}"),
+            };
+            contract
+                .request_attributes
+                .retain(|attribute| allowed.contains(attribute.as_str()));
+            contract
+                .required_request_attributes
+                .retain(|attribute| allowed.contains(attribute.as_str()));
+            contract
+                .request_attribute_specs
+                .retain(|attribute, _| allowed.contains(attribute.as_str()));
+            for group in &mut contract.interaction_groups {
+                group.retain(|attribute| allowed.contains(attribute.as_str()));
+            }
+            contract.interaction_groups.retain(|group| group.len() > 1);
+            let voice_path = if contract.family == mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH {
+                let model_spec = contract
+                    .request_attribute_specs
+                    .get_mut("model")
+                    .expect("OpenAI speech model spec");
+                model_spec.enum_values = vec![json!(model_id.clone())];
+                model_spec.calibration_values = vec![json!(model_id.clone())];
+                let response_format = contract
+                    .request_attribute_specs
+                    .get_mut("response_format")
+                    .expect("OpenAI speech response_format spec");
+                response_format.default = Some(json!("wav"));
+                response_format.enum_values = vec![json!("wav")];
+                response_format.calibration_values = vec![json!("wav")];
+                "voice"
+            } else {
+                "parameters.voice"
+            };
+            let input_path = if contract.family == mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH {
+                "input"
+            } else {
+                "inputs"
+            };
+            let input = contract
+                .request_attribute_specs
+                .get_mut(input_path)
+                .expect("speech input spec");
+            input.min_length = Some(1);
+            input.max_length = Some(16_384);
+            input.calibration_values = vec![json!("Open Mayhem Chatterbox calibration.")];
+            let voice = contract
+                .request_attribute_specs
+                .get_mut(voice_path)
+                .expect("speech voice spec");
+            voice.default = Some(json!("default"));
+            voice.enum_values = vec![json!("default")];
+            voice.calibration_values = vec![json!("default")];
+            voice.min_length = None;
+            voice.max_length = None;
+        }
+        let output = tiny_wav_bytes(24_000);
+        let witness = ProviderSessionOutput {
+            content: String::new(),
+            reasoning_evidence: String::new(),
+            tools: Vec::new(),
+            embeddings: None,
+            transcription: None,
+            artifacts: vec![ProviderSessionArtifact {
+                id: "chatterbox-canary".to_owned(),
+                content_type: "audio/wav".to_owned(),
+                bytes: output,
+            }],
+            finish_reason: "stop".to_owned(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            token_ids: Vec::new(),
+            usage: ReceiptUsage::default(),
+            usage_attribution: BTreeMap::new(),
+        };
+        let witness_fingerprint = provider_session_output_fingerprint(&witness);
+        let mut backend = FakeEngineBackend::new("").with_speech_validation();
+        let (artifact_name, artifact) = model
+            .artifacts
+            .iter()
+            .next()
+            .expect("Chatterbox catalog artifact");
+
+        let report = catalog_endpoint_calibration_report(
+            &mut backend,
+            &model,
+            artifact_name,
+            artifact,
+            &[prompt],
+            Some(EndpointCalibrationBehavioralWitness {
+                output: witness,
+                fingerprint: witness_fingerprint,
+            }),
+        );
+        let failures = report
+            .families
+            .iter()
+            .flat_map(|family| &family.cases)
+            .filter(|case| !case.ok)
+            .map(|case| {
+                format!(
+                    "{}: contract={:?}; gateway={:?}; translation={:?}; backend={:?}; response={:?}",
+                    case.case_id,
+                    case.contract_validation.error,
+                    case.gateway_normalization.error,
+                    case.provider_translation.error,
+                    case.backend_execution.error,
+                    case.response_normalization.error
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert!(report.ok, "{failures:#?}");
+        assert!(backend.speech_validation_calls > 20);
+        assert_eq!(backend.speech_synthesis_calls, 0);
         assert!(report
             .families
             .iter()
@@ -87409,6 +88767,194 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(request.input, "hello");
         assert_eq!(request.voice.as_deref(), Some("launch"));
         assert_eq!(request.response_format.as_deref(), Some("wav"));
+    }
+
+    #[test]
+    fn provider_speech_translation_maps_openai_and_hf_chatterbox_controls() {
+        let wav = tiny_wav_bytes(16_000);
+        let reference_audio = json!({
+            "data": base64::engine::general_purpose::STANDARD.encode(&wav),
+            "encoding": "base64",
+            "content_type": "audio/wav"
+        });
+        let openai = provider_speech_request_from_body(
+            mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH,
+            &json!({
+                "input": "OpenAI speech",
+                "voice": "default",
+                "response_format": "wav",
+                "speed": 1.0,
+                "reference_audio": reference_audio,
+                "exaggeration": 0.7,
+                "cfg_weight": 0.4,
+                "seed": 7,
+                "temperature": 0.8,
+                "min_p": 0.05,
+                "top_p": 0.9,
+                "repetition_penalty": 1.2
+            }),
+        )
+        .unwrap();
+        assert_eq!(openai.input, "OpenAI speech");
+        assert_eq!(openai.voice.as_deref(), Some("default"));
+        assert_eq!(openai.speed, Some(1.0));
+        assert_eq!(openai.exaggeration, Some(0.7));
+        assert_eq!(openai.cfg_weight, Some(0.4));
+        assert_eq!(openai.seed, Some(7));
+        assert_eq!(openai.temperature, Some(0.8));
+        assert_eq!(openai.min_p, Some(0.05));
+        assert_eq!(openai.top_p, Some(0.9));
+        assert_eq!(openai.repetition_penalty, Some(1.2));
+        let reference = openai.reference_audio.expect("OpenAI reference audio");
+        assert_eq!(reference.content_type.as_deref(), Some("audio/wav"));
+        assert_eq!(reference.data, wav);
+
+        let hf = provider_speech_request_from_body(
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH,
+            &json!({
+                "inputs": "HF speech",
+                "parameters": {
+                    "voice": "builtin",
+                    "speed": 1.0,
+                    "reference_audio": {
+                        "data": base64::engine::general_purpose::STANDARD.encode(&wav),
+                        "encoding": "base64",
+                        "content_type": "audio/wav"
+                    },
+                    "exaggeration": 0.6,
+                    "cfg_weight": 0.3,
+                    "seed": 11,
+                    "generation_parameters": {
+                        "temperature": 0.75,
+                        "min_p": 0.04,
+                        "top_p": 0.92,
+                        "repetition_penalty": 1.15
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(hf.input, "HF speech");
+        assert_eq!(hf.voice.as_deref(), Some("builtin"));
+        assert_eq!(hf.response_format.as_deref(), Some("wav"));
+        assert_eq!(hf.speed, Some(1.0));
+        assert_eq!(hf.exaggeration, Some(0.6));
+        assert_eq!(hf.cfg_weight, Some(0.3));
+        assert_eq!(hf.seed, Some(11));
+        assert_eq!(hf.temperature, Some(0.75));
+        assert_eq!(hf.min_p, Some(0.04));
+        assert_eq!(hf.top_p, Some(0.92));
+        assert_eq!(hf.repetition_penalty, Some(1.15));
+        assert_eq!(hf.reference_audio.expect("HF reference audio").data, wav);
+    }
+
+    #[test]
+    fn provider_speech_translation_rejects_malformed_or_mismatched_reference_audio() {
+        let valid_wav = tiny_wav_bytes(16_000);
+        let cases = [
+            (
+                json!({
+                    "data": base64::engine::general_purpose::STANDARD.encode(&valid_wav),
+                    "encoding": "hex",
+                    "content_type": "audio/wav"
+                }),
+                "encoding must be exactly base64",
+            ),
+            (
+                json!({
+                    "data": base64::engine::general_purpose::STANDARD.encode(&valid_wav),
+                    "encoding": "base64",
+                    "content_type": "audio/mpeg"
+                }),
+                "content_type must be exactly audio/wav",
+            ),
+            (
+                json!({
+                    "data": "not-base64!",
+                    "encoding": "base64",
+                    "content_type": "audio/wav"
+                }),
+                "not valid base64",
+            ),
+            (
+                json!({
+                    "data": base64::engine::general_purpose::STANDARD.encode(b"not a wav"),
+                    "encoding": "base64",
+                    "content_type": "audio/wav"
+                }),
+                "does not match content_type audio/wav",
+            ),
+            (
+                json!({
+                    "data": base64::engine::general_purpose::STANDARD
+                        .encode(tiny_wav_bytes(11 * 16_000)),
+                    "encoding": "base64",
+                    "content_type": "audio/wav"
+                }),
+                "exceeds the 10 second limit",
+            ),
+        ];
+        for (reference_audio, expected) in cases {
+            let error = provider_speech_request_from_body(
+                mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH,
+                &json!({
+                    "input": "reject invalid reference",
+                    "voice": "default",
+                    "reference_audio": reference_audio
+                }),
+            )
+            .expect_err("invalid reference audio must fail before engine");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn chatterbox_calibration_marks_every_signed_control_as_handled() {
+        let openai = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH,
+        )
+        .expect("OpenAI speech contract");
+        for path in [
+            "reference_audio",
+            "reference_audio.data",
+            "reference_audio.encoding",
+            "reference_audio.content_type",
+            "exaggeration",
+            "cfg_weight",
+            "seed",
+            "temperature",
+            "min_p",
+            "top_p",
+            "repetition_penalty",
+        ] {
+            assert!(
+                calibration_endpoint_attribute_is_handled(&openai, path, &Value::Null),
+                "OpenAI speech attribute {path} is not covered"
+            );
+        }
+
+        let hf = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH,
+        )
+        .expect("HF speech contract");
+        for path in [
+            "parameters.reference_audio",
+            "parameters.reference_audio.data",
+            "parameters.reference_audio.encoding",
+            "parameters.reference_audio.content_type",
+            "parameters.exaggeration",
+            "parameters.cfg_weight",
+            "parameters.seed",
+            "parameters.generation_parameters.temperature",
+            "parameters.generation_parameters.min_p",
+            "parameters.generation_parameters.top_p",
+            "parameters.generation_parameters.repetition_penalty",
+        ] {
+            assert!(
+                calibration_endpoint_attribute_is_handled(&hf, path, &Value::Null),
+                "HF speech attribute {path} is not covered"
+            );
+        }
     }
 
     #[test]
@@ -88400,6 +89946,125 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             mlx_model_cache_dir(&paths.primary, "mlx-2bit", &relocated),
             "signed layout paths must participate in the materialized-cache identity"
         );
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn chatterbox_materialization_preserves_only_the_canonical_five_files() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        let mut artifact = catalog
+            .models
+            .remove(0)
+            .artifacts
+            .remove("gguf-q4_k_m")
+            .unwrap();
+        artifact.engine = "chatterbox".to_owned();
+        artifact.source = catalog::SourceRef {
+            kind: "huggingface".to_owned(),
+            repo: CHATTERBOX_MODEL_REPO.to_owned(),
+            revision: mayhem_engine::CHATTERBOX_MODEL_REVISION.to_owned(),
+            publisher_key: None,
+        };
+        artifact.path = CHATTERBOX_PRIMARY_PATH.to_owned();
+        artifact.artifact_root = "11".repeat(32);
+        artifact.sidecars.clear();
+
+        let temp = test_temp_dir("mayhem-chatterbox-layout");
+        let cache = temp.join("cache");
+        let primary = temp.join("downloaded-primary");
+        fs::write(&primary, b"chatterbox-primary").unwrap();
+        artifact.weights_bytes = fs::metadata(&primary).unwrap().len();
+        artifact.source_sha256 = Some(file_sha256_hex(&primary).unwrap());
+
+        let mut sidecar_paths = BTreeMap::new();
+        for (index, (name, path)) in CHATTERBOX_REQUIRED_SIDECARS.iter().enumerate() {
+            let local = temp.join(format!("downloaded-sidecar-{index}"));
+            fs::write(&local, format!("chatterbox-sidecar-{index}")).unwrap();
+            artifact.sidecars.insert(
+                (*name).to_owned(),
+                catalog::CatalogArtifactSidecar {
+                    source: artifact.source.clone(),
+                    upstream_source: None,
+                    path: (*path).to_owned(),
+                    artifact_root: format!("{:064x}", index + 2),
+                    artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                    weights_bytes: fs::metadata(&local).unwrap().len(),
+                    source_sha256: file_sha256_hex(&local).unwrap(),
+                },
+            );
+            sidecar_paths.insert((*name).to_owned(), local);
+        }
+        let paths = ProviderArtifactPaths {
+            primary,
+            sidecars: sidecar_paths,
+        };
+
+        let materialized = materialize_chatterbox_layout(
+            "resembleai/chatterbox@pytorch",
+            "pytorch",
+            &artifact,
+            &paths,
+            &cache,
+        )
+        .unwrap();
+        let model_root = materialized.parent().expect("Chatterbox model root");
+        assert_eq!(
+            materialized.file_name().and_then(OsStr::to_str),
+            Some(CHATTERBOX_PRIMARY_PATH)
+        );
+        assert_eq!(fs::read(&materialized).unwrap(), b"chatterbox-primary");
+        for (index, (_, path)) in CHATTERBOX_REQUIRED_SIDECARS.iter().enumerate() {
+            assert_eq!(
+                fs::read(model_root.join(path)).unwrap(),
+                format!("chatterbox-sidecar-{index}").as_bytes()
+            );
+        }
+        assert_eq!(fs::read_dir(model_root).unwrap().count(), 5);
+
+        let mut mirrored = artifact.clone();
+        let canonical_upstream = mirrored.source.clone();
+        mirrored.upstream_source = Some(canonical_upstream.clone());
+        mirrored.source.repo = "admin/chatterbox-release".to_owned();
+        mirrored.source.revision = "a".repeat(40);
+        for sidecar in mirrored.sidecars.values_mut() {
+            sidecar.upstream_source = Some(canonical_upstream.clone());
+            sidecar.source = mirrored.source.clone();
+        }
+        materialize_chatterbox_layout(
+            "resembleai/chatterbox@pytorch-mirror",
+            "pytorch",
+            &mirrored,
+            &paths,
+            &cache,
+        )
+        .expect("admin mirror with exact canonical upstream provenance");
+
+        let mut incomplete = paths.clone();
+        incomplete
+            .sidecars
+            .remove("chatterbox_default_conditionals");
+        let error = materialize_chatterbox_layout(
+            "resembleai/chatterbox@pytorch",
+            "pytorch",
+            &artifact,
+            &incomplete,
+            &cache,
+        )
+        .expect_err("incomplete Chatterbox layout must fail closed");
+        assert!(format!("{error:#}").contains("exact four signed sidecars"));
+
+        let mut mutable_revision = artifact.clone();
+        mutable_revision.source.revision = "main".to_owned();
+        let error = materialize_chatterbox_layout(
+            "resembleai/chatterbox@pytorch",
+            "pytorch",
+            &mutable_revision,
+            &paths,
+            &cache,
+        )
+        .expect_err("mutable Chatterbox source must fail closed");
+        assert!(format!("{error:#}").contains(mayhem_engine::CHATTERBOX_MODEL_REVISION));
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -92660,6 +94325,7 @@ State initialization...
             f13_budget_bytes: 200,
             source: "test resume memory".to_owned(),
             probe: CalibrationMemoryProbe::ProcessRss,
+            chatterbox_device: None,
         };
 
         validate_resumed_canary_core(
@@ -93194,6 +94860,11 @@ State initialization...
             }]);
         let mut tts_model = test_catalog(&"aa".repeat(32)).models[0].clone();
         tts_model.model_class = "tts".to_owned();
+        tts_model.adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH,
+            )
+            .expect("OpenAI speech endpoint contract")];
         let artifact_output = test_temp_dir("mayhem-calibration-artifacts");
         let speech = calibrate_audio_fingerprint_prompt(
             &mut tts_backend,
@@ -93267,11 +94938,147 @@ State initialization...
     }
 
     #[test]
+    fn chatterbox_audio_fingerprint_calibration_uses_signed_reference_and_controls() {
+        let reference_wav = tiny_wav_bytes(8_000);
+        let output_wav = tiny_wav_bytes(24_000);
+        let reference_b64 = base64::engine::general_purpose::STANDARD.encode(&reference_wav);
+        let prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "chatterbox-tts-p1",
+            "input": "A fixed Chatterbox calibration sentence.",
+            "voice": "default",
+            "response_format": "wav",
+            "audio_b64": reference_b64,
+            "content_type": "audio/wav",
+            "temperature": 0.8,
+            "min_p": 0.05,
+            "top_p": 0.95,
+            "repeat_penalty": 1.2,
+            "seed": 17,
+            "exaggeration": 0.7,
+            "cfg_weight": 0.4
+        }))
+        .unwrap();
+        let mut model = test_catalog(&"aa".repeat(32)).models[0].clone();
+        model.model_class = "tts".to_owned();
+        model.artifacts.get_mut("gguf-q4_k_m").unwrap().engine = "chatterbox".to_owned();
+        model.adapter.endpoint_families = vec![mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH,
+        )
+        .expect("OpenAI speech endpoint contract")];
+        let mut backend = FakeEngineBackend::new("").with_artifact_chunks(vec![ArtifactChunk {
+            artifact_id: "chatterbox-speech-1".to_owned(),
+            index: 0,
+            content_type: "audio/wav".to_owned(),
+            bytes: output_wav,
+            final_chunk: true,
+        }]);
+
+        let report =
+            calibrate_audio_fingerprint_prompt(&mut backend, &model, &prompt, None).unwrap();
+        let request = backend
+            .last_speech_request
+            .expect("Chatterbox calibration speech request");
+        assert_eq!(
+            request
+                .reference_audio
+                .as_ref()
+                .expect("fixed reference WAV")
+                .data,
+            reference_wav
+        );
+        assert_eq!(request.exaggeration, Some(0.7));
+        assert_eq!(request.cfg_weight, Some(0.4));
+        assert_eq!(request.seed, Some(17));
+        assert_eq!(request.temperature, Some(0.8));
+        assert_eq!(request.min_p, Some(0.05));
+        assert_eq!(request.top_p, Some(0.95));
+        assert_eq!(request.repetition_penalty, Some(1.2));
+
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(
+            !serialized.contains(&base64::engine::general_purpose::STANDARD.encode(&reference_wav)),
+            "calibration report retained the private reference audio"
+        );
+
+        let mut incomplete = prompt;
+        incomplete.endpoint_attributes.remove("cfg_weight");
+        let mut rejected_backend = FakeEngineBackend::new("");
+        let error =
+            calibrate_audio_fingerprint_prompt(&mut rejected_backend, &model, &incomplete, None)
+                .expect_err("incomplete Chatterbox calibration controls must fail");
+        assert!(format!("{error:#}").contains("signed control cfg_weight"));
+        assert!(rejected_backend.last_speech_request.is_none());
+    }
+
+    #[test]
+    fn chatterbox_hf_audio_fingerprint_calibration_nests_and_translates_controls() {
+        let reference_wav = tiny_wav_bytes(8_000);
+        let reference_b64 = base64::engine::general_purpose::STANDARD.encode(&reference_wav);
+        let prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "chatterbox-hf-tts-p1",
+            "input": "A fixed Hugging Face Chatterbox calibration sentence.",
+            "voice": "default",
+            "audio_b64": reference_b64,
+            "content_type": "audio/wav",
+            "endpoint_family": mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH,
+            "temperature": 0.75,
+            "min_p": 0.04,
+            "top_p": 0.92,
+            "repetition_penalty": 1.15,
+            "seed": 11,
+            "exaggeration": 0.6,
+            "cfg_weight": 0.3
+        }))
+        .unwrap();
+        let mut model = test_catalog(&"aa".repeat(32)).models[0].clone();
+        model.model_class = "tts".to_owned();
+        model.artifacts.get_mut("gguf-q4_k_m").unwrap().engine = "chatterbox".to_owned();
+        model.adapter.endpoint_families = vec![mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH,
+        )
+        .expect("HF speech endpoint contract")];
+        let mut backend = FakeEngineBackend::new("").with_artifact_chunks(vec![ArtifactChunk {
+            artifact_id: "chatterbox-hf-speech-1".to_owned(),
+            index: 0,
+            content_type: "audio/wav".to_owned(),
+            bytes: tiny_wav_bytes(24_000),
+            final_chunk: true,
+        }]);
+
+        let report =
+            calibrate_audio_fingerprint_prompt(&mut backend, &model, &prompt, None).unwrap();
+        let request = backend
+            .last_speech_request
+            .expect("HF Chatterbox calibration speech request");
+        assert_eq!(
+            request
+                .reference_audio
+                .expect("fixed HF reference WAV")
+                .data,
+            reference_wav
+        );
+        assert_eq!(request.exaggeration, Some(0.6));
+        assert_eq!(request.cfg_weight, Some(0.3));
+        assert_eq!(request.seed, Some(11));
+        assert_eq!(request.temperature, Some(0.75));
+        assert_eq!(request.min_p, Some(0.04));
+        assert_eq!(request.top_p, Some(0.92));
+        assert_eq!(request.repetition_penalty, Some(1.15));
+        assert!(
+            !serde_json::to_string(&report)
+                .unwrap()
+                .contains(&base64::engine::general_purpose::STANDARD.encode(&reference_wav)),
+            "HF calibration report retained the private reference audio"
+        );
+    }
+
+    #[test]
     fn calibration_memory_sampler_handles_fast_operations() {
         let context = CalibrationMemoryContext {
             f13_budget_bytes: u64::MAX,
             source: "test-process-rss".to_owned(),
             probe: CalibrationMemoryProbe::ProcessRss,
+            chatterbox_device: None,
         };
 
         let (value, baseline, peak) =
@@ -93280,6 +95087,66 @@ State initialization...
         assert_eq!(value, 7);
         assert!(baseline > 0);
         assert!(peak >= baseline);
+    }
+
+    #[test]
+    fn nvidia_calibration_memory_is_scoped_to_the_worker_process_tree() {
+        let bytes = parse_nvidia_compute_process_memory_bytes(
+            "101, 128\n202, 4096 MiB\n303, 64\n202, 256\n",
+            &[101, 303],
+        )
+        .unwrap();
+        assert_eq!(bytes, 192 * 1024 * 1024);
+        let error = parse_nvidia_compute_process_memory_bytes("202, 4096\n", &[101])
+            .expect_err("unrelated GPU use must not satisfy the probe");
+        assert!(error.to_string().contains("no CUDA memory"));
+    }
+
+    #[test]
+    fn calibration_process_tree_expands_all_descendants_once() {
+        let pids = process_tree_ids_from_parent_rows(
+            &[10],
+            &[(11, 10), (12, 11), (13, 12), (20, 1), (11, 10)],
+        );
+        assert_eq!(pids, vec![10, 11, 12, 13]);
+        let scoped = process_scope_ids_from_parent_rows(
+            &[10],
+            20,
+            &[(11, 10), (12, 20), (13, 11), (21, 20)],
+        );
+        assert_eq!(scoped, vec![10, 11, 13, 20]);
+        assert_eq!(
+            parse_calibration_process_parent_rows("11 10\n12,11\n").unwrap(),
+            vec![(11, 10), (12, 11)]
+        );
+    }
+
+    #[test]
+    fn chatterbox_memory_pool_tracks_the_managed_execution_device() {
+        for (fixture, expected_pool, unified) in [
+            (
+                FixtureProfile::WindowsNvidia,
+                "nvidia_dedicated_memory",
+                false,
+            ),
+            (FixtureProfile::LinuxNvidiaArm64, "system_memory", true),
+            (FixtureProfile::AppleSilicon, "unified_memory", true),
+            (FixtureProfile::CpuOnly, "system_memory", false),
+        ] {
+            let hardware = probe(ProbeOptions {
+                fixture: Some(fixture),
+                run_disk_bench: false,
+                ..ProbeOptions::default()
+            });
+            let verdict = hardware
+                .backend_verdicts
+                .iter()
+                .find(|verdict| verdict.backend == "chatterbox")
+                .unwrap();
+            let pool = provider_memory_pool(&hardware, verdict, "chatterbox");
+            assert_eq!(pool.pool, expected_pool, "{fixture:?}");
+            assert_eq!(pool.unified, unified, "{fixture:?}");
+        }
     }
 
     #[test]
@@ -93313,6 +95180,7 @@ State initialization...
             f13_budget_bytes: u64::MAX,
             source: "test-process-rss".to_owned(),
             probe: CalibrationMemoryProbe::ProcessRss,
+            chatterbox_device: None,
         };
         let mut backend = SpecialityCalibrationBackend::default();
 
@@ -93384,6 +95252,7 @@ State initialization...
             f13_budget_bytes: u64::MAX,
             source: "test-process-rss".to_owned(),
             probe: CalibrationMemoryProbe::ProcessRss,
+            chatterbox_device: None,
         };
         let mut off_backend = SpecialityCalibrationBackend::default();
         let off = calibrate_model_specialities(
@@ -94206,6 +96075,8 @@ State initialization...
         args.trt_max_batch_size = Some(4);
         args.trt_max_num_tokens = Some(4096);
         let catalog_sign = CatalogCanaryPlanSignOptions {
+            base_catalog_path: PathBuf::from("/tmp/catalog.json"),
+            base_signature_path: PathBuf::from("/tmp/catalog.json.sig"),
             signature_output: PathBuf::from("/tmp/reports/models.json.sig"),
             key_id: "test-catalog-key".to_owned(),
             seed_file: PathBuf::from("/tmp/catalog-seed.hex"),
@@ -94295,11 +96166,36 @@ State initialization...
         assert!(signature_command
             .argv
             .windows(2)
+            .any(|pair| pair[0] == "--base-catalog-path" && pair[1] == "/tmp/catalog.json"));
+        assert!(signature_command
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--base-signature-path" && pair[1] == "/tmp/catalog.json.sig"));
+        assert!(signature_command
+            .argv
+            .windows(2)
             .any(|pair| pair[0] == "--key-id" && pair[1] == "test-catalog-key"));
         assert!(signature_command
             .argv
             .iter()
             .any(|arg| arg == "--write-key"));
+    }
+
+    #[test]
+    fn canary_plan_signing_requires_explicit_active_catalog_and_signature() {
+        let mut args = test_canary_plan_args();
+        args.catalog_signature_output = Some(PathBuf::from("/tmp/models.json.sig"));
+        args.catalog_key_id = Some("test-catalog-key".to_owned());
+        args.catalog_seed_file = Some(PathBuf::from("/tmp/catalog-seed.hex"));
+
+        let missing_catalog = catalog_canary_plan_sign_options(&args).unwrap_err();
+        assert!(format!("{missing_catalog:#}").contains("--catalog-path is required"));
+
+        args.catalog_path = Some(PathBuf::from("/tmp/catalog.json"));
+        let missing_signature = catalog_canary_plan_sign_options(&args).unwrap_err();
+        assert!(
+            format!("{missing_signature:#}").contains("--catalog-base-signature-path is required")
+        );
     }
 
     #[test]
@@ -94835,6 +96731,8 @@ State initialization...
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
         let sign = CatalogCanaryPlanSignOptions {
+            base_catalog_path: PathBuf::from("/tmp/catalog.json"),
+            base_signature_path: PathBuf::from("/tmp/catalog.json.sig"),
             signature_output: PathBuf::from("/tmp/reports/models.json.sig"),
             key_id: "test-catalog-key".to_owned(),
             seed_file: PathBuf::from("/tmp/catalog-seed.hex"),
@@ -94878,6 +96776,14 @@ State initialization...
             .contains("'apply-artifact-metadata'"));
         let signature_command = report.signature_command.as_ref().unwrap();
         assert!(signature_command.shell.contains("'catalog' 'sign'"));
+        assert!(signature_command
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--base-catalog-path" && pair[1] == "/tmp/catalog.json"));
+        assert!(signature_command
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--base-signature-path" && pair[1] == "/tmp/catalog.json.sig"));
         let verify_command = report.verify_command.as_ref().unwrap();
         assert!(verify_command.shell.contains("'verify'"));
         assert!(verify_command
@@ -95405,6 +97311,8 @@ State initialization...
         fs::create_dir_all(expected_artifact_path.parent().unwrap()).unwrap();
         fs::write(&expected_artifact_path, b"publish-plan artifact").unwrap();
         let sign = CatalogCanaryPlanSignOptions {
+            base_catalog_path: temp.join("catalog.json"),
+            base_signature_path: temp.join("catalog.json.sig"),
             signature_output: temp.join("reports/models.json.sig"),
             key_id: "test-catalog-key".to_owned(),
             seed_file: temp.join("catalog-seed.hex"),
@@ -95485,6 +97393,16 @@ State initialization...
             .contains("\"$PUBLISHED_ARTIFACT_PATH\""));
         let signature_command = report.signature_command.as_ref().unwrap();
         assert!(signature_command.shell.contains("'catalog' 'sign'"));
+        assert!(signature_command
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--base-catalog-path"
+                && pair[1] == temp.join("catalog.json").display().to_string()));
+        assert!(signature_command
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--base-signature-path"
+                && pair[1] == temp.join("catalog.json.sig").display().to_string()));
         let verify_command = report.verify_command.as_ref().unwrap();
         assert!(verify_command
             .argv
@@ -97167,12 +99085,12 @@ State initialization...
         let candidate_path = temp.join("candidate.json");
         fs::write(
             &base_path,
-            r#"{"models":[{"model_id":"test/keep","zero":0.0,"limit":4294967295.0,"fraction":0.5}]}"#,
+            r#"{"models":[{"model_id":"test/keep","zero":0.0,"limit":4294967295.0,"large_integer":9007199254740993,"fraction":0.5}]}"#,
         )
         .unwrap();
         fs::write(
             &candidate_path,
-            r#"{"models":[{"model_id":"test/keep","zero":0,"limit":4294967295,"fraction":0.5},{"model_id":"test/new","value":1}]}"#,
+            r#"{"models":[{"model_id":"test/keep","zero":0,"limit":4294967295,"large_integer":9007199254740993,"fraction":0.5},{"model_id":"test/new","value":1}]}"#,
         )
         .unwrap();
 
@@ -97181,7 +99099,17 @@ State initialization...
 
         fs::write(
             &candidate_path,
-            r#"{"models":[{"model_id":"test/keep","zero":0,"limit":4294967295,"fraction":1}]}"#,
+            r#"{"models":[{"model_id":"test/keep","zero":0,"limit":4294967295,"large_integer":9007199254740992,"fraction":0.5}]}"#,
+        )
+        .unwrap();
+        let rounded =
+            validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), false)
+                .unwrap_err();
+        assert!(rounded.to_string().contains("unapproved changes"));
+
+        fs::write(
+            &candidate_path,
+            r#"{"models":[{"model_id":"test/keep","zero":0,"limit":4294967295,"large_integer":9007199254740993,"fraction":1}]}"#,
         )
         .unwrap();
         let changed =
@@ -97537,6 +99465,7 @@ State initialization...
         let err = catalog_sign(CatalogSignArgs {
             catalog_path: Some(catalog_path),
             base_catalog_path: None,
+            base_signature_path: None,
             allow_model_change: Vec::new(),
             allow_attestation_authority_change: false,
             initial_catalog: false,
@@ -97552,6 +99481,66 @@ State initialization...
         .unwrap_err();
 
         assert!(err.to_string().contains("refusing to overwrite"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn catalog_sign_requires_an_explicit_untampered_signed_base() {
+        let temp = test_temp_dir("mayhem-catalog-sign-live-base");
+        let base_catalog = temp.join("models.json");
+        let candidate_catalog = temp.join("candidate.json");
+        fs::copy(repo_path("catalog/models.json").unwrap(), &base_catalog).unwrap();
+        fs::copy(&base_catalog, &candidate_catalog).unwrap();
+        let keys_dir = temp.join("keys");
+        let seed_file = temp.join("catalog-seed.hex");
+        fs::write(&seed_file, "37".repeat(32)).unwrap();
+        let base_signature = temp.join("models.json.sig");
+        catalog_sign_report(CatalogSignRequest {
+            catalog_path: base_catalog.clone(),
+            signature_output: base_signature.clone(),
+            keys_dir: keys_dir.clone(),
+            key_id: "test-live-base-v1".to_owned(),
+            seed_file: seed_file.clone(),
+            write_key: true,
+            created_at: Some("2026-07-24T00:00:00Z".to_owned()),
+        })
+        .unwrap();
+
+        let sign_args = |base_signature_path: Option<PathBuf>, output: PathBuf| CatalogSignArgs {
+            catalog_path: Some(candidate_catalog.clone()),
+            base_catalog_path: Some(base_catalog.clone()),
+            base_signature_path,
+            allow_model_change: Vec::new(),
+            allow_attestation_authority_change: false,
+            initial_catalog: false,
+            signature_output: output,
+            keys_dir: Some(keys_dir.clone()),
+            key_id: "test-live-base-v1".to_owned(),
+            seed_file: seed_file.clone(),
+            write_key: false,
+            created_at: None,
+            force: false,
+            json: true,
+        };
+
+        let missing = catalog_sign(sign_args(None, temp.join("missing.sig"))).unwrap_err();
+        assert!(missing.to_string().contains("--base-signature-path"));
+
+        let original = fs::read(&base_catalog).unwrap();
+        fs::write(&base_catalog, b"{\"models\":[]}").unwrap();
+        let tampered = catalog_sign(sign_args(
+            Some(base_signature.clone()),
+            temp.join("tampered.sig"),
+        ))
+        .unwrap_err();
+        assert!(format!("{tampered:#}").contains("not validly signed"));
+        assert!(!temp.join("tampered.sig").exists());
+
+        fs::write(&base_catalog, original).unwrap();
+        let valid_output = temp.join("candidate.sig");
+        catalog_sign(sign_args(Some(base_signature), valid_output.clone())).unwrap();
+        assert!(valid_output.is_file());
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -98511,6 +100500,7 @@ State initialization...
             report_dir: PathBuf::from("/tmp/reports"),
             catalog_output: None,
             catalog_signature_output: None,
+            catalog_base_signature_path: None,
             catalog_key_id: None,
             catalog_seed_file: None,
             catalog_keys_dir: None,

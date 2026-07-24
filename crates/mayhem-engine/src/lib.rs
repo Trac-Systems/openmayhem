@@ -23,6 +23,7 @@ pub const DEFAULT_SEED: u32 = 0x4d415948;
 pub const MTMD_MEDIA_MARKER: &str = "<__media__>";
 #[cfg(any(
     feature = "ace-step",
+    feature = "chatterbox",
     feature = "sulphur",
     feature = "mlx",
     feature = "vllm",
@@ -67,6 +68,8 @@ pub enum EngineError {
     TransformersAsr(String),
     #[error("ACE-Step backend error: {0}")]
     AceStep(String),
+    #[error("Chatterbox backend error: {0}")]
+    Chatterbox(String),
     #[error("Sulphur backend error: {0}")]
     Sulphur(String),
     #[error("stable-diffusion.cpp backend error: {0}")]
@@ -209,6 +212,7 @@ pub enum ArtifactFormat {
     VllmSafetensors,
     TransformersSafetensors,
     AceStepSafetensors,
+    ChatterboxSafetensors,
     StableDiffusionCheckpoint,
     WhisperGgml,
     PiperVoice,
@@ -224,6 +228,7 @@ impl ArtifactFormat {
             Self::VllmSafetensors => b"",
             Self::TransformersSafetensors => b"",
             Self::AceStepSafetensors => b"",
+            Self::ChatterboxSafetensors => b"",
             Self::StableDiffusionCheckpoint => b"",
             Self::WhisperGgml => b"",
             Self::PiperVoice => b"",
@@ -239,6 +244,7 @@ impl ArtifactFormat {
             Self::VllmSafetensors => "vLLM safetensors",
             Self::TransformersSafetensors => "Transformers safetensors",
             Self::AceStepSafetensors => "ACE-Step safetensors",
+            Self::ChatterboxSafetensors => "Chatterbox safetensors",
             Self::StableDiffusionCheckpoint => "stable-diffusion checkpoint",
             Self::WhisperGgml => "whisper.cpp ggml model",
             Self::PiperVoice => "Piper voice",
@@ -351,6 +357,15 @@ impl ModelArtifact {
         Self {
             path: path.into(),
             format: ArtifactFormat::AceStepSafetensors,
+            sha256: None,
+            sha256_path: None,
+        }
+    }
+
+    pub fn chatterbox_safetensors(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            format: ArtifactFormat::ChatterboxSafetensors,
             sha256: None,
             sha256_path: None,
         }
@@ -509,6 +524,13 @@ impl LoadConfig {
     pub fn ace_step_safetensors(path: impl Into<PathBuf>) -> Self {
         Self {
             artifact: ModelArtifact::ace_step_safetensors(path),
+            ..Self::default()
+        }
+    }
+
+    pub fn chatterbox_safetensors(path: impl Into<PathBuf>) -> Self {
+        Self {
+            artifact: ModelArtifact::chatterbox_safetensors(path),
             ..Self::default()
         }
     }
@@ -1020,6 +1042,23 @@ pub struct AudioTranscriptionTimestamp {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SpeechReferenceAudio {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    pub data: Vec<u8>,
+}
+
+impl SpeechReferenceAudio {
+    #[must_use]
+    pub fn wav(data: impl Into<Vec<u8>>) -> Self {
+        Self {
+            content_type: Some("audio/wav".to_owned()),
+            data: data.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SpeechRequest {
     pub input: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1028,11 +1067,53 @@ pub struct SpeechRequest {
     pub response_format: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_audio: Option<SpeechReferenceAudio>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exaggeration: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfg_weight: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+}
+
+impl SpeechRequest {
+    #[must_use]
+    pub fn new(input: impl Into<String>) -> Self {
+        Self {
+            input: input.into(),
+            voice: None,
+            response_format: None,
+            speed: None,
+            reference_audio: None,
+            exaggeration: None,
+            cfg_weight: None,
+            temperature: None,
+            seed: None,
+            repetition_penalty: None,
+            min_p: None,
+            top_p: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SpeechOutput {
     pub audio_seconds: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SpeechValidation {
+    pub evidence: Value,
+    pub handled_controls: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1294,6 +1375,13 @@ pub trait EngineBackend {
             "{} backend does not support speech synthesis",
             self.backend_id()
         )))
+    }
+    fn validate_speech(
+        &mut self,
+        _request: SpeechRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<Option<SpeechValidation>> {
+        Ok(None)
     }
     fn generate_video(
         &mut self,
@@ -1597,6 +1685,11 @@ pub fn verify_artifact(artifact: &ModelArtifact) -> Result<()> {
             }
             verify_safetensors_header_as(&artifact.path, artifact.format.label())?;
             artifact.path.clone()
+        }
+        ArtifactFormat::ChatterboxSafetensors => {
+            let payload = chatterbox_safetensors_payload_path(&artifact.path)?;
+            verify_safetensors_header_as(&payload, artifact.format.label())?;
+            payload
         }
         ArtifactFormat::StableDiffusionCheckpoint => {
             let payload = stable_diffusion_payload_path(&artifact.path)?;
@@ -1940,6 +2033,36 @@ fn transformers_safetensors_payload_path(path: &Path) -> Result<PathBuf> {
     })
 }
 
+fn chatterbox_safetensors_payload_path(path: &Path) -> Result<PathBuf> {
+    let model_root = if path.is_file() {
+        path.parent().ok_or_else(|| {
+            EngineError::InvalidConfig(format!(
+                "Chatterbox weights path {} has no parent",
+                path.display()
+            ))
+        })?
+    } else if path.is_dir() {
+        path
+    } else {
+        return Err(EngineError::ModelPathMissing(path.to_path_buf()));
+    };
+    let primary = model_root.join("t3_cfg.safetensors");
+    if path.is_file() && path != primary {
+        return Err(EngineError::InvalidConfig(format!(
+            "original Chatterbox primary artifact must be {}, got {}",
+            primary.display(),
+            path.display()
+        )));
+    }
+    if !primary.is_file() {
+        return Err(EngineError::InvalidConfig(format!(
+            "original Chatterbox artifact {} is missing t3_cfg.safetensors",
+            model_root.display()
+        )));
+    }
+    Ok(primary)
+}
+
 fn stable_diffusion_payload_path(path: &Path) -> Result<PathBuf> {
     if path.is_file() {
         return Ok(path.to_path_buf());
@@ -2202,6 +2325,16 @@ mod ace_step_backend;
 pub use ace_step_backend::{
     ensure_ace_step_source, AceStepBackend, AceStepExecutionConfig, ACE_STEP_SOURCE_COMMIT,
     ACE_STEP_SOURCE_SHA256,
+};
+
+#[cfg(feature = "chatterbox")]
+mod chatterbox_backend;
+
+#[cfg(feature = "chatterbox")]
+pub use chatterbox_backend::{
+    ChatterboxBackend, ChatterboxExecutionConfig, ChatterboxReferenceAudio,
+    ChatterboxSpeechRequest, CHATTERBOX_MODEL_REVISION, CHATTERBOX_PERTH_COMMIT,
+    CHATTERBOX_SOURCE_COMMIT,
 };
 
 #[cfg(feature = "sulphur")]
@@ -4989,6 +5122,7 @@ cp "{}" "$out"
                     voice: Some("launch".to_owned()),
                     response_format: Some("wav".to_owned()),
                     speed: Some(1.0),
+                    ..SpeechRequest::new("")
                 },
                 &mut |chunk| {
                     artifacts.push(chunk);
@@ -5067,6 +5201,7 @@ cp "{}" "$out"
                     voice: None,
                     response_format: Some("wav".to_owned()),
                     speed: Some(1.0),
+                    ..SpeechRequest::new("")
                 },
                 &mut |chunk| {
                     artifacts.push(chunk);

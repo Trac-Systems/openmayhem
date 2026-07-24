@@ -182,17 +182,36 @@ impl GatewaySessionBackend for EmbeddingDirectSessionBackend {
     fn run_embedding<'a>(
         &'a self,
         _model: &'a GatewayModel,
-        _request: &'a EmbeddingRequest,
+        request: &'a EmbeddingRequest,
         _invocation: &'a GatewaySessionInvocation,
     ) -> GatewayEmbeddingFuture<'a> {
         Box::pin(async move {
+            let input_count = request.input.as_array().map_or(1, Vec::len);
+            let prompt_tokens = match &request.input {
+                Value::String(value) => value.split_whitespace().count() as u64,
+                Value::Array(values) => values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|value| value.split_whitespace().count() as u64)
+                    .sum(),
+                _ => 0,
+            };
+            let embeddings = (0..input_count)
+                .map(|index| {
+                    if index == 0 {
+                        vec![0.12, 0.34, 0.56]
+                    } else {
+                        vec![0.11, 0.33, 0.55]
+                    }
+                })
+                .collect();
             Ok(GatewayEmbeddingResult {
                 output: EmbeddingOutput {
-                    embeddings: vec![vec![0.12, 0.34, 0.56], vec![0.11, 0.33, 0.55]],
+                    embeddings,
                     usage: Usage {
-                        prompt_tokens: 2,
+                        prompt_tokens,
                         completion_tokens: 0,
-                        total_tokens: 2,
+                        total_tokens: prompt_tokens,
                     },
                 },
                 backend: self.name().to_owned(),
@@ -4164,6 +4183,51 @@ async fn audio_speech_endpoint_uses_routed_engine_and_records_receipt() {
 }
 
 #[tokio::test]
+async fn audio_speech_voice_clone_controls_are_signed_without_receipt_audio_leakage() {
+    let state = test_gateway_state_from_models(vec![routed_audio_speech_test_model()])
+        .with_session_backend(Arc::new(AudioSpeechDirectSessionBackend));
+    let app = openai_router(state.clone());
+    let reference_audio = base64::engine::general_purpose::STANDARD.encode(tiny_wav_bytes(16_000));
+    let request = json!({
+        "model": "admin/tts-fixture",
+        "input": "clone this signed reference",
+        "voice": "default",
+        "response_format": "wav",
+        "reference_audio": {
+            "data": reference_audio,
+            "encoding": "base64",
+            "content_type": "audio/wav"
+        },
+        "exaggeration": 0.7,
+        "cfg_weight": 0.3,
+        "temperature": 0.8,
+        "min_p": 0.05,
+        "top_p": 1.0,
+        "repetition_penalty": 1.2,
+        "seed": 7
+    });
+    let contract =
+        mayhem_proto::endpoint_family_contract_template(mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH)
+            .unwrap();
+    let normalized_request =
+        mayhem_proto::materialize_endpoint_request_defaults(&contract, &request).unwrap();
+    let expected_prompt_hash = endpoint_request_fingerprint(&normalized_request);
+
+    let (status, _, bytes) =
+        raw_request(app, Method::POST, "/v1/audio/speech", Some(request)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(bytes.starts_with(b"RIFF"));
+    let receipts = state.receipts();
+    assert_eq!(receipts.len(), 1);
+    let receipt = &receipts[0].receipt;
+    assert_eq!(receipt.body.prompt_hash, expected_prompt_hash);
+    assert!(!serde_json::to_string(receipt)
+        .unwrap()
+        .contains(&reference_audio));
+}
+
+#[tokio::test]
 async fn automatic_audio_fingerprint_probe_records_pass() {
     let expected_audio = tiny_wav_bytes(16_000);
     let state = test_gateway_state_from_models(vec![routed_audio_speech_test_model()])
@@ -6388,6 +6452,20 @@ fn audio_speech_prompt_hash_for_test(request: &AudioSpeechRequest) -> String {
             "stream_format",
             request.stream_format.as_ref().map(|value| json!(value)),
         ),
+        ("reference_audio", request.reference_audio.as_ref().cloned()),
+        (
+            "exaggeration",
+            request.exaggeration.map(|value| json!(value)),
+        ),
+        ("cfg_weight", request.cfg_weight.map(|value| json!(value))),
+        ("temperature", request.temperature.map(|value| json!(value))),
+        ("min_p", request.min_p.map(|value| json!(value))),
+        ("top_p", request.top_p.map(|value| json!(value))),
+        (
+            "repetition_penalty",
+            request.repetition_penalty.map(|value| json!(value)),
+        ),
+        ("seed", request.seed.map(|value| json!(value))),
     ] {
         if let Some(value) = value {
             body[name] = value;
