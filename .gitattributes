@@ -6,3 +6,5 @@ catalog/**/*.json text eol=lf
 catalog/**/*.sig text eol=lf
 crates/mayhem-cli/resources/python/*.txt text eol=lf
 crates/mayhem-cli/resources/python/*.py text eol=lf
+crates/mayhem-cli/resources/python/chatterbox-runtime-*/pyproject.toml text eol=lf
+crates/mayhem-cli/resources/python/chatterbox-runtime-*/uv.lock text eol=lf

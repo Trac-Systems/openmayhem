@@ -2441,6 +2441,10 @@ mod tests {
         ] {
             let project = chatterbox_uv_project(flavor);
             assert_eq!(project.torch_version, torch_version);
+            assert!(
+                !project.project.contains(&b'\r') && !project.lock.contains(&b'\r'),
+                "byte-hashed Chatterbox runtime inputs must be embedded with LF line endings"
+            );
             let project_text = std::str::from_utf8(project.project).unwrap();
             assert!(project_text.contains("chatterbox-tts==0.1.7"));
             assert!(project_text.contains(&format!(

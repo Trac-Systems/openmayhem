@@ -52,14 +52,14 @@ gateway is loopback-only; a public ledger records prices, receipts, settlements.
 ## 3. Install
 
 ### 3.1 Get the code — exact source release (MANDATORY rule)
-- `v0.2.44` is source-only. Never invent or offer a native archive URL: the release has no unsigned
+- `v0.2.45` is source-only. Never invent or offer a native archive URL: the release has no unsigned
   OpenMayhem executable assets. Clone the exact release tag and build it locally.
 
   **macOS/Linux:**
   ```bash
   git clone https://github.com/Trac-Systems/openmayhem.git
   cd openmayhem
-  git checkout --detach v0.2.44
+  git checkout --detach v0.2.45
   ./install.sh --from-source
   ```
 
@@ -67,7 +67,7 @@ gateway is loopback-only; a public ledger records prices, receipts, settlements.
   ```powershell
   git clone https://github.com/Trac-Systems/openmayhem.git
   Set-Location openmayhem
-  git checkout --detach v0.2.44
+  git checkout --detach v0.2.45
   .\install.ps1 -FromSource
   ```
 On updated source checkouts, `mayhem up` verifies and, when needed, deterministically repairs only
@@ -468,6 +468,17 @@ serve, `heartbeat.live=true`, `gateway.ok=true`, `gateway.route_count>0`, and th
   Linux CUDA, all 604 endpoint rows per platform, image/video understanding, and two tool calls
   retained in one turn.
 
+For every text-generation model, catalog `ctx_max` is a ceiling, not a required provider setting.
+A provider may commit a smaller fitting value with `--ctx`; Mayhem carries that exact value through
+the heartbeat, route, voucher, receipt, and dashboard. Before an LLM market opens, the admin must
+publish every applicable context-price bracket: `le8k` always, then `le32k`, `le128k`, `le256k`,
+and `gt256k` as the catalog ceiling crosses each preceding boundary. Do not tell a provider to
+inherit the ceiling price for a smaller context, and do not claim a lower context requires a new
+enclave or admin approval. `provider join` and `provider start` use the same signed-catalog and
+hardware-fit context selection; an explicit `--ctx` is preserved exactly or rejected before
+download/load. If this provider previously committed a different context, it can sign its own
+`provider leave` and rejoin without an admin transaction.
+
 For any model, preserve and relay the exact `mayhem up` rejection bullets. In particular,
 `ledger artifact binding does not match signed catalog artifact`, `no local-compatible artifact`,
 `functional modality canary <id> failed/returned invalid output`, and
@@ -475,6 +486,16 @@ For any model, preserve and relay the exact `mayhem up` rejection bullets. In pa
 health report or missing route is not green: re-run that model's exact doctor command and the same
 managed start, fix only documented environment prerequisites, and never bypass verification or
 change the admin artifact.
+
+An artifact-binding rejection is not a propagation delay and must not trigger a new wallet,
+provider identity, enclave, or catalog edit. First verify that the command and running stack are the
+same current release (`mayhem --version` and the checked-out tag), stop the old stack with
+`mayhem down --restart`, rebuild/install the exact tag, start it again, and retry with that exact
+binary plus `--verbose`. Preserve `~/.mayhem`; do not reset its wallet or sparse store merely to
+repair a stale executable. If the exact current binary still rejects the binding, relay the full
+unabridged `--verbose` output together with the version and enclave id. The operator then compares
+the immutable ledger enclave tuple with the ledger-pinned signed catalog; providers never work
+around a genuine mismatch locally.
 
 For explicit Tier 2, pass `--provider-hardware-quote-kind tpm2-quote-ek` and the platform helper
 to `mayhem up --provider --yes`: `scripts/hardware/mayhem-tpm2-quote-linux.sh` on Linux or
@@ -519,8 +540,8 @@ forwarded as-is.
 
 | Goal | Command |
 |---|---|
-| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.44 && ./install.sh --from-source` |
-| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.44; .\install.ps1 -FromSource` |
+| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.45 && ./install.sh --from-source` |
+| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.45; .\install.ps1 -FromSource` |
 | Start user gateway | `mayhem up --rail <fiat\|tap\|tnk> --yes` |
 | Start provider | `mayhem up --provider --yes` |
 | Stop and leave provider registrations | `mayhem down` |

@@ -27,6 +27,22 @@ intercom_eol="$(
 [[ "$intercom_eol" == *": eol: lf" ]] ||
   fail "byte-hashed Intercom release source is not pinned to LF checkouts"
 
+for embedded_runtime_file in \
+  crates/mayhem-cli/resources/python/chatterbox-runtime-cpu/pyproject.toml \
+  crates/mayhem-cli/resources/python/chatterbox-runtime-cpu/uv.lock \
+  crates/mayhem-cli/resources/python/chatterbox-runtime-cpu-x86/pyproject.toml \
+  crates/mayhem-cli/resources/python/chatterbox-runtime-cpu-x86/uv.lock \
+  crates/mayhem-cli/resources/python/chatterbox-runtime-cuda124/pyproject.toml \
+  crates/mayhem-cli/resources/python/chatterbox-runtime-cuda124/uv.lock
+do
+  embedded_eol="$(
+    git -C "$ROOT_DIR" check-attr eol -- "$embedded_runtime_file" |
+      tr -d '\r'
+  )"
+  [[ "$embedded_eol" == *": eol: lf" ]] ||
+    fail "byte-hashed embedded runtime source is not pinned to LF: $embedded_runtime_file"
+done
+
 node_sees_symlink() {
   node -e \
     "process.exit(require('node:fs').lstatSync(process.argv[1]).isSymbolicLink() ? 0 : 1)" \

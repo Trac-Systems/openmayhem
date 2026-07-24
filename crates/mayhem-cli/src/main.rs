@@ -5562,7 +5562,8 @@ struct ProviderJoinArgs {
     #[arg(long, default_value = "auto")]
     rooms: String,
 
-    /// Maximum context tokens this provider commits to serve. Defaults to the catalog maximum.
+    /// Maximum context tokens this provider commits to serve. Defaults to the same hardware-fitting
+    /// context selected by `provider start`.
     #[arg(long)]
     ctx: Option<u64>,
 
@@ -48544,22 +48545,38 @@ struct ProviderServePlanComputed {
     hardware_quote_config: Option<ProviderHardwareQuoteConfig>,
 }
 
+struct ProviderServeCandidatesComputed {
+    rpc_url: String,
+    provider_catalog: ProviderResolvedCatalog,
+    contract: ContractCatalog,
+    config: Option<MayhemConfig>,
+    hardware: HardwareReport,
+    candidates: Vec<ProviderCandidate>,
+    start_args: ProviderStartArgs,
+}
+
 async fn compute_provider_serve_plan(
     home: &Path,
     args: &ProviderServePlanArgs,
 ) -> Result<ProviderServePlanComputed> {
-    let (rpc_url, provider_catalog, hardware, candidates, gpu_layers) =
-        compute_provider_serve_candidates(home, args).await?;
+    let computed = compute_provider_serve_candidates(home, args).await?;
+    let candidates = provider_candidates_with_config_defaults(
+        &computed.contract,
+        &computed.provider_catalog.catalog_doc,
+        &computed.hardware,
+        &computed.start_args,
+        computed.config.as_ref(),
+        &computed.candidates,
+    )?;
     let selection = select_provider_auto_fit_set(&candidates)?;
-    let hardware_quote_config =
-        provider_hardware_quote_config(&provider_start_args_for_serve_plan(args, home))?;
+    let hardware_quote_config = provider_hardware_quote_config(&computed.start_args)?;
     Ok(ProviderServePlanComputed {
-        rpc_url,
-        provider_catalog,
-        hardware,
+        rpc_url: computed.rpc_url,
+        provider_catalog: computed.provider_catalog,
+        hardware: computed.hardware,
         candidates,
         selection,
-        gpu_layers,
+        gpu_layers: computed.start_args.gpu_layers,
         hardware_quote_config,
     })
 }
@@ -48572,18 +48589,34 @@ async fn compute_provider_explicit_serve_plan(
     if requested.is_empty() {
         bail!("explicit provider serve plan requires at least one admin enclave/model id");
     }
-    let (rpc_url, provider_catalog, hardware, candidates, gpu_layers) =
-        compute_provider_serve_candidates(home, args).await?;
-    let selection = select_provider_explicit_set(&candidates, requested)?;
-    let hardware_quote_config =
-        provider_hardware_quote_config(&provider_start_args_for_serve_plan(args, home))?;
+    let computed = compute_provider_serve_candidates(home, args).await?;
+    let mut selected = Vec::with_capacity(requested.len());
+    for request in requested {
+        let mut scoped_args = computed.start_args.clone();
+        scoped_args.enclave = Some(request.clone());
+        let candidate = select_provider_candidate_with_config_defaults(
+            &computed.contract,
+            &computed.provider_catalog.catalog_doc,
+            &computed.hardware,
+            &mut scoped_args,
+            computed.config.as_ref(),
+            Some(request),
+        )?;
+        selected.push(candidate);
+    }
+    let selected_ids = selected
+        .iter()
+        .map(|candidate| candidate.enclave.enclave_id.clone())
+        .collect::<Vec<_>>();
+    let selection = select_provider_explicit_set(&selected, &selected_ids)?;
+    let hardware_quote_config = provider_hardware_quote_config(&computed.start_args)?;
     Ok(ProviderServePlanComputed {
-        rpc_url,
-        provider_catalog,
-        hardware,
-        candidates,
+        rpc_url: computed.rpc_url,
+        provider_catalog: computed.provider_catalog,
+        hardware: computed.hardware,
+        candidates: selected,
         selection,
-        gpu_layers,
+        gpu_layers: computed.start_args.gpu_layers,
         hardware_quote_config,
     })
 }
@@ -48592,20 +48625,29 @@ async fn compute_provider_default_serve_plan(
     home: &Path,
     args: &ProviderServePlanArgs,
 ) -> Result<ProviderServePlanComputed> {
-    let (rpc_url, provider_catalog, hardware, candidates, gpu_layers) =
-        compute_provider_serve_candidates(home, args).await?;
-    let selected = select_provider_candidate(&candidates, None)?;
-    let requested = vec![selected.enclave.enclave_id.clone()];
-    let selection = select_provider_explicit_set(&candidates, &requested)?;
-    let hardware_quote_config =
-        provider_hardware_quote_config(&provider_start_args_for_serve_plan(args, home))?;
+    let computed = compute_provider_serve_candidates(home, args).await?;
+    let initial_selected = select_provider_candidate(&computed.candidates, None)?;
+    let requested = initial_selected.enclave.enclave_id.clone();
+    let mut scoped_args = computed.start_args.clone();
+    scoped_args.enclave = Some(requested.clone());
+    let selected = select_provider_candidate_with_config_defaults(
+        &computed.contract,
+        &computed.provider_catalog.catalog_doc,
+        &computed.hardware,
+        &mut scoped_args,
+        computed.config.as_ref(),
+        Some(&requested),
+    )?;
+    let candidates = vec![selected];
+    let selection = select_provider_explicit_set(&candidates, &[requested])?;
+    let hardware_quote_config = provider_hardware_quote_config(&computed.start_args)?;
     Ok(ProviderServePlanComputed {
-        rpc_url,
-        provider_catalog,
-        hardware,
+        rpc_url: computed.rpc_url,
+        provider_catalog: computed.provider_catalog,
+        hardware: computed.hardware,
         candidates,
         selection,
-        gpu_layers,
+        gpu_layers: computed.start_args.gpu_layers,
         hardware_quote_config,
     })
 }
@@ -48613,13 +48655,7 @@ async fn compute_provider_default_serve_plan(
 async fn compute_provider_serve_candidates(
     home: &Path,
     args: &ProviderServePlanArgs,
-) -> Result<(
-    String,
-    ProviderResolvedCatalog,
-    HardwareReport,
-    Vec<ProviderCandidate>,
-    Option<u32>,
-)> {
+) -> Result<ProviderServeCandidatesComputed> {
     let config = read_mayhem_config(home)?;
     let mut start_args = provider_start_args_for_serve_plan(args, home);
     if start_args.engine_backend == "auto" {
@@ -48660,13 +48696,15 @@ async fn compute_provider_serve_candidates(
         &hardware,
         &start_args,
     )?;
-    Ok((
+    Ok(ProviderServeCandidatesComputed {
         rpc_url,
         provider_catalog,
+        contract,
+        config,
         hardware,
         candidates,
-        start_args.gpu_layers,
-    ))
+        start_args,
+    })
 }
 
 async fn provider_serve_plan(args: ProviderServePlanArgs) -> Result<()> {
@@ -50010,15 +50048,14 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     let hardware = provider_hwprobe(&args)?;
     let hardware_fingerprint = provider_hardware_fingerprint(&hardware);
     let identity_anchor = format!("fingerprint:{hardware_fingerprint}");
-    let candidates =
-        build_provider_candidates(&contract, &provider_catalog.catalog_doc, &hardware, &args)?;
-    let initial_selected = select_provider_candidate(&candidates, args.enclave.as_deref())?;
-    apply_provider_config_defaults(&mut args, config.as_ref(), &initial_selected);
-    let candidates =
-        build_provider_candidates(&contract, &provider_catalog.catalog_doc, &hardware, &args)?;
-    let selected = select_provider_candidate(
-        &candidates,
-        Some(initial_selected.enclave.enclave_id.as_str()),
+    let requested_enclave = args.enclave.clone();
+    let selected = select_provider_candidate_with_config_defaults(
+        &contract,
+        &provider_catalog.catalog_doc,
+        &hardware,
+        &mut args,
+        config.as_ref(),
+        requested_enclave.as_deref(),
     )?;
     let configured_attestation_tier = hardware_quote_config
         .as_ref()
@@ -53701,45 +53738,29 @@ async fn provider_contract_tx_context(args: &ProviderContractTxArgs) -> Result<P
 
 async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
     let ctx = provider_tx_context(&args.tx).await?;
+    let serve_plan_args = provider_join_serve_plan_args(&args, &ctx.home, &ctx.rpc_url);
+    let requested = vec![args.enclave.clone()];
+    let computed =
+        compute_provider_explicit_serve_plan(&ctx.home, &serve_plan_args, &requested).await?;
+    let selected = computed
+        .selection
+        .candidates
+        .first()
+        .context("provider join did not select a hardware-fitting candidate")?;
+    let enclave = selected.enclave.clone();
     let contract = read_contract_catalog(&ctx.rpc).await?;
-    let enclave = resolve_provider_lifecycle_enclave(&contract.enclaves, &args.enclave)?;
     ensure!(
         enclave.att_tier == mayhem_proto::TIER1_SOFTWARE_ATTESTATION_TIER,
         "Tier-{} enclave admission requires the hardware-bound report generated by `mayhem provider start`; the lightweight join command only proves Tier 1",
         enclave.att_tier
     );
-    let catalog_ctx = u64::from(gateway_caps_from_contract(&enclave.caps).ctx);
-    let served_ctx = resolve_provider_join_served_ctx(catalog_ctx, args.ctx)?;
-    let price_ctx_bracket = price_ctx_bracket_for_model_class(
-        &enclave.model_class,
-        served_ctx,
-        &contract.ctx_bracket_schedule,
-        unix_epoch_seconds()?,
-    )?;
-    let price = find_current_au_usd_price_schedule(
-        &contract.prices,
-        &enclave.enclave_id,
-        price_ctx_bracket.as_deref(),
-    )
-    .with_context(|| {
-        format!(
-            "enclave {} has no current au_usd admin price for provider context {}; ask the admin to run `mayhem admin set-price` before providers join it",
-            enclave.enclave_id,
-            price_ctx_bracket.as_deref().unwrap_or("base")
-        )
-    })?;
-    let served_modalities = ledger_enclave_served_modalities(&enclave, &args.disable_modalities)?;
-    let served_specialities =
-        ledger_enclave_served_specialities(&enclave, &args.speciality_levels)?;
-    let serve_terms = provider_join_context_terms_from_price(
-        &enclave,
-        served_ctx,
-        served_modalities,
-        served_specialities,
-        price,
-    )?;
+    let price = selected
+        .price
+        .clone()
+        .context("selected provider enclave has no current admin price")?;
+    let serve_terms = provider_join_context_terms_for_candidate(selected)?;
     let rooms = select_provider_rooms(&contract.rooms, &enclave, &args.rooms)?;
-    let hardware_fingerprint = current_provider_hardware_fingerprint();
+    let hardware_fingerprint = provider_hardware_fingerprint(&computed.hardware);
     let join_attestation =
         provider_tier1_join_attestation(&ctx.wallet.public_key, &enclave, &hardware_fingerprint)?;
     let activation_leave_replay = replay_provider_leaves_before_activation(
@@ -53809,6 +53830,35 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
     print_provider_lifecycle_report(&report, args.tx.json)
 }
 
+fn provider_join_serve_plan_args(
+    args: &ProviderJoinArgs,
+    home: &Path,
+    rpc_url: &str,
+) -> ProviderServePlanArgs {
+    ProviderServePlanArgs {
+        home: Some(home.to_path_buf()),
+        rpc_url: Some(rpc_url.to_owned()),
+        catalog_path: None,
+        signature_path: None,
+        keys_dir: None,
+        canaries_dir: None,
+        engine_backend: "auto".to_owned(),
+        gpu_layers: None,
+        fixture: None,
+        disk_path: None,
+        skip_disk_bench: false,
+        ctx: args.ctx,
+        disable_modalities: args.disable_modalities.clone(),
+        speciality_levels: args.speciality_levels.clone(),
+        memory_reserve: None,
+        hardware_quote_kind: None,
+        hardware_quote_command: None,
+        hardware_quote_timeout_seconds: DEFAULT_HARDWARE_QUOTE_TIMEOUT_SECONDS,
+        json: true,
+        dev_skip_catalog_verify: false,
+    }
+}
+
 fn provider_tier1_join_attestation(
     provider: &str,
     enclave: &LedgerEnclave,
@@ -53827,17 +53877,6 @@ fn provider_tier1_join_attestation(
             "hardware_fingerprint": hardware_fingerprint,
         })),
     })
-}
-
-fn resolve_provider_join_served_ctx(catalog_ctx: u64, requested: Option<u64>) -> Result<u64> {
-    ensure!(catalog_ctx > 0, "admin enclave has no usable context limit");
-    let served_ctx = requested.unwrap_or(catalog_ctx);
-    ensure!(served_ctx > 0, "--ctx must be greater than zero");
-    ensure!(
-        served_ctx <= catalog_ctx,
-        "--ctx {served_ctx} exceeds the admin catalog maximum {catalog_ctx}"
-    );
-    Ok(served_ctx)
 }
 
 async fn provider_leave(args: ProviderLeaveArgs) -> Result<()> {
@@ -56878,12 +56917,6 @@ fn provider_hardware_fingerprint(hardware: &HardwareReport) -> String {
         },
         "gpus": gpus,
     }))
-}
-
-fn current_provider_hardware_fingerprint() -> String {
-    let mut options = ProbeOptions::default();
-    options.run_disk_bench = false;
-    provider_hardware_fingerprint(&probe(options))
 }
 
 async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
@@ -60368,26 +60401,6 @@ fn provider_served_modalities(
     resolve_provider_served_modalities(&model.model_class, &model.adapter.modality_set, disabled)
 }
 
-fn ledger_enclave_served_modalities(
-    enclave: &LedgerEnclave,
-    disabled: &[String],
-) -> Result<Vec<String>> {
-    let enabled = enclave
-        .caps
-        .get("modality_set")
-        .and_then(Value::as_array)
-        .context("admin enclave caps are missing explicit modality_set")?
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .context("admin enclave caps modality_set entries must be strings")
-                .and_then(normalize_provider_modality)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    resolve_provider_served_modalities(&enclave.model_class, &enabled, disabled)
-}
-
 fn valid_provider_speciality_component(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -60741,6 +60754,79 @@ fn select_provider_candidate(
         })
         .cloned()
         .context("no provider candidate available")
+}
+
+fn select_provider_candidate_with_config_defaults(
+    contract: &ContractCatalog,
+    catalog: &catalog::CatalogDocument,
+    hardware: &HardwareReport,
+    args: &mut ProviderStartArgs,
+    config: Option<&MayhemConfig>,
+    requested: Option<&str>,
+) -> Result<ProviderCandidate> {
+    let candidates = build_provider_candidates(contract, catalog, hardware, args)?;
+    let initial_selected = select_provider_candidate(&candidates, requested)?;
+    rebuild_provider_candidate_with_config_defaults(
+        contract,
+        catalog,
+        hardware,
+        args,
+        config,
+        &initial_selected,
+    )
+}
+
+fn rebuild_provider_candidate_with_config_defaults(
+    contract: &ContractCatalog,
+    catalog: &catalog::CatalogDocument,
+    hardware: &HardwareReport,
+    args: &mut ProviderStartArgs,
+    config: Option<&MayhemConfig>,
+    initial_selected: &ProviderCandidate,
+) -> Result<ProviderCandidate> {
+    apply_provider_config_defaults(args, config, initial_selected);
+    let candidates = build_provider_candidates(contract, catalog, hardware, args)?;
+    select_provider_candidate(
+        &candidates,
+        Some(initial_selected.enclave.enclave_id.as_str()),
+    )
+}
+
+fn provider_candidates_with_config_defaults(
+    contract: &ContractCatalog,
+    catalog: &catalog::CatalogDocument,
+    hardware: &HardwareReport,
+    base_args: &ProviderStartArgs,
+    config: Option<&MayhemConfig>,
+    initial_candidates: &[ProviderCandidate],
+) -> Result<Vec<ProviderCandidate>> {
+    let mut candidates = Vec::with_capacity(initial_candidates.len());
+    let mut rejections = Vec::new();
+    for initial in initial_candidates {
+        let mut scoped_args = base_args.clone();
+        scoped_args.enclave = Some(initial.enclave.enclave_id.clone());
+        match rebuild_provider_candidate_with_config_defaults(
+            contract,
+            catalog,
+            hardware,
+            &mut scoped_args,
+            config,
+            initial,
+        ) {
+            Ok(candidate) => candidates.push(candidate),
+            Err(error) => rejections.push(format!(
+                "{} ({}): {error:#}",
+                initial.enclave.model_id, initial.enclave.enclave_id
+            )),
+        }
+    }
+    if candidates.is_empty() {
+        bail!(
+            "no provider candidates remain after applying enclave-scoped provider limits: {}",
+            rejections.join("; ")
+        );
+    }
+    Ok(candidates)
 }
 
 fn select_provider_auto_fit_set(
@@ -75914,20 +76000,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_join_context_is_explicitly_bounded_by_catalog() {
-        assert_eq!(
-            resolve_provider_join_served_ctx(131_072, None).unwrap(),
-            131_072
-        );
-        assert_eq!(
-            resolve_provider_join_served_ctx(131_072, Some(65_536)).unwrap(),
-            65_536
-        );
-        assert!(resolve_provider_join_served_ctx(131_072, Some(0)).is_err());
-        assert!(resolve_provider_join_served_ctx(131_072, Some(131_073)).is_err());
-    }
-
-    #[test]
     fn child_process_asset_root_strips_windows_verbatim_disk_prefix() {
         assert_eq!(
             asset_root_for_child_process(PathBuf::from(r"\\?\C:\mayhem\openmayhem")),
@@ -77458,6 +77530,70 @@ mod tests {
         apply_provider_config_defaults(&mut cli_args, Some(&config), &selected);
         assert_eq!(cli_args.max_sessions, Some(7));
         assert_eq!(cli_args.accept_rate_per_minute, 3);
+    }
+
+    #[test]
+    fn provider_selection_rebuilds_after_enclave_scoped_defaults() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0]
+            .artifacts
+            .get_mut("gguf-q4_k_m")
+            .unwrap()
+            .speciality_levels = Some(BTreeMap::from([(
+            "reasoning_effort".to_owned(),
+            vec!["low".to_owned(), "high".to_owned()],
+        )]));
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].caps["speciality_levels"] =
+            json!({"reasoning_effort": ["low", "high"]});
+        let enclave_id = contract.enclaves[0].enclave_id.clone();
+        let config: MayhemConfig = toml::from_str(&format!(
+            r#"
+            [provider.enclave_limits."{enclave_id}".specialities]
+            reasoning_effort = ["low"]
+            "#
+        ))
+        .unwrap();
+        let hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        let initial_args = test_provider_start_args();
+        let initial_candidates =
+            build_provider_candidates(&contract, &catalog, &hardware, &initial_args).unwrap();
+        let auto_fit_candidates = provider_candidates_with_config_defaults(
+            &contract,
+            &catalog,
+            &hardware,
+            &initial_args,
+            Some(&config),
+            &initial_candidates,
+        )
+        .unwrap();
+        assert_eq!(
+            auto_fit_candidates[0].served_specialities,
+            BTreeMap::from([("reasoning_effort".to_owned(), vec!["low".to_owned()])])
+        );
+
+        let mut args = test_provider_start_args();
+        args.enclave = Some(enclave_id.clone());
+
+        let selected = select_provider_candidate_with_config_defaults(
+            &contract,
+            &catalog,
+            &hardware,
+            &mut args,
+            Some(&config),
+            Some(&enclave_id),
+        )
+        .unwrap();
+
+        assert_eq!(
+            args.speciality_levels,
+            vec!["reasoning_effort=low".to_owned()]
+        );
+        assert_eq!(
+            selected.served_specialities,
+            BTreeMap::from([("reasoning_effort".to_owned(), vec!["low".to_owned()])])
+        );
     }
 
     #[test]
@@ -81415,6 +81551,35 @@ mod tests {
         assert_eq!(args.rooms, "room-a,room-b");
         assert!(args.tx.sim);
         assert!(args.tx.json);
+        let join_plan =
+            provider_join_serve_plan_args(&args, Path::new("/provider-home"), "http://peer/v1");
+        assert_eq!(join_plan.home.as_deref(), Some(Path::new("/provider-home")));
+        assert_eq!(join_plan.rpc_url.as_deref(), Some("http://peer/v1"));
+        assert_eq!(join_plan.ctx, None);
+        assert_eq!(join_plan.engine_backend, "auto");
+
+        let explicit_join = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "join",
+            "--enclave",
+            "enclave-a",
+            "--ctx",
+            "32768",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = explicit_join.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Join(explicit_args) = *command else {
+            panic!("expected provider join command");
+        };
+        let explicit_plan = provider_join_serve_plan_args(
+            &explicit_args,
+            Path::new("/provider-home"),
+            "http://peer/v1",
+        );
+        assert_eq!(explicit_plan.ctx, Some(32_768));
 
         let rooms = Cli::try_parse_from([
             "mayhem",

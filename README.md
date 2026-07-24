@@ -76,7 +76,7 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.44` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.45` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -85,7 +85,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.44
+git checkout --detach v0.2.45
 ./install.sh --from-source
 ```
 
@@ -94,7 +94,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.44
+git checkout --detach v0.2.45
 .\install.ps1 -FromSource
 ```
 
@@ -482,6 +482,12 @@ mayhem up --provider --yes
 
 That's the whole Tier-1 happy path. The software probes your hardware, shows which admin-approved models fit (with estimated speed and context, before anything downloads), fetches and verifies the model, and starts serving. The provider dashboard shows download, verify, seal, load, and serving progress live. Your Mayhem binary may be built from source: its measured hash is signed evidence, not an admin approval list. The model, artifact, manifest, room, and market still come only from the admin-published catalog and ledger.
 
+An LLM catalog context is a ceiling, not a required setting. Use
+`mayhem provider start --ctx <tokens>` or `mayhem provider serve add <enclave> --ctx <tokens>`
+when you want a smaller fitting commitment. Manual join and streamlined start run the same
+hardware-fit selection; explicit values are kept exactly or rejected before model download, and
+every supported context bracket has its own admin-published price.
+
 Higher-tier proof is explicit. It never needs a manual provider approval after it verifies, and Mayhem does not auto-run a proof helper just because hardware was detected. For example, a Linux TPM provider starts Tier 2 with:
 
 ```bash
@@ -738,8 +744,8 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
-| `huihui-ai/Huihui-Agents-A1-abliterated` | Multimodal LLM, vision/video input, tools, uncensored, 262K ctx | C | calibrated; publishing with `v0.2.44` |
-| `ResembleAI/chatterbox` | TTS + zero-shot voice cloning | A/B | calibrated; publishing with `v0.2.44` |
+| `huihui-ai/Huihui-Agents-A1-abliterated` | Multimodal LLM, vision/video input, tools, uncensored, 262K ctx | C | **live** |
+| `ResembleAI/chatterbox` | TTS + zero-shot voice cloning | A/B | **live** |
 | `SulphurAI/Sulphur-2-base` | Video with synchronized audio, uncensored | C/D | **live** |
 | `prism-ml/Ternary-Bonsai-27B` | LLM, reasoning, 262K ctx, 2-bit ternary | B | **live** |
 | `ACE-Step/Ace-Step1.5` | Music generation | B/C | **live** |
@@ -851,7 +857,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.44` is source-only. The GitHub release contains the tagged source, not
+`v0.2.45` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -859,7 +865,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.44
+git checkout --detach v0.2.45
 ./install.sh --from-source
 ```
 
@@ -868,7 +874,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.44
+git checkout --detach v0.2.45
 .\install.ps1 -FromSource
 ```
 
@@ -888,11 +894,14 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
-The `0.2.44` source release carries the current PAYOUTFREE, ATTAUTO, FLOWRATE,
+The `0.2.45` source release carries the current PAYOUTFREE, ATTAUTO, FLOWRATE,
 LIVEROUTE, bounded Z-Image readiness, process-lifetime dashboard auth,
 non-destructive authenticated direct-to-relay session handover, and the
 generalized joint audio/video serving path used by Sulphur. The releases page and live signed catalog remain
 the user-facing truth for the current software revision and available models.
+It also keeps provider join/start context commitments on one hardware-fit path and pins every
+byte-hashed Chatterbox runtime input to LF so Windows source builds are independent of
+`core.autocrlf`.
 
 ```bash
 scripts/dev-net.sh --cleanup
