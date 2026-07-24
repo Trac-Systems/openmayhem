@@ -10,8 +10,8 @@ import math
 import os
 import pathlib
 import random
+import secrets
 import sys
-import tempfile
 import wave
 
 
@@ -33,6 +33,7 @@ S3GEN_REFERENCE_SECONDS = 10
 MAX_OUTPUT_AUDIO_BYTES = 64 * 1024 * 1024
 MAX_OUTPUT_AUDIO_SECONDS = 120
 MAX_PROTOCOL_LINE_BYTES = 24 * 1024 * 1024
+MAX_REFERENCE_FILE_ATTEMPTS = 100
 REQUIRED_MODEL_FILES = (
     "ve.safetensors",
     "t3_cfg.safetensors",
@@ -428,6 +429,19 @@ def _wav_bytes(pcm, sample_rate):
     return result
 
 
+def _write_reference_audio(inputs_root, reference_audio):
+    for _ in range(MAX_REFERENCE_FILE_ATTEMPTS):
+        reference_path = inputs_root / f"reference-{secrets.token_hex(16)}.wav"
+        try:
+            with reference_path.open("xb") as reference_file:
+                reference_file.write(reference_audio)
+                reference_file.flush()
+            return reference_path
+        except FileExistsError:
+            continue
+    raise ProtocolError("could not allocate a unique Chatterbox reference-audio file")
+
+
 def _handle_synthesize(payload):
     if _runtime is None:
         raise ProtocolError("Chatterbox model has not been loaded")
@@ -462,16 +476,10 @@ def _handle_synthesize(payload):
             model.conds = _default_conditionals_for_request()
         else:
             model.conds = None
-            with tempfile.NamedTemporaryFile(
-                mode="xb",
-                suffix=".wav",
-                prefix="reference-",
-                dir=_runtime["cache_root"] / "inputs",
-                delete=False,
-            ) as reference_file:
-                reference_file.write(reference_audio)
-                reference_file.flush()
-                reference_path = pathlib.Path(reference_file.name)
+            reference_path = _write_reference_audio(
+                _runtime["cache_root"] / "inputs",
+                reference_audio,
+            )
         with contextlib.redirect_stdout(sys.stderr):
             waveform = model.generate(
                 text,

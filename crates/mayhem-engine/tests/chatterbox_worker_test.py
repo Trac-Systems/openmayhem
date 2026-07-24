@@ -311,6 +311,30 @@ class ChatterboxWorkerTests(unittest.TestCase):
         self.assertEqual(default_call["conds"], {"voice": "builtin"})
         self.assertIsNone(_FakeChatterboxTTS.model.conds)
 
+    def test_reference_file_permission_failure_is_immediate_not_retried(self):
+        inputs = self.cache_root / "inputs"
+        inputs.mkdir()
+        with mock.patch.object(
+            pathlib.Path,
+            "open",
+            side_effect=PermissionError("sandbox denied reference input"),
+        ) as open_file:
+            with self.assertRaisesRegex(PermissionError, "sandbox denied"):
+                worker._write_reference_audio(inputs, b"reference")
+        self.assertEqual(open_file.call_count, 1)
+
+    def test_reference_file_name_collisions_are_bounded(self):
+        inputs = self.cache_root / "inputs"
+        inputs.mkdir()
+        with mock.patch.object(
+            pathlib.Path,
+            "open",
+            side_effect=FileExistsError("collision"),
+        ) as open_file:
+            with self.assertRaisesRegex(worker.ProtocolError, "unique Chatterbox"):
+                worker._write_reference_audio(inputs, b"reference")
+        self.assertEqual(open_file.call_count, worker.MAX_REFERENCE_FILE_ATTEMPTS)
+
     def test_reference_longer_than_ten_seconds_is_rejected_not_clipped(self):
         self.load()
         reference = pcm_wav(24_000, 240_001)

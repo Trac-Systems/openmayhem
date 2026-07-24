@@ -407,7 +407,7 @@ impl ChatterboxBackend {
         let worker_cache = self.worker_cache.clone().ok_or_else(|| {
             EngineError::Chatterbox("Chatterbox worker cache is not prepared".to_owned())
         })?;
-        purge_worker_inputs(&worker_cache)?;
+        prepare_worker_inputs(&worker_cache)?;
         self.worker = Some(ChatterboxWorker::spawn(
             &self.python,
             config.memory_limit_bytes,
@@ -521,7 +521,7 @@ impl ChatterboxBackend {
             worker.stop();
         }
         if let Some(cache) = &self.worker_cache {
-            let _ = purge_worker_inputs(cache);
+            let _ = prepare_worker_inputs(cache);
         }
     }
 }
@@ -556,7 +556,7 @@ impl EngineBackend for ChatterboxBackend {
         self.model_root = Some(model_root.clone());
         self.worker_cache = Some(worker_cache.clone());
         self.execution_config = None;
-        purge_worker_inputs(&worker_cache)?;
+        prepare_worker_inputs(&worker_cache)?;
         self.worker = Some(ChatterboxWorker::spawn(
             &self.python,
             config.memory_limit_bytes,
@@ -996,11 +996,24 @@ fn chatterbox_worker_cache(cache_root: &Path, model_root: &Path) -> Result<PathB
     Ok(cache_root.join("workers").join(format!("{digest:x}")))
 }
 
-fn purge_worker_inputs(cache_root: &Path) -> Result<()> {
+fn prepare_worker_inputs(cache_root: &Path) -> Result<()> {
     let inputs = cache_root.join("inputs");
     let metadata = match fs::symlink_metadata(&inputs) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&inputs).map_err(|error| {
+                EngineError::Chatterbox(format!(
+                    "creating Chatterbox worker input directory {} failed: {error}",
+                    inputs.display()
+                ))
+            })?;
+            fs::symlink_metadata(&inputs).map_err(|error| {
+                EngineError::Chatterbox(format!(
+                    "inspecting Chatterbox worker input directory {} failed: {error}",
+                    inputs.display()
+                ))
+            })?
+        }
         Err(error) => {
             return Err(EngineError::Chatterbox(format!(
                 "inspecting Chatterbox worker input directory {} failed: {error}",
@@ -1902,12 +1915,25 @@ mod tests {
         let preserved_directory = inputs.join("not-a-worker-input");
         fs::create_dir(&preserved_directory).unwrap();
 
-        purge_worker_inputs(&worker_cache).expect("startup cleanup");
+        prepare_worker_inputs(&worker_cache).expect("startup cleanup");
 
         assert!(!stale_reference.exists());
         assert!(fs::symlink_metadata(&stale_link).is_err());
         assert_eq!(fs::read(&link_target).unwrap(), b"must survive cleanup");
         assert!(preserved_directory.is_dir());
+    }
+
+    #[test]
+    fn worker_startup_materializes_inputs_before_sandbox_launch() {
+        let tree = TestTree::new();
+        let worker_cache = tree.path.join("worker-cache");
+        fs::create_dir_all(&worker_cache).unwrap();
+        let inputs = worker_cache.join("inputs");
+
+        prepare_worker_inputs(&worker_cache).expect("prepare worker inputs");
+
+        assert!(inputs.is_dir());
+        assert!(!inputs.is_symlink());
     }
 
     #[cfg(unix)]

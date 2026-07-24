@@ -437,6 +437,7 @@ chown mayhem:mayhem "$systemd_env"
 install -m 0644 "$repo"/ops/systemd/mayhem-*.service /etc/systemd/system/
 install -m 0644 "$repo"/ops/systemd/mayhem-*.timer /etc/systemd/system/
 systemctl daemon-reload
+systemctl disable --now mayhem-backup.timer
 systemctl enable \
   mayhem-stack.service \
   mayhem-paygate.service \
@@ -445,8 +446,7 @@ systemctl enable \
   mayhem-tap-deposit.service \
   mayhem-tnk-deposit.service \
   mayhem-tap-settlement.service \
-  mayhem-epoch-cadence.timer \
-  mayhem-backup.timer
+  mayhem-epoch-cadence.timer
 systemctl enable --now mayhem-payout-worker.timer
 
-echo "Mayhem mainnet units installed; the automatic payout timer is enabled and running."
+echo "Mayhem mainnet units installed; payouts are enabled and quiesced backups remain disabled."

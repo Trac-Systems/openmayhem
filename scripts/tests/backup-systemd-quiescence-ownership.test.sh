@@ -38,5 +38,11 @@ grep -Fq 'canonical units require MAYHEM_ROOT=/opt/mayhem and MAYHEM_REPO=/opt/m
   fail "installer does not reject unsupported path overrides"
 grep -Fqx 'install -m 0644 "$repo"/ops/systemd/mayhem-*.service /etc/systemd/system/' "$INSTALLER" ||
   fail "installer does not deploy service units unchanged"
+grep -Fqx 'systemctl disable --now mayhem-backup.timer' "$INSTALLER" ||
+  fail "installer must keep the outage-prone quiesced backup timer disabled"
+if sed -n '/^systemctl enable \\/,/^systemctl enable --now mayhem-payout-worker.timer/p' "$INSTALLER" |
+  grep -Fq 'mayhem-backup.timer'; then
+  fail "installer must not enable the quiesced backup timer"
+fi
 
 printf 'backup-systemd-quiescence-ownership.test: ok\n'
