@@ -17,6 +17,7 @@ _MAX_PROTOCOL_LINE_BYTES = 48 * 1024 * 1024
 _MAX_OUTPUT_BYTES = 1024 * 1024 * 1024
 _MAX_CONDITIONING_IMAGE_BYTES = 32 * 1024 * 1024
 _REQUIRED_ADAPTER_FUNCTIONS = ("load", "describe", "validate_video", "generate_video")
+_WINDOWS = os.name == "nt"
 
 runtime_adapter = None
 runtime = None
@@ -49,25 +50,57 @@ def _require_exact_fields(value, expected, label):
     return value
 
 
-def _require_real_directory(value, label):
+def _absolute_local_path(value, label):
+    path = pathlib.Path(value)
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be absolute")
+    return pathlib.Path(os.path.abspath(path))
+
+
+def _is_link_or_reparse(path, metadata=None):
+    metadata = metadata or os.lstat(path)
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+
+
+def _existing_real_path(value, label):
     supplied = pathlib.Path(value)
+    if _WINDOWS:
+        path = _absolute_local_path(supplied, label)
+        metadata = os.lstat(path)
+        if _is_link_or_reparse(path, metadata):
+            raise ValueError(f"{label} must not be a symlink or reparse point")
+        return path, metadata
     if supplied.is_symlink():
-        raise ValueError(f"{label} must be a real directory")
+        raise ValueError(f"{label} must not be a symlink")
     path = supplied.resolve(strict=True)
-    if not path.is_dir():
+    return path, path.stat()
+
+
+def _require_real_directory(value, label):
+    path, metadata = _existing_real_path(value, label)
+    if not stat.S_ISDIR(metadata.st_mode):
         raise ValueError(f"{label} must be a real directory")
     return path
 
 
 def _require_real_file(value, label):
-    supplied = pathlib.Path(value)
-    if supplied.is_symlink():
-        raise ValueError(f"{label} must be a real regular file")
-    path = supplied.resolve(strict=True)
-    mode = path.stat().st_mode
-    if not stat.S_ISREG(mode):
+    path, metadata = _existing_real_path(value, label)
+    if not stat.S_ISREG(metadata.st_mode):
         raise ValueError(f"{label} must be a real regular file")
     return path
+
+
+def _ensure_private_directory(path, label):
+    path = pathlib.Path(path)
+    if _WINDOWS:
+        path.mkdir(parents=True, exist_ok=True)
+    else:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(path, 0o700)
+    return _require_real_directory(path, label)
 
 
 def _safe_module_name(value):
@@ -145,20 +178,22 @@ def _load(payload):
     if backend not in ("gguf", "mlx"):
         raise ValueError("Sulphur backend must be gguf or mlx")
     model_root = _require_real_directory(payload["model_root"], "Sulphur model root")
-    artifact_path = pathlib.Path(payload["artifact_path"]).resolve(strict=True)
+    artifact_path = (
+        _require_real_file(payload["artifact_path"], "Sulphur GGUF artifact")
+        if backend == "gguf"
+        else _require_real_directory(payload["artifact_path"], "Sulphur MLX artifact")
+    )
     if artifact_path != model_root and model_root not in artifact_path.parents:
         raise ValueError("Sulphur artifact escaped its model root")
-    if backend == "gguf":
-        _require_real_file(artifact_path, "Sulphur GGUF artifact")
-    elif not artifact_path.is_dir() or artifact_path.is_symlink():
-        raise ValueError("Sulphur MLX artifact must be a real directory")
     cache_root = _require_real_directory(payload["cache_root"], "Sulphur cache root")
-    output_root = cache_root / "outputs"
-    output_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(output_root, 0o700)
-    input_root = cache_root / "inputs"
-    input_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(input_root, 0o700)
+    output_root = _ensure_private_directory(
+        cache_root / "outputs",
+        "Sulphur output directory",
+    )
+    input_root = _ensure_private_directory(
+        cache_root / "inputs",
+        "Sulphur input directory",
+    )
     _purge_worker_inputs()
     ffmpeg_path = _require_real_file(payload["ffmpeg_path"], "Sulphur ffmpeg executable")
     ffprobe_path = _require_real_file(payload["ffprobe_path"], "Sulphur ffprobe executable")
@@ -387,8 +422,13 @@ def _generate(payload):
     requested_output = pathlib.Path(payload["output_path"])
     if not requested_output.is_absolute():
         raise ValueError("Sulphur output path must be absolute")
-    requested_output = requested_output.resolve(strict=False)
-    if requested_output.parent != output_root.resolve(strict=True) or requested_output.suffix.lower() != ".mp4":
+    requested_output = (
+        _absolute_local_path(requested_output, "Sulphur output path")
+        if _WINDOWS
+        else requested_output.resolve(strict=False)
+    )
+    bounded_output_root = output_root if _WINDOWS else output_root.resolve(strict=True)
+    if requested_output.parent != bounded_output_root or requested_output.suffix.lower() != ".mp4":
         raise ValueError("Sulphur output path escaped its bounded MP4 output directory")
     if requested_output.exists():
         raise ValueError("Sulphur output path already exists")

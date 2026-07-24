@@ -2721,6 +2721,27 @@ fn endpoint_calibration_companion_maximum(
         .unwrap_or(fallback)
 }
 
+fn endpoint_calibration_companion_minimum(
+    contract: &EndpointFamilyContract,
+    path: &str,
+    fallback: Value,
+) -> Value {
+    contract
+        .request_attribute_specs
+        .get(path)
+        .and_then(|spec| {
+            spec.calibration_values
+                .iter()
+                .chain(spec.enum_values.iter())
+                .chain(spec.default.iter())
+                .filter(|value| validate_endpoint_attribute_value(spec, value).is_ok())
+                .filter_map(|value| value.as_f64().map(|number| (number, value)))
+                .min_by(|(left, _), (right, _)| left.total_cmp(right))
+                .map(|(_, value)| value.clone())
+        })
+        .unwrap_or(fallback)
+}
+
 fn add_calibration_companion_mutations(
     contract: &EndpointFamilyContract,
     path: &str,
@@ -2996,7 +3017,7 @@ fn add_calibration_companion_mutations(
         ),
         "parameters.fps" if contract.family == ENDPOINT_HF_TEXT_TO_VIDEO => add(
             "parameters.num_frames",
-            endpoint_calibration_companion_baseline(contract, "parameters.num_frames", json!(9)),
+            endpoint_calibration_companion_minimum(contract, "parameters.num_frames", json!(9)),
         ),
         "parameters.num_frames" if contract.family == ENDPOINT_HF_TEXT_TO_VIDEO => add(
             "parameters.fps",
@@ -5102,6 +5123,11 @@ mod tests {
             .get_mut("parameters.num_frames")
             .unwrap()
             .calibration_values = vec![json!(9), json!(497)];
+        hf_contract
+            .request_attribute_specs
+            .get_mut("parameters.num_frames")
+            .unwrap()
+            .default = Some(json!(121));
         let hf_cases = generate_endpoint_calibration_cases(&hf_contract).expect("HF video matrix");
         let hf_fps_case = hf_cases
             .iter()
@@ -5114,10 +5140,10 @@ mod tests {
                         .is_some_and(|mutation| mutation.path == "parameters.fps")
             })
             .expect("accepted HF fps case");
-        assert!(hf_fps_case
-            .mutations
-            .iter()
-            .any(|mutation| mutation.path == "parameters.num_frames"));
+        assert!(hf_fps_case.mutations.iter().any(|mutation| {
+            mutation.path == "parameters.num_frames"
+                && mutation.value == (EndpointCalibrationValue::Literal { value: json!(9) })
+        }));
         let hf_frame_case = hf_cases
             .iter()
             .find(|case| {

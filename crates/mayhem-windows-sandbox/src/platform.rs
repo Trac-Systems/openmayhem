@@ -344,31 +344,55 @@ fn grant_configured_directory_access(
     profile: &mut AppContainerProfile,
     config: &ResolvedWindowsSandboxConfig,
 ) -> Result<()> {
-    let mut granted_ancestors = Vec::new();
-    for path in config
-        .read_only_dirs
-        .iter()
-        .chain(config.writable_dirs.iter())
-    {
-        for ancestor in path.ancestors().skip(1) {
-            if granted_ancestors
-                .iter()
-                .any(|granted: &PathBuf| granted == ancestor)
-            {
-                continue;
-            }
-            profile.grant_access(ancestor, false, AppContainerFileAccess::Traverse)?;
-            granted_ancestors.push(ancestor.to_path_buf());
-        }
-    }
+    // AppContainer tokens retain Windows' traverse-bypass privilege. Granting
+    // every ancestor would broaden access outside Mayhem-owned roots and may
+    // require elevation for system-owned directories such as the drive root.
     for path in &config.read_only_dirs {
         profile.grant_access(path, true, AppContainerFileAccess::ReadOnly)?;
     }
     for path in &config.writable_dirs {
         profile.grant_access(path, true, AppContainerFileAccess::Writable)?;
+        grant_existing_writable_descendants(profile, path)?;
     }
     for path in &config.materialized_read_only_dirs {
         grant_materialized_read_only_descendants(profile, path)?;
+    }
+    Ok(())
+}
+
+fn grant_existing_writable_descendants(
+    profile: &mut AppContainerProfile,
+    path: &Path,
+) -> Result<()> {
+    for entry in fs::read_dir(path).map_err(|err| {
+        WindowsSandboxError::InvalidConfig(format!(
+            "writable tree {} could not be inspected: {err}",
+            path.display()
+        ))
+    })? {
+        let entry = entry.map_err(|err| {
+            WindowsSandboxError::InvalidConfig(format!(
+                "writable tree {} could not be inspected: {err}",
+                path.display()
+            ))
+        })?;
+        let child = entry.path();
+        let metadata = fs::symlink_metadata(&child).map_err(|err| {
+            WindowsSandboxError::InvalidConfig(format!(
+                "writable entry {} could not be inspected: {err}",
+                child.display()
+            ))
+        })?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(WindowsSandboxError::InvalidConfig(format!(
+                "writable tree must not contain symlink or reparse point {}",
+                child.display()
+            )));
+        }
+        profile.grant_access(&child, metadata.is_dir(), AppContainerFileAccess::Writable)?;
+        if metadata.is_dir() {
+            grant_existing_writable_descendants(profile, &child)?;
+        }
     }
     Ok(())
 }
@@ -1036,7 +1060,6 @@ fn create_job_handle(memory_limit_bytes: Option<u64>) -> Result<HandleGuard> {
 
 #[derive(Clone, Copy)]
 enum AppContainerFileAccess {
-    Traverse,
     ReadOnly,
     ReadOnlyDirectory,
     Writable,
@@ -1049,9 +1072,6 @@ fn appcontainer_access_entries(
     file_access: AppContainerFileAccess,
 ) -> Vec<EXPLICIT_ACCESS_W> {
     let permissions = match file_access {
-        // Python resolves directory roots through handles, which also requires
-        // read-attributes and synchronization rights on each parent.
-        AppContainerFileAccess::Traverse => FILE_GENERIC_EXECUTE,
         AppContainerFileAccess::ReadOnly => FILE_GENERIC_READ,
         AppContainerFileAccess::ReadOnlyDirectory => FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
         // Traverse must inherit too: workers commonly create a cache directory

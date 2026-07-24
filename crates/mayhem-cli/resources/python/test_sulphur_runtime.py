@@ -160,6 +160,40 @@ class SulphurRuntimeValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown or missing fields"):
             MODULE.validate_video(self.runtime, request)
 
+    def test_windows_worker_validates_owned_paths_without_final_path_normalization(self):
+        model = self.runtime.cache_root / "model-root"
+        model.mkdir()
+        with (
+            mock.patch.object(WORKER, "_WINDOWS", True),
+            mock.patch.object(
+                pathlib.Path,
+                "resolve",
+                side_effect=AssertionError("strict final-path lookup is forbidden"),
+            ),
+        ):
+            self.assertEqual(
+                WORKER._require_real_directory(model, "model root"),
+                model,
+            )
+
+    def test_windows_runtime_rejects_reparse_points_without_admin_setup(self):
+        target = self.runtime.cache_root / "model-root"
+        target.mkdir()
+        metadata = types.SimpleNamespace(
+            st_mode=MODULE.stat.S_IFDIR,
+            st_file_attributes=getattr(
+                MODULE.stat,
+                "FILE_ATTRIBUTE_REPARSE_POINT",
+                0x400,
+            ),
+        )
+        with (
+            mock.patch.object(MODULE, "_WINDOWS", True),
+            mock.patch.object(MODULE.os, "lstat", return_value=metadata),
+        ):
+            with self.assertRaisesRegex(ValueError, "symlink or reparse point"):
+                MODULE._real_directory(target, "model root")
+
     def test_description_matches_real_worker_contract(self):
         description = MODULE.describe(self.runtime)
         self.assertEqual(description["stage_1_denoise_intervals"], 8)

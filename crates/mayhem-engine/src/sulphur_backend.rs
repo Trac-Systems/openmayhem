@@ -1603,10 +1603,18 @@ fn inspect_joint_mp4(path: &Path) -> Result<Mp4Info> {
         .ok_or_else(|| {
             EngineError::Sulphur("Sulphur MP4 is missing its movie metadata".to_owned())
         })?;
+    let moov_boxes = read_iso_boxes(&mut file, moov.payload_start, moov.end)?;
+    let mvhd = moov_boxes
+        .iter()
+        .find(|item| &item.kind == b"mvhd")
+        .ok_or_else(|| {
+            EngineError::Sulphur("Sulphur MP4 is missing its movie timebase".to_owned())
+        })?;
+    let movie_timescale = read_mp4_movie_timescale(&mut file, *mvhd)?;
     let mut tracks = Vec::new();
-    for item in read_iso_boxes(&mut file, moov.payload_start, moov.end)? {
+    for item in moov_boxes {
         if &item.kind == b"trak" {
-            tracks.push(read_mp4_track(&mut file, item)?);
+            tracks.push(read_mp4_track(&mut file, item, movie_timescale)?);
         }
     }
     let video = tracks
@@ -1622,8 +1630,16 @@ fn inspect_joint_mp4(path: &Path) -> Result<Mp4Info> {
     Ok(Mp4Info { video, audio })
 }
 
-fn read_mp4_track(file: &mut File, track: IsoBox) -> Result<Mp4Track> {
-    let mdia = read_iso_boxes(file, track.payload_start, track.end)?
+fn read_mp4_track(file: &mut File, track: IsoBox, movie_timescale: u32) -> Result<Mp4Track> {
+    let track_boxes = read_iso_boxes(file, track.payload_start, track.end)?;
+    let tkhd = track_boxes
+        .iter()
+        .find(|item| &item.kind == b"tkhd")
+        .ok_or_else(|| {
+            EngineError::Sulphur("Sulphur MP4 track has no presentation duration".to_owned())
+        })?;
+    let duration_seconds = read_mp4_track_duration(file, *tkhd, movie_timescale)?;
+    let mdia = track_boxes
         .into_iter()
         .find(|item| &item.kind == b"mdia")
         .ok_or_else(|| EngineError::Sulphur("Sulphur MP4 track has no media box".to_owned()))?;
@@ -1640,51 +1656,70 @@ fn read_mp4_track(file: &mut File, track: IsoBox) -> Result<Mp4Track> {
     file.seek(SeekFrom::Start(hdlr.payload_start + 8))?;
     let mut kind = [0_u8; 4];
     file.read_exact(&mut kind)?;
-    let mdhd = boxes
-        .iter()
-        .find(|item| &item.kind == b"mdhd")
-        .ok_or_else(|| {
-            EngineError::Sulphur("Sulphur MP4 track has no duration metadata".to_owned())
-        })?;
-    let duration_seconds = read_mp4_duration(file, *mdhd)?;
     Ok(Mp4Track {
         kind,
         duration_seconds,
     })
 }
 
-fn read_mp4_duration(file: &mut File, mdhd: IsoBox) -> Result<f64> {
-    file.seek(SeekFrom::Start(mdhd.payload_start))?;
+fn read_mp4_movie_timescale(file: &mut File, mvhd: IsoBox) -> Result<u32> {
+    file.seek(SeekFrom::Start(mvhd.payload_start))?;
     let mut header = [0_u8; 4];
     file.read_exact(&mut header)?;
-    let (timescale_offset, duration_offset, duration_bytes) = match header[0] {
-        0 => (12, 16, 4),
-        1 => (20, 24, 8),
+    let timescale_offset = match header[0] {
+        0 => 12,
+        1 => 20,
         _ => {
             return Err(EngineError::Sulphur(
-                "Sulphur MP4 media header version is unsupported".to_owned(),
+                "Sulphur MP4 movie header version is unsupported".to_owned(),
             ))
         }
     };
-    if mdhd.end.saturating_sub(mdhd.payload_start) < duration_offset + duration_bytes {
+    if mvhd.end.saturating_sub(mvhd.payload_start) < timescale_offset + 4 {
         return Err(EngineError::Sulphur(
-            "Sulphur MP4 media duration is truncated".to_owned(),
+            "Sulphur MP4 movie timebase is truncated".to_owned(),
         ));
     }
-    file.seek(SeekFrom::Start(mdhd.payload_start + timescale_offset))?;
+    file.seek(SeekFrom::Start(mvhd.payload_start + timescale_offset))?;
     let timescale = read_u32(file)?;
-    file.seek(SeekFrom::Start(mdhd.payload_start + duration_offset))?;
+    if timescale == 0 {
+        return Err(EngineError::Sulphur(
+            "Sulphur MP4 movie timebase is invalid".to_owned(),
+        ));
+    }
+    Ok(timescale)
+}
+
+fn read_mp4_track_duration(file: &mut File, tkhd: IsoBox, movie_timescale: u32) -> Result<f64> {
+    file.seek(SeekFrom::Start(tkhd.payload_start))?;
+    let mut header = [0_u8; 4];
+    file.read_exact(&mut header)?;
+    let (duration_offset, duration_bytes) = match header[0] {
+        0 => (20, 4),
+        1 => (28, 8),
+        _ => {
+            return Err(EngineError::Sulphur(
+                "Sulphur MP4 track header version is unsupported".to_owned(),
+            ))
+        }
+    };
+    if tkhd.end.saturating_sub(tkhd.payload_start) < duration_offset + duration_bytes {
+        return Err(EngineError::Sulphur(
+            "Sulphur MP4 track duration is truncated".to_owned(),
+        ));
+    }
+    file.seek(SeekFrom::Start(tkhd.payload_start + duration_offset))?;
     let duration = if duration_bytes == 4 {
         u64::from(read_u32(file)?)
     } else {
         read_u64(file)?
     };
-    if timescale == 0 || duration == 0 {
+    if movie_timescale == 0 || duration == 0 {
         return Err(EngineError::Sulphur(
-            "Sulphur MP4 media duration is invalid".to_owned(),
+            "Sulphur MP4 track duration is invalid".to_owned(),
         ));
     }
-    Ok(duration as f64 / f64::from(timescale))
+    Ok(duration as f64 / f64::from(movie_timescale))
 }
 
 fn read_iso_boxes(file: &mut File, start: u64, end: u64) -> Result<Vec<IsoBox>> {
@@ -2351,6 +2386,87 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn test_iso_box(kind: [u8; 4], payload: &[u8]) -> Vec<u8> {
+        let size = u32::try_from(payload.len() + 8).expect("test box size");
+        let mut bytes = Vec::with_capacity(size as usize);
+        bytes.extend_from_slice(&size.to_be_bytes());
+        bytes.extend_from_slice(&kind);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    #[test]
+    fn mp4_track_uses_presentation_duration_instead_of_padded_media_duration() {
+        let tree = TestTree::new("mp4-presentation-duration");
+        let path = tree.root.join("track.bin");
+
+        let mut tkhd = vec![0_u8; 24];
+        tkhd[20..24].copy_from_slice(&2_125_u32.to_be_bytes());
+        let mut mdhd = vec![0_u8; 20];
+        mdhd[12..16].copy_from_slice(&48_000_u32.to_be_bytes());
+        mdhd[16..20].copy_from_slice(&144_000_u32.to_be_bytes());
+        let mut hdlr = vec![0_u8; 12];
+        hdlr[8..12].copy_from_slice(b"soun");
+
+        let mut mdia = test_iso_box(*b"mdhd", &mdhd);
+        mdia.extend_from_slice(&test_iso_box(*b"hdlr", &hdlr));
+        let mut track = test_iso_box(*b"tkhd", &tkhd);
+        track.extend_from_slice(&test_iso_box(*b"mdia", &mdia));
+        fs::write(&path, &track).expect("write track fixture");
+
+        let mut file = File::open(&path).expect("open track fixture");
+        let parsed = read_mp4_track(
+            &mut file,
+            IsoBox {
+                kind: *b"trak",
+                payload_start: 0,
+                end: track.len() as u64,
+            },
+            1_000,
+        )
+        .expect("parse presentation duration");
+        assert_eq!(parsed.kind, *b"soun");
+        assert!((parsed.duration_seconds - 2.125).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn version_one_movie_and_track_durations_are_supported() {
+        let tree = TestTree::new("mp4-version-one-duration");
+        let movie_path = tree.root.join("mvhd.bin");
+        let track_path = tree.root.join("tkhd.bin");
+        let mut mvhd = vec![0_u8; 24];
+        mvhd[0] = 1;
+        mvhd[20..24].copy_from_slice(&1_000_u32.to_be_bytes());
+        let mut tkhd = vec![0_u8; 36];
+        tkhd[0] = 1;
+        tkhd[28..36].copy_from_slice(&2_125_u64.to_be_bytes());
+        fs::write(&movie_path, &mvhd).expect("write movie header fixture");
+        fs::write(&track_path, &tkhd).expect("write track header fixture");
+
+        let mut movie = File::open(&movie_path).expect("open movie header fixture");
+        let timescale = read_mp4_movie_timescale(
+            &mut movie,
+            IsoBox {
+                kind: *b"mvhd",
+                payload_start: 0,
+                end: mvhd.len() as u64,
+            },
+        )
+        .expect("parse movie timescale");
+        let mut track = File::open(&track_path).expect("open track header fixture");
+        let duration = read_mp4_track_duration(
+            &mut track,
+            IsoBox {
+                kind: *b"tkhd",
+                payload_start: 0,
+                end: tkhd.len() as u64,
+            },
+            timescale,
+        )
+        .expect("parse track duration");
+        assert!((duration - 2.125).abs() < f64::EPSILON);
     }
 
     #[cfg(unix)]

@@ -23,7 +23,7 @@ const SULPHUR_REQUIREMENTS: &[u8] =
     include_bytes!("../resources/python/sulphur-runtime-requirements.txt");
 const SULPHUR_RUNTIME_ADAPTER: &[u8] = include_bytes!("../resources/python/sulphur_runtime.py");
 const SULPHUR_RUNTIME_ADAPTER_SHA256: &str =
-    "8e3c0e8d0f1668e29b234c34fd1ddbbaaac4cb3992bac0c1cb6080df796d2fe6";
+    "5ce2bf8bfe6143aa7eb6d91297600cfc507a0f57727f96547594afad7e1fb5ff";
 const SULPHUR_MLX_REQUIREMENTS: &[u8] =
     include_bytes!("../resources/python/sulphur-mlx-runtime-requirements.txt");
 const SULPHUR_MLX_RUNTIME_ADAPTER: &[u8] =

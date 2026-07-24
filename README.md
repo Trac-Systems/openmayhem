@@ -6,6 +6,8 @@ OpenMayhem is a peer-to-peer AI inference marketplace. Providers plug in machine
 
 The CLI binary is `mayhem`. The network runs on [Trac Network](https://www.tracsystems.io/trac-network), which carries the peer-to-peer transport and the replicated contract that every node verifies identically.
 
+Telegram: **[t.me/openmayhem](https://t.me/openmayhem)** — join the OpenMayhem group.
+
 Website: **[openmayhem.ai](https://www.openmayhem.ai/)** — the project site.
 
 Community: **[r/Open_Mayhem](https://www.reddit.com/r/Open_Mayhem/)** — setup help, provider earnings talk, announcements.
@@ -74,7 +76,7 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.41` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.42` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -83,7 +85,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.41
+git checkout --detach v0.2.42
 ./install.sh --from-source
 ```
 
@@ -92,7 +94,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.41
+git checkout --detach v0.2.42
 .\install.ps1 -FromSource
 ```
 
@@ -736,13 +738,14 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
+| `SulphurAI/Sulphur-2-base` | Video with synchronized audio, uncensored | C/D | **live** |
+| `prism-ml/Ternary-Bonsai-27B` | LLM, reasoning, 262K ctx, 2-bit ternary | B | **live** |
 | `ACE-Step/Ace-Step1.5` | Music generation | B/C | **live** |
 | `nvidia/parakeet-tdt-0.6b-v3` | ASR | A | **live** |
 | `Tongyi-MAI/Z-Image-Turbo` | Image | B/C | **live** |
 | `google/gemma-4-E4B-it` | LLM, small + vision, laptop/CPU-friendly | A/B | **live** |
 | `HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive` (`@nvfp4`) | LLM, uncensored, 262K ctx | C | **live** |
-| `prism-ml/Ternary-Bonsai-27B` | LLM, reasoning, 262K ctx, 2-bit ternary | B | onboarding now |
-| `SulphurAI/Sulphur-2-base` | Video with synchronized audio, uncensored | C/D | onboarding next |
+| `ResembleAI/chatterbox` | TTS + zero-shot voice cloning | A/B | onboarding next |
 | `huihui-ai/Huihui-Agents-A1-abliterated` | LLM, vision input, uncensored | C | onboarding |
 | `Cactus-Compute/needle` | Tool-calling specialist, 26M, CPU | A | onboarding |
 | `NousResearch/Hermes-3-Llama-3.1-70B` (`@mlx-4bit`) | LLM, 70B, 128K ctx | D | onboarding |
@@ -758,7 +761,6 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 | `lodestones/Chroma1-HD` | Image, uncensored | C | onboarding |
 | `Qwen/Qwen-Image-2512` | Image, text rendering | C | onboarding |
 | `hexgrad/Kokoro-82M` | TTS (CPU-friendly) | A | onboarding |
-| `ResembleAI/chatterbox` | TTS | A/B | onboarding |
 | `openai/whisper-large-v3-turbo` | ASR | A/B | onboarding |
 | `BAAI/bge-m3` | Embeddings (CPU-friendly) | A | onboarding |
 | `Qwen/Qwen3-Embedding-0.6B` | Embeddings (CPU-friendly) | A | onboarding |
@@ -832,7 +834,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.41` is source-only. The GitHub release contains the tagged source, not
+`v0.2.42` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -840,7 +842,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.41
+git checkout --detach v0.2.42
 ./install.sh --from-source
 ```
 
@@ -849,7 +851,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.41
+git checkout --detach v0.2.42
 .\install.ps1 -FromSource
 ```
 
@@ -869,9 +871,10 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
-The `0.2.41` source release carries the current PAYOUTFREE, ATTAUTO, FLOWRATE,
-LIVEROUTE, bounded Z-Image readiness, process-lifetime dashboard auth, and
-non-destructive authenticated direct-to-relay session handover. The releases page and live signed catalog remain
+The `0.2.42` source release carries the current PAYOUTFREE, ATTAUTO, FLOWRATE,
+LIVEROUTE, bounded Z-Image readiness, process-lifetime dashboard auth,
+non-destructive authenticated direct-to-relay session handover, and the
+generalized joint audio/video serving path used by Sulphur. The releases page and live signed catalog remain
 the user-facing truth for the current software revision and available models.
 
 ```bash

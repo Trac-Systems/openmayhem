@@ -61,6 +61,7 @@ _MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 _HASH_CHUNK_BYTES = 8 * 1024 * 1024
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _CUDA_DEVICE_RE = re.compile(r"^cuda:(0|[1-9][0-9]*)$")
+_WINDOWS = os.name == "nt"
 
 _REQUIRED_DISTRIBUTIONS = {
     "accelerate": "1.12.0",
@@ -131,24 +132,66 @@ def _require_exact_object(value: Any, fields: set[str] | frozenset[str], label: 
     return value
 
 
-def _real_directory(value: str | os.PathLike[str], label: str) -> pathlib.Path:
+def _absolute_local_path(
+    value: str | os.PathLike[str],
+    label: str,
+) -> pathlib.Path:
+    path = pathlib.Path(value)
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be absolute")
+    return pathlib.Path(os.path.abspath(path))
+
+
+def _is_link_or_reparse(path: pathlib.Path, metadata: os.stat_result | None = None) -> bool:
+    metadata = metadata or os.lstat(path)
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+
+
+def _existing_real_path(
+    value: str | os.PathLike[str],
+    label: str,
+) -> tuple[pathlib.Path, os.stat_result]:
     source = pathlib.Path(value)
+    if _WINDOWS:
+        path = _absolute_local_path(source, label)
+        metadata = os.lstat(path)
+        if _is_link_or_reparse(path, metadata):
+            raise ValueError(f"{label} must not be a symlink or reparse point")
+        return path, metadata
     if source.is_symlink():
         raise ValueError(f"{label} must not be a symlink")
     path = source.resolve(strict=True)
-    if not path.is_dir():
+    return path, path.stat()
+
+
+def _real_directory(value: str | os.PathLike[str], label: str) -> pathlib.Path:
+    path, metadata = _existing_real_path(value, label)
+    if not stat.S_ISDIR(metadata.st_mode):
         raise ValueError(f"{label} must be a real directory")
     return path
 
 
 def _real_file(value: str | os.PathLike[str], label: str) -> pathlib.Path:
-    source = pathlib.Path(value)
-    if source.is_symlink():
-        raise ValueError(f"{label} must not be a symlink")
-    path = source.resolve(strict=True)
-    if not stat.S_ISREG(path.stat().st_mode):
+    path, metadata = _existing_real_path(value, label)
+    if not stat.S_ISREG(metadata.st_mode):
         raise ValueError(f"{label} must be a real regular file")
     return path
+
+
+def _ensure_private_directory(
+    value: str | os.PathLike[str],
+    label: str,
+) -> pathlib.Path:
+    path = pathlib.Path(value)
+    if _WINDOWS:
+        path.mkdir(parents=True, exist_ok=True)
+    else:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(path, 0o700)
+    return _real_directory(path, label)
 
 
 def _contained(path: pathlib.Path, root: pathlib.Path, label: str) -> pathlib.Path:
@@ -173,14 +216,14 @@ def _resolve_manifest_path(root: pathlib.Path, value: Any, label: str, directory
     current = root
     for part in relative.parts:
         current = current / part
-        if current.is_symlink():
-            raise ValueError(f"{label} contains a symlink")
-    resolved = current.resolve(strict=True)
+        if _is_link_or_reparse(current):
+            raise ValueError(f"{label} contains a symlink or reparse point")
+    resolved = (
+        _real_directory(current, label)
+        if directory
+        else _real_file(current, label)
+    )
     _contained(resolved, root, label)
-    if directory and not resolved.is_dir():
-        raise ValueError(f"{label} must resolve to a directory")
-    if not directory and not stat.S_ISREG(resolved.stat().st_mode):
-        raise ValueError(f"{label} must resolve to a regular file")
     return resolved
 
 
@@ -193,8 +236,9 @@ def _sha256_file(path: pathlib.Path) -> str:
 
 
 def _load_and_verify_manifest(model_root: pathlib.Path, artifact_path: pathlib.Path) -> dict[str, Any]:
-    model_root = model_root.resolve(strict=True)
-    artifact_path = artifact_path.resolve(strict=True)
+    model_root = _real_directory(model_root, "Sulphur model root")
+    artifact_path = _real_file(artifact_path, "Sulphur GGUF artifact")
+    _contained(artifact_path, model_root, "Sulphur GGUF artifact")
     manifest_path = _real_file(model_root / _MANIFEST_NAME, "Sulphur runtime manifest")
     if manifest_path.stat().st_size > _MAX_MANIFEST_BYTES:
         raise ValueError("Sulphur runtime manifest exceeds its size bound")
@@ -1108,10 +1152,15 @@ def generate_video(
     output = pathlib.Path(output_path)
     if not output.is_absolute() or output.suffix.lower() != ".mp4":
         raise ValueError("Sulphur output_path must be an absolute MP4 path")
-    outputs_root = runtime.cache_root / "outputs"
-    outputs_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    outputs_root = _real_directory(outputs_root, "Sulphur output directory")
-    resolved_output = output.resolve(strict=False)
+    outputs_root = _ensure_private_directory(
+        runtime.cache_root / "outputs",
+        "Sulphur output directory",
+    )
+    resolved_output = (
+        _absolute_local_path(output, "Sulphur output path")
+        if _WINDOWS
+        else output.resolve(strict=False)
+    )
     if resolved_output.parent != outputs_root or output.exists() or output.is_symlink():
         raise ValueError("Sulphur output_path escaped its fresh bounded output directory")
 
