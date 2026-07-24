@@ -47792,22 +47792,9 @@ fn provider_live_memory_available_bytes() -> Option<u64> {
 
 #[cfg(target_os = "windows")]
 fn provider_live_memory_available_bytes() -> Option<u64> {
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let kib = String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u64>()
-        .ok()?;
-    kib.checked_mul(1024)
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    Some(system.available_memory())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
@@ -47950,21 +47937,10 @@ fn provider_process_rss_bytes(pid: u32) -> Option<u64> {
 
 #[cfg(target_os = "windows")]
 fn provider_process_rss_bytes(pid: u32) -> Option<u64> {
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            &format!("(Get-Process -Id {pid}).WorkingSet64"),
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<u64>()
-        .ok()
+    let pid = sysinfo::Pid::from_u32(pid);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+    system.process(pid).map(sysinfo::Process::memory)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

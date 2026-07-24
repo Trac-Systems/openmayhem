@@ -1619,28 +1619,7 @@ fn probe_disk(path: &Path, run_bench: bool, bench_mib: u64) -> DiskInfo {
 }
 
 fn disk_free_bytes(path: &Path) -> Option<u64> {
-    let output = if cfg!(target_os = "windows") {
-        command_stdout(
-            "powershell",
-            &[
-                "-NoProfile",
-                "-Command",
-                "(Get-PSDrive -Name ((Get-Location).Path.Substring(0,1))).Free",
-            ],
-        )
-    } else {
-        command_stdout("df", &["-k", path.to_str().unwrap_or(".")])
-    }?;
-    if cfg!(target_os = "windows") {
-        output.trim().parse::<u64>().ok()
-    } else {
-        output
-            .lines()
-            .nth(1)
-            .and_then(|line| line.split_whitespace().nth(3))
-            .and_then(|kib| kib.parse::<u64>().ok())
-            .map(|kib| kib * 1024)
-    }
+    fs2::available_space(path).ok()
 }
 
 fn disk_write_bench(path: &Path, bytes: u64) -> Option<f64> {
