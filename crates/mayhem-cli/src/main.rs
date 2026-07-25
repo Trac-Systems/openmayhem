@@ -59328,7 +59328,7 @@ fn provider_vllm_memory_utilization_for_candidates(
     {
         let budget = &candidate.feasibility.memory_budget;
         let reserved_bytes =
-            u64::try_from((u128::from(budget.total_bytes) * u128::from(target_pct)).div_ceil(100))
+            u64::try_from((u128::from(budget.total_bytes) * u128::from(target_pct)) / 100)
                 .unwrap_or(u64::MAX);
         let allocation = pool_allocations
             .entry(budget.pool.clone())
@@ -84833,6 +84833,25 @@ mod tests {
         assert!(error
             .to_string()
             .contains("exceeding the admitted shared budget"));
+    }
+
+    #[test]
+    fn vllm_exact_shared_budget_boundary_uses_consistent_rounding() {
+        let mut selected =
+            test_auto_fit_candidate('e', "test/vllm-boundary", "text", 20, 40, 1, 30.0);
+        selected.enclave.backend = "vllm".to_owned();
+        selected.artifact.engine = "vllm".to_owned();
+        selected.enclave.caps = json!({ "vllm_gpu_memory_utilization_pct": 40 });
+        selected.feasibility.memory_budget.pool = "nvidia_unified_memory".to_owned();
+        selected.feasibility.memory_budget.unified = true;
+        selected.feasibility.memory_budget.total_bytes = 123 * GIB_BYTES + 1;
+        selected.feasibility.memory_budget.budget_bytes =
+            u64::try_from(u128::from(selected.feasibility.memory_budget.total_bytes) * 40 / 100)
+                .unwrap();
+        selected.feasibility.estimated_required_bytes = 20 * GIB_BYTES;
+
+        let plan = provider_vllm_memory_utilization_for_candidates(&[selected], Some(40)).unwrap();
+        assert_eq!(plan.unwrap().target_pct, 40);
     }
 
     #[test]
