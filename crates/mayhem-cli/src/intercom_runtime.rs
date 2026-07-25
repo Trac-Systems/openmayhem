@@ -49,6 +49,7 @@ pub(crate) async fn ensure_ready(intercom_dir: &Path) -> Result<Readiness> {
     let lock_path = lock_dir.join("intercom-runtime-hydration.lock");
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)

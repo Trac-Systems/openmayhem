@@ -55861,6 +55861,7 @@ fn write_provider_heartbeat_cache_file(path: &Path, cache: &Value) -> Result<()>
     let lock_path = provider_heartbeat_cache_lock_path(path);
     let lock = fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
@@ -55877,6 +55878,7 @@ fn read_provider_heartbeat_cache_file(path: &Path) -> Result<Value> {
     let lock_path = provider_heartbeat_cache_lock_path(path);
     let lock = fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
