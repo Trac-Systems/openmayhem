@@ -79,7 +79,7 @@ use base64::{
     Engine as _,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
-use futures_util::{stream, Stream};
+use futures_util::{stream, stream::FuturesUnordered, Stream, StreamExt};
 use image::ImageReader;
 use mayhem_attestation::{
     issue_tpm_activate_credential_challenge, ActivatedTpmIdentity, AttestationPolicyChain,
@@ -114,7 +114,7 @@ use mayhem_proto::{
 use mayhem_proto::{chunk_json_payload, visible_output_units};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Notify};
 use tower::limit::ConcurrencyLimitLayer;
 
 type SharedState = Arc<GatewayState>;
@@ -232,6 +232,11 @@ const CONTEXT_NEEDLE_FILLER_WORDS_PER_LINE: usize = 32;
 const DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS: u64 = 1_000;
 const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
 const TPM_ACTIVATION_CACHE_TTL_MILLIS: u64 = 24 * 60 * 60 * 1_000;
+const TPM_ACTIVATION_SUPERVISOR_MAX_CONCURRENCY: usize = 2;
+const TPM_ACTIVATION_INITIAL_BACKOFF_MILLIS: u64 = 500;
+const TPM_ACTIVATION_MAX_BACKOFF_MILLIS: u64 = 30_000;
+const TPM_ACTIVATION_MAX_AUTONOMOUS_FAILURES: u32 = 5;
+const TPM_ACTIVATION_BUSY_RETRY_MILLIS: u64 = 250;
 const DASHBOARD_COOKIE_PREFIX: &str = "__Secure-mayhem_dashboard_";
 // Browsers require persistent cookies to carry a finite lifetime. Keep the
 // cookie for the longest broadly supported window and refresh it on every
@@ -261,6 +266,7 @@ pub struct GatewayState {
         Arc<Mutex<BTreeMap<ProviderKey, LiveHeartbeatAttestationAdvertisement>>>,
     tpm_activation_cache: Arc<Mutex<BTreeMap<ProviderKey, GatewayTpmActivationCacheEntry>>>,
     tpm_activation_inflight: Arc<Mutex<BTreeSet<GatewayTpmActivationOwnershipScope>>>,
+    tpm_activation_supervisor: Arc<GatewayTpmActivationSupervisor>,
     canary_policy: GatewayCanaryProbePolicy,
     canary_scheduler: Arc<Mutex<GatewayCanaryScheduler>>,
     dashboard_session: Arc<DashboardSession>,
@@ -1902,6 +1908,62 @@ impl Drop for GatewayTpmActivationAttemptGuard {
     }
 }
 
+#[derive(Debug, Default)]
+struct GatewayTpmActivationSupervisor {
+    started: AtomicBool,
+    notify: Notify,
+    work: Mutex<BTreeMap<ProviderKey, GatewayTpmActivationWorkState>>,
+}
+
+#[derive(Clone, Debug)]
+struct GatewayTpmActivationWorkState {
+    scope: GatewayTpmActivationOwnershipScope,
+    binding: GatewayTpmActivationCacheBinding,
+    consecutive_failures: u32,
+    next_attempt_at_millis: u64,
+    in_flight: bool,
+    dormant: bool,
+    non_retryable_failure: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GatewayTpmActivationWorkIdentity {
+    key: ProviderKey,
+    scope: GatewayTpmActivationOwnershipScope,
+    binding: GatewayTpmActivationCacheBinding,
+}
+
+#[derive(Clone, Debug)]
+struct GatewayPreparedTpmActivation {
+    key: ProviderKey,
+    route: GatewayRouteCandidate,
+    readiness: RouteAttestationPolicyReadiness,
+    live: LiveHeartbeatAttestationAdvertisement,
+    binding: GatewayTpmActivationCacheBinding,
+    scope: GatewayTpmActivationOwnershipScope,
+    invocation: GatewayTpmActivationInvocation,
+}
+
+#[derive(Debug)]
+enum GatewayTpmActivationAttemptOutcome {
+    Activated,
+    NoLongerPending,
+    SharedAttemptInFlight,
+    StaleBinding,
+    Failed { reason: String, retryable: bool },
+}
+
+type GatewayTpmActivationTask = Pin<
+    Box<
+        dyn Future<
+                Output = (
+                    GatewayTpmActivationWorkIdentity,
+                    GatewayTpmActivationAttemptOutcome,
+                ),
+            > + Send,
+    >,
+>;
+
 #[derive(Clone, Debug)]
 struct GatewayResolvedRouteAttestation {
     readiness: RouteAttestationPolicyReadiness,
@@ -3498,6 +3560,7 @@ impl GatewayState {
             heartbeat_attestation_advertisements: Arc::new(Mutex::new(BTreeMap::new())),
             tpm_activation_cache: Arc::new(Mutex::new(BTreeMap::new())),
             tpm_activation_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+            tpm_activation_supervisor: Arc::new(GatewayTpmActivationSupervisor::default()),
             canary_policy: GatewayCanaryProbePolicy::default(),
             canary_scheduler: Arc::new(Mutex::new(GatewayCanaryScheduler::default())),
             dashboard_session: Arc::new(DashboardSession::new()),
@@ -3783,6 +3846,7 @@ impl GatewayState {
         *self
             .canary_scheduler
             .lock_recover("gateway canary scheduler") = GatewayCanaryScheduler::default();
+        self.refresh_tpm_activation_work_after_policy_change(&valid_route_keys);
     }
 
     pub fn with_canary_registry(mut self, registry: GatewayCanaryRegistry) -> Self {
@@ -3883,8 +3947,10 @@ impl GatewayState {
             table.upsert_heartbeat(heartbeat.clone(), received_at_millis);
             table.heartbeat_matches(&key, heartbeat_ts, &heartbeat_nonce)
         };
-        if accepted && self.update_heartbeat_attestation_advertisement(&heartbeat, None) {
-            self.rebuild_provider_contract_snapshot();
+        if accepted {
+            if self.update_heartbeat_attestation_advertisement(&heartbeat, None) {
+                self.rebuild_provider_contract_snapshot();
+            }
         }
     }
 
@@ -3898,6 +3964,9 @@ impl GatewayState {
         received_at_millis: u64,
     ) -> Result<(), String> {
         let advertisement = signed_heartbeat_attestation_advertisement(signed_raw, &heartbeat)?;
+        let advertises_tpm = advertisement
+            .as_ref()
+            .is_some_and(|live| live.advertisement.kind == HardwareQuoteKind::Tpm2QuoteEk);
         let key = ProviderKey::from_heartbeat(&heartbeat);
         let heartbeat_ts = heartbeat.ts;
         let heartbeat_nonce = heartbeat.nonce.clone();
@@ -3906,8 +3975,13 @@ impl GatewayState {
             table.upsert_heartbeat(heartbeat.clone(), received_at_millis);
             table.heartbeat_matches(&key, heartbeat_ts, &heartbeat_nonce)
         };
-        if accepted && self.update_heartbeat_attestation_advertisement(&heartbeat, advertisement) {
-            self.rebuild_provider_contract_snapshot();
+        if accepted {
+            if self.update_heartbeat_attestation_advertisement(&heartbeat, advertisement) {
+                self.rebuild_provider_contract_snapshot();
+            }
+            if advertises_tpm {
+                self.enqueue_tpm_activation_for_route(key, false, received_at_millis);
+            }
         }
         Ok(())
     }
@@ -4091,6 +4165,12 @@ impl GatewayState {
             .lock_recover("gateway catalog runtime")
             .attestation_authority = Some(Arc::new(authority));
         self.rebuild_provider_contract_snapshot();
+        let valid_route_keys = self
+            .models_snapshot()
+            .iter()
+            .flat_map(|model| model.mayhem.route_candidates.iter().map(route_key))
+            .collect::<BTreeSet<_>>();
+        self.refresh_tpm_activation_work_after_policy_change(&valid_route_keys);
     }
 
     fn attestation_authority_snapshot(&self) -> Option<Arc<GatewayAttestationAuthority>> {
@@ -19372,7 +19452,7 @@ where
         };
     }
     if routes.is_empty() {
-        activate_one_pending_tpm_route(state, model, options, requirements).await;
+        enqueue_one_pending_tpm_route(state, model, options, requirements);
         routes = refresh();
     }
     let now_millis = now_millis_u64();
@@ -19421,7 +19501,7 @@ where
     RouteWaitOutcome { routes, waited }
 }
 
-async fn activate_one_pending_tpm_route(
+fn enqueue_one_pending_tpm_route(
     state: &GatewayState,
     model: &GatewayModel,
     options: &GatewayRequestOptions,
@@ -19456,10 +19536,6 @@ async fn activate_one_pending_tpm_route(
     if route_by_key.is_empty() {
         return;
     }
-    let entries_by_key = entries
-        .iter()
-        .map(|entry| (entry.key.clone(), entry))
-        .collect::<BTreeMap<_, _>>();
     let mut current_requirements = requirements.clone();
     current_requirements.now_millis = now_millis;
     let filtered_entries = entries
@@ -19475,90 +19551,10 @@ async fn activate_one_pending_tpm_route(
     pending.sort_by(|left, right| right.weight.total_cmp(&left.weight));
 
     for selection in pending {
-        let key = selection.entry.key;
-        let Some(route) = route_by_key.get(&key).copied() else {
-            continue;
-        };
-        let Some(readiness) = entries_by_key
-            .get(&key)
-            .map(|entry| &entry.contract.attestation_policy)
-        else {
-            continue;
-        };
-        let live = state
-            .heartbeat_attestation_advertisements
-            .lock_recover("heartbeat attestation advertisements")
-            .get(&key)
-            .cloned();
-        let Some(live) = live else {
-            continue;
-        };
-        let (Some(hello), Some(transport_peer)) = (
-            live.tpm_activation_hello.clone(),
-            live.transport_peer
-                .clone()
-                .filter(|peer| is_hex_len(peer, 64)),
-        ) else {
-            continue;
-        };
-        let (Some(policy_sequence), Some(policy_digest), Some(device_id)) = (
-            readiness.policy_sequence,
-            readiness.policy_digest.clone(),
-            route
-                .device_key
-                .clone()
-                .filter(|device_id| is_hex_len(device_id, 64)),
-        ) else {
-            continue;
-        };
-        let activation_binding = GatewayTpmActivationCacheBinding {
-            policy_sequence,
-            policy_digest,
-            device_id,
-            transport_peer: transport_peer.clone(),
-            ek_public_spki_der_b64: hello.ek_public_spki_der_b64.clone(),
-            ak_name_b64: hello.ak_name_b64.clone(),
-            hello_digest: match tpm_activation_hello_digest(&hello) {
-                Ok(digest) => digest,
-                Err(_) => continue,
-            },
-        };
-        let activation_scope = tpm_activation_ownership_scope(&key, &activation_binding);
-        let Some(_attempt) = state.begin_tpm_activation(activation_scope) else {
-            continue;
-        };
-        let invocation = GatewayTpmActivationInvocation {
-            provider_pubkey: route.provider.clone(),
-            transport_peer,
-            enclave_id: route.enclave_id.clone(),
-            room_id: route.room_id.clone(),
-            hello,
-        };
-        match state.session_backend.activate_tpm(&invocation).await {
-            Ok(identity) => {
-                if let Err(reason) = state.cache_tpm_activation(
-                    key,
-                    readiness,
-                    route,
-                    &live,
-                    identity,
-                    now_millis_u64(),
-                ) {
-                    eprintln!(
-                        "Mayhem gateway discarded TPM activation for provider {}: {reason}",
-                        route.provider
-                    );
-                    continue;
-                }
-                state.rebuild_provider_contract_snapshot();
-                return;
-            }
-            Err(error) => {
-                eprintln!(
-                    "Mayhem gateway TPM activation for provider {} failed before spend: {}",
-                    route.provider, error.message
-                );
-            }
+        if route_by_key.contains_key(&selection.entry.key)
+            && state.enqueue_tpm_activation_for_route(selection.entry.key, true, now_millis)
+        {
+            return;
         }
     }
 }
@@ -22559,7 +22555,380 @@ fn ordered_route_candidates_for_requirements_with_seed<'a>(
     prioritize_material_reputation_gap(ordered)
 }
 
+fn tpm_activation_retry_delay_millis(consecutive_failures: u32) -> u64 {
+    let shift = consecutive_failures.saturating_sub(1).min(16);
+    TPM_ACTIVATION_INITIAL_BACKOFF_MILLIS
+        .saturating_mul(1_u64 << shift)
+        .min(TPM_ACTIVATION_MAX_BACKOFF_MILLIS)
+}
+
+fn prepare_tpm_activation_for_route(
+    state: &GatewayState,
+    key: &ProviderKey,
+    now_millis: u64,
+) -> Option<GatewayPreparedTpmActivation> {
+    let route = state.models_snapshot().iter().find_map(|model| {
+        model
+            .mayhem
+            .route_candidates
+            .iter()
+            .find(|candidate| route_key(candidate) == *key)
+            .cloned()
+    })?;
+    let entry = state
+        .provider_table
+        .lock_recover("provider table")
+        .entries(now_millis)
+        .into_iter()
+        .find(|entry| entry.key == *key)?;
+    let requirements = RequestRequirements {
+        current_rules_ver: state.receipt_config.rules_ver,
+        requires_transport_peer: !state.dev_session_shim,
+        now_millis,
+        heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
+        ..RequestRequirements::default()
+    };
+    if crate::provider_table::eligible_tpm_activation_candidates(
+        std::slice::from_ref(&entry),
+        &requirements,
+        &SelectionWeights::default(),
+    )
+    .is_empty()
+    {
+        return None;
+    }
+    let readiness = entry.contract.attestation_policy;
+    let live = state
+        .heartbeat_attestation_advertisements
+        .lock_recover("heartbeat attestation advertisements")
+        .get(key)
+        .cloned()?;
+    let hello = live.tpm_activation_hello.clone()?;
+    let transport_peer = live
+        .transport_peer
+        .clone()
+        .filter(|peer| is_hex_len(peer, 64))?;
+    let binding = GatewayTpmActivationCacheBinding {
+        policy_sequence: readiness.policy_sequence?,
+        policy_digest: readiness.policy_digest.clone()?,
+        device_id: route
+            .device_key
+            .clone()
+            .filter(|device_id| is_hex_len(device_id, 64))?,
+        transport_peer: transport_peer.clone(),
+        ek_public_spki_der_b64: hello.ek_public_spki_der_b64.clone(),
+        ak_name_b64: hello.ak_name_b64.clone(),
+        hello_digest: tpm_activation_hello_digest(&hello).ok()?,
+    };
+    let scope = tpm_activation_ownership_scope(key, &binding);
+    let invocation = GatewayTpmActivationInvocation {
+        provider_pubkey: route.provider.clone(),
+        transport_peer,
+        enclave_id: route.enclave_id.clone(),
+        room_id: route.room_id.clone(),
+        hello,
+    };
+    Some(GatewayPreparedTpmActivation {
+        key: key.clone(),
+        route,
+        readiness,
+        live,
+        binding,
+        scope,
+        invocation,
+    })
+}
+
+async fn attempt_tpm_activation_for_route(
+    state: &GatewayState,
+    work: &GatewayTpmActivationWorkIdentity,
+) -> GatewayTpmActivationAttemptOutcome {
+    let Some(prepared) = prepare_tpm_activation_for_route(state, &work.key, now_millis_u64())
+    else {
+        return GatewayTpmActivationAttemptOutcome::NoLongerPending;
+    };
+    if prepared.scope != work.scope || prepared.binding != work.binding {
+        return GatewayTpmActivationAttemptOutcome::StaleBinding;
+    }
+    let Some(_attempt) = state.begin_tpm_activation(prepared.scope.clone()) else {
+        return GatewayTpmActivationAttemptOutcome::SharedAttemptInFlight;
+    };
+    let identity = match state
+        .session_backend
+        .activate_tpm(&prepared.invocation)
+        .await
+    {
+        Ok(identity) => identity,
+        Err(error) => {
+            return GatewayTpmActivationAttemptOutcome::Failed {
+                reason: error.message,
+                retryable: error.retryable,
+            };
+        }
+    };
+    let Some(current) = prepare_tpm_activation_for_route(state, &work.key, now_millis_u64()) else {
+        return GatewayTpmActivationAttemptOutcome::NoLongerPending;
+    };
+    if current.scope != work.scope || current.binding != work.binding {
+        return GatewayTpmActivationAttemptOutcome::StaleBinding;
+    }
+    if let Err(reason) = state.cache_tpm_activation(
+        current.key,
+        &current.readiness,
+        &current.route,
+        &current.live,
+        identity,
+        now_millis_u64(),
+    ) {
+        return GatewayTpmActivationAttemptOutcome::Failed {
+            reason,
+            retryable: false,
+        };
+    }
+    state.rebuild_provider_contract_snapshot();
+    GatewayTpmActivationAttemptOutcome::Activated
+}
+
+async fn run_tpm_activation_supervisor(state: GatewayState) {
+    let mut active = FuturesUnordered::<GatewayTpmActivationTask>::new();
+    loop {
+        while active.len() < TPM_ACTIVATION_SUPERVISOR_MAX_CONCURRENCY {
+            let Some(work) = state.claim_due_tpm_activation(now_millis_u64()) else {
+                break;
+            };
+            let task_state = state.clone();
+            active.push(Box::pin(async move {
+                let outcome = attempt_tpm_activation_for_route(&task_state, &work).await;
+                (work, outcome)
+            }));
+        }
+
+        if active.is_empty() {
+            let next_due = state.next_tpm_activation_due_millis();
+            if let Some(next_due) = next_due {
+                tokio::select! {
+                    _ = state.tpm_activation_supervisor.notify.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_millis(
+                        next_due.saturating_sub(now_millis_u64())
+                    )) => {}
+                }
+            } else {
+                state.tpm_activation_supervisor.notify.notified().await;
+            }
+            continue;
+        }
+
+        let has_capacity = active.len() < TPM_ACTIVATION_SUPERVISOR_MAX_CONCURRENCY;
+        let next_due = has_capacity
+            .then(|| state.next_tpm_activation_due_millis())
+            .flatten();
+        let delay = Duration::from_millis(
+            next_due
+                .map(|due| due.saturating_sub(now_millis_u64()))
+                .unwrap_or(0),
+        );
+        tokio::select! {
+            Some((work, outcome)) = active.next() => {
+                state.finish_tpm_activation(work, outcome, now_millis_u64());
+            }
+            _ = state.tpm_activation_supervisor.notify.notified() => {}
+            _ = tokio::time::sleep(delay), if next_due.is_some() => {}
+        }
+    }
+}
+
 impl GatewayState {
+    fn refresh_tpm_activation_work_after_policy_change(
+        &self,
+        valid_route_keys: &BTreeSet<ProviderKey>,
+    ) {
+        self.tpm_activation_supervisor
+            .work
+            .lock_recover("TPM activation supervisor work")
+            .retain(|key, _| valid_route_keys.contains(key));
+        let now_millis = now_millis_u64();
+        for key in valid_route_keys {
+            self.enqueue_tpm_activation_for_route(key.clone(), false, now_millis);
+        }
+        self.tpm_activation_supervisor.notify.notify_one();
+    }
+
+    fn ensure_tpm_activation_supervisor(&self) {
+        if self
+            .tpm_activation_supervisor
+            .started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.tpm_activation_supervisor
+                .started
+                .store(false, Ordering::Release);
+            return;
+        };
+        let state = self.clone();
+        runtime.spawn(run_tpm_activation_supervisor(state));
+    }
+
+    fn enqueue_tpm_activation_for_route(
+        &self,
+        key: ProviderKey,
+        request_wakeup: bool,
+        now_millis: u64,
+    ) -> bool {
+        let Some(prepared) = prepare_tpm_activation_for_route(self, &key, now_millis) else {
+            self.tpm_activation_supervisor
+                .work
+                .lock_recover("TPM activation supervisor work")
+                .remove(&key);
+            return false;
+        };
+        let mut should_notify = false;
+        {
+            let mut work = self
+                .tpm_activation_supervisor
+                .work
+                .lock_recover("TPM activation supervisor work");
+            match work.get_mut(&key) {
+                Some(current)
+                    if current.scope == prepared.scope && current.binding == prepared.binding =>
+                {
+                    if request_wakeup
+                        && current.dormant
+                        && !current.non_retryable_failure
+                        && now_millis >= current.next_attempt_at_millis
+                    {
+                        current.dormant = false;
+                        should_notify = true;
+                    }
+                }
+                Some(current) => {
+                    let in_flight = current.in_flight;
+                    *current = GatewayTpmActivationWorkState {
+                        scope: prepared.scope,
+                        binding: prepared.binding,
+                        consecutive_failures: 0,
+                        next_attempt_at_millis: now_millis,
+                        in_flight,
+                        dormant: false,
+                        non_retryable_failure: false,
+                    };
+                    should_notify = !in_flight;
+                }
+                None => {
+                    work.insert(
+                        key,
+                        GatewayTpmActivationWorkState {
+                            scope: prepared.scope,
+                            binding: prepared.binding,
+                            consecutive_failures: 0,
+                            next_attempt_at_millis: now_millis,
+                            in_flight: false,
+                            dormant: false,
+                            non_retryable_failure: false,
+                        },
+                    );
+                    should_notify = true;
+                }
+            }
+        }
+        self.ensure_tpm_activation_supervisor();
+        if should_notify {
+            self.tpm_activation_supervisor.notify.notify_one();
+        }
+        true
+    }
+
+    fn claim_due_tpm_activation(
+        &self,
+        now_millis: u64,
+    ) -> Option<GatewayTpmActivationWorkIdentity> {
+        let mut work = self
+            .tpm_activation_supervisor
+            .work
+            .lock_recover("TPM activation supervisor work");
+        let (key, state) = work.iter_mut().find(|(_, state)| {
+            !state.in_flight && !state.dormant && state.next_attempt_at_millis <= now_millis
+        })?;
+        state.in_flight = true;
+        Some(GatewayTpmActivationWorkIdentity {
+            key: key.clone(),
+            scope: state.scope.clone(),
+            binding: state.binding.clone(),
+        })
+    }
+
+    fn next_tpm_activation_due_millis(&self) -> Option<u64> {
+        self.tpm_activation_supervisor
+            .work
+            .lock_recover("TPM activation supervisor work")
+            .values()
+            .filter(|state| !state.in_flight && !state.dormant)
+            .map(|state| state.next_attempt_at_millis)
+            .min()
+    }
+
+    fn finish_tpm_activation(
+        &self,
+        completed: GatewayTpmActivationWorkIdentity,
+        outcome: GatewayTpmActivationAttemptOutcome,
+        now_millis: u64,
+    ) {
+        let mut notify = false;
+        let mut log_failure = None;
+        {
+            let mut work = self
+                .tpm_activation_supervisor
+                .work
+                .lock_recover("TPM activation supervisor work");
+            let Some(current) = work.get_mut(&completed.key) else {
+                return;
+            };
+            if current.scope != completed.scope || current.binding != completed.binding {
+                current.in_flight = false;
+                notify = true;
+            } else {
+                current.in_flight = false;
+                match outcome {
+                    GatewayTpmActivationAttemptOutcome::Activated
+                    | GatewayTpmActivationAttemptOutcome::NoLongerPending
+                    | GatewayTpmActivationAttemptOutcome::StaleBinding => {
+                        work.remove(&completed.key);
+                    }
+                    GatewayTpmActivationAttemptOutcome::SharedAttemptInFlight => {
+                        current.next_attempt_at_millis =
+                            now_millis.saturating_add(TPM_ACTIVATION_BUSY_RETRY_MILLIS);
+                        notify = true;
+                    }
+                    GatewayTpmActivationAttemptOutcome::Failed { reason, retryable } => {
+                        current.consecutive_failures =
+                            current.consecutive_failures.saturating_add(1);
+                        current.next_attempt_at_millis = now_millis.saturating_add(
+                            tpm_activation_retry_delay_millis(current.consecutive_failures),
+                        );
+                        current.non_retryable_failure = !retryable;
+                        current.dormant = !retryable
+                            || current.consecutive_failures
+                                >= TPM_ACTIVATION_MAX_AUTONOMOUS_FAILURES;
+                        notify = !current.dormant;
+                        log_failure = Some(reason);
+                    }
+                }
+            }
+        }
+        if let Some(reason) = log_failure {
+            eprintln!(
+                "Mayhem gateway autonomous TPM activation for provider {} failed before spend: {}",
+                completed.key.provider, reason
+            );
+        }
+        if notify {
+            self.tpm_activation_supervisor.notify.notify_one();
+        }
+    }
+
     fn begin_tpm_activation(
         &self,
         scope: GatewayTpmActivationOwnershipScope,
@@ -31936,6 +32305,437 @@ mod tests {
             state.begin_tpm_activation(scope).is_some(),
             "a failed or completed attempt must release the scope for recovery"
         );
+    }
+
+    #[derive(Debug)]
+    struct FailingTpmActivationBackend {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl GatewaySessionBackend for FailingTpmActivationBackend {
+        fn name(&self) -> &str {
+            "failing-tpm-activation"
+        }
+
+        fn activate_tpm<'a>(
+            &'a self,
+            _invocation: &'a GatewayTpmActivationInvocation,
+        ) -> GatewayTpmActivationFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(GatewaySessionError::retryable(
+                    "deliberate TPM activation failure",
+                ))
+            })
+        }
+
+        fn run_chat<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            _request: &'a ChatCompletionRequest,
+            _invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            Box::pin(async { Err(GatewaySessionError::new("unused test backend")) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingTpmActivationBackend {
+        started: Arc<std::sync::atomic::AtomicUsize>,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        max_active: Arc<std::sync::atomic::AtomicUsize>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl GatewaySessionBackend for BlockingTpmActivationBackend {
+        fn name(&self) -> &str {
+            "blocking-tpm-activation"
+        }
+
+        fn activate_tpm<'a>(
+            &'a self,
+            _invocation: &'a GatewayTpmActivationInvocation,
+        ) -> GatewayTpmActivationFuture<'a> {
+            let started = Arc::clone(&self.started);
+            let active = Arc::clone(&self.active);
+            let max_active = Arc::clone(&self.max_active);
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max_active.fetch_max(current, Ordering::SeqCst);
+                let permit = release
+                    .acquire()
+                    .await
+                    .expect("test activation release semaphore");
+                permit.forget();
+                active.fetch_sub(1, Ordering::SeqCst);
+                Err(GatewaySessionError::retryable(
+                    "deliberate TPM activation failure",
+                ))
+            })
+        }
+
+        fn run_chat<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            _request: &'a ChatCompletionRequest,
+            _invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            Box::pin(async { Err(GatewaySessionError::new("unused test backend")) })
+        }
+    }
+
+    fn pending_tpm_activation_test_state(
+        provider_count: u8,
+        backend: Arc<dyn GatewaySessionBackend>,
+    ) -> (GatewayState, Vec<ProviderKey>) {
+        let mut model = test_routed_model(provider_count);
+        for (idx, route) in model.mayhem.route_candidates.iter_mut().enumerate() {
+            route.att_tier = 2;
+            route.device_key = Some(format!("{:02x}", idx + 40).repeat(32));
+        }
+        let state = GatewayState::from_models(vec![model.clone()]).with_session_backend(backend);
+        let now = now_millis_u64();
+        let keys = model
+            .mayhem
+            .route_candidates
+            .iter()
+            .map(route_key)
+            .collect::<Vec<_>>();
+        for (route, key) in model.mayhem.route_candidates.iter().zip(&keys) {
+            let mut table = state.provider_table.lock_recover("provider table");
+            let mut contract = table
+                .entries(now)
+                .into_iter()
+                .find(|entry| entry.key == *key)
+                .expect("test route contract")
+                .contract;
+            contract.attestation_policy = RouteAttestationPolicyReadiness {
+                attestation_tier: 2,
+                policy_required: true,
+                locally_ready: false,
+                tpm_activation_pending: true,
+                quote_kind: Some(HardwareQuoteKind::Tpm2QuoteEk),
+                policy_sequence: Some(7),
+                policy_digest: Some("ab".repeat(32)),
+                policy_effective_epoch: Some(1),
+                evaluated_epoch: Some(1),
+                verifier_profile: Some(AttestationVerifierProfile::Tpm2EkActivateCredentialV1),
+                evidence_schema_version: Some(1),
+                required_measurement_layers: BTreeSet::new(),
+                runtime_binary_hash_evidence_only: true,
+                reason: Some("TPM activation pending".to_owned()),
+            };
+            table.upsert_contract(contract);
+            table.upsert_heartbeat(heartbeat_for_route(&model, route, now), now);
+            drop(table);
+            state
+                .heartbeat_attestation_advertisements
+                .lock_recover("heartbeat attestation advertisements")
+                .insert(
+                    key.clone(),
+                    LiveHeartbeatAttestationAdvertisement {
+                        advertisement: HardwareQuoteRouteAdvertisement {
+                            kind: HardwareQuoteKind::Tpm2QuoteEk,
+                            declared_platform: Some("test-tpm2".to_owned()),
+                        },
+                        tpm_activation_hello: Some(TpmActivateCredentialHello {
+                            schema_version: 1,
+                            ek_profile: mayhem_proto::TpmEkProfile::RsaSha256Aes128Cfb,
+                            ek_public_spki_der_b64: format!("ek-{}", key.provider),
+                            ak_name_b64: format!("ak-{}", key.provider),
+                            quote_binding: "cd".repeat(32),
+                        }),
+                        heartbeat_ts: now,
+                        transport_peer: Some(route.provider.clone()),
+                    },
+                );
+        }
+        (state, keys)
+    }
+
+    async fn wait_for_atomic_at_least(value: &std::sync::atomic::AtomicUsize, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while value.load(Ordering::SeqCst) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bounded TPM activation test wait");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_tpm_activation_is_autonomous_single_flight_and_spend_free() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (state, keys) = pending_tpm_activation_test_state(
+            1,
+            Arc::new(FailingTpmActivationBackend {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let now = now_millis_u64();
+
+        for _ in 0..20 {
+            assert!(state.enqueue_tpm_activation_for_route(keys[0].clone(), false, now));
+        }
+        wait_for_atomic_at_least(&calls, 1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "repeated heartbeats must notify one supervisor, not spawn attempts"
+        );
+        assert!(state.receipts().is_empty(), "TPM activation never spends");
+        let work = state
+            .tpm_activation_supervisor
+            .work
+            .lock_recover("TPM activation supervisor work");
+        let route = work.get(&keys[0]).expect("failed route remains queued");
+        assert_eq!(route.consecutive_failures, 1);
+        assert!(!route.in_flight);
+        assert!(route.next_attempt_at_millis >= now + TPM_ACTIVATION_INITIAL_BACKOFF_MILLIS);
+    }
+
+    #[tokio::test]
+    async fn tpm_activation_supervisor_caps_global_concurrency_at_two() {
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let (state, keys) = pending_tpm_activation_test_state(
+            3,
+            Arc::new(BlockingTpmActivationBackend {
+                started: Arc::clone(&started),
+                active: Arc::clone(&active),
+                max_active: Arc::clone(&max_active),
+                release: Arc::clone(&release),
+            }),
+        );
+        let now = now_millis_u64();
+
+        for key in &keys {
+            assert!(state.enqueue_tpm_activation_for_route(key.clone(), false, now));
+        }
+        wait_for_atomic_at_least(&started, 2).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+
+        release.add_permits(3);
+        wait_for_atomic_at_least(&started, 3).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn tpm_activation_backoff_is_exponential_capped_and_dormant() {
+        assert_eq!(tpm_activation_retry_delay_millis(1), 500);
+        assert_eq!(tpm_activation_retry_delay_millis(2), 1_000);
+        assert_eq!(tpm_activation_retry_delay_millis(3), 2_000);
+        assert_eq!(
+            tpm_activation_retry_delay_millis(u32::MAX),
+            TPM_ACTIVATION_MAX_BACKOFF_MILLIS
+        );
+
+        let (state, keys) = pending_tpm_activation_test_state(
+            1,
+            Arc::new(FailingTpmActivationBackend {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+        );
+        let now = now_millis_u64();
+        let prepared =
+            prepare_tpm_activation_for_route(&state, &keys[0], now).expect("pending TPM route");
+        state
+            .tpm_activation_supervisor
+            .work
+            .lock_recover("TPM activation supervisor work")
+            .insert(
+                keys[0].clone(),
+                GatewayTpmActivationWorkState {
+                    scope: prepared.scope.clone(),
+                    binding: prepared.binding.clone(),
+                    consecutive_failures: TPM_ACTIVATION_MAX_AUTONOMOUS_FAILURES - 1,
+                    next_attempt_at_millis: now,
+                    in_flight: true,
+                    dormant: false,
+                    non_retryable_failure: false,
+                },
+            );
+        state.finish_tpm_activation(
+            GatewayTpmActivationWorkIdentity {
+                key: keys[0].clone(),
+                scope: prepared.scope,
+                binding: prepared.binding,
+            },
+            GatewayTpmActivationAttemptOutcome::Failed {
+                reason: "expected".to_owned(),
+                retryable: true,
+            },
+            now,
+        );
+        let work = state
+            .tpm_activation_supervisor
+            .work
+            .lock_recover("TPM activation supervisor work");
+        let route = work.get(&keys[0]).expect("dormant work retained");
+        assert!(route.dormant);
+        assert!(!route.non_retryable_failure);
+        assert!(route.next_attempt_at_millis > now);
+        drop(work);
+        assert!(state.claim_due_tpm_activation(u64::MAX).is_none());
+    }
+
+    #[test]
+    fn tpm_activation_non_retryable_failure_sleeps_until_exact_binding_changes() {
+        let (state, keys) = pending_tpm_activation_test_state(
+            1,
+            Arc::new(FailingTpmActivationBackend {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+        );
+        let now = now_millis_u64();
+        let prepared =
+            prepare_tpm_activation_for_route(&state, &keys[0], now).expect("pending TPM route");
+        state
+            .tpm_activation_supervisor
+            .work
+            .lock_recover("TPM activation supervisor work")
+            .insert(
+                keys[0].clone(),
+                GatewayTpmActivationWorkState {
+                    scope: prepared.scope.clone(),
+                    binding: prepared.binding.clone(),
+                    consecutive_failures: 0,
+                    next_attempt_at_millis: now,
+                    in_flight: true,
+                    dormant: false,
+                    non_retryable_failure: false,
+                },
+            );
+        state.finish_tpm_activation(
+            GatewayTpmActivationWorkIdentity {
+                key: keys[0].clone(),
+                scope: prepared.scope,
+                binding: prepared.binding,
+            },
+            GatewayTpmActivationAttemptOutcome::Failed {
+                reason: "fatal".to_owned(),
+                retryable: false,
+            },
+            now,
+        );
+        assert!(state.enqueue_tpm_activation_for_route(
+            keys[0].clone(),
+            true,
+            now + TPM_ACTIVATION_INITIAL_BACKOFF_MILLIS
+        ));
+        {
+            let work = state
+                .tpm_activation_supervisor
+                .work
+                .lock_recover("TPM activation supervisor work");
+            let route = work.get(&keys[0]).expect("fatal work retained");
+            assert!(route.dormant);
+            assert!(route.non_retryable_failure);
+        }
+
+        state
+            .heartbeat_attestation_advertisements
+            .lock_recover("heartbeat attestation advertisements")
+            .get_mut(&keys[0])
+            .expect("live TPM advertisement")
+            .tpm_activation_hello
+            .as_mut()
+            .expect("TPM activation hello")
+            .quote_binding = "ef".repeat(32);
+        assert!(state.enqueue_tpm_activation_for_route(keys[0].clone(), false, now_millis_u64()));
+        let work = state
+            .tpm_activation_supervisor
+            .work
+            .lock_recover("TPM activation supervisor work");
+        let route = work.get(&keys[0]).expect("changed binding requeued");
+        assert!(!route.dormant);
+        assert!(!route.non_retryable_failure);
+        assert_eq!(route.consecutive_failures, 0);
+    }
+
+    #[test]
+    fn tpm_activation_catalog_policy_refresh_prunes_and_requeues_only_canonical_routes() {
+        let (state, keys) = pending_tpm_activation_test_state(
+            2,
+            Arc::new(FailingTpmActivationBackend {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }),
+        );
+        let stale_key = ProviderKey::new("ee".repeat(32), "dd".repeat(32), "cc".repeat(16));
+        let prepared = prepare_tpm_activation_for_route(&state, &keys[0], now_millis_u64())
+            .expect("pending TPM route");
+        state
+            .tpm_activation_supervisor
+            .work
+            .lock_recover("TPM activation supervisor work")
+            .insert(
+                stale_key.clone(),
+                GatewayTpmActivationWorkState {
+                    scope: prepared.scope,
+                    binding: prepared.binding,
+                    consecutive_failures: 0,
+                    next_attempt_at_millis: 0,
+                    in_flight: false,
+                    dormant: false,
+                    non_retryable_failure: false,
+                },
+            );
+
+        let valid = keys.iter().cloned().collect::<BTreeSet<_>>();
+        state.refresh_tpm_activation_work_after_policy_change(&valid);
+        let work = state
+            .tpm_activation_supervisor
+            .work
+            .lock_recover("TPM activation supervisor work");
+        assert_eq!(work.len(), valid.len());
+        assert!(!work.contains_key(&stale_key));
+        assert!(valid.iter().all(|key| work.contains_key(key)));
+    }
+
+    #[tokio::test]
+    async fn tpm_activation_rechecks_exact_binding_before_challenge() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (state, keys) = pending_tpm_activation_test_state(
+            1,
+            Arc::new(FailingTpmActivationBackend {
+                calls: Arc::clone(&calls),
+            }),
+        );
+        let prepared = prepare_tpm_activation_for_route(&state, &keys[0], now_millis_u64())
+            .expect("pending TPM route");
+        let work = GatewayTpmActivationWorkIdentity {
+            key: keys[0].clone(),
+            scope: prepared.scope,
+            binding: prepared.binding,
+        };
+        state
+            .heartbeat_attestation_advertisements
+            .lock_recover("heartbeat attestation advertisements")
+            .get_mut(&keys[0])
+            .expect("live TPM advertisement")
+            .tpm_activation_hello
+            .as_mut()
+            .expect("TPM activation hello")
+            .quote_binding = "ef".repeat(32);
+
+        assert!(matches!(
+            attempt_tpm_activation_for_route(&state, &work).await,
+            GatewayTpmActivationAttemptOutcome::StaleBinding
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(state
+            .tpm_activation_cache
+            .lock_recover("TPM activation cache")
+            .is_empty());
     }
 
     #[test]
