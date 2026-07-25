@@ -308,6 +308,20 @@ pub const TIER2_DEVICE_IDENTITY_TIER: u8 = 2;
 pub const TIER3_CONFIDENTIAL_COMPUTE_TIER: u8 = 3;
 pub const TIER4_PROVIDER_KYB_TIER: u8 = 4;
 
+pub fn video_generation_required_modalities(
+    output_modalities: &[String],
+    has_conditioning_image: bool,
+) -> Vec<String> {
+    let mut required = vec!["video".to_owned()];
+    if output_modalities.iter().any(|modality| modality == "audio") {
+        required.push("audio".to_owned());
+    }
+    if has_conditioning_image {
+        required.push("image".to_owned());
+    }
+    required
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointValueType {

@@ -48346,6 +48346,7 @@ struct ProviderSessionTerms {
     model_id: String,
     adapter: catalog::CatalogAdapter,
     sampling: catalog::CatalogSamplingProfile,
+    output_modalities: Vec<String>,
     served_modalities: Vec<String>,
     served_specialities: BTreeMap<String, Vec<String>>,
     modality_capacities: BTreeMap<String, HeartbeatModalityCapacity>,
@@ -64339,13 +64340,21 @@ fn provider_speciality_level<'a>(
     }
 }
 
-fn provider_session_request_modalities(family: &str, body: &Value) -> Result<Vec<String>> {
+fn provider_session_request_modalities(
+    family: &str,
+    body: &Value,
+    output_modalities: &[String],
+    modality_load: &BTreeMap<String, ModalityRequestLoad>,
+) -> Result<Vec<String>> {
     let mut modalities = match provider_endpoint_transport_kind(family)? {
         "embedding" => vec!["embedding".to_owned()],
         "image_generation" => vec!["image".to_owned()],
         "audio_speech" | "audio_generation" | "music_generation" => vec!["audio".to_owned()],
         "audio_transcription" => vec!["audio".to_owned(), "text".to_owned()],
-        "video_generation" => vec!["video".to_owned()],
+        "video_generation" => mayhem_proto::video_generation_required_modalities(
+            output_modalities,
+            modality_load.contains_key("image"),
+        ),
         "chat" => vec!["text".to_owned()],
         other => bail!("unsupported provider request kind {other}"),
     };
@@ -64648,7 +64657,18 @@ fn validate_provider_session_request_modalities(
         actual_specialities,
         active.required_specialities
     );
-    let actual = provider_session_request_modalities(verified.family, verified.request)?;
+    let load = provider_session_modality_load(
+        verified.family,
+        verified.request,
+        body,
+        &terms.output_modalities,
+    )?;
+    let actual = provider_session_request_modalities(
+        verified.family,
+        verified.request,
+        &terms.output_modalities,
+        &load,
+    )?;
     if actual != active.required_modalities {
         bail!(
             "request modalities {:?} do not match signed voucher modalities {:?}",
@@ -64656,7 +64676,6 @@ fn validate_provider_session_request_modalities(
             active.required_modalities
         );
     }
-    let load = provider_session_modality_load(verified.family, verified.request, body)?;
     for modality in actual.iter().filter(|modality| modality.as_str() != "text") {
         let request = load
             .get(modality)
@@ -64687,10 +64706,52 @@ fn validate_provider_session_request_modalities(
         .collect())
 }
 
+fn provider_video_conditioning_image_load(body: &Value) -> Result<Option<ModalityRequestLoad>> {
+    let parameters = body.get("parameters").and_then(Value::as_object);
+    let top_level = body.get("conditions").filter(|value| !value.is_null());
+    let nested = parameters
+        .and_then(|parameters| parameters.get("conditions"))
+        .filter(|value| !value.is_null());
+    ensure!(
+        top_level.is_none() || nested.is_none(),
+        "video generation conditions must appear at exactly one signed request path"
+    );
+    let Some(conditions) = top_level.or(nested) else {
+        return Ok(None);
+    };
+    let conditions = conditions
+        .as_array()
+        .context("video generation conditions must be an ordered array")?;
+    ensure!(
+        conditions.len()
+            <= usize::try_from(MAX_PROVIDER_MODALITY_ITEMS_PER_REQUEST).unwrap_or(usize::MAX),
+        "video generation conditions exceed the provider image item ceiling"
+    );
+    let mut load = ModalityRequestLoad {
+        item_count: 0,
+        max_item_bytes: 0,
+        max_item_units: 0,
+    };
+    for (index, condition) in conditions.iter().enumerate() {
+        let image_url = condition
+            .get("image_url")
+            .and_then(Value::as_str)
+            .with_context(|| {
+                format!("video generation conditions[{index}] is missing image_url")
+            })?;
+        let (bytes, pixels) = validate_provider_chat_image_data_url(image_url)?;
+        load.item_count = load.item_count.saturating_add(1);
+        load.max_item_bytes = load.max_item_bytes.max(bytes);
+        load.max_item_units = load.max_item_units.max(pixels);
+    }
+    Ok((load.item_count > 0).then_some(load))
+}
+
 fn provider_session_modality_load(
     family: &str,
     body: &Value,
     transport_body: &Value,
+    output_modalities: &[String],
 ) -> Result<BTreeMap<String, ModalityRequestLoad>> {
     match provider_endpoint_transport_kind(family)? {
         "chat" => {
@@ -64804,6 +64865,15 @@ fn provider_session_modality_load(
         }
         "video_generation" => {
             let request = provider_media_generation_request_from_body(family, body)?;
+            let output_item_count = request
+                .request
+                .get("n")
+                .and_then(Value::as_u64)
+                .map(u32::try_from)
+                .transpose()
+                .context("video generation n overflowed u32")?
+                .unwrap_or(1)
+                .max(1);
             let frames = request
                 .frame_count
                 .or_else(|| {
@@ -64813,14 +64883,32 @@ fn provider_session_modality_load(
                 })
                 .unwrap_or(1)
                 .max(1);
-            Ok(BTreeMap::from([(
+            let duration_seconds = request
+                .duration_seconds
+                .unwrap_or_else(|| frames.div_ceil(DEFAULT_VIDEO_GENERATION_FPS))
+                .max(1);
+            let mut load = BTreeMap::from([(
                 "video".to_owned(),
                 ModalityRequestLoad {
-                    item_count: 1,
+                    item_count: output_item_count,
                     max_item_bytes: 1,
                     max_item_units: frames,
                 },
-            )]))
+            )]);
+            if output_modalities.iter().any(|modality| modality == "audio") {
+                load.insert(
+                    "audio".to_owned(),
+                    ModalityRequestLoad {
+                        item_count: output_item_count,
+                        max_item_bytes: 1,
+                        max_item_units: duration_seconds,
+                    },
+                );
+            }
+            if let Some(image_load) = provider_video_conditioning_image_load(body)? {
+                load.insert("image".to_owned(), image_load);
+            }
+            Ok(load)
         }
         "audio_generation" | "music_generation" => {
             let request = provider_media_generation_request_from_body(family, body)?;
@@ -70523,6 +70611,17 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         model_id: ctx.selected.enclave.model_id.clone(),
         adapter: ctx.selected.model.adapter.clone(),
         sampling: ctx.selected.model.sampling.clone(),
+        output_modalities: if ctx.selected.model.caps.output_modalities.is_empty() {
+            ctx.selected
+                .model
+                .caps
+                .output_modality
+                .iter()
+                .cloned()
+                .collect()
+        } else {
+            ctx.selected.model.caps.output_modalities.clone()
+        },
         served_modalities: ctx.selected.served_modalities.clone(),
         served_specialities: ctx.selected.served_specialities.clone(),
         modality_capacities: ctx.selected.modality_capacities.clone(),
@@ -89805,6 +89904,63 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn provider_video_validator_separates_signed_outputs_from_measured_load() {
+        for family in [
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+        ] {
+            let body = test_provider_video_request(family);
+
+            let joint_terms =
+                test_provider_video_session_terms(family, &["video", "audio"], &["video", "audio"]);
+            let joint_voucher = test_active_provider_session(
+                &joint_terms,
+                vec!["video".to_owned(), "audio".to_owned()],
+            );
+            let sealed = provider_test_seal_contract_request(&body, &joint_terms.adapter).unwrap();
+            let measured =
+                validate_provider_session_request_modalities(&joint_voucher, &joint_terms, &sealed)
+                    .expect("joint AV output must carry measured video and audio work");
+            assert_eq!(
+                measured,
+                BTreeMap::from([("audio".to_owned(), 1), ("video".to_owned(), 1)])
+            );
+
+            let video_terms =
+                test_provider_video_session_terms(family, &["video"], &["video", "audio"]);
+            let video_voucher =
+                test_active_provider_session(&video_terms, vec!["video".to_owned()]);
+            let sealed = provider_test_seal_contract_request(&body, &video_terms.adapter).unwrap();
+            let measured =
+                validate_provider_session_request_modalities(&video_voucher, &video_terms, &sealed)
+                    .expect("video-only output must remain exact");
+            assert_eq!(measured, BTreeMap::from([("video".to_owned(), 1)]));
+
+            let missing_audio_voucher =
+                test_active_provider_session(&joint_terms, vec!["video".to_owned()]);
+            let error = validate_provider_session_request_modalities(
+                &missing_audio_voucher,
+                &joint_terms,
+                &sealed,
+            )
+            .expect_err("a voucher must not omit signed joint audio output");
+            assert!(error.to_string().contains("do not match signed voucher"));
+
+            let extra_audio_voucher = test_active_provider_session(
+                &video_terms,
+                vec!["video".to_owned(), "audio".to_owned()],
+            );
+            let error = validate_provider_session_request_modalities(
+                &extra_audio_voucher,
+                &video_terms,
+                &sealed,
+            )
+            .expect_err("a voucher must not add an unadvertised output modality");
+            assert!(error.to_string().contains("do not match signed voucher"));
+        }
+    }
+
+    #[test]
     fn provider_rejects_remote_or_malformed_media_before_engine_dispatch() {
         let mut terms = test_provider_session_terms();
         terms.served_modalities = vec!["text".to_owned(), "image".to_owned()];
@@ -90628,6 +90784,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
             &body,
             &json!({"kind": "music_generation"}),
+            &[],
         )
         .unwrap();
 
@@ -90688,6 +90845,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
             &body,
             &json!({"kind": "music_generation"}),
+            &[],
         )
         .unwrap();
 
@@ -101895,6 +102053,7 @@ State initialization...
             model_id: "test/model@4bit".to_owned(),
             adapter: catalog::CatalogAdapter::default(),
             sampling: catalog::CatalogSamplingProfile::default(),
+            output_modalities: vec!["text".to_owned()],
             served_modalities: vec!["text".to_owned()],
             served_specialities: BTreeMap::new(),
             modality_capacities: BTreeMap::new(),
@@ -101909,6 +102068,57 @@ State initialization...
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             ctx_bracket_schedule: default_ctx_bracket_schedule(),
+        }
+    }
+
+    fn test_provider_video_session_terms(
+        family: &str,
+        output_modalities: &[&str],
+        served_modalities: &[&str],
+    ) -> ProviderSessionTerms {
+        let mut terms = test_provider_session_terms();
+        terms.adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(family).unwrap()];
+        terms.output_modalities = output_modalities
+            .iter()
+            .map(|modality| (*modality).to_owned())
+            .collect();
+        terms.served_modalities = served_modalities
+            .iter()
+            .map(|modality| (*modality).to_owned())
+            .collect();
+        let mut modality_capacities = BTreeMap::from([(
+            "video".to_owned(),
+            test_heartbeat_modality_capacity("video"),
+        )]);
+        if output_modalities.contains(&"audio") {
+            modality_capacities.insert(
+                "audio".to_owned(),
+                test_heartbeat_modality_capacity("audio"),
+            );
+        }
+        terms.modality_capacities = modality_capacities;
+        terms
+    }
+
+    fn test_provider_video_request(family: &str) -> Value {
+        match family {
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS => json!({
+                "endpoint_family": family,
+                "model": "test/model@4bit",
+                "prompt": "a synchronized audiovisual scene",
+                "num_frames": 24,
+                "fps": 24
+            }),
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO => json!({
+                "endpoint_family": family,
+                "inputs": "a synchronized audiovisual scene",
+                "parameters": {
+                    "num_frames": 24,
+                    "fps": 24
+                }
+            }),
+            _ => panic!("unsupported test video endpoint {family}"),
         }
     }
 

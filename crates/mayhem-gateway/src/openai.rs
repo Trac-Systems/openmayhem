@@ -23295,27 +23295,14 @@ fn artifact_generation_required_modalities(
     model: &GatewayModel,
     request: &ArtifactGenerationRequest,
 ) -> Vec<String> {
-    let mut required = Vec::new();
     if request.output_modality == "video" {
-        for modality in ["video", "audio"] {
-            if modality == "video"
-                || model
-                    .mayhem
-                    .caps
-                    .output_modalities
-                    .iter()
-                    .any(|declared| declared == modality)
-            {
-                required.push(modality.to_owned());
-            }
-        }
-        if request.input_image_count > 0 {
-            required.push("image".to_owned());
-        }
+        mayhem_proto::video_generation_required_modalities(
+            &model.mayhem.caps.output_modalities,
+            request.input_image_count > 0,
+        )
     } else {
-        required.push(request.output_modality.clone());
+        vec![request.output_modality.clone()]
     }
-    required
 }
 
 fn route_selection_seed(
