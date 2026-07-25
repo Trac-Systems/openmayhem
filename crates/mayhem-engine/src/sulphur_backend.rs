@@ -847,6 +847,7 @@ impl NormalizedVideoRequest {
         mark_handled_attribute(body, &parameters, "fps", &mut handled);
         let explicit_frames = integer_value(body, &parameters, "num_frames");
         let explicit_duration = requested_duration_value(body, &parameters)?;
+        let resolved_frames = request.frame_count;
         if explicit_frames.is_some() && explicit_duration.is_some() {
             return Err(EngineError::InvalidConfig(
                 "Sulphur seconds and num_frames are alternative controls".to_owned(),
@@ -861,6 +862,8 @@ impl NormalizedVideoRequest {
                 )
             })?)?
         } else if let Some(frames) = explicit_frames {
+            validate_ltx_frame_count(frames)?
+        } else if let Some(frames) = resolved_frames {
             validate_ltx_frame_count(frames)?
         } else {
             let duration = requested_duration.unwrap_or(4.0);
@@ -880,8 +883,15 @@ impl NormalizedVideoRequest {
             None
         };
         if let Some(requested) = duration_to_compare {
-            let quantization_tolerance_seconds = 4.0 / fps + 1e-6;
-            if (requested - duration_seconds).abs() > quantization_tolerance_seconds {
+            let delta = requested - duration_seconds;
+            let resolved_frame_tolerance = 8.0 / fps + 1e-6;
+            let nearest_frame_tolerance = 4.0 / fps + 1e-6;
+            let conflicts = if explicit_frames.is_none() && resolved_frames.is_some() {
+                delta < -1e-6 || delta > resolved_frame_tolerance
+            } else {
+                delta.abs() > nearest_frame_tolerance
+            };
+            if conflicts {
                 return Err(EngineError::InvalidConfig(
                     "Sulphur duration conflicts with num_frames/fps".to_owned(),
                 ));
@@ -3284,6 +3294,62 @@ mod tests {
         assert!(error
             .to_string()
             .contains("seconds and num_frames are alternative controls"));
+    }
+
+    #[test]
+    fn openai_video_honors_contract_resolved_frames_for_duration_requests() {
+        let mut resolved = request(
+            ENDPOINT_OPENAI_VIDEOS,
+            json!({
+                "model": "sulphur",
+                "prompt": "animate this",
+                "seconds": "4",
+                "size": "256x256",
+                "fps": 24
+            }),
+        );
+        resolved.duration_seconds = Some(4);
+        resolved.frame_count = Some(89);
+        let normalized = NormalizedVideoRequest::from_media_request(resolved)
+            .expect("honor contract-resolved frame count");
+        assert_eq!(normalized.frame_count, 89);
+        assert!((normalized.duration_seconds - (89.0 / 24.0)).abs() < 1e-9);
+
+        let mut overrun = request(
+            ENDPOINT_OPENAI_VIDEOS,
+            json!({
+                "model": "sulphur",
+                "prompt": "animate this",
+                "seconds": "4",
+                "size": "256x256",
+                "fps": 24
+            }),
+        );
+        overrun.duration_seconds = Some(4);
+        overrun.frame_count = Some(97);
+        let error = NormalizedVideoRequest::from_media_request(overrun)
+            .expect_err("resolved frames may not exceed the requested duration");
+        assert!(error
+            .to_string()
+            .contains("duration conflicts with num_frames/fps"));
+
+        let mut fractional = request(
+            ENDPOINT_OPENAI_VIDEOS,
+            json!({
+                "model": "sulphur",
+                "prompt": "animate this",
+                "seconds": 3.1,
+                "size": "256x256",
+                "fps": 24
+            }),
+        );
+        fractional.duration_seconds = Some(4);
+        fractional.frame_count = Some(73);
+        let normalized = NormalizedVideoRequest::from_media_request(fractional)
+            .expect("fractional duration must use the contract-resolved frame count");
+        assert_eq!(normalized.frame_count, 73);
+        assert!((normalized.duration_seconds - (73.0 / 24.0)).abs() < 1e-9);
+        assert!(normalized.duration_seconds <= 3.1);
     }
 
     #[test]

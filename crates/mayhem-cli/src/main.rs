@@ -64658,6 +64658,7 @@ fn validate_provider_session_request_modalities(
         active.required_specialities
     );
     let load = provider_session_modality_load(
+        verified.contract,
         verified.family,
         verified.request,
         body,
@@ -64748,6 +64749,7 @@ fn provider_video_conditioning_image_load(body: &Value) -> Result<Option<Modalit
 }
 
 fn provider_session_modality_load(
+    contract: &mayhem_proto::EndpointFamilyContract,
     family: &str,
     body: &Value,
     transport_body: &Value,
@@ -64865,6 +64867,7 @@ fn provider_session_modality_load(
         }
         "video_generation" => {
             let request = provider_media_generation_request_from_body(family, body)?;
+            let (duration_seconds, frames) = provider_video_output_expectation(contract, &request)?;
             let output_item_count = request
                 .request
                 .get("n")
@@ -64873,19 +64876,6 @@ fn provider_session_modality_load(
                 .transpose()
                 .context("video generation n overflowed u32")?
                 .unwrap_or(1)
-                .max(1);
-            let frames = request
-                .frame_count
-                .or_else(|| {
-                    request
-                        .duration_seconds
-                        .map(|seconds| seconds.saturating_mul(24))
-                })
-                .unwrap_or(1)
-                .max(1);
-            let duration_seconds = request
-                .duration_seconds
-                .unwrap_or_else(|| frames.div_ceil(DEFAULT_VIDEO_GENERATION_FPS))
                 .max(1);
             let mut load = BTreeMap::from([(
                 "video".to_owned(),
@@ -69078,6 +69068,8 @@ fn provider_canary_self_test_endpoint_family(
 const VIDEO_CANARY_FRAME_ATTRIBUTES: &[&str] =
     &["num_frames", "frame_count", "frameCount", "frames"];
 const VIDEO_CANARY_FPS_ATTRIBUTES: &[&str] = &["fps", "frame_rate", "frameRate"];
+const MEDIA_GENERATION_DURATION_ATTRIBUTES: &[&str] =
+    &["seconds", "duration_seconds", "duration", "target_duration"];
 const VIDEO_CANARY_IMAGE_ATTRIBUTES: &[&str] = &[
     "input_reference",
     "input_image",
@@ -71832,12 +71824,13 @@ fn provider_session_configured_limit(name: &str, default: usize) -> usize {
 struct ProviderVerifiedEndpointRequest<'a> {
     family: &'a str,
     request: &'a Value,
+    contract: &'a mayhem_proto::EndpointFamilyContract,
 }
 
 fn provider_verify_endpoint_request<'a>(
     transport_body: &'a Value,
     expected_model_id: Option<&str>,
-    adapter: &catalog::CatalogAdapter,
+    adapter: &'a catalog::CatalogAdapter,
 ) -> Result<ProviderVerifiedEndpointRequest<'a>> {
     let metadata = transport_body
         .get("mayhem_contract")
@@ -71923,7 +71916,11 @@ fn provider_verify_endpoint_request<'a>(
             == Some(provider_endpoint_transport_kind(family)?),
         "provider request transport kind does not match endpoint family {family}"
     );
-    Ok(ProviderVerifiedEndpointRequest { family, request })
+    Ok(ProviderVerifiedEndpointRequest {
+        family,
+        request,
+        contract,
+    })
 }
 
 fn provider_endpoint_transport_kind(family: &str) -> Result<&'static str> {
@@ -72407,9 +72404,16 @@ fn provider_engine_session_response_with_sampling_bounded(
         endpoint_family,
         mayhem_proto::ENDPOINT_OPENAI_VIDEOS | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
     ) {
-        let request = provider_media_generation_request_from_body(endpoint_family, request_body)?;
-        let requested_duration = request.duration_seconds;
-        let requested_frames = request.frame_count;
+        let mut request =
+            provider_media_generation_request_from_body(endpoint_family, request_body)?;
+        let (expected_duration, expected_frames) =
+            provider_video_output_expectation(verified.contract, &request)?;
+        request.frame_count = Some(expected_frames);
+        provider_canonicalize_video_engine_request(
+            verified.contract,
+            &mut request,
+            expected_frames,
+        )?;
         let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
         let output = backend
             .generate_video(
@@ -72422,20 +72426,16 @@ fn provider_engine_session_response_with_sampling_bounded(
             output.duration_seconds > 0 && output.frame_count > 0,
             "provider video engine returned zero duration or frames"
         );
-        if let Some(expected) = requested_duration {
-            ensure!(
-                output.duration_seconds == expected,
-                "provider video engine returned {} seconds, expected {expected}",
-                output.duration_seconds
-            );
-        }
-        if let Some(expected) = requested_frames {
-            ensure!(
-                output.frame_count == expected,
-                "provider video engine returned {} frames, expected {expected}",
-                output.frame_count
-            );
-        }
+        ensure!(
+            output.duration_seconds == expected_duration,
+            "provider video engine returned {} seconds, expected {expected_duration}",
+            output.duration_seconds
+        );
+        ensure!(
+            output.frame_count == expected_frames,
+            "provider video engine returned {} frames, expected {expected_frames}",
+            output.frame_count
+        );
         let artifacts = artifact_chunks.finish()?;
         ensure!(
             !artifacts.is_empty()
@@ -73243,13 +73243,7 @@ fn provider_media_generation_request_from_body(
                 .and_then(|parameters| parameters.get("duration_seconds"))
                 .and_then(provider_duration_seconds_ceil)
         })
-        .or_else(|| {
-            body.get("seconds").and_then(|seconds| {
-                seconds
-                    .as_u64()
-                    .or_else(|| seconds.as_str().and_then(|value| value.parse().ok()))
-            })
-        });
+        .or_else(|| body.get("seconds").and_then(provider_duration_seconds_ceil));
     let frame_count = provider_consistent_positive_u64_alias(
         body,
         parameters,
@@ -73266,14 +73260,6 @@ fn provider_media_generation_request_from_body(
         let frames = frame_count?;
         let fps = fps?;
         Some(((frames as f64) / fps).ceil().max(1.0) as u64)
-    });
-    let frame_count = frame_count.or_else(|| {
-        (endpoint_family == mayhem_proto::ENDPOINT_OPENAI_VIDEOS).then(|| {
-            duration_seconds
-                .unwrap_or(4)
-                .max(1)
-                .saturating_mul(DEFAULT_VIDEO_GENERATION_FPS)
-        })
     });
     let step_count = parameters
         .and_then(|parameters| parameters.get("num_inference_steps"))
@@ -73347,6 +73333,7 @@ fn provider_consistent_positive_f64_alias(
             };
             let value = value
                 .as_f64()
+                .or_else(|| value.as_str().and_then(|value| value.parse::<f64>().ok()))
                 .filter(|value| value.is_finite() && *value > 0.0)
                 .with_context(|| format!("{label} {alias} must be a positive finite number"))?;
             if let Some(previous) = selected {
@@ -73363,13 +73350,179 @@ fn provider_consistent_positive_f64_alias(
     Ok(selected)
 }
 
+fn provider_video_output_expectation(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    request: &EngineMediaGenerationRequest,
+) -> Result<(u64, u64)> {
+    let body = request
+        .request
+        .as_object()
+        .context("video generation request body must be an object")?;
+    let parameters = body.get("parameters").and_then(Value::as_object);
+    let fps = provider_video_frame_rate(contract, request)?;
+    let requested_duration = provider_consistent_positive_f64_alias(
+        &request.request,
+        parameters,
+        MEDIA_GENERATION_DURATION_ATTRIBUTES,
+        "media generation duration",
+    )?;
+
+    let expected_frames = if let Some(frames) = request.frame_count {
+        frames
+    } else {
+        let duration = requested_duration
+            .or_else(|| request.duration_seconds.map(|value| value as f64))
+            .or_else(|| (contract.family == mayhem_proto::ENDPOINT_OPENAI_VIDEOS).then_some(4.0))
+            .context("video generation request resolved neither duration nor frame count")?;
+        let requested_frames = duration * fps;
+        ensure!(
+            requested_frames.is_finite()
+                && requested_frames >= 1.0
+                && requested_frames <= u64::MAX as f64,
+            "video duration/fps produced an invalid frame count"
+        );
+        let requested_frames = requested_frames.floor().max(1.0) as u64;
+        provider_video_request_attribute_spec(contract, VIDEO_CANARY_FRAME_ATTRIBUTES)
+            .map(|spec| {
+                mayhem_proto::canonicalize_positive_integer_at_most_for_spec(requested_frames, spec)
+                    .map_err(anyhow::Error::msg)
+            })
+            .transpose()?
+            .unwrap_or(requested_frames)
+    };
+    ensure!(
+        expected_frames > 0,
+        "video generation request resolved a zero frame count"
+    );
+    let expected_duration_f64 = (expected_frames as f64) / fps;
+    ensure!(
+        expected_duration_f64.is_finite()
+            && expected_duration_f64 > 0.0
+            && expected_duration_f64 <= u64::MAX as f64,
+        "video frame count/fps produced an invalid duration"
+    );
+    Ok((
+        expected_duration_f64.ceil().max(1.0) as u64,
+        expected_frames,
+    ))
+}
+
+fn provider_video_frame_rate(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    request: &EngineMediaGenerationRequest,
+) -> Result<f64> {
+    let parameters = request.request.get("parameters").and_then(Value::as_object);
+    let fps = provider_consistent_positive_f64_alias(
+        &request.request,
+        parameters,
+        VIDEO_CANARY_FPS_ATTRIBUTES,
+        "media generation fps",
+    )?
+    .unwrap_or(
+        if contract.family == mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO {
+            8.0
+        } else {
+            DEFAULT_VIDEO_GENERATION_FPS as f64
+        },
+    );
+    ensure!(
+        fps.is_finite() && fps > 0.0 && fps <= 240.0,
+        "media generation fps must be finite and between 0 and 240"
+    );
+    Ok(fps)
+}
+
+fn provider_canonicalize_video_engine_request(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    request: &mut EngineMediaGenerationRequest,
+    expected_frames: u64,
+) -> Result<()> {
+    let fps = provider_video_frame_rate(contract, request)?;
+    let body = request
+        .request
+        .as_object()
+        .context("video generation request body must be an object")?;
+    let parameters = body.get("parameters").and_then(Value::as_object);
+    let explicit_frames = provider_consistent_positive_u64_alias(
+        &request.request,
+        parameters,
+        VIDEO_CANARY_FRAME_ATTRIBUTES,
+        "media generation frame count",
+    )?;
+    let requested_duration = provider_consistent_positive_f64_alias(
+        &request.request,
+        parameters,
+        MEDIA_GENERATION_DURATION_ATTRIBUTES,
+        "media generation duration",
+    )?;
+
+    let body = request
+        .request
+        .as_object_mut()
+        .context("video generation request body must be an object")?;
+    let mut parameters = body
+        .remove("parameters")
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    for alias in VIDEO_CANARY_FRAME_ATTRIBUTES
+        .iter()
+        .chain(VIDEO_CANARY_FPS_ATTRIBUTES)
+        .chain(MEDIA_GENERATION_DURATION_ATTRIBUTES)
+    {
+        body.remove(*alias);
+        parameters.remove(*alias);
+    }
+
+    if contract.family == mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO {
+        parameters.insert("num_frames".to_owned(), Value::from(expected_frames));
+        parameters.insert("fps".to_owned(), Value::from(fps));
+        body.insert("parameters".to_owned(), Value::Object(parameters));
+    } else {
+        ensure!(
+            contract.family == mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            "unsupported video endpoint family {}",
+            contract.family
+        );
+        ensure!(
+            parameters.is_empty(),
+            "OpenAI video request retained unsupported nested engine controls"
+        );
+        body.insert("fps".to_owned(), Value::from(fps));
+        if explicit_frames.is_some() {
+            body.insert("num_frames".to_owned(), Value::from(expected_frames));
+        } else if let Some(duration) = requested_duration {
+            body.insert("seconds".to_owned(), Value::from(duration));
+        }
+    }
+    Ok(())
+}
+
+fn provider_video_request_attribute_spec<'a>(
+    contract: &'a mayhem_proto::EndpointFamilyContract,
+    aliases: &[&str],
+) -> Option<&'a mayhem_proto::EndpointAttributeSpec> {
+    let nested_first = contract.family == mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO;
+    for nested in [nested_first, !nested_first] {
+        for alias in aliases {
+            let path = if nested {
+                format!("parameters.{alias}")
+            } else {
+                (*alias).to_owned()
+            };
+            if let Some(spec) = contract.request_attribute_specs.get(&path) {
+                return Some(spec);
+            }
+        }
+    }
+    None
+}
+
 fn provider_duration_seconds_ceil(value: &Value) -> Option<u64> {
-    value.as_u64().filter(|value| *value > 0).or_else(|| {
-        value
-            .as_f64()
-            .filter(|value| value.is_finite() && *value > 0.0 && *value <= u64::MAX as f64)
-            .map(|value| value.ceil() as u64)
-    })
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0 && *value <= u64::MAX as f64)
+        .map(|value| value.ceil() as u64)
 }
 
 fn provider_image_generation_usage(
@@ -76574,6 +76727,7 @@ mod tests {
         last_transcription_request: Option<EngineAudioTranscriptionRequest>,
         last_speech_request: Option<SpeechRequest>,
         last_video_request: Option<EngineMediaGenerationRequest>,
+        video_output: Option<mayhem_engine::MediaGenerationOutput>,
         last_audio_request: Option<EngineMediaGenerationRequest>,
         last_music_request: Option<EngineMediaGenerationRequest>,
     }
@@ -76707,6 +76861,7 @@ mod tests {
                 last_transcription_request: None,
                 last_speech_request: None,
                 last_video_request: None,
+                video_output: None,
                 last_audio_request: None,
                 last_music_request: None,
             }
@@ -76724,6 +76879,15 @@ mod tests {
 
         fn with_media_validation(mut self) -> Self {
             self.media_validation_enabled = true;
+            self
+        }
+
+        fn with_video_output(mut self, duration_seconds: u64, frame_count: u64) -> Self {
+            self.video_output = Some(mayhem_engine::MediaGenerationOutput {
+                duration_seconds,
+                frame_count,
+                step_count: 1,
+            });
             self
         }
 
@@ -76888,11 +77052,19 @@ mod tests {
             artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
             _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::MediaGenerationOutput> {
-            let output = mayhem_engine::MediaGenerationOutput {
-                duration_seconds: request.duration_seconds.unwrap_or(1),
-                frame_count: request.frame_count.unwrap_or(24),
-                step_count: request.step_count.unwrap_or(1),
-            };
+            let output =
+                self.video_output
+                    .clone()
+                    .unwrap_or_else(|| mayhem_engine::MediaGenerationOutput {
+                        duration_seconds: request.duration_seconds.unwrap_or(1),
+                        frame_count: request.frame_count.unwrap_or_else(|| {
+                            request
+                                .duration_seconds
+                                .unwrap_or(1)
+                                .saturating_mul(DEFAULT_VIDEO_GENERATION_FPS)
+                        }),
+                        step_count: request.step_count.unwrap_or(1),
+                    });
             self.last_video_request = Some(request);
             for chunk in self.artifact_chunks.clone() {
                 artifact_sink.on_artifact_chunk(chunk)?;
@@ -90674,6 +90846,274 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(request.request["size"], json!("1280x720"));
     }
 
+    fn provider_video_grid_adapter() -> catalog::CatalogAdapter {
+        let mut adapter = catalog::CatalogAdapter::default();
+        let mut contract =
+            catalog::endpoint_contract_template(mayhem_proto::ENDPOINT_OPENAI_VIDEOS)
+                .expect("OpenAI Videos contract template");
+        contract
+            .request_attribute_specs
+            .get_mut("num_frames")
+            .expect("OpenAI Videos num_frames spec")
+            .enum_values = (9_u64..=497).step_by(8).map(Value::from).collect();
+        adapter.endpoint_families = vec![contract];
+        adapter
+    }
+
+    #[test]
+    fn provider_video_duration_uses_signed_backend_frame_grid() {
+        let mut backend = FakeEngineBackend::new("")
+            .with_video_output(4, 89)
+            .with_artifact_chunks(vec![ArtifactChunk {
+                artifact_id: "video-quantized".to_owned(),
+                index: 0,
+                content_type: "video/mp4".to_owned(),
+                bytes: b"video".to_vec(),
+                final_chunk: true,
+            }]);
+        let body = json!({
+            "kind": "video_generation",
+            "prompt": "a quantized four second clip",
+            "seconds": "4",
+            "size": "704x448"
+        });
+
+        let output = provider_engine_session_response(
+            &mut backend,
+            &provider_video_grid_adapter(),
+            &body,
+            None,
+        )
+        .expect("signed frame-grid quantization must remain routable");
+
+        assert_eq!(output.usage.get(USAGE_VIDEO_SECOND), 4);
+        assert_eq!(output.usage.get(USAGE_FRAME), 89);
+        let request = backend.last_video_request.expect("video request");
+        assert_eq!(request.duration_seconds, Some(4));
+        assert_eq!(request.frame_count, Some(89));
+    }
+
+    #[test]
+    fn provider_video_duration_floors_fractional_fps() {
+        let mut adapter = provider_video_grid_adapter();
+        let frame_spec = adapter
+            .endpoint_families
+            .iter_mut()
+            .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_VIDEOS)
+            .and_then(|contract| contract.request_attribute_specs.get_mut("num_frames"))
+            .expect("OpenAI Videos frame spec");
+        frame_spec.enum_values.clear();
+        frame_spec.minimum = Some(1.0);
+        frame_spec.maximum = Some(497.0);
+        let mut backend = FakeEngineBackend::new("")
+            .with_video_output(4, 95)
+            .with_artifact_chunks(vec![ArtifactChunk {
+                artifact_id: "video-fractional-fps".to_owned(),
+                index: 0,
+                content_type: "video/mp4".to_owned(),
+                bytes: b"video".to_vec(),
+                final_chunk: true,
+            }]);
+        let body = json!({
+            "kind": "video_generation",
+            "prompt": "fractional fps",
+            "seconds": "4",
+            "fps": 23.9,
+            "size": "704x448"
+        });
+
+        let output = provider_engine_session_response(&mut backend, &adapter, &body, None)
+            .expect("fractional fps must not overrun the requested duration");
+
+        assert_eq!(output.usage.get(USAGE_VIDEO_SECOND), 4);
+        assert_eq!(output.usage.get(USAGE_FRAME), 95);
+        let request = backend.last_video_request.expect("video request");
+        assert_eq!(request.duration_seconds, Some(4));
+        assert_eq!(request.frame_count, Some(95));
+    }
+
+    #[test]
+    fn provider_video_fractional_duration_uses_the_signed_time_budget() {
+        let adapter = provider_video_grid_adapter();
+        let contract = adapter.endpoint_families.first().expect("video contract");
+        let request = provider_media_generation_request_from_body(
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            &json!({
+                "model": "test/video",
+                "prompt": "fractional duration",
+                "seconds": 3.1,
+                "fps": 24,
+                "size": "704x448"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(request.duration_seconds, Some(4));
+        assert_eq!(
+            provider_video_output_expectation(contract, &request).unwrap(),
+            (4, 73)
+        );
+        assert!((73.0 / 24.0) <= 3.1);
+    }
+
+    #[test]
+    fn provider_video_duration_uses_openai_default_when_controls_are_omitted() {
+        let mut backend = FakeEngineBackend::new("")
+            .with_video_output(4, 89)
+            .with_artifact_chunks(vec![ArtifactChunk {
+                artifact_id: "video-default-duration".to_owned(),
+                index: 0,
+                content_type: "video/mp4".to_owned(),
+                bytes: b"video".to_vec(),
+                final_chunk: true,
+            }]);
+        let body = json!({
+            "kind": "video_generation",
+            "prompt": "default duration",
+            "size": "704x448"
+        });
+
+        let output = provider_engine_session_response(
+            &mut backend,
+            &provider_video_grid_adapter(),
+            &body,
+            None,
+        )
+        .expect("OpenAI video default duration must remain routable");
+
+        assert_eq!(output.usage.get(USAGE_VIDEO_SECOND), 4);
+        assert_eq!(output.usage.get(USAGE_FRAME), 89);
+        let request = backend.last_video_request.expect("video request");
+        assert_eq!(request.duration_seconds, None);
+        assert_eq!(request.frame_count, Some(89));
+    }
+
+    #[test]
+    fn provider_video_admission_uses_signed_fps_and_frame_grid() {
+        let adapter = provider_video_grid_adapter();
+        let contract = adapter.endpoint_families.first().expect("video contract");
+        let body = json!({
+            "model": "test/video",
+            "prompt": "high frame rate",
+            "seconds": "4",
+            "fps": 50,
+            "size": "704x448"
+        });
+
+        let load = provider_session_modality_load(
+            contract,
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            &body,
+            &json!({"kind": "video_generation"}),
+            &["video".to_owned(), "audio".to_owned()],
+        )
+        .expect("video admission load");
+
+        assert_eq!(load["video"].max_item_units, 193);
+        assert_eq!(load["audio"].max_item_units, 4);
+    }
+
+    #[test]
+    fn provider_video_frame_spec_lookup_accepts_the_alternate_signed_layout() {
+        let mut adapter = provider_video_grid_adapter();
+        let contract = adapter
+            .endpoint_families
+            .first_mut()
+            .expect("video contract");
+        let frame_spec = contract
+            .request_attribute_specs
+            .remove("num_frames")
+            .expect("top-level frame spec");
+        contract
+            .request_attribute_specs
+            .insert("parameters.num_frames".to_owned(), frame_spec);
+        let request = provider_media_generation_request_from_body(
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            &json!({
+                "model": "test/video",
+                "prompt": "alternate signed layout",
+                "fps": 24,
+                "parameters": {
+                    "num_frames": 89
+                },
+                "size": "704x448"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            provider_video_output_expectation(contract, &request).unwrap(),
+            (4, 89)
+        );
+        let mut request = request;
+        provider_canonicalize_video_engine_request(contract, &mut request, 89).unwrap();
+        assert_eq!(request.request["num_frames"], 89);
+        assert_eq!(request.request["fps"], 24.0);
+        assert!(request.request.get("parameters").is_none());
+    }
+
+    #[test]
+    fn provider_video_duration_rejects_wrong_lower_grid_point() {
+        let mut backend = FakeEngineBackend::new("")
+            .with_video_output(4, 81)
+            .with_artifact_chunks(vec![ArtifactChunk {
+                artifact_id: "video-underproduction".to_owned(),
+                index: 0,
+                content_type: "video/mp4".to_owned(),
+                bytes: b"video".to_vec(),
+                final_chunk: true,
+            }]);
+        let body = json!({
+            "kind": "video_generation",
+            "prompt": "an invalid lower grid point",
+            "seconds": "4",
+            "size": "704x448"
+        });
+
+        let error = provider_engine_session_response(
+            &mut backend,
+            &provider_video_grid_adapter(),
+            &body,
+            None,
+        )
+        .expect_err("a different lower grid point must remain rejected");
+
+        assert!(error
+            .to_string()
+            .contains("provider video engine returned 81 frames, expected 89"));
+    }
+
+    #[test]
+    fn provider_video_duration_rejects_non_grid_output() {
+        let mut backend = FakeEngineBackend::new("")
+            .with_video_output(4, 121)
+            .with_artifact_chunks(vec![ArtifactChunk {
+                artifact_id: "video-non-grid".to_owned(),
+                index: 0,
+                content_type: "video/mp4".to_owned(),
+                bytes: b"video".to_vec(),
+                final_chunk: true,
+            }]);
+        let body = json!({
+            "kind": "video_generation",
+            "prompt": "an invalid non-grid clip",
+            "seconds": "4",
+            "size": "704x448"
+        });
+
+        let error = provider_engine_session_response(
+            &mut backend,
+            &provider_video_grid_adapter(),
+            &body,
+            None,
+        )
+        .expect_err("a different legal grid point must remain rejected");
+
+        assert!(error
+            .to_string()
+            .contains("provider video engine returned 121 frames, expected 89"));
+    }
+
     #[test]
     fn provider_engine_session_response_keeps_audio_and_music_generation_distinct() {
         let audio_artifact = ArtifactChunk {
@@ -90781,6 +91221,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         });
 
         let load = provider_session_modality_load(
+            &catalog::endpoint_contract_template(mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+                .unwrap(),
             mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
             &body,
             &json!({"kind": "music_generation"}),
@@ -90842,6 +91284,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         });
 
         let load = provider_session_modality_load(
+            &catalog::endpoint_contract_template(mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+                .unwrap(),
             mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
             &body,
             &json!({"kind": "music_generation"}),

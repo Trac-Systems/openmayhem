@@ -378,6 +378,116 @@ impl EndpointAttributeSpec {
     }
 }
 
+pub fn canonicalize_positive_integer_for_spec(
+    requested: u64,
+    spec: &EndpointAttributeSpec,
+) -> Result<u64, String> {
+    let mut allowed = spec
+        .enum_values
+        .iter()
+        .filter_map(|value| {
+            value.as_u64().filter(|value| *value > 0).or_else(|| {
+                value
+                    .as_str()?
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| *value > 0)
+            })
+        })
+        .collect::<Vec<_>>();
+    allowed.sort_unstable();
+    allowed.dedup();
+    if !allowed.is_empty() {
+        return allowed
+            .into_iter()
+            .min_by_key(|candidate| (candidate.abs_diff(requested), *candidate))
+            .ok_or_else(|| "signed integer set is empty".to_owned());
+    }
+
+    let minimum = spec.minimum.unwrap_or(1.0).ceil().max(1.0) as u64;
+    let maximum = spec.maximum.unwrap_or(u64::MAX as f64).floor().max(1.0) as u64;
+    if minimum > maximum {
+        return Err("signed integer range has minimum greater than maximum".to_owned());
+    }
+    let mut actual = requested.clamp(minimum, maximum);
+    if let Some(multiple) = spec
+        .multiple_of
+        .filter(|value| value.is_finite() && *value >= 1.0)
+        .map(|value| value.round() as u64)
+        .filter(|value| *value > 1)
+    {
+        let lower = actual / multiple * multiple;
+        let upper = lower.saturating_add(multiple);
+        actual = [lower, upper]
+            .into_iter()
+            .filter(|candidate| *candidate >= minimum && *candidate <= maximum)
+            .min_by_key(|candidate| (candidate.abs_diff(actual), *candidate))
+            .ok_or_else(|| "signed integer range contains no valid multiple".to_owned())?;
+    }
+    Ok(actual)
+}
+
+pub fn canonicalize_positive_integer_at_most_for_spec(
+    requested: u64,
+    spec: &EndpointAttributeSpec,
+) -> Result<u64, String> {
+    let mut allowed = spec
+        .enum_values
+        .iter()
+        .filter_map(|value| {
+            value.as_u64().filter(|value| *value > 0).or_else(|| {
+                value
+                    .as_str()?
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|value| *value > 0)
+            })
+        })
+        .collect::<Vec<_>>();
+    allowed.sort_unstable();
+    allowed.dedup();
+    if !allowed.is_empty() {
+        return allowed
+            .into_iter()
+            .filter(|candidate| *candidate <= requested)
+            .next_back()
+            .ok_or_else(|| {
+                format!(
+                    "signed integer set contains no value at or below requested value {requested}"
+                )
+            });
+    }
+
+    let minimum = spec.minimum.unwrap_or(1.0).ceil().max(1.0) as u64;
+    let maximum = spec.maximum.unwrap_or(u64::MAX as f64).floor().max(1.0) as u64;
+    if minimum > maximum {
+        return Err("signed integer range has minimum greater than maximum".to_owned());
+    }
+    let upper = requested.min(maximum);
+    if upper < minimum {
+        return Err(format!(
+            "signed integer range contains no value at or below requested value {requested}"
+        ));
+    }
+    let actual = if let Some(multiple) = spec
+        .multiple_of
+        .filter(|value| value.is_finite() && *value >= 1.0)
+        .map(|value| value.round() as u64)
+        .filter(|value| *value > 1)
+    {
+        let candidate = upper / multiple * multiple;
+        if candidate < minimum {
+            return Err(format!(
+                "signed integer range contains no valid multiple at or below requested value {requested}"
+            ));
+        }
+        candidate
+    } else {
+        upper
+    };
+    Ok(actual)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EndpointFamilyContract {
     pub family: String,
@@ -2333,6 +2443,44 @@ mod tests {
     #[test]
     fn exposes_crate_name() {
         assert_eq!(CRATE_NAME, "mayhem-proto");
+    }
+
+    #[test]
+    fn at_most_integer_canonicalization_never_exceeds_the_request() {
+        let mut enumerated = EndpointAttributeSpec::new(EndpointValueType::Integer);
+        enumerated.enum_values = (9_u64..=121).step_by(8).map(Value::from).collect();
+        assert_eq!(
+            canonicalize_positive_integer_at_most_for_spec(96, &enumerated).unwrap(),
+            89
+        );
+        assert!(
+            canonicalize_positive_integer_at_most_for_spec(8, &enumerated)
+                .unwrap_err()
+                .contains("no value at or below")
+        );
+
+        let mut ranged = EndpointAttributeSpec::new(EndpointValueType::Integer);
+        ranged.minimum = Some(8.0);
+        ranged.maximum = Some(128.0);
+        ranged.multiple_of = Some(8.0);
+        assert_eq!(
+            canonicalize_positive_integer_at_most_for_spec(95, &ranged).unwrap(),
+            88
+        );
+        assert_eq!(
+            canonicalize_positive_integer_at_most_for_spec(200, &ranged).unwrap(),
+            128
+        );
+    }
+
+    #[test]
+    fn nearest_integer_canonicalization_remains_available_for_explicit_values() {
+        let mut spec = EndpointAttributeSpec::new(EndpointValueType::Integer);
+        spec.enum_values = (9_u64..=121).step_by(8).map(Value::from).collect();
+        assert_eq!(
+            canonicalize_positive_integer_for_spec(96, &spec).unwrap(),
+            97
+        );
     }
 
     fn binary_speciality_descriptor() -> ModelSpecialityDescriptor {

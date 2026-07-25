@@ -78,7 +78,7 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.45` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.51` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -87,7 +87,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.45
+git checkout --detach v0.2.51
 ./install.sh --from-source
 ```
 
@@ -96,7 +96,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.45
+git checkout --detach v0.2.51
 .\install.ps1 -FromSource
 ```
 
@@ -759,7 +759,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 | `NousResearch/Hermes-3-Llama-3.1-70B` (`@mlx-4bit`) | LLM, 70B, 128K ctx | D | onboarding |
 | `openai/gpt-oss-20b` | LLM, agentic | B | onboarding |
 | `Qwen/Qwen3.6-35B-A3B` | LLM, MoE, 262K ctx | C | onboarding |
-| `deepreinforce-ai/Ornith-1.0-9B` | LLM, agentic | B | onboarding |
+| `deepreinforce-ai/Ornith-1.0-35B` | LLM, agentic MoE, 262K ctx — GGUF Q4 / MLX 4-bit / NVFP4 | B/C | onboarding (next) |
 | `mistralai/Devstral-Small-2-24B-Instruct-2512` | LLM, coding | C | onboarding |
 | `openai/gpt-oss-120b` | LLM, flagship | D | onboarding |
 | `HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive` | LLM, uncensored | B | onboarding |
@@ -859,7 +859,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.45` is source-only. The GitHub release contains the tagged source, not
+`v0.2.51` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -867,7 +867,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.45
+git checkout --detach v0.2.51
 ./install.sh --from-source
 ```
 
@@ -876,7 +876,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.45
+git checkout --detach v0.2.51
 .\install.ps1 -FromSource
 ```
 
@@ -896,14 +896,16 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
-The `0.2.45` source release carries the current PAYOUTFREE, ATTAUTO, FLOWRATE,
+The `0.2.51` source release carries the current PAYOUTFREE, ATTAUTO, FLOWRATE,
 LIVEROUTE, bounded Z-Image readiness, process-lifetime dashboard auth,
 non-destructive authenticated direct-to-relay session handover, and the
 generalized joint audio/video serving path used by Sulphur. The releases page and live signed catalog remain
 the user-facing truth for the current software revision and available models.
 It also keeps provider join/start context commitments on one hardware-fit path and pins every
 byte-hashed Chatterbox runtime input to LF so Windows source builds are independent of
-`core.autocrlf`.
+`core.autocrlf`. Video duration requests resolve deterministically to the greatest
+signed legal frame count inside the requested duration, and providers enforce that
+exact frame/duration pair before signing usage.
 
 ```bash
 scripts/dev-net.sh --cleanup

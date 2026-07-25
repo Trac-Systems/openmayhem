@@ -5575,6 +5575,7 @@ const VIDEO_GENERATION_SERVER_IMAGE_PATH_FIELDS: &[&str] = &[
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct VideoRequestPreparation {
     requested_frames: Option<u64>,
+    canonical_frames: Option<u64>,
     inline_image: InlineImageLoad,
 }
 
@@ -5772,7 +5773,7 @@ fn normalize_catalog_endpoint_request_with_metadata(
     raw_request: &Value,
 ) -> Result<PreparedCatalogEndpointRequest, ApiError> {
     let contract = catalog_endpoint_contract(state, model_id, endpoint_family)?;
-    let (prepared_request, video) = if uses_video_generation_aliases(endpoint_family) {
+    let (prepared_request, mut video) = if uses_video_generation_aliases(endpoint_family) {
         let (request, video) = canonicalize_video_generation_request(
             &contract,
             endpoint_family,
@@ -5805,6 +5806,8 @@ fn normalize_catalog_endpoint_request_with_metadata(
     if uses_video_generation_aliases(endpoint_family) {
         validate_video_prompt_enhancement_opt_in(&contract, prepared_request, &normalized)
             .map_err(|err| ApiError::bad_request(err, Some("prompt_enhancement")))?;
+        video = finalize_video_request_preparation(&contract, endpoint_family, &normalized, video)
+            .map_err(|err| ApiError::bad_request(err, Some("request")))?;
     }
     Ok(PreparedCatalogEndpointRequest { normalized, video })
 }
@@ -5910,9 +5913,78 @@ fn canonicalize_video_generation_request(
         request,
         VideoRequestPreparation {
             requested_frames,
+            canonical_frames: None,
             inline_image,
         },
     ))
+}
+
+fn finalize_video_request_preparation(
+    contract: &EndpointFamilyContract,
+    endpoint_family: &str,
+    normalized: &Value,
+    mut video: VideoRequestPreparation,
+) -> Result<VideoRequestPreparation, String> {
+    if video.requested_frames.is_some() {
+        let frames = artifact_generation_request_value(
+            normalized,
+            endpoint_family,
+            VIDEO_GENERATION_FRAME_ALIASES,
+        )
+        .and_then(endpoint_positive_integer)
+        .ok_or_else(|| {
+            "signed video frame request did not survive endpoint normalization".to_owned()
+        })?;
+        video.canonical_frames = Some(frames);
+        return Ok(video);
+    }
+
+    let duration = artifact_generation_request_value(
+        normalized,
+        endpoint_family,
+        ARTIFACT_GENERATION_DURATION_ALIASES,
+    )
+    .and_then(generation_duration_seconds)
+    .or_else(|| {
+        normalized
+            .get("seconds")
+            .and_then(generation_duration_seconds)
+    })
+    .unwrap_or(4.0);
+    let fps = artifact_generation_request_value(
+        normalized,
+        endpoint_family,
+        VIDEO_GENERATION_FPS_ALIASES,
+    )
+    .and_then(endpoint_positive_number)
+    .unwrap_or(
+        if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO {
+            8.0
+        } else {
+            DEFAULT_VIDEO_GENERATION_FPS as f64
+        },
+    );
+    let requested_frames_f64 = duration * fps;
+    if !requested_frames_f64.is_finite()
+        || requested_frames_f64 < 1.0
+        || requested_frames_f64 > u64::MAX as f64
+    {
+        return Err("video duration/fps produced an invalid frame count".to_owned());
+    }
+    let requested_frames = requested_frames_f64.floor().max(1.0) as u64;
+    let canonical_frames = artifact_generation_alias_target(
+        contract,
+        &artifact_generation_alias_candidates(endpoint_family, VIDEO_GENERATION_FRAME_ALIASES),
+    )
+    .and_then(|path| contract.request_attribute_specs.get(&path))
+    .map(|spec| {
+        mayhem_proto::canonicalize_positive_integer_at_most_for_spec(requested_frames, spec)
+    })
+    .transpose()?
+    .unwrap_or(requested_frames);
+    video.requested_frames = Some(requested_frames);
+    video.canonical_frames = Some(canonical_frames);
+    Ok(video)
 }
 
 fn canonicalize_signed_video_generation_alias_group(
@@ -6251,41 +6323,7 @@ fn canonical_video_frame_count(
     requested: u64,
     spec: &mayhem_proto::EndpointAttributeSpec,
 ) -> Result<u64, String> {
-    let mut allowed = spec
-        .enum_values
-        .iter()
-        .filter_map(endpoint_positive_integer)
-        .collect::<Vec<_>>();
-    allowed.sort_unstable();
-    allowed.dedup();
-    if !allowed.is_empty() {
-        return allowed
-            .into_iter()
-            .min_by_key(|candidate| (candidate.abs_diff(requested), *candidate))
-            .ok_or_else(|| "signed frame set is empty".to_owned());
-    }
-
-    let minimum = spec.minimum.unwrap_or(1.0).ceil().max(1.0) as u64;
-    let maximum = spec.maximum.unwrap_or(u64::MAX as f64).floor().max(1.0) as u64;
-    if minimum > maximum {
-        return Err("signed frame range has minimum greater than maximum".to_owned());
-    }
-    let mut actual = requested.clamp(minimum, maximum);
-    if let Some(multiple) = spec
-        .multiple_of
-        .filter(|value| value.is_finite() && *value >= 1.0)
-        .map(|value| value.round() as u64)
-        .filter(|value| *value > 1)
-    {
-        let lower = actual / multiple * multiple;
-        let upper = lower.saturating_add(multiple);
-        actual = [lower, upper]
-            .into_iter()
-            .filter(|candidate| *candidate >= minimum && *candidate <= maximum)
-            .min_by_key(|candidate| (candidate.abs_diff(actual), *candidate))
-            .ok_or_else(|| "signed frame range contains no valid multiple".to_owned())?;
-    }
-    Ok(actual)
+    mayhem_proto::canonicalize_positive_integer_for_spec(requested, spec)
 }
 
 fn validate_video_prompt_enhancement_opt_in(
@@ -9142,32 +9180,40 @@ fn artifact_generation_request(
         response_format,
     ) = match endpoint_family {
         mayhem_proto::ENDPOINT_OPENAI_VIDEOS => {
-            let duration = duration_seconds.unwrap_or(4).max(1);
             let fps = frame_rate.unwrap_or(DEFAULT_VIDEO_GENERATION_FPS as f64);
-            let requested_frames = video
-                .requested_frames
-                .unwrap_or_else(|| ((duration as f64) * fps).round().max(1.0) as u64);
+            let requested_frames = video.requested_frames.unwrap_or_else(|| {
+                ((duration_seconds.unwrap_or(4).max(1) as f64) * fps)
+                    .floor()
+                    .max(1.0) as u64
+            });
+            let frames = video
+                .canonical_frames
+                .or(normalized_frames)
+                .unwrap_or(requested_frames);
+            let duration = ((frames as f64) / fps).ceil().max(1.0) as u64;
             (
                 "video",
                 "video_generation",
                 duration,
                 requested_frames,
-                normalized_frames.unwrap_or(requested_frames),
+                frames,
                 fps,
                 "mp4",
             )
         }
         mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO => {
-            let frames = normalized_frames.ok_or_else(|| {
-                ApiError::bad_request(
-                    "signed HF text-to-video contract did not resolve num_frames",
-                    Some("request"),
-                )
-            })?;
+            let frames = video
+                .canonical_frames
+                .or(normalized_frames)
+                .ok_or_else(|| {
+                    ApiError::bad_request(
+                        "signed HF text-to-video contract did not resolve num_frames",
+                        Some("request"),
+                    )
+                })?;
             let requested_frames = video.requested_frames.unwrap_or(frames);
             let fps = frame_rate.unwrap_or(8.0);
-            let duration =
-                duration_seconds.unwrap_or_else(|| ((frames as f64) / fps).ceil().max(1.0) as u64);
+            let duration = ((frames as f64) / fps).ceil().max(1.0) as u64;
             (
                 "video",
                 "video_generation",
@@ -9297,16 +9343,11 @@ fn artifact_generation_request_value<'a>(
 }
 
 fn generation_duration_seconds_ceil(value: &Value) -> Option<u64> {
-    value
-        .as_u64()
-        .filter(|value| *value > 0)
-        .or_else(|| value.as_str().and_then(|value| value.parse::<u64>().ok()))
-        .or_else(|| {
-            value
-                .as_f64()
-                .filter(|value| value.is_finite() && *value > 0.0 && *value <= u64::MAX as f64)
-                .map(|value| value.ceil() as u64)
-        })
+    generation_duration_seconds(value).map(|value| value.ceil() as u64)
+}
+
+fn generation_duration_seconds(value: &Value) -> Option<f64> {
+    endpoint_positive_number(value).filter(|value| *value <= u64::MAX as f64)
 }
 
 fn endpoint_positive_number(value: &Value) -> Option<f64> {
@@ -39412,19 +39453,44 @@ mod tests {
 
     #[test]
     fn artifact_video_usage_and_spend_ceiling_remain_request_bound() {
-        let request = artifact_generation_request(
-            "mayhem/video-test",
+        let mut model = signed_joint_video_model();
+        let frame_spec = model
+            .mayhem
+            .adapter
+            .endpoint_families
+            .iter_mut()
+            .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_VIDEOS)
+            .and_then(|contract| contract.request_attribute_specs.get_mut("num_frames"))
+            .expect("OpenAI Videos frame spec");
+        frame_spec.default = None;
+        frame_spec.enum_values = (9_u64..=497).step_by(8).map(Value::from).collect();
+        let state = GatewayState::from_models(vec![model.clone()]).with_dev_session_shim();
+        let prepared = normalize_catalog_endpoint_request_with_metadata(
+            &state,
+            &model.id,
             mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
-            json!({
-                "model": "mayhem/video-test",
+            &json!({
+                "model": model.id,
                 "prompt": "orbit",
-                "seconds": 4,
-                "fps": 24
+                "seconds": "4",
+                "fps": 24,
+                "size": "512x512"
             }),
-            VideoRequestPreparation::default(),
         )
         .unwrap();
+        let request = artifact_generation_request(
+            &model.id,
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            prepared.normalized,
+            prepared.video,
+        )
+        .unwrap();
+        assert_eq!(request.duration_seconds, 4);
+        assert_eq!(request.requested_frame_count, 96);
+        assert_eq!(request.frame_count, 89);
         let usage = artifact_generation_usage_for_request(&request);
+        assert_eq!(usage.get(USAGE_VIDEO_SECOND), 4);
+        assert_eq!(usage.get(USAGE_FRAME), 89);
         let output = ArtifactGenerationOutput {
             artifacts: vec![GatewayArtifactOutput {
                 id: "video-1".to_owned(),
@@ -39456,6 +39522,100 @@ mod tests {
             estimate_artifact_generation_max_spend_au(&price, &request),
             calculate_au_owed(&price, &usage)
         );
+    }
+
+    #[test]
+    fn video_duration_frame_budget_floors_fractional_fps() {
+        let mut model = signed_joint_video_model();
+        let frame_spec = model
+            .mayhem
+            .adapter
+            .endpoint_families
+            .iter_mut()
+            .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_VIDEOS)
+            .and_then(|contract| contract.request_attribute_specs.get_mut("num_frames"))
+            .expect("OpenAI Videos frame spec");
+        frame_spec.default = None;
+        frame_spec.enum_values.clear();
+        frame_spec.minimum = Some(1.0);
+        frame_spec.maximum = Some(497.0);
+        let state = GatewayState::from_models(vec![model.clone()]).with_dev_session_shim();
+        let prepared = normalize_catalog_endpoint_request_with_metadata(
+            &state,
+            &model.id,
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            &json!({
+                "model": model.id,
+                "prompt": "fractional fps",
+                "seconds": "4",
+                "fps": 23.9,
+                "size": "512x512"
+            }),
+        )
+        .unwrap();
+        let request = artifact_generation_request(
+            &model.id,
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            prepared.normalized,
+            prepared.video,
+        )
+        .unwrap();
+
+        assert_eq!(request.duration_seconds, 4);
+        assert_eq!(request.requested_frame_count, 95);
+        assert_eq!(request.frame_count, 95);
+    }
+
+    #[test]
+    fn video_fractional_duration_never_exceeds_the_signed_time_budget() {
+        let mut model = signed_joint_video_model();
+        let contract = model
+            .mayhem
+            .adapter
+            .endpoint_families
+            .iter_mut()
+            .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_VIDEOS)
+            .expect("OpenAI Videos contract");
+        let duration_spec = contract
+            .request_attribute_specs
+            .get_mut("seconds")
+            .expect("OpenAI Videos duration spec");
+        duration_spec.value_types = vec![EndpointValueType::Number];
+        duration_spec.enum_values.clear();
+        duration_spec.minimum = Some(1.0);
+        duration_spec.maximum = Some(12.0);
+        let frame_spec = contract
+            .request_attribute_specs
+            .get_mut("num_frames")
+            .expect("OpenAI Videos frame spec");
+        frame_spec.default = None;
+        frame_spec.enum_values = (9_u64..=497).step_by(8).map(Value::from).collect();
+        let state = GatewayState::from_models(vec![model.clone()]).with_dev_session_shim();
+        let prepared = normalize_catalog_endpoint_request_with_metadata(
+            &state,
+            &model.id,
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            &json!({
+                "model": model.id,
+                "prompt": "fractional duration",
+                "seconds": 3.1,
+                "fps": 24,
+                "size": "512x512"
+            }),
+        )
+        .unwrap();
+        let request = artifact_generation_request(
+            &model.id,
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            prepared.normalized,
+            prepared.video,
+        )
+        .unwrap();
+
+        assert_eq!(request.duration_seconds, 4);
+        assert_eq!(request.requested_frame_count, 74);
+        assert_eq!(request.frame_count, 73);
+        assert!((request.frame_count as f64) / request.frame_rate <= 3.1);
     }
 
     #[test]
