@@ -466,9 +466,11 @@ async fn start_mock_stripe() -> (String, StripeCapture) {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContractFeatureMode {
     Applied,
+    ExistingExactState,
     Rejected,
     MissingState,
     MismatchedState,
+    PrefixedFeatureKey,
 }
 
 #[derive(Clone)]
@@ -496,7 +498,7 @@ async fn mock_contract_feature(
             "message": "Admin required.",
             "result": {
                 "type": "feature_result",
-                "feature_key": format!("mayhem_{key}"),
+                "feature_key": key,
                 "hash": hash,
                 "status": "rejected",
                 "ok": false,
@@ -537,6 +539,11 @@ async fn mock_contract_feature(
         "fiat_chargeback" => "fiatChargeback",
         _ => "unknown",
     };
+    let response_feature_key = if capture.mode == ContractFeatureMode::PrefixedFeatureKey {
+        format!("mayhem_{key}")
+    } else {
+        key.clone()
+    };
     Json(json!({
         "ok": true,
         "accepted": true,
@@ -547,11 +554,15 @@ async fn mock_contract_feature(
         "message": "Feature applied.",
         "result": {
             "type": "feature_result",
-            "feature_key": format!("mayhem_{key}"),
+            "feature_key": response_feature_key,
             "hash": hash,
             "status": "applied",
             "ok": true,
-            "result": {"ok": true, "op": contract_op},
+            "result": {
+                "ok": true,
+                "op": contract_op,
+                "duplicate": capture.mode == ContractFeatureMode::ExistingExactState
+            },
             "error": null
         }
     }))
@@ -910,6 +921,7 @@ async fn stripe_event_is_not_persisted_until_admin_feature_and_state_are_applied
         ContractFeatureMode::Rejected,
         ContractFeatureMode::MissingState,
         ContractFeatureMode::MismatchedState,
+        ContractFeatureMode::PrefixedFeatureKey,
     ] {
         let (contract_base, capture) = start_mock_contract(mode).await;
         let temp = tempfile::tempdir().expect("tempdir");
@@ -2895,6 +2907,54 @@ async fn stripe_backfill_pulls_events_api_from_cursor_and_dedups_replay() {
     assert_eq!(event_log.lines().count(), 2);
     assert!(event_log.contains("evt_backfill_deposit"));
     assert!(event_log.contains("evt_backfill_dispute"));
+}
+
+#[tokio::test]
+async fn stripe_backfill_recovers_exact_existing_state_and_posts_once() {
+    let (stripe_base, stripe_capture) = start_mock_stripe().await;
+    let (contract_base, contract_capture) =
+        start_mock_contract(ContractFeatureMode::ExistingExactState).await;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let event_store_path = temp.path().join("stripe-events.jsonl");
+    let cursor_path = event_store_path.with_file_name("stripe-backfill-cursor.json");
+    let mut config = test_config(stripe_base, event_store_path.clone());
+    config.contract_rpc_url = contract_base;
+    config.contract_dry_run = false;
+    let state = PaygateState::try_new(
+        config,
+        OracleKeypair::from_seed_hex(&"58".repeat(32)).expect("oracle"),
+    )
+    .expect("state");
+
+    *stripe_capture.events.lock().await = vec![serde_json::from_str(&succeeded_payment_payload(
+        "evt_canonical_backfill",
+        "pi_canonical_backfill",
+    ))
+    .expect("Stripe event")];
+
+    let first = run_stripe_backfill_once(&state)
+        .await
+        .expect("canonical backfill");
+    assert_eq!(first.credited, 1);
+    assert_eq!(first.duplicates, 0);
+    assert_eq!(first.last_created, 3_600);
+
+    let cursor: Value =
+        serde_json::from_slice(&std::fs::read(&cursor_path).expect("backfill cursor"))
+            .expect("cursor JSON");
+    assert_eq!(cursor["last_created"], 3_600);
+
+    let second = run_stripe_backfill_once(&state)
+        .await
+        .expect("idempotent backfill retry");
+    assert_eq!(second.credited, 0);
+    assert_eq!(second.duplicates, 1);
+    assert_eq!(second.last_created, 3_600);
+    assert_eq!(contract_capture.feature_requests.lock().await.len(), 1);
+
+    let event_log = std::fs::read_to_string(event_store_path).expect("event log");
+    assert_eq!(event_log.lines().count(), 1);
+    assert!(event_log.contains("evt_canonical_backfill"));
 }
 
 #[tokio::test]
