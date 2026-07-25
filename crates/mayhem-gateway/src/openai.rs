@@ -38744,7 +38744,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn active_job_visibility_waits_for_cancellation_registration() {
         use tower::ServiceExt;
 
@@ -38774,16 +38774,14 @@ mod tests {
             .await
         });
 
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if state.jobs.try_lock().is_err() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("job creation reached the atomic registration section");
+        let registration_deadline = Instant::now() + Duration::from_secs(2);
+        while state.jobs.try_lock().is_ok() {
+            assert!(
+                Instant::now() < registration_deadline,
+                "job creation reached the atomic registration section"
+            );
+            std::thread::yield_now();
+        }
         drop(registration_guard);
 
         let job = match prepare
