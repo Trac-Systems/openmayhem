@@ -1,0 +1,638 @@
+# Canonical Model Cheatsheet
+
+This is the provider and operator reference for every model currently present in
+the signed canonical catalog. It is derived from
+[`catalog/models.json`](catalog/models.json), its
+[detached signature](catalog/signatures/models.json.sig), the canaries named
+by that catalog, the managed-runtime locks in
+[`python_runtime.rs`](crates/mayhem-cli/src/python_runtime.rs), and
+[`CALIBRATION.md`](docs/CALIBRATION.md).
+
+The live ledger remains authoritative for active enclave IDs, rooms, prices,
+routes, and revisions. Never copy an enclave ID or price from documentation:
+
+```bash
+mayhem models --gateway
+```
+
+## v0.2.48 runtime status
+
+The `0.2.48` application release keeps contract version 16 and does not change
+the signed catalog, enclave IDs, rooms, prices, provider identities, or the
+canonical indexer store. It adds the managed Linux/aarch64 CUDA 13 Chatterbox
+runtime, Linux llama.cpp acceleration selection, platform-aware Sulphur
+artifact admission, early Sulphur media-tool capability checks, and the
+audio/music receipt-duration correction described below.
+
+The restored sponsored Chatterbox endpoint has completed a real request.
+ACE-Step remains pending its final corrected-binary live request. The
+audio/music receipt ceiling now reserves a signed one-second encoding tolerance
+and checks billing against the measured returned bytes; that change remains
+pending the same final live proof and is not yet marked released.
+
+## How to read this document
+
+- **Hard requirement** means the signed catalog or release code enforces it.
+  Failing it prevents admission or startup.
+- **Measured guidance** reports a calibration observation. It helps size a
+  machine but is not a new admission rule, throughput promise, or exact minimum.
+- Artifact sizes are exact catalog bytes. GiB values are rounded only for
+  readability.
+- Catalog `tier: "launch"` is a publication stage, not a provider trust-tier
+  floor. Every model below may be served at Tier 1. A provider that proves a
+  higher tier is admitted at that tier; if a higher proof is unavailable or
+  fails, admission falls through to the next lower provable tier. Tier 4 is an
+  optional admin elevation, not a prerequisite for joining.
+- Providers join permissionlessly. They do not create canonical models,
+  enclaves, rooms, prices, or price brackets, and no admin manually approves a
+  provider or its payout binding.
+
+## Common provider workflow
+
+Use the exact, case-sensitive model ID printed in this document:
+
+```bash
+mayhem models --gateway
+mayhem doctor --provider-backend <backend>
+mayhem up --provider --provider-enclave <exact-model-id> --yes
+mayhem provider health --json
+mayhem models --gateway
+```
+
+`mayhem up` resolves the active admin-published enclave, downloads the immutable
+primary artifact and all signed sidecars, verifies their hashes and bindings,
+seals them, runs the signed canary surface, joins admin-created canonical rooms,
+and starts heartbeats. `HF_TOKEN` or `--hf-token-file` may authenticate and speed
+up that download; it cannot select different weights. Do not clone upstream
+weights, substitute projectors/encoders, or build an ad hoc Python environment.
+
+For a text-generation model, catalog `ctx_max` is a ceiling, not an exact
+provider setting. An explicit lower `--ctx` is preserved through heartbeat,
+routing, vouchers, receipts, and reporting. Current price brackets are:
+
+| Catalog ceiling | Required canonical brackets |
+|---|---|
+| Up to 8,192 | `le8k` |
+| 8,193 through 32,768 | `le8k`, `le32k` |
+| 32,769 through 131,072 | `le8k`, `le32k`, `le128k` |
+| 131,073 through 262,144 | `le8k`, `le32k`, `le128k`, `le256k` |
+| Above 262,144 | The preceding four plus `gt256k` |
+
+A lower context does not create a new enclave and does not need admin approval.
+If a provider changes its committed context, it signs its own leave/rejoin.
+
+### Rooms, payments, and limits
+
+- `--rooms auto` joins existing canonical rooms. Providers cannot create a
+  contract-canonical room.
+- A route is usable only where buyer and provider rails intersect and the
+  provider has a current verified payout binding for that rail.
+- Providers select rails and bind their own payout targets:
+
+  ```bash
+  mayhem provider rails set --rails fiat,tap,tnk --submit
+  mayhem provider payout set --rail tap --submit
+  mayhem provider payout set --rail tnk --submit
+  mayhem provider payout get
+  mayhem provider stripe onboard --country <CC>
+  ```
+
+- `mayhem provider stripe adopt --country <CC>` adopts an existing eligible
+  Stripe Standard account. A terminal always prints a copyable URL even when it
+  cannot open a browser. The same provider identity reuses its bindings across
+  models and rooms; another provider identity uses the signed relink flow.
+- A first payout binding activates at the next epoch; a later rotation activates
+  at epoch E+2. The provider submits the signed intent through its read-only
+  peer; the sole canonical indexer verifies and appends it.
+- Provider min-ask, utilization, concurrency, and local safety limits remain
+  provider controls. Canonical starting prices, brackets, fees, epochs, models,
+  enclaves, and rooms remain admin controls.
+
+## Runtime lock summary
+
+These are release-managed runtime identities, not commands for manual package
+installation. Full transitive hashes remain in the linked lockfiles.
+
+| Backend | Exact managed runtime |
+|---|---|
+| vLLM | `uv 0.11.29`, Python 3.12, `vllm 0.24.0`, `torch 2.11.0`, `transformers 5.12.1`, `tokenizers 0.22.2`, `safetensors 0.8.0`, `compressed-tensors 0.17.0`, `triton 3.6.0`, `av 18` |
+| MLX language/vision | `uv 0.11.29`, Python 3.12, `mlx-lm 0.31.3`, `mlx-vlm 0.6.3`, `mlx 0.32.0`, `llguidance 1.7.6`, `transformers 5.12.1`, `tokenizers 0.22.2`, `safetensors 0.8.0`, `av 18` |
+| llama.cpp media | `llama-cpp-2`/`llama-cpp-sys-2 0.1.150` from llama.cpp revision `7f15e87e3cb0f636e236243e6ee4fc2a4c357277`, with `llguidance` and `mtmd`; acceleration is compile-time CUDA, Metal, or Vulkan. Linux x86_64/aarch64 source builds select a working CUDA toolkit, then Vulkan, then CPU; `MAYHEM_LLAMA_CPP_FEATURES` preserves an explicit operator override. |
+| Transformers ASR | `uv 0.11.29`, Python 3.12, `transformers 5.14.1`, `torch 2.13.0`, `tokenizers 0.22.2`, `safetensors 0.8.0`, `numpy 2.4.6`, `soundfile 0.14.0`, `soxr 1.1.0`, `librosa 0.11.0` |
+| ACE-Step | Embedded ACE-Step `0.1.8` source revision `dce621408bee8c31b4fcf4811682eb9359e1bc94` (package `ace-step 1.5.0`, source archive SHA-256 `816a58b7cdc66b3817625dd67e7407b77c0d05e8526a70f6a43cd93889655080`, lock SHA-256 `0a9c8067b3299bfc6881a06e097ff95e55e1b7bb8f9d1f84192ac23e59b995ab`); direct locks include `accelerate 1.12.0`, `diffusers 0.37.1`, `transformers 4.57.6`, `tokenizers 0.22.2`, `safetensors 0.7.0`, `soundfile 0.13.1`, and `av 18.0.0`. Platform Torch is Windows `2.7.1+cu128`, Linux x86_64 `2.10.0+cu128`, Linux ARM64 `2.10.0+cu130`, or macOS ARM64 `2.10.0`; matching `torchaudio` and `torchvision` are lock-resolved. |
+| Sulphur CUDA | `diffusers 0.39.0`, `torch 2.9.1`, `torchvision 0.24.1`, `transformers 4.57.6`, `tokenizers 0.22.2`, `accelerate 1.12.0`, `bitsandbytes 0.49.1`, `peft 0.18.1`, `safetensors 0.8.0`, `gguf 0.19.0`, `huggingface-hub 0.36.0`, `av 16.1.0`, `numpy 2.2.6`, `Pillow 12.1.0`, `tqdm 4.67.1`; CUDA 13.0 wheel family |
+| Sulphur MLX | Embedded LTX core/pipelines `0.14.19` from revision `e1838a855bfd1640135c424c96cb27a0c0ad150e`; `mlx`, `mlx-lm`, and `mlx-metal 0.31.1`, `transformers 5.3.0`, `tokenizers 0.22.2`, `safetensors 0.7.0`, `numpy 2.4.3`, `Pillow 12.1.1` |
+| Chatterbox | Python 3.11; `chatterbox-tts 0.1.7`, `conformer 0.3.2`, `diffusers 0.29.0`, `gradio 6.8.0`, `librosa 0.11.0`, `numpy 1.26.4`, `omegaconf 2.3.0`, `pykakasi 2.3.0`, `pyloudnorm 0.2.0`, Perth revision `ce86c49d029f42272c1902eccb675556b9ed2330`, `s3tokenizer 0.3.0`, `safetensors 0.5.3`, `spacy-pkuseg 1.0.1`, `transformers 5.2.0`; CPU/MPS and x86 CUDA retain their frozen platform flavors, while Linux/aarch64 CUDA uses `torch 2.9.1+cu130`, `torchaudio 2.9.1`, and CUDA 13.0 from its separate hash-pinned lock |
+
+The authoritative full locks are
+[`python_runtime.rs`](crates/mayhem-cli/src/python_runtime.rs),
+[`sulphur-runtime-requirements.txt`](crates/mayhem-cli/resources/python/sulphur-runtime-requirements.txt),
+[`sulphur-mlx-runtime-requirements.txt`](crates/mayhem-cli/resources/python/sulphur-mlx-runtime-requirements.txt),
+and the three
+[`chatterbox-runtime-*`](crates/mayhem-cli/resources/python/) lock
+directories. Stable-diffusion.cpp is the one external engine below: its
+executable version is not release-pinned, so this document does not invent one.
+
+## Canonical catalog at a glance
+
+| Exact model ID | Class | Canonical backend/artifact | Tier floor/fallback | Catalog RAM | Full-offload guidance | Download |
+|---|---|---|---|---:|---:|---:|
+| `hauhaucs/qwen3.6-35b-a3b-uncensored` | Text generation | vLLM / NVFP4 | Tier 1; use highest proved tier | 48 GiB | 24 GiB NVIDIA | 23,374,279,873 B (21.77 GiB) |
+| `google/gemma-4-E4B-it` | Text generation | llama.cpp / Q4_K_M GGUF | Tier 1; use highest proved tier | 12 GiB | 8 GiB | 6,326,841,504 B (5.89 GiB) |
+| `tongyi/z-image-turbo` | Image generation | stable-diffusion.cpp / Q4_K GGUF | Tier 1; use highest proved tier | 16 GiB | 8 GiB | 6,696,835,812 B (6.24 GiB) |
+| `nvidia/parakeet-tdt-0.6b-v3` | Speech to text | Transformers safetensors | Tier 1; use highest proved tier | 8 GiB | 4 GiB | 2,509,473,204 B (2.34 GiB) |
+| `acestep/ace-step-1.5` | Music generation | ACE-Step safetensors composite | Tier 1; use highest proved tier | 16 GiB | 20 GiB | 10,092,101,191 B (9.40 GiB) |
+| `prism-ml/Ternary-Bonsai-27B` | Text generation | llama.cpp Q2_0 or MLX 2-bit | Tier 1; use highest proved tier | 16 GiB | 8 GiB | 7.26 GiB GGUF / 7.94 GiB MLX |
+| `SulphurAI/Sulphur-2-base` | Video generation | CUDA GGUF composition or MLX Q4 | Tier 1; use highest proved tier | 64 GiB | See measured guidance | 40.66 GiB CUDA / 44.32 GiB MLX |
+| `ResembleAI/chatterbox` | Text to speech | PyTorch safetensors | Tier 1; use highest proved tier | 8 GiB | 6 GiB | 3,191,966,992 B (2.97 GiB) |
+| `huihui-ai/Huihui-Agents-A1-abliterated` | Text generation | llama.cpp Q4_K GGUF | Tier 1; use highest proved tier | 32 GiB | 32 GiB | 22,069,579,360 B (20.55 GiB) |
+
+The RAM and full-offload columns are catalog admission/guidance fields. Model
+weights, runtime environments, caches, outputs, and build artifacts require
+additional disk and memory headroom.
+
+## Qwen 3.6 35B-A3B uncensored
+
+**Selector and source**
+
+- Model: `hauhaucs/qwen3.6-35b-a3b-uncensored`
+- Backend/artifact: `vllm` / `nvfp4`
+- Admin mirror:
+  `TracNetwork/mayhem-catalog-hauhaucs-qwen3-6-35b-a3b-uncensored-NVFP4@58722d97ba2d93c32740f409efc9155b784edb95`
+- Primary `model.safetensors`: 23,354,242,416 bytes, plus eight signed
+  configuration, tokenizer, processor, template, and recipe sidecars.
+- Canary:
+  [`canary-launch-v2.json`](catalog/canaries/canary-launch-v2.json)
+
+**Hard requirements and surface**
+
+- Linux NVIDIA Blackwell is the current canonical path; compute capability must
+  be at least 12.0. Windows, CPU, Apple Metal, AMD, and pre-Blackwell NVIDIA are
+  unsupported for this artifact.
+- 48 GiB RAM, 24 GiB NVIDIA dedicated or unified memory, and AVX2 or NEON.
+- vLLM preflight requires a CUDA toolkit containing `bin/nvcc`; its managed
+  bootstrap requires at least 8 GiB free disk.
+- Endpoints: OpenAI chat completions, completions, responses, and HF multimodal.
+  Input is text, image, or video; output is text. Streaming, JSON, tools, and
+  multiple tool calls are supported.
+- Context ceiling: 262,144 tokens; brackets `le8k`, `le32k`, `le128k`,
+  `le256k`.
+- Sampling ranges: temperature `0..2`, top-p `0.000001..1`, top-k
+  `0..1000000`, min-p `0..1`, frequency/presence penalty `-2..2`, seed
+  `0..4294967295`. Defaults are temperature `1`, top-p `0.95`, top-k `20`,
+  min-p `0`, presence penalty `1.5`. `thinking_mode` is
+  `enabled|disabled` (default enabled); `thinking_history` is
+  `latest_only|preserve` (default latest only).
+
+**Measured guidance**
+
+- Signed modality evidence uses a 1-megapixel image and 16 video frames.
+- Calibration process RSS was about 2.40 GiB, with roughly 12 MiB incremental
+  image and 9 MiB incremental video working RSS. This excludes the meaningfully
+  larger accelerator allocation and does not lower the 48/24 GiB admission
+  floors.
+
+**Start**
+
+```bash
+mayhem doctor --provider-backend vllm
+mayhem up --provider --provider-enclave hauhaucs/qwen3.6-35b-a3b-uncensored --yes
+```
+
+Do not substitute another Qwen checkpoint, quantization, or CPU fallback.
+
+## Gemma 4 E4B IT
+
+**Selector and source**
+
+- Model: `google/gemma-4-E4B-it`
+- Backend/artifact: `llama.cpp` / `gguf-q4_k_m`
+- Admin mirror:
+  `TracNetwork/mayhem-catalog-google-gemma-4-E4B-it-GGUF@68772908c9431af9c9bfc3cee0ebefcd74995891`
+- Upstream pin:
+  `lmstudio-community/gemma-4-E4B-it-GGUF@53a691ddc52708042c56f80cdaf47f8a1daf051e`
+- Primary GGUF: 5,335,289,664 bytes. Mandatory BF16 multimodal projector:
+  991,551,840 bytes.
+- Canary:
+  [`canary-gemma4-launch-v1.json`](catalog/canaries/canary-gemma4-launch-v1.json)
+
+**Hard requirements and surface**
+
+- Linux, Windows, or macOS CPU; CUDA, Metal, or Vulkan only when compiled into
+  the installed Mayhem build.
+- 12 GiB RAM and AVX2 or NEON. The 8 GiB VRAM value is a full-offload target,
+  not a CPU admission minimum.
+- Endpoints: OpenAI chat completions, completions, responses, and HF multimodal.
+  Text, image, audio, and video input produce text; JSON and tools are supported.
+- Context ceiling: 131,072 tokens; brackets `le8k`, `le32k`, `le128k`.
+- Signed audio input is WAV up to 30 seconds. Signed video input is 1 fps up to
+  60 frames.
+- Defaults: temperature `1`, top-p `0.95`, top-k `64`;
+  `thinking_mode=disabled`. `visual_token_budget` is exactly
+  `budget_70|budget_140|budget_280|budget_560|budget_1120`, default
+  `budget_280`.
+
+**Measured guidance**
+
+- Calibration dedicated-memory baselines were about 4.49-4.88 GiB. Peaks were
+  about 7.20-7.61 GiB for the 1-megapixel image, 30-second audio, and 60-frame
+  video cases. These are proof-host observations, not portable guarantees.
+
+**Start**
+
+```bash
+mayhem doctor --provider-backend llama.cpp
+mayhem up --provider --provider-enclave google/gemma-4-E4B-it --yes
+```
+
+The signed BF16 projector is mandatory. Do not pair the GGUF with another
+projector.
+
+## Z-Image Turbo
+
+**Selector and source**
+
+- Model: `tongyi/z-image-turbo`
+- Backend/artifact: `stable-diffusion.cpp` / `gguf-q4_k`
+- Admin mirror:
+  `TracNetwork/mayhem-catalog-tongyi-z-image-turbo-GGUF@b0110258385798d6e5b9bea626f6560607ce17ad`
+- Upstream pin:
+  `leejet/Z-Image-Turbo-GGUF@c61c0e422dc8b541b7548cf33a4ef8302b0f8085`
+- Primary GGUF: 3,864,250,304 bytes. Mandatory Qwen text encoder:
+  2,497,281,120 bytes. Mandatory VAE: 335,304,388 bytes.
+- Canary:
+  [`canary-z-image-launch-v1.json`](catalog/canaries/canary-z-image-launch-v1.json)
+
+**Hard requirements and surface**
+
+- Linux, Windows, or macOS CPU; CUDA, Metal, ROCm, or Vulkan when the matching
+  external stable-diffusion.cpp build is installed.
+- 16 GiB RAM. The 8 GiB VRAM value is a full-offload target.
+- `sd-cli` must be on `PATH` or named by
+  `MAYHEM_STABLE_DIFFUSION_CPP_BIN`; a sibling `sd-server` is required. Mayhem
+  pins and verifies model files but does not pin or install that external
+  executable.
+- Endpoints: OpenAI image generations and HF text-to-image.
+- Prompt length `1..32000`; optional negative prompt `0..32000`; `n=1..4`;
+  `response_format=b64_json`; width/height `576..2048`, each divisible by 16,
+  default `1024x1024`; steps `7..9`, default `9`; guidance `0..49`, default
+  `0`; shift `1..10`, default `3`; seed `0..4294967295`, default `42`.
+- Signed adapter semantics map public steps by `-1` and guidance by `+1`.
+  Providers must not alter those offsets.
+
+**Measured guidance**
+
+- The 1-megapixel canary process RSS rose from about 294 MiB to 683 MiB.
+  Model weights and accelerator allocations are additional.
+- One image generation is admitted in flight per calibrated worker.
+
+**Start**
+
+```bash
+mayhem doctor --provider-backend stable-diffusion.cpp
+mayhem up --provider --provider-enclave tongyi/z-image-turbo --yes
+```
+
+Do not download an arbitrary engine binary or substitute the signed text encoder
+or VAE.
+
+## Parakeet TDT 0.6B v3
+
+**Selector and source**
+
+- Model: `nvidia/parakeet-tdt-0.6b-v3`
+- Backend/artifact: `transformers-asr` / safetensors
+- Admin mirror:
+  `TracNetwork/mayhem-catalog-nvidia-parakeet-tdt-0-6b-v3-Transformers@a83f71f1a8a1cf099b5dbe23262c5028ad931086`
+- Upstream pin:
+  `nvidia/parakeet-tdt-0.6b-v3@7c35754d166cca382ad1e53e68b01e7c575f3a1d`
+- Primary weights: 2,508,311,120 bytes plus five signed processor, tokenizer,
+  and configuration sidecars.
+- Canary:
+  [`canary-stt-launch-v2.json`](catalog/canaries/canary-stt-launch-v2.json)
+
+**Hard requirements and surface**
+
+- Linux, Windows, or macOS CPU; CUDA on Linux/Windows; Metal/MPS on macOS.
+- 8 GiB RAM and AVX2 or NEON. The 4 GiB VRAM value is a full-offload target.
+- Managed runtime bootstrap needs 8 GiB free disk.
+- Endpoints: OpenAI audio transcription and HF ASR.
+- Input is bounded 16 kHz mono WAV or FLAC. Automatic recognition covers 25
+  signed languages, punctuation/capitalization, overlap-chunked long audio,
+  and word/segment timestamps.
+- OpenAI formats:
+  `json|text|srt|verbose_json|vtt`. HF timestamps:
+  `false|true|word|segment`.
+- Forced language, prompt conditioning, sampling controls, and streaming
+  transcription are unsupported. Concurrency is one transcription.
+
+**Measured guidance**
+
+- The signed long-audio proof is 130 seconds.
+- Calibration process RSS rose by roughly 24 MiB; loaded weights and backend
+  allocations are additional.
+
+**Start**
+
+```bash
+mayhem doctor --provider-backend transformers-asr
+mayhem up --provider --provider-enclave nvidia/parakeet-tdt-0.6b-v3 --yes
+```
+
+The portable provider artifact is the signed Transformers mirror, not an
+upstream NeMo checkout.
+
+## ACE-Step 1.5
+
+**Selector and source**
+
+- Model: `acestep/ace-step-1.5`
+- Backend/artifact: `ace-step` / signed safetensors composite
+- Admin mirror:
+  `TracNetwork/mayhem-catalog-ACE-Step-Ace-Step1-5-SFT@f41443d7171a03181ada08912780b0449e8ff7fe`
+- Upstream SFT pin:
+  `ACE-Step/acestep-v15-sft@c410d249e71ea9385a7b586865e65b1473e1098d`;
+  all embedding, language-model, VAE, code, and latent components have their own
+  signed pins.
+- Primary DiT: 4,787,825,604 bytes. Total primary plus 25 sidecars:
+  10,092,101,191 bytes.
+- Canary:
+  [`canary-music-launch-v1.json`](catalog/canaries/canary-music-launch-v1.json)
+
+**Hard requirements and surface**
+
+- CPU: Linux x86_64/ARM64, Windows x86_64, macOS x86_64/ARM64. CUDA:
+  Linux/Windows. Metal/MPS: Apple Silicon.
+- 16 GiB RAM, 20 GiB VRAM for full offload, AVX2 or NEON. Current preflight
+  permits CUDA CPU/INT8 partial offload from 4 GiB usable VRAM and MPS from
+  16 GiB available unified memory. Runtime bootstrap needs 24 GiB free disk.
+- Endpoints: OpenAI music generation, OpenAI audio generation, and HF
+  text-to-audio.
+- Full music modes:
+  `text2music|cover|cover-nofsq|repaint`. Prompt/caption composed maximum is 512
+  characters; lyrics maximum is 4,096. Source/reference input accepts signed
+  AAC, FLAC, M4A, MP4, MPEG, MP3, OGG, Opus, and WAV.
+- Duration is auto/`-1` or `10..600` seconds; steps `1..200` (default 50);
+  guidance `1..15` (default 7); `n=1..8` (default 2); seed
+  `-1..4294967295`; BPM `30..300`. Key, time signature, ODE/SDE,
+  Euler/Heun, cover/repaint, normalization, and fade controls are signed.
+  Output is `flac|opus|aac|wav|wav32|mp3`.
+- The simpler audio/HF families expose their narrower signed subset.
+  Concurrency is one generation.
+
+**Measured guidance**
+
+- The launch canary produces 10 seconds of audio.
+- Calibration process RSS rose from about 3.30 GiB to 4.41 GiB, an incremental
+  1.11 GiB. Backend/device allocations still need headroom.
+
+**Start**
+
+```bash
+mayhem doctor --provider-backend ace-step
+mayhem up --provider --provider-enclave acestep/ace-step-1.5 --yes
+```
+
+The embedded source and managed runtime are part of the measured enclave. Do
+not enable arbitrary remote code or replace individual composite components.
+
+## Ternary Bonsai 27B
+
+**Selector and source**
+
+- Model: `prism-ml/Ternary-Bonsai-27B`
+- GGUF variant: `llama.cpp` / `gguf-q2_0`; mirror
+  `TracNetwork/mayhem-catalog-prism-ml-Ternary-Bonsai-27B-GGUF@49b3f8175fc1b066110dce26e3e76313b2c04d93`,
+  upstream
+  `prism-ml/Ternary-Bonsai-27B-gguf@abbae723028d71be674e71e1a71201a6f43fab22`.
+  Primary: 7,165,121,600 bytes; Q8 projector: 629,246,880 bytes.
+- MLX variant: `mlx` / `mlx-2bit`; mirror
+  `TracNetwork/mayhem-catalog-prism-ml-Ternary-Bonsai-27B-MLX-2bit@2935ee5921feb4b0effddeedc68bf0b7babb419b`,
+  upstream
+  `prism-ml/Ternary-Bonsai-27B-mlx-2bit@70f75f3ad081ab840a42f3304c02c27e7f89bfb7`.
+  Total: 8,521,049,516 bytes.
+- Canary:
+  [`canary-bonsai-launch-v1.json`](catalog/canaries/canary-bonsai-launch-v1.json)
+
+**Hard requirements and surface**
+
+- GGUF: Linux, Windows, or macOS CPU, plus a compiled CUDA, Metal, or Vulkan
+  accelerator. MLX: Apple Silicon only.
+- 16 GiB RAM, 8 GiB VRAM full-offload target, AVX2 or NEON. MLX bootstrap needs
+  2 GiB free disk; llama.cpp media bootstrap needs 1 GiB.
+- Endpoints: OpenAI chat completions, completions, responses, and HF
+  multimodal. Input is text, image, or video; output is text. JSON and tools are
+  supported.
+- Context ceiling: 262,144 tokens; brackets `le8k`, `le32k`, `le128k`,
+  `le256k`.
+- Defaults: temperature `0.7`, top-p `0.95`, top-k `20`.
+  `thinking_mode=enabled|disabled` (default enabled);
+  `thinking_history=latest_only|preserve`.
+- The DGX Spark path is intentionally unsupported because the required
+  temperature-zero identity proof failed. Do not reinterpret that as a
+  network-wide NVIDIA ban.
+
+**Measured guidance**
+
+- Signed image evidence uses 1 megapixel; signed video evidence uses 16 frames.
+- MLX calibration RSS was about 7.98 GiB baseline and 8.02 GiB peak. GGUF
+  process RSS was about 1.08-1.11 GiB baseline and 1.36 GiB peak; memory-mapped
+  weights and device allocations make process RSS alone an incomplete sizing
+  figure.
+- One generation is admitted in flight.
+
+**Start**
+
+```bash
+mayhem doctor --provider-backend llama.cpp
+mayhem up --provider --provider-enclave prism-ml/Ternary-Bonsai-27B --yes
+```
+
+On Apple Silicon, select/preflight `mlx` instead when that is the intended
+canonical artifact. Never mix a projector or primary across the two variants.
+
+## Sulphur 2 base
+
+**Selector and source**
+
+- Model: `SulphurAI/Sulphur-2-base`
+- CUDA variant: `sulphur` / `gguf-q4_k_m` composition; mirror
+  `TracNetwork/mayhem-catalog-SulphurAI-Sulphur-2-base-GGUF@659728cebbcb4cc3c48f1ff3a6d237f4c4357aa6`,
+  upstream
+  `SulphurAI/Sulphur-2-base@875e886e556b955d21149316fd631cc121db6cc1`.
+  Total: 43,657,590,667 bytes.
+- MLX variant: `sulphur-mlx` / `mlx-q4` composition; mirror
+  `TracNetwork/mayhem-catalog-SulphurAI-Sulphur-2-base-MLX-4bit@72d1f4293e8b7ac913618cc146653acea15845a4`,
+  upstream
+  `MLXBits/sulphur-2-distill-mlx-q4@d210a0937cac3464ef80c74806e886beddf19a8e`.
+  Total: 47,589,019,748 bytes.
+- Canary:
+  [`canary-sulphur-calibration-v3.json`](catalog/canaries/canary-sulphur-calibration-v3.json)
+
+**Hard requirements and surface**
+
+- CUDA variant: Linux or Windows NVIDIA, compute capability at least 8.9.
+  MLX variant: Apple Silicon. CPU-only serving is unsupported.
+- 64 GiB RAM. The catalog does not invent a portable VRAM minimum; use the
+  measured allocations below plus operating-system and runtime headroom.
+- `ffmpeg` and `ffprobe` are required. Their exact detected versions are
+  recorded in evidence, but no universal executable version is hard-pinned.
+  Mayhem resolves both tools and checks the required codecs, demuxers, muxers,
+  and version evidence before model load, with an actionable error before a
+  long initialization begins.
+- Endpoints: OpenAI video generation and HF text-to-video. Text-to-video and
+  bounded image-conditioned video are supported, with synchronized audio.
+- Prompt `1..4096`; negative prompt `0..4096` on CUDA/GGUF only (MLX requires
+  it empty); width/height `256..2048`, divisible by 64; fps `1..50`; `n=1`;
+  frames are `9 + 8k` through 497; duration `1..10` seconds; seed
+  `0..4294967295`; up to 16 signed conditions; selectable prompt enhancer.
+- The distilled schedule is fixed at 8 video steps plus 3 audio steps. There
+  is no user step control. One generation is admitted in flight.
+
+**Measured guidance**
+
+- MLX proof: about 17.83 GiB baseline and 27.34 GiB peak for a 6-second,
+  121-frame generation.
+- CUDA proof: about 45.41 GiB baseline and 50.79 GiB peak.
+- These are backend-specific calibration observations, not interchangeable
+  admission floors or a claim that every prompt uses the same memory.
+
+**Start**
+
+```bash
+mayhem doctor --provider-backend sulphur
+mayhem up --provider --provider-enclave SulphurAI/Sulphur-2-base --yes
+```
+
+The doctor selector remains `sulphur`; Mayhem chooses its managed
+`sulphur-mlx` runtime for the Apple Silicon artifact. CUDA and MLX are
+canonical variants in the same model market only when their signed capability
+and canary bindings match; never cross-mix their sidecars or runtime
+environments.
+
+## Chatterbox original-English TTS
+
+**Selector and source**
+
+- Model: `ResembleAI/chatterbox`
+- Backend/artifact: `chatterbox` / PyTorch safetensors
+- Admin mirror:
+  `TracNetwork/mayhem-catalog-ResembleAI-chatterbox-PyTorch@0adbad4d3515285bdcdc3d503759e7110e664201`
+- Upstream pin:
+  `ResembleAI/chatterbox@5bb1f6ee58e50c3b8d408bc82a6d3740c2db6e18`;
+  embedded runtime source revision
+  `59bc590b3cad826e5d5987745bf6844627a21ad5`; Perth watermark revision
+  `ce86c49d029f42272c1902eccb675556b9ed2330`.
+- Primary: 2,129,653,744 bytes. Mandatory `ve.safetensors`,
+  `s3gen.safetensors`, `tokenizer.json`, and `conds.pt` bring the total to
+  3,191,966,992 bytes.
+- Canary:
+  [`canary-chatterbox-launch-v1.json`](catalog/canaries/canary-chatterbox-launch-v1.json)
+
+**Hard requirements and surface**
+
+- Linux/Windows/macOS CPU; CUDA on Linux/Windows x86_64; Metal/MPS on Apple
+  Silicon. Linux ARM64 supports the frozen CUDA 13 runtime and falls back to
+  the frozen CPU runtime when CUDA is unavailable. Intel macOS remains
+  CPU-only; Windows ARM64 CUDA is unsupported.
+- 8 GiB RAM; 6 GiB full-offload target. Runtime bootstrap needs 16 GiB free
+  disk.
+- Endpoints: OpenAI audio speech and HF text-to-speech. Output is mono 24 kHz
+  WAV with Perth watermarking.
+- Input length `1..16384`; `voice` is exactly `default`. Zero-shot voice cloning
+  uses a bounded base64 WAV `reference_audio`; it replaces the need for a
+  built-in voice library.
+- Controls: exaggeration `0.25..2` (default 0.5), cfg weight `0..1` (0.5),
+  temperature `0.05..5` (0.8), min-p `0..1` (0.05), top-p `0..1` (1),
+  repetition penalty `1..2` (1.2), seed `0..4294967295` (7).
+- One synthesis is admitted in flight.
+
+**Measured guidance**
+
+- The signed launch clip is 7 seconds.
+- Calibration RSS rose from about 1.48 GiB to 2.84 GiB, an incremental
+  1.36 GiB, excluding other device/runtime headroom.
+
+**Start**
+
+```bash
+mayhem doctor --provider-backend chatterbox
+mayhem up --provider --provider-enclave ResembleAI/chatterbox --yes
+```
+
+Do not substitute the multilingual or turbo checkpoint or invent named voices.
+An explicit CUDA request still fails closed when the matching frozen platform
+runtime or a usable NVIDIA device is absent.
+
+## Huihui Agents A1 abliterated
+
+**Selector and source**
+
+- Model: `huihui-ai/Huihui-Agents-A1-abliterated`
+- Backend/artifact: `llama.cpp` / `gguf-q4_k`
+- Admin mirror:
+  `TracNetwork/mayhem-catalog-huihui-ai-Huihui-Agents-A1-abliterated-GGUF@59d0dfbbdb07138fb53fc8672cd04261efa3065e`
+- Upstream pin:
+  `huihui-ai/Huihui-Agents-A1-abliterated-GGUF@9189aa287362d13d803cb0d21335c0b0fd5d191c`
+- Primary GGUF: 21,166,757,536 bytes. Mandatory BF16 projector:
+  902,821,824 bytes.
+- Canary:
+  [`canary-a1-launch-v1.json`](catalog/canaries/canary-a1-launch-v1.json)
+
+**Hard requirements and surface**
+
+- Linux, Windows, or macOS CPU; CUDA, Metal, or Vulkan when compiled into the
+  installed Mayhem build.
+- 32 GiB RAM, 32 GiB full-offload target, AVX2 or NEON.
+- Endpoints: OpenAI chat completions, completions, responses, and HF
+  multimodal. Text, image, and video input produce text. JSON, automatic and
+  required tools, and multiple tool calls in one turn are supported.
+- Context ceiling: 262,144 tokens; brackets `le8k`, `le32k`, `le128k`,
+  `le256k`.
+- Defaults: temperature `0.85`, top-p `0.95`, top-k `20`, min-p `0`, repeat
+  penalty `1`, presence penalty `1.1`.
+  `thinking_mode=enabled|disabled`; no signed thinking-history or
+  low/medium/high effort control is advertised.
+- Signed video input is 4 through 64 frames. The larger upstream claim is not
+  exposed because the canonical llama.cpp decoder proof is bounded at 64.
+
+**Measured guidance**
+
+- Signed image evidence uses 1 megapixel; signed video evidence uses 4 frames.
+- Calibration process-tree RSS was about 19.51 GiB baseline and 24.24 GiB peak,
+  an incremental 4.73 GiB. Device and OS headroom remain necessary.
+- One generation is admitted in flight.
+
+**Start**
+
+```bash
+mayhem doctor --provider-backend llama.cpp
+mayhem up --provider --provider-enclave huihui-ai/Huihui-Agents-A1-abliterated --yes
+```
+
+The BF16 projector is mandatory. Do not advertise unsupported effort levels or
+replace the signed projector.
+
+## Verification and troubleshooting
+
+After startup, require all of the following rather than treating process
+existence as success:
+
+```bash
+mayhem provider health --json
+mayhem models --gateway
+```
+
+- `self_test.ok=true`
+- every advertised `modality_health` row has `ok=true`
+- at least one active serve and a fresh heartbeat
+- gateway health is true and `route_count` is greater than zero for a
+  compatible buyer rail
+- the exact model/provider appears in the local `/v1/models` response
+
+A failed higher-tier proof should lower the provider tier, not block Tier-1
+joining. A missing canonical price bracket, inactive enclave, absent room,
+artifact/signature mismatch, unsupported backend/platform pair, or failed
+signed canary is a real admission failure. Report that exact reason; do not
+repair it by changing a model ID, bypassing signed artifacts, creating a local
+room, weakening attestation, or asking an admin to approve the provider.

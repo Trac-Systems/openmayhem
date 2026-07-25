@@ -34,7 +34,9 @@ jobs:
           rustup default 1.89.0
 
       - name: Sellable surface audit
-        run: node scripts/i3-e15-sellable-surface-audit.mjs
+        run: |
+          node scripts/tests/i3-e15-sellable-surface-audit.test.mjs
+          node scripts/i3-e15-sellable-surface-audit.mjs
 
       - name: Check formatting
         run: cargo fmt --all -- --check

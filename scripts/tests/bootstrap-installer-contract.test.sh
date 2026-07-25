@@ -99,6 +99,98 @@ grep -F 'xattr -p com.apple.quarantine "$tmp"' <<<"$shell_source_binary" >/dev/n
 if grep -F 'spctl' "$ROOT_DIR/install.sh" >/dev/null; then
   fail "Unix source install incorrectly requires Gatekeeper distribution approval"
 fi
+
+installer_acceleration_functions="$(
+  awk '
+    /^llama_cpp_feature_name\(\) \{/ { capture = 1 }
+    /^install_source_binary\(\) \{/ { capture = 0 }
+    capture { print }
+  ' "$ROOT_DIR/install.sh"
+)"
+for function_name in \
+  llama_cpp_feature_name \
+  llama_cpp_cuda_toolkit_usable \
+  llama_cpp_vulkan_toolkit_usable \
+  linux_llama_cpp_features; do
+  grep -F "${function_name}() {" <<<"$installer_acceleration_functions" >/dev/null ||
+    fail "Unix source installer is missing $function_name"
+done
+grep -F '"$resolved" --version' <<<"$installer_acceleration_functions" >/dev/null ||
+  fail "Unix source installer accepts an nvcc path without executing it"
+grep -F 'pkg-config --exists vulkan' <<<"$installer_acceleration_functions" >/dev/null ||
+  fail "Unix source installer does not validate Vulkan development metadata"
+
+assert_installer_acceleration() {
+  local expected="$1"
+  local target_arch="$2"
+  local host_arch="$3"
+  local cuda_status="$4"
+  local vulkan_status="$5"
+  local configured="${6:-}"
+  local actual
+
+  actual="$(
+    (
+      eval "$installer_acceleration_functions"
+      die() {
+        printf 'error: %s\n' "$*" >&2
+        exit 1
+      }
+      llama_cpp_cuda_toolkit_usable() {
+        return "$cuda_status"
+      }
+      llama_cpp_vulkan_toolkit_usable() {
+        return "$vulkan_status"
+      }
+      if [[ -n "$configured" ]]; then
+        export MAYHEM_LLAMA_CPP_FEATURES="$configured"
+      else
+        unset MAYHEM_LLAMA_CPP_FEATURES
+      fi
+      linux_llama_cpp_features Linux "$target_arch" "$host_arch"
+    )
+  )"
+  [[ "$actual" == "$expected" ]] ||
+    fail "Unix source acceleration for $target_arch selected '$actual', expected '$expected'"
+}
+
+for linux_arch in x86_64 aarch64; do
+  assert_installer_acceleration \
+    "mayhem-cli/llama-cpp-cuda" "$linux_arch" "$linux_arch" 0 0
+  assert_installer_acceleration \
+    "mayhem-cli/llama-cpp-vulkan" "$linux_arch" "$linux_arch" 1 0
+  assert_installer_acceleration \
+    "" "$linux_arch" "$linux_arch" 1 1
+  assert_installer_acceleration \
+    "" "$linux_arch" "$linux_arch" 0 0 cpu
+done
+assert_installer_acceleration "" x86_64 aarch64 0 0
+assert_installer_acceleration \
+  "mayhem-cli/llama-cpp-vulkan" x86_64 aarch64 0 0 vulkan
+
+if (
+  eval "$installer_acceleration_functions"
+  die() { exit 1; }
+  llama_cpp_cuda_toolkit_usable() { return 1; }
+  llama_cpp_vulkan_toolkit_usable() { return 0; }
+  MAYHEM_LLAMA_CPP_FEATURES=cuda \
+    linux_llama_cpp_features Linux x86_64 x86_64
+) >/dev/null 2>&1; then
+  fail "Unix source installer accepted an explicit CUDA build without working nvcc"
+fi
+
+shell_source_build="$(
+  sed -n '/^install_from_source() {/,/^}/p' "$ROOT_DIR/install.sh"
+)"
+grep -F 'linux_llama_cpp_features Linux "$(uname -m)" "$(uname -m)"' \
+  <<<"$shell_source_build" >/dev/null ||
+  fail "Unix source build does not select Linux llama.cpp acceleration"
+grep -F 'cargo_args+=(--features "$llama_cpp_features")' \
+  <<<"$shell_source_build" >/dev/null ||
+  fail "Unix source build does not pass selected llama.cpp features to Cargo"
+grep -F 'mayhem-cli/llama-cpp-metal' <<<"$shell_source_build" >/dev/null ||
+  fail "Unix source acceleration change removed the existing macOS Metal build"
+
 grep -F '"$INSTALL_DIR/mayhem" --version' "$ROOT_DIR/install.sh" >/dev/null ||
   fail "Unix installer does not execute the installed binary version check"
 

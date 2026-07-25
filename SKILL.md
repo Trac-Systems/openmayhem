@@ -20,6 +20,19 @@ The CLI binary is `mayhem`. The network runs on Trac. Prices float on an automat
 Pay by card (Stripe/fiat), or on-chain via **TAP** (Ethereum ERC-20) or **TNK** (Trac native). The
 gateway is loopback-only; a public ledger records prices, receipts, settlements.
 
+Before selecting or serving a model, read the canonical
+**[`MODEL-CHEATSHEET.md`](MODEL-CHEATSHEET.md)**. It records every current exact model
+selector, signed artifact, endpoint and modality surface, supported backend/platform pair, runtime
+pin, resource floor, measured guidance, unsupported combination, and provider start command. Live
+enclave IDs, rooms, routes, and prices must still come from `mayhem models --gateway`.
+
+When one host will serve multiple models, start their provider workers **serially**. Wait for each
+worker to finish artifact verification, model load, functional canary, and fresh-heartbeat
+stabilization before admitting and starting the next worker. Concurrent startup can overlap
+transient load headroom and cause an OOM even when the models fit together at steady state. After
+each worker settles, rerun `mayhem doctor` and `mayhem provider health --json`; never bypass an
+aggregate admission refusal or compensate with an undocumented memory override.
+
 ---
 
 ## 2. PRIME DIRECTIVES (read before doing anything)

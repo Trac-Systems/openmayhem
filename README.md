@@ -14,6 +14,8 @@ Community: **[r/Open_Mayhem](https://www.reddit.com/r/Open_Mayhem/)** — setup 
 
 Models: **[huggingface.co/TracNetwork](https://huggingface.co/TracNetwork)** — the network's Hugging Face account; every served model is mirrored there and the signed catalog is published from it.
 
+Model cheatsheet: **[MODEL-CHEATSHEET.md](MODEL-CHEATSHEET.md)** — exact canonical model IDs, artifacts, endpoints, platform/backend support, runtime pins, resource guidance, controls, and provider commands.
+
 ```text
 your OpenAI client ──▶ local gateway (127.0.0.1) ──▶ encrypted P2P session ──▶ a provider's machine
                                      │                                                │

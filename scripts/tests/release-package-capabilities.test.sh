@@ -20,6 +20,96 @@ expect_failure() {
   fi
 }
 
+assert_release_acceleration() {
+  local expected="$1"
+  local target_arch="$2"
+  local host_arch="$3"
+  local cuda_status="$4"
+  local vulkan_status="$5"
+  local configured="${6:-}"
+  local actual
+
+  actual="$(
+    (
+      llama_cpp_cuda_toolkit_usable() {
+        return "$cuda_status"
+      }
+      llama_cpp_vulkan_toolkit_usable() {
+        return "$vulkan_status"
+      }
+      if [[ -n "$configured" ]]; then
+        export MAYHEM_LLAMA_CPP_FEATURES="$configured"
+      else
+        unset MAYHEM_LLAMA_CPP_FEATURES
+      fi
+      linux_llama_cpp_features Linux "$target_arch" "$host_arch"
+    )
+  )"
+  [[ "$actual" == "$expected" ]] ||
+    fail "release acceleration for $target_arch selected '$actual', expected '$expected'"
+}
+
+for linux_arch in x86_64 aarch64; do
+  assert_release_acceleration \
+    "mayhem-cli/llama-cpp-cuda" "$linux_arch" "$linux_arch" 0 0
+  assert_release_acceleration \
+    "mayhem-cli/llama-cpp-vulkan" "$linux_arch" "$linux_arch" 1 0
+  assert_release_acceleration \
+    "" "$linux_arch" "$linux_arch" 1 1
+  assert_release_acceleration \
+    "" "$linux_arch" "$linux_arch" 0 0 cpu
+done
+assert_release_acceleration "" aarch64 x86_64 0 0
+assert_release_acceleration \
+  "mayhem-cli/llama-cpp-vulkan" aarch64 x86_64 0 0 vulkan
+
+if (
+  llama_cpp_cuda_toolkit_usable() { return 1; }
+  llama_cpp_vulkan_toolkit_usable() { return 0; }
+  MAYHEM_LLAMA_CPP_FEATURES=cuda \
+    linux_llama_cpp_features Linux x86_64 x86_64
+) >/dev/null 2>&1; then
+  fail "release packaging accepted an explicit CUDA build without working nvcc"
+fi
+
+grep -F '"$resolved" --version' "$ROOT_DIR/scripts/package-release.sh" >/dev/null ||
+  fail "release packaging accepts an nvcc path without executing it"
+grep -F 'pkg-config --exists vulkan' "$ROOT_DIR/scripts/package-release.sh" >/dev/null ||
+  fail "release packaging does not validate Vulkan development metadata"
+release_build_block="$(
+  sed -n '/^if \[\[ "\$SKIP_BUILD" -eq 0 \]\]; then/,/^fi$/p' \
+    "$ROOT_DIR/scripts/package-release.sh"
+)"
+grep -F 'x86_64-*-linux-* | aarch64-*-linux-*' <<<"$release_build_block" >/dev/null ||
+  fail "release packaging does not cover both supported Linux architectures"
+grep -F 'linux_llama_cpp_features Linux "$target_arch" "$(uname -m)"' \
+  <<<"$release_build_block" >/dev/null ||
+  fail "release packaging does not select target-aware Linux llama.cpp acceleration"
+grep -F 'cargo_args+=(--features "$llama_cpp_features")' \
+  <<<"$release_build_block" >/dev/null ||
+  fail "release packaging does not pass selected llama.cpp features to Cargo"
+grep -F 'mayhem-cli/llama-cpp-metal' <<<"$release_build_block" >/dev/null ||
+  fail "release acceleration change removed the existing macOS Metal build"
+
+installer_acceleration_functions="$(
+  awk '
+    /^llama_cpp_feature_name\(\) \{/ { capture = 1 }
+    /^install_source_binary\(\) \{/ { capture = 0 }
+    capture { print }
+  ' "$ROOT_DIR/install.sh"
+)"
+release_acceleration_functions="$(
+  awk '
+    /^llama_cpp_feature_name\(\) \{/ { capture = 1 }
+    /^if \[\[ "\$\{MAYHEM_PACKAGE_RELEASE_SOURCE_ONLY:-0\}" == "1" \]\]; then/ {
+      capture = 0
+    }
+    capture { print }
+  ' "$ROOT_DIR/scripts/package-release.sh"
+)"
+[[ "$installer_acceleration_functions" == "$release_acceleration_functions" ]] ||
+  fail "Unix installer and release packager acceleration selectors have drifted"
+
 intercom_eol="$(
   git -C "$ROOT_DIR" check-attr eol -- intercom/contract/contract.js |
     tr -d '\r'
@@ -33,7 +123,9 @@ for embedded_runtime_file in \
   crates/mayhem-cli/resources/python/chatterbox-runtime-cpu-x86/pyproject.toml \
   crates/mayhem-cli/resources/python/chatterbox-runtime-cpu-x86/uv.lock \
   crates/mayhem-cli/resources/python/chatterbox-runtime-cuda124/pyproject.toml \
-  crates/mayhem-cli/resources/python/chatterbox-runtime-cuda124/uv.lock
+  crates/mayhem-cli/resources/python/chatterbox-runtime-cuda124/uv.lock \
+  crates/mayhem-cli/resources/python/chatterbox-runtime-cuda130-arm64/pyproject.toml \
+  crates/mayhem-cli/resources/python/chatterbox-runtime-cuda130-arm64/uv.lock
 do
   embedded_eol="$(
     git -C "$ROOT_DIR" check-attr eol -- "$embedded_runtime_file" |

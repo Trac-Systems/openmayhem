@@ -207,6 +207,7 @@ const DEFAULT_GATEWAY_MAX_CHAT_IMAGE_PIXELS: u64 = 40_000_000;
 const DEFAULT_GATEWAY_MAX_CHAT_AUDIO_BYTES: u64 = 32 * 1024 * 1024;
 const DEFAULT_GATEWAY_MAX_CHAT_AUDIO_SECONDS: u64 = 3_600;
 const MAX_AUDIO_SPEECH_OUTPUT_SECONDS: u64 = 120;
+const ARTIFACT_AUDIO_DURATION_TOLERANCE_SECONDS: u64 = 1;
 const DEFAULT_GATEWAY_MAX_CHAT_VIDEO_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_GATEWAY_MAX_CHAT_VIDEO_FRAMES: u64 = 64;
 const GATEWAY_MEDIA_SCHEMA_MAX_ITEMS: u32 = 1_024;
@@ -16520,7 +16521,7 @@ async fn collect_direct_session_artifact_generation_output(
             artifacts.len()
         )));
     }
-    let observed_usage = artifact_generation_usage_for_request(request);
+    let observed_usage = artifact_generation_usage_for_observed(request, &artifacts)?;
     ensure_optional_reported_receipt_usage_matches(
         usage.as_ref(),
         &observed_usage,
@@ -17935,7 +17936,7 @@ fn authoritative_artifact_generation_usage(
             request.output_modality
         )));
     }
-    let usage = artifact_generation_usage_for_request(request);
+    let usage = artifact_generation_usage_for_observed(request, &output.artifacts)?;
     ensure_optional_reported_receipt_usage_matches(
         Some(&output.usage),
         &usage,
@@ -31237,6 +31238,107 @@ fn artifact_generation_usage_for_request(request: &ArtifactGenerationRequest) ->
     }
 }
 
+fn artifact_generation_usage_for_observed(
+    request: &ArtifactGenerationRequest,
+    artifacts: &[GatewayArtifactOutput],
+) -> Result<ReceiptUsage, GatewaySessionError> {
+    if request.output_modality != "audio" {
+        return Ok(artifact_generation_usage_for_request(request));
+    }
+    if !matches!(
+        request.endpoint_family.as_str(),
+        mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+            | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+            | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+    ) {
+        return Err(GatewaySessionError::new(format!(
+            "endpoint family {} cannot return metered audio artifacts",
+            request.endpoint_family
+        )));
+    }
+
+    let mut measured_audio_seconds = 0_u64;
+    for artifact in artifacts {
+        let metadata = validated_audio_metadata(&artifact.bytes).ok_or_else(|| {
+            GatewaySessionError::new(format!(
+                "provider returned invalid {} bytes",
+                artifact.content_type
+            ))
+        })?;
+        if !artifact_audio_content_type_matches_format(&artifact.content_type, metadata.format) {
+            return Err(GatewaySessionError::new(format!(
+                "provider audio artifact content type {} does not match the encoded audio format",
+                artifact.content_type
+            )));
+        }
+        if metadata.duration_seconds_ceil == 0
+            || request
+                .duration_seconds
+                .abs_diff(metadata.duration_seconds_ceil)
+                > ARTIFACT_AUDIO_DURATION_TOLERANCE_SECONDS
+        {
+            return Err(GatewaySessionError::new(format!(
+                "provider audio artifact measures {} seconds, expected {} +/- {} second",
+                metadata.duration_seconds_ceil,
+                request.duration_seconds,
+                ARTIFACT_AUDIO_DURATION_TOLERANCE_SECONDS
+            )));
+        }
+        measured_audio_seconds = measured_audio_seconds
+            .checked_add(metadata.duration_seconds_ceil)
+            .ok_or_else(|| GatewaySessionError::new("measured audio duration overflow"))?;
+    }
+
+    Ok(ReceiptUsage::from_units([
+        (
+            USAGE_INPUT_CHARACTER,
+            mayhem_proto::artifact_generation_input_characters(
+                &request.endpoint_family,
+                &request.contract_request,
+            ),
+        ),
+        (USAGE_AUDIO_SECOND, measured_audio_seconds),
+    ]))
+}
+
+fn artifact_audio_content_type_matches_format(
+    content_type: &str,
+    format: ValidatedAudioFormat,
+) -> bool {
+    match format {
+        ValidatedAudioFormat::Wav => matches!(content_type, "audio/wav" | "audio/x-wav"),
+        ValidatedAudioFormat::Flac => content_type == "audio/flac",
+        ValidatedAudioFormat::Mp3 => matches!(content_type, "audio/mpeg" | "audio/mp3"),
+        ValidatedAudioFormat::Opus => matches!(content_type, "audio/ogg" | "audio/opus"),
+        ValidatedAudioFormat::Aac => matches!(
+            content_type,
+            "audio/aac" | "audio/m4a" | "audio/mp4" | "audio/x-m4a"
+        ),
+    }
+}
+
+fn artifact_generation_max_usage_for_request(request: &ArtifactGenerationRequest) -> ReceiptUsage {
+    if request.output_modality != "audio" {
+        return artifact_generation_usage_for_request(request);
+    }
+    ReceiptUsage::from_units([
+        (
+            USAGE_INPUT_CHARACTER,
+            mayhem_proto::artifact_generation_input_characters(
+                &request.endpoint_family,
+                &request.contract_request,
+            ),
+        ),
+        (
+            USAGE_AUDIO_SECOND,
+            request
+                .duration_seconds
+                .saturating_add(ARTIFACT_AUDIO_DURATION_TOLERANCE_SECONDS)
+                .saturating_mul(request.artifact_count),
+        ),
+    ])
+}
+
 fn embedding_input_token_count(inputs: &[String]) -> u64 {
     inputs
         .iter()
@@ -31431,7 +31533,7 @@ fn estimate_artifact_generation_max_spend_au(
     price: &PriceRefAu,
     request: &ArtifactGenerationRequest,
 ) -> MoneyAu {
-    calculate_au_owed(price, &artifact_generation_usage_for_request(request)).max(1_000)
+    calculate_au_owed(price, &artifact_generation_max_usage_for_request(request)).max(1_000)
 }
 
 fn rough_tokens(text: &str) -> u64 {
@@ -35030,6 +35132,12 @@ mod tests {
         wav.extend_from_slice(&(data.len() as u32).to_le_bytes());
         wav.extend_from_slice(&data);
         BASE64_STANDARD.encode(wav)
+    }
+
+    fn test_wav_with_samples(sample_count: usize) -> Vec<u8> {
+        BASE64_STANDARD
+            .decode(test_wav_b64_with_samples(sample_count))
+            .unwrap()
     }
 
     #[test]
@@ -39175,6 +39283,194 @@ mod tests {
             assert_eq!(response["object"], json!(expected_object));
             assert_eq!(response["data"].as_array().unwrap().len(), 1);
         }
+    }
+
+    #[test]
+    fn artifact_audio_receipt_uses_measured_duration_with_signed_tolerance() {
+        let price = PriceRefAu {
+            denom: "au_usd".to_owned(),
+            ver: 7,
+            rate_map: vec![RateMapEntry {
+                unit: USAGE_AUDIO_SECOND.to_owned(),
+                per_unit_au: 1_000,
+                granularity: 1,
+            }],
+            per_req_au: 0,
+            min_session_au: 0,
+            derivation: None,
+            history: Vec::new(),
+        };
+
+        for family in [
+            mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO,
+        ] {
+            let request = artifact_generation_request(
+                "mayhem/audio-test",
+                family,
+                json!({
+                    "model": "mayhem/audio-test",
+                    "prompt": "piano",
+                    "duration_seconds": 10,
+                    "response_format": "wav"
+                }),
+                VideoRequestPreparation::default(),
+            )
+            .unwrap();
+            let bytes = test_wav_with_samples(88_000);
+            let input_characters = mayhem_proto::artifact_generation_input_characters(
+                &request.endpoint_family,
+                &request.contract_request,
+            );
+            let measured_usage = ReceiptUsage::from_units([
+                (USAGE_INPUT_CHARACTER, input_characters),
+                (USAGE_AUDIO_SECOND, 11),
+            ]);
+            let output = ArtifactGenerationOutput {
+                artifacts: vec![GatewayArtifactOutput {
+                    id: "audio-1".to_owned(),
+                    content_type: "audio/wav".to_owned(),
+                    blake3: blake3_hex(&bytes),
+                    bytes,
+                }],
+                usage: measured_usage.clone(),
+            };
+
+            assert_eq!(
+                authoritative_artifact_generation_usage(&request, &output).unwrap(),
+                measured_usage
+            );
+            let max_spend_au = estimate_artifact_generation_max_spend_au(&price, &request);
+            assert_eq!(max_spend_au, calculate_au_owed(&price, &measured_usage));
+
+            let model = test_model();
+            let mut invocation = test_invocation();
+            invocation.spend_voucher.body.locked_rate_map = price.rate_map.clone();
+            invocation.spend_voucher.body.max_spend_au = max_spend_au;
+            let receipt = test_signed_provider_receipt_for_usage(
+                &model,
+                &invocation,
+                measured_usage,
+                artifact_generation_prompt_hash(&request),
+            );
+            direct_session_artifact_generation_receipt_ack(
+                &request,
+                &output,
+                &invocation,
+                &receipt,
+                invocation.provider_pubkey.as_deref().unwrap(),
+                &model,
+            )
+            .expect("an encoded artifact at requested duration +1s fits the signed voucher");
+        }
+    }
+
+    #[test]
+    fn artifact_audio_receipt_rejects_duration_outside_signed_tolerance() {
+        let request = artifact_generation_request(
+            "mayhem/audio-test",
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            json!({
+                "model": "mayhem/audio-test",
+                "prompt": "piano",
+                "duration_seconds": 10,
+                "response_format": "wav"
+            }),
+            VideoRequestPreparation::default(),
+        )
+        .unwrap();
+        let bytes = test_wav_with_samples(96_000);
+        let output = ArtifactGenerationOutput {
+            artifacts: vec![GatewayArtifactOutput {
+                id: "audio-1".to_owned(),
+                content_type: "audio/wav".to_owned(),
+                blake3: blake3_hex(&bytes),
+                bytes,
+            }],
+            usage: ReceiptUsage::from_units([(USAGE_INPUT_CHARACTER, 5), (USAGE_AUDIO_SECOND, 12)]),
+        };
+
+        let error = authoritative_artifact_generation_usage(&request, &output)
+            .expect_err("an encoded artifact at requested duration +2s must be rejected");
+        assert!(error.message.contains("measures 12 seconds"), "{error:?}");
+    }
+
+    #[test]
+    fn artifact_audio_receipt_rejects_provider_usage_not_matching_measured_bytes() {
+        let request = artifact_generation_request(
+            "mayhem/audio-test",
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO,
+            json!({
+                "model": "mayhem/audio-test",
+                "inputs": "piano",
+                "parameters": {"duration_seconds": 10}
+            }),
+            VideoRequestPreparation::default(),
+        )
+        .unwrap();
+        let bytes = test_wav_with_samples(88_000);
+        let output = ArtifactGenerationOutput {
+            artifacts: vec![GatewayArtifactOutput {
+                id: "audio-1".to_owned(),
+                content_type: "audio/wav".to_owned(),
+                blake3: blake3_hex(&bytes),
+                bytes,
+            }],
+            usage: artifact_generation_usage_for_request(&request),
+        };
+
+        let error = authoritative_artifact_generation_usage(&request, &output)
+            .expect_err("provider-reported duration cannot override encoded duration");
+        assert!(error.message.contains("usage does not match"), "{error:?}");
+    }
+
+    #[test]
+    fn artifact_video_usage_and_spend_ceiling_remain_request_bound() {
+        let request = artifact_generation_request(
+            "mayhem/video-test",
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            json!({
+                "model": "mayhem/video-test",
+                "prompt": "orbit",
+                "seconds": 4,
+                "fps": 24
+            }),
+            VideoRequestPreparation::default(),
+        )
+        .unwrap();
+        let usage = artifact_generation_usage_for_request(&request);
+        let output = ArtifactGenerationOutput {
+            artifacts: vec![GatewayArtifactOutput {
+                id: "video-1".to_owned(),
+                content_type: "video/mp4".to_owned(),
+                bytes: b"video".to_vec(),
+                blake3: blake3_hex(b"video"),
+            }],
+            usage: usage.clone(),
+        };
+        let price = PriceRefAu {
+            denom: "au_usd".to_owned(),
+            ver: 7,
+            rate_map: vec![RateMapEntry {
+                unit: USAGE_VIDEO_SECOND.to_owned(),
+                per_unit_au: 1_000,
+                granularity: 1,
+            }],
+            per_req_au: 0,
+            min_session_au: 0,
+            derivation: None,
+            history: Vec::new(),
+        };
+
+        assert_eq!(
+            authoritative_artifact_generation_usage(&request, &output).unwrap(),
+            usage
+        );
+        assert_eq!(
+            estimate_artifact_generation_max_spend_au(&price, &request),
+            calculate_au_owed(&price, &usage)
+        );
     }
 
     #[test]

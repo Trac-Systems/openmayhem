@@ -7937,6 +7937,9 @@ fn artifact_hardware_compatibility_base(
             artifact.engine
         ));
     }
+    if let Some(reason) = sulphur_artifact_platform_incompatibility(artifact, hardware) {
+        return incompatible_artifact(reason);
+    }
     let min_ram_bytes = gib_u64(model.requirements.min_ram_gb);
     if hardware.memory.total_bytes < min_ram_bytes {
         return incompatible_artifact(format!(
@@ -8019,6 +8022,87 @@ fn incompatible_artifact(reason: String) -> CatalogArtifactCompatibility {
         status: "incompatible".to_owned(),
         reason,
         suggestion: None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SulphurExecutionFlavor {
+    CudaGguf,
+    AppleMlx,
+}
+
+impl SulphurExecutionFlavor {
+    fn runtime_manifest_path(self) -> &'static str {
+        match self {
+            Self::CudaGguf => SULPHUR_CUDA_RUNTIME_MANIFEST_PATH,
+            Self::AppleMlx => SULPHUR_MLX_RUNTIME_MANIFEST_PATH,
+        }
+    }
+
+    fn primary_extension(self) -> &'static str {
+        match self {
+            Self::CudaGguf => "gguf",
+            Self::AppleMlx => "safetensors",
+        }
+    }
+}
+
+fn sulphur_execution_flavor(artifact: &catalog::CatalogArtifact) -> Result<SulphurExecutionFlavor> {
+    ensure!(
+        artifact.engine == "sulphur",
+        "artifact backend {} is not Sulphur",
+        artifact.engine
+    );
+    let manifest = artifact
+        .sidecars
+        .get(SULPHUR_RUNTIME_MANIFEST_SIDECAR)
+        .context("Sulphur artifact is missing its admin-signed runtime manifest")?;
+    match manifest.path.as_str() {
+        SULPHUR_CUDA_RUNTIME_MANIFEST_PATH => Ok(SulphurExecutionFlavor::CudaGguf),
+        SULPHUR_MLX_RUNTIME_MANIFEST_PATH => Ok(SulphurExecutionFlavor::AppleMlx),
+        path => bail!("unrecognized signed Sulphur runtime manifest path {path}"),
+    }
+}
+
+fn sulphur_artifact_platform_incompatibility(
+    artifact: &catalog::CatalogArtifact,
+    hardware: &HardwareReport,
+) -> Option<String> {
+    if artifact.engine != "sulphur" {
+        return None;
+    }
+    let flavor = match sulphur_execution_flavor(artifact) {
+        Ok(flavor) => flavor,
+        Err(err) => {
+            return Some(format!(
+                "Sulphur artifact has no recognized signed execution flavor: {err:#}"
+            ));
+        }
+    };
+    let host = format!("{}/{}", hardware.host.os, hardware.host.arch);
+    match flavor {
+        SulphurExecutionFlavor::AppleMlx
+            if !(hardware.host.os == "macos"
+                && matches!(hardware.host.arch.as_str(), "aarch64" | "arm64")) =>
+        {
+            Some(format!(
+                "signed Sulphur artifact selects the Apple MLX execution flavor, which is unavailable on {host}"
+            ))
+        }
+        SulphurExecutionFlavor::CudaGguf
+            if !matches!(
+                (hardware.host.os.as_str(), hardware.host.arch.as_str()),
+                ("linux", "x86_64")
+                    | ("linux", "aarch64")
+                    | ("linux", "arm64")
+                    | ("windows", "x86_64")
+            ) =>
+        {
+            Some(format!(
+                "signed Sulphur artifact selects the CUDA/GGUF execution flavor, which is unavailable on {host}"
+            ))
+        }
+        _ => None,
     }
 }
 
@@ -17843,24 +17927,8 @@ fn verify_calibration_sidecars_match_catalog(
         );
     }
     if artifact.engine == "sulphur" {
-        let manifest = artifact
-            .sidecars
-            .get(SULPHUR_RUNTIME_MANIFEST_SIDECAR)
-            .context("Sulphur calibration requires its admin-signed runtime manifest")?;
-        let expected_manifest_path = if Path::new(&artifact.path)
-            .extension()
-            .and_then(OsStr::to_str)
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("safetensors"))
-        {
-            SULPHUR_MLX_RUNTIME_MANIFEST_PATH
-        } else {
-            SULPHUR_CUDA_RUNTIME_MANIFEST_PATH
-        };
-        ensure!(
-            manifest.path == expected_manifest_path,
-            "Sulphur runtime manifest must use path {expected_manifest_path}, got {}",
-            manifest.path
-        );
+        sulphur_execution_flavor(artifact)
+            .context("Sulphur calibration requires a recognized signed execution flavor")?;
         ensure!(
             paths.len() == artifact.sidecars.len()
                 && artifact
@@ -22204,10 +22272,10 @@ fn canary_set_file_sha256(
 
 fn managed_python_backend_for_artifact(artifact: &catalog::CatalogArtifact) -> &str {
     if artifact.engine == "sulphur"
-        && Path::new(&artifact.path)
-            .extension()
-            .and_then(OsStr::to_str)
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("safetensors"))
+        && matches!(
+            sulphur_execution_flavor(artifact),
+            Ok(SulphurExecutionFlavor::AppleMlx)
+        )
     {
         "sulphur-mlx"
     } else {
@@ -32024,6 +32092,8 @@ async fn up_add_selected_provider_workers(
     hardware_quote_config: Option<&ProviderHardwareQuoteConfig>,
     worker_names: Option<&[String]>,
 ) -> Result<Vec<Value>> {
+    let vllm_memory_utilization =
+        ensure_provider_vllm_memory_utilization_config(&plan.home, &selection.candidates, None)?;
     let runtimes = selection
         .candidates
         .iter()
@@ -32045,6 +32115,9 @@ async fn up_add_selected_provider_workers(
             &candidate.enclave.enclave_id,
             &candidate.artifact.engine,
             runtime,
+            (candidate.artifact.engine == "vllm")
+                .then_some(vllm_memory_utilization.as_ref())
+                .flatten(),
             plan.provider_gpu_layers,
             Some(candidate.served_ctx),
             &candidate.served_modalities,
@@ -32071,6 +32144,8 @@ async fn up_add_selected_provider_workers(
             "model_id": &candidate.enclave.model_id,
             "backend": &candidate.enclave.backend,
             "required_bytes": candidate.feasibility.estimated_required_bytes,
+            "vllm_memory_utilization": (candidate.artifact.engine == "vllm")
+                .then_some(vllm_memory_utilization),
             "runtime": runtime,
             "response": response,
         }));
@@ -37119,6 +37194,12 @@ struct CanaryPrompt {
     instrumental: Option<bool>,
     #[serde(default)]
     duration_seconds: Option<u64>,
+    #[serde(default)]
+    num_frames: Option<u64>,
+    #[serde(default)]
+    fps: Option<f64>,
+    #[serde(default)]
+    negative_prompt: Option<Value>,
     #[serde(default)]
     bpm: Option<u32>,
     #[serde(default)]
@@ -48802,6 +48883,7 @@ struct PreparedProviderServeWorker {
     model_id: String,
     served_ctx: u64,
     serve_terms: ProviderJoinContextTerms,
+    vllm_memory_utilization: Option<VllmMemoryUtilizationPlan>,
     runtime: ProviderBackendRuntime,
     reactivation_drain_cleanup: Value,
     child: Value,
@@ -48866,11 +48948,17 @@ async fn prepare_provider_serve_worker(
                 selected.model.model_id, selected.artifact.engine
             )
         })?;
+    let vllm_memory_utilization = ensure_provider_vllm_memory_utilization_config(
+        &home,
+        std::slice::from_ref(selected),
+        None,
+    )?;
     let child = provider_serve_child_config(
         &home,
         &selected.enclave.enclave_id,
         &selected.artifact.engine,
         &runtime,
+        vllm_memory_utilization.as_ref(),
         computed.gpu_layers,
         Some(selected.served_ctx),
         &selected.served_modalities,
@@ -48887,6 +48975,7 @@ async fn prepare_provider_serve_worker(
         model_id: selected.enclave.model_id.clone(),
         served_ctx: selected.served_ctx,
         serve_terms,
+        vllm_memory_utilization,
         runtime,
         reactivation_drain_cleanup,
         child,
@@ -48928,6 +49017,7 @@ async fn add_prepared_provider_worker(
         "enclave": prepared.enclave_id,
         "model_id": prepared.model_id,
         "served_ctx": prepared.served_ctx,
+        "vllm_memory_utilization": prepared.vllm_memory_utilization,
         "runtime": prepared.runtime,
         "reactivation_drain_cleanup": prepared.reactivation_drain_cleanup,
         "activation_leave_replay": activation_leave_replay,
@@ -49197,6 +49287,7 @@ fn provider_serve_child_config(
     enclave: &str,
     backend: &str,
     runtime: &ProviderBackendRuntime,
+    vllm_memory_utilization: Option<&VllmMemoryUtilizationPlan>,
     gpu_layers: Option<u32>,
     ctx: Option<u64>,
     served_modalities: &[String],
@@ -49211,6 +49302,7 @@ fn provider_serve_child_config(
         enclave,
         backend,
         runtime,
+        vllm_memory_utilization,
         gpu_layers,
         ctx,
         served_modalities,
@@ -49226,6 +49318,7 @@ fn provider_serve_child_config_with_pear_runtime(
     enclave: &str,
     backend: &str,
     runtime: &ProviderBackendRuntime,
+    vllm_memory_utilization: Option<&VllmMemoryUtilizationPlan>,
     gpu_layers: Option<u32>,
     ctx: Option<u64>,
     served_modalities: &[String],
@@ -49272,6 +49365,23 @@ fn provider_serve_child_config_with_pear_runtime(
         enclave.to_owned(),
     ];
     append_provider_hardware_quote_args(&mut args, hardware_quote_config);
+    if backend == "vllm" {
+        let admitted = vllm_memory_utilization.context(
+            "vLLM worker is missing its admitted memory utilization; rerun `mayhem up --provider`",
+        )?;
+        let persisted = configured_provider_vllm_memory_utilization_pct(&config)?.context(
+            "provider.limits.vllm_memory_utilization_pct is missing after vLLM admission",
+        )?;
+        ensure!(
+            persisted == admitted.target_pct,
+            "persisted vLLM memory utilization {persisted}% does not match the admitted {}%",
+            admitted.target_pct
+        );
+        args.extend([
+            "--vllm-memory-utilization".to_owned(),
+            persisted.to_string(),
+        ]);
+    }
     if let Some(gpu_layers) = gpu_layers.or(configured_gpu_layers) {
         args.extend(["--gpu-layers".to_owned(), gpu_layers.to_string()]);
     }
@@ -50033,6 +50143,14 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         config.as_ref(),
         requested_enclave.as_deref(),
     )?;
+    let vllm_memory_utilization = ensure_provider_vllm_memory_utilization_config(
+        &home,
+        std::slice::from_ref(&selected),
+        args.vllm_memory_utilization,
+    )?;
+    if let Some(utilization) = vllm_memory_utilization {
+        args.vllm_memory_utilization = Some(utilization.target_pct);
+    }
     let configured_attestation_tier = hardware_quote_config
         .as_ref()
         .map(|config| config.kind.attestation_tier());
@@ -50440,6 +50558,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             "disk_reserve_bytes": disk_reserve_bytes,
             "disk_reserve_source": disk_reserve_source,
         },
+        "vllm_memory_utilization": vllm_memory_utilization,
         "protection": {
             "max_sessions": protection_config.max_sessions,
             "accept_rate_per_minute": protection_config.accept_rate_per_minute,
@@ -59082,7 +59201,7 @@ fn enclave_vllm_gpu_memory_utilization_pct(caps: &Value) -> Result<u32> {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 struct VllmMemoryUtilizationPlan {
     target_pct: u32,
     floor_pct: u32,
@@ -59158,6 +59277,124 @@ fn provider_vllm_memory_utilization(
         floor_pct,
         max_pct,
     })
+}
+
+fn provider_vllm_memory_utilization_for_candidates(
+    candidates: &[ProviderCandidate],
+    local_target_pct: Option<u32>,
+) -> Result<Option<VllmMemoryUtilizationPlan>> {
+    let mut floor_pct = 0;
+    let mut max_pct = VLLM_ADMIN_MEMORY_UTILIZATION_MAX_PCT;
+    let mut count = 0usize;
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate.artifact.engine == "vllm")
+    {
+        let plan = provider_vllm_memory_utilization(candidate, None)?;
+        floor_pct = floor_pct.max(plan.floor_pct);
+        max_pct = max_pct.min(plan.max_pct);
+        count += 1;
+    }
+    if count == 0 {
+        return Ok(None);
+    }
+    ensure!(
+        floor_pct <= max_pct,
+        "admitted vLLM workers have no common safe memory utilization: require at least {floor_pct}% but permit at most {max_pct}%"
+    );
+    let target_pct = if let Some(pct) = local_target_pct {
+        let pct = validate_provider_vllm_memory_utilization_pct(pct)?;
+        ensure!(
+            pct >= floor_pct,
+            "local vLLM memory utilization {pct}% is below the admitted {floor_pct}% fit floor"
+        );
+        ensure!(
+            pct <= max_pct,
+            "local vLLM memory utilization {pct}% exceeds the admitted safe ceiling {max_pct}%"
+        );
+        pct
+    } else {
+        floor_pct
+            .saturating_add(VLLM_MEMORY_UTILIZATION_CUSHION_PCT)
+            .min(max_pct)
+    };
+    let mut pool_allocations = BTreeMap::<String, (u64, u64)>::new();
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate.artifact.engine == "vllm")
+    {
+        let budget = &candidate.feasibility.memory_budget;
+        let reserved_bytes =
+            u64::try_from((u128::from(budget.total_bytes) * u128::from(target_pct)).div_ceil(100))
+                .unwrap_or(u64::MAX);
+        let allocation = pool_allocations
+            .entry(budget.pool.clone())
+            .or_insert((0, budget.budget_bytes));
+        allocation.0 = allocation.0.saturating_add(reserved_bytes);
+        allocation.1 = allocation.1.min(budget.budget_bytes);
+    }
+    for (pool, (reserved_bytes, budget_bytes)) in pool_allocations {
+        ensure!(
+            reserved_bytes <= budget_bytes,
+            "vLLM memory utilization {target_pct}% would reserve {} across workers in {pool}, exceeding the admitted shared budget {}; select fewer co-resident vLLM workers or lower their admitted memory requirements",
+            human_bytes(reserved_bytes),
+            human_bytes(budget_bytes)
+        );
+    }
+    Ok(Some(VllmMemoryUtilizationPlan {
+        target_pct,
+        floor_pct,
+        max_pct,
+    }))
+}
+
+fn configured_provider_vllm_memory_utilization_pct(config: &toml::Value) -> Result<Option<u32>> {
+    let Some(value) = toml_get_path(config, "provider.limits.vllm_memory_utilization_pct") else {
+        return Ok(None);
+    };
+    let pct = value
+        .as_integer()
+        .and_then(|value| u32::try_from(value).ok())
+        .context("provider.limits.vllm_memory_utilization_pct must be a positive integer")?;
+    Ok(Some(validate_provider_vllm_memory_utilization_pct(pct)?))
+}
+
+fn ensure_provider_vllm_memory_utilization_config(
+    home: &Path,
+    candidates: &[ProviderCandidate],
+    requested_target_pct: Option<u32>,
+) -> Result<Option<VllmMemoryUtilizationPlan>> {
+    if !candidates
+        .iter()
+        .any(|candidate| candidate.artifact.engine == "vllm")
+    {
+        return Ok(None);
+    }
+    let path = config_path_for_home(home);
+    let mut config = read_config_toml_value(&path)?;
+    let configured_target_pct = configured_provider_vllm_memory_utilization_pct(&config)?;
+    let plan = provider_vllm_memory_utilization_for_candidates(
+        candidates,
+        requested_target_pct.or(configured_target_pct),
+    )?
+    .context("vLLM admission did not produce a memory utilization plan")?;
+    if configured_target_pct != Some(plan.target_pct) {
+        let limits = ensure_toml_table_path(&mut config, &["provider", "limits"])?;
+        toml_table_set_u64(
+            limits,
+            "vllm_memory_utilization_pct",
+            u64::from(plan.target_pct),
+        )?;
+        write_config_toml_value(&path, &config)?;
+    }
+    let persisted =
+        configured_provider_vllm_memory_utilization_pct(&read_config_toml_value(&path)?)?;
+    ensure!(
+        persisted == Some(plan.target_pct),
+        "persisted vLLM memory utilization does not match the admitted {}%",
+        plan.target_pct
+    );
+    Ok(Some(plan))
 }
 
 fn tensor_parallel_capable_gpu_count(hardware: &HardwareReport) -> usize {
@@ -68374,6 +68611,19 @@ fn provider_canary_self_test_body(
                             .entry("height".to_owned())
                             .or_insert(json!(height));
                     }
+                    if let Some(num_frames) = prompt.num_frames {
+                        parameters
+                            .entry("num_frames".to_owned())
+                            .or_insert(json!(num_frames));
+                    }
+                    if let Some(fps) = prompt.fps {
+                        parameters.entry("fps".to_owned()).or_insert(json!(fps));
+                    }
+                    if let Some(negative_prompt) = &prompt.negative_prompt {
+                        parameters
+                            .entry("negative_prompt".to_owned())
+                            .or_insert_with(|| negative_prompt.clone());
+                    }
                 }
                 mayhem_proto::ENDPOINT_OPENAI_VIDEOS => {
                     request
@@ -68389,6 +68639,19 @@ fn provider_canary_self_test_body(
                     }
                     if let Some(size) = prompt.size.as_deref() {
                         request.entry("size".to_owned()).or_insert(json!(size));
+                    }
+                    if let Some(num_frames) = prompt.num_frames {
+                        request
+                            .entry("num_frames".to_owned())
+                            .or_insert(json!(num_frames));
+                    }
+                    if let Some(fps) = prompt.fps {
+                        request.entry("fps".to_owned()).or_insert(json!(fps));
+                    }
+                    if let Some(negative_prompt) = &prompt.negative_prompt {
+                        request
+                            .entry("negative_prompt".to_owned())
+                            .or_insert_with(|| negative_prompt.clone());
                     }
                 }
                 _ => unreachable!("video canary endpoint family was validated"),
@@ -69611,32 +69874,18 @@ fn materialize_sulphur_layout(
     artifact_paths: &ProviderArtifactPaths,
     cache_dir: &Path,
 ) -> Result<PathBuf> {
+    let execution_flavor = sulphur_execution_flavor(artifact)
+        .with_context(|| format!("Sulphur artifact {label} has an invalid execution flavor"))?;
     let primary_extension = Path::new(&artifact.path)
         .extension()
         .and_then(OsStr::to_str)
         .map(str::to_ascii_lowercase)
         .context("Sulphur primary artifact path has no extension")?;
     ensure!(
-        matches!(primary_extension.as_str(), "gguf" | "safetensors"),
-        "Sulphur primary artifact must be GGUF or safetensors"
-    );
-    let manifest = artifact
-        .sidecars
-        .get(SULPHUR_RUNTIME_MANIFEST_SIDECAR)
-        .with_context(|| {
-            format!(
-                "Sulphur artifact {label} requires admin catalog sidecar {SULPHUR_RUNTIME_MANIFEST_SIDECAR}"
-            )
-        })?;
-    let expected_manifest_path = if primary_extension == "gguf" {
-        SULPHUR_CUDA_RUNTIME_MANIFEST_PATH
-    } else {
-        SULPHUR_MLX_RUNTIME_MANIFEST_PATH
-    };
-    ensure!(
-        manifest.path == expected_manifest_path,
-        "Sulphur artifact {label} sidecar {SULPHUR_RUNTIME_MANIFEST_SIDECAR} must use path {expected_manifest_path}, got {}",
-        manifest.path
+        primary_extension == execution_flavor.primary_extension(),
+        "Sulphur artifact {label} signed execution flavor {} requires a .{} primary artifact, got .{primary_extension}",
+        execution_flavor.runtime_manifest_path(),
+        execution_flavor.primary_extension()
     );
     ensure!(
         artifact_paths.sidecars.len() == artifact.sidecars.len(),
@@ -69680,7 +69929,7 @@ fn materialize_sulphur_layout(
         )?;
     }
 
-    if primary_extension == "gguf" {
+    if execution_flavor == SulphurExecutionFlavor::CudaGguf {
         Ok(primary)
     } else {
         let artifact_root = primary
@@ -72900,15 +73149,21 @@ fn provider_media_generation_request_from_body(
                     .or_else(|| seconds.as_str().and_then(|value| value.parse().ok()))
             })
         });
-    let frame_count = parameters
-        .and_then(|parameters| parameters.get("num_frames"))
-        .and_then(Value::as_u64);
+    let frame_count = provider_consistent_positive_u64_alias(
+        body,
+        parameters,
+        VIDEO_CANARY_FRAME_ATTRIBUTES,
+        "media generation frame count",
+    )?;
+    let fps = provider_consistent_positive_f64_alias(
+        body,
+        parameters,
+        VIDEO_CANARY_FPS_ATTRIBUTES,
+        "media generation fps",
+    )?;
     let duration_seconds = duration_seconds.or_else(|| {
         let frames = frame_count?;
-        let fps = parameters
-            .and_then(|parameters| parameters.get("fps"))
-            .and_then(Value::as_f64)
-            .filter(|fps| fps.is_finite() && *fps > 0.0)?;
+        let fps = fps?;
         Some(((frames as f64) / fps).ceil().max(1.0) as u64)
     });
     let frame_count = frame_count.or_else(|| {
@@ -72946,6 +73201,65 @@ fn provider_media_generation_request_from_body(
     };
     request.validate()?;
     Ok(request)
+}
+
+fn provider_consistent_positive_u64_alias(
+    body: &Value,
+    parameters: Option<&serde_json::Map<String, Value>>,
+    aliases: &[&str],
+    label: &str,
+) -> Result<Option<u64>> {
+    let mut selected: Option<u64> = None;
+    for object in [body.as_object(), parameters].into_iter().flatten() {
+        for alias in aliases {
+            let Some(value) = object.get(*alias) else {
+                continue;
+            };
+            let value = value
+                .as_u64()
+                .filter(|value| *value > 0)
+                .with_context(|| format!("{label} {alias} must be a positive integer"))?;
+            if let Some(previous) = selected {
+                ensure!(
+                    previous == value,
+                    "{label} aliases conflict: {previous} versus {value}"
+                );
+            } else {
+                selected = Some(value);
+            }
+        }
+    }
+    Ok(selected)
+}
+
+fn provider_consistent_positive_f64_alias(
+    body: &Value,
+    parameters: Option<&serde_json::Map<String, Value>>,
+    aliases: &[&str],
+    label: &str,
+) -> Result<Option<f64>> {
+    let mut selected: Option<f64> = None;
+    for object in [body.as_object(), parameters].into_iter().flatten() {
+        for alias in aliases {
+            let Some(value) = object.get(*alias) else {
+                continue;
+            };
+            let value = value
+                .as_f64()
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .with_context(|| format!("{label} {alias} must be a positive finite number"))?;
+            if let Some(previous) = selected {
+                ensure!(
+                    (previous - value).abs()
+                        <= f64::EPSILON * previous.abs().max(value.abs()).max(1.0),
+                    "{label} aliases conflict: {previous} versus {value}"
+                );
+            } else {
+                selected = Some(value);
+            }
+        }
+    }
+    Ok(selected)
 }
 
 fn provider_duration_seconds_ceil(value: &Value) -> Option<u64> {
@@ -83097,6 +83411,7 @@ mod tests {
             &ProviderBackendRuntime::default(),
             None,
             None,
+            None,
             &["text".to_owned()],
             &BTreeMap::new(),
             None,
@@ -84081,6 +84396,173 @@ mod tests {
     }
 
     #[test]
+    fn fresh_vllm_config_persists_admitted_budget_and_child_uses_exact_flag() {
+        let home = test_temp_dir("mayhem-vllm-fresh-admission");
+        let config = toml::from_str::<toml::Value>(
+            r#"
+            [network]
+            rpc_url = "http://127.0.0.1:49223/v1"
+            sc_bridge_url = "ws://127.0.0.1:8001"
+            sc_bridge_token = "provider-secret-token"
+            "#,
+        )
+        .unwrap();
+        write_config_toml_value(&config_path_for_home(&home), &config).unwrap();
+        let mut selected =
+            test_auto_fit_candidate('a', "test/vllm-unified", "text", 60, 85, 1, 30.0);
+        selected.enclave.backend = "vllm".to_owned();
+        selected.artifact.engine = "vllm".to_owned();
+        selected.enclave.caps = json!({ "vllm_gpu_memory_utilization_pct": 80 });
+        selected.feasibility.memory_budget.pool = "nvidia_unified_memory".to_owned();
+        selected.feasibility.memory_budget.unified = true;
+        selected.feasibility.memory_budget.total_bytes = 100 * GIB_BYTES;
+        selected.feasibility.memory_budget.budget_bytes = 85 * GIB_BYTES;
+        selected.feasibility.estimated_required_bytes = 60 * GIB_BYTES;
+        let admitted = provider_vllm_memory_utilization(&selected, None).unwrap();
+        let pear_runtime = PathBuf::from("/opt/pear/bin/pear-runtime");
+
+        let missing = provider_serve_child_config_with_pear_runtime(
+            &home,
+            &selected.enclave.enclave_id,
+            "vllm",
+            &ProviderBackendRuntime::default(),
+            Some(&admitted),
+            None,
+            Some(selected.served_ctx),
+            &selected.served_modalities,
+            &selected.served_specialities,
+            None,
+            Some("provider-vllm-test".to_owned()),
+            &pear_runtime,
+        )
+        .expect_err("a fresh config must not bypass admission persistence");
+        assert!(missing
+            .to_string()
+            .contains("vllm_memory_utilization_pct is missing"));
+
+        let persisted = ensure_provider_vllm_memory_utilization_config(
+            &home,
+            std::slice::from_ref(&selected),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(persisted, admitted);
+        assert_eq!(persisted.target_pct, 65);
+        let config = read_config_toml_value(&config_path_for_home(&home)).unwrap();
+        assert_eq!(
+            configured_provider_vllm_memory_utilization_pct(&config).unwrap(),
+            Some(65)
+        );
+
+        let child = provider_serve_child_config_with_pear_runtime(
+            &home,
+            &selected.enclave.enclave_id,
+            "vllm",
+            &ProviderBackendRuntime::default(),
+            Some(&persisted),
+            None,
+            Some(selected.served_ctx),
+            &selected.served_modalities,
+            &selected.served_specialities,
+            None,
+            Some("provider-vllm-test".to_owned()),
+            &pear_runtime,
+        )
+        .unwrap();
+        let args = child["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        let flag = args
+            .iter()
+            .position(|arg| *arg == "--vllm-memory-utilization")
+            .unwrap();
+        assert_eq!(args[flag + 1], "65");
+        assert_eq!(
+            serde_json::to_value(persisted).unwrap(),
+            json!({ "target_pct": 65, "floor_pct": 60, "max_pct": 80 })
+        );
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn discrete_vllm_override_may_lower_target_but_not_exceed_admission() {
+        let home = test_temp_dir("mayhem-vllm-discrete-admission");
+        let mut config = toml::from_str::<toml::Value>(
+            r#"
+            [provider.limits]
+            vllm_memory_utilization_pct = 61
+            "#,
+        )
+        .unwrap();
+        write_config_toml_value(&config_path_for_home(&home), &config).unwrap();
+        let mut selected =
+            test_auto_fit_candidate('b', "test/vllm-discrete", "text", 60, 85, 1, 30.0);
+        selected.enclave.backend = "vllm".to_owned();
+        selected.artifact.engine = "vllm".to_owned();
+        selected.enclave.caps = json!({ "vllm_gpu_memory_utilization_pct": 80 });
+        selected.feasibility.memory_budget.pool = "nvidia_dedicated_memory".to_owned();
+        selected.feasibility.memory_budget.unified = false;
+        selected.feasibility.memory_budget.total_bytes = 100 * GIB_BYTES;
+        selected.feasibility.memory_budget.budget_bytes = 85 * GIB_BYTES;
+        selected.feasibility.estimated_required_bytes = 60 * GIB_BYTES;
+
+        assert_eq!(
+            ensure_provider_vllm_memory_utilization_config(
+                &home,
+                std::slice::from_ref(&selected),
+                None,
+            )
+            .unwrap()
+            .unwrap()
+            .target_pct,
+            61
+        );
+
+        toml_set_u64(
+            &mut config,
+            "provider.limits.vllm_memory_utilization_pct",
+            81,
+        )
+        .unwrap();
+        write_config_toml_value(&config_path_for_home(&home), &config).unwrap();
+        let error = ensure_provider_vllm_memory_utilization_config(
+            &home,
+            std::slice::from_ref(&selected),
+            None,
+        )
+        .expect_err("an override above the admitted ceiling must fail");
+        assert!(error.to_string().contains("safe ceiling 80%"));
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn co_resident_vllm_workers_cannot_overreserve_a_shared_pool() {
+        let mut large = test_auto_fit_candidate('c', "test/vllm-large", "text", 60, 85, 1, 30.0);
+        let mut small = test_auto_fit_candidate('d', "test/vllm-small", "text", 10, 85, 1, 30.0);
+        for selected in [&mut large, &mut small] {
+            selected.enclave.backend = "vllm".to_owned();
+            selected.artifact.engine = "vllm".to_owned();
+            selected.enclave.caps = json!({ "vllm_gpu_memory_utilization_pct": 80 });
+            selected.feasibility.memory_budget.pool = "nvidia_unified_memory".to_owned();
+            selected.feasibility.memory_budget.unified = true;
+            selected.feasibility.memory_budget.total_bytes = 100 * GIB_BYTES;
+            selected.feasibility.memory_budget.budget_bytes = 85 * GIB_BYTES;
+        }
+
+        let error = provider_vllm_memory_utilization_for_candidates(&[large, small], None)
+            .expect_err("one common vLLM target must not overreserve a shared memory pool");
+        assert!(error
+            .to_string()
+            .contains("exceeding the admitted shared budget"));
+    }
+
+    #[test]
     fn provider_candidates_count_non_text_worker_memory() {
         let root = "aa".repeat(32);
         let mut catalog = test_catalog(&root);
@@ -84568,6 +85050,64 @@ mod tests {
         assert!(message.contains("TensorRT-LLM requires a compatible NVIDIA GPU"));
         assert!(message.contains("no NVIDIA GPU detected"));
         assert!(message.contains("suggestion: use catalog artifact mlx-4bit via mlx"));
+    }
+
+    #[test]
+    fn sulphur_rejects_signed_execution_flavor_on_wrong_platform() {
+        let (catalog, _) = test_sulphur_catalog_and_contract();
+        let model = &catalog.models[0];
+        let mlx = &model.artifacts["mlx-q4"];
+        let cuda = &model.artifacts["gguf-q4_k_m"];
+
+        for fixture in [FixtureProfile::LinuxNvidia, FixtureProfile::WindowsNvidia] {
+            let hardware = test_hardware(fixture);
+            let compatibility = artifact_hardware_compatibility(model, "mlx-q4", mlx, &hardware);
+            assert!(!compatibility.compatible);
+            assert!(compatibility
+                .reason
+                .contains("signed Sulphur artifact selects the Apple MLX execution flavor"));
+            assert!(compatibility
+                .suggestion
+                .as_deref()
+                .is_some_and(|value| value.contains("gguf-q4_k_m via sulphur")));
+        }
+
+        let hardware = test_viable_sulphur_apple_hardware();
+        let compatibility = artifact_hardware_compatibility(model, "gguf-q4_k_m", cuda, &hardware);
+        assert!(!compatibility.compatible);
+        assert!(compatibility
+            .reason
+            .contains("signed Sulphur artifact selects the CUDA/GGUF execution flavor"));
+        assert!(compatibility
+            .suggestion
+            .as_deref()
+            .is_some_and(|value| value.contains("mlx-q4 via sulphur")));
+    }
+
+    #[test]
+    fn sulphur_provider_selection_automatically_uses_compatible_sibling_artifact() {
+        let (catalog, contract) = test_sulphur_catalog_and_contract();
+        for (hardware, expected_artifact) in [
+            (test_hardware(FixtureProfile::LinuxNvidia), "gguf-q4_k_m"),
+            (test_hardware(FixtureProfile::WindowsNvidia), "gguf-q4_k_m"),
+            (test_viable_sulphur_apple_hardware(), "mlx-q4"),
+        ] {
+            let mut args = test_provider_start_args();
+            args.enclave = Some("test/model@4bit".to_owned());
+            let candidates =
+                build_provider_candidates(&contract, &catalog, &hardware, &args).unwrap();
+            assert_eq!(candidates.len(), 1);
+            let selected = select_provider_candidate(&candidates, Some("test/model@4bit")).unwrap();
+            assert_eq!(selected.artifact_name, expected_artifact);
+            assert_eq!(
+                sulphur_execution_flavor(&selected.artifact).unwrap(),
+                if expected_artifact == "mlx-q4" {
+                    SulphurExecutionFlavor::AppleMlx
+                } else {
+                    SulphurExecutionFlavor::CudaGguf
+                }
+            );
+        }
     }
 
     #[test]
@@ -91068,13 +91608,6 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         artifact.path = "weights.gguf".to_owned();
         artifact.artifact_root = "11".repeat(32);
         artifact.sidecars.clear();
-        assert_eq!(managed_python_backend_for_artifact(&artifact), "sulphur");
-        let mut mlx_artifact = artifact.clone();
-        mlx_artifact.path = "transformer-distilled.safetensors".to_owned();
-        assert_eq!(
-            managed_python_backend_for_artifact(&mlx_artifact),
-            "sulphur-mlx"
-        );
 
         let temp = test_temp_dir("mayhem-sulphur-layout");
         let cache = temp.join("cache");
@@ -91113,6 +91646,11 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 },
             );
         }
+        assert_eq!(
+            sulphur_execution_flavor(&artifact).unwrap(),
+            SulphurExecutionFlavor::CudaGguf
+        );
+        assert_eq!(managed_python_backend_for_artifact(&artifact), "sulphur");
         let paths = ProviderArtifactPaths {
             primary,
             sidecars: BTreeMap::from([
@@ -91166,6 +91704,14 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 weights_bytes: fs::metadata(&mlx_manifest).unwrap().len(),
                 source_sha256: file_sha256_hex(&mlx_manifest).unwrap(),
             },
+        );
+        assert_eq!(
+            sulphur_execution_flavor(&mlx_artifact).unwrap(),
+            SulphurExecutionFlavor::AppleMlx
+        );
+        assert_eq!(
+            managed_python_backend_for_artifact(&mlx_artifact),
+            "sulphur-mlx"
         );
         let mlx_paths = ProviderArtifactPaths {
             primary: mlx_primary,
@@ -94962,6 +95508,9 @@ State initialization...
             lyrics: None,
             instrumental: None,
             duration_seconds: None,
+            num_frames: None,
+            fps: None,
+            negative_prompt: None,
             bpm: None,
             keyscale: None,
             timesignature: None,
@@ -95101,6 +95650,161 @@ State initialization...
                 .unwrap_err()
                 .to_string()
                 .contains("remote image URLs are not fetched")
+        );
+    }
+
+    #[test]
+    fn sulphur_video_canary_propagates_direct_shape_for_each_endpoint_family() {
+        let catalog = catalog::load_document(&repo_path("catalog/models.json").unwrap()).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "SulphurAI/Sulphur-2-base")
+            .expect("Sulphur catalog model");
+
+        for family in [
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+        ] {
+            let prompt: CanaryPrompt = serde_json::from_value(json!({
+                "id": format!("direct-{family}"),
+                "endpoint_family": family,
+                "prompt": "A fixed direct-value video canary.",
+                "size": "704x448",
+                "seed": 11,
+                "num_frames": 121,
+                "fps": 24,
+                "negative_prompt": "blur, watermark"
+            }))
+            .unwrap();
+
+            let body = provider_canary_self_test_body(model, &prompt).unwrap();
+            let (frames, fps, negative_prompt) = if family == mayhem_proto::ENDPOINT_OPENAI_VIDEOS {
+                (
+                    body["num_frames"].clone(),
+                    body["fps"].clone(),
+                    body["negative_prompt"].clone(),
+                )
+            } else {
+                (
+                    body["parameters"]["num_frames"].clone(),
+                    body["parameters"]["fps"].clone(),
+                    body["parameters"]["negative_prompt"].clone(),
+                )
+            };
+            assert_eq!(frames, json!(121), "{family}");
+            assert_eq!(fps, json!(24.0), "{family}");
+            assert_eq!(negative_prompt, json!("blur, watermark"), "{family}");
+
+            let sealed =
+                provider_seal_local_contract_request(&body, &model.adapter, &model.model_id)
+                    .unwrap();
+            let verified =
+                provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter)
+                    .unwrap();
+            let request =
+                provider_media_generation_request_from_body(&verified.family, verified.request)
+                    .unwrap();
+            assert_eq!(request.frame_count, Some(121), "{family}");
+        }
+    }
+
+    #[test]
+    fn video_canary_endpoint_attributes_override_direct_shape_for_each_family() {
+        let catalog = catalog::load_document(&repo_path("catalog/models.json").unwrap()).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "SulphurAI/Sulphur-2-base")
+            .expect("Sulphur catalog model");
+
+        for family in [
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+        ] {
+            let mut prompt: CanaryPrompt = serde_json::from_value(json!({
+                "id": format!("precedence-{family}"),
+                "endpoint_family": family,
+                "prompt": "A fixed precedence video canary.",
+                "size": "704x448",
+                "seed": 11,
+                "num_frames": 121,
+                "fps": 24,
+                "negative_prompt": "direct value"
+            }))
+            .unwrap();
+            if family == mayhem_proto::ENDPOINT_OPENAI_VIDEOS {
+                prompt
+                    .endpoint_attributes
+                    .insert("num_frames".to_owned(), json!(9));
+                prompt
+                    .endpoint_attributes
+                    .insert("fps".to_owned(), json!(8));
+                prompt
+                    .endpoint_attributes
+                    .insert("negative_prompt".to_owned(), json!("endpoint attribute"));
+            } else {
+                prompt.endpoint_attributes.insert(
+                    "parameters".to_owned(),
+                    json!({
+                        "num_frames": 9,
+                        "fps": 8,
+                        "negative_prompt": "endpoint attribute"
+                    }),
+                );
+            }
+
+            let body = provider_canary_self_test_body(model, &prompt).unwrap();
+            let (frames, fps, negative_prompt) = if family == mayhem_proto::ENDPOINT_OPENAI_VIDEOS {
+                (
+                    body["num_frames"].clone(),
+                    body["fps"].clone(),
+                    body["negative_prompt"].clone(),
+                )
+            } else {
+                (
+                    body["parameters"]["num_frames"].clone(),
+                    body["parameters"]["fps"].clone(),
+                    body["parameters"]["negative_prompt"].clone(),
+                )
+            };
+            assert_eq!(frames, json!(9), "{family}");
+            assert_eq!(fps, json!(8), "{family}");
+            assert_eq!(negative_prompt, json!("endpoint attribute"), "{family}");
+
+            let sealed =
+                provider_seal_local_contract_request(&body, &model.adapter, &model.model_id)
+                    .unwrap();
+            let verified =
+                provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter)
+                    .unwrap();
+            let request =
+                provider_media_generation_request_from_body(&verified.family, verified.request)
+                    .unwrap();
+            assert_eq!(request.frame_count, Some(9), "{family}");
+        }
+    }
+
+    #[test]
+    fn media_request_rejects_conflicting_frame_aliases() {
+        let error = provider_media_generation_request_from_body(
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            &json!({
+                "prompt": "A conflicting video request.",
+                "num_frames": 121,
+                "parameters": {
+                    "frame_count": 9,
+                    "fps": 24
+                }
+            }),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("media generation frame count aliases conflict"),
+            "{error:#}"
         );
     }
 
@@ -103401,6 +104105,114 @@ State initialization...
                 },
             }],
         }
+    }
+
+    fn test_viable_sulphur_apple_hardware() -> HardwareReport {
+        let mut hardware = test_hardware(FixtureProfile::AppleSilicon);
+        hardware.memory.total_bytes = gib_u64(96);
+        hardware.memory.available_bytes = Some(gib_u64(80));
+        let verdict = hardware
+            .backend_verdicts
+            .iter_mut()
+            .find(|verdict| verdict.backend == "sulphur")
+            .unwrap();
+        verdict.status = VerdictStatus::FullOffload;
+        verdict.reason = Some("test Apple Silicon MLX hardware path".to_owned());
+        hardware
+    }
+
+    fn test_sulphur_catalog_and_contract() -> (catalog::CatalogDocument, ContractCatalog) {
+        let cuda_root = "aa".repeat(32);
+        let mlx_root = "bb".repeat(32);
+        let mut catalog = test_catalog(&cuda_root);
+        let model = &mut catalog.models[0];
+        let mut cuda = model.artifacts.remove("gguf-q4_k_m").unwrap();
+        cuda.engine = "sulphur".to_owned();
+        cuda.path = "sulphur_dev-Q4_K_M.gguf".to_owned();
+        cuda.artifact_root = cuda_root.clone();
+        cuda.sidecars = BTreeMap::from([(
+            SULPHUR_RUNTIME_MANIFEST_SIDECAR.to_owned(),
+            catalog::CatalogArtifactSidecar {
+                source: cuda.source.clone(),
+                upstream_source: None,
+                path: SULPHUR_CUDA_RUNTIME_MANIFEST_PATH.to_owned(),
+                artifact_root: "cc".repeat(32),
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 11,
+                source_sha256: "dd".repeat(32),
+            },
+        )]);
+        let mut mlx = cuda.clone();
+        mlx.path = "sulphur/transformer-distilled.safetensors".to_owned();
+        mlx.artifact_root = mlx_root;
+        mlx.min_compute_cap = None;
+        mlx.sidecars = BTreeMap::from([(
+            SULPHUR_RUNTIME_MANIFEST_SIDECAR.to_owned(),
+            catalog::CatalogArtifactSidecar {
+                source: mlx.source.clone(),
+                upstream_source: None,
+                path: SULPHUR_MLX_RUNTIME_MANIFEST_PATH.to_owned(),
+                artifact_root: "ee".repeat(32),
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 12,
+                source_sha256: "ff".repeat(32),
+            },
+        )]);
+        model
+            .artifacts
+            .insert("gguf-q4_k_m".to_owned(), cuda.clone());
+        model.artifacts.insert("mlx-q4".to_owned(), mlx.clone());
+        model.requirements.backends = vec!["sulphur".to_owned()];
+
+        let ledger_sidecars = |artifact: &catalog::CatalogArtifact| {
+            artifact
+                .sidecars
+                .iter()
+                .map(|(name, sidecar)| {
+                    (
+                        name.clone(),
+                        LedgerArtifactSidecar {
+                            source: LedgerArtifactSource {
+                                kind: sidecar.source.kind.clone(),
+                                repo: sidecar.source.repo.clone(),
+                                revision: sidecar.source.revision.clone(),
+                                path: sidecar.path.clone(),
+                            },
+                            path: sidecar.path.clone(),
+                            artifact_root: sidecar.artifact_root.clone(),
+                            artifact_root_kind: sidecar.artifact_root_kind.clone(),
+                            weights_bytes: sidecar.weights_bytes,
+                            source_sha256: sidecar.source_sha256.clone(),
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let bind_enclave = |enclave: &mut LedgerEnclave, artifact: &catalog::CatalogArtifact| {
+            enclave.backend = artifact.engine.clone();
+            enclave.artifact_root = artifact.artifact_root.clone();
+            enclave.artifact_root_kind = artifact.artifact_root_kind.clone();
+            enclave.artifact_source = LedgerArtifactSource {
+                kind: artifact.source.kind.clone(),
+                repo: artifact.source.repo.clone(),
+                revision: artifact.source.revision.clone(),
+                path: artifact.path.clone(),
+            };
+            enclave.artifact_sidecars = ledger_sidecars(artifact);
+            enclave.source_sha256 = artifact.source_sha256.clone();
+            canonicalize_test_enclave_id(enclave)
+        };
+
+        let mut contract = test_contract(&cuda_root);
+        let cuda_id = bind_enclave(&mut contract.enclaves[0], &cuda);
+        contract.prices[0].enclave_id = cuda_id;
+        let mut mlx_enclave = contract.enclaves[0].clone();
+        let mlx_id = bind_enclave(&mut mlx_enclave, &mlx);
+        let mut mlx_price = contract.prices[0].clone();
+        mlx_price.enclave_id = mlx_id;
+        contract.enclaves.push(mlx_enclave);
+        contract.prices.push(mlx_price);
+        (catalog, contract)
     }
 
     fn add_test_reasoning_speciality(model: &mut catalog::CatalogModel) {

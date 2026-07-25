@@ -1211,6 +1211,128 @@ install_from_artifact() {
   fi
 }
 
+llama_cpp_feature_name() {
+  local token
+  token="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+
+  case "$token" in
+    cpu | none) printf '\n' ;;
+    cuda | llama-cpp-cuda | mayhem-cli/llama-cpp-cuda)
+      printf 'mayhem-cli/llama-cpp-cuda\n'
+      ;;
+    vulkan | llama-cpp-vulkan | mayhem-cli/llama-cpp-vulkan)
+      printf 'mayhem-cli/llama-cpp-vulkan\n'
+      ;;
+    openmp | llama-cpp-openmp | mayhem-cli/llama-cpp-openmp)
+      printf 'mayhem-cli/llama-cpp-openmp\n'
+      ;;
+    static-openmp | llama-cpp-static-openmp | mayhem-cli/llama-cpp-static-openmp)
+      printf 'mayhem-cli/llama-cpp-static-openmp\n'
+      ;;
+    *)
+      die "unknown MAYHEM_LLAMA_CPP_FEATURES entry '$1' (expected cuda, vulkan, openmp, static-openmp, or cpu)"
+      ;;
+  esac
+}
+
+llama_cpp_cuda_toolkit_usable() {
+  local candidate resolved
+  local -a candidates=()
+
+  [[ -n "${CUDACXX:-}" ]] && candidates+=("$CUDACXX")
+  [[ -n "${CUDA_HOME:-}" ]] && candidates+=("$CUDA_HOME/bin/nvcc")
+  [[ -n "${CUDA_PATH:-}" ]] && candidates+=("$CUDA_PATH/bin/nvcc")
+  candidates+=("/usr/local/cuda/bin/nvcc" "/opt/cuda/bin/nvcc" "nvcc")
+
+  for candidate in "${candidates[@]}"; do
+    resolved="$candidate"
+    if [[ "$candidate" != */* ]]; then
+      resolved="$(command -v "$candidate" 2>/dev/null || true)"
+    fi
+    [[ -n "$resolved" && -x "$resolved" ]] || continue
+    if "$resolved" --version >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+llama_cpp_vulkan_toolkit_usable() {
+  local library_dir
+
+  if command -v pkg-config >/dev/null 2>&1 &&
+    pkg-config --exists vulkan >/dev/null 2>&1; then
+    return 0
+  fi
+
+  [[ -n "${VULKAN_SDK:-}" ]] || return 1
+  [[ -r "$VULKAN_SDK/include/vulkan/vulkan.h" ]] || return 1
+  for library_dir in "$VULKAN_SDK/lib" "$VULKAN_SDK/lib64"; do
+    if compgen -G "$library_dir/libvulkan.so*" >/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+normalize_linux_arch() {
+  case "$1" in
+    x86_64 | amd64) printf 'x86_64\n' ;;
+    aarch64 | arm64) printf 'aarch64\n' ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+linux_llama_cpp_features() {
+  local os="$1"
+  local target_arch host_arch raw token feature features=""
+  local -a tokens=()
+
+  [[ "$os" == "Linux" ]] || return 0
+  target_arch="$(normalize_linux_arch "$2")"
+  host_arch="$(normalize_linux_arch "${3:-$2}")"
+  case "$target_arch" in
+    x86_64 | aarch64) ;;
+    *) return 0 ;;
+  esac
+
+  raw="${MAYHEM_LLAMA_CPP_FEATURES:-}"
+  if [[ -n "${raw//[[:space:],;]/}" ]]; then
+    IFS=',; ' read -r -a tokens <<< "$raw"
+    for token in "${tokens[@]}"; do
+      [[ -n "$token" ]] || continue
+      feature="$(llama_cpp_feature_name "$token")"
+      [[ -n "$feature" ]] || continue
+      case "$feature" in
+        mayhem-cli/llama-cpp-cuda)
+          llama_cpp_cuda_toolkit_usable ||
+            die "llama.cpp CUDA source build requested, but a working nvcc was not found; install CUDA Toolkit or set MAYHEM_LLAMA_CPP_FEATURES=cpu"
+          ;;
+        mayhem-cli/llama-cpp-vulkan)
+          llama_cpp_vulkan_toolkit_usable ||
+            die "llama.cpp Vulkan source build requested, but Vulkan headers and loader were not found; install the Vulkan SDK or set MAYHEM_LLAMA_CPP_FEATURES=cpu"
+          ;;
+      esac
+      case ",$features," in
+        *",$feature,"*) ;;
+        *) features="${features:+$features,}$feature" ;;
+      esac
+    done
+    printf '%s\n' "$features"
+    return 0
+  fi
+
+  # A host toolkit does not prove that a cross-compiled target can use it.
+  if [[ "$target_arch" != "$host_arch" ]]; then
+    return 0
+  fi
+  if llama_cpp_cuda_toolkit_usable; then
+    printf 'mayhem-cli/llama-cpp-cuda\n'
+  elif llama_cpp_vulkan_toolkit_usable; then
+    printf 'mayhem-cli/llama-cpp-vulkan\n'
+  fi
+}
+
 install_source_binary() {
   local src="$1"
   local dest="$2"
@@ -1238,7 +1360,7 @@ install_source_binary() {
 }
 
 install_from_source() {
-  local bin src target_root
+  local bin src target_root llama_cpp_features
   local -a cargo_args
 
   [[ -f "$SOURCE_DIR/Cargo.toml" ]] || die "source dir does not contain Cargo.toml: $SOURCE_DIR"
@@ -1248,6 +1370,16 @@ install_from_source() {
   cargo_args=(build --release --workspace --bins)
   if [[ "$(uname -s)" == "Darwin" ]]; then
     cargo_args+=(--features mayhem-cli/llama-cpp-metal)
+  elif [[ "$(uname -s)" == "Linux" ]]; then
+    llama_cpp_features="$(
+      linux_llama_cpp_features Linux "$(uname -m)" "$(uname -m)"
+    )"
+    if [[ -n "$llama_cpp_features" ]]; then
+      log "building llama.cpp provider feature(s): $llama_cpp_features"
+      cargo_args+=(--features "$llama_cpp_features")
+    else
+      log "building llama.cpp CPU fallback; install a usable CUDA or Vulkan toolkit, or set MAYHEM_LLAMA_CPP_FEATURES explicitly"
+    fi
   fi
   (cd "$SOURCE_DIR" && cargo "${cargo_args[@]}")
 

@@ -242,14 +242,43 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          metadata_file="$RUNNER_TEMP/mayhem-cargo-metadata.json"
+          cargo metadata --format-version 1 --no-deps --locked >"$metadata_file"
+          release_version="$(
+            METADATA_FILE="$metadata_file" node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+
+          const metadata = JSON.parse(fs.readFileSync(process.env.METADATA_FILE, 'utf8'));
+          const workspaceMembers = new Set(metadata.workspace_members);
+          const workspacePackages = metadata.packages.filter(({ id }) => workspaceMembers.has(id));
+          const cli = workspacePackages.find(({ name }) => name === 'mayhem-cli');
+          if (!cli) throw new Error('workspace metadata does not contain mayhem-cli');
+          const mismatches = workspacePackages
+            .filter(({ version }) => version !== cli.version)
+            .map(({ name, version }) => `${name}@${version}`);
+          if (mismatches.length > 0) {
+            throw new Error(
+              `workspace package versions differ from mayhem-cli@${cli.version}: ${mismatches.join(', ')}`
+            );
+          }
+          process.stdout.write(cli.version);
+          NODE
+          )"
+          [[ "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            printf 'invalid derived workspace release version: %s\n' "$release_version" >&2
+            exit 1
+          }
+          printf 'MAYHEM_SOURCE_RELEASE_VERSION=%s\n' "$release_version" >>"$GITHUB_ENV"
+
           node --input-type=module <<'NODE'
           import path from 'node:path';
           import { verifyStartupReleaseIdentity } from './intercom/src/release-identity.js';
 
           const identity = verifyStartupReleaseIdentity({ rootDir: path.resolve('intercom') });
-          if (identity.releaseVersion !== '0.2.35' || identity.contractVersion !== 14) {
-            throw new Error(`unexpected release identity: ${JSON.stringify(identity)}`);
-          }
+          process.stdout.write(
+            `Verified Intercom ${identity.releaseVersion}, contract ${identity.contractVersion}, ` +
+            `code ${identity.contractCodeSha256}\n`
+          );
           NODE
 
       - name: Build locked native release
@@ -292,7 +321,7 @@ jobs:
           } >>"$GITHUB_STEP_SUMMARY"
 
           version="$($release_dir/mayhem$EXE --version | tr -d '\r')"
-          [[ "$version" == "mayhem 0.2.35" ]] || {
+          [[ "$version" == "mayhem $MAYHEM_SOURCE_RELEASE_VERSION" ]] || {
             printf 'unexpected mayhem version: %s\n' "$version" >&2
             exit 1
           }

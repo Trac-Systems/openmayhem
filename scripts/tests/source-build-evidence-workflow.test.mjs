@@ -27,8 +27,25 @@ requireText('[[ "$WORKFLOW_SHA" == "$SOURCE_SHA" ]]', 'workflow bytes are not bo
 requireText('cargo "${args[@]}"', 'native build command is missing');
 requireText('build --release --workspace --bins --locked --target "$TARGET"',
   'native build is not fresh, locked, release, workspace-wide, and target-bound');
-requireText("identity.releaseVersion !== '0.2.35' || identity.contractVersion !== 14",
-  'release and contract identity gate is stale');
+requireText('cargo metadata --format-version 1 --no-deps --locked',
+  'workspace release version is not derived from locked Cargo metadata');
+requireText("workspacePackages.find(({ name }) => name === 'mayhem-cli')",
+  'workspace release version is not anchored to mayhem-cli');
+requireText('version !== cli.version',
+  'workspace package version consistency is not checked');
+requireText('verifyStartupReleaseIdentity({ rootDir: path.resolve(\'intercom\') })',
+  'Intercom release and contract identity are not verified from checked-in metadata');
+requireText('MAYHEM_SOURCE_RELEASE_VERSION=%s',
+  'derived workspace release version is not exported to later build checks');
+requireText('mayhem $MAYHEM_SOURCE_RELEASE_VERSION',
+  'native binary is not checked against the derived workspace release version');
+
+if (/\b0\.2\.[0-9]+\b/.test(workflow)) {
+  fail('workflow must not hardcode an OpenMayhem release version');
+}
+if (/contractVersion\s*!==\s*[0-9]+/.test(workflow)) {
+  fail('workflow must not hardcode an Intercom contract version');
+}
 
 const entries = [...workflow.matchAll(
   /^          - runner: (?<runner>\S+)\n            target: (?<target>\S+)$/gm,

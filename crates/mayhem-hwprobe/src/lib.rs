@@ -444,8 +444,11 @@ fn chatterbox_managed_device_for_parts(
     host_memory: u64,
     gpus: &[GpuInfo],
 ) -> ChatterboxManagedDevice {
-    let managed_cuda_runtime =
-        matches!(host.os.as_str(), "linux" | "windows") && host.arch == "x86_64";
+    let managed_cuda_runtime = match host.os.as_str() {
+        "linux" => matches!(host.arch.as_str(), "x86_64" | "aarch64" | "arm64"),
+        "windows" => host.arch == "x86_64",
+        _ => false,
+    };
     let cuda_memory = managed_cuda_runtime
         .then(|| {
             gpus.iter()
@@ -3068,7 +3071,11 @@ mod tests {
 
     #[test]
     fn chatterbox_supports_cuda_mps_and_cpu_without_admin_setup() {
-        for fixture in [FixtureProfile::LinuxNvidia, FixtureProfile::WindowsNvidia] {
+        for fixture in [
+            FixtureProfile::LinuxNvidia,
+            FixtureProfile::LinuxNvidiaArm64,
+            FixtureProfile::WindowsNvidia,
+        ] {
             let profile = fixture_profile(fixture, Path::new("."));
             let verdict = chatterbox_verdict(&profile);
             assert_eq!(verdict.status, VerdictStatus::FullOffload, "{fixture:?}");
@@ -3079,18 +3086,6 @@ mod tests {
                 .unwrap_or_default()
                 .contains("CUDA"));
         }
-
-        let linux_arm = chatterbox_verdict(&fixture_profile(
-            FixtureProfile::LinuxNvidiaArm64,
-            Path::new("."),
-        ));
-        assert_eq!(linux_arm.status, VerdictStatus::CpuOnly);
-        assert_eq!(linux_arm.n_layers_gpu, Some(0));
-        assert!(linux_arm
-            .reason
-            .as_deref()
-            .unwrap_or_default()
-            .contains("CPU fallback"));
 
         let apple = chatterbox_verdict(&fixture_profile(
             FixtureProfile::AppleSilicon,
@@ -3120,7 +3115,7 @@ mod tests {
             (FixtureProfile::LinuxNvidia, ChatterboxManagedDevice::Cuda),
             (
                 FixtureProfile::LinuxNvidiaArm64,
-                ChatterboxManagedDevice::Cpu,
+                ChatterboxManagedDevice::Cuda,
             ),
             (FixtureProfile::WindowsNvidia, ChatterboxManagedDevice::Cuda),
             (FixtureProfile::AppleSilicon, ChatterboxManagedDevice::Mps),

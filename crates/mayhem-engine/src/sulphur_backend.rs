@@ -17,13 +17,15 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const WORKER: &str = include_str!("sulphur_worker.py");
 const WORKER_STDIN_BOOTSTRAP: &str = concat!(
@@ -58,6 +60,9 @@ const PROMPT_ENHANCER_CONTEXT: u32 = 16 * 1024;
 const PROMPT_ENHANCER_MAX_NEW_TOKENS: u32 = 2 * 1024;
 const ARTIFACT_CHUNK_BYTES: usize = 256 * 1024;
 const WORKER_STDERR_TAIL_BYTES: usize = 64 * 1024;
+const MEDIA_TOOL_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const MEDIA_TOOL_PROBE_MAX_OUTPUT_BYTES: u64 = 2 * 1024 * 1024;
+static MEDIA_TOOL_PROBE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct SulphurBackend {
     python: PathBuf,
@@ -122,10 +127,18 @@ impl SulphurBackend {
         self.execution_config.as_ref()
     }
 
+    fn preflight_media_tools(&mut self) -> Result<()> {
+        let tools = preflight_media_tools(&self.ffmpeg, &self.ffprobe)?;
+        self.ffmpeg = tools.ffmpeg;
+        self.ffprobe = tools.ffprobe;
+        Ok(())
+    }
+
     fn ensure_worker_loaded(&mut self) -> Result<()> {
         if self.worker.is_some() {
             return Ok(());
         }
+        self.preflight_media_tools()?;
         let config = self.config.clone().ok_or(EngineError::NotLoaded)?;
         let model_root = self
             .model_root
@@ -414,6 +427,7 @@ impl EngineBackend for SulphurBackend {
     }
 
     fn load(&mut self, mut config: LoadConfig) -> Result<LoadedModelInfo> {
+        self.preflight_media_tools()?;
         validate_load_config(&config)?;
         let (backend, model_root) = match config.artifact.format {
             ArtifactFormat::Gguf => {
@@ -2309,12 +2323,245 @@ fn sulphur_worker_path(python: &Path, ffmpeg: &Path, ffprobe: &Path) -> Result<O
     })
 }
 
+#[derive(Debug)]
+struct SulphurMediaTools {
+    ffmpeg: PathBuf,
+    ffprobe: PathBuf,
+}
+
+fn preflight_media_tools(ffmpeg: &Path, ffprobe: &Path) -> Result<SulphurMediaTools> {
+    let ffmpeg = resolve_media_tool(ffmpeg, "ffmpeg", FFMPEG_ENV)?;
+    let ffprobe = resolve_media_tool(ffprobe, "ffprobe", FFPROBE_ENV)?;
+
+    let ffmpeg_version = run_media_tool_probe(&ffmpeg, &["-version"], "ffmpeg")?;
+    require_media_tool_version(&ffmpeg_version, "ffmpeg", FFMPEG_ENV)?;
+    let ffprobe_version = run_media_tool_probe(&ffprobe, &["-version"], "ffprobe")?;
+    require_media_tool_version(&ffprobe_version, "ffprobe", FFPROBE_ENV)?;
+
+    let decoders =
+        run_media_tool_probe(&ffmpeg, &["-hide_banner", "-decoders"], "ffmpeg decoders")?;
+    require_media_capabilities(
+        &decoders,
+        "ffmpeg",
+        FFMPEG_ENV,
+        "decoder",
+        &[("h264", "H.264 video"), ("aac", "AAC audio")],
+    )?;
+    let encoders =
+        run_media_tool_probe(&ffmpeg, &["-hide_banner", "-encoders"], "ffmpeg encoders")?;
+    require_media_capabilities(
+        &encoders,
+        "ffmpeg",
+        FFMPEG_ENV,
+        "encoder",
+        &[("pcm_s16le", "signed 16-bit PCM audio")],
+    )?;
+    let muxers = run_media_tool_probe(&ffmpeg, &["-hide_banner", "-muxers"], "ffmpeg muxers")?;
+    require_media_capabilities(
+        &muxers,
+        "ffmpeg",
+        FFMPEG_ENV,
+        "muxer",
+        &[("s16le", "raw signed 16-bit PCM")],
+    )?;
+    let demuxers =
+        run_media_tool_probe(&ffprobe, &["-hide_banner", "-demuxers"], "ffprobe demuxers")?;
+    require_media_capabilities(
+        &demuxers,
+        "ffprobe",
+        FFPROBE_ENV,
+        "demuxer",
+        &[("mov", "MP4/QuickTime")],
+    )?;
+
+    Ok(SulphurMediaTools { ffmpeg, ffprobe })
+}
+
+fn resolve_media_tool(program: &Path, label: &str, environment: &str) -> Result<PathBuf> {
+    resolve_program(program, label).map_err(|error| {
+        EngineError::Sulphur(format!(
+            "{error}; install a complete FFmpeg distribution in the provider user's environment \
+             or set {environment} to its {label} executable"
+        ))
+    })
+}
+
+fn require_media_tool_version(output: &[u8], label: &str, environment: &str) -> Result<()> {
+    let text = media_probe_text(output, label)?;
+    let expected = format!("{label} version ");
+    if text.lines().next().is_some_and(|line| {
+        line.starts_with(&expected) && !line[expected.len()..].trim().is_empty()
+    }) {
+        return Ok(());
+    }
+    Err(EngineError::Sulphur(format!(
+        "Sulphur {label} executable returned invalid version evidence; install a complete FFmpeg \
+         distribution or set {environment} to its {label} executable"
+    )))
+}
+
+fn require_media_capabilities(
+    output: &[u8],
+    label: &str,
+    environment: &str,
+    capability_kind: &str,
+    required: &[(&str, &str)],
+) -> Result<()> {
+    let text = media_probe_text(output, label)?;
+    let missing = required
+        .iter()
+        .filter(|(name, _)| !media_inventory_has(text, name))
+        .map(|(name, description)| format!("{description} ({name})"))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(EngineError::Sulphur(format!(
+        "Sulphur {label} lacks required {capability_kind} capability: {}; install a complete \
+         FFmpeg distribution or set {environment} to a compatible {label} executable",
+        missing.join(", ")
+    )))
+}
+
+fn media_inventory_has(output: &str, expected: &str) -> bool {
+    output.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let Some(flags) = fields.next() else {
+            return false;
+        };
+        let Some(names) = fields.next() else {
+            return false;
+        };
+        if flags.len() > 8
+            || flags.is_empty()
+            || !flags
+                .bytes()
+                .all(|byte| byte == b'.' || byte.is_ascii_uppercase())
+        {
+            return false;
+        }
+        names.split(',').any(|name| name == expected)
+    })
+}
+
+fn media_probe_text<'a>(output: &'a [u8], label: &str) -> Result<&'a str> {
+    std::str::from_utf8(output).map_err(|_| {
+        EngineError::Sulphur(format!(
+            "Sulphur {label} capability probe returned non-UTF-8 output"
+        ))
+    })
+}
+
+fn run_media_tool_probe(program: &Path, arguments: &[&str], label: &str) -> Result<Vec<u8>> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = MEDIA_TOOL_PROBE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let prefix = format!(
+        "mayhem-sulphur-media-probe-{}-{nonce}-{counter}",
+        std::process::id()
+    );
+    let stdout_path = env::temp_dir().join(format!("{prefix}.stdout"));
+    let stderr_path = env::temp_dir().join(format!("{prefix}.stderr"));
+    let cleanup = MediaProbeCleanup {
+        paths: vec![stdout_path.clone(), stderr_path.clone()],
+    };
+    let stdout = open_media_probe_file(&stdout_path)?;
+    let stderr = open_media_probe_file(&stderr_path)?;
+    let mut child = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .map_err(|error| {
+            EngineError::Sulphur(format!(
+                "starting Sulphur {label} capability probe with {} failed: {error}",
+                program.display()
+            ))
+        })?;
+    let deadline = Instant::now() + MEDIA_TOOL_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(EngineError::Sulphur(format!(
+                    "Sulphur {label} capability probe exceeded {} seconds",
+                    MEDIA_TOOL_PROBE_TIMEOUT.as_secs()
+                )));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(EngineError::Sulphur(format!(
+                    "waiting for Sulphur {label} capability probe failed: {error}"
+                )));
+            }
+        }
+    };
+    let stdout = read_media_probe_file(&stdout_path, label)?;
+    let stderr = read_media_probe_file(&stderr_path, label)?;
+    drop(cleanup);
+    if status.success() {
+        return Ok(stdout);
+    }
+    let detail = String::from_utf8_lossy(&stderr);
+    let detail = detail.trim();
+    let detail = if detail.is_empty() {
+        "no diagnostic output".to_owned()
+    } else {
+        detail.chars().take(512).collect()
+    };
+    Err(EngineError::Sulphur(format!(
+        "Sulphur {label} capability probe failed with {status}: {detail}"
+    )))
+}
+
+fn open_media_probe_file(path: &Path) -> Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            EngineError::Sulphur(format!(
+                "creating bounded Sulphur media-tool probe output {} failed: {error}",
+                path.display()
+            ))
+        })
+}
+
+fn read_media_probe_file(path: &Path, label: &str) -> Result<Vec<u8>> {
+    let size = fs::metadata(path)?.len();
+    if size > MEDIA_TOOL_PROBE_MAX_OUTPUT_BYTES {
+        return Err(EngineError::Sulphur(format!(
+            "Sulphur {label} capability probe exceeded its {}-byte output bound",
+            MEDIA_TOOL_PROBE_MAX_OUTPUT_BYTES
+        )));
+    }
+    fs::read(path).map_err(EngineError::from)
+}
+
+struct MediaProbeCleanup {
+    paths: Vec<PathBuf>,
+}
+
+impl Drop for MediaProbeCleanup {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::NoopArtifactSink;
-    use std::process::{Child, Command, Stdio};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::process::Child;
 
     struct TestTree {
         root: PathBuf,
@@ -2380,12 +2627,84 @@ mod tests {
                 .expect("make mock worker executable");
             worker
         }
+
+        #[cfg(unix)]
+        fn media_tool(&self, name: &str, source: &str) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+
+            let tools = self.root.join("media-tools");
+            fs::create_dir_all(&tools).expect("create mock media tools");
+            let tool = tools.join(name);
+            fs::write(&tool, source).expect("write mock media tool");
+            fs::set_permissions(&tool, fs::Permissions::from_mode(0o755))
+                .expect("make mock media tool executable");
+            tool
+        }
     }
 
     impl Drop for TestTree {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn media_tool_preflight_rejects_missing_binaries_with_actionable_guidance() {
+        let tree = TestTree::new("missing-media-tools");
+        let error = preflight_media_tools(
+            &tree.root.join("missing-ffmpeg"),
+            &tree.root.join("missing-ffprobe"),
+        )
+        .expect_err("missing media tools must fail before model load");
+        let error = error.to_string();
+        assert!(error.contains("ffmpeg"));
+        assert!(error.contains(FFMPEG_ENV));
+        assert!(error.contains("complete FFmpeg distribution"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn media_tool_preflight_rejects_an_inadequate_ffmpeg_build() {
+        let tree = TestTree::new("inadequate-media-tools");
+        let ffmpeg = tree.media_tool("ffmpeg", INADEQUATE_FFMPEG);
+        let ffprobe = tree.media_tool("ffprobe", VALID_FFPROBE);
+        let error = preflight_media_tools(&ffmpeg, &ffprobe)
+            .expect_err("ffmpeg without AAC decoding must fail");
+        let error = error.to_string();
+        assert!(error.contains("AAC audio (aac)"));
+        assert!(error.contains("decoder capability"));
+        assert!(error.contains(FFMPEG_ENV));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn media_tool_preflight_rejects_missing_or_inadequate_ffprobe() {
+        let tree = TestTree::new("invalid-ffprobe");
+        let ffmpeg = tree.media_tool("ffmpeg", VALID_FFMPEG);
+        let missing = tree.root.join("missing-ffprobe");
+        let error =
+            preflight_media_tools(&ffmpeg, &missing).expect_err("missing ffprobe must fail");
+        assert!(error.to_string().contains(FFPROBE_ENV));
+
+        let ffprobe = tree.media_tool("ffprobe", INADEQUATE_FFPROBE);
+        let error = preflight_media_tools(&ffmpeg, &ffprobe)
+            .expect_err("ffprobe without MP4 demuxing must fail");
+        let error = error.to_string();
+        assert!(error.contains("MP4/QuickTime (mov)"));
+        assert!(error.contains("demuxer capability"));
+        assert!(error.contains(FFPROBE_ENV));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn media_tool_preflight_accepts_a_complete_capability_fixture() {
+        let tree = TestTree::new("valid-media-tools");
+        let ffmpeg = tree.media_tool("ffmpeg", VALID_FFMPEG);
+        let ffprobe = tree.media_tool("ffprobe", VALID_FFPROBE);
+        let tools =
+            preflight_media_tools(&ffmpeg, &ffprobe).expect("complete media tools must pass");
+        assert_eq!(tools.ffmpeg, fs::canonicalize(ffmpeg).unwrap());
+        assert_eq!(tools.ffprobe, fs::canonicalize(ffprobe).unwrap());
     }
 
     fn test_iso_box(kind: [u8; 4], payload: &[u8]) -> Vec<u8> {
@@ -3378,6 +3697,79 @@ mod tests {
         }
         let _ = child.wait();
     }
+
+    #[cfg(unix)]
+    const VALID_FFMPEG: &str = r#"#!/bin/sh
+case "$*" in
+  "-version")
+    echo "ffmpeg version mayhem-test"
+    ;;
+  *"-decoders"*)
+    echo " VFS..D h264 H.264 video"
+    echo " A....D aac AAC audio"
+    ;;
+  *"-encoders"*)
+    echo " A....D pcm_s16le signed 16-bit PCM"
+    ;;
+  *"-muxers"*)
+    echo " E s16le raw signed 16-bit PCM"
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#;
+
+    #[cfg(unix)]
+    const INADEQUATE_FFMPEG: &str = r#"#!/bin/sh
+case "$*" in
+  "-version")
+    echo "ffmpeg version mayhem-test"
+    ;;
+  *"-decoders"*)
+    echo " VFS..D h264 H.264 video"
+    ;;
+  *"-encoders"*)
+    echo " A....D pcm_s16le signed 16-bit PCM"
+    ;;
+  *"-muxers"*)
+    echo " E s16le raw signed 16-bit PCM"
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#;
+
+    #[cfg(unix)]
+    const VALID_FFPROBE: &str = r#"#!/bin/sh
+case "$*" in
+  "-version")
+    echo "ffprobe version mayhem-test"
+    ;;
+  *"-demuxers"*)
+    echo " D mov,mp4,m4a,3gp,3g2,mj2 QuickTime / MOV"
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#;
+
+    #[cfg(unix)]
+    const INADEQUATE_FFPROBE: &str = r#"#!/bin/sh
+case "$*" in
+  "-version")
+    echo "ffprobe version mayhem-test"
+    ;;
+  *"-demuxers"*)
+    echo " D matroska,webm Matroska / WebM"
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#;
 
     #[cfg(unix)]
     const MOCK_WORKER: &str = r#"#!/usr/bin/env python3

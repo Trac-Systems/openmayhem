@@ -314,7 +314,7 @@ impl GatewaySessionBackend for ArtifactGenerationDirectSessionBackend {
             } else {
                 (
                     "audio/wav",
-                    tiny_wav_bytes(16_000),
+                    wav_bytes_for_duration_seconds(request.duration_seconds),
                     ReceiptUsage::from_units([
                         (
                             USAGE_INPUT_CHARACTER,
@@ -381,15 +381,13 @@ impl GatewaySessionBackend for ArtifactGenerationRecordingBackend {
                 .lock()
                 .expect("artifact generation records")
                 .push(request.clone());
+            let bytes = wav_bytes_for_duration_seconds(request.duration_seconds);
             let artifacts = (0..request.artifact_count)
-                .map(|index| {
-                    let bytes = tiny_wav_bytes(16_000 + u32::try_from(index).unwrap_or(0));
-                    GatewayArtifactOutput {
-                        id: format!("recorded-audio-{index}"),
-                        content_type: "audio/wav".to_owned(),
-                        blake3: blake3::hash(&bytes).to_hex().to_string(),
-                        bytes,
-                    }
+                .map(|index| GatewayArtifactOutput {
+                    id: format!("recorded-audio-{index}"),
+                    content_type: "audio/wav".to_owned(),
+                    blake3: blake3::hash(&bytes).to_hex().to_string(),
+                    bytes: bytes.clone(),
                 })
                 .collect();
             Ok(GatewayArtifactGenerationResult {
@@ -447,7 +445,7 @@ impl GatewaySessionBackend for ExtraCanaryArtifactBackend {
             let count = request
                 .artifact_count
                 .saturating_add(u64::from(request.prompt == "fixed music canary"));
-            let bytes = tiny_wav_bytes(16_000);
+            let bytes = wav_bytes_for_duration_seconds(request.duration_seconds);
             let artifacts = (0..count)
                 .map(|index| GatewayArtifactOutput {
                     id: format!("recorded-audio-{index}"),
@@ -3296,7 +3294,7 @@ async fn audio_and_music_generation_routes_remain_distinct_and_hf_compatible() {
     assert_eq!(hf_status, StatusCode::OK);
     assert_eq!(hf_headers["content-type"], "audio/wav");
     assert_eq!(hf_headers["x-mayhem-sampling-rate"], "16000");
-    assert_eq!(hf_audio, tiny_wav_bytes(16_000));
+    assert_eq!(hf_audio, wav_bytes_for_duration_seconds(2));
     assert!(hf_headers.contains_key("x-mayhem-receipt"));
     assert_eq!(state.receipts().len(), 3);
 }
@@ -4267,7 +4265,7 @@ async fn automatic_audio_fingerprint_probe_records_pass() {
 #[tokio::test]
 async fn automatic_music_fingerprint_probe_uses_signed_music_surface() {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let expected_audio = tiny_wav_bytes(16_000);
+    let expected_audio = wav_bytes_for_duration_seconds(10);
     let state = test_gateway_state_from_models(vec![routed_music_generation_test_model()])
         .with_canary_registry(test_music_audio_fingerprint_canary_registry(
             audio_fingerprint(&expected_audio),
@@ -4332,7 +4330,7 @@ async fn automatic_music_fingerprint_probe_uses_signed_music_surface() {
 
 #[tokio::test]
 async fn automatic_music_fingerprint_probe_rejects_extra_artifacts() {
-    let expected_audio = tiny_wav_bytes(16_000);
+    let expected_audio = wav_bytes_for_duration_seconds(10);
     let state = test_gateway_state_from_models(vec![routed_music_generation_test_model()])
         .with_canary_registry(test_music_audio_fingerprint_canary_registry(
             audio_fingerprint(&expected_audio),
@@ -6514,6 +6512,14 @@ fn tiny_wav_bytes(sample_count: u32) -> Vec<u8> {
         bytes.extend_from_slice(&sample.to_le_bytes());
     }
     bytes
+}
+
+fn wav_bytes_for_duration_seconds(duration_seconds: u64) -> Vec<u8> {
+    let sample_count = duration_seconds
+        .checked_mul(16_000)
+        .and_then(|samples| u32::try_from(samples).ok())
+        .expect("signed test duration fits the bounded WAV fixture");
+    tiny_wav_bytes(sample_count)
 }
 
 fn tiny_flac_bytes() -> Vec<u8> {

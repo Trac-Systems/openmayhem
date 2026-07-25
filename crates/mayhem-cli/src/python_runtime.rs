@@ -31,6 +31,10 @@ const CHATTERBOX_CUDA124_PROJECT: &[u8] =
     include_bytes!("../resources/python/chatterbox-runtime-cuda124/pyproject.toml");
 const CHATTERBOX_CUDA124_LOCK: &[u8] =
     include_bytes!("../resources/python/chatterbox-runtime-cuda124/uv.lock");
+const CHATTERBOX_CUDA130_ARM64_PROJECT: &[u8] =
+    include_bytes!("../resources/python/chatterbox-runtime-cuda130-arm64/pyproject.toml");
+const CHATTERBOX_CUDA130_ARM64_LOCK: &[u8] =
+    include_bytes!("../resources/python/chatterbox-runtime-cuda130-arm64/uv.lock");
 const SULPHUR_REQUIREMENTS: &[u8] =
     include_bytes!("../resources/python/sulphur-runtime-requirements.txt");
 const SULPHUR_RUNTIME_ADAPTER: &[u8] = include_bytes!("../resources/python/sulphur_runtime.py");
@@ -80,6 +84,10 @@ const CHATTERBOX_CUDA124_PROJECT_SHA256: &str =
     "0e46147713a73d3f7d771b03fdf83e5e03c6bdb96314a2700c4faec933e438e1";
 const CHATTERBOX_CUDA124_LOCK_SHA256: &str =
     "2080d1e677da4dd0095f5afaf26d972a1d2fb5fba5ff8f83f19b8d17df378fa5";
+const CHATTERBOX_CUDA130_ARM64_PROJECT_SHA256: &str =
+    "17df5a7ca5b71872685ef23f39656395326c9814be05c88f25e4df986ea03518";
+const CHATTERBOX_CUDA130_ARM64_LOCK_SHA256: &str =
+    "afef8c6e5a717784ef477e7dbd9091b1bb08870f02d4afec1d36e89935191ad6";
 const CHATTERBOX_MIN_FREE_BYTES: u64 = 16 * GIB;
 const ACE_STEP_LOCK_SHA256: &str =
     "0a9c8067b3299bfc6881a06e097ff95e55e1b7bb8f9d1f84192ac23e59b995ab";
@@ -132,6 +140,7 @@ enum ChatterboxRuntimeFlavor {
     CpuArm64,
     CpuX86,
     Cuda124,
+    Cuda130Arm64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -142,7 +151,8 @@ struct ChatterboxUvProject {
     lock: &'static [u8],
     lock_sha256: &'static str,
     torch_version: &'static str,
-    require_cuda: bool,
+    torchaudio_version: &'static str,
+    cuda_version: Option<&'static str>,
 }
 
 pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<PythonRuntime> {
@@ -565,7 +575,8 @@ fn chatterbox_uv_project(flavor: ChatterboxRuntimeFlavor) -> ChatterboxUvProject
             lock: CHATTERBOX_CPU_LOCK,
             lock_sha256: CHATTERBOX_CPU_LOCK_SHA256,
             torch_version: "2.6.0",
-            require_cuda: false,
+            torchaudio_version: "2.6.0",
+            cuda_version: None,
         },
         ChatterboxRuntimeFlavor::CpuX86 => ChatterboxUvProject {
             name: "cpu-x86",
@@ -574,7 +585,8 @@ fn chatterbox_uv_project(flavor: ChatterboxRuntimeFlavor) -> ChatterboxUvProject
             lock: CHATTERBOX_CPU_X86_LOCK,
             lock_sha256: CHATTERBOX_CPU_X86_LOCK_SHA256,
             torch_version: "2.6.0+cpu",
-            require_cuda: false,
+            torchaudio_version: "2.6.0+cpu",
+            cuda_version: None,
         },
         ChatterboxRuntimeFlavor::Cuda124 => ChatterboxUvProject {
             name: "cuda124",
@@ -583,7 +595,18 @@ fn chatterbox_uv_project(flavor: ChatterboxRuntimeFlavor) -> ChatterboxUvProject
             lock: CHATTERBOX_CUDA124_LOCK,
             lock_sha256: CHATTERBOX_CUDA124_LOCK_SHA256,
             torch_version: "2.6.0+cu124",
-            require_cuda: true,
+            torchaudio_version: "2.6.0+cu124",
+            cuda_version: Some("12.4"),
+        },
+        ChatterboxRuntimeFlavor::Cuda130Arm64 => ChatterboxUvProject {
+            name: "cuda130-arm64",
+            project: CHATTERBOX_CUDA130_ARM64_PROJECT,
+            project_sha256: CHATTERBOX_CUDA130_ARM64_PROJECT_SHA256,
+            lock: CHATTERBOX_CUDA130_ARM64_LOCK,
+            lock_sha256: CHATTERBOX_CUDA130_ARM64_LOCK_SHA256,
+            torch_version: "2.9.1+cu130",
+            torchaudio_version: "2.9.1",
+            cuda_version: Some("13.0"),
         },
     }
 }
@@ -607,13 +630,20 @@ fn select_chatterbox_runtime_flavor(
             );
             Ok(ChatterboxRuntimeFlavor::CpuArm64)
         }
-        ("linux", "aarch64") => {
-            ensure!(
-                matches!(requested.as_str(), "auto" | "cpu"),
-                "the frozen Linux arm64 Chatterbox runtime supports CPU only"
-            );
-            Ok(ChatterboxRuntimeFlavor::CpuArm64)
-        }
+        ("linux", "aarch64") => match requested.as_str() {
+            "mps" => bail!("Chatterbox MPS is supported only on Apple Silicon"),
+            "cuda" => {
+                ensure!(
+                    cuda_available,
+                    "MAYHEM_CHATTERBOX_DEVICE=cuda was requested but no usable NVIDIA CUDA device was detected"
+                );
+                Ok(ChatterboxRuntimeFlavor::Cuda130Arm64)
+            }
+            "cpu" => Ok(ChatterboxRuntimeFlavor::CpuArm64),
+            "auto" if cuda_available => Ok(ChatterboxRuntimeFlavor::Cuda130Arm64),
+            "auto" => Ok(ChatterboxRuntimeFlavor::CpuArm64),
+            _ => unreachable!(),
+        },
         ("linux" | "windows", "x86_64") => match requested.as_str() {
             "mps" => bail!("Chatterbox MPS is supported only on Apple Silicon"),
             "cuda" => {
@@ -638,7 +668,7 @@ fn select_chatterbox_runtime_flavor(
 fn chatterbox_cuda_available() -> bool {
     if !matches!(
         (env::consts::OS, env::consts::ARCH),
-        ("linux" | "windows", "x86_64")
+        ("linux", "aarch64" | "x86_64") | ("windows", "x86_64")
     ) {
         return false;
     }
@@ -962,7 +992,7 @@ fn validate_chatterbox_python(
         ("safetensors", "0.5.3"),
         ("spacy-pkuseg", "1.0.1"),
         ("torch", project.torch_version),
-        ("torchaudio", project.torch_version),
+        ("torchaudio", project.torchaudio_version),
         ("transformers", "5.2.0"),
     ])?;
     let imports = serde_json::to_string(&[
@@ -985,13 +1015,13 @@ fn validate_chatterbox_python(
     let source_commit = serde_json::to_string(mayhem_engine::CHATTERBOX_SOURCE_COMMIT)?;
     let source_tree_sha256 = serde_json::to_string(CHATTERBOX_SOURCE_TREE_SHA256)?;
     let perth_commit = serde_json::to_string(mayhem_engine::CHATTERBOX_PERTH_COMMIT)?;
-    let require_cuda = if project.require_cuda {
-        "True"
-    } else {
-        "False"
-    };
+    let cuda_version = project
+        .cuda_version
+        .map(serde_json::to_string)
+        .transpose()?
+        .unwrap_or_else(|| "None".to_owned());
     let script = format!(
-        "import hashlib,importlib,importlib.metadata as m,json,pathlib,sys; assert sys.version_info[:2] == (3,11), sys.version; expected=dict({expected_versions}); mismatched=[f'{{name}}={{m.version(name)}} (expected {{version}})' for name,version in expected.items() if m.version(name) != version]; assert not mismatched, '; '.join(mismatched); modules={{name:importlib.import_module(name) for name in {imports}}}; perth_raw=m.distribution('resemble-perth').read_text('direct_url.json'); assert perth_raw is not None and json.loads(perth_raw).get('vcs_info',{{}}).get('commit_id') == {perth_commit}, 'Perth VCS commit mismatch'; source_root=pathlib.Path(modules['chatterbox'].__file__).resolve().parent; source_base=source_root.parent; source_rows=''.join(f'{{hashlib.sha256(path.read_bytes()).hexdigest()}}  {{path.relative_to(source_base).as_posix()}}\\n' for path in sorted(source_root.rglob('*.py'),key=lambda path:path.relative_to(source_base).as_posix())); assert hashlib.sha256(source_rows.encode()).hexdigest() == {source_tree_sha256}, 'installed Chatterbox source tree does not match reviewed upstream commit ' + {source_commit}; assert not {require_cuda} or modules['torch'].cuda.is_available(), 'frozen CUDA 12.4 runtime installed but CUDA is unavailable'; print('__MAYHEM_CHATTERBOX_RUNTIME__=' + m.version('chatterbox-tts'))"
+        "import hashlib,importlib,importlib.metadata as m,json,pathlib,sys; assert sys.version_info[:2] == (3,11), sys.version; expected=dict({expected_versions}); mismatched=[f'{{name}}={{m.version(name)}} (expected {{version}})' for name,version in expected.items() if m.version(name) != version]; assert not mismatched, '; '.join(mismatched); modules={{name:importlib.import_module(name) for name in {imports}}}; perth_raw=m.distribution('resemble-perth').read_text('direct_url.json'); assert perth_raw is not None and json.loads(perth_raw).get('vcs_info',{{}}).get('commit_id') == {perth_commit}, 'Perth VCS commit mismatch'; source_root=pathlib.Path(modules['chatterbox'].__file__).resolve().parent; source_base=source_root.parent; source_rows=''.join(f'{{hashlib.sha256(path.read_bytes()).hexdigest()}}  {{path.relative_to(source_base).as_posix()}}\\n' for path in sorted(source_root.rglob('*.py'),key=lambda path:path.relative_to(source_base).as_posix())); assert hashlib.sha256(source_rows.encode()).hexdigest() == {source_tree_sha256}, 'installed Chatterbox source tree does not match reviewed upstream commit ' + {source_commit}; expected_cuda={cuda_version}; assert expected_cuda is None or modules['torch'].cuda.is_available(), 'frozen CUDA runtime installed but CUDA is unavailable'; assert expected_cuda is None or modules['torch'].version.cuda == expected_cuda, f'frozen CUDA runtime mismatch: {{modules[\"torch\"].version.cuda}} (expected {{expected_cuda}})'; print('__MAYHEM_CHATTERBOX_RUNTIME__=' + m.version('chatterbox-tts'))"
     );
     let mut command = Command::new(python);
     configure_validation_cache(&mut command, cache_root)?;
@@ -2426,21 +2456,40 @@ mod tests {
             "ce86c49d029f42272c1902eccb675556b9ed2330"
         );
         let mut runtime_ids = BTreeSet::new();
-        for (flavor, torch_version, index) in [
-            (ChatterboxRuntimeFlavor::CpuArm64, "2.6.0", None),
+        for (flavor, torch_version, torchaudio_version, cuda_version, index) in [
+            (
+                ChatterboxRuntimeFlavor::CpuArm64,
+                "2.6.0",
+                "2.6.0",
+                None,
+                None,
+            ),
             (
                 ChatterboxRuntimeFlavor::CpuX86,
                 "2.6.0+cpu",
+                "2.6.0+cpu",
+                None,
                 Some("https://download.pytorch.org/whl/cpu"),
             ),
             (
                 ChatterboxRuntimeFlavor::Cuda124,
                 "2.6.0+cu124",
+                "2.6.0+cu124",
+                Some("12.4"),
                 Some("https://download.pytorch.org/whl/cu124"),
+            ),
+            (
+                ChatterboxRuntimeFlavor::Cuda130Arm64,
+                "2.9.1+cu130",
+                "2.9.1",
+                Some("13.0"),
+                Some("https://download.pytorch.org/whl/cu130"),
             ),
         ] {
             let project = chatterbox_uv_project(flavor);
             assert_eq!(project.torch_version, torch_version);
+            assert_eq!(project.torchaudio_version, torchaudio_version);
+            assert_eq!(project.cuda_version, cuda_version);
             assert!(
                 !project.project.contains(&b'\r') && !project.lock.contains(&b'\r'),
                 "byte-hashed Chatterbox runtime inputs must be embedded with LF line endings"
@@ -2454,6 +2503,23 @@ mod tests {
             assert!(project_text.contains("requires-python = \"==3.11.*\""));
             if let Some(index) = index {
                 assert!(project_text.contains(index));
+            }
+            if flavor == ChatterboxRuntimeFlavor::Cuda130Arm64 {
+                assert!(project_text
+                    .contains("\"sys_platform == 'linux' and platform_machine == 'aarch64'\""));
+                assert!(project_text.contains("override-dependencies"));
+                let lock_text = std::str::from_utf8(project.lock).unwrap();
+                assert!(lock_text
+                    .contains("torch-2.9.1%2Bcu130-cp311-cp311-manylinux_2_28_aarch64.whl"));
+                assert!(lock_text.contains(
+                    "sha256:fd6c7d297e21758a7fa07624f2b5bb15607ee3b1dcc52519e8e796c6d4fcf960"
+                ));
+                assert!(
+                    lock_text.contains("torchaudio-2.9.1-cp311-cp311-manylinux_2_28_aarch64.whl")
+                );
+                assert!(lock_text.contains(
+                    "sha256:493421d061375074ce84840ca619605f625892e16dead63ec97181ef02da3357"
+                ));
             }
             let runtime_id = verify_chatterbox_uv_project(&project).unwrap();
             assert_eq!(runtime_id.len(), 64);
@@ -2483,8 +2549,21 @@ mod tests {
             select_chatterbox_runtime_flavor(Some("cpu"), false, "linux", "aarch64").unwrap(),
             ChatterboxRuntimeFlavor::CpuArm64
         );
+        assert_eq!(
+            select_chatterbox_runtime_flavor(Some("auto"), true, "linux", "aarch64").unwrap(),
+            ChatterboxRuntimeFlavor::Cuda130Arm64
+        );
+        assert_eq!(
+            select_chatterbox_runtime_flavor(Some("auto"), false, "linux", "aarch64").unwrap(),
+            ChatterboxRuntimeFlavor::CpuArm64
+        );
+        assert_eq!(
+            select_chatterbox_runtime_flavor(Some("cuda"), true, "linux", "aarch64").unwrap(),
+            ChatterboxRuntimeFlavor::Cuda130Arm64
+        );
         assert!(select_chatterbox_runtime_flavor(Some("cuda"), false, "linux", "x86_64").is_err());
-        assert!(select_chatterbox_runtime_flavor(Some("cuda"), true, "linux", "aarch64").is_err());
+        assert!(select_chatterbox_runtime_flavor(Some("cuda"), false, "linux", "aarch64").is_err());
+        assert!(select_chatterbox_runtime_flavor(Some("mps"), true, "linux", "aarch64").is_err());
         assert!(select_chatterbox_runtime_flavor(Some("auto"), false, "macos", "x86_64").is_err());
         assert!(select_chatterbox_runtime_flavor(Some("bogus"), false, "linux", "x86_64").is_err());
     }

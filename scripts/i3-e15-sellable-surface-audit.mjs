@@ -3,6 +3,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
+import {
+  launchRowsMatchingModel,
+  parseLaunchRows,
+} from './lib/launch-roster.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const jsonMode = process.argv.includes('--json');
@@ -81,15 +85,6 @@ function routeListFor(model) {
   return [...new Set((model.adapter?.endpoint_families || []).map(({ family }) => endpointRoutes[family]).filter(Boolean))];
 }
 
-function markdownCells(line) {
-  return line
-    .trim()
-    .replace(/^\|/, '')
-    .replace(/\|$/, '')
-    .split('|')
-    .map((cell) => cell.trim());
-}
-
 function launchSurfaceSection(readme) {
   const startMarker = '## Available Models';
   const start = readme.indexOf(startMarker);
@@ -100,22 +95,6 @@ function launchSurfaceSection(readme) {
   }
   ok('readme.launch_surface.section', 'README Available Models section is heading-bound');
   return readme.slice(start + startMarker.length, nextHeading);
-}
-
-function normalizedSearchText(value) {
-  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
-}
-
-function parseLaunchRows(section) {
-  const rows = [];
-  for (const line of section.split('\n')) {
-    const cells = markdownCells(line);
-    if (cells.length < 4) continue;
-    const id = cells[0].replace(/^`|`$/g, '');
-    if (!id.includes('/')) continue;
-    rows.push({ id, cells, line });
-  }
-  return rows;
 }
 
 function listFiles(dir) {
@@ -231,13 +210,14 @@ function checkCatalogAndReadme() {
 
   const section = launchSurfaceSection(readme);
   if (!section) return;
-  const rows = parseLaunchRows(section);
-  const normalizedSection = normalizedSearchText(section);
+  const rows = parseLaunchRows(section).filter(({ status }) => status === 'live');
   for (const model of launchModels) {
+    const matchingRows = launchRowsMatchingModel(rows, model);
     assertCheck(
       `readme.launch_surface.model.${model.model_id}`,
-      normalizedSection.includes(normalizedSearchText(model.family)),
-      `README launch roster includes ${model.model_id}`
+      matchingRows.length === 1,
+      `README launch roster includes exactly one row for ${model.model_id}`,
+      { matchingRows: matchingRows.map(({ id }) => id) }
     );
   }
   assertCheck(
