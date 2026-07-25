@@ -28,6 +28,9 @@ const DEFAULT_RESTART_STABLE_AFTER_MS: u64 = 60_000;
 const DEFAULT_CRASH_LOOP_THRESHOLD: u64 = 5;
 const CONTROL_TOKEN_ENV: &str = "MAYHEMD_CONTROL_TOKEN";
 const MIN_CONTROL_TOKEN_BYTES: usize = 32;
+const MAX_STATUS_REQUEST_HEADER_BYTES: usize = 16 * 1024;
+const MAX_STATUS_REQUEST_BODY_BYTES: usize = 64 * 1024;
+const STATUS_REQUEST_READ_CHUNK_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "mayhemd")]
@@ -755,18 +758,18 @@ async fn handle_status_connection(
     control_tx: mpsc::Sender<SupervisorCommand>,
     control_token: Option<Arc<str>>,
 ) -> Result<()> {
-    let mut buffer = [0_u8; 65_536];
-    let read = stream.read(&mut buffer).await.context("reading request")?;
-    let request = String::from_utf8_lossy(&buffer[..read]);
-    let first_line = request.lines().next().unwrap_or("");
-    let mut first = first_line.split_whitespace();
-    let method = first.next().unwrap_or("");
-    let path = first.next().unwrap_or("/");
-    let body = request
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body)
-        .unwrap_or("");
-    match (method, path) {
+    let request = match read_status_request(&mut stream).await {
+        Ok(request) => request,
+        Err(error) => {
+            return write_http_json(
+                &mut stream,
+                error.status(),
+                &json!({ "ok": false, "error": error.message() }),
+            )
+            .await;
+        }
+    };
+    match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/health") => {
             let snapshot = runtime.snapshot().await;
             let (status, report) = supervisor_health_report(&snapshot);
@@ -777,7 +780,7 @@ async fn handle_status_connection(
             write_http_json(&mut stream, 200, &snapshot).await
         }
         ("POST", "/children/add") => {
-            if !control_request_authorized(&request, control_token.as_deref()) {
+            if !control_request_authorized(&request.headers, control_token.as_deref()) {
                 return write_http_json(
                     &mut stream,
                     401,
@@ -785,8 +788,17 @@ async fn handle_status_connection(
                 )
                 .await;
             }
-            let child = serde_json::from_str::<ChildConfig>(body.trim())
-                .context("parsing child add request")?;
+            let child = match serde_json::from_slice::<ChildConfig>(&request.body) {
+                Ok(child) => child,
+                Err(_) => {
+                    return write_http_json(
+                        &mut stream,
+                        400,
+                        &json!({ "ok": false, "error": "malformed JSON body" }),
+                    )
+                    .await;
+                }
+            };
             let (reply, response) = oneshot::channel();
             control_tx
                 .send(SupervisorCommand::Add { child, reply })
@@ -800,7 +812,7 @@ async fn handle_status_connection(
             }
         }
         ("POST", "/children/remove") => {
-            if !control_request_authorized(&request, control_token.as_deref()) {
+            if !control_request_authorized(&request.headers, control_token.as_deref()) {
                 return write_http_json(
                     &mut stream,
                     401,
@@ -808,15 +820,31 @@ async fn handle_status_connection(
                 )
                 .await;
             }
-            let body = serde_json::from_str::<serde_json::Value>(body.trim())
-                .context("parsing child remove request")?;
+            let body = match serde_json::from_slice::<serde_json::Value>(&request.body) {
+                Ok(body) => body,
+                Err(_) => {
+                    return write_http_json(
+                        &mut stream,
+                        400,
+                        &json!({ "ok": false, "error": "malformed JSON body" }),
+                    )
+                    .await;
+                }
+            };
             let name = body
                 .get("name")
                 .and_then(serde_json::Value::as_str)
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .context("child remove request requires name")?
-                .to_owned();
+                .filter(|value| !value.is_empty());
+            let Some(name) = name else {
+                return write_http_json(
+                    &mut stream,
+                    400,
+                    &json!({ "ok": false, "error": "child remove request requires name" }),
+                )
+                .await;
+            };
+            let name = name.to_owned();
             let (reply, response) = oneshot::channel();
             control_tx
                 .send(SupervisorCommand::Remove { name, reply })
@@ -843,6 +871,150 @@ async fn handle_status_connection(
     }
 }
 
+struct StatusRequest {
+    method: String,
+    path: String,
+    headers: String,
+    body: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum StatusRequestError {
+    Malformed,
+    HeadersTooLarge,
+    BodyTooLarge,
+    Truncated,
+    Io,
+}
+
+impl StatusRequestError {
+    fn status(&self) -> u16 {
+        match self {
+            Self::BodyTooLarge => 413,
+            Self::HeadersTooLarge => 431,
+            Self::Malformed | Self::Truncated | Self::Io => 400,
+        }
+    }
+
+    fn message(&self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed HTTP request",
+            Self::HeadersTooLarge => "HTTP request headers are too large",
+            Self::BodyTooLarge => "HTTP request body is too large",
+            Self::Truncated => "truncated HTTP request",
+            Self::Io => "failed to read HTTP request",
+        }
+    }
+}
+
+async fn read_status_request(
+    stream: &mut TcpStream,
+) -> std::result::Result<StatusRequest, StatusRequestError> {
+    let mut received = Vec::with_capacity(STATUS_REQUEST_READ_CHUNK_BYTES);
+    let mut chunk = [0_u8; STATUS_REQUEST_READ_CHUNK_BYTES];
+    let header_end = loop {
+        let remaining = MAX_STATUS_REQUEST_HEADER_BYTES.saturating_sub(received.len());
+        if remaining == 0 {
+            return Err(StatusRequestError::HeadersTooLarge);
+        }
+        let read_limit = remaining.min(chunk.len());
+        let read = stream
+            .read(&mut chunk[..read_limit])
+            .await
+            .map_err(|_| StatusRequestError::Io)?;
+        if read == 0 {
+            return Err(StatusRequestError::Truncated);
+        }
+        received.extend_from_slice(&chunk[..read]);
+        if let Some(offset) = received.windows(4).position(|window| window == b"\r\n\r\n") {
+            break offset + 4;
+        }
+    };
+
+    let header_bytes = &received[..header_end - 4];
+    if !header_bytes.is_ascii() {
+        return Err(StatusRequestError::Malformed);
+    }
+    let headers = std::str::from_utf8(header_bytes)
+        .map_err(|_| StatusRequestError::Malformed)?
+        .to_owned();
+    let mut lines = headers.split("\r\n");
+    let request_line = lines.next().ok_or(StatusRequestError::Malformed)?;
+    let mut request_parts = request_line.split_ascii_whitespace();
+    let method = request_parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or(StatusRequestError::Malformed)?;
+    let path = request_parts
+        .next()
+        .filter(|value| value.starts_with('/'))
+        .ok_or(StatusRequestError::Malformed)?;
+    let version = request_parts.next().ok_or(StatusRequestError::Malformed)?;
+    if request_parts.next().is_some() || !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
+        return Err(StatusRequestError::Malformed);
+    }
+
+    let mut content_length = None;
+    for line in lines {
+        let (name, value) = line.split_once(':').ok_or(StatusRequestError::Malformed)?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(StatusRequestError::Malformed);
+        }
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(StatusRequestError::Malformed);
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some()
+                || value.trim().is_empty()
+                || !value.trim().bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(StatusRequestError::Malformed);
+            }
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| StatusRequestError::Malformed)?,
+            );
+        }
+    }
+    if method == "POST" && content_length.is_none() {
+        return Err(StatusRequestError::Malformed);
+    }
+    let content_length = content_length.unwrap_or(0);
+    if content_length > MAX_STATUS_REQUEST_BODY_BYTES {
+        return Err(StatusRequestError::BodyTooLarge);
+    }
+    let method = method.to_owned();
+    let path = path.to_owned();
+
+    let mut body = received.split_off(header_end);
+    body.truncate(content_length);
+    while body.len() < content_length {
+        let remaining = content_length - body.len();
+        let read_limit = remaining.min(chunk.len());
+        let read = stream
+            .read(&mut chunk[..read_limit])
+            .await
+            .map_err(|_| StatusRequestError::Io)?;
+        if read == 0 {
+            return Err(StatusRequestError::Truncated);
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+
+    Ok(StatusRequest {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
+
 async fn write_http_json<T: Serialize>(
     stream: &mut TcpStream,
     status: u16,
@@ -850,8 +1022,11 @@ async fn write_http_json<T: Serialize>(
 ) -> Result<()> {
     let reason = match status {
         200 => "OK",
+        400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
+        413 => "Content Too Large",
+        431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
         _ => "Error",
     };
@@ -1419,13 +1594,34 @@ mod tests {
         control_token: Option<&str>,
         request: &str,
     ) -> String {
+        send_fragmented_control_request(
+            runtime,
+            control_tx,
+            control_token,
+            vec![request.as_bytes().to_vec()],
+        )
+        .await
+    }
+
+    async fn send_fragmented_control_request(
+        runtime: SupervisorRuntime,
+        control_tx: mpsc::Sender<SupervisorCommand>,
+        control_token: Option<&str>,
+        fragments: Vec<Vec<u8>>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(address).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
         let token = control_token.map(|value| Arc::<str>::from(value.to_owned()));
         let task = tokio::spawn(handle_status_connection(server, runtime, control_tx, token));
-        client.write_all(request.as_bytes()).await.unwrap();
+        let fragment_count = fragments.len();
+        for (index, fragment) in fragments.into_iter().enumerate() {
+            client.write_all(&fragment).await.unwrap();
+            if index + 1 < fragment_count {
+                sleep(Duration::from_millis(20)).await;
+            }
+        }
         client.shutdown().await.unwrap();
         let mut response = String::new();
         client.read_to_string(&mut response).await.unwrap();
@@ -1460,21 +1656,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authenticated_child_add_reaches_the_supervisor() {
-        let temp = env::temp_dir().join(format!("mayhemd-auth-accept-test-{}", std::process::id()));
+    async fn fragmented_authenticated_child_add_reaches_the_supervisor() {
+        let temp = env::temp_dir().join(format!(
+            "mayhemd-fragmented-add-test-{}",
+            std::process::id()
+        ));
         let runtime = test_runtime(&temp, &[]);
         let (control_tx, mut control_rx) = mpsc::channel(1);
         let body = r#"{"name":"worker","command":"true","restart":false}"#;
-        let request = format!(
-            "POST /children/add HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-control-token-0123456789abcdef\r\nContent-Length: {}\r\n\r\n{body}",
+        let headers = format!(
+            "POST /children/add HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-control-token-0123456789abcdef\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
+        let body_split = body.len() / 2;
+        let fragments = vec![
+            headers.into_bytes(),
+            body.as_bytes()[..body_split].to_vec(),
+            body.as_bytes()[body_split..].to_vec(),
+        ];
         let response_task = tokio::spawn(async move {
-            send_control_request(
+            send_fragmented_control_request(
                 runtime,
                 control_tx,
                 Some("test-control-token-0123456789abcdef"),
-                &request,
+                fragments,
             )
             .await
         });
@@ -1489,6 +1694,109 @@ mod tests {
         let response = response_task.await.unwrap();
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         assert!(response.contains(r#""name": "worker""#));
+    }
+
+    #[tokio::test]
+    async fn fragmented_authenticated_child_remove_reaches_the_supervisor() {
+        let temp = env::temp_dir().join(format!(
+            "mayhemd-fragmented-remove-test-{}",
+            std::process::id()
+        ));
+        let runtime = test_runtime(&temp, &[]);
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let body = r#"{"name":"worker"}"#;
+        let headers = format!(
+            "POST /children/remove HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-control-token-0123456789abcdef\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let fragments = vec![
+            headers.into_bytes(),
+            body.as_bytes()[..5].to_vec(),
+            body.as_bytes()[5..].to_vec(),
+        ];
+        let response_task = tokio::spawn(async move {
+            send_fragmented_control_request(
+                runtime,
+                control_tx,
+                Some("test-control-token-0123456789abcdef"),
+                fragments,
+            )
+            .await
+        });
+        let command = control_rx.recv().await.expect("authenticated command");
+        let SupervisorCommand::Remove { name, reply } = command else {
+            panic!("expected child remove command");
+        };
+        assert_eq!(name, "worker");
+        reply.send(Ok(json!({ "ok": true, "name": name }))).unwrap();
+        let response = response_task.await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains(r#""name": "worker""#));
+    }
+
+    #[tokio::test]
+    async fn normal_get_status_request_still_succeeds() {
+        let temp = env::temp_dir().join(format!("mayhemd-get-test-{}", std::process::id()));
+        let runtime = test_runtime(&temp, &[]);
+        let (control_tx, _control_rx) = mpsc::channel(1);
+        let response = send_control_request(
+            runtime,
+            control_tx,
+            None,
+            "GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains(r#""ok": true"#));
+    }
+
+    #[tokio::test]
+    async fn truncated_control_request_body_is_rejected() {
+        let temp = env::temp_dir().join(format!("mayhemd-truncated-test-{}", std::process::id()));
+        let runtime = test_runtime(&temp, &[]);
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let request = "POST /children/remove HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-control-token-0123456789abcdef\r\nContent-Length: 17\r\n\r\n{}";
+        let response = send_control_request(
+            runtime,
+            control_tx,
+            Some("test-control-token-0123456789abcdef"),
+            request,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response.contains("truncated HTTP request"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), control_rx.recv())
+                .await
+                .expect("control channel should close without dispatch")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_control_request_body_is_rejected() {
+        let temp = env::temp_dir().join(format!("mayhemd-oversized-test-{}", std::process::id()));
+        let runtime = test_runtime(&temp, &[]);
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let request = format!(
+            "POST /children/add HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-control-token-0123456789abcdef\r\nContent-Length: {}\r\n\r\n",
+            MAX_STATUS_REQUEST_BODY_BYTES + 1
+        );
+        let response = send_control_request(
+            runtime,
+            control_tx,
+            Some("test-control-token-0123456789abcdef"),
+            &request,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 413 Content Too Large"));
+        assert!(response.contains("HTTP request body is too large"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), control_rx.recv())
+                .await
+                .expect("control channel should close without dispatch")
+                .is_none()
+        );
     }
 
     #[test]
