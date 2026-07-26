@@ -124,6 +124,7 @@ const NEEDLE_CUDA130_X86_LOCK_SHA256: &str =
     "fa136bc03b6a843957fba29db06d0d66ee64b45ca0b1aaa344e6749e96d3523f";
 const NEEDLE_CPU_MIN_FREE_BYTES: u64 = 4 * GIB;
 const NEEDLE_CUDA_MIN_FREE_BYTES: u64 = 12 * GIB;
+const NEEDLE_CUDA130_MIN_DRIVER_MAJOR: u32 = 580;
 const ACE_STEP_LOCK_SHA256: &str =
     "0a9c8067b3299bfc6881a06e097ff95e55e1b7bb8f9d1f84192ac23e59b995ab";
 const ACE_STEP_SUPPLEMENTAL_REQUIREMENTS: &[u8] = b"av==18.0.0\n";
@@ -907,7 +908,7 @@ fn select_needle_runtime(
             "gpu" | "cuda" => {
                 ensure!(
                     cuda_available,
-                    "Needle GPU execution was requested but no usable NVIDIA CUDA device was detected"
+                    "Needle GPU execution requires a usable NVIDIA device with driver r580 or newer for CUDA 13"
                 );
                 Ok(NeedleRuntimeSelection {
                     flavor: NeedleRuntimeFlavor::Cuda130Arm64,
@@ -938,7 +939,7 @@ fn select_needle_runtime(
                 device: NeedleDevice::Cuda,
             }),
             "gpu" | "cuda" => {
-                bail!("Needle GPU execution was requested but no usable NVIDIA CUDA device was detected")
+                bail!("Needle GPU execution requires a usable NVIDIA device with driver r580 or newer for CUDA 13")
             }
             "auto" if cuda_available => Ok(NeedleRuntimeSelection {
                 flavor: NeedleRuntimeFlavor::Cuda130X86,
@@ -960,7 +961,7 @@ fn select_needle_runtime(
                 device: NeedleDevice::Cuda,
             }),
             "gpu" | "cuda" => {
-                bail!("Needle GPU execution was requested but no usable NVIDIA CUDA device was detected")
+                bail!("Needle GPU execution requires a usable NVIDIA device with driver r580 or newer for CUDA 13")
             }
             "auto" if cuda_available => Ok(NeedleRuntimeSelection {
                 flavor: NeedleRuntimeFlavor::Cuda130X86,
@@ -990,8 +991,19 @@ fn needle_cuda_available() -> bool {
         ])
         .output()
         .is_ok_and(|output| {
-            output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+            output.status.success()
+                && needle_cuda_driver_supported(&String::from_utf8_lossy(&output.stdout))
         })
+}
+
+fn needle_cuda_driver_supported(output: &str) -> bool {
+    output.lines().any(|line| {
+        line.trim()
+            .split('.')
+            .next()
+            .and_then(|major| major.parse::<u32>().ok())
+            .is_some_and(|major| major >= NEEDLE_CUDA130_MIN_DRIVER_MAJOR)
+    })
 }
 
 fn needle_device_name(device: NeedleDevice) -> &'static str {
@@ -3799,6 +3811,11 @@ mod tests {
         );
         assert!(select_needle_runtime(Some("gpu"), false, "windows", "x86_64").is_err());
         assert!(select_needle_runtime(Some("bogus"), false, "linux", "aarch64").is_err());
+        assert!(!needle_cuda_driver_supported(""));
+        assert!(!needle_cuda_driver_supported("579.99"));
+        assert!(!needle_cuda_driver_supported("not-a-version"));
+        assert!(needle_cuda_driver_supported("580.00"));
+        assert!(needle_cuda_driver_supported("590.12\n590.12"));
     }
 
     #[test]

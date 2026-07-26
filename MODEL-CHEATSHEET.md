@@ -638,8 +638,9 @@ replace the signed projector.
 - Endpoints: OpenAI chat completions and responses.
 - `needle-cpu` supports Linux, Windows x86_64, and Apple Silicon macOS.
 - `needle-gpu` is CUDA-only on Linux aarch64/x86_64 and Windows x86_64
-  hosts. Apple Metal/MPS is intentionally not eligible and does not create a
-  third market.
+  hosts and requires NVIDIA driver r580 or newer for the frozen CUDA 13
+  runtime. Apple Metal/MPS is intentionally not eligible and does not create
+  a third market.
 
 **Measured guidance**
 

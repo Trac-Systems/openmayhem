@@ -1437,6 +1437,152 @@ pub fn normalized_request_prompt_units(
     )
 }
 
+pub fn tools_only_model_input_prompt_units(
+    endpoint_family: &str,
+    request: &serde_json::Value,
+) -> Result<u64, String> {
+    let projection = tools_only_model_input_projection(endpoint_family, request)?;
+    normalized_request_prompt_units(&projection)
+        .map_err(|error| format!("serializing tools-only model input failed: {error}"))
+}
+
+fn tools_only_model_input_projection(
+    endpoint_family: &str,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let query = match endpoint_family {
+        ENDPOINT_OPENAI_CHAT_COMPLETIONS => {
+            let messages = request
+                .get("messages")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "tools-only chat request is missing messages".to_owned())?;
+            tools_only_single_user_query(messages)?
+        }
+        ENDPOINT_OPENAI_RESPONSES => match request.get("input") {
+            Some(serde_json::Value::String(text)) if !text.trim().is_empty() => text.clone(),
+            Some(serde_json::Value::Array(messages)) => tools_only_single_user_query(messages)?,
+            _ => return Err("tools-only Responses request has no usable input".to_owned()),
+        },
+        other => {
+            return Err(format!(
+                "endpoint family {other} has no tools-only model-input projection"
+            ))
+        }
+    };
+
+    let named_choice = request
+        .get("tool_choice")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|choice| {
+            choice
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| choice.get("name").and_then(serde_json::Value::as_str))
+        });
+    if request
+        .get("tool_choice")
+        .and_then(serde_json::Value::as_str)
+        == Some("none")
+    {
+        return Err("tools-only request cannot disable tools".to_owned());
+    }
+
+    let tools = request
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "tools-only request is missing tools".to_owned())?;
+    let mut projected_tools = Vec::with_capacity(tools.len());
+    for (index, tool) in tools.iter().enumerate() {
+        if tool.get("type").and_then(serde_json::Value::as_str) != Some("function") {
+            return Err(format!("tools-only request tool {index} is not a function"));
+        }
+        let function = tool
+            .get("function")
+            .and_then(serde_json::Value::as_object)
+            .or_else(|| tool.as_object().filter(|tool| tool.get("name").is_some()))
+            .ok_or_else(|| format!("tools-only request tool {index} has no function"))?;
+        let name = function
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| format!("tools-only request tool {index} has no function name"))?;
+        if named_choice.is_some_and(|chosen| chosen != name) {
+            continue;
+        }
+        let description = match function.get("description") {
+            None | Some(serde_json::Value::Null) => "",
+            Some(serde_json::Value::String(description)) => description,
+            Some(_) => {
+                return Err(format!(
+                    "tools-only request tool {index} has a non-string description"
+                ))
+            }
+        };
+        let parameters = match function.get("parameters") {
+            None | Some(serde_json::Value::Null) => serde_json::json!({
+                "type": "object",
+                "properties": {},
+            }),
+            Some(serde_json::Value::Object(parameters)) => {
+                serde_json::Value::Object(parameters.clone())
+            }
+            Some(_) => {
+                return Err(format!(
+                    "tools-only request tool {index} has non-object parameters"
+                ))
+            }
+        };
+        projected_tools.push(serde_json::json!({
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        }));
+    }
+    if projected_tools.is_empty() {
+        return Err("tools-only request selected no model-visible tools".to_owned());
+    }
+
+    Ok(serde_json::json!({
+        "query": query,
+        "tools": projected_tools,
+    }))
+}
+
+fn tools_only_single_user_query(messages: &[serde_json::Value]) -> Result<String, String> {
+    if messages.len() != 1
+        || messages[0].get("role").and_then(serde_json::Value::as_str) != Some("user")
+    {
+        return Err("tools-only request requires exactly one user message".to_owned());
+    }
+    let content = messages[0]
+        .get("content")
+        .ok_or_else(|| "tools-only user message has no content".to_owned())?;
+    let query = match content {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(parts) if !parts.is_empty() => {
+            let mut text = Vec::with_capacity(parts.len());
+            for (index, part) in parts.iter().enumerate() {
+                if part.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+                    return Err(format!("tools-only user message part {index} is not text"));
+                }
+                text.push(
+                    part.get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| format!("tools-only user message part {index} has no text"))?
+                        .to_owned(),
+                );
+            }
+            text.join("\n")
+        }
+        _ => return Err("tools-only user message content is not text".to_owned()),
+    };
+    if query.trim().is_empty() {
+        return Err("tools-only request query is empty".to_owned());
+    }
+    Ok(query)
+}
+
 pub const TRANSCRIPTION_RESULT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_TRANSCRIPTION_RESULT_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_TRANSCRIPTION_RESULT_MAX_TIMESTAMP_ENTRIES: usize = 1_000_000;
@@ -3387,6 +3533,131 @@ mod tests {
         assert_eq!(
             normalized_request_prompt_units(&request).unwrap(),
             normalized_request_prompt_units(&reordered).unwrap()
+        );
+    }
+
+    #[test]
+    fn tools_only_model_input_metering_ignores_transport_envelope_fields() {
+        let request = json!({
+            "model": "admin/needle",
+            "messages": [{"role": "user", "content": "find it"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "description": "Look up a value.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"key": {"type": "string"}},
+                        "required": ["key"],
+                        "additionalProperties": false
+                    }
+                }
+            }],
+            "metadata": {"trace": "a"},
+            "user": "buyer-a",
+            "stream": false,
+            "max_tokens": 32
+        });
+        let mut changed_envelope = request.clone();
+        changed_envelope["model"] = json!("other/model");
+        changed_envelope["metadata"] = json!({"trace": "completely different"});
+        changed_envelope["user"] = json!("buyer-b");
+        changed_envelope["stream"] = json!(true);
+        changed_envelope["max_tokens"] = json!(512);
+
+        let expected =
+            tools_only_model_input_prompt_units(ENDPOINT_OPENAI_CHAT_COMPLETIONS, &request)
+                .unwrap();
+        assert_eq!(
+            expected,
+            tools_only_model_input_prompt_units(
+                ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+                &changed_envelope
+            )
+            .unwrap()
+        );
+
+        let responses = json!({
+            "model": "admin/needle",
+            "input": "find it",
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "description": "Look up a value.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"key": {"type": "string"}},
+                    "required": ["key"],
+                    "additionalProperties": false
+                }
+            }],
+            "metadata": {"different": true},
+            "max_output_tokens": 512
+        });
+        assert_eq!(
+            expected,
+            tools_only_model_input_prompt_units(ENDPOINT_OPENAI_RESPONSES, &responses).unwrap()
+        );
+    }
+
+    #[test]
+    fn tools_only_model_input_metering_tracks_only_consumed_query_and_tools() {
+        let request = json!({
+            "messages": [{"role": "user", "content": "find it"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "description": "Look up a value.",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "ignore_me",
+                        "description": "This tool is not selected.",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }
+            ],
+            "tool_choice": {"type": "function", "function": {"name": "lookup"}}
+        });
+        let selected =
+            tools_only_model_input_prompt_units(ENDPOINT_OPENAI_CHAT_COMPLETIONS, &request)
+                .unwrap();
+
+        let mut ignored_tool_changed = request.clone();
+        ignored_tool_changed["tools"][1]["function"]["description"] = json!("x".repeat(1024));
+        assert_eq!(
+            selected,
+            tools_only_model_input_prompt_units(
+                ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+                &ignored_tool_changed
+            )
+            .unwrap()
+        );
+
+        let mut query_changed = request.clone();
+        query_changed["messages"][0]["content"] = json!("find a much longer value");
+        assert_ne!(
+            selected,
+            tools_only_model_input_prompt_units(ENDPOINT_OPENAI_CHAT_COMPLETIONS, &query_changed)
+                .unwrap()
+        );
+
+        let mut selected_tool_changed = request;
+        selected_tool_changed["tools"][0]["function"]["description"] =
+            json!("A substantially longer model-visible description.");
+        assert_ne!(
+            selected,
+            tools_only_model_input_prompt_units(
+                ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+                &selected_tool_changed
+            )
+            .unwrap()
         );
     }
 

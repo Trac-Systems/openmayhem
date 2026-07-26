@@ -54,7 +54,7 @@ pub const NEEDLE_MODEL_REVISION: &str = "5f89b4307696d669c3df1d38ae057e6e1728b10
 #[serde(deny_unknown_fields)]
 pub struct NeedleExecutionConfig {
     pub api_version: u32,
-    pub deterministic_greedy: bool,
+    pub greedy_decoding_only: bool,
     pub device: String,
     pub dtype: String,
     pub max_decoder_tokens: u32,
@@ -538,7 +538,7 @@ fn normalize_device(device: &str) -> Result<String> {
 
 fn validate_execution_config(config: &NeedleExecutionConfig, expected_device: &str) -> Result<()> {
     if config.api_version != 1
-        || !config.deterministic_greedy
+        || !config.greedy_decoding_only
         || config.device != expected_device
         || config.max_encoder_tokens != MAX_ENCODER_TOKENS
         || config.max_decoder_tokens != MAX_DECODER_TOKENS

@@ -903,7 +903,8 @@ source pinned at `ffd0d081401257fee31150d30c494b2f98910fc0`. It accepts 1 to
 10 tools and has a 1,024-token combined context with a 512-token decoder
 ceiling. Needle has exactly two canonical markets: `needle-cpu` on Linux,
 Windows x86_64, and Apple Silicon macOS, and `needle-gpu` for CUDA on supported
-Linux aarch64/x86_64 and Windows x86_64 hosts. Needle GPU means CUDA, not Metal/MPS. Apple MPS measured
+Linux aarch64/x86_64 and Windows x86_64 hosts with NVIDIA driver r580 or newer.
+Needle GPU means CUDA, not Metal/MPS. Apple MPS measured
 about 2.5 decode tok/s cold and 10.7 warm, so it is intentionally ineligible;
 Apple CPU measured about 260-277 decode tok/s. Prior measurements were about
 89.7 cold/166 warm decode tok/s on `.70` CUDA, 122-149 on Windows CPU, and

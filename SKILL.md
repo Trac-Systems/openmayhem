@@ -494,9 +494,9 @@ serve, `heartbeat.live=true`, `gateway.ok=true`, `gateway.route_count>0`, and th
   completions and responses. The combined context is 1,024 tokens and the decoder ceiling is
   512 tokens. Do not advertise ordinary prose generation or a larger context.
 - **Markets:** `needle-cpu` supports Linux, Windows x86_64, and Apple Silicon macOS.
-  `needle-gpu` is CUDA-only on Linux aarch64/x86_64 and Windows x86_64 hosts. There are
-  exactly two markets; Apple Metal/MPS is not a third market and must not be mapped to
-  `needle-gpu`.
+  `needle-gpu` is CUDA-only on Linux aarch64/x86_64 and Windows x86_64 hosts and
+  requires NVIDIA driver r580 or newer for its frozen CUDA 13 runtime. There are exactly
+  two markets; Apple Metal/MPS is not a third market and must not be mapped to `needle-gpu`.
 - **Measured decode:** Apple MPS was about 2.5 tok/s cold and 10.7 warm, while Apple CPU was
   about 260-277 tok/s, so MPS is intentionally ineligible. Prior measurements were about
   89.7 tok/s cold and 166 warm on `.70` CUDA, 122-149 on Windows CPU, and 64-78 on `.70` CPU.

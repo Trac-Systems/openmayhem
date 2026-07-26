@@ -1097,7 +1097,7 @@ def _handle_load(payload):
     return {
         "execution_config": {
             "api_version": API_VERSION,
-            "deterministic_greedy": True,
+            "greedy_decoding_only": True,
             "device": device,
             "dtype": _runtime["dtype"],
             "max_decoder_tokens": MAX_DECODER_TOKENS,

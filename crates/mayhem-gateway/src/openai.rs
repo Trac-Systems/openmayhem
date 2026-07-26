@@ -89,27 +89,27 @@ use mayhem_attestation::{
 use mayhem_bridge::{sc_bridge_session_transport, BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
     artifact_generation_inline_audio_load, ctx_bracket_for_tokens_in_schedule,
-    default_ctx_bracket_schedule, default_model_class, metered_output_units,
-    normalized_request_prompt_units, payload_chunk_at, payload_chunk_manifest,
-    receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
-    spend_voucher_signing_bytes, stable_json_bytes, validate_transcription_result,
-    validated_audio_metadata, validated_wav_audio_metadata, AdminAttestationPolicy,
-    AdminEnclaveAttestationBinding, AttestationReport, AttestationTrustDataRef,
-    AttestationVerifierProfile, CheckpointPolicy, CtxBracketSchedule, EndpointFamilyContract,
-    EndpointValueType, HardwareQuoteKind, HardwareQuoteRouteAdvertisement,
-    HardwareQuoteRoutePolicyBinding, ModelSpecialityDescriptor, MoneyAu, PayloadChunk,
-    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SessionReceipt, SpendVoucher, SpendVoucherBody, TpmActivateCredentialChallengeFrame,
-    TpmActivateCredentialHello, TpmActivateCredentialResponseFrame, TranscriptionResult,
-    TranscriptionResultLimits, ValidatedAudioFormat, VisibleToolCall, ATTESTATION_ALG,
-    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
-    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
-    DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
-    MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
-    SESSION_RECEIPT_SCHEMA_VERSION, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
-    TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION, TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE,
-    USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
-    USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
+    default_ctx_bracket_schedule, default_model_class, metered_output_units, payload_chunk_at,
+    payload_chunk_manifest, receipt_signing_bytes, session_accept_signing_bytes,
+    session_frame_head, spend_voucher_signing_bytes, stable_json_bytes,
+    tools_only_model_input_prompt_units, validate_transcription_result, validated_audio_metadata,
+    validated_wav_audio_metadata, AdminAttestationPolicy, AdminEnclaveAttestationBinding,
+    AttestationReport, AttestationTrustDataRef, AttestationVerifierProfile, CheckpointPolicy,
+    CtxBracketSchedule, EndpointFamilyContract, EndpointValueType, HardwareQuoteKind,
+    HardwareQuoteRouteAdvertisement, HardwareQuoteRoutePolicyBinding, ModelSpecialityDescriptor,
+    MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
+    ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody,
+    TpmActivateCredentialChallengeFrame, TpmActivateCredentialHello,
+    TpmActivateCredentialResponseFrame, TranscriptionResult, TranscriptionResultLimits,
+    ValidatedAudioFormat, VisibleToolCall, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
+    CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
+    DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
+    DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN,
+    MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN, SESSION_RECEIPT_SCHEMA_VERSION,
+    TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
+    TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN,
+    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
+    USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 #[cfg(test)]
 use mayhem_proto::{chunk_json_payload, visible_output_units};
@@ -14586,14 +14586,16 @@ fn tools_only_prompt_token_units(
             "signed tools-only endpoint requires at least one normalized tool",
         ));
     }
-    let prompt_units = normalized_request_prompt_units(&normalized_request).map_err(|err| {
-        GatewaySessionError::new(format!(
-            "failed to meter normalized tools-only request: {err}"
-        ))
+    let prompt_units = tools_only_model_input_prompt_units(
+        direct_chat_endpoint_family(request),
+        &normalized_request,
+    )
+    .map_err(|err| {
+        GatewaySessionError::new(format!("failed to meter tools-only model input: {err}"))
     })?;
     if prompt_units == 0 {
         return Err(GatewaySessionError::new(
-            "normalized tools-only request produced zero prompt units",
+            "tools-only model input produced zero prompt units",
         ));
     }
     if prompt_units > u64::from(served_ctx) {

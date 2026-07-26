@@ -103,17 +103,17 @@ use mayhem_proto::MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN;
 use mayhem_proto::{
     artifact_generation_inline_audio_load, catalog_enclave_id, chunk_json_payload,
     ctx_bracket_for_tokens_in_schedule, ctx_bracket_table_at, default_ctx_bracket_schedule,
-    metered_output_units, normalized_request_prompt_units, payload_chunk_at,
-    payload_chunk_manifest, reassemble_json_payload, receipt_signing_bytes,
-    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
-    stable_json_bytes, validate_ctx_bracket_schedule, validated_audio_metadata,
-    validated_wav_audio_metadata, AdminAttestationPolicy, AttestationRuntimeConfig,
-    AttestationTrustDataRef, CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule,
-    HardwareQuote, HardwareQuoteKind, HardwareQuoteRoutePolicyBinding, MoneyAu, PayloadChunk,
-    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SpendVoucher, TpmActivateCredentialChallengeFrame, TpmActivateCredentialResponseFrame,
-    TranscriptionResult, TranscriptionResultLimits, TranscriptionTimestamp, ValidatedAudioFormat,
-    VisibleToolCall, CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
+    metered_output_units, payload_chunk_at, payload_chunk_manifest, reassemble_json_payload,
+    receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
+    spend_voucher_signing_bytes, stable_json_bytes, tools_only_model_input_prompt_units,
+    validate_ctx_bracket_schedule, validated_audio_metadata, validated_wav_audio_metadata,
+    AdminAttestationPolicy, AttestationRuntimeConfig, AttestationTrustDataRef,
+    CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind,
+    HardwareQuoteRoutePolicyBinding, MoneyAu, PayloadChunk, PayloadChunkCollector,
+    PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SpendVoucher,
+    TpmActivateCredentialChallengeFrame, TpmActivateCredentialResponseFrame, TranscriptionResult,
+    TranscriptionResultLimits, TranscriptionTimestamp, ValidatedAudioFormat, VisibleToolCall,
+    CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
     DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
     DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
     MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN, SESSION_RECEIPT_SCHEMA_VERSION,
@@ -72626,11 +72626,12 @@ fn provider_protocol_prompt_tokens(
             .is_some_and(|tools| !tools.is_empty()),
         "signed tools-only endpoint requires at least one normalized tool"
     );
-    let prompt_tokens = normalized_request_prompt_units(request)
-        .context("metering normalized tools-only provider request")?;
+    let prompt_tokens = tools_only_model_input_prompt_units(&contract.family, request)
+        .map_err(anyhow::Error::msg)
+        .context("metering tools-only provider model input")?;
     ensure!(
         prompt_tokens > 0,
-        "normalized tools-only provider request produced zero prompt units"
+        "tools-only provider model input produced zero prompt units"
     );
     Ok(Some(prompt_tokens))
 }
@@ -73010,8 +73011,8 @@ fn provider_engine_session_response_with_sampling_bounded(
     let mut token_ids = Vec::new();
     let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
     // Existing text models keep the established request-text estimate. A signed
-    // tools-only endpoint is metered from the normalized request so the buyer
-    // and provider derive the same value without trusting either tokenizer.
+    // tools-only endpoint is metered from the model-visible query and selected
+    // tools so buyer and provider agree without charging transport metadata.
     let estimated_prompt_tokens = rough_text_tokens(&provider_session_prompt_text(body));
     let output = backend
         .generate_with_artifacts(
@@ -74834,7 +74835,7 @@ fn provider_engine_tool_specs(body: &Value) -> Result<Vec<ToolSpec>> {
         .unwrap_or(&[]);
     let mut specs = Vec::new();
     for tool in tools {
-        let Some(function) = tool.get("function") else {
+        let Some(function) = provider_engine_tool_definition(tool) else {
             continue;
         };
         let Some(name) = function.get("name").and_then(Value::as_str) else {
@@ -74855,6 +74856,15 @@ fn provider_engine_tool_specs(body: &Value) -> Result<Vec<ToolSpec>> {
         specs.push(spec);
     }
     Ok(specs)
+}
+
+fn provider_engine_tool_definition(tool: &Value) -> Option<&serde_json::Map<String, Value>> {
+    tool.get("function").and_then(Value::as_object).or_else(|| {
+        (tool.get("type").and_then(Value::as_str) == Some("function"))
+            .then(|| tool.as_object())
+            .flatten()
+            .filter(|tool| tool.get("name").is_some())
+    })
 }
 
 fn provider_engine_named_tool_choice(choice: &serde_json::Map<String, Value>) -> Option<&str> {
@@ -89209,22 +89219,18 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             "tools": [
                 {
                     "type": "function",
-                    "function": {
-                        "name": "read",
-                        "parameters": { "type": "object" }
-                    }
+                    "name": "read",
+                    "parameters": { "type": "object" }
                 },
                 {
                     "type": "function",
-                    "function": {
-                        "name": "write",
-                        "parameters": { "type": "object" }
-                    }
+                    "name": "write",
+                    "parameters": { "type": "object" }
                 }
             ],
             "tool_choice": {
                 "type": "function",
-                "function": { "name": "write" }
+                "name": "write"
             }
         });
 
