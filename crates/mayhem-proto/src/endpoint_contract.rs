@@ -2376,7 +2376,11 @@ pub fn materialize_endpoint_calibration_request(
                     format!("array fixture for {} exceeds this platform", mutation.path)
                 })?;
                 let item = substitute_calibration_markers(item.clone(), substitutions);
-                let values = if case.endpoint_family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+                let values = if mutation.path == "tools" && case.expect_accept && length > 1 {
+                    (0..length)
+                        .map(|index| endpoint_calibration_unique_tool(&item, index))
+                        .collect::<Result<Vec<_>, _>>()?
+                } else if case.endpoint_family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS
                     && matches!(mutation.path.as_str(), "custom_timesteps" | "timesteps")
                     && case.expect_accept
                     && length >= 2
@@ -2393,6 +2397,24 @@ pub fn materialize_endpoint_calibration_request(
         }
     }
     Ok(request)
+}
+
+fn endpoint_calibration_unique_tool(item: &Value, index: usize) -> Result<Value, String> {
+    if index == 0 {
+        return Ok(item.clone());
+    }
+    let mut tool = item.clone();
+    let name = if tool.pointer("/function/name").is_some() {
+        tool.pointer_mut("/function/name")
+    } else {
+        tool.pointer_mut("/name")
+    }
+    .ok_or_else(|| "tools calibration fixture has no function name".to_owned())?;
+    let base = name
+        .as_str()
+        .ok_or_else(|| "tools calibration fixture function name is not a string".to_owned())?;
+    *name = json!(format!("{base}_{index}"));
+    Ok(tool)
 }
 
 pub fn materialize_endpoint_request_defaults(
@@ -3089,7 +3111,14 @@ fn add_calibration_companion_mutations(
         "messages.tool_calls" => add("messages.role", json!("assistant")),
         "messages.tool_call_id" => add("messages.role", json!("tool")),
         "messages.content.type" => match value.and_then(Value::as_str) {
-            Some("text") => add("messages.content.text", json!("Mayhem calibration")),
+            Some("text") => add(
+                "messages.content.text",
+                endpoint_calibration_companion_baseline(
+                    contract,
+                    "messages.content.text",
+                    json!("Mayhem calibration"),
+                ),
+            ),
             Some("image_url") => {
                 add("messages.content.image_url.url", json!("$IMAGE_DATA_URL"));
             }
@@ -3268,6 +3297,11 @@ fn endpoint_calibration_string_fixture(
             return audio;
         }
     }
+    if case.expect_accept {
+        if let Some(seed) = endpoint_calibration_semantic_string(case, path) {
+            return endpoint_calibration_string_with_length(seed, length);
+        }
+    }
     if case.endpoint_family != ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
         return "x".repeat(length);
     }
@@ -3288,6 +3322,43 @@ fn endpoint_calibration_string_fixture(
         };
     }
     "x".repeat(length)
+}
+
+fn endpoint_calibration_semantic_string<'a>(
+    case: &'a EndpointCalibrationCase,
+    path: &str,
+) -> Option<&'a str> {
+    endpoint_values_at_path(&case.base_request, path)
+        .into_iter()
+        .find_map(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            (path == "messages.content.text")
+                .then(|| {
+                    case.base_request
+                        .pointer("/messages/0/content")
+                        .and_then(|content| match content {
+                            Value::String(text) => Some(text.as_str()),
+                            Value::Array(parts) => parts.iter().find_map(|part| {
+                                (part.get("type").and_then(Value::as_str) == Some("text"))
+                                    .then(|| part.get("text").and_then(Value::as_str))
+                                    .flatten()
+                            }),
+                            _ => None,
+                        })
+                })
+                .flatten()
+        })
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn endpoint_calibration_string_with_length(seed: &str, length: usize) -> String {
+    let seed_length = seed.chars().count();
+    if seed_length >= length {
+        seed.chars().take(length).collect()
+    } else {
+        format!("{seed}{}", " ".repeat(length - seed_length))
+    }
 }
 
 fn endpoint_calibration_wav_base64_fixture(encoded_length: usize) -> Option<String> {
@@ -3463,26 +3534,45 @@ fn add_boundary_calibration_cases(
             Vec::new(),
         );
     }
-    let array_item = spec
+    let array_values = spec
         .calibration_values
         .iter()
         .chain(spec.default.iter())
-        .find_map(Value::as_array)
-        .and_then(|items| items.first())
+        .filter_map(Value::as_array)
+        .collect::<Vec<_>>();
+    let array_item = array_values
+        .iter()
+        .find_map(|items| items.first())
         .cloned()
         .or_else(|| spec.enum_values.first().cloned())
         .unwrap_or_else(|| json!("item"));
     for (kind, length, accept) in length_boundary_values(spec.min_items, spec.max_items) {
-        let mut mutations = vec![EndpointCalibrationMutation {
-            path: path.to_owned(),
-            value: EndpointCalibrationValue::ArrayLength {
+        let exact_fixture = accept
+            .then(|| {
+                usize::try_from(length).ok().and_then(|length| {
+                    array_values
+                        .iter()
+                        .find(|items| items.len() == length)
+                        .map(|items| Value::Array((*items).clone()))
+                })
+            })
+            .flatten();
+        let mutation_value = exact_fixture
+            .clone()
+            .map(|value| EndpointCalibrationValue::Literal { value })
+            .unwrap_or_else(|| EndpointCalibrationValue::ArrayLength {
                 length,
                 item: array_item.clone(),
-            },
+            });
+        let mut mutations = vec![EndpointCalibrationMutation {
+            path: path.to_owned(),
+            value: mutation_value,
         }];
-        let companion_value = usize::try_from(length)
-            .ok()
-            .map(|length| Value::Array(vec![array_item.clone(); length]));
+        let companion_value = exact_fixture.or_else(|| {
+            usize::try_from(length)
+                .ok()
+                .map(|length| Value::Array(vec![array_item.clone(); length]))
+        });
         add_calibration_companion_mutations(
             contract,
             path,
@@ -7037,6 +7127,90 @@ mod tests {
         );
         assert_eq!(request["messages"][0]["role"], "user");
         assert!(validate_endpoint_request(&contract, &request).is_ok());
+    }
+
+    #[test]
+    fn calibration_boundaries_preserve_semantic_text_and_exact_array_fixtures() {
+        let mut contract = endpoint_family_contract_template(ENDPOINT_OPENAI_CHAT_COMPLETIONS)
+            .expect("chat contract");
+        let text = contract
+            .request_attribute_specs
+            .get_mut("messages.content.text")
+            .expect("text spec");
+        text.max_length = Some(64);
+        text.calibration_values = vec![json!("What is the weather in Berlin?")];
+
+        let first_tool = json!({"type":"function","function":{"name":"get_weather"}});
+        let second_tool = json!({"type":"function","function":{"name":"set_timer"}});
+        let tools = contract
+            .request_attribute_specs
+            .get_mut("tools")
+            .expect("tools spec");
+        tools.min_items = Some(1);
+        tools.max_items = Some(2);
+        tools.calibration_values = vec![
+            json!([first_tool.clone()]),
+            json!([first_tool.clone(), second_tool.clone()]),
+        ];
+
+        let cases = generate_endpoint_calibration_cases(&contract).expect("calibration matrix");
+        let substitutions = BTreeMap::from([("$MODEL".to_owned(), json!("test/model"))]);
+
+        let text_type = cases
+            .iter()
+            .find(|case| {
+                case.case_kind.starts_with("accepted_value_")
+                    && case.mutations.iter().any(|mutation| {
+                        mutation.path == "messages.content.type"
+                            && mutation.value
+                                == (EndpointCalibrationValue::Literal {
+                                    value: json!("text"),
+                                })
+                    })
+            })
+            .expect("accepted text-part case");
+        let request = materialize_endpoint_calibration_request(text_type, &substitutions)
+            .expect("text-part request");
+        assert_eq!(
+            request["messages"][0]["content"][0]["text"],
+            json!("What is the weather in Berlin?")
+        );
+
+        let maximum_text = cases
+            .iter()
+            .find(|case| {
+                case.case_kind == "maximum_length_valid"
+                    && case.mutations.iter().any(|mutation| {
+                        mutation.path == "messages.content.text"
+                            && mutation.value
+                                == (EndpointCalibrationValue::StringLength { length: 64 })
+                    })
+            })
+            .expect("maximum text case");
+        let request = materialize_endpoint_calibration_request(maximum_text, &substitutions)
+            .expect("maximum text request");
+        let text = request["messages"][0]["content"][0]["text"]
+            .as_str()
+            .expect("text fixture");
+        assert!(text.starts_with("Mayhem calibration"));
+        assert_eq!(text.chars().count(), 64);
+
+        let maximum_tools = cases
+            .iter()
+            .find(|case| {
+                case.case_kind == "maximum_length_valid"
+                    && case.mutations.iter().any(|mutation| {
+                        mutation.path == "tools"
+                            && mutation.value
+                                == (EndpointCalibrationValue::Literal {
+                                    value: json!([first_tool.clone(), second_tool.clone()]),
+                                })
+                    })
+            })
+            .expect("maximum tools case");
+        let request = materialize_endpoint_calibration_request(maximum_tools, &substitutions)
+            .expect("maximum tools request");
+        assert_eq!(request["tools"], json!([first_tool, second_tool]));
     }
 
     #[test]

@@ -78,7 +78,7 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.53` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.54` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -87,7 +87,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.53
+git checkout --detach v0.2.54
 ./install.sh --from-source
 ```
 
@@ -96,7 +96,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.53
+git checkout --detach v0.2.54
 .\install.ps1 -FromSource
 ```
 
@@ -755,7 +755,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 | `Tongyi-MAI/Z-Image-Turbo` | Image | B/C | **live** |
 | `google/gemma-4-E4B-it` | LLM, small + vision, laptop/CPU-friendly | A/B | **live** |
 | `HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive` (`@nvfp4`) | LLM, uncensored, 262K ctx | C | **live** |
-| `Cactus-Compute/needle` | Tool-calling specialist, 26M, CPU | A | onboarding |
+| `Cactus-Compute/needle` | Deterministic tools-only specialist, 30.4M, CPU/CUDA | A | release in progress |
 | `NousResearch/Hermes-3-Llama-3.1-70B` (`@mlx-4bit`) | LLM, 70B, 128K ctx | D | onboarding |
 | `openai/gpt-oss-20b` | LLM, agentic | B | onboarding |
 | `Qwen/Qwen3.6-35B-A3B` | LLM, MoE, 262K ctx | C | onboarding |
@@ -859,7 +859,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.53` is source-only. The GitHub release contains the tagged source, not
+`v0.2.54` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -867,7 +867,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.53
+git checkout --detach v0.2.54
 ./install.sh --from-source
 ```
 
@@ -876,7 +876,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.53
+git checkout --detach v0.2.54
 .\install.ps1 -FromSource
 ```
 
@@ -896,7 +896,21 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
-The `0.2.53` source release carries the current PAYOUTFREE, ATTAUTO, FLOWRATE,
+The `0.2.54` source release adds `Cactus-Compute/needle`, a deterministic
+tools-only 30.4M model pinned at
+`5f89b4307696d669c3df1d38ae057e6e1728b107`, with its `needle-hf` runtime
+source pinned at `ffd0d081401257fee31150d30c494b2f98910fc0`. It accepts 1 to
+10 tools and has a 1,024-token combined context with a 512-token decoder
+ceiling. Needle has exactly two canonical markets: `needle-cpu` on Linux,
+Windows x86_64, and Apple Silicon macOS, and `needle-gpu` for CUDA on supported
+Linux aarch64/x86_64 and Windows x86_64 hosts. Needle GPU means CUDA, not Metal/MPS. Apple MPS measured
+about 2.5 decode tok/s cold and 10.7 warm, so it is intentionally ineligible;
+Apple CPU measured about 260-277 decode tok/s. Prior measurements were about
+89.7 cold/166 warm decode tok/s on `.70` CUDA, 122-149 on Windows CPU, and
+64-78 on `.70` CPU.
+
+The release also adds a forward-reader gate for future catalog engines while carrying
+the current PAYOUTFREE, ATTAUTO, FLOWRATE,
 LIVEROUTE, autonomous bounded TPM route activation after gateway restarts,
 consistent exact-boundary vLLM shared-memory admission,
 bounded Z-Image readiness, process-lifetime dashboard auth,
@@ -908,6 +922,8 @@ byte-hashed Chatterbox runtime input to LF so Windows source builds are independ
 `core.autocrlf`. Video duration requests resolve deterministically to the greatest
 signed legal frame count inside the requested duration, and providers enforce that
 exact frame/duration pair before signing usage.
+Needle's canonical catalog entry requires Mayhem `0.2.54`; older installations
+must update before they can discover or serve it.
 
 ```bash
 scripts/dev-net.sh --cleanup

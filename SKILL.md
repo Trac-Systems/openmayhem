@@ -65,14 +65,14 @@ aggregate admission refusal or compensate with an undocumented memory override.
 ## 3. Install
 
 ### 3.1 Get the code — exact source release (MANDATORY rule)
-- `v0.2.53` is source-only. Never invent or offer a native archive URL: the release has no unsigned
+- `v0.2.54` is source-only. Never invent or offer a native archive URL: the release has no unsigned
   OpenMayhem executable assets. Clone the exact release tag and build it locally.
 
   **macOS/Linux:**
   ```bash
   git clone https://github.com/Trac-Systems/openmayhem.git
   cd openmayhem
-  git checkout --detach v0.2.53
+  git checkout --detach v0.2.54
   ./install.sh --from-source
   ```
 
@@ -80,7 +80,7 @@ aggregate admission refusal or compensate with an undocumented memory override.
   ```powershell
   git clone https://github.com/Trac-Systems/openmayhem.git
   Set-Location openmayhem
-  git checkout --detach v0.2.53
+  git checkout --detach v0.2.54
   .\install.ps1 -FromSource
   ```
 On updated source checkouts, `mayhem up` verifies and, when needed, deterministically repairs only
@@ -282,6 +282,7 @@ its managed runtime only. The exact model/artifact/enclave fit is decided by the
 | `SulphurAI/Sulphur-2-base` | `sulphur` | `gguf-q4_k_m` CUDA composition or `mlx-q4` composition, with all signed A/V sidecars | CUDA on Linux/Windows; Metal/MPS on Apple Silicon | 64 GiB RAM; one generation in flight | `/v1/videos`, `/hf-inference/models/<model-id>` |
 | `ResembleAI/chatterbox` | `chatterbox` | original-English PyTorch safetensors plus four mandatory signed sidecars | Linux/Windows/macOS CPU; CUDA on Linux/Windows; Metal/MPS on Apple Silicon | 8 GiB RAM, 6 GiB VRAM for full offload | `/v1/audio/speech`, `/hf-inference/models/<model-id>` |
 | `huihui-ai/Huihui-Agents-A1-abliterated` | `llama.cpp` | `gguf-q4_k` + mandatory BF16 vision projector | Linux/Windows/macOS CPU; CUDA, Metal, or Vulkan when the installed build has that feature | 32 GiB RAM, 32 GiB VRAM for full offload, AVX2 or NEON | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/hf-inference/models/<model-id>` |
+| `Cactus-Compute/needle` | `needle-cpu` or `needle-gpu` | Pinned 30.4M Needle model plus pinned `needle-hf` runtime | CPU on Linux, Windows x86_64, and Apple Silicon macOS; GPU is CUDA-only on Linux aarch64/x86_64 and Windows x86_64; no Metal/MPS market | 1,024 combined context, 512 decoder tokens, 1-10 tools | `/v1/chat/completions`, `/v1/responses` |
 
 For every published model, the managed sequence is:
 ```
@@ -481,6 +482,25 @@ serve, `heartbeat.live=true`, `gateway.ok=true`, `gateway.route_count>0`, and th
   Linux CUDA, all 604 endpoint rows per platform, image/video understanding, and two tool calls
   retained in one turn.
 
+**Cactus Compute Needle**
+- **Install/start:** choose exactly one canonical market, run
+  `mayhem doctor --provider-backend needle-cpu` or
+  `mayhem doctor --provider-backend needle-gpu`, then run
+  `mayhem up --provider --provider-enclave Cactus-Compute/needle --yes`.
+- **Pins:** model `Cactus-Compute/needle@5f89b4307696d669c3df1d38ae057e6e1728b107`;
+  runtime source `Cactus-Compute/needle-hf@ffd0d081401257fee31150d30c494b2f98910fc0`.
+  Both are immutable release inputs.
+- **Surface:** deterministic tools-only inference for 1 to 10 tools through OpenAI chat
+  completions and responses. The combined context is 1,024 tokens and the decoder ceiling is
+  512 tokens. Do not advertise ordinary prose generation or a larger context.
+- **Markets:** `needle-cpu` supports Linux, Windows x86_64, and Apple Silicon macOS.
+  `needle-gpu` is CUDA-only on Linux aarch64/x86_64 and Windows x86_64 hosts. There are
+  exactly two markets; Apple Metal/MPS is not a third market and must not be mapped to
+  `needle-gpu`.
+- **Measured decode:** Apple MPS was about 2.5 tok/s cold and 10.7 warm, while Apple CPU was
+  about 260-277 tok/s, so MPS is intentionally ineligible. Prior measurements were about
+  89.7 tok/s cold and 166 warm on `.70` CUDA, 122-149 on Windows CPU, and 64-78 on `.70` CPU.
+
 For every text-generation model, catalog `ctx_max` is a ceiling, not a required provider setting.
 A provider may commit a smaller fitting value with `--ctx`; Mayhem carries that exact value through
 the heartbeat, route, voucher, receipt, and dashboard. Before an LLM market opens, the admin must
@@ -553,8 +573,8 @@ forwarded as-is.
 
 | Goal | Command |
 |---|---|
-| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.53 && ./install.sh --from-source` |
-| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.53; .\install.ps1 -FromSource` |
+| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.54 && ./install.sh --from-source` |
+| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.54; .\install.ps1 -FromSource` |
 | Start user gateway | `mayhem up --rail <fiat\|tap\|tnk> --yes` |
 | Start provider | `mayhem up --provider --yes` |
 | Stop and leave provider registrations | `mayhem down` |

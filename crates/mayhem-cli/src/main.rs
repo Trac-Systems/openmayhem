@@ -103,24 +103,24 @@ use mayhem_proto::MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN;
 use mayhem_proto::{
     artifact_generation_inline_audio_load, catalog_enclave_id, chunk_json_payload,
     ctx_bracket_for_tokens_in_schedule, ctx_bracket_table_at, default_ctx_bracket_schedule,
-    metered_output_units, payload_chunk_at, payload_chunk_manifest, reassemble_json_payload,
-    receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
-    spend_voucher_signing_bytes, stable_json_bytes, validate_ctx_bracket_schedule,
-    validated_audio_metadata, validated_wav_audio_metadata, AdminAttestationPolicy,
-    AttestationRuntimeConfig, AttestationTrustDataRef, CatalogEnclaveIdentity, CheckpointPolicy,
-    CtxBracketSchedule, HardwareQuote, HardwareQuoteKind, HardwareQuoteRoutePolicyBinding, MoneyAu,
-    PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
-    ReceiptUsage, SpendVoucher, TpmActivateCredentialChallengeFrame,
-    TpmActivateCredentialResponseFrame, TranscriptionResult, TranscriptionResultLimits,
-    TranscriptionTimestamp, ValidatedAudioFormat, VisibleToolCall, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
-    DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
-    DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
-    SESSION_RECEIPT_SCHEMA_VERSION, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
-    TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION, TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE,
-    USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
-    USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
-    VISIBLE_OUTPUT_BYTES_PER_UNIT,
+    metered_output_units, normalized_request_prompt_units, payload_chunk_at,
+    payload_chunk_manifest, reassemble_json_payload, receipt_signing_bytes,
+    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
+    stable_json_bytes, validate_ctx_bracket_schedule, validated_audio_metadata,
+    validated_wav_audio_metadata, AdminAttestationPolicy, AttestationRuntimeConfig,
+    AttestationTrustDataRef, CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule,
+    HardwareQuote, HardwareQuoteKind, HardwareQuoteRoutePolicyBinding, MoneyAu, PayloadChunk,
+    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SpendVoucher, TpmActivateCredentialChallengeFrame, TpmActivateCredentialResponseFrame,
+    TranscriptionResult, TranscriptionResultLimits, TranscriptionTimestamp, ValidatedAudioFormat,
+    VisibleToolCall, CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
+    DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
+    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
+    MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN, SESSION_RECEIPT_SCHEMA_VERSION,
+    TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
+    TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN,
+    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
+    USAGE_STEP, USAGE_VIDEO_SECOND, VISIBLE_OUTPUT_BYTES_PER_UNIT,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -2753,7 +2753,7 @@ struct DoctorArgs {
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
 
-    /// Also preflight one provider backend: auto, llama.cpp, mlx, vllm, trt-llm, stable-diffusion.cpp, ace-step, chatterbox, sulphur, transformers-asr, whisper.cpp, or piper.
+    /// Also preflight one provider backend: auto, llama.cpp, mlx, vllm, trt-llm, stable-diffusion.cpp, ace-step, chatterbox, needle-cpu, needle-gpu, sulphur, transformers-asr, whisper.cpp, or piper.
     #[arg(long, value_name = "BACKEND")]
     provider_backend: Option<String>,
 
@@ -5654,7 +5654,7 @@ struct ProviderServePlanArgs {
     #[arg(long, value_name = "PATH")]
     canaries_dir: Option<PathBuf>,
 
-    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, ace-step, chatterbox, sulphur, transformers-asr, whisper.cpp, or piper.
+    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, ace-step, chatterbox, needle-cpu, needle-gpu, sulphur, transformers-asr, whisper.cpp, or piper.
     #[arg(long, default_value = "auto")]
     engine_backend: String,
 
@@ -5874,7 +5874,7 @@ struct ProviderStartArgs {
     #[arg(long, value_name = "PATH")]
     hf_token_file: Option<PathBuf>,
 
-    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, ace-step, chatterbox, sulphur, transformers-asr, whisper.cpp, or piper.
+    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, ace-step, chatterbox, needle-cpu, needle-gpu, sulphur, transformers-asr, whisper.cpp, or piper.
     #[arg(long, default_value = "auto")]
     engine_backend: String,
 
@@ -7122,6 +7122,8 @@ fn resolve_doctor_provider_backend(requested: &str, report: &HardwareReport) -> 
                 | "stable-diffusion.cpp"
                 | "ace-step"
                 | "chatterbox"
+                | "needle-cpu"
+                | "needle-gpu"
                 | "sulphur"
                 | "transformers-asr"
                 | "whisper.cpp"
@@ -8147,6 +8149,12 @@ fn backend_requirement_hint(backend: &str) -> &'static str {
         }
         "chatterbox" => {
             "Chatterbox requires its pinned offline Python runtime and enough RAM or CUDA/Metal memory for the signed five-file artifact"
+        }
+        "needle-cpu" => {
+            "Needle CPU requires its pinned offline Python runtime and the exact signed tools-only model inventory"
+        }
+        "needle-gpu" => {
+            "Needle GPU requires a supported NVIDIA CUDA host and its matching pinned offline runtime"
         }
         "sulphur" => {
             "Sulphur requires its pinned local joint audio-video runtime and a calibrated CUDA or Apple Silicon artifact"
@@ -17871,6 +17879,41 @@ fn verify_calibration_sidecars_match_catalog(
             );
         }
     }
+    if needle_device_for_engine(&artifact.engine).is_some() {
+        ensure!(
+            needle_source_binds_canonical_upstream(
+                &artifact.source,
+                artifact.upstream_source.as_ref(),
+                NEEDLE_MODEL_REPO,
+                mayhem_engine::NEEDLE_MODEL_REVISION,
+            ) && artifact.path == NEEDLE_PRIMARY_PATH,
+            "Needle calibration requires canonical {NEEDLE_MODEL_REPO}@{} path {NEEDLE_PRIMARY_PATH}",
+            mayhem_engine::NEEDLE_MODEL_REVISION
+        );
+        for (required, source_path, repo, revision) in NEEDLE_REQUIRED_SIDECARS {
+            let sidecar = artifact.sidecars.get(*required).with_context(|| {
+                format!("Needle calibration requires admin catalog sidecar {required}")
+            })?;
+            ensure!(
+                needle_source_binds_canonical_upstream(
+                    &sidecar.source,
+                    sidecar.upstream_source.as_ref(),
+                    repo,
+                    revision,
+                ) && sidecar.path == *source_path,
+                "Needle sidecar {required} must bind {repo}@{revision} path {source_path}"
+            );
+            ensure!(
+                paths.contains_key(*required),
+                "Needle calibration requires --artifact-sidecar {required}=PATH"
+            );
+        }
+        ensure!(
+            paths.len() == NEEDLE_REQUIRED_SIDECARS.len()
+                && artifact.sidecars.len() == NEEDLE_REQUIRED_SIDECARS.len(),
+            "Needle calibration requires its exact seven signed sidecars and no extras"
+        );
+    }
     if artifact.engine == "chatterbox" {
         ensure!(
             chatterbox_source_binds_canonical_upstream(
@@ -21315,6 +21358,8 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
                 | "stable-diffusion.cpp"
                 | "ace-step"
                 | "chatterbox"
+                | "needle-cpu"
+                | "needle-gpu"
                 | "sulphur"
                 | "transformers-asr"
                 | "whisper.cpp"
@@ -22200,6 +22245,30 @@ fn canary_prompt_uses_model_sampling_defaults(
         })
 }
 
+fn signed_sampling_control_has_alternate(
+    model: &catalog::CatalogModel,
+    path: &str,
+    default: Option<f64>,
+) -> bool {
+    let differs = |value: f64| default.is_none_or(|default| !sampling_float_eq(value, default));
+    model
+        .adapter
+        .endpoint_families
+        .iter()
+        .filter_map(|contract| contract.request_attribute_specs.get(path))
+        .any(|spec| {
+            spec.minimum.is_some_and(differs)
+                || spec.maximum.is_some_and(differs)
+                || spec
+                    .calibration_values
+                    .iter()
+                    .chain(spec.enum_values.iter())
+                    .chain(spec.default.iter())
+                    .filter_map(Value::as_f64)
+                    .any(differs)
+        })
+}
+
 fn validate_canary_sampling_range(
     model: &catalog::CatalogModel,
     prompts: &[CanaryPrompt],
@@ -22243,7 +22312,9 @@ fn validate_canary_sampling_range(
             .top_k
             .is_some_and(|value| defaults.top_k != Some(value))
     });
-    if !top_k_override {
+    if signed_sampling_control_has_alternate(model, "top_k", defaults.top_k.map(f64::from))
+        && !top_k_override
+    {
         return Err(format!(
             "canary set {set_id} must include a client-set top_k probe distinct from the model default"
         ));
@@ -22255,7 +22326,7 @@ fn validate_canary_sampling_range(
                 .is_none_or(|default| !sampling_float_eq(value, default))
         })
     });
-    if !min_p_override {
+    if signed_sampling_control_has_alternate(model, "min_p", defaults.min_p) && !min_p_override {
         return Err(format!(
             "canary set {set_id} must include a client-set min_p probe distinct from the model default"
         ));
@@ -22278,8 +22349,31 @@ fn managed_python_backend_for_artifact(artifact: &catalog::CatalogArtifact) -> &
         )
     {
         "sulphur-mlx"
+    } else if needle_device_for_engine(&artifact.engine).is_some() {
+        "needle"
     } else {
         artifact.engine.as_str()
+    }
+}
+
+fn needle_device_for_engine(engine: &str) -> Option<&'static str> {
+    match engine {
+        "needle-cpu" => Some("cpu"),
+        "needle-gpu" => Some("gpu"),
+        _ => None,
+    }
+}
+
+fn ensure_catalog_artifact_python(
+    home: &Path,
+    artifact: &catalog::CatalogArtifact,
+) -> Result<python_runtime::PythonRuntime> {
+    match needle_device_for_engine(&artifact.engine) {
+        Some(device) => python_runtime::ensure_needle_python_for_device(home, device),
+        None => python_runtime::ensure_backend_python(
+            home,
+            managed_python_backend_for_artifact(artifact),
+        ),
     }
 }
 
@@ -22289,15 +22383,22 @@ fn preflight_catalog_calibration_managed_runtime(
 ) -> Result<()> {
     if !matches!(
         artifact.engine.as_str(),
-        "mlx" | "ace-step" | "chatterbox" | "sulphur" | "transformers-asr" | "trt-llm" | "vllm"
+        "mlx"
+            | "ace-step"
+            | "chatterbox"
+            | "needle-cpu"
+            | "needle-gpu"
+            | "sulphur"
+            | "transformers-asr"
+            | "trt-llm"
+            | "vllm"
     ) {
         return Ok(());
     }
-    let managed_backend = managed_python_backend_for_artifact(artifact);
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
-    python_runtime::ensure_backend_python(&home, managed_backend).with_context(|| {
+    ensure_catalog_artifact_python(&home, artifact).with_context(|| {
         format!(
             "preparing the managed {} calibration runtime under {}",
             artifact.engine,
@@ -22317,20 +22418,26 @@ fn catalog_calibration_backend(
 ) -> Result<Box<dyn EngineBackend>> {
     let managed_runtime = if matches!(
         artifact.engine.as_str(),
-        "mlx" | "ace-step" | "chatterbox" | "sulphur" | "transformers-asr" | "trt-llm" | "vllm"
+        "mlx"
+            | "ace-step"
+            | "chatterbox"
+            | "needle-cpu"
+            | "needle-gpu"
+            | "sulphur"
+            | "transformers-asr"
+            | "trt-llm"
+            | "vllm"
     ) {
-        let managed_backend = managed_python_backend_for_artifact(artifact);
         let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
         let home = absolutize(home)?;
         fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
-        let runtime =
-            python_runtime::ensure_backend_python(&home, managed_backend).with_context(|| {
-                format!(
-                    "preparing the managed {} calibration runtime under {}",
-                    artifact.engine,
-                    home.display()
-                )
-            })?;
+        let runtime = ensure_catalog_artifact_python(&home, artifact).with_context(|| {
+            format!(
+                "preparing the managed {} calibration runtime under {}",
+                artifact.engine,
+                home.display()
+            )
+        })?;
         Some((runtime, home.join("cache").join(&artifact.engine)))
     } else {
         None
@@ -22357,7 +22464,24 @@ fn catalog_calibration_backend(
         None
     };
     let materialized_artifact_path;
-    let artifact_path = if artifact.engine == "transformers-asr" {
+    let artifact_path = if needle_device_for_engine(&artifact.engine).is_some() {
+        let cache_dir = &managed_runtime
+            .as_ref()
+            .context("Needle calibration runtime cache was not resolved")?
+            .1;
+        let paths = ProviderArtifactPaths {
+            primary: artifact_path.to_path_buf(),
+            sidecars: sidecar_paths.clone(),
+        };
+        materialized_artifact_path = materialize_needle_layout(
+            &format!("{}/{}", artifact.source.repo, artifact.path),
+            &artifact.artifact_root,
+            artifact,
+            &paths,
+            cache_dir,
+        )?;
+        materialized_artifact_path.as_path()
+    } else if artifact.engine == "transformers-asr" {
         let paths = ProviderArtifactPaths {
             primary: artifact_path.to_path_buf(),
             sidecars: sidecar_paths.clone(),
@@ -22431,6 +22555,7 @@ fn catalog_calibration_backend(
         "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
         "ace-step" => LoadConfig::ace_step_safetensors(artifact_path),
         "chatterbox" => LoadConfig::chatterbox_safetensors(artifact_path),
+        "needle-cpu" | "needle-gpu" => LoadConfig::transformers_safetensors(artifact_path),
         "sulphur" => sulphur_load_config(artifact_path)?,
         "transformers-asr" => LoadConfig::transformers_safetensors(artifact_path),
         "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
@@ -22606,6 +22731,23 @@ fn catalog_calibration_backend(
             backend
                 .load(config)
                 .context("loading Chatterbox canary calibration artifact")?;
+            Ok(Box::new(backend))
+        }
+        "needle-cpu" | "needle-gpu" => {
+            let python = &managed_runtime
+                .as_ref()
+                .context("Needle calibration runtime was not resolved")?
+                .0
+                .python;
+            let requested_device = needle_device_for_engine(&artifact.engine)
+                .context("Needle calibration engine did not select a device")?;
+            let device = python_runtime::resolve_needle_device_for_request(requested_device)
+                .context("Needle calibration host did not resolve a supported device")?;
+            let mut backend = mayhem_engine::NeedleBackend::with_python_for_device(python, device)
+                .context("initializing Needle backend")?;
+            backend
+                .load(config)
+                .context("loading Needle canary calibration artifact")?;
             Ok(Box::new(backend))
         }
         "sulphur" => {
@@ -49479,6 +49621,12 @@ fn provider_backend_runtime_child_env(
                 );
             }
         }
+        "needle-cpu" | "needle-gpu" => {
+            insert_path("MAYHEM_NEEDLE_PYTHON", runtime.python.as_deref());
+            if let Some(device) = needle_device_for_engine(backend) {
+                child_env.insert("MAYHEM_NEEDLE_DEVICE".to_owned(), device.to_owned());
+            }
+        }
         "sulphur" => insert_path("MAYHEM_SULPHUR_PYTHON", runtime.python.as_deref()),
         "transformers-asr" => {
             insert_path("MAYHEM_TRANSFORMERS_ASR_PYTHON", runtime.python.as_deref());
@@ -49779,7 +49927,8 @@ fn provider_backend_runtime_preflight_for_backend(
 ) -> Result<ProviderBackendRuntime> {
     let mut runtime = ProviderBackendRuntime::default();
     match backend {
-        "vllm" | "trt-llm" | "mlx" | "ace-step" | "chatterbox" | "sulphur" | "transformers-asr" => {
+        "vllm" | "trt-llm" | "mlx" | "ace-step" | "chatterbox" | "needle-cpu" | "needle-gpu"
+        | "sulphur" | "transformers-asr" => {
             let python_backend = managed_backend.unwrap_or(backend);
             let chatterbox_device = if backend == "chatterbox" {
                 let device = chatterbox_managed_device(hardware).context(
@@ -49793,8 +49942,11 @@ fn provider_backend_runtime_preflight_for_backend(
             } else {
                 None
             };
-            let python = python_runtime::ensure_backend_python(home, python_backend)
-                .with_context(|| format!("preparing the managed {backend} runtime"))?;
+            let python = match needle_device_for_engine(backend) {
+                Some(device) => python_runtime::ensure_needle_python_for_device(home, device),
+                None => python_runtime::ensure_backend_python(home, python_backend),
+            }
+            .with_context(|| format!("preparing the managed {backend} runtime"))?;
             let cache_dir = home.join("cache").join(backend);
             fs::create_dir_all(&cache_dir).with_context(|| {
                 format!("creating managed {backend} cache {}", cache_dir.display())
@@ -61428,6 +61580,8 @@ fn backend_rank(backend: &str) -> u8 {
         "mlx" => 2,
         "ace-step" => 2,
         "chatterbox" => 2,
+        "needle-cpu" => 1,
+        "needle-gpu" => 2,
         "sulphur" => 2,
         "transformers-asr" => 2,
         "llama.cpp" => 1,
@@ -68345,6 +68499,28 @@ fn provider_session_responder(
                 backend: Box::new(backend),
             }))
         }
+        "needle-cpu" | "needle-gpu" => {
+            let python = ctx
+                .backend_runtime
+                .python
+                .as_ref()
+                .context("Needle runtime preflight did not resolve Python")?;
+            let requested_device = needle_device_for_engine(ctx.selected.artifact.engine.as_str())
+                .context("Needle provider engine did not select a device")?;
+            let device = python_runtime::resolve_needle_device_for_request(requested_device)
+                .context("Needle provider host did not resolve a supported device")?;
+            let mut backend =
+                mayhem_engine::NeedleBackend::with_python_for_device(python, device)
+                    .context("initializing Needle provider session engine")?;
+            with_provider_progress_spinner(ctx.args, "Needle engine load", || {
+                backend
+                    .load(load_config)
+                    .context("loading Needle provider session engine")
+            })?;
+            Ok(Box::new(EngineProviderSessionResponder {
+                backend: Box::new(backend),
+            }))
+        }
         "sulphur" => {
             let python = ctx
                 .backend_runtime
@@ -69280,6 +69456,12 @@ fn provider_engine_load_config(
             .as_deref()
             .context("Sulphur provider runtime cache was not resolved")?;
         artifact_path_buf = materialize_sulphur_artifacts(selected, artifact_paths, cache_dir)?;
+    } else if needle_device_for_engine(&selected.artifact.engine).is_some() {
+        let cache_dir = backend_runtime
+            .cache_dir
+            .as_deref()
+            .context("Needle provider runtime cache was not resolved")?;
+        artifact_path_buf = materialize_needle_artifacts(selected, artifact_paths, cache_dir)?;
     } else if selected.artifact.engine == "transformers-asr" {
         artifact_path_buf = materialize_transformers_asr_artifacts(selected, artifact_paths)?;
     }
@@ -69292,6 +69474,7 @@ fn provider_engine_load_config(
         "stable-diffusion.cpp" => ModelArtifact::stable_diffusion_checkpoint(artifact_path),
         "ace-step" => ModelArtifact::ace_step_safetensors(artifact_path),
         "chatterbox" => ModelArtifact::chatterbox_safetensors(artifact_path),
+        "needle-cpu" | "needle-gpu" => ModelArtifact::transformers_safetensors(artifact_path),
         "sulphur" => sulphur_load_config(artifact_path)?.artifact,
         "transformers-asr" => ModelArtifact::transformers_safetensors(artifact_path),
         "whisper.cpp" => ModelArtifact::whisper_ggml(artifact_path),
@@ -69314,6 +69497,7 @@ fn provider_engine_load_config(
         "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
         "ace-step" => LoadConfig::ace_step_safetensors(artifact_path),
         "chatterbox" => LoadConfig::chatterbox_safetensors(artifact_path),
+        "needle-cpu" | "needle-gpu" => LoadConfig::transformers_safetensors(artifact_path),
         "sulphur" => sulphur_load_config(artifact_path)?,
         "transformers-asr" => LoadConfig::transformers_safetensors(artifact_path),
         "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
@@ -69445,6 +69629,67 @@ const TRANSFORMERS_ASR_REQUIRED_SIDECARS: &[(&str, &str)] = &[
     ("transformers_tokenizer_json", "tokenizer.json"),
     ("transformers_tokenizer_config", "tokenizer_config.json"),
 ];
+
+const NEEDLE_MODEL_REPO: &str = "Cactus-Compute/needle";
+const NEEDLE_RUNTIME_REPO: &str = "Cactus-Compute/needle-hf";
+const NEEDLE_PRIMARY_PATH: &str = "model.safetensors";
+const NEEDLE_REQUIRED_SIDECARS: &[(&str, &str, &str, &str)] = &[
+    (
+        "needle_config",
+        "config.json",
+        NEEDLE_MODEL_REPO,
+        mayhem_engine::NEEDLE_MODEL_REVISION,
+    ),
+    (
+        "needle_special_tokens",
+        "special_tokens_map.json",
+        NEEDLE_MODEL_REPO,
+        mayhem_engine::NEEDLE_MODEL_REVISION,
+    ),
+    (
+        "needle_tokenizer_model",
+        "tokenizer.model",
+        NEEDLE_MODEL_REPO,
+        mayhem_engine::NEEDLE_MODEL_REVISION,
+    ),
+    (
+        "needle_tokenizer_config",
+        "tokenizer_config.json",
+        NEEDLE_MODEL_REPO,
+        mayhem_engine::NEEDLE_MODEL_REVISION,
+    ),
+    (
+        "needle_configuration_code",
+        "configuration_needle.py",
+        NEEDLE_RUNTIME_REPO,
+        mayhem_engine::NEEDLE_SOURCE_COMMIT,
+    ),
+    (
+        "needle_modeling_code",
+        "modeling_needle.py",
+        NEEDLE_RUNTIME_REPO,
+        mayhem_engine::NEEDLE_SOURCE_COMMIT,
+    ),
+    (
+        "needle_tokenization_code",
+        "tokenization_needle.py",
+        NEEDLE_RUNTIME_REPO,
+        mayhem_engine::NEEDLE_SOURCE_COMMIT,
+    ),
+];
+
+fn needle_source_binds_canonical_upstream(
+    source: &catalog::SourceRef,
+    upstream_source: Option<&catalog::SourceRef>,
+    repo: &str,
+    revision: &str,
+) -> bool {
+    let upstream = upstream_source.unwrap_or(source);
+    source.kind == "huggingface"
+        && upstream.kind == "huggingface"
+        && upstream.repo == repo
+        && upstream.revision == revision
+}
 
 const CHATTERBOX_MODEL_REPO: &str = "ResembleAI/chatterbox";
 const CHATTERBOX_PRIMARY_PATH: &str = "t3_cfg.safetensors";
@@ -69765,6 +70010,89 @@ fn materialize_transformers_asr_layout(
         })?;
     }
     Ok(model_dir)
+}
+
+fn materialize_needle_artifacts(
+    selected: &ProviderCandidate,
+    artifact_paths: &ProviderArtifactPaths,
+    cache_dir: &Path,
+) -> Result<PathBuf> {
+    materialize_needle_layout(
+        &format!("{}/{}", selected.model.model_id, selected.artifact_name),
+        &selected.artifact_name,
+        &selected.artifact,
+        artifact_paths,
+        cache_dir,
+    )
+}
+
+fn materialize_needle_layout(
+    label: &str,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    artifact_paths: &ProviderArtifactPaths,
+    cache_dir: &Path,
+) -> Result<PathBuf> {
+    ensure!(
+        needle_source_binds_canonical_upstream(
+            &artifact.source,
+            artifact.upstream_source.as_ref(),
+            NEEDLE_MODEL_REPO,
+            mayhem_engine::NEEDLE_MODEL_REVISION,
+        ) && artifact.path == NEEDLE_PRIMARY_PATH,
+        "Needle artifact {label} must bind canonical upstream {NEEDLE_MODEL_REPO}@{} path {NEEDLE_PRIMARY_PATH}",
+        mayhem_engine::NEEDLE_MODEL_REVISION
+    );
+    ensure!(
+        artifact.sidecars.len() == NEEDLE_REQUIRED_SIDECARS.len()
+            && artifact_paths.sidecars.len() == NEEDLE_REQUIRED_SIDECARS.len(),
+        "Needle artifact {label} requires its exact seven signed sidecars and no extras"
+    );
+
+    let model_root = needle_checkpoint_cache_dir(cache_dir, artifact_name, artifact);
+    fs::create_dir_all(&model_root)
+        .with_context(|| format!("creating Needle model layout {}", model_root.display()))?;
+    let primary = model_root.join(NEEDLE_PRIMARY_PATH);
+    materialize_verified_ace_step_file(
+        &artifact_paths.primary,
+        &primary,
+        artifact.weights_bytes,
+        artifact
+            .source_sha256
+            .as_deref()
+            .context("Needle primary artifact is missing source_sha256")?,
+        "Needle primary artifact",
+    )?;
+
+    for (sidecar_name, expected_path, repo, revision) in NEEDLE_REQUIRED_SIDECARS {
+        let sidecar = artifact
+            .sidecars
+            .get(*sidecar_name)
+            .with_context(|| format!("Needle artifact {label} requires sidecar {sidecar_name}"))?;
+        ensure!(
+            needle_source_binds_canonical_upstream(
+                &sidecar.source,
+                sidecar.upstream_source.as_ref(),
+                repo,
+                revision,
+            ) && sidecar.path == *expected_path,
+            "Needle artifact {label} sidecar {sidecar_name} must bind {repo}@{revision} path {expected_path}"
+        );
+        let source = artifact_paths
+            .sidecars
+            .get(*sidecar_name)
+            .with_context(|| {
+                format!("downloaded Needle artifact {label} is missing sidecar {sidecar_name}")
+            })?;
+        materialize_verified_ace_step_file(
+            source,
+            &model_root.join(expected_path),
+            sidecar.weights_bytes,
+            &sidecar.source_sha256,
+            &format!("Needle sidecar {sidecar_name}"),
+        )?;
+    }
+    Ok(primary)
 }
 
 fn materialize_chatterbox_artifacts(
@@ -70473,6 +70801,29 @@ fn transformers_asr_checkpoint_cache_dir(artifact_path: &Path, artifact_name: &s
     };
     base.join(".transformers-asr-models")
         .join(safe_path_component(artifact_name))
+}
+
+fn needle_checkpoint_cache_dir(
+    cache_dir: &Path,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+) -> PathBuf {
+    let mut identity = blake3::Hasher::new();
+    identity.update(b"mayhem/needle/materialized-layout/v1\0");
+    identity.update(artifact.artifact_root.as_bytes());
+    identity.update(&(artifact.path.len() as u64).to_be_bytes());
+    identity.update(artifact.path.as_bytes());
+    for (name, sidecar) in &artifact.sidecars {
+        identity.update(&(name.len() as u64).to_be_bytes());
+        identity.update(name.as_bytes());
+        identity.update(sidecar.artifact_root.as_bytes());
+        identity.update(&(sidecar.path.len() as u64).to_be_bytes());
+        identity.update(sidecar.path.as_bytes());
+    }
+    cache_dir
+        .join("models")
+        .join(safe_path_component(artifact_name))
+        .join(identity.finalize().to_hex().as_str())
 }
 
 fn chatterbox_checkpoint_cache_dir(
@@ -72252,6 +72603,38 @@ fn provider_engine_session_response_with_sampling(
     )
 }
 
+fn provider_protocol_prompt_tokens(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    request: &Value,
+) -> Result<Option<u64>> {
+    let tools_required = contract
+        .required_request_attributes
+        .iter()
+        .any(|attribute| attribute == "tools")
+        && contract
+            .request_attribute_specs
+            .get("tools")
+            .and_then(|spec| spec.min_items)
+            .is_some_and(|min_items| min_items > 0);
+    if !tools_required {
+        return Ok(None);
+    }
+    ensure!(
+        request
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty()),
+        "signed tools-only endpoint requires at least one normalized tool"
+    );
+    let prompt_tokens = normalized_request_prompt_units(request)
+        .context("metering normalized tools-only provider request")?;
+    ensure!(
+        prompt_tokens > 0,
+        "normalized tools-only provider request produced zero prompt units"
+    );
+    Ok(Some(prompt_tokens))
+}
+
 fn provider_engine_session_response_with_sampling_bounded(
     backend: &mut dyn EngineBackend,
     expected_model_id: Option<&str>,
@@ -72266,6 +72649,7 @@ fn provider_engine_session_response_with_sampling_bounded(
     let verified = provider_verify_endpoint_request(body, expected_model_id, adapter)?;
     let endpoint_family = verified.family;
     let request_body = verified.request;
+    let protocol_prompt_tokens = provider_protocol_prompt_tokens(verified.contract, request_body)?;
     if matches!(
         endpoint_family,
         mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS
@@ -72625,9 +73009,10 @@ fn provider_engine_session_response_with_sampling_bounded(
         ProviderReasoningOutputFilter::with_delimiters(reasoning_output_mode, reasoning_delimiters);
     let mut token_ids = Vec::new();
     let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
-    // Bill the canonical request content shared with the gateway, not backend-specific
-    // chat-template wrappers that are added only for inference.
-    let prompt_tokens = rough_text_tokens(&provider_session_prompt_text(body));
+    // Existing text models keep the established request-text estimate. A signed
+    // tools-only endpoint is metered from the normalized request so the buyer
+    // and provider derive the same value without trusting either tokenizer.
+    let estimated_prompt_tokens = rough_text_tokens(&provider_session_prompt_text(body));
     let output = backend
         .generate_with_artifacts(
             request,
@@ -72638,7 +73023,7 @@ fn provider_engine_session_response_with_sampling_bounded(
                         let mut visible_chunk = chunk.clone();
                         visible_chunk.text = filtered.visible;
                         stream
-                            .on_token(visible_chunk, &filtered.hidden, prompt_tokens)
+                            .on_token(visible_chunk, &filtered.hidden, estimated_prompt_tokens)
                             .map_err(|err| {
                                 mayhem_engine::EngineError::InvalidConfig(format!(
                                     "provider live stream failed: {err:#}"
@@ -72694,6 +73079,7 @@ fn provider_engine_session_response_with_sampling_bounded(
     let reasoning_tokens = u64::from(output.usage.reasoning_tokens).min(completion_tokens);
     let vision_tokens = u64::from(output.usage.vision_tokens);
     let audio_tokens = u64::from(output.usage.audio_tokens);
+    let prompt_tokens = protocol_prompt_tokens.unwrap_or(estimated_prompt_tokens);
     let billed_prompt_tokens = prompt_tokens
         .saturating_add(vision_tokens)
         .saturating_add(audio_tokens);
@@ -73626,6 +74012,9 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
     request.messages = messages.clone();
     request.media = provider_engine_media_inputs(&messages);
     request.tools = template_tools;
+    request.parallel_tool_calls = tool_request
+        .as_ref()
+        .map(|tool_request| tool_request.parallel);
     request.speciality_parameters = speciality_parameters;
     if let Some(max_tokens) = provider_requested_max_output_tokens(body) {
         request.max_new_tokens = u32::try_from(max_tokens)
@@ -76707,6 +77096,7 @@ mod tests {
     }
 
     struct FakeEngineBackend {
+        backend_id: &'static str,
         output: mayhem_engine::GenerateOutput,
         embedding_output: mayhem_engine::EmbeddingOutput,
         transcription_output: mayhem_engine::AudioTranscriptionOutput,
@@ -76812,6 +77202,7 @@ mod tests {
     impl FakeEngineBackend {
         fn new(text: &str) -> Self {
             Self {
+                backend_id: "fake",
                 output: mayhem_engine::GenerateOutput {
                     text: text.to_owned(),
                     usage: mayhem_engine::UsageCounters::new(4, 2),
@@ -76867,6 +77258,11 @@ mod tests {
             }
         }
 
+        fn with_backend_id(mut self, backend_id: &'static str) -> Self {
+            self.backend_id = backend_id;
+            self
+        }
+
         fn with_artifact_chunks(mut self, artifact_chunks: Vec<ArtifactChunk>) -> Self {
             self.artifact_chunks = artifact_chunks;
             self
@@ -76899,7 +77295,7 @@ mod tests {
 
     impl EngineBackend for FakeEngineBackend {
         fn backend_id(&self) -> &'static str {
-            "fake"
+            self.backend_id
         }
 
         fn load(
@@ -88892,6 +89288,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             panic!("expected OpenAI tool_calls JSON schema grammar");
         };
         assert_eq!(schema["properties"]["tool_calls"]["maxItems"], 1);
+        assert_eq!(request.parallel_tool_calls, Some(false));
         assert!(
             !provider_engine_tool_request(&body, &adapter)
                 .unwrap()
@@ -90283,6 +90680,124 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .contains("user: Reply only: transport observer passed"));
         assert_eq!(request.max_new_tokens, 8);
         assert!(request.grammar.is_none());
+    }
+
+    #[test]
+    fn tools_only_receipt_bills_buyer_verifiable_normalized_prompt_units() {
+        let mut adapter = catalog::CatalogAdapter {
+            tool_call_strategy: "mayhem_json".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let mut tools_only_contract =
+            catalog::endpoint_contract_template(mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS)
+                .unwrap();
+        tools_only_contract
+            .required_request_attributes
+            .push("tools".to_owned());
+        tools_only_contract
+            .request_attribute_specs
+            .get_mut("tools")
+            .unwrap()
+            .min_items = Some(1);
+        adapter.endpoint_families = vec![tools_only_contract];
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": "Find the weather in Berlin."
+            }],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Return current weather observations for a city, country, unit system, and reporting station.",
+                        "parameters": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["city", "country", "units"],
+                            "properties": {
+                                "city": { "type": "string", "minLength": 1, "maxLength": 128 },
+                                "country": { "type": "string", "pattern": "^[A-Z]{2}$" },
+                                "units": { "type": "string", "enum": ["metric", "imperial"] },
+                                "station": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "id": { "type": "string" },
+                                        "maximum_age_minutes": { "type": "integer", "minimum": 0, "maximum": 1440 }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "search_forecast_archive",
+                        "description": "Search archived forecasts using a deliberately substantial schema.",
+                        "parameters": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": ["query"],
+                            "properties": {
+                                "query": { "type": "string" },
+                                "years": {
+                                    "type": "array",
+                                    "items": { "type": "integer", "minimum": 1900, "maximum": 2100 },
+                                    "maxItems": 25
+                                }
+                            }
+                        }
+                    }
+                }
+            ],
+            "tool_choice": "required",
+            "parallel_tool_calls": true,
+            "max_tokens": 64
+        });
+        let sealed = provider_test_seal_contract_request(&body, &adapter).unwrap();
+        let verified = provider_verify_endpoint_request(&sealed, None, &adapter).unwrap();
+        let protocol_prompt_tokens =
+            provider_protocol_prompt_tokens(verified.contract, verified.request)
+                .unwrap()
+                .unwrap();
+        let mut needle = FakeEngineBackend::new(
+            r#"{"tool":"get_weather","arguments":{"city":"Berlin","country":"DE","units":"metric"}}"#,
+        )
+        .with_backend_id("needle");
+        needle.output.usage = mayhem_engine::UsageCounters::new(1, 9);
+
+        let output = provider_engine_session_response(&mut needle, &adapter, &body, None).unwrap();
+        assert_eq!(output.prompt_tokens, protocol_prompt_tokens);
+        assert_eq!(output.usage.input_tokens(), protocol_prompt_tokens);
+
+        let terms = test_provider_session_terms();
+        let active = test_active_provider_session(&terms, vec!["text".to_owned()]);
+        let receipt = provider_session_receipt(
+            &terms,
+            &active,
+            &body,
+            &output,
+            &RuntimeKeypair::from_seed([9; 32]),
+        )
+        .unwrap();
+        assert_eq!(receipt.body.usage.input_tokens(), protocol_prompt_tokens);
+
+        let ordinary_adapter = catalog::CatalogAdapter {
+            tool_call_strategy: "mayhem_json".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let estimated = rough_text_tokens(&provider_session_prompt_text(&body));
+        let mut ordinary = FakeEngineBackend::new(
+            r#"{"tool":"get_weather","arguments":{"city":"Berlin","country":"DE","units":"metric"}}"#,
+        );
+        ordinary.output.usage = mayhem_engine::UsageCounters::new(1, 9);
+        let ordinary_output =
+            provider_engine_session_response(&mut ordinary, &ordinary_adapter, &body, None)
+                .unwrap();
+        assert_eq!(ordinary_output.prompt_tokens, estimated);
+        assert_eq!(ordinary_output.usage.input_tokens(), estimated);
     }
 
     #[test]
@@ -92095,6 +92610,116 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             mlx_model_cache_dir(&paths.primary, "mlx-2bit", &relocated),
             "signed layout paths must participate in the materialized-cache identity"
         );
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn needle_materialization_preserves_exact_pinned_eight_file_layout() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        let mut artifact = catalog
+            .models
+            .remove(0)
+            .artifacts
+            .remove("gguf-q4_k_m")
+            .unwrap();
+        artifact.engine = "needle-cpu".to_owned();
+        artifact.source = catalog::SourceRef {
+            kind: "huggingface".to_owned(),
+            repo: NEEDLE_MODEL_REPO.to_owned(),
+            revision: mayhem_engine::NEEDLE_MODEL_REVISION.to_owned(),
+            publisher_key: None,
+        };
+        artifact.upstream_source = None;
+        artifact.path = NEEDLE_PRIMARY_PATH.to_owned();
+        artifact.artifact_root = "11".repeat(32);
+        artifact.sidecars.clear();
+
+        let temp = test_temp_dir("mayhem-needle-layout");
+        let cache = temp.join("cache");
+        let primary = temp.join("downloaded-primary");
+        fs::write(&primary, b"needle-primary").unwrap();
+        artifact.weights_bytes = fs::metadata(&primary).unwrap().len();
+        artifact.source_sha256 = Some(file_sha256_hex(&primary).unwrap());
+
+        let mut sidecar_paths = BTreeMap::new();
+        for (index, (name, path, repo, revision)) in NEEDLE_REQUIRED_SIDECARS.iter().enumerate() {
+            let local = temp.join(format!("downloaded-sidecar-{index}"));
+            fs::write(&local, format!("needle-sidecar-{index}")).unwrap();
+            artifact.sidecars.insert(
+                (*name).to_owned(),
+                catalog::CatalogArtifactSidecar {
+                    source: catalog::SourceRef {
+                        kind: "huggingface".to_owned(),
+                        repo: (*repo).to_owned(),
+                        revision: (*revision).to_owned(),
+                        publisher_key: None,
+                    },
+                    upstream_source: None,
+                    path: (*path).to_owned(),
+                    artifact_root: format!("{:064x}", index + 2),
+                    artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                    weights_bytes: fs::metadata(&local).unwrap().len(),
+                    source_sha256: file_sha256_hex(&local).unwrap(),
+                },
+            );
+            sidecar_paths.insert((*name).to_owned(), local);
+        }
+        let paths = ProviderArtifactPaths {
+            primary,
+            sidecars: sidecar_paths,
+        };
+
+        let materialized = materialize_needle_layout(
+            "cactus-compute/needle@cpu",
+            "transformers-bf16-cpu",
+            &artifact,
+            &paths,
+            &cache,
+        )
+        .unwrap();
+        let model_root = materialized.parent().expect("Needle model root");
+        assert_eq!(
+            materialized.file_name().and_then(OsStr::to_str),
+            Some(NEEDLE_PRIMARY_PATH)
+        );
+        assert_eq!(fs::read(&materialized).unwrap(), b"needle-primary");
+        for (index, (_, path, _, _)) in NEEDLE_REQUIRED_SIDECARS.iter().enumerate() {
+            assert_eq!(
+                fs::read(model_root.join(path)).unwrap(),
+                format!("needle-sidecar-{index}").as_bytes()
+            );
+        }
+        assert_eq!(fs::read_dir(model_root).unwrap().count(), 8);
+
+        let mut mirrored = artifact.clone();
+        mirrored.upstream_source = Some(mirrored.source.clone());
+        mirrored.source.repo = "TracNetwork/needle-release".to_owned();
+        mirrored.source.revision = "a".repeat(40);
+        for sidecar in mirrored.sidecars.values_mut() {
+            sidecar.upstream_source = Some(sidecar.source.clone());
+            sidecar.source = mirrored.source.clone();
+        }
+        materialize_needle_layout(
+            "cactus-compute/needle@cpu-mirror",
+            "transformers-bf16-cpu",
+            &mirrored,
+            &paths,
+            &cache,
+        )
+        .expect("admin mirror with exact canonical upstream provenance");
+
+        let mut mutable_revision = artifact.clone();
+        mutable_revision.source.revision = "main".to_owned();
+        let error = materialize_needle_layout(
+            "cactus-compute/needle@cpu",
+            "transformers-bf16-cpu",
+            &mutable_revision,
+            &paths,
+            &cache,
+        )
+        .expect_err("mutable Needle source must fail closed");
+        assert!(format!("{error:#}").contains(mayhem_engine::NEEDLE_MODEL_REVISION));
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -96914,6 +97539,69 @@ State initialization...
             result.prompt_ids,
             vec!["profile-default", "profile-low", "profile-high"]
         );
+    }
+
+    #[test]
+    fn canary_sampling_range_does_not_invent_alternates_for_fixed_controls() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        let model = &mut catalog.models[0];
+        model.sampling = catalog::CatalogSamplingProfile {
+            temperature: Some(0.0),
+            top_p: Some(1.0),
+            top_k: Some(0),
+            min_p: Some(0.0),
+            repeat_penalty: Some(1.0),
+            frequency_penalty: Some(0.0),
+            presence_penalty: Some(0.0),
+        };
+        for contract in &mut model.adapter.endpoint_families {
+            let top_k = contract
+                .request_attribute_specs
+                .get_mut("top_k")
+                .expect("top_k spec");
+            top_k.minimum = Some(0.0);
+            top_k.maximum = Some(1.0);
+            top_k.calibration_values = vec![json!(0), json!(1)];
+            let min_p = contract
+                .request_attribute_specs
+                .get_mut("min_p")
+                .expect("min_p spec");
+            min_p.minimum = Some(0.0);
+            min_p.maximum = Some(0.0);
+            min_p.calibration_values = vec![json!(0.0)];
+        }
+        let prompts = serde_json::from_value::<Vec<CanaryPrompt>>(json!([
+            {
+                "id": "fixed-default",
+                "messages": [{"role": "user", "content": "default"}],
+                "temperature": 0,
+                "top_p": 1,
+                "top_k": 0,
+                "min_p": 0,
+                "seed": 7
+            },
+            {
+                "id": "top-k-one",
+                "messages": [{"role": "user", "content": "alternate"}],
+                "temperature": 0,
+                "top_p": 1,
+                "top_k": 1,
+                "min_p": 0,
+                "seed": 8
+            }
+        ]))
+        .expect("canary prompts");
+
+        assert!(validate_canary_sampling_range(model, &prompts).is_ok());
+        for contract in &mut model.adapter.endpoint_families {
+            contract
+                .request_attribute_specs
+                .get_mut("min_p")
+                .expect("min_p spec")
+                .maximum = Some(0.1);
+        }
+        let error = validate_canary_sampling_range(model, &prompts).unwrap_err();
+        assert!(error.contains("client-set min_p probe"), "{error}");
     }
 
     #[test]

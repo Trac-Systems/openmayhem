@@ -15,14 +15,16 @@ routes, and revisions. Never copy an enclave ID or price from documentation:
 mayhem models --gateway
 ```
 
-## v0.2.48 runtime status
+## v0.2.54 runtime status
 
-The `0.2.48` application release keeps contract version 16 and does not change
-the signed catalog, enclave IDs, rooms, prices, provider identities, or the
-canonical indexer store. It adds the managed Linux/aarch64 CUDA 13 Chatterbox
-runtime, Linux llama.cpp acceleration selection, platform-aware Sulphur
-artifact admission, early Sulphur media-tool capability checks, and the
-audio/music receipt-duration correction described below.
+The `0.2.54` source release adds the canonical Needle CPU/CUDA tools-only
+runtime. Needle has exactly two markets: `needle-cpu` across Linux, Windows
+x86_64, and Apple Silicon macOS, and CUDA-only `needle-gpu` on supported
+Linux aarch64/x86_64 and Windows x86_64 hosts. Apple Metal/MPS is not eligible for the GPU market. The release
+also carries the managed Linux/aarch64 CUDA 13 Chatterbox runtime, Linux
+llama.cpp acceleration selection, platform-aware Sulphur artifact admission,
+early Sulphur media-tool capability checks, and the audio/music
+receipt-duration correction described below.
 
 The restored sponsored Chatterbox endpoint has completed a real request.
 ACE-Step remains pending its final corrected-binary live request. The
@@ -123,6 +125,7 @@ installation. Full transitive hashes remain in the linked lockfiles.
 | Sulphur CUDA | `diffusers 0.39.0`, `torch 2.9.1`, `torchvision 0.24.1`, `transformers 4.57.6`, `tokenizers 0.22.2`, `accelerate 1.12.0`, `bitsandbytes 0.49.1`, `peft 0.18.1`, `safetensors 0.8.0`, `gguf 0.19.0`, `huggingface-hub 0.36.0`, `av 16.1.0`, `numpy 2.2.6`, `Pillow 12.1.0`, `tqdm 4.67.1`; CUDA 13.0 wheel family |
 | Sulphur MLX | Embedded LTX core/pipelines `0.14.19` from revision `e1838a855bfd1640135c424c96cb27a0c0ad150e`; `mlx`, `mlx-lm`, and `mlx-metal 0.31.1`, `transformers 5.3.0`, `tokenizers 0.22.2`, `safetensors 0.7.0`, `numpy 2.4.3`, `Pillow 12.1.1` |
 | Chatterbox | Python 3.11; `chatterbox-tts 0.1.7`, `conformer 0.3.2`, `diffusers 0.29.0`, `gradio 6.8.0`, `librosa 0.11.0`, `numpy 1.26.4`, `omegaconf 2.3.0`, `pykakasi 2.3.0`, `pyloudnorm 0.2.0`, Perth revision `ce86c49d029f42272c1902eccb675556b9ed2330`, `s3tokenizer 0.3.0`, `safetensors 0.5.3`, `spacy-pkuseg 1.0.1`, `transformers 5.2.0`; CPU/MPS and x86 CUDA retain their frozen platform flavors, while Linux/aarch64 CUDA uses `torch 2.9.1+cu130`, `torchaudio 2.9.1`, and CUDA 13.0 from its separate hash-pinned lock |
+| Needle | Model `Cactus-Compute/needle@5f89b4307696d669c3df1d38ae057e6e1728b107`; runtime source `Cactus-Compute/needle-hf@ffd0d081401257fee31150d30c494b2f98910fc0`; exact hash-pinned release locks are split by CPU and CUDA platform. Apple MPS is measured but intentionally not market-eligible. |
 
 The authoritative full locks are
 [`python_runtime.rs`](crates/mayhem-cli/src/python_runtime.rs),
@@ -146,6 +149,7 @@ executable version is not release-pinned, so this document does not invent one.
 | `SulphurAI/Sulphur-2-base` | Video generation | CUDA GGUF composition or MLX Q4 | Tier 1; use highest proved tier | 64 GiB | See measured guidance | 40.66 GiB CUDA / 44.32 GiB MLX |
 | `ResembleAI/chatterbox` | Text to speech | PyTorch safetensors | Tier 1; use highest proved tier | 8 GiB | 6 GiB | 3,191,966,992 B (2.97 GiB) |
 | `huihui-ai/Huihui-Agents-A1-abliterated` | Text generation | llama.cpp Q4_K GGUF | Tier 1; use highest proved tier | 32 GiB | 32 GiB | 22,069,579,360 B (20.55 GiB) |
+| `Cactus-Compute/needle` | Deterministic tool selection | `needle-cpu` or CUDA-only `needle-gpu` | Tier 1; use highest proved tier | Managed preflight | See measured guidance | 30.4M parameters |
 
 The RAM and full-offload columns are catalog admission/guidance fields. Model
 weights, runtime environments, caches, outputs, and build artifacts require
@@ -612,6 +616,52 @@ mayhem up --provider --provider-enclave huihui-ai/Huihui-Agents-A1-abliterated -
 
 The BF16 projector is mandatory. Do not advertise unsupported effort levels or
 replace the signed projector.
+
+## Cactus Compute Needle
+
+**Selector and source**
+
+- Model: `Cactus-Compute/needle`
+- Canonical markets: exactly `needle-cpu` and `needle-gpu`
+- Model pin:
+  `Cactus-Compute/needle@5f89b4307696d669c3df1d38ae057e6e1728b107`
+- Runtime source pin:
+  `Cactus-Compute/needle-hf@ffd0d081401257fee31150d30c494b2f98910fc0`
+- Parameter count: 30.4M
+
+**Hard requirements and surface**
+
+- Needle is deterministic and tools-only. It accepts 1 through 10 tools and
+  does not advertise ordinary prose generation.
+- The combined context ceiling is 1,024 tokens; the decoder ceiling is 512
+  tokens.
+- Endpoints: OpenAI chat completions and responses.
+- `needle-cpu` supports Linux, Windows x86_64, and Apple Silicon macOS.
+- `needle-gpu` is CUDA-only on Linux aarch64/x86_64 and Windows x86_64
+  hosts. Apple Metal/MPS is intentionally not eligible and does not create a
+  third market.
+
+**Measured guidance**
+
+- Apple MPS decode: about 2.5 tok/s cold and 10.7 tok/s warm.
+- Apple CPU decode: about 260-277 tok/s.
+- `.70` CUDA decode: about 89.7 tok/s cold and 166 tok/s warm.
+- Windows CPU decode: about 122-149 tok/s.
+- `.70` CPU decode: about 64-78 tok/s.
+
+Apple CPU materially outperformed MPS in the measured proof, so providers on
+Apple Silicon use `needle-cpu`.
+
+**Start**
+
+```bash
+mayhem doctor --provider-backend needle-cpu
+mayhem up --provider --provider-enclave Cactus-Compute/needle --yes
+```
+
+On a supported NVIDIA host, use
+`mayhem doctor --provider-backend needle-gpu` before the same managed start.
+Do not map MPS to `needle-gpu` or add a third canonical market.
 
 ## Verification and troubleshooting
 

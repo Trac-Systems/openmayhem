@@ -24,6 +24,7 @@ pub const MTMD_MEDIA_MARKER: &str = "<__media__>";
 #[cfg(any(
     feature = "ace-step",
     feature = "chatterbox",
+    feature = "needle",
     feature = "sulphur",
     feature = "mlx",
     feature = "vllm",
@@ -70,6 +71,8 @@ pub enum EngineError {
     AceStep(String),
     #[error("Chatterbox backend error: {0}")]
     Chatterbox(String),
+    #[error("Needle backend error: {0}")]
+    Needle(String),
     #[error("Sulphur backend error: {0}")]
     Sulphur(String),
     #[error("stable-diffusion.cpp backend error: {0}")]
@@ -628,6 +631,8 @@ pub struct GenerateRequest {
     pub messages: Vec<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<MediaInput>,
     #[serde(default = "default_max_new_tokens")]
@@ -821,6 +826,7 @@ impl GenerateRequest {
             prompt: prompt.into(),
             messages: Vec::new(),
             tools: Vec::new(),
+            parallel_tool_calls: None,
             media: Vec::new(),
             max_new_tokens: default_max_new_tokens(),
             grammar: None,
@@ -2335,6 +2341,15 @@ pub use chatterbox_backend::{
     ChatterboxBackend, ChatterboxExecutionConfig, ChatterboxReferenceAudio,
     ChatterboxSpeechRequest, CHATTERBOX_MODEL_REVISION, CHATTERBOX_PERTH_COMMIT,
     CHATTERBOX_SOURCE_COMMIT,
+};
+
+#[cfg(feature = "needle")]
+mod needle_backend;
+
+#[cfg(feature = "needle")]
+pub use needle_backend::{
+    NeedleBackend, NeedleExecutionConfig, NeedleGenerationMetrics, NEEDLE_MODEL_REVISION,
+    NEEDLE_SOURCE_COMMIT,
 };
 
 #[cfg(feature = "sulphur")]

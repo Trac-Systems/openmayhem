@@ -1,0 +1,28 @@
+[project]
+name = "openmayhem-needle-runtime-cuda130-arm64"
+version = "0.0.0"
+requires-python = "==3.11.*"
+dependencies = [
+    "numpy==1.26.4",
+    "safetensors==0.5.3",
+    "sentencepiece==0.2.1",
+    "torch==2.9.1+cu130",
+    "transformers==5.2.0",
+]
+
+[tool.uv]
+package = false
+override-dependencies = [
+    "torch==2.9.1+cu130",
+]
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

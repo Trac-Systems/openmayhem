@@ -89,13 +89,14 @@ use mayhem_attestation::{
 use mayhem_bridge::{sc_bridge_session_transport, BridgeError, ScBridgeClient, ScBridgeConfig};
 use mayhem_proto::{
     artifact_generation_inline_audio_load, ctx_bracket_for_tokens_in_schedule,
-    default_ctx_bracket_schedule, default_model_class, metered_output_units, payload_chunk_at,
-    payload_chunk_manifest, receipt_signing_bytes, session_accept_signing_bytes,
-    session_frame_head, spend_voucher_signing_bytes, stable_json_bytes,
-    validate_transcription_result, validated_audio_metadata, validated_wav_audio_metadata,
-    AdminAttestationPolicy, AdminEnclaveAttestationBinding, AttestationReport,
-    AttestationTrustDataRef, AttestationVerifierProfile, CheckpointPolicy, CtxBracketSchedule,
-    EndpointFamilyContract, EndpointValueType, HardwareQuoteKind, HardwareQuoteRouteAdvertisement,
+    default_ctx_bracket_schedule, default_model_class, metered_output_units,
+    normalized_request_prompt_units, payload_chunk_at, payload_chunk_manifest,
+    receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
+    spend_voucher_signing_bytes, stable_json_bytes, validate_transcription_result,
+    validated_audio_metadata, validated_wav_audio_metadata, AdminAttestationPolicy,
+    AdminEnclaveAttestationBinding, AttestationReport, AttestationTrustDataRef,
+    AttestationVerifierProfile, CheckpointPolicy, CtxBracketSchedule, EndpointFamilyContract,
+    EndpointValueType, HardwareQuoteKind, HardwareQuoteRouteAdvertisement,
     HardwareQuoteRoutePolicyBinding, ModelSpecialityDescriptor, MoneyAu, PayloadChunk,
     PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
     SessionReceipt, SpendVoucher, SpendVoucherBody, TpmActivateCredentialChallengeFrame,
@@ -14543,6 +14544,79 @@ fn direct_chat_contract_request(request: &ChatCompletionRequest, transport_body:
         .unwrap_or_else(|| direct_session_contract_request(transport_body))
 }
 
+fn signed_tools_only_chat_contract<'a>(
+    model: &'a GatewayModel,
+    request: &ChatCompletionRequest,
+) -> Option<&'a EndpointFamilyContract> {
+    model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == direct_chat_endpoint_family(request))
+        .filter(|contract| {
+            contract
+                .required_request_attributes
+                .iter()
+                .any(|attribute| attribute == "tools")
+                && contract
+                    .request_attribute_specs
+                    .get("tools")
+                    .and_then(|spec| spec.min_items)
+                    .is_some_and(|min_items| min_items > 0)
+        })
+}
+
+fn tools_only_prompt_token_units(
+    model: &GatewayModel,
+    request: &ChatCompletionRequest,
+    served_ctx: u32,
+) -> Result<Option<u64>, GatewaySessionError> {
+    if signed_tools_only_chat_contract(model, request).is_none() {
+        return Ok(None);
+    }
+    let transport_body = direct_session_request_body(request);
+    let normalized_request = direct_chat_contract_request(request, &transport_body);
+    let has_tools = normalized_request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    if !has_tools {
+        return Err(GatewaySessionError::new(
+            "signed tools-only endpoint requires at least one normalized tool",
+        ));
+    }
+    let prompt_units = normalized_request_prompt_units(&normalized_request).map_err(|err| {
+        GatewaySessionError::new(format!(
+            "failed to meter normalized tools-only request: {err}"
+        ))
+    })?;
+    if prompt_units == 0 {
+        return Err(GatewaySessionError::new(
+            "normalized tools-only request produced zero prompt units",
+        ));
+    }
+    if prompt_units > u64::from(served_ctx) {
+        return Err(GatewaySessionError::new(format!(
+            "normalized tools-only request requires {prompt_units} prompt units, exceeding served context {served_ctx}"
+        )));
+    }
+    Ok(Some(prompt_units))
+}
+
+fn verified_tools_only_prompt_tokens(
+    provider_usage: &ReceiptUsage,
+    expected: u64,
+) -> Result<u64, GatewaySessionError> {
+    let prompt_tokens = provider_usage.prompt_tokens();
+    if prompt_tokens != expected {
+        return Err(GatewaySessionError::new(format!(
+            "tools-only provider receipt prompt usage {prompt_tokens} does not match buyer-derived normalized request usage {expected}"
+        )));
+    }
+    Ok(prompt_tokens)
+}
+
 fn direct_session_contract_request(transport_body: &Value) -> Value {
     let mut request = transport_body.clone();
     if let Some(object) = request.as_object_mut() {
@@ -16030,11 +16104,15 @@ async fn collect_direct_session_output(
             "provider claimed audio tokens for a request without audio input",
         ));
     }
-    usage.prompt_tokens = usage
-        .prompt_tokens
-        .saturating_add(vision_tokens)
-        .saturating_add(audio_tokens);
-    usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
+    reconcile_final_chat_prompt_usage(
+        model,
+        request,
+        invocation,
+        &final_receipt.body.usage,
+        &mut usage,
+        vision_tokens,
+        audio_tokens,
+    )?;
     if let Some(claimed) = claimed_usage {
         if claimed != usage {
             return Err(GatewaySessionError::new(format!(
@@ -16095,6 +16173,30 @@ fn observed_chat_usage(
         completion_tokens,
         total_tokens: prompt_tokens + completion_tokens,
     }
+}
+
+fn reconcile_final_chat_prompt_usage(
+    model: &GatewayModel,
+    request: &ChatCompletionRequest,
+    invocation: &GatewaySessionInvocation,
+    provider_usage: &ReceiptUsage,
+    usage: &mut Usage,
+    vision_tokens: u64,
+    audio_tokens: u64,
+) -> Result<(), GatewaySessionError> {
+    if let Some(expected_prompt_tokens) =
+        tools_only_prompt_token_units(model, request, invocation.served_ctx)?
+    {
+        usage.prompt_tokens =
+            verified_tools_only_prompt_tokens(provider_usage, expected_prompt_tokens)?;
+    } else {
+        usage.prompt_tokens = usage
+            .prompt_tokens
+            .saturating_add(vision_tokens)
+            .saturating_add(audio_tokens);
+    }
+    usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
+    Ok(())
 }
 
 async fn collect_direct_session_embedding_output(
@@ -17108,8 +17210,9 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
 ) -> Result<Option<Value>, GatewaySessionError> {
     let observed = observed_chat_usage(request, content, reasoning_evidence, &tool_calls);
     let observed_usage = expected_chat_usage_for_invocation(
+        model,
         request,
-        None,
+        Some(&receipt.body.usage),
         observed.prompt_tokens,
         observed.completion_tokens,
         &invocation.spend_voucher.body.locked_rate_map,
@@ -17531,6 +17634,7 @@ fn direct_session_receipt_ack(
         ));
     }
     let usage = expected_chat_usage_for_invocation(
+        model,
         request,
         Some(&provider_receipt.body.usage),
         output.usage.prompt_tokens,
@@ -17874,6 +17978,7 @@ fn direct_session_partial_receipt_ack(
     }
     let body = &partial.provider_receipt.body;
     let usage = expected_chat_usage_for_invocation(
+        model,
         request,
         Some(&partial.provider_receipt.body.usage),
         partial.output.usage.prompt_tokens,
@@ -18101,7 +18206,28 @@ fn expected_text_usage_for_provider(
     observed_prompt_tokens: u64,
     observed_completion_tokens: u64,
     locked_rate_map: &[RateMapEntry],
+    protocol_prompt_tokens: Option<u64>,
 ) -> Result<ReceiptUsage, GatewaySessionError> {
+    if let (Some(provider_usage), Some(expected_prompt_tokens)) =
+        (provider_usage, protocol_prompt_tokens)
+    {
+        verified_tools_only_prompt_tokens(provider_usage, expected_prompt_tokens)?;
+        if provider_usage.output_tokens() != observed_completion_tokens {
+            return Err(GatewaySessionError::new(
+                "tools-only provider receipt output usage mismatch",
+            ));
+        }
+        if provider_usage.cached_input_tokens() > 0
+            && !locked_rate_map
+                .iter()
+                .any(|entry| entry.unit == USAGE_CACHED_INPUT_TOKEN)
+        {
+            return Err(GatewaySessionError::new(
+                "provider receipt claimed cached input but locked rate_map lacks cached_input_token",
+            ));
+        }
+        return Ok(provider_usage.clone());
+    }
     let Some(provider_usage) = provider_usage else {
         return Ok(ReceiptUsage::text(
             observed_prompt_tokens,
@@ -18141,12 +18267,14 @@ fn expected_chat_usage_for_provider(
     observed_prompt_tokens: u64,
     observed_completion_tokens: u64,
     locked_rate_map: &[RateMapEntry],
+    protocol_prompt_tokens: Option<u64>,
 ) -> Result<ReceiptUsage, GatewaySessionError> {
     let text = expected_text_usage_for_provider(
         provider_usage,
         observed_prompt_tokens,
         observed_completion_tokens,
         locked_rate_map,
+        protocol_prompt_tokens,
     )?;
     chat_media_stats(&request.messages, &GatewayMediaLimits::schema_ceiling())
         .map_err(|err| GatewaySessionError::new(err.message))?;
@@ -18170,6 +18298,7 @@ fn expected_chat_usage_for_provider(
 }
 
 fn expected_chat_usage_for_invocation(
+    model: &GatewayModel,
     request: &ChatCompletionRequest,
     provider_usage: Option<&ReceiptUsage>,
     observed_prompt_tokens: u64,
@@ -18177,6 +18306,8 @@ fn expected_chat_usage_for_invocation(
     locked_rate_map: &[RateMapEntry],
     invocation: &GatewaySessionInvocation,
 ) -> Result<ReceiptUsage, GatewaySessionError> {
+    let protocol_prompt_tokens =
+        tools_only_prompt_token_units(model, request, invocation.served_ctx)?;
     let prior_usage = &invocation.spend_voucher.body.billing_prior_usage;
     let prior_au_owed_cum = invocation.spend_voucher.body.billing_prior_au_owed_cum;
     if prior_au_owed_cum == 0 && prior_usage != &ReceiptUsage::default() {
@@ -18200,6 +18331,7 @@ fn expected_chat_usage_for_invocation(
         observed_prompt_tokens,
         observed_completion_tokens,
         locked_rate_map,
+        protocol_prompt_tokens,
     )?;
     let increment = if prior_au_owed_cum == 0 {
         local_usage
@@ -21421,11 +21553,15 @@ async fn run_live_direct_chat_sse_inner(
             "provider claimed audio tokens for a request without audio input",
         ));
     }
-    usage.prompt_tokens = usage
-        .prompt_tokens
-        .saturating_add(vision_tokens)
-        .saturating_add(audio_tokens);
-    usage.total_tokens = usage.prompt_tokens.saturating_add(usage.completion_tokens);
+    reconcile_final_chat_prompt_usage(
+        &session.model,
+        &session.request,
+        &session.invocation,
+        &final_receipt.body.usage,
+        &mut usage,
+        vision_tokens,
+        audio_tokens,
+    )?;
     if let Some(claimed) = claimed_usage {
         if claimed != usage {
             return Err(GatewaySessionError::new(format!(
@@ -27832,7 +27968,10 @@ impl GatewayState {
             .map(|candidate| self.session_attestation_for_route(model, candidate))
             .transpose()?;
         let served_ctx = self.served_ctx_for_route(model, route);
-        let max_spend_au = estimate_max_spend_au(price, request, served_ctx, &billing);
+        let protocol_prompt_tokens = tools_only_prompt_token_units(model, request, served_ctx)
+            .map_err(|err| ApiError::bad_request(err.message, Some("tools")))?;
+        let max_spend_au =
+            estimate_max_spend_au(price, request, served_ctx, &billing, protocol_prompt_tokens);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
         let spend_reservation =
             self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
@@ -28449,6 +28588,7 @@ impl GatewayState {
         let receipt = if let Some(provider_receipt) = provider_receipt {
             let seq = provider_receipt.body.seq;
             let usage = expected_chat_usage_for_invocation(
+                model,
                 request,
                 Some(&provider_receipt.body.usage),
                 output.usage.prompt_tokens,
@@ -28479,6 +28619,7 @@ impl GatewayState {
             )?
         } else {
             let usage = expected_chat_usage_for_invocation(
+                model,
                 request,
                 None,
                 output.usage.prompt_tokens,
@@ -28875,6 +29016,7 @@ impl GatewayState {
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
         let body = &partial.provider_receipt.body;
         let usage = expected_chat_usage_for_invocation(
+            model,
             request,
             Some(&partial.provider_receipt.body.usage),
             partial.output.usage.prompt_tokens,
@@ -31865,8 +32007,10 @@ fn estimate_max_spend_au(
     request: &ChatCompletionRequest,
     served_ctx: u32,
     billing: &GatewayBillingContext,
+    protocol_prompt_tokens: Option<u64>,
 ) -> MoneyAu {
     let served_ctx = u64::from(served_ctx).max(1);
+    let max_input_tokens = protocol_prompt_tokens.unwrap_or(served_ctx).min(served_ctx);
     let max_output_tokens = request
         .max_tokens
         .max(request.max_completion_tokens)
@@ -31876,7 +32020,7 @@ fn estimate_max_spend_au(
         .min(served_ctx)
         .saturating_mul(MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN);
     let usage = if billing.prior_au_owed_cum == 0 {
-        ReceiptUsage::text(served_ctx, max_visible_output_units)
+        ReceiptUsage::text(max_input_tokens, max_visible_output_units)
     } else {
         billing
             .prior_usage
@@ -34784,6 +34928,226 @@ mod tests {
     }
 
     #[test]
+    fn tools_only_protocol_prompt_usage_covers_tool_schemas_in_all_receipts() {
+        let model = tools_only_test_model();
+        let request = tool_heavy_test_request(&model.id);
+        let invocation = test_invocation();
+        assert_eq!(
+            request
+                .endpoint_request
+                .as_ref()
+                .and_then(|value| value.get("parallel_tool_calls")),
+            Some(&json!(false))
+        );
+        let rough_prompt_tokens = rough_tokens(&chat_prompt_text(&request));
+        let protocol_prompt_tokens =
+            tools_only_prompt_token_units(&model, &request, invocation.served_ctx)
+                .unwrap()
+                .expect("tools-only protocol prompt usage");
+        assert!(protocol_prompt_tokens > rough_prompt_tokens);
+
+        let mut exact_output = test_chat_output();
+        exact_output.usage.prompt_tokens = protocol_prompt_tokens;
+        exact_output.usage.total_tokens =
+            protocol_prompt_tokens.saturating_add(exact_output.usage.completion_tokens);
+        let final_receipt = test_provider_receipt(&model, &request, &exact_output, &invocation);
+        let mut reconciled_usage = test_chat_output().usage;
+        reconcile_final_chat_prompt_usage(
+            &model,
+            &request,
+            &invocation,
+            &final_receipt.body.usage,
+            &mut reconciled_usage,
+            0,
+            0,
+        )
+        .expect("final output should expose protocol tools-only prompt usage");
+        assert_eq!(reconciled_usage.prompt_tokens, protocol_prompt_tokens);
+        direct_session_receipt_ack(
+            &request,
+            &exact_output,
+            &invocation,
+            &final_receipt,
+            invocation.provider_pubkey.as_deref().unwrap(),
+            &model,
+        )
+        .expect("tool-heavy protocol final prompt usage should be co-signed");
+
+        let checkpoint_receipt = test_provider_receipt_with_finality(
+            &model,
+            &request,
+            &exact_output,
+            &invocation,
+            1,
+            false,
+        );
+        let checkpoint = GatewaySessionPartial {
+            output: test_chat_output(),
+            provider_receipt: checkpoint_receipt,
+            token_ids: vec![1, 2, 3],
+            quality: None,
+            reason: "checkpoint".to_owned(),
+            redispatch_mode: RedispatchMode::FullMessageHistoryClientSide,
+        };
+        direct_session_partial_receipt_ack(
+            &request,
+            &invocation,
+            &checkpoint,
+            invocation.provider_pubkey.as_deref().unwrap(),
+            &model,
+        )
+        .expect("tool-heavy protocol checkpoint prompt usage should be co-signed");
+
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let prepared = state
+            .prepare_chat_invocation_for_route(
+                &model,
+                &request,
+                None,
+                &GatewayRequestOptions::default(),
+            )
+            .expect("tools-only request reservation");
+        let prepared_prompt_tokens =
+            tools_only_prompt_token_units(&model, &request, prepared.served_ctx)
+                .unwrap()
+                .expect("prepared tools-only protocol prompt usage");
+        let expected_max_spend = estimate_max_spend_au(
+            &model.mayhem.price_ref_au,
+            &request,
+            prepared.served_ctx,
+            &GatewayBillingContext::initial(prepared.session_id.clone()),
+            Some(prepared_prompt_tokens),
+        );
+        assert_eq!(prepared.spend_voucher.body.max_spend_au, expected_max_spend);
+    }
+
+    #[test]
+    fn tools_only_prompt_usage_must_match_buyer_derived_value_for_all_receipts() {
+        let model = tools_only_test_model();
+        let request = tool_heavy_test_request(&model.id);
+        let invocation = test_invocation();
+        let expected_prompt_tokens =
+            tools_only_prompt_token_units(&model, &request, invocation.served_ctx)
+                .unwrap()
+                .expect("tools-only protocol prompt usage");
+        let inflated_prompt_tokens = expected_prompt_tokens.saturating_add(1);
+        let mut inflated_output = test_chat_output();
+        inflated_output.usage.prompt_tokens = inflated_prompt_tokens;
+        inflated_output.usage.total_tokens =
+            inflated_prompt_tokens.saturating_add(inflated_output.usage.completion_tokens);
+
+        let final_receipt = test_provider_receipt(&model, &request, &inflated_output, &invocation);
+        let final_error = direct_session_receipt_ack(
+            &request,
+            &inflated_output,
+            &invocation,
+            &final_receipt,
+            invocation.provider_pubkey.as_deref().unwrap(),
+            &model,
+        )
+        .expect_err("provider-inflated final prompt usage must be rejected");
+        assert!(final_error.message.contains("buyer-derived"));
+
+        let checkpoint_receipt = test_provider_receipt_with_finality(
+            &model,
+            &request,
+            &inflated_output,
+            &invocation,
+            1,
+            false,
+        );
+        let checkpoint = GatewaySessionPartial {
+            output: test_chat_output(),
+            provider_receipt: checkpoint_receipt,
+            token_ids: vec![1, 2, 3],
+            quality: None,
+            reason: "checkpoint".to_owned(),
+            redispatch_mode: RedispatchMode::FullMessageHistoryClientSide,
+        };
+        let checkpoint_error = direct_session_partial_receipt_ack(
+            &request,
+            &invocation,
+            &checkpoint,
+            invocation.provider_pubkey.as_deref().unwrap(),
+            &model,
+        )
+        .expect_err("provider-inflated checkpoint prompt usage must be rejected");
+        assert!(checkpoint_error.message.contains("buyer-derived"));
+
+        let mut zero_output = test_chat_output();
+        zero_output.usage.prompt_tokens = 0;
+        zero_output.usage.total_tokens = zero_output.usage.completion_tokens;
+        let zero_receipt = test_provider_receipt(&model, &request, &zero_output, &invocation);
+        let zero_error = direct_session_receipt_ack(
+            &request,
+            &zero_output,
+            &invocation,
+            &zero_receipt,
+            invocation.provider_pubkey.as_deref().unwrap(),
+            &model,
+        )
+        .expect_err("zero provider prompt usage must be rejected");
+        assert!(zero_error.message.contains("buyer-derived"));
+
+        let mut voucher_limited_output = test_chat_output();
+        voucher_limited_output.usage.prompt_tokens = expected_prompt_tokens;
+        voucher_limited_output.usage.total_tokens =
+            expected_prompt_tokens.saturating_add(voucher_limited_output.usage.completion_tokens);
+        let mut voucher_limited_invocation = invocation.clone();
+        voucher_limited_invocation.spend_voucher.body.max_spend_au = 0;
+        let voucher_limited_receipt = test_provider_receipt(
+            &model,
+            &request,
+            &voucher_limited_output,
+            &voucher_limited_invocation,
+        );
+        let voucher_error = direct_session_receipt_ack(
+            &request,
+            &voucher_limited_output,
+            &voucher_limited_invocation,
+            &voucher_limited_receipt,
+            voucher_limited_invocation
+                .provider_pubkey
+                .as_deref()
+                .unwrap(),
+            &model,
+        )
+        .expect_err("protocol usage above the voucher must be rejected");
+        assert!(voucher_error.message.contains("spend voucher"));
+    }
+
+    #[test]
+    fn optional_tools_model_keeps_gateway_observed_prompt_metering() {
+        let model = test_model();
+        let mut request = tool_heavy_test_request(&model.id);
+        request.endpoint_request = None;
+        let invocation = test_invocation();
+        let output = test_chat_output();
+        let mut inflated_receipt = test_provider_receipt(&model, &request, &output, &invocation);
+        inflated_receipt.body.usage = ReceiptUsage::text(
+            output.usage.prompt_tokens.saturating_add(512),
+            output.usage.completion_tokens,
+        );
+        inflated_receipt.body.au_owed_cum =
+            calculate_locked_au_owed(&invocation, &inflated_receipt.body.usage);
+        inflated_receipt.enclave_sig = sign_hex(
+            &test_enclave_seed(),
+            &receipt_signing_bytes(&inflated_receipt.body).unwrap(),
+        );
+
+        let error = direct_session_receipt_ack(
+            &request,
+            &output,
+            &invocation,
+            &inflated_receipt,
+            invocation.provider_pubkey.as_deref().unwrap(),
+            &model,
+        )
+        .expect_err("optional-tools model must not trust provider prompt usage");
+        assert!(error.message.contains("usage"));
+    }
+
+    #[test]
     fn client_disconnect_uses_last_checkpoint_partial_without_redispatch_marker() {
         let model = test_model();
         let request = test_chat_request(&model.id);
@@ -35354,6 +35718,77 @@ mod tests {
                 route_candidates: Vec::new(),
             },
         }
+    }
+
+    fn tools_only_test_model() -> GatewayModel {
+        let mut model = test_model();
+        let mut contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+        )
+        .expect("OpenAI chat contract");
+        contract
+            .required_request_attributes
+            .push("tools".to_owned());
+        contract
+            .request_attribute_specs
+            .get_mut("tools")
+            .expect("tools request specification")
+            .min_items = Some(1);
+        model.mayhem.adapter.endpoint_families = vec![contract];
+        model
+    }
+
+    fn tool_heavy_test_request(model_id: &str) -> ChatCompletionRequest {
+        let mut request = test_chat_request(model_id);
+        request.tools = Some(
+            (0..8)
+                .map(|index| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": format!("catalog_lookup_{index}"),
+                            "description": format!(
+                                "Search a structured catalog while retaining exact schema usage. {}",
+                                "Detailed constraints and provenance. ".repeat(3)
+                            ),
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "query": {
+                                        "type": "string",
+                                        "description": "The complete catalog query."
+                                    },
+                                    "filters": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "field": { "type": "string" },
+                                                "operator": {
+                                                    "type": "string",
+                                                    "enum": ["eq", "contains", "starts_with"]
+                                                },
+                                                "value": { "type": "string" }
+                                            },
+                                            "required": ["field", "operator", "value"],
+                                            "additionalProperties": false
+                                        }
+                                    }
+                                },
+                                "required": ["query", "filters"],
+                                "additionalProperties": false
+                            }
+                        }
+                    })
+                })
+                .collect(),
+        );
+        request.tool_choice = Some(json!("required"));
+        request.parallel_tool_calls = Some(false);
+        request.endpoint_family = Some(mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS.to_owned());
+        let transport_body = direct_session_request_body(&request);
+        request.endpoint_request = Some(direct_session_contract_request(&transport_body));
+        request
     }
 
     #[test]
@@ -40932,6 +41367,7 @@ mod tests {
                     granularity: 1,
                 },
             ],
+            None,
         )
         .unwrap();
         assert_eq!(expected, provider_usage);
@@ -40948,6 +41384,7 @@ mod tests {
             requirements.input_tokens,
             2,
             &[],
+            None,
         )
         .unwrap_err()
         .message

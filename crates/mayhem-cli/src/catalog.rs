@@ -861,6 +861,7 @@ pub(crate) fn validate_catalog_attestation_authority_bytes(catalog_bytes: &[u8])
 }
 
 fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
+    let future_model = model_targets_newer_app(model);
     if model.model_id.trim().is_empty() {
         errors.push("model_id is required".to_owned());
     }
@@ -926,7 +927,14 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
         ));
     }
     for (name, artifact) in &model.artifacts {
-        validate_artifact(&model.model_id, &model.tier, name, artifact, errors);
+        validate_artifact_with_engine_policy(
+            &model.model_id,
+            &model.tier,
+            name,
+            artifact,
+            !future_model,
+            errors,
+        );
     }
     if model.caps.ctx_max == 0 {
         errors.push(format!("{} caps.ctx_max must be positive", model.model_id));
@@ -1005,6 +1013,20 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
         ));
     }
     validate_price_ref(model, errors);
+}
+
+fn model_targets_newer_app(model: &CatalogModel) -> bool {
+    let Some(required) = model
+        .min_app_version
+        .as_deref()
+        .and_then(|value| semver::Version::parse(value.trim()).ok())
+    else {
+        return false;
+    };
+    let Ok(installed) = semver::Version::parse(env!("CARGO_PKG_VERSION")) else {
+        return false;
+    };
+    required > installed
 }
 
 fn validate_chatterbox_endpoint_surface(model: &CatalogModel, errors: &mut Vec<String>) {
@@ -3434,7 +3456,24 @@ fn valid_endpoint_family(family: &str) -> bool {
 }
 
 fn required_endpoint_families(model: &CatalogModel) -> BTreeSet<&'static str> {
-    required_endpoint_family_names(&model.model_class, &model.adapter.modality_set)
+    let mut required =
+        required_endpoint_family_names(&model.model_class, &model.adapter.modality_set);
+    let tools_only = model.model_class == DEFAULT_MODEL_CLASS
+        && model.caps.tools
+        && model.adapter.endpoint_families.iter().any(|contract| {
+            matches!(
+                contract.family.as_str(),
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+            ) && contract
+                .required_request_attributes
+                .iter()
+                .any(|attribute| attribute == "tools")
+        });
+    if tools_only {
+        required.remove(mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS);
+    }
+    required
 }
 
 fn required_endpoint_family_names(
@@ -3559,20 +3598,35 @@ fn validate_artifact(
     artifact: &CatalogArtifact,
     errors: &mut Vec<String>,
 ) {
-    if !matches!(
-        artifact.engine.as_str(),
-        "llama.cpp"
-            | "mlx"
-            | "trt-llm"
-            | "vllm"
-            | "stable-diffusion.cpp"
-            | "ace-step"
-            | "chatterbox"
-            | "sulphur"
-            | "transformers-asr"
-            | "whisper.cpp"
-            | "piper"
-    ) {
+    validate_artifact_with_engine_policy(model_id, tier, name, artifact, true, errors);
+}
+
+fn validate_artifact_with_engine_policy(
+    model_id: &str,
+    tier: &str,
+    name: &str,
+    artifact: &CatalogArtifact,
+    require_known_engine: bool,
+    errors: &mut Vec<String>,
+) {
+    if require_known_engine
+        && !matches!(
+            artifact.engine.as_str(),
+            "llama.cpp"
+                | "mlx"
+                | "trt-llm"
+                | "vllm"
+                | "stable-diffusion.cpp"
+                | "ace-step"
+                | "chatterbox"
+                | "needle-cpu"
+                | "needle-gpu"
+                | "sulphur"
+                | "transformers-asr"
+                | "whisper.cpp"
+                | "piper"
+        )
+    {
         errors.push(format!(
             "{model_id}/{name} has unsupported engine {}",
             artifact.engine
@@ -3770,6 +3824,9 @@ fn validate_artifact(
                 ));
             }
         }
+    }
+    if matches!(artifact.engine.as_str(), "needle-cpu" | "needle-gpu") {
+        validate_needle_artifact(model_id, name, artifact, errors);
     }
     if artifact.engine == "sulphur" {
         let lower_path = artifact.path.to_ascii_lowercase();
@@ -4123,6 +4180,130 @@ const CHATTERBOX_REQUIRED_SIDECARS: &[(&str, &str)] = &[
     ("chatterbox_tokenizer", "tokenizer.json"),
     ("chatterbox_default_conditionals", "conds.pt"),
 ];
+const NEEDLE_MODEL_REPO: &str = "Cactus-Compute/needle";
+const NEEDLE_MODEL_REVISION: &str = "5f89b4307696d669c3df1d38ae057e6e1728b107";
+const NEEDLE_CODE_REPO: &str = "Cactus-Compute/needle-hf";
+const NEEDLE_CODE_REVISION: &str = "ffd0d081401257fee31150d30c494b2f98910fc0";
+const NEEDLE_PRIMARY_PATH: &str = "model.safetensors";
+const NEEDLE_REQUIRED_SIDECARS: &[(&str, &str, &str, &str)] = &[
+    (
+        "needle_config",
+        "config.json",
+        NEEDLE_MODEL_REPO,
+        NEEDLE_MODEL_REVISION,
+    ),
+    (
+        "needle_special_tokens",
+        "special_tokens_map.json",
+        NEEDLE_MODEL_REPO,
+        NEEDLE_MODEL_REVISION,
+    ),
+    (
+        "needle_tokenizer_model",
+        "tokenizer.model",
+        NEEDLE_MODEL_REPO,
+        NEEDLE_MODEL_REVISION,
+    ),
+    (
+        "needle_tokenizer_config",
+        "tokenizer_config.json",
+        NEEDLE_MODEL_REPO,
+        NEEDLE_MODEL_REVISION,
+    ),
+    (
+        "needle_configuration_code",
+        "configuration_needle.py",
+        NEEDLE_CODE_REPO,
+        NEEDLE_CODE_REVISION,
+    ),
+    (
+        "needle_modeling_code",
+        "modeling_needle.py",
+        NEEDLE_CODE_REPO,
+        NEEDLE_CODE_REVISION,
+    ),
+    (
+        "needle_tokenization_code",
+        "tokenization_needle.py",
+        NEEDLE_CODE_REPO,
+        NEEDLE_CODE_REVISION,
+    ),
+];
+
+fn source_binds_huggingface(source: &SourceRef, repo: &str, revision: &str) -> bool {
+    source.kind == "huggingface" && source.repo == repo && source.revision == revision
+}
+
+fn validate_needle_artifact(
+    model_id: &str,
+    name: &str,
+    artifact: &CatalogArtifact,
+    errors: &mut Vec<String>,
+) {
+    if artifact.path != NEEDLE_PRIMARY_PATH {
+        errors.push(format!(
+            "{model_id}/{name} Needle primary artifact must use path {NEEDLE_PRIMARY_PATH}, got {}",
+            artifact.path
+        ));
+    }
+
+    let mirrored = artifact.upstream_source.is_some();
+    if mirrored {
+        if !artifact.upstream_source.as_ref().is_some_and(|source| {
+            source_binds_huggingface(source, NEEDLE_MODEL_REPO, NEEDLE_MODEL_REVISION)
+        }) {
+            errors.push(format!(
+                "{model_id}/{name} mirrored Needle primary artifact must bind upstream {NEEDLE_MODEL_REPO}@{NEEDLE_MODEL_REVISION}"
+            ));
+        }
+    } else if !source_binds_huggingface(&artifact.source, NEEDLE_MODEL_REPO, NEEDLE_MODEL_REVISION)
+    {
+        errors.push(format!(
+            "{model_id}/{name} direct Needle primary artifact must use {NEEDLE_MODEL_REPO}@{NEEDLE_MODEL_REVISION}"
+        ));
+    }
+
+    for (required, expected_path, expected_repo, expected_revision) in NEEDLE_REQUIRED_SIDECARS {
+        match artifact.sidecars.get(*required) {
+            Some(sidecar) => {
+                let valid_provenance = if mirrored {
+                    sidecar.source == artifact.source
+                        && sidecar.upstream_source.as_ref().is_some_and(|source| {
+                            source_binds_huggingface(source, expected_repo, expected_revision)
+                        })
+                } else {
+                    sidecar.upstream_source.is_none()
+                        && source_binds_huggingface(
+                            &sidecar.source,
+                            expected_repo,
+                            expected_revision,
+                        )
+                };
+                if sidecar.path != *expected_path || !valid_provenance {
+                    let mode = if mirrored { "mirrored" } else { "direct" };
+                    errors.push(format!(
+                        "{model_id}/{name} {mode} Needle sidecar {required} must use path {expected_path} and bind {expected_repo}@{expected_revision}"
+                    ));
+                }
+            }
+            None => errors.push(format!(
+                "{model_id}/{name} Needle artifact needs sidecar {required}"
+            )),
+        }
+    }
+
+    let required = NEEDLE_REQUIRED_SIDECARS
+        .iter()
+        .map(|(sidecar, _, _, _)| *sidecar)
+        .collect::<BTreeSet<_>>();
+    for sidecar_name in artifact.sidecars.keys() {
+        if !required.contains(sidecar_name.as_str()) {
+            errors.push(format!(
+                "{model_id}/{name} Needle artifact has unapproved sidecar {sidecar_name}"
+            ));
+        }
+    }
+}
 
 fn validate_artifact_sidecar(
     model_id: &str,
@@ -5365,6 +5546,210 @@ mod tests {
             .any(|error| error.contains("unapproved sidecar provider_local_voice")));
     }
 
+    fn needle_artifact_fixture(engine: &str) -> (CatalogModel, CatalogArtifact) {
+        let mut model = verification_test_model(
+            "Cactus-Compute/needle@transformers",
+            DEFAULT_MODEL_CLASS,
+            engine,
+            CanaryRef {
+                set_id: "canary-tools-v1".to_owned(),
+                match_min: 1.0,
+                verification_method: VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
+            },
+        );
+        let artifact = {
+            let artifact = model.artifacts.get_mut("fixture").unwrap();
+            artifact.source = SourceRef {
+                kind: "huggingface".to_owned(),
+                repo: NEEDLE_MODEL_REPO.to_owned(),
+                revision: NEEDLE_MODEL_REVISION.to_owned(),
+                publisher_key: None,
+            };
+            artifact.path = NEEDLE_PRIMARY_PATH.to_owned();
+            artifact.sidecars = NEEDLE_REQUIRED_SIDECARS
+                .iter()
+                .enumerate()
+                .map(|(index, (sidecar_name, path, repo, revision))| {
+                    (
+                        (*sidecar_name).to_owned(),
+                        CatalogArtifactSidecar {
+                            source: SourceRef {
+                                kind: "huggingface".to_owned(),
+                                repo: (*repo).to_owned(),
+                                revision: (*revision).to_owned(),
+                                publisher_key: None,
+                            },
+                            upstream_source: None,
+                            path: (*path).to_owned(),
+                            artifact_root: format!("{:064x}", index + 1),
+                            artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                            weights_bytes: 1,
+                            source_sha256: format!("{:064x}", index + 2),
+                        },
+                    )
+                })
+                .collect();
+            artifact.clone()
+        };
+        (model, artifact)
+    }
+
+    #[test]
+    fn needle_catalog_validation_accepts_direct_pinned_inventory_for_both_engines() {
+        for engine in ["needle-cpu", "needle-gpu"] {
+            let (model, artifact) = needle_artifact_fixture(engine);
+            let mut errors = Vec::new();
+            validate_artifact(
+                &model.model_id,
+                &model.tier,
+                "fixture",
+                &artifact,
+                &mut errors,
+            );
+            assert!(errors.is_empty(), "{engine}: {errors:#?}");
+        }
+    }
+
+    #[test]
+    fn needle_catalog_validation_accepts_one_canonical_mirrored_release() {
+        let (model, mut artifact) = needle_artifact_fixture("needle-gpu");
+        let mirror = SourceRef {
+            kind: "huggingface".to_owned(),
+            repo: "TracNetwork/needle-release".to_owned(),
+            revision: "a".repeat(40),
+            publisher_key: None,
+        };
+        artifact.upstream_source = Some(artifact.source.clone());
+        artifact.source = mirror.clone();
+        for (sidecar_name, _, repo, revision) in NEEDLE_REQUIRED_SIDECARS {
+            let sidecar = artifact.sidecars.get_mut(*sidecar_name).unwrap();
+            sidecar.upstream_source = Some(SourceRef {
+                kind: "huggingface".to_owned(),
+                repo: (*repo).to_owned(),
+                revision: (*revision).to_owned(),
+                publisher_key: None,
+            });
+            sidecar.source = mirror.clone();
+        }
+
+        let mut errors = Vec::new();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            &artifact,
+            &mut errors,
+        );
+        assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn needle_catalog_validation_rejects_wrong_or_split_sources() {
+        let (model, mut direct) = needle_artifact_fixture("needle-cpu");
+        direct.source.revision = "b".repeat(40);
+        let mut errors = Vec::new();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            &direct,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("direct Needle primary artifact must use")));
+
+        let (_, mut mirrored) = needle_artifact_fixture("needle-gpu");
+        let mirror = SourceRef {
+            kind: "huggingface".to_owned(),
+            repo: "TracNetwork/needle-release".to_owned(),
+            revision: "c".repeat(40),
+            publisher_key: None,
+        };
+        mirrored.upstream_source = Some(mirrored.source.clone());
+        mirrored.source = mirror.clone();
+        for (sidecar_name, _, repo, revision) in NEEDLE_REQUIRED_SIDECARS {
+            let sidecar = mirrored.sidecars.get_mut(*sidecar_name).unwrap();
+            sidecar.upstream_source = Some(SourceRef {
+                kind: "huggingface".to_owned(),
+                repo: (*repo).to_owned(),
+                revision: (*revision).to_owned(),
+                publisher_key: None,
+            });
+            sidecar.source = mirror.clone();
+        }
+        mirrored
+            .sidecars
+            .get_mut("needle_modeling_code")
+            .unwrap()
+            .source
+            .revision = "d".repeat(40);
+        errors.clear();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            &mirrored,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("mirrored Needle sidecar needle_modeling_code")));
+    }
+
+    #[test]
+    fn needle_catalog_validation_rejects_missing_sidecar() {
+        let (model, mut artifact) = needle_artifact_fixture("needle-cpu");
+        artifact.sidecars.remove("needle_tokenizer_model");
+        let mut errors = Vec::new();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            &artifact,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("needs sidecar needle_tokenizer_model")));
+    }
+
+    #[test]
+    fn needle_catalog_validation_rejects_extra_sidecar() {
+        let (model, mut artifact) = needle_artifact_fixture("needle-gpu");
+        artifact.sidecars.insert(
+            "needle_provider_code".to_owned(),
+            CatalogArtifactSidecar {
+                source: artifact.source.clone(),
+                upstream_source: None,
+                path: "provider.py".to_owned(),
+                artifact_root: "d".repeat(64),
+                artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                weights_bytes: 1,
+                source_sha256: "e".repeat(64),
+            },
+        );
+        let mut errors = Vec::new();
+        validate_artifact(
+            &model.model_id,
+            &model.tier,
+            "fixture",
+            &artifact,
+            &mut errors,
+        );
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unapproved sidecar needle_provider_code")));
+    }
+
     #[test]
     fn sulphur_artifact_requires_a_fixed_signed_runtime_manifest() {
         let mut model = verification_test_model(
@@ -5552,6 +5937,59 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("min_app_version must be a semantic version")));
+    }
+
+    #[test]
+    fn future_models_keep_structural_validation_without_requiring_known_engines() {
+        let mut model = verification_test_model(
+            "admin/future-model",
+            DEFAULT_MODEL_CLASS,
+            "future-engine",
+            CanaryRef {
+                set_id: "canary-launch-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::from([("fixture".to_owned(), "a".repeat(64))]),
+                token_prefixes: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([(
+                        "fixed-text".to_owned(),
+                        vec![1; MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS],
+                    )]),
+                )]),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
+            },
+        );
+        let mut errors = Vec::new();
+        validate_model(&model, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unsupported engine future-engine")));
+
+        model.min_app_version = Some("9999.0.0".to_owned());
+        errors.clear();
+        validate_model(&model, &mut errors);
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.contains("unsupported engine future-engine")),
+            "{errors:?}"
+        );
+
+        model.artifacts.get_mut("fixture").unwrap().path.clear();
+        errors.clear();
+        validate_model(&model, &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("path is required")),
+            "future models must still receive generic structural validation: {errors:?}"
+        );
     }
 
     #[test]
@@ -6393,6 +6831,62 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("adapter.modality_set entry is unsupported: smell")));
+    }
+
+    #[test]
+    fn tools_only_text_model_does_not_advertise_legacy_completions() {
+        let mut model = verification_test_model(
+            "admin/tools-only@fixture",
+            DEFAULT_MODEL_CLASS,
+            "llama.cpp",
+            CanaryRef {
+                set_id: "canary-tools-v1".to_owned(),
+                match_min: 1.0,
+                verification_method: VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::from([("fixture".to_owned(), "a".repeat(64))]),
+                token_prefixes: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([(
+                        "tools".to_owned(),
+                        vec![1; MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS],
+                    )]),
+                )]),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
+            },
+        );
+        model.adapter.endpoint_families.retain(|contract| {
+            matches!(
+                contract.family.as_str(),
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+            )
+        });
+        for contract in &mut model.adapter.endpoint_families {
+            contract
+                .required_request_attributes
+                .push("tools".to_owned());
+            contract.required_request_attributes.sort();
+            contract.required_request_attributes.dedup();
+        }
+
+        let mut errors = Vec::new();
+        validate_model(&model, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        model
+            .adapter
+            .endpoint_families
+            .retain(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS);
+        errors.clear();
+        validate_model(&model, &mut errors);
+        assert!(errors.iter().any(|error| {
+            error.contains("missing required compatible family openai_responses")
+        }));
     }
 
     #[test]

@@ -33,7 +33,7 @@ hf-xet = { version = "=1.5.3", features = ["no-default-cache"] }
 mayhem-bridge = { path = "../mayhem-bridge" }
 mayhem-attestation = { path = "../mayhem-attestation" }
 mayhem-enclave = { path = "../mayhem-enclave" }
-mayhem-engine = { path = "../mayhem-engine", features = ["ace-step", "chatterbox", "mlx", "sulphur", "transformers-asr", "trt-llm", "vllm"] }
+mayhem-engine = { path = "../mayhem-engine", features = ["ace-step", "chatterbox", "mlx", "needle", "sulphur", "transformers-asr", "trt-llm", "vllm"] }
 mayhem-gateway = { path = "../mayhem-gateway" }
 mayhem-hwprobe = { path = "../mayhem-hwprobe" }
 mayhem-proto = { path = "../mayhem-proto" }

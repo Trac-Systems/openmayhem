@@ -1425,6 +1425,18 @@ pub fn stable_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>, serde_jso
     serde_json::to_vec(&stable_json_value(value))
 }
 
+pub const NORMALIZED_REQUEST_BYTES_PER_PROMPT_UNIT: u64 = 4;
+
+pub fn normalized_request_prompt_units(
+    value: &serde_json::Value,
+) -> Result<u64, serde_json::Error> {
+    let byte_count = u64::try_from(stable_json_bytes(value)?.len()).unwrap_or(u64::MAX);
+    Ok(
+        byte_count.saturating_add(NORMALIZED_REQUEST_BYTES_PER_PROMPT_UNIT - 1)
+            / NORMALIZED_REQUEST_BYTES_PER_PROMPT_UNIT,
+    )
+}
+
 pub const TRANSCRIPTION_RESULT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_TRANSCRIPTION_RESULT_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_TRANSCRIPTION_RESULT_MAX_TIMESTAMP_ENTRIES: usize = 1_000_000;
@@ -3354,6 +3366,27 @@ mod tests {
         assert_ne!(
             session_frame_head(&changed).unwrap(),
             session_frame_head(&reordered).unwrap()
+        );
+    }
+
+    #[test]
+    fn normalized_request_prompt_units_are_stable_and_byte_derived() {
+        let request = json!({
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+            "messages": [{"role": "user", "content": "find it"}],
+        });
+        let reordered = json!({
+            "messages": [{"content": "find it", "role": "user"}],
+            "tools": [{"function": {"name": "lookup"}, "type": "function"}],
+        });
+        let bytes = stable_json_bytes(&request).unwrap();
+        let expected =
+            (u64::try_from(bytes.len()).unwrap() + NORMALIZED_REQUEST_BYTES_PER_PROMPT_UNIT - 1)
+                / NORMALIZED_REQUEST_BYTES_PER_PROMPT_UNIT;
+        assert_eq!(normalized_request_prompt_units(&request).unwrap(), expected);
+        assert_eq!(
+            normalized_request_prompt_units(&request).unwrap(),
+            normalized_request_prompt_units(&reordered).unwrap()
         );
     }
 

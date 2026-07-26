@@ -20,6 +20,8 @@ const ACE_STEP_CUDA_FULL_OFFLOAD_FLOOR: u64 = 20 * GIB;
 const ACE_STEP_APPLE_UNIFIED_MEMORY_FLOOR: u64 = 16 * GIB;
 const CHATTERBOX_RAM_FLOOR: u64 = 8 * GIB;
 const CHATTERBOX_ACCELERATOR_MEMORY_FLOOR: u64 = 6 * GIB;
+const NEEDLE_RAM_FLOOR: u64 = GIB;
+const NEEDLE_GPU_MEMORY_FLOOR: u64 = 512 * MIB;
 const TRANSFORMERS_ASR_RAM_FLOOR: u64 = 8 * GIB;
 const TRANSFORMERS_ASR_CUDA_MEMORY_FLOOR: u64 = 4 * GIB;
 const SULPHUR_NVIDIA_PARTIAL_OFFLOAD_FLOOR: u64 = 16 * GIB;
@@ -343,6 +345,8 @@ fn compute_backend_verdicts(profile: &HardwareProfile) -> Vec<BackendVerdict> {
         transformers_asr_verdict(profile),
         whisper_cpp_verdict(profile),
         piper_verdict(profile),
+        needle_cpu_verdict(profile),
+        needle_gpu_verdict(profile),
         sulphur_verdict(profile),
     ]
 }
@@ -1359,6 +1363,142 @@ fn piper_verdict(profile: &HardwareProfile) -> BackendVerdict {
             .available_bytes
             .unwrap_or(profile.memory.total_bytes)
             / 8,
+    }
+}
+
+fn needle_cpu_verdict(profile: &HardwareProfile) -> BackendVerdict {
+    let platform_supported = match profile.host.os.as_str() {
+        "linux" => {
+            matches!(profile.host.arch.as_str(), "x86_64" | "aarch64" | "arm64")
+        }
+        "macos" => matches!(profile.host.arch.as_str(), "aarch64" | "arm64"),
+        "windows" => profile.host.arch == "x86_64",
+        _ => false,
+    };
+    if !platform_supported {
+        return insufficient(
+            "needle-cpu",
+            &format!(
+                "Needle CPU execution has no supported 64-bit runtime for {}/{}",
+                profile.host.os, profile.host.arch
+            ),
+        );
+    }
+
+    let available_memory = profile
+        .memory
+        .available_bytes
+        .unwrap_or(profile.memory.total_bytes);
+    if available_memory < NEEDLE_RAM_FLOOR {
+        return insufficient(
+            "needle-cpu",
+            &format!(
+                "Needle CPU execution needs at least 1 GiB available host memory; {} detected",
+                format_bytes(available_memory)
+            ),
+        );
+    }
+
+    BackendVerdict {
+        backend: "needle-cpu".to_owned(),
+        status: VerdictStatus::CpuOnly,
+        reason: Some(format!(
+            "Needle's 30.4M BF16 model and 1,024-token combined context fit CPU execution{}",
+            if profile.cpu.flags.avx2 {
+                " with AVX2"
+            } else if profile.cpu.flags.neon {
+                " with NEON"
+            } else {
+                ""
+            }
+        )),
+        est_tok_s: Some(50.0),
+        n_layers_gpu: Some(0),
+        max_sessions: 2,
+        kv_cache_bytes_budget: 64 * MIB,
+    }
+}
+
+fn needle_gpu_verdict(profile: &HardwareProfile) -> BackendVerdict {
+    let platform_supported = match profile.host.os.as_str() {
+        "macos" => matches!(profile.host.arch.as_str(), "aarch64" | "arm64"),
+        "linux" => matches!(profile.host.arch.as_str(), "aarch64" | "arm64" | "x86_64"),
+        "windows" => profile.host.arch == "x86_64",
+        _ => false,
+    };
+    if !platform_supported {
+        return insufficient(
+            "needle-gpu",
+            &format!(
+                "Needle GPU execution has no frozen runtime for {}/{}",
+                profile.host.os, profile.host.arch
+            ),
+        );
+    }
+
+    let available_memory = profile
+        .memory
+        .available_bytes
+        .unwrap_or(profile.memory.total_bytes);
+    if available_memory < NEEDLE_RAM_FLOOR {
+        return insufficient(
+            "needle-gpu",
+            &format!(
+                "Needle GPU execution needs at least 1 GiB available host memory; {} detected",
+                format_bytes(available_memory)
+            ),
+        );
+    }
+
+    if profile.host.os == "macos" {
+        return insufficient(
+            "needle-gpu",
+            "Needle's calibrated Apple MPS path is slower than CPU; use needle-cpu",
+        );
+    }
+
+    let nvidia = profile
+        .gpus
+        .iter()
+        .filter(|gpu| {
+            gpu.vendor == GpuVendor::Nvidia
+                && gpu.backend == GpuBackend::Nvml
+                && gpu
+                    .compute_capability
+                    .as_deref()
+                    .and_then(parse_compute_capability)
+                    .is_some_and(|capability| capability >= (7, 5))
+        })
+        .collect::<Vec<_>>();
+    if nvidia.is_empty() {
+        return insufficient(
+            "needle-gpu",
+            "no compatible NVIDIA GPU with compute capability >= 7.5 detected",
+        );
+    }
+
+    let cuda_memory = nvidia_usable_memory_bytes(profile, &nvidia);
+    if cuda_memory < NEEDLE_GPU_MEMORY_FLOOR {
+        return insufficient(
+            "needle-gpu",
+            &format!(
+                "Needle CUDA execution needs at least 512 MiB usable NVIDIA memory; {} detected",
+                format_bytes(cuda_memory)
+            ),
+        );
+    }
+
+    BackendVerdict {
+        backend: "needle-gpu".to_owned(),
+        status: VerdictStatus::FullOffload,
+        reason: Some(format!(
+            "NVIDIA CUDA GPU has enough memory for Needle's 30.4M BF16 model and 1,024-token combined context{}",
+            nvidia_memory_reason_suffix(profile, &nvidia)
+        )),
+        est_tok_s: Some(200.0),
+        n_layers_gpu: None,
+        max_sessions: 4,
+        kv_cache_bytes_budget: 64 * MIB,
     }
 }
 
@@ -3245,6 +3385,105 @@ mod tests {
         assert_eq!(verdict.status, VerdictStatus::CpuOnly);
         assert_eq!(verdict.n_layers_gpu, Some(0));
         assert!(verdict.reason.unwrap_or_default().contains("below 4 GiB"));
+    }
+
+    #[test]
+    fn needle_cpu_only_host_gets_cpu_but_not_gpu() {
+        let report = fixture_report(FixtureProfile::CpuOnly);
+        let cpu = report
+            .backend_verdicts
+            .iter()
+            .find(|verdict| verdict.backend == "needle-cpu")
+            .unwrap();
+        let gpu = report
+            .backend_verdicts
+            .iter()
+            .find(|verdict| verdict.backend == "needle-gpu")
+            .unwrap();
+
+        assert_eq!(cpu.status, VerdictStatus::CpuOnly);
+        assert_eq!(cpu.est_tok_s, Some(50.0));
+        assert_eq!(gpu.status, VerdictStatus::Insufficient);
+    }
+
+    #[test]
+    fn needle_nvidia_hosts_get_cpu_and_gpu_in_deterministic_order() {
+        for fixture in [
+            FixtureProfile::LinuxNvidiaArm64,
+            FixtureProfile::LinuxNvidia,
+            FixtureProfile::WindowsNvidia,
+        ] {
+            let report = fixture_report(fixture);
+            let needle = report
+                .backend_verdicts
+                .iter()
+                .filter(|verdict| verdict.backend.starts_with("needle-"))
+                .collect::<Vec<_>>();
+
+            assert_eq!(needle.len(), 2, "{}", fixture.as_str());
+            assert_eq!(needle[0].backend, "needle-cpu", "{}", fixture.as_str());
+            assert_eq!(
+                needle[0].status,
+                VerdictStatus::CpuOnly,
+                "{}",
+                fixture.as_str()
+            );
+            assert_eq!(needle[1].backend, "needle-gpu", "{}", fixture.as_str());
+            assert_eq!(
+                needle[1].status,
+                VerdictStatus::FullOffload,
+                "{}",
+                fixture.as_str()
+            );
+            assert_eq!(needle[1].est_tok_s, Some(200.0), "{}", fixture.as_str());
+        }
+    }
+
+    #[test]
+    fn needle_apple_host_uses_cpu_and_rejects_inefficient_mps() {
+        let report = fixture_report(FixtureProfile::AppleSilicon);
+        let cpu = report
+            .backend_verdicts
+            .iter()
+            .find(|verdict| verdict.backend == "needle-cpu")
+            .unwrap();
+        let gpu = report
+            .backend_verdicts
+            .iter()
+            .find(|verdict| verdict.backend == "needle-gpu")
+            .unwrap();
+
+        assert_eq!(cpu.status, VerdictStatus::CpuOnly);
+        assert_eq!(cpu.n_layers_gpu, Some(0));
+        assert_eq!(gpu.status, VerdictStatus::Insufficient);
+        assert_eq!(gpu.est_tok_s, None);
+        assert!(gpu
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("slower than CPU"));
+    }
+
+    #[test]
+    fn needle_rejects_unsupported_architectures() {
+        let mut profile = fixture_profile(FixtureProfile::CpuOnly, Path::new("."));
+        profile.host.arch = "i686".to_owned();
+
+        assert_eq!(
+            needle_cpu_verdict(&profile).status,
+            VerdictStatus::Insufficient
+        );
+        assert_eq!(
+            needle_gpu_verdict(&profile).status,
+            VerdictStatus::Insufficient
+        );
+
+        profile.host.os = "macos".to_owned();
+        profile.host.arch = "x86_64".to_owned();
+        assert_eq!(
+            needle_cpu_verdict(&profile).status,
+            VerdictStatus::Insufficient
+        );
     }
 
     #[test]

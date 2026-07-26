@@ -1,0 +1,188 @@
+{
+  "set_id": "canary-needle-launch-v1",
+  "description": "Needle launch canaries covering deterministic tool selection, argument extraction, distractor rejection, and parallel tool calls.",
+  "prompts": [
+    {
+      "id": "needle-weather-berlin",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is the weather in Berlin?"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "City name."
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "temperature": 0,
+      "top_k": 1,
+      "seed": 7,
+      "max_tokens": 128
+    },
+    {
+      "id": "needle-weather-paris",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What's the weather in Paris?"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "City name."
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "temperature": 0,
+      "seed": 7,
+      "max_tokens": 128
+    },
+    {
+      "id": "needle-distractor-selection",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Turn off the lights."
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string",
+                  "description": "City name."
+                }
+              },
+              "required": [
+                "city"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "toggle_lights",
+            "description": "Toggle smart lights on or off.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "on",
+                    "off"
+                  ]
+                }
+              },
+              "required": [
+                "state"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "temperature": 0,
+      "seed": 7,
+      "max_tokens": 128
+    },
+    {
+      "id": "needle-parallel-timer-lights",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Set a timer for five minutes and turn off the lights."
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "set_timer",
+            "description": "Set a timer.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "time_human": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "time_human"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "toggle_lights",
+            "description": "Toggle lights on or off.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "state": {
+                  "type": "string",
+                  "enum": [
+                    "on",
+                    "off"
+                  ]
+                }
+              },
+              "required": [
+                "state"
+              ],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "temperature": 0,
+      "seed": 11,
+      "max_tokens": 128
+    }
+  ]
+}

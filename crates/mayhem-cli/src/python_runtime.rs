@@ -35,6 +35,22 @@ const CHATTERBOX_CUDA130_ARM64_PROJECT: &[u8] =
     include_bytes!("../resources/python/chatterbox-runtime-cuda130-arm64/pyproject.toml");
 const CHATTERBOX_CUDA130_ARM64_LOCK: &[u8] =
     include_bytes!("../resources/python/chatterbox-runtime-cuda130-arm64/uv.lock");
+const NEEDLE_CPU_ARM64_PROJECT: &[u8] =
+    include_bytes!("../resources/python/needle-runtime-cpu-arm64/pyproject.toml");
+const NEEDLE_CPU_ARM64_LOCK: &[u8] =
+    include_bytes!("../resources/python/needle-runtime-cpu-arm64/uv.lock");
+const NEEDLE_CPU_X86_PROJECT: &[u8] =
+    include_bytes!("../resources/python/needle-runtime-cpu-x86/pyproject.toml");
+const NEEDLE_CPU_X86_LOCK: &[u8] =
+    include_bytes!("../resources/python/needle-runtime-cpu-x86/uv.lock");
+const NEEDLE_CUDA130_ARM64_PROJECT: &[u8] =
+    include_bytes!("../resources/python/needle-runtime-cuda130-arm64/pyproject.toml");
+const NEEDLE_CUDA130_ARM64_LOCK: &[u8] =
+    include_bytes!("../resources/python/needle-runtime-cuda130-arm64/uv.lock");
+const NEEDLE_CUDA130_X86_PROJECT: &[u8] =
+    include_bytes!("../resources/python/needle-runtime-cuda130-x86/pyproject.toml");
+const NEEDLE_CUDA130_X86_LOCK: &[u8] =
+    include_bytes!("../resources/python/needle-runtime-cuda130-x86/uv.lock");
 const SULPHUR_REQUIREMENTS: &[u8] =
     include_bytes!("../resources/python/sulphur-runtime-requirements.txt");
 const SULPHUR_RUNTIME_ADAPTER: &[u8] = include_bytes!("../resources/python/sulphur_runtime.py");
@@ -89,6 +105,25 @@ const CHATTERBOX_CUDA130_ARM64_PROJECT_SHA256: &str =
 const CHATTERBOX_CUDA130_ARM64_LOCK_SHA256: &str =
     "afef8c6e5a717784ef477e7dbd9091b1bb08870f02d4afec1d36e89935191ad6";
 const CHATTERBOX_MIN_FREE_BYTES: u64 = 16 * GIB;
+const NEEDLE_PYTHON_VERSION: &str = "3.11";
+const NEEDLE_CPU_ARM64_PROJECT_SHA256: &str =
+    "f7ed2e8f740ad3de1e9e5f5585da21f8ae35b6aa9556be0c61ec8ea52d8eb7a6";
+const NEEDLE_CPU_ARM64_LOCK_SHA256: &str =
+    "91a168f4a3ab97699627621a2fd833ace13a1f5710bbfadb4e010265f924853c";
+const NEEDLE_CPU_X86_PROJECT_SHA256: &str =
+    "605fb6c116a360227f236c890efdd9af924cb1ae2831eb11a9f569072920cda8";
+const NEEDLE_CPU_X86_LOCK_SHA256: &str =
+    "52fd580a67bfff360184976ad195fdf76abc4aa35e41d3fdfdbe091242e00bd6";
+const NEEDLE_CUDA130_ARM64_PROJECT_SHA256: &str =
+    "acf40cc505e8ed705afe926b53adc9e8270f59c12a749738cb6c4c1254618638";
+const NEEDLE_CUDA130_ARM64_LOCK_SHA256: &str =
+    "5ef6768852fd83823c05457a6c058e2edb9902698f42958c4027e3fd1a6797db";
+const NEEDLE_CUDA130_X86_PROJECT_SHA256: &str =
+    "dba0ea384d584c2a5cfb640366f91a111e634ec711ff1871c595a49312253f1e";
+const NEEDLE_CUDA130_X86_LOCK_SHA256: &str =
+    "fa136bc03b6a843957fba29db06d0d66ee64b45ca0b1aaa344e6749e96d3523f";
+const NEEDLE_CPU_MIN_FREE_BYTES: u64 = 4 * GIB;
+const NEEDLE_CUDA_MIN_FREE_BYTES: u64 = 12 * GIB;
 const ACE_STEP_LOCK_SHA256: &str =
     "0a9c8067b3299bfc6881a06e097ff95e55e1b7bb8f9d1f84192ac23e59b995ab";
 const ACE_STEP_SUPPLEMENTAL_REQUIREMENTS: &[u8] = b"av==18.0.0\n";
@@ -155,12 +190,48 @@ struct ChatterboxUvProject {
     cuda_version: Option<&'static str>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NeedleRuntimeFlavor {
+    CpuArm64,
+    CpuX86,
+    Cuda130Arm64,
+    Cuda130X86,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NeedleDevice {
+    Cpu,
+    Cuda,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NeedleRuntimeSelection {
+    flavor: NeedleRuntimeFlavor,
+    device: NeedleDevice,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NeedleUvProject {
+    name: &'static str,
+    project: &'static [u8],
+    project_sha256: &'static str,
+    lock: &'static [u8],
+    lock_sha256: &'static str,
+    torch_version: &'static str,
+    cuda_version: Option<&'static str>,
+    min_cuda_compute_capability: Option<(u8, u8)>,
+    min_free_bytes: u64,
+}
+
 pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<PythonRuntime> {
     if backend == "ace-step" {
         return ensure_ace_step_python(home);
     }
     if backend == "chatterbox" {
         return ensure_chatterbox_python(home);
+    }
+    if backend == "needle" {
+        return ensure_needle_python(home);
     }
     let spec = python_runtime_spec(backend)
         .with_context(|| format!("backend {backend} does not use a managed Python runtime"))?;
@@ -546,6 +617,1002 @@ fn ensure_chatterbox_python(home: &Path) -> Result<PythonRuntime> {
 
     let _ = FileExt::unlock(&bootstrap_lock);
     result
+}
+
+fn ensure_needle_python(home: &Path) -> Result<PythonRuntime> {
+    let requested = env::var("MAYHEM_NEEDLE_DEVICE").ok();
+    ensure_needle_python_requested(home, requested.as_deref())
+}
+
+pub(crate) fn ensure_needle_python_for_device(home: &Path, device: &str) -> Result<PythonRuntime> {
+    let resolved = resolve_needle_device_for_request(device)?;
+    ensure_needle_python_requested(home, Some(resolved))
+}
+
+pub(crate) fn resolve_needle_device_for_request(device: &str) -> Result<&'static str> {
+    let requested = normalize_explicit_needle_device(device)?;
+    let selection = select_needle_runtime(
+        Some(&requested),
+        needle_cuda_available(),
+        env::consts::OS,
+        env::consts::ARCH,
+    )?;
+    Ok(needle_device_name(selection.device))
+}
+
+fn normalize_explicit_needle_device(device: &str) -> Result<String> {
+    let requested = device.trim().to_ascii_lowercase();
+    ensure!(
+        matches!(requested.as_str(), "cpu" | "gpu" | "cuda"),
+        "Needle device must be cpu, gpu, or cuda"
+    );
+    Ok(requested)
+}
+
+fn ensure_needle_python_requested(home: &Path, requested: Option<&str>) -> Result<PythonRuntime> {
+    let selection = select_needle_runtime(
+        requested,
+        needle_cuda_available(),
+        env::consts::OS,
+        env::consts::ARCH,
+    )?;
+    let project = needle_uv_project(selection.flavor);
+    let runtime_sha256 = verify_needle_uv_project(&project)?;
+    let cache_root = home.join("cache").join("needle").join(project.name);
+    let venvs = home.join("venvs");
+    fs::create_dir_all(&venvs)
+        .with_context(|| format!("creating managed Python directory {}", venvs.display()))?;
+    let venv = venvs.join(format!("needle-{}", project.name));
+    let python = venv_python(&venv);
+
+    if validate_existing_needle_runtime(&venv, &runtime_sha256, || {
+        validate_managed_needle_python(
+            &python,
+            &venv,
+            &project,
+            selection.device,
+            &cache_root,
+            &runtime_sha256,
+            home,
+        )
+    })? {
+        return Ok(PythonRuntime {
+            python,
+            source: format!(
+                "managed existing frozen Needle uv runtime ({}/{})",
+                project.name,
+                needle_device_name(selection.device)
+            ),
+            requirements_sha256: runtime_sha256,
+        });
+    }
+
+    let bootstrap_lock_path = venvs.join(format!(".needle-{}.bootstrap.lock", project.name));
+    let bootstrap_lock = open_lock_file(&bootstrap_lock_path)?;
+    bootstrap_lock.lock_exclusive().with_context(|| {
+        format!(
+            "locking managed Needle bootstrap {}",
+            bootstrap_lock_path.display()
+        )
+    })?;
+
+    let result = (|| {
+        if validate_existing_needle_runtime(&venv, &runtime_sha256, || {
+            validate_managed_needle_python(
+                &python,
+                &venv,
+                &project,
+                selection.device,
+                &cache_root,
+                &runtime_sha256,
+                home,
+            )
+        })? {
+            return Ok(PythonRuntime {
+                python,
+                source: format!(
+                    "managed existing frozen Needle uv runtime ({}/{})",
+                    project.name,
+                    needle_device_name(selection.device)
+                ),
+                requirements_sha256: runtime_sha256.clone(),
+            });
+        }
+
+        let free_bytes = fs2::available_space(&venvs).with_context(|| {
+            format!(
+                "reading free space before Needle {} Python bootstrap under {}",
+                project.name,
+                venvs.display()
+            )
+        })?;
+        if free_bytes < project.min_free_bytes {
+            bail!(
+                "Needle {} Python bootstrap needs at least {} GiB free under {}; only {} GiB is available",
+                project.name,
+                project.min_free_bytes / GIB,
+                venvs.display(),
+                free_bytes / GIB
+            );
+        }
+        if venv.exists() {
+            cleanup_incomplete_needle_venv(&venv)?;
+        }
+
+        let install_result = (|| {
+            let uv = ensure_managed_uv(home)?;
+            let install_project = temporary_needle_install_project(&project, &cache_root)?;
+            let python_install_dir = home.join("python");
+            let uv_cache = cache_root.join("uv");
+            fs::create_dir_all(&python_install_dir).with_context(|| {
+                format!(
+                    "creating managed Python install directory {}",
+                    python_install_dir.display()
+                )
+            })?;
+            fs::create_dir_all(&uv_cache)
+                .with_context(|| format!("creating uv cache directory {}", uv_cache.display()))?;
+            let install = Command::new(&uv)
+                .arg("sync")
+                .arg("--frozen")
+                .arg("--no-dev")
+                .arg("--no-install-project")
+                .arg("--python")
+                .arg(NEEDLE_PYTHON_VERSION)
+                .arg("--project")
+                .arg(install_project.path())
+                .env("UV_PROJECT_ENVIRONMENT", &venv)
+                .env("UV_PYTHON_INSTALL_DIR", &python_install_dir)
+                .env("UV_CACHE_DIR", &uv_cache)
+                .env("UV_NO_PROGRESS", "1")
+                .output()
+                .with_context(|| {
+                    format!(
+                        "starting {} frozen sync for Needle {}",
+                        uv.display(),
+                        project.name
+                    )
+                })?;
+            if !install.status.success() {
+                let detail = command_output_detail(&install);
+                bail!(
+                    "installing the frozen Needle {} runtime failed with {}{}",
+                    project.name,
+                    install.status,
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {detail}")
+                    }
+                );
+            }
+            let managed_python = venv_python(&venv);
+            check_needle_environment(home, &venv, &project, &cache_root).with_context(|| {
+                format!(
+                    "managed Needle {} install completed but its frozen environment check failed",
+                    project.name
+                )
+            })?;
+            validate_needle_python(&managed_python, &project, selection.device, &cache_root)
+                .with_context(|| {
+                    format!(
+                        "managed Needle {} install completed but runtime validation failed",
+                        project.name
+                    )
+                })?;
+            write_needle_runtime_marker(&venv, &runtime_sha256)?;
+            Ok(managed_python)
+        })();
+
+        let managed_python = match install_result {
+            Ok(python) => python,
+            Err(error) => {
+                cleanup_incomplete_needle_venv(&venv).with_context(|| {
+                    format!(
+                        "cleaning incomplete Needle {} environment {} after: {error:#}",
+                        project.name,
+                        venv.display()
+                    )
+                })?;
+                return Err(error);
+            }
+        };
+        Ok(PythonRuntime {
+            python: managed_python,
+            source: format!(
+                "managed bootstrapped frozen Needle uv runtime ({}/{})",
+                project.name,
+                needle_device_name(selection.device)
+            ),
+            requirements_sha256: runtime_sha256.clone(),
+        })
+    })();
+
+    let _ = FileExt::unlock(&bootstrap_lock);
+    result
+}
+
+fn needle_uv_project(flavor: NeedleRuntimeFlavor) -> NeedleUvProject {
+    match flavor {
+        NeedleRuntimeFlavor::CpuArm64 => NeedleUvProject {
+            name: "cpu-arm64",
+            project: NEEDLE_CPU_ARM64_PROJECT,
+            project_sha256: NEEDLE_CPU_ARM64_PROJECT_SHA256,
+            lock: NEEDLE_CPU_ARM64_LOCK,
+            lock_sha256: NEEDLE_CPU_ARM64_LOCK_SHA256,
+            torch_version: "2.9.1",
+            cuda_version: None,
+            min_cuda_compute_capability: None,
+            min_free_bytes: NEEDLE_CPU_MIN_FREE_BYTES,
+        },
+        NeedleRuntimeFlavor::CpuX86 => NeedleUvProject {
+            name: "cpu-x86",
+            project: NEEDLE_CPU_X86_PROJECT,
+            project_sha256: NEEDLE_CPU_X86_PROJECT_SHA256,
+            lock: NEEDLE_CPU_X86_LOCK,
+            lock_sha256: NEEDLE_CPU_X86_LOCK_SHA256,
+            torch_version: "2.9.1+cpu",
+            cuda_version: None,
+            min_cuda_compute_capability: None,
+            min_free_bytes: NEEDLE_CPU_MIN_FREE_BYTES,
+        },
+        NeedleRuntimeFlavor::Cuda130Arm64 => NeedleUvProject {
+            name: "cuda130-arm64",
+            project: NEEDLE_CUDA130_ARM64_PROJECT,
+            project_sha256: NEEDLE_CUDA130_ARM64_PROJECT_SHA256,
+            lock: NEEDLE_CUDA130_ARM64_LOCK,
+            lock_sha256: NEEDLE_CUDA130_ARM64_LOCK_SHA256,
+            torch_version: "2.9.1+cu130",
+            cuda_version: Some("13.0"),
+            min_cuda_compute_capability: Some((7, 5)),
+            min_free_bytes: NEEDLE_CUDA_MIN_FREE_BYTES,
+        },
+        NeedleRuntimeFlavor::Cuda130X86 => NeedleUvProject {
+            name: "cuda130-x86",
+            project: NEEDLE_CUDA130_X86_PROJECT,
+            project_sha256: NEEDLE_CUDA130_X86_PROJECT_SHA256,
+            lock: NEEDLE_CUDA130_X86_LOCK,
+            lock_sha256: NEEDLE_CUDA130_X86_LOCK_SHA256,
+            torch_version: "2.9.1+cu130",
+            cuda_version: Some("13.0"),
+            min_cuda_compute_capability: Some((7, 5)),
+            min_free_bytes: NEEDLE_CUDA_MIN_FREE_BYTES,
+        },
+    }
+}
+
+fn select_needle_runtime(
+    requested: Option<&str>,
+    cuda_available: bool,
+    target_os: &str,
+    target_arch: &str,
+) -> Result<NeedleRuntimeSelection> {
+    let requested = requested.unwrap_or("auto").trim().to_ascii_lowercase();
+    ensure!(
+        matches!(requested.as_str(), "auto" | "cpu" | "gpu" | "cuda"),
+        "MAYHEM_NEEDLE_DEVICE must be auto, cpu, gpu, or cuda"
+    );
+    match (target_os, target_arch) {
+        ("macos", "aarch64") => match requested.as_str() {
+            "gpu" | "cuda" => {
+                bail!("Needle GPU execution is CUDA-only; calibrated Apple hosts use needle-cpu")
+            }
+            "auto" | "cpu" => Ok(NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::CpuArm64,
+                device: NeedleDevice::Cpu,
+            }),
+            _ => unreachable!(),
+        },
+        ("linux", "aarch64") => match requested.as_str() {
+            "gpu" | "cuda" => {
+                ensure!(
+                    cuda_available,
+                    "Needle GPU execution was requested but no usable NVIDIA CUDA device was detected"
+                );
+                Ok(NeedleRuntimeSelection {
+                    flavor: NeedleRuntimeFlavor::Cuda130Arm64,
+                    device: NeedleDevice::Cuda,
+                })
+            }
+            "cpu" => Ok(NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::CpuArm64,
+                device: NeedleDevice::Cpu,
+            }),
+            "auto" if cuda_available => Ok(NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::Cuda130Arm64,
+                device: NeedleDevice::Cuda,
+            }),
+            "auto" => Ok(NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::CpuArm64,
+                device: NeedleDevice::Cpu,
+            }),
+            _ => unreachable!(),
+        },
+        ("linux", "x86_64") => match requested.as_str() {
+            "cpu" => Ok(NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::CpuX86,
+                device: NeedleDevice::Cpu,
+            }),
+            "gpu" | "cuda" if cuda_available => Ok(NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::Cuda130X86,
+                device: NeedleDevice::Cuda,
+            }),
+            "gpu" | "cuda" => {
+                bail!("Needle GPU execution was requested but no usable NVIDIA CUDA device was detected")
+            }
+            "auto" if cuda_available => Ok(NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::Cuda130X86,
+                device: NeedleDevice::Cuda,
+            }),
+            "auto" => Ok(NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::CpuX86,
+                device: NeedleDevice::Cpu,
+            }),
+            _ => unreachable!(),
+        },
+        ("windows", "x86_64") => match requested.as_str() {
+            "cpu" => Ok(NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::CpuX86,
+                device: NeedleDevice::Cpu,
+            }),
+            "gpu" | "cuda" if cuda_available => Ok(NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::Cuda130X86,
+                device: NeedleDevice::Cuda,
+            }),
+            "gpu" | "cuda" => {
+                bail!("Needle GPU execution was requested but no usable NVIDIA CUDA device was detected")
+            }
+            "auto" if cuda_available => Ok(NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::Cuda130X86,
+                device: NeedleDevice::Cuda,
+            }),
+            "auto" => Ok(NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::CpuX86,
+                device: NeedleDevice::Cpu,
+            }),
+            _ => unreachable!(),
+        },
+        _ => bail!("the frozen Needle runtime does not support {target_os}/{target_arch}"),
+    }
+}
+
+fn needle_cuda_available() -> bool {
+    if !matches!(
+        (env::consts::OS, env::consts::ARCH),
+        ("linux", "aarch64") | ("linux", "x86_64") | ("windows", "x86_64")
+    ) {
+        return false;
+    }
+    Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=driver_version",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
+        })
+}
+
+fn needle_device_name(device: NeedleDevice) -> &'static str {
+    match device {
+        NeedleDevice::Cpu => "cpu",
+        NeedleDevice::Cuda => "cuda",
+    }
+}
+
+fn verify_needle_uv_project(project: &NeedleUvProject) -> Result<String> {
+    let project_actual = format!("{:x}", Sha256::digest(project.project));
+    ensure!(
+        project_actual == project.project_sha256,
+        "embedded Needle {} pyproject checksum mismatch: expected {}, got {}",
+        project.name,
+        project.project_sha256,
+        project_actual
+    );
+    let lock_actual = format!("{:x}", Sha256::digest(project.lock));
+    ensure!(
+        lock_actual == project.lock_sha256,
+        "embedded Needle {} uv.lock checksum mismatch: expected {}, got {}",
+        project.name,
+        project.lock_sha256,
+        lock_actual
+    );
+
+    let project_text = std::str::from_utf8(project.project)
+        .with_context(|| format!("embedded Needle {} pyproject is not UTF-8", project.name))?;
+    let project_toml: toml::Value = toml::from_str(project_text)
+        .with_context(|| format!("parsing embedded Needle {} pyproject", project.name))?;
+    let dependencies = project_toml
+        .get("project")
+        .and_then(|value| value.get("dependencies"))
+        .and_then(toml::Value::as_array)
+        .context("embedded Needle pyproject has no dependency array")?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .context("embedded Needle pyproject dependency is not a string")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let expected_dependencies = vec![
+        "numpy==1.26.4",
+        "safetensors==0.5.3",
+        "sentencepiece==0.2.1",
+        match project.cuda_version {
+            Some(_) => "torch==2.9.1+cu130",
+            None if project.name == "cpu-x86" => "torch==2.9.1+cpu",
+            None => "torch==2.9.1",
+        },
+        "transformers==5.2.0",
+    ];
+    ensure!(
+        dependencies == expected_dependencies,
+        "embedded Needle {} pyproject dependency topology changed",
+        project.name
+    );
+
+    let lock_text = std::str::from_utf8(project.lock)
+        .with_context(|| format!("embedded Needle {} uv.lock is not UTF-8", project.name))?;
+    let lock: toml::Value = toml::from_str(lock_text)
+        .with_context(|| format!("parsing embedded Needle {} uv.lock", project.name))?;
+    ensure!(
+        lock.get("requires-python").and_then(toml::Value::as_str) == Some("==3.11.*"),
+        "embedded Needle {} uv.lock is not pinned to Python 3.11",
+        project.name
+    );
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .context("embedded Needle uv.lock has no package array")?;
+    let mut direct_versions = std::collections::BTreeMap::new();
+    for package in packages {
+        let table = package
+            .as_table()
+            .context("embedded Needle uv.lock package is not a table")?;
+        let name = table
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .context("embedded Needle uv.lock package has no name")?;
+        ensure!(
+            !matches!(
+                name,
+                "accelerate"
+                    | "cactus"
+                    | "datasets"
+                    | "jax"
+                    | "jaxlib"
+                    | "peft"
+                    | "tensorboard"
+                    | "trl"
+                    | "wandb"
+            ),
+            "embedded Needle {} lock contains forbidden runtime package {}",
+            project.name,
+            name
+        );
+        if matches!(
+            name,
+            "numpy" | "safetensors" | "sentencepiece" | "torch" | "transformers"
+        ) {
+            direct_versions.insert(
+                name,
+                table
+                    .get("version")
+                    .and_then(toml::Value::as_str)
+                    .context("embedded Needle lock package has no version")?,
+            );
+        }
+        let source = table
+            .get("source")
+            .and_then(toml::Value::as_table)
+            .context("embedded Needle uv.lock package has no source")?;
+        if let Some(registry) = source.get("registry").and_then(toml::Value::as_str) {
+            ensure!(
+                registry.starts_with("https://"),
+                "embedded Needle {} lock uses a non-HTTPS registry for {}",
+                project.name,
+                name
+            );
+            verify_locked_registry_artifacts(project.name, name, table)?;
+        } else {
+            ensure!(
+                source.get("virtual").is_some(),
+                "embedded Needle {} lock contains a non-registry dependency for {}",
+                project.name,
+                name
+            );
+        }
+    }
+    for (name, version) in [
+        ("numpy", "1.26.4"),
+        ("safetensors", "0.5.3"),
+        ("sentencepiece", "0.2.1"),
+        ("torch", project.torch_version),
+        ("transformers", "5.2.0"),
+    ] {
+        ensure!(
+            direct_versions.get(name).copied() == Some(version),
+            "embedded Needle {} lock does not contain {}=={}",
+            project.name,
+            name,
+            version
+        );
+    }
+
+    let mut runtime = Sha256::new();
+    runtime.update(b"mayhem/needle/runtime/v1\0");
+    runtime.update(project.name.as_bytes());
+    runtime.update(b"\0");
+    runtime.update(project.project_sha256.as_bytes());
+    runtime.update(b"\0");
+    runtime.update(project.lock_sha256.as_bytes());
+    Ok(format!("{:x}", runtime.finalize()))
+}
+
+struct TemporaryNeedleProject {
+    path: PathBuf,
+}
+
+impl TemporaryNeedleProject {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TemporaryNeedleProject {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn validate_existing_needle_runtime<F>(
+    venv: &Path,
+    runtime_sha256: &str,
+    validate_health: F,
+) -> Result<bool>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let metadata = match fs::symlink_metadata(venv) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("reading existing Needle environment {}", venv.display())
+            });
+        }
+    };
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "existing Needle environment {} is not a regular directory",
+        venv.display()
+    );
+
+    let marker = venv.join(".mayhem-needle-runtime-sha256");
+    let marker_metadata = match fs::symlink_metadata(&marker) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading Needle runtime marker {}", marker.display()));
+        }
+    };
+    ensure!(
+        marker_metadata.is_file() && !marker_metadata.file_type().is_symlink(),
+        "Needle runtime marker {} is not a regular file",
+        marker.display()
+    );
+    let actual = fs::read_to_string(&marker)
+        .with_context(|| format!("reading Needle runtime marker {}", marker.display()))?;
+    if actual.trim() != runtime_sha256 {
+        return Ok(false);
+    }
+
+    validate_health().with_context(|| {
+        format!(
+            "existing complete Needle environment {} is temporarily unhealthy; preserving it without reinstall",
+            venv.display()
+        )
+    })?;
+    Ok(true)
+}
+
+fn temporary_needle_install_project(
+    project: &NeedleUvProject,
+    cache_root: &Path,
+) -> Result<TemporaryNeedleProject> {
+    let projects = cache_root.join("uv-projects");
+    fs::create_dir_all(&projects)
+        .with_context(|| format!("creating Needle uv project root {}", projects.display()))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = projects.join(format!(
+        ".needle-{}.{}.{}.tmp",
+        project.name,
+        std::process::id(),
+        nonce
+    ));
+    fs::create_dir(&path)
+        .with_context(|| format!("creating disposable Needle project {}", path.display()))?;
+    let result = (|| {
+        materialize_embedded_regular_file(
+            &path.join("pyproject.toml"),
+            project.project,
+            project.project_sha256,
+            "Needle pyproject",
+        )?;
+        materialize_embedded_regular_file(
+            &path.join("uv.lock"),
+            project.lock,
+            project.lock_sha256,
+            "Needle uv.lock",
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&path);
+        return Err(error);
+    }
+    Ok(TemporaryNeedleProject { path })
+}
+
+fn cleanup_incomplete_needle_venv(venv: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(venv) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading incomplete Needle venv {}", venv.display()));
+        }
+    };
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "refusing to remove non-directory or symlink Needle venv {}",
+        venv.display()
+    );
+    fs::remove_dir_all(venv)
+        .with_context(|| format!("removing incomplete Needle venv {}", venv.display()))
+}
+
+fn validate_managed_needle_python(
+    python: &Path,
+    venv: &Path,
+    project: &NeedleUvProject,
+    device: NeedleDevice,
+    cache_root: &Path,
+    runtime_sha256: &str,
+    home: &Path,
+) -> Result<()> {
+    let marker = venv.join(".mayhem-needle-runtime-sha256");
+    let metadata = fs::symlink_metadata(&marker)
+        .with_context(|| format!("reading Needle runtime marker {}", marker.display()))?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "Needle runtime marker {} is not a regular file",
+        marker.display()
+    );
+    let actual = fs::read_to_string(&marker)
+        .with_context(|| format!("reading Needle runtime marker {}", marker.display()))?;
+    ensure!(
+        actual.trim() == runtime_sha256,
+        "managed Needle {} runtime identity changed",
+        project.name
+    );
+    check_needle_environment(home, venv, project, cache_root)?;
+    validate_needle_python(python, project, device, cache_root)
+}
+
+fn check_needle_environment(
+    home: &Path,
+    venv: &Path,
+    project: &NeedleUvProject,
+    cache_root: &Path,
+) -> Result<()> {
+    let uv = ensure_managed_uv(home)?;
+    let install_project = temporary_needle_install_project(project, cache_root)?;
+    let uv_cache = cache_root.join("uv");
+    fs::create_dir_all(&uv_cache)
+        .with_context(|| format!("creating uv cache directory {}", uv_cache.display()))?;
+    let check = Command::new(&uv)
+        .arg("sync")
+        .arg("--check")
+        .arg("--frozen")
+        .arg("--no-dev")
+        .arg("--no-install-project")
+        .arg("--project")
+        .arg(install_project.path())
+        .env("UV_PROJECT_ENVIRONMENT", venv)
+        .env("UV_CACHE_DIR", &uv_cache)
+        .env("UV_NO_PROGRESS", "1")
+        .env("UV_OFFLINE", "1")
+        .output()
+        .with_context(|| {
+            format!(
+                "checking Needle {} environment with {}",
+                project.name,
+                uv.display()
+            )
+        })?;
+    if check.status.success() {
+        return Ok(());
+    }
+    let detail = command_output_detail(&check);
+    if project.name == "cuda130-arm64" {
+        return check_needle_cuda_environment_with_malformed_cusparselt(
+            &uv,
+            venv,
+            project,
+            &install_project,
+            &uv_cache,
+        )
+        .with_context(|| {
+            format!(
+                "Needle {} environment failed its frozen uv check{}",
+                project.name,
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            )
+        });
+    }
+    bail!(
+        "Needle {} environment is not synchronized with its frozen uv.lock{}",
+        project.name,
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        }
+    )
+}
+
+fn check_needle_cuda_environment_with_malformed_cusparselt(
+    uv: &Path,
+    venv: &Path,
+    project: &NeedleUvProject,
+    install_project: &TemporaryNeedleProject,
+    uv_cache: &Path,
+) -> Result<()> {
+    let check = Command::new(uv)
+        .arg("sync")
+        .arg("--check")
+        .arg("--frozen")
+        .arg("--no-dev")
+        .arg("--no-install-project")
+        .arg("--no-install-package")
+        .arg("nvidia-cusparselt-cu13")
+        .arg("--inexact")
+        .arg("--project")
+        .arg(install_project.path())
+        .env("UV_PROJECT_ENVIRONMENT", venv)
+        .env("UV_CACHE_DIR", uv_cache)
+        .env("UV_NO_PROGRESS", "1")
+        .env("UV_OFFLINE", "1")
+        .output()
+        .context("checking the frozen Needle CUDA environment around NVIDIA's malformed wheel")?;
+    ensure!(
+        check.status.success(),
+        "Needle CUDA environment differs from its lock beyond nvidia-cusparselt-cu13: {}",
+        command_output_detail(&check)
+    );
+
+    let listed = Command::new(uv)
+        .arg("pip")
+        .arg("list")
+        .arg("--python")
+        .arg(venv_python(venv))
+        .arg("--format")
+        .arg("json")
+        .env("UV_CACHE_DIR", uv_cache)
+        .env("UV_OFFLINE", "1")
+        .output()
+        .context("listing installed Needle CUDA distributions")?;
+    ensure!(
+        listed.status.success(),
+        "listing installed Needle CUDA distributions failed: {}",
+        command_output_detail(&listed)
+    );
+    let values: Vec<serde_json::Value> =
+        serde_json::from_slice(&listed.stdout).context("parsing Needle CUDA distribution list")?;
+    let mut actual = std::collections::BTreeMap::new();
+    for value in values {
+        let name = value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .context("installed Needle CUDA distribution has no name")?;
+        let version = value
+            .get("version")
+            .and_then(serde_json::Value::as_str)
+            .context("installed Needle CUDA distribution has no version")?;
+        ensure!(
+            actual
+                .insert(normalize_python_distribution_name(name), version.to_owned())
+                .is_none(),
+            "Needle CUDA environment contains a duplicate distribution named {name}"
+        );
+    }
+    let expected = needle_cuda_expected_distributions(project)?;
+    ensure!(
+        actual == expected,
+        "Needle CUDA environment distribution set differs from its frozen lock"
+    );
+
+    let version = expected
+        .get("nvidia-cusparselt-cu13")
+        .context("Needle CUDA lock has no nvidia-cusparselt-cu13 distribution")?;
+    let wheel = venv
+        .join("lib/python3.11/site-packages")
+        .join(format!("nvidia_cusparselt_cu13-{version}.dist-info/WHEEL"));
+    let metadata = fs::symlink_metadata(&wheel).with_context(|| {
+        format!(
+            "inspecting malformed NVIDIA wheel metadata {}",
+            wheel.display()
+        )
+    })?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "malformed NVIDIA wheel metadata must be a regular non-symlink file"
+    );
+    let wheel =
+        fs::read_to_string(&wheel).context("reading malformed NVIDIA cuSPARSELt wheel metadata")?;
+    let tags = wheel
+        .lines()
+        .filter_map(|line| line.strip_prefix("Tag: "))
+        .collect::<Vec<_>>();
+    ensure!(
+        tags == ["py3-none-manylinux2014_sbsa"],
+        "nvidia-cusparselt-cu13 no longer has the one publisher tag defect covered by this verifier"
+    );
+    Ok(())
+}
+
+fn needle_cuda_expected_distributions(
+    project: &NeedleUvProject,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let lock_text =
+        std::str::from_utf8(project.lock).context("embedded Needle CUDA uv.lock is not UTF-8")?;
+    let lock: toml::Value =
+        toml::from_str(lock_text).context("parsing embedded Needle CUDA uv.lock")?;
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .context("embedded Needle CUDA uv.lock has no package array")?;
+    let mut expected = std::collections::BTreeMap::new();
+    for package in packages {
+        let table = package
+            .as_table()
+            .context("embedded Needle CUDA package is not a table")?;
+        let source = table
+            .get("source")
+            .and_then(toml::Value::as_table)
+            .context("embedded Needle CUDA package has no source")?;
+        if source.get("virtual").is_some() {
+            continue;
+        }
+        let name = table
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .context("embedded Needle CUDA package has no name")?;
+        // The CUDA runtime is Linux ARM64; this is the lock's sole Windows-only package.
+        if name == "colorama" {
+            continue;
+        }
+        let version = table
+            .get("version")
+            .and_then(toml::Value::as_str)
+            .context("embedded Needle CUDA package has no version")?;
+        ensure!(
+            expected
+                .insert(normalize_python_distribution_name(name), version.to_owned())
+                .is_none(),
+            "embedded Needle CUDA lock has duplicate package {name}"
+        );
+    }
+    Ok(expected)
+}
+
+fn normalize_python_distribution_name(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    let mut separator = false;
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator && !normalized.is_empty() {
+                normalized.push('-');
+            }
+            normalized.push(character.to_ascii_lowercase());
+            separator = false;
+        } else {
+            separator = true;
+        }
+    }
+    normalized
+}
+
+fn needle_validation_script(project: &NeedleUvProject, device: NeedleDevice) -> Result<String> {
+    let expected_versions = serde_json::to_string(&[
+        ("numpy", "1.26.4"),
+        ("safetensors", "0.5.3"),
+        ("sentencepiece", "0.2.1"),
+        ("torch", project.torch_version),
+        ("transformers", "5.2.0"),
+    ])?;
+    let device_check = match device {
+        NeedleDevice::Cpu => "assert device == 'cpu'".to_owned(),
+        NeedleDevice::Cuda => {
+            let cuda_version = project
+                .cuda_version
+                .context("Needle CUDA device selected with a non-CUDA runtime")?;
+            let min_capability = project
+                .min_cuda_compute_capability
+                .context("Needle CUDA runtime has no minimum compute capability")?;
+            format!(
+                "assert device == 'cuda'; assert torch.cuda.is_available(), 'frozen Needle CUDA runtime cannot access a CUDA device'; assert torch.version.cuda == {cuda_version:?}, f'expected CUDA {cuda_version}, got {{torch.version.cuda}}'; capability=torch.cuda.get_device_capability(0); assert capability >= {min_capability:?}, f'Needle CUDA runtime requires compute capability >= {major}.{minor}, got {{capability}}'",
+                major = min_capability.0,
+                minor = min_capability.1,
+            )
+        }
+    };
+    Ok(format!(
+        "import importlib,importlib.metadata as m,os,sys; assert sys.version_info[:2] == (3,11), sys.version; expected=dict({expected_versions}); mismatched=[f'{{name}}={{m.version(name)}} (expected {{version}})' for name,version in expected.items() if m.version(name) != version]; assert not mismatched, '; '.join(mismatched); modules={{name:importlib.import_module(name) for name in ['numpy','safetensors','sentencepiece','torch','transformers']}}; torch=modules['torch']; device={:?}; {device_check}; assert os.environ.get('HF_HUB_OFFLINE') == '1'; assert os.environ.get('TRANSFORMERS_OFFLINE') == '1'; print('__MAYHEM_NEEDLE_RUNTIME__=' + m.version('torch') + '/' + device)",
+        needle_device_name(device)
+    ))
+}
+
+fn validate_needle_python(
+    python: &Path,
+    project: &NeedleUvProject,
+    device: NeedleDevice,
+    cache_root: &Path,
+) -> Result<()> {
+    let script = needle_validation_script(project, device)?;
+    const MARKER: &str = "__MAYHEM_NEEDLE_RUNTIME__=";
+    let mut command = Command::new(python);
+    configure_validation_cache(&mut command, cache_root)?;
+    configure_offline_validation(&mut command);
+    let output = command
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .with_context(|| format!("starting {}", python.display()))?;
+    if !output.status.success() {
+        let detail = command_output_detail(&output);
+        bail!(
+            "{} could not validate the frozen Needle {}/{} runtime{}",
+            python.display(),
+            project.name,
+            needle_device_name(device),
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        );
+    }
+    ensure!(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim().starts_with(MARKER)),
+        "{} validated Needle but did not emit its runtime marker",
+        python.display()
+    );
+    Ok(())
+}
+
+fn write_needle_runtime_marker(venv: &Path, runtime_sha256: &str) -> Result<()> {
+    let marker = venv.join(".mayhem-needle-runtime-sha256");
+    let bytes = format!("{runtime_sha256}\n");
+    let expected = format!("{:x}", Sha256::digest(bytes.as_bytes()));
+    materialize_embedded_regular_file(
+        &marker,
+        bytes.as_bytes(),
+        &expected,
+        "Needle runtime marker",
+    )
 }
 
 fn cleanup_incomplete_chatterbox_venv(venv: &Path) -> Result<()> {
@@ -2566,6 +3633,265 @@ mod tests {
         assert!(select_chatterbox_runtime_flavor(Some("mps"), true, "linux", "aarch64").is_err());
         assert!(select_chatterbox_runtime_flavor(Some("auto"), false, "macos", "x86_64").is_err());
         assert!(select_chatterbox_runtime_flavor(Some("bogus"), false, "linux", "x86_64").is_err());
+    }
+
+    #[test]
+    fn needle_uv_projects_are_frozen_hashed_and_minimal() {
+        assert_eq!(NEEDLE_PYTHON_VERSION, "3.11");
+        let mut runtime_ids = BTreeSet::new();
+        for (flavor, torch_version, cuda_version, index) in [
+            (NeedleRuntimeFlavor::CpuArm64, "2.9.1", None, None),
+            (
+                NeedleRuntimeFlavor::CpuX86,
+                "2.9.1+cpu",
+                None,
+                Some("https://download.pytorch.org/whl/cpu"),
+            ),
+            (
+                NeedleRuntimeFlavor::Cuda130Arm64,
+                "2.9.1+cu130",
+                Some("13.0"),
+                Some("https://download.pytorch.org/whl/cu130"),
+            ),
+            (
+                NeedleRuntimeFlavor::Cuda130X86,
+                "2.9.1+cu130",
+                Some("13.0"),
+                Some("https://download.pytorch.org/whl/cu130"),
+            ),
+        ] {
+            let project = needle_uv_project(flavor);
+            assert_eq!(project.torch_version, torch_version);
+            assert_eq!(project.cuda_version, cuda_version);
+            assert!(!project.project.contains(&b'\r') && !project.lock.contains(&b'\r'));
+            let project_text = std::str::from_utf8(project.project).unwrap();
+            for dependency in [
+                "numpy==1.26.4",
+                "safetensors==0.5.3",
+                "sentencepiece==0.2.1",
+                "transformers==5.2.0",
+            ] {
+                assert!(project_text.contains(dependency));
+            }
+            for forbidden in [
+                "accelerate",
+                "cactus",
+                "datasets",
+                "jax",
+                "peft",
+                "tensorboard",
+                "trl",
+                "wandb",
+            ] {
+                assert!(!project_text.contains(forbidden));
+            }
+            if let Some(index) = index {
+                assert!(project_text.contains(index));
+            }
+            let lock_text = std::str::from_utf8(project.lock).unwrap();
+            match flavor {
+                NeedleRuntimeFlavor::Cuda130Arm64 => {
+                    assert!(lock_text
+                        .contains("torch-2.9.1%2Bcu130-cp311-cp311-manylinux_2_28_aarch64.whl"));
+                }
+                NeedleRuntimeFlavor::Cuda130X86 => {
+                    assert!(lock_text
+                        .contains("torch-2.9.1%2Bcu130-cp311-cp311-manylinux_2_28_x86_64.whl"));
+                    assert!(lock_text.contains("torch-2.9.1%2Bcu130-cp311-cp311-win_amd64.whl"));
+                }
+                NeedleRuntimeFlavor::CpuArm64 | NeedleRuntimeFlavor::CpuX86 => {}
+            }
+            let runtime_id = verify_needle_uv_project(&project).unwrap();
+            assert_eq!(runtime_id.len(), 64);
+            assert!(runtime_ids.insert(runtime_id));
+        }
+
+        let mut tampered = needle_uv_project(NeedleRuntimeFlavor::CpuArm64);
+        tampered.project_sha256 =
+            "0000000000000000000000000000000000000000000000000000000000000000";
+        assert!(verify_needle_uv_project(&tampered)
+            .unwrap_err()
+            .to_string()
+            .contains("pyproject checksum mismatch"));
+    }
+
+    #[test]
+    fn needle_runtime_selection_tracks_device_and_platform() {
+        assert_eq!(normalize_explicit_needle_device(" CPU ").unwrap(), "cpu");
+        assert_eq!(normalize_explicit_needle_device("GPU").unwrap(), "gpu");
+        assert_eq!(normalize_explicit_needle_device("cuda").unwrap(), "cuda");
+        assert!(normalize_explicit_needle_device("MPS").is_err());
+        assert!(normalize_explicit_needle_device("auto").is_err());
+        assert!(normalize_explicit_needle_device("bogus").is_err());
+        assert_eq!(
+            select_needle_runtime(Some("auto"), false, "macos", "aarch64").unwrap(),
+            NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::CpuArm64,
+                device: NeedleDevice::Cpu,
+            }
+        );
+        assert!(select_needle_runtime(Some("gpu"), false, "macos", "aarch64").is_err());
+        assert_eq!(
+            select_needle_runtime(Some("cpu"), false, "macos", "aarch64").unwrap(),
+            NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::CpuArm64,
+                device: NeedleDevice::Cpu,
+            }
+        );
+        assert_eq!(
+            select_needle_runtime(Some("auto"), true, "linux", "aarch64").unwrap(),
+            NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::Cuda130Arm64,
+                device: NeedleDevice::Cuda,
+            }
+        );
+        assert_eq!(
+            select_needle_runtime(Some("auto"), false, "linux", "aarch64").unwrap(),
+            NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::CpuArm64,
+                device: NeedleDevice::Cpu,
+            }
+        );
+        assert_eq!(
+            select_needle_runtime(Some("cpu"), true, "linux", "x86_64").unwrap(),
+            NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::CpuX86,
+                device: NeedleDevice::Cpu,
+            }
+        );
+        assert_eq!(
+            select_needle_runtime(Some("auto"), true, "linux", "x86_64").unwrap(),
+            NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::Cuda130X86,
+                device: NeedleDevice::Cuda,
+            }
+        );
+        assert!(select_needle_runtime(Some("cuda"), false, "linux", "aarch64").is_err());
+        assert!(select_needle_runtime(Some("gpu"), false, "linux", "x86_64").is_err());
+        assert_eq!(
+            select_needle_runtime(Some("gpu"), true, "linux", "x86_64").unwrap(),
+            NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::Cuda130X86,
+                device: NeedleDevice::Cuda,
+            }
+        );
+        assert!(select_needle_runtime(Some("mps"), true, "linux", "aarch64").is_err());
+        assert_eq!(
+            select_needle_runtime(Some("cpu"), false, "windows", "x86_64").unwrap(),
+            NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::CpuX86,
+                device: NeedleDevice::Cpu,
+            }
+        );
+        assert_eq!(
+            select_needle_runtime(Some("auto"), true, "windows", "x86_64").unwrap(),
+            NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::Cuda130X86,
+                device: NeedleDevice::Cuda,
+            }
+        );
+        assert_eq!(
+            select_needle_runtime(Some("gpu"), true, "windows", "x86_64").unwrap(),
+            NeedleRuntimeSelection {
+                flavor: NeedleRuntimeFlavor::Cuda130X86,
+                device: NeedleDevice::Cuda,
+            }
+        );
+        assert!(select_needle_runtime(Some("gpu"), false, "windows", "x86_64").is_err());
+        assert!(select_needle_runtime(Some("bogus"), false, "linux", "aarch64").is_err());
+    }
+
+    #[test]
+    fn needle_validation_is_device_specific_and_offline() {
+        let cpu = needle_validation_script(
+            &needle_uv_project(NeedleRuntimeFlavor::CpuArm64),
+            NeedleDevice::Cpu,
+        )
+        .unwrap();
+        assert!(cpu.contains("device == 'cpu'"));
+        assert!(!cpu.contains("get_device_capability"));
+
+        let cuda = needle_validation_script(
+            &needle_uv_project(NeedleRuntimeFlavor::Cuda130Arm64),
+            NeedleDevice::Cuda,
+        )
+        .unwrap();
+        assert!(cuda.contains("torch.cuda.is_available()"));
+        assert!(cuda.contains("expected CUDA 13.0"));
+        assert!(cuda.contains("get_device_capability"));
+
+        assert!(cuda.contains("compute capability >= 7.5"));
+        for script in [&cpu, &cuda] {
+            assert!(script.contains("HF_HUB_OFFLINE"));
+            assert!(script.contains("TRANSFORMERS_OFFLINE"));
+            assert!(script.contains("sentencepiece"));
+        }
+    }
+
+    #[test]
+    fn needle_uv_project_materialization_is_transactional() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "mayhem-needle-project-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let cache = root.join("cache");
+        let project = needle_uv_project(NeedleRuntimeFlavor::CpuArm64);
+        let materialized = temporary_needle_install_project(&project, &cache).unwrap();
+        assert_eq!(
+            file_sha256(&materialized.path().join("pyproject.toml")).unwrap(),
+            project.project_sha256
+        );
+        assert_eq!(
+            file_sha256(&materialized.path().join("uv.lock")).unwrap(),
+            project.lock_sha256
+        );
+        let materialized_path = materialized.path().to_path_buf();
+        drop(materialized);
+        assert!(!materialized_path.exists());
+
+        let partial_venv = root.join("partial-venv");
+        fs::create_dir_all(partial_venv.join("nested")).unwrap();
+        fs::write(partial_venv.join("nested/partial.whl"), b"partial").unwrap();
+        cleanup_incomplete_needle_venv(&partial_venv).unwrap();
+        assert!(!partial_venv.exists());
+        cleanup_incomplete_needle_venv(&partial_venv).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn complete_needle_runtime_is_preserved_when_health_validation_is_transiently_unavailable() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "mayhem-needle-runtime-health-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let venv = root.join("venv");
+        fs::create_dir_all(&venv).unwrap();
+        let runtime_sha256 =
+            verify_needle_uv_project(&needle_uv_project(NeedleRuntimeFlavor::CpuArm64)).unwrap();
+        write_needle_runtime_marker(&venv, &runtime_sha256).unwrap();
+        let sentinel = venv.join("installed-package.sentinel");
+        fs::write(&sentinel, b"complete").unwrap();
+
+        let error = validate_existing_needle_runtime(&venv, &runtime_sha256, || {
+            bail!("runtime health check is temporarily unavailable")
+        })
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("temporarily unhealthy; preserving it without reinstall"));
+        assert!(venv.exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"complete");
+        assert!(venv.join(".mayhem-needle-runtime-sha256").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
