@@ -63550,8 +63550,12 @@ impl std::fmt::Display for ProviderSessionOutputError {
 
 impl std::error::Error for ProviderSessionOutputError {}
 
+fn provider_session_request_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ProviderSessionRequestError(message.into()))
+}
+
 fn provider_session_request_result<T>(result: Result<T>) -> Result<T> {
-    result.map_err(|error| anyhow::Error::new(ProviderSessionRequestError(format!("{error:#}"))))
+    result.map_err(|error| provider_session_request_error(format!("{error:#}")))
 }
 
 fn provider_session_output_error(message: impl Into<String>) -> anyhow::Error {
@@ -64775,7 +64779,7 @@ fn provider_request_speciality_selection(
                 )
             })?;
         let submitted = provider_request_path_value(body, &mapping.request_path);
-        let level =
+        let selection =
             mayhem_proto::endpoint_speciality_level_for_request(descriptor, mapping, submitted)
                 .with_context(|| {
                     format!(
@@ -64785,7 +64789,12 @@ fn provider_request_speciality_selection(
                             .map(Value::to_string)
                             .unwrap_or_else(|| descriptor.default_level.clone())
                     )
-                })?;
+                });
+        let level = if submitted.is_some() {
+            provider_session_request_result(selection)?
+        } else {
+            selection?
+        };
         selected.insert(descriptor.name.clone(), level.name.clone());
     }
     Ok(selected)
@@ -65115,19 +65124,22 @@ fn validate_provider_session_request_modalities(
     body: &Value,
 ) -> Result<BTreeMap<String, u32>> {
     let verified = provider_verify_endpoint_request(body, Some(&terms.model_id), &terms.adapter)?;
-    validate_provider_session_modalities(&active.required_modalities, &terms.served_modalities)?;
-    validate_provider_session_specialities(
+    provider_session_request_result(validate_provider_session_modalities(
+        &active.required_modalities,
+        &terms.served_modalities,
+    ))?;
+    provider_session_request_result(validate_provider_session_specialities(
         &active.required_specialities,
         &terms.served_specialities,
-    )?;
+    ))?;
     let actual_specialities =
         provider_request_speciality_selection(verified.family, verified.request, &terms.adapter)?;
-    ensure!(
-        actual_specialities == active.required_specialities,
-        "request specialities {:?} do not match signed voucher specialities {:?}",
-        actual_specialities,
-        active.required_specialities
-    );
+    if actual_specialities != active.required_specialities {
+        return Err(provider_session_request_error(format!(
+            "request specialities {:?} do not match signed voucher specialities {:?}",
+            actual_specialities, active.required_specialities
+        )));
+    }
     let load = provider_session_modality_load(
         verified.contract,
         verified.family,
@@ -65142,35 +65154,42 @@ fn validate_provider_session_request_modalities(
         &load,
     )?;
     if actual != active.required_modalities {
-        bail!(
+        return Err(provider_session_request_error(format!(
             "request modalities {:?} do not match signed voucher modalities {:?}",
-            actual,
-            active.required_modalities
-        );
+            actual, active.required_modalities
+        )));
     }
     for modality in actual.iter().filter(|modality| modality.as_str() != "text") {
         let request = load
             .get(modality)
-            .with_context(|| format!("request has no measured {modality} load"))?;
+            .with_context(|| format!("provider failed to measure {modality} request load"))?;
         let capacity = terms
             .modality_capacities
             .get(modality)
             .with_context(|| format!("provider has no advertised {modality} capacity"))?;
         ensure!(
-            request.item_count > 0
-                && request.item_count <= capacity.max_items_per_request
-                && request.max_item_bytes > 0
-                && request.max_item_bytes <= capacity.max_item_bytes
-                && request.max_item_units > 0
-                && request.max_item_units <= capacity.max_item_units,
-            "request exceeds provider {modality} capacity: items {} of {}, bytes {} of {}, units {} of {}",
-            request.item_count,
-            capacity.max_items_per_request,
-            request.max_item_bytes,
-            capacity.max_item_bytes,
-            request.max_item_units,
-            capacity.max_item_units
+            capacity.max_items_per_request > 0
+                && capacity.max_item_bytes > 0
+                && capacity.max_item_units > 0,
+            "provider advertised invalid zero-valued {modality} request capacity"
         );
+        if request.item_count == 0
+            || request.item_count > capacity.max_items_per_request
+            || request.max_item_bytes == 0
+            || request.max_item_bytes > capacity.max_item_bytes
+            || request.max_item_units == 0
+            || request.max_item_units > capacity.max_item_units
+        {
+            return Err(provider_session_request_error(format!(
+                "request exceeds provider {modality} capacity: items {} of {}, bytes {} of {}, units {} of {}",
+                request.item_count,
+                capacity.max_items_per_request,
+                request.max_item_bytes,
+                capacity.max_item_bytes,
+                request.max_item_units,
+                capacity.max_item_units
+            )));
+        }
     }
     Ok(load
         .into_iter()
@@ -65228,7 +65247,7 @@ fn provider_session_modality_load(
 ) -> Result<BTreeMap<String, ModalityRequestLoad>> {
     match provider_endpoint_transport_kind(family)? {
         "chat" => {
-            let media = provider_chat_media_stats(body)?;
+            let media = provider_session_request_result(provider_chat_media_stats(body))?;
             let mut load = BTreeMap::new();
             if media.image_count > 0 {
                 load.insert(
@@ -65263,7 +65282,8 @@ fn provider_session_modality_load(
             Ok(load)
         }
         "embedding" => {
-            let inputs = provider_embedding_input_texts_from_body(body)?;
+            let inputs =
+                provider_session_request_result(provider_embedding_input_texts_from_body(body))?;
             let max_item_bytes = inputs
                 .iter()
                 .map(|input| u64::try_from(input.len()).unwrap_or(u64::MAX))
@@ -65286,7 +65306,9 @@ fn provider_session_modality_load(
             )]))
         }
         "image_generation" => {
-            let request = provider_image_generation_request_from_body(family, body)?;
+            let request = provider_session_request_result(
+                provider_image_generation_request_from_body(family, body),
+            )?;
             Ok(BTreeMap::from([(
                 "image".to_owned(),
                 ModalityRequestLoad {
@@ -65298,8 +65320,9 @@ fn provider_session_modality_load(
             )]))
         }
         "audio_transcription" => {
-            let request =
-                provider_audio_transcription_request_from_body(family, body, transport_body)?;
+            let request = provider_session_request_result(
+                provider_audio_transcription_request_from_body(family, body, transport_body),
+            )?;
             Ok(BTreeMap::from([(
                 "audio".to_owned(),
                 ModalityRequestLoad {
@@ -65312,7 +65335,8 @@ fn provider_session_modality_load(
             )]))
         }
         "audio_speech" => {
-            let request = provider_speech_request_from_body(family, body)?;
+            let request =
+                provider_session_request_result(provider_speech_request_from_body(family, body))?;
             let estimated_seconds = u64::try_from(request.input.chars().count())
                 .unwrap_or(u64::MAX)
                 .div_ceil(12)
@@ -65337,17 +65361,21 @@ fn provider_session_modality_load(
             )]))
         }
         "video_generation" => {
-            let request = provider_media_generation_request_from_body(family, body)?;
+            let request = provider_session_request_result(
+                provider_media_generation_request_from_body(family, body),
+            )?;
             let (duration_seconds, frames) = provider_video_output_expectation(contract, &request)?;
-            let output_item_count = request
-                .request
-                .get("n")
-                .and_then(Value::as_u64)
-                .map(u32::try_from)
-                .transpose()
-                .context("video generation n overflowed u32")?
-                .unwrap_or(1)
-                .max(1);
+            let output_item_count = provider_session_request_result(
+                request
+                    .request
+                    .get("n")
+                    .and_then(Value::as_u64)
+                    .map(u32::try_from)
+                    .transpose()
+                    .context("video generation n overflowed u32"),
+            )?
+            .unwrap_or(1)
+            .max(1);
             let mut load = BTreeMap::from([(
                 "video".to_owned(),
                 ModalityRequestLoad {
@@ -65366,24 +65394,31 @@ fn provider_session_modality_load(
                     },
                 );
             }
-            if let Some(image_load) = provider_video_conditioning_image_load(body)? {
+            if let Some(image_load) =
+                provider_session_request_result(provider_video_conditioning_image_load(body))?
+            {
                 load.insert("image".to_owned(), image_load);
             }
             Ok(load)
         }
         "audio_generation" | "music_generation" => {
-            let request = provider_media_generation_request_from_body(family, body)?;
-            let output_item_count = request
-                .request
-                .get("n")
-                .and_then(Value::as_u64)
-                .map(u32::try_from)
-                .transpose()
-                .context("media generation n overflowed u32")?
-                .unwrap_or(1)
-                .max(1);
-            let inline_audio = artifact_generation_inline_audio_load(&request.request)
-                .map_err(anyhow::Error::msg)?;
+            let request = provider_session_request_result(
+                provider_media_generation_request_from_body(family, body),
+            )?;
+            let output_item_count = provider_session_request_result(
+                request
+                    .request
+                    .get("n")
+                    .and_then(Value::as_u64)
+                    .map(u32::try_from)
+                    .transpose()
+                    .context("media generation n overflowed u32"),
+            )?
+            .unwrap_or(1)
+            .max(1);
+            let inline_audio = provider_session_request_result(
+                artifact_generation_inline_audio_load(&request.request).map_err(anyhow::Error::msg),
+            )?;
             let item_count = output_item_count.max(inline_audio.item_count);
             let max_item_units = request
                 .duration_seconds
@@ -66098,20 +66133,22 @@ async fn handle_provider_session_frame(
                     provider_session_debug(format!(
                             "request modality/capacity validation failed for session {session_id}: {err:#}"
                         ));
+                    let error_code = provider_response_error_code(&err);
+                    let error_message = provider_response_error_message(&err);
                     send_provider_session_error(
                         bridge,
                         &active.remote,
                         &active.session_id,
                         request_id,
-                        "modality_capacity",
-                        &err.to_string(),
+                        error_code,
+                        &error_message,
                     )
                     .await?;
                     send_provider_session_close(
                         bridge,
                         &active.remote,
                         &active.session_id,
-                        "err:modality_capacity",
+                        &format!("err:{error_code}"),
                     )
                     .await?;
                     sessions.remove(&session_id);
@@ -72539,90 +72576,111 @@ fn provider_verify_endpoint_request<'a>(
     expected_model_id: Option<&str>,
     adapter: &'a catalog::CatalogAdapter,
 ) -> Result<ProviderVerifiedEndpointRequest<'a>> {
-    let metadata = transport_body
-        .get("mayhem_contract")
-        .and_then(Value::as_object)
-        .context("provider request missing mayhem_contract envelope")?;
-    ensure!(
-        metadata.get("schema_version").and_then(Value::as_u64) == Some(1),
-        "provider request has unsupported mayhem_contract schema_version"
-    );
-    let family = metadata
-        .get("endpoint_family")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-        .context("provider request missing endpoint_family")?;
+    let metadata = provider_session_request_result(
+        transport_body
+            .get("mayhem_contract")
+            .and_then(Value::as_object)
+            .context("provider request missing mayhem_contract envelope"),
+    )?;
+    if metadata.get("schema_version").and_then(Value::as_u64) != Some(1) {
+        return Err(provider_session_request_error(
+            "provider request has unsupported mayhem_contract schema_version",
+        ));
+    }
+    let family = provider_session_request_result(
+        metadata
+            .get("endpoint_family")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .context("provider request missing endpoint_family"),
+    )?;
     let contract = adapter
         .endpoint_families
         .iter()
         .find(|contract| contract.family == family)
         .with_context(|| format!("provider model does not expose endpoint family {family}"))?;
-    let declared_contract_fingerprint = metadata
-        .get("endpoint_contract_fingerprint")
-        .and_then(Value::as_str)
-        .context("provider request missing endpoint contract fingerprint")?;
-    ensure!(
-        declared_contract_fingerprint == mayhem_proto::endpoint_contract_fingerprint(contract),
-        "provider request endpoint contract fingerprint does not match the local signed catalog"
-    );
-    let request = transport_body
-        .get("contract_request")
-        .context("provider request missing normalized contract_request")?;
-    let declared_request_fingerprint = metadata
-        .get("normalized_request_fingerprint")
-        .and_then(Value::as_str)
-        .context("provider request missing normalized request fingerprint")?;
-    ensure!(
-        declared_request_fingerprint == mayhem_proto::endpoint_request_fingerprint(request),
-        "provider normalized request fingerprint mismatch"
-    );
+    let declared_contract_fingerprint = provider_session_request_result(
+        metadata
+            .get("endpoint_contract_fingerprint")
+            .and_then(Value::as_str)
+            .context("provider request missing endpoint contract fingerprint"),
+    )?;
+    if declared_contract_fingerprint != mayhem_proto::endpoint_contract_fingerprint(contract) {
+        return Err(provider_session_request_error(
+            "provider request endpoint contract fingerprint does not match the local signed catalog",
+        ));
+    }
+    let request = provider_session_request_result(
+        transport_body
+            .get("contract_request")
+            .context("provider request missing normalized contract_request"),
+    )?;
+    let declared_request_fingerprint = provider_session_request_result(
+        metadata
+            .get("normalized_request_fingerprint")
+            .and_then(Value::as_str)
+            .context("provider request missing normalized request fingerprint"),
+    )?;
+    if declared_request_fingerprint != mayhem_proto::endpoint_request_fingerprint(request) {
+        return Err(provider_session_request_error(
+            "provider normalized request fingerprint mismatch",
+        ));
+    }
     let mut transport = transport_body.clone();
     if let Some(object) = transport.as_object_mut() {
         object.remove("mayhem_contract");
         object.remove("contract_request");
     }
-    let declared_transport_fingerprint = metadata
-        .get("transport_request_fingerprint")
-        .and_then(Value::as_str)
-        .context("provider request missing transport request fingerprint")?;
-    ensure!(
-        declared_transport_fingerprint == stable_value_hash(&transport),
-        "provider transport request fingerprint mismatch"
-    );
-    mayhem_proto::validate_endpoint_request(contract, request).map_err(|violations| {
-        anyhow::anyhow!(
-            "provider request violates signed endpoint contract: {}",
-            violations
-                .iter()
-                .take(4)
-                .map(|violation| format!("{}: {}", violation.path, violation.reason))
-                .collect::<Vec<_>>()
-                .join("; ")
-        )
-    })?;
+    let declared_transport_fingerprint = provider_session_request_result(
+        metadata
+            .get("transport_request_fingerprint")
+            .and_then(Value::as_str)
+            .context("provider request missing transport request fingerprint"),
+    )?;
+    if declared_transport_fingerprint != stable_value_hash(&transport) {
+        return Err(provider_session_request_error(
+            "provider transport request fingerprint mismatch",
+        ));
+    }
+    provider_session_request_result(
+        mayhem_proto::validate_endpoint_request(contract, request).map_err(|violations| {
+            anyhow::anyhow!(
+                "provider request violates signed endpoint contract: {}",
+                violations
+                    .iter()
+                    .take(4)
+                    .map(|violation| format!("{}: {}", violation.path, violation.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        }),
+    )?;
     let request_with_defaults =
         mayhem_proto::materialize_endpoint_request_defaults(contract, request)
             .map_err(anyhow::Error::msg)?;
-    ensure!(
-        &request_with_defaults == request,
-        "provider request omitted an admin-signed endpoint default"
-    );
+    if &request_with_defaults != request {
+        return Err(provider_session_request_error(
+            "provider request omitted an admin-signed endpoint default",
+        ));
+    }
     if let Some(expected_model_id) = expected_model_id.filter(|_| {
         contract
             .request_attributes
             .iter()
             .any(|path| path == "model")
     }) {
-        ensure!(
-            request.get("model").and_then(Value::as_str) == Some(expected_model_id),
-            "provider request model does not match the loaded canonical model"
-        );
+        if request.get("model").and_then(Value::as_str) != Some(expected_model_id) {
+            return Err(provider_session_request_error(
+                "provider request model does not match the loaded canonical model",
+            ));
+        }
     }
-    ensure!(
-        transport_body.get("kind").and_then(Value::as_str)
-            == Some(provider_endpoint_transport_kind(family)?),
-        "provider request transport kind does not match endpoint family {family}"
-    );
+    let transport_kind = provider_endpoint_transport_kind(family)?;
+    if transport_body.get("kind").and_then(Value::as_str) != Some(transport_kind) {
+        return Err(provider_session_request_error(format!(
+            "provider request transport kind does not match endpoint family {family}"
+        )));
+    }
     Ok(ProviderVerifiedEndpointRequest {
         family,
         request,
@@ -72975,20 +73033,25 @@ fn provider_protocol_prompt_tokens(
     if !tools_required {
         return Ok(None);
     }
-    ensure!(
-        request
-            .get("tools")
-            .and_then(Value::as_array)
-            .is_some_and(|tools| !tools.is_empty()),
-        "signed tools-only endpoint requires at least one normalized tool"
-    );
-    let prompt_tokens = tools_only_model_input_prompt_units(&contract.family, request)
-        .map_err(anyhow::Error::msg)
-        .context("metering tools-only provider model input")?;
-    ensure!(
-        prompt_tokens > 0,
-        "tools-only provider model input produced zero prompt units"
-    );
+    if !request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        return Err(provider_session_request_error(
+            "signed tools-only endpoint requires at least one normalized tool",
+        ));
+    }
+    let prompt_tokens = provider_session_request_result(
+        tools_only_model_input_prompt_units(&contract.family, request)
+            .map_err(anyhow::Error::msg)
+            .context("metering tools-only provider model input"),
+    )?;
+    if prompt_tokens == 0 {
+        return Err(provider_session_request_error(
+            "tools-only provider model input produced zero prompt units",
+        ));
+    }
     Ok(Some(prompt_tokens))
 }
 
@@ -73003,17 +73066,10 @@ fn provider_engine_session_response_with_sampling_bounded(
     cancellation: &CancellationToken,
 ) -> Result<ProviderSessionOutput> {
     cancellation.check().context("provider request cancelled")?;
-    let verified = provider_session_request_result(provider_verify_endpoint_request(
-        body,
-        expected_model_id,
-        adapter,
-    ))?;
+    let verified = provider_verify_endpoint_request(body, expected_model_id, adapter)?;
     let endpoint_family = verified.family;
     let request_body = verified.request;
-    let protocol_prompt_tokens = provider_session_request_result(provider_protocol_prompt_tokens(
-        verified.contract,
-        request_body,
-    ))?;
+    let protocol_prompt_tokens = provider_protocol_prompt_tokens(verified.contract, request_body)?;
     if matches!(
         endpoint_family,
         mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS
@@ -73163,15 +73219,14 @@ fn provider_engine_session_response_with_sampling_bounded(
         let mut request = provider_session_request_result(
             provider_media_generation_request_from_body(endpoint_family, request_body),
         )?;
-        let (expected_duration, expected_frames) = provider_session_request_result(
-            provider_video_output_expectation(verified.contract, &request),
-        )?;
+        let (expected_duration, expected_frames) =
+            provider_video_output_expectation(verified.contract, &request)?;
         request.frame_count = Some(expected_frames);
-        provider_session_request_result(provider_canonicalize_video_engine_request(
+        provider_canonicalize_video_engine_request(
             verified.contract,
             &mut request,
             expected_frames,
-        ))?;
+        )?;
         let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
         let output = backend
             .generate_video(
@@ -73228,9 +73283,8 @@ fn provider_engine_session_response_with_sampling_bounded(
             provider_media_generation_request_from_body(endpoint_family, request_body),
         )?;
         let requested_duration = request.duration_seconds;
-        let input_characters = provider_session_request_result(
-            provider_media_generation_input_characters(endpoint_family, &request.request),
-        )?;
+        let input_characters =
+            provider_media_generation_input_characters(endpoint_family, &request.request)?;
         let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
         let output = if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
             backend
@@ -73362,29 +73416,24 @@ fn provider_engine_session_response_with_sampling_bounded(
         });
     }
 
-    provider_session_request_result((|| {
-        ensure!(
-            matches!(
-                endpoint_family,
-                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
-                    | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
-                    | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
-                    | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
-            ),
-            "provider endpoint family {endpoint_family} has no engine execution path"
-        );
-        Ok(())
-    })())?;
-
-    let tool_mode =
-        provider_session_request_result(provider_engine_tool_request(request_body, adapter))?;
-    let mut request =
-        provider_session_request_result(provider_engine_request_from_endpoint_body_with_sampling(
+    ensure!(
+        matches!(
             endpoint_family,
-            request_body,
-            adapter,
-            sampling,
-        ))?;
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+                | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+                | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+        ),
+        "provider endpoint family {endpoint_family} has no engine execution path"
+    );
+
+    let tool_mode = provider_engine_tool_request(request_body, adapter)?;
+    let mut request = provider_engine_request_from_endpoint_body_with_sampling(
+        endpoint_family,
+        request_body,
+        adapter,
+        sampling,
+    )?;
     if let Some(cap) = output_token_cap {
         request.max_new_tokens = request.max_new_tokens.min(cap.max(1));
     }
@@ -74381,10 +74430,12 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
     adapter: &catalog::CatalogAdapter,
     sampling: &catalog::CatalogSamplingProfile,
 ) -> Result<GenerateRequest> {
-    let messages = provider_engine_template_messages(
-        provider_endpoint_messages(endpoint_family, body)?,
+    let endpoint_messages =
+        provider_session_request_result(provider_endpoint_messages(endpoint_family, body))?;
+    let messages = provider_session_request_result(provider_engine_template_messages(
+        endpoint_messages,
         adapter,
-    )?;
+    ))?;
     let (speciality_parameters, speciality_output_cap) =
         provider_engine_speciality_parameters(endpoint_family, body, adapter)?;
     let tool_request = provider_engine_tool_request(body, adapter)?;
@@ -74403,30 +74454,37 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
         .map(|tool_request| tool_request.parallel);
     request.speciality_parameters = speciality_parameters;
     if let Some(max_tokens) = provider_requested_max_output_tokens(body) {
-        request.max_new_tokens = u32::try_from(max_tokens)
-            .context("max_tokens exceeds provider engine request range")?;
+        request.max_new_tokens = provider_session_request_result(
+            u32::try_from(max_tokens).context("max_tokens exceeds provider engine request range"),
+        )?;
     } else if let Some(default_cap) = speciality_output_cap {
         request.max_new_tokens = default_cap;
     }
-    request.temperature = provider_optional_f64(body, "temperature")?
-        .or(sampling.temperature)
-        .map(|value| value as f32);
-    request.top_p = provider_optional_f64(body, "top_p")?
+    request.temperature =
+        provider_session_request_result(provider_optional_f64(body, "temperature"))?
+            .or(sampling.temperature)
+            .map(|value| value as f32);
+    request.top_p = provider_session_request_result(provider_optional_f64(body, "top_p"))?
         .or(sampling.top_p)
         .map(|value| value as f32);
-    request.top_k = provider_optional_i32(body, "top_k")?.or(sampling.top_k);
-    request.min_p = provider_optional_f64(body, "min_p")?
+    request.top_k =
+        provider_session_request_result(provider_optional_i32(body, "top_k"))?.or(sampling.top_k);
+    request.min_p = provider_session_request_result(provider_optional_f64(body, "min_p"))?
         .or(sampling.min_p)
         .map(|value| value as f32);
-    request.repeat_penalty = provider_repeat_penalty(body, sampling)?.map(|value| value as f32);
-    request.frequency_penalty = provider_optional_f64(body, "frequency_penalty")?
-        .or(sampling.frequency_penalty)
-        .map(|value| value as f32);
-    request.presence_penalty = provider_optional_f64(body, "presence_penalty")?
-        .or(sampling.presence_penalty)
-        .map(|value| value as f32);
-    request.stop = provider_stop_sequences(body)?;
-    request.seed = provider_optional_u32(body, "seed")?;
+    request.repeat_penalty =
+        provider_session_request_result(provider_repeat_penalty(body, sampling))?
+            .map(|value| value as f32);
+    request.frequency_penalty =
+        provider_session_request_result(provider_optional_f64(body, "frequency_penalty"))?
+            .or(sampling.frequency_penalty)
+            .map(|value| value as f32);
+    request.presence_penalty =
+        provider_session_request_result(provider_optional_f64(body, "presence_penalty"))?
+            .or(sampling.presence_penalty)
+            .map(|value| value as f32);
+    request.stop = provider_session_request_result(provider_stop_sequences(body))?;
+    request.seed = provider_session_request_result(provider_optional_u32(body, "seed"))?;
     request.validate_sampling()?;
     if let Some(tool_request) = tool_request {
         if tool_request.required {
@@ -74566,7 +74624,7 @@ fn provider_engine_speciality_parameters(
         let submitted = selected
             .and_then(|values| values.get(&descriptor.name))
             .or_else(|| body.get(&descriptor.name));
-        let level = provider_speciality_level(descriptor, submitted).with_context(|| {
+        let selection = provider_speciality_level(descriptor, submitted).with_context(|| {
             format!(
                 "model speciality {} does not support value {}",
                 descriptor.name,
@@ -74574,7 +74632,12 @@ fn provider_engine_speciality_parameters(
                     .map(Value::to_string)
                     .unwrap_or_else(|| descriptor.default_level.clone())
             )
-        })?;
+        });
+        let level = if submitted.is_some() {
+            provider_session_request_result(selection)?
+        } else {
+            selection?
+        };
         let mapping = contract
             .speciality_mappings
             .get(&descriptor.name)
@@ -75163,12 +75226,20 @@ fn provider_engine_tool_request(
         Some(Value::String(choice)) if choice == "auto" => false,
         Some(Value::String(choice)) if matches!(choice.as_str(), "required" | "any") => true,
         Some(Value::Object(choice)) if provider_engine_named_tool_choice(choice).is_some() => true,
-        Some(other) => bail!("unsupported tool_choice value: {other}"),
+        Some(other) => {
+            return Err(provider_session_request_error(format!(
+                "unsupported tool_choice value: {other}"
+            )));
+        }
     };
     let parallel = match body.get("parallel_tool_calls") {
         None | Some(Value::Null) => true,
         Some(Value::Bool(parallel)) => *parallel,
-        Some(_) => bail!("parallel_tool_calls must be a boolean"),
+        Some(_) => {
+            return Err(provider_session_request_error(
+                "parallel_tool_calls must be a boolean",
+            ));
+        }
     };
     let advertised_tools = body
         .get("tools")
@@ -75178,7 +75249,7 @@ fn provider_engine_tool_request(
     if advertised_tools.is_empty() {
         return Ok(None);
     }
-    let tools = provider_engine_tool_specs(body)?;
+    let tools = provider_session_request_result(provider_engine_tool_specs(body))?;
     if tools.is_empty() {
         ensure!(
             !required,
@@ -91243,6 +91314,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let err = validate_provider_session_request_modalities(&text_only_voucher, &terms, &sealed)
             .expect_err("actual image input must be bound by the signed voucher");
         assert!(err.to_string().contains("do not match signed voucher"));
+        assert_eq!(provider_response_error_code(&err), "request_invalid");
 
         terms.served_modalities = vec!["text".to_owned()];
         let image_voucher =
@@ -91250,6 +91322,148 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let err = validate_provider_session_request_modalities(&image_voucher, &terms, &sealed)
             .expect_err("a text-only provider must reject image work");
         assert!(err.to_string().contains("does not serve required image"));
+        assert_eq!(provider_response_error_code(&err), "request_invalid");
+    }
+
+    #[test]
+    fn provider_preflight_taxonomy_separates_request_limits_from_provider_health() {
+        let one_image = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "describe" },
+                    { "type": "image_url", "image_url": { "url": tiny_png_data_url() } }
+                ]
+            }]
+        });
+        let two_images = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "compare" },
+                    { "type": "image_url", "image_url": { "url": tiny_png_data_url() } },
+                    { "type": "image_url", "image_url": { "url": tiny_png_data_url() } }
+                ]
+            }]
+        });
+        let mut terms = test_provider_session_terms();
+        terms.served_modalities = vec!["text".to_owned(), "image".to_owned()];
+        terms.modality_capacities.insert(
+            "image".to_owned(),
+            test_heartbeat_modality_capacity("image"),
+        );
+        let active =
+            test_active_provider_session(&terms, vec!["text".to_owned(), "image".to_owned()]);
+
+        let sealed = provider_test_seal_contract_request(&two_images, &terms.adapter).unwrap();
+        let request_limit = validate_provider_session_request_modalities(&active, &terms, &sealed)
+            .expect_err("two images must exceed the one-image request capacity");
+        assert!(request_limit
+            .to_string()
+            .contains("request exceeds provider image capacity"));
+        assert_eq!(
+            provider_response_error_code(&request_limit),
+            "request_invalid"
+        );
+
+        terms.modality_capacities.clear();
+        let sealed = provider_test_seal_contract_request(&one_image, &terms.adapter).unwrap();
+        let missing_provider_capacity =
+            validate_provider_session_request_modalities(&active, &terms, &sealed)
+                .expect_err("missing provider capacity is a provider configuration fault");
+        assert!(missing_provider_capacity
+            .to_string()
+            .contains("provider has no advertised image capacity"));
+        assert_eq!(
+            provider_response_error_code(&missing_provider_capacity),
+            "provider_response_failed"
+        );
+
+        let mut invalid_capacity = test_heartbeat_modality_capacity("image");
+        invalid_capacity.max_item_bytes = 0;
+        terms
+            .modality_capacities
+            .insert("image".to_owned(), invalid_capacity);
+        let invalid_provider_capacity =
+            validate_provider_session_request_modalities(&active, &terms, &sealed)
+                .expect_err("zero provider capacity is a provider configuration fault");
+        assert!(invalid_provider_capacity
+            .to_string()
+            .contains("provider advertised invalid zero-valued image request capacity"));
+        assert_eq!(
+            provider_response_error_code(&invalid_provider_capacity),
+            "provider_response_failed"
+        );
+
+        let mut malformed = sealed.clone();
+        malformed["contract_request"]["messages"] = Value::Null;
+        let malformed_buyer_body =
+            validate_provider_session_request_modalities(&active, &terms, &malformed)
+                .expect_err("a mutated normalized request must be request-scoped");
+        assert_eq!(
+            provider_response_error_code(&malformed_buyer_body),
+            "request_invalid"
+        );
+
+        let mut invariant_terms = test_provider_session_terms();
+        let invariant_active =
+            test_active_provider_session(&invariant_terms, vec!["text".to_owned()]);
+        let invariant_request = provider_test_seal_contract_request(
+            &json!({"messages": [{"role": "user", "content": "answer"}]}),
+            &invariant_terms.adapter,
+        )
+        .unwrap();
+        invariant_terms.adapter.endpoint_families.clear();
+        let adapter_invariant = validate_provider_session_request_modalities(
+            &invariant_active,
+            &invariant_terms,
+            &invariant_request,
+        )
+        .expect_err("a missing provider adapter contract is a provider fault");
+        assert!(adapter_invariant
+            .to_string()
+            .contains("provider model does not expose endpoint family"));
+        assert_eq!(
+            provider_response_error_code(&adapter_invariant),
+            "provider_response_failed"
+        );
+
+        let unsupported_transport = provider_session_request_modalities(
+            "unsupported.test",
+            &json!({}),
+            &[],
+            &BTreeMap::new(),
+        )
+        .expect_err("unsupported provider transport is a provider fault");
+        assert_eq!(
+            provider_response_error_code(&unsupported_transport),
+            "provider_response_failed"
+        );
+
+        let mut speciality_terms = test_provider_session_terms();
+        speciality_terms
+            .served_specialities
+            .insert("reasoning_effort".to_owned(), vec!["low".to_owned()]);
+        let mut speciality_active =
+            test_active_provider_session(&speciality_terms, vec!["text".to_owned()]);
+        speciality_active
+            .required_specialities
+            .insert("reasoning_effort".to_owned(), "high".to_owned());
+        let sealed = provider_test_seal_contract_request(
+            &json!({"messages": [{"role": "user", "content": "answer"}]}),
+            &speciality_terms.adapter,
+        )
+        .unwrap();
+        let speciality = validate_provider_session_request_modalities(
+            &speciality_active,
+            &speciality_terms,
+            &sealed,
+        )
+        .expect_err("unsupported request speciality must be request-scoped");
+        assert!(speciality
+            .to_string()
+            .contains("does not serve speciality reasoning_effort level high"));
+        assert_eq!(provider_response_error_code(&speciality), "request_invalid");
     }
 
     #[test]

@@ -12470,7 +12470,9 @@ fn provider_reported_session_error(
         .unwrap_or("provider returned s.error");
     let message = format!("provider returned {code} on {session_context}: {message}");
     match code {
-        "request_invalid" => GatewaySessionError::buyer_local(message),
+        "request_invalid" | "request_chunk_failed" | "request_reassembly_failed" => {
+            GatewaySessionError::buyer_local(message)
+        }
         "model_output_invalid" => GatewaySessionError::request_scoped(message),
         _ if retryable => GatewaySessionError::retryable(message),
         _ => GatewaySessionError::new(message),
@@ -36950,6 +36952,91 @@ mod tests {
     #[derive(Debug)]
     struct BuyerLocalLimiterFailureBackend;
 
+    #[derive(Debug)]
+    struct ProviderReportedFailureBackend {
+        code: &'static str,
+    }
+
+    impl ProviderReportedFailureBackend {
+        fn error(&self, context: &str, retryable: bool) -> GatewaySessionError {
+            provider_reported_session_error(
+                &json!({
+                    "t": "s.error",
+                    "code": self.code,
+                    "message": "focused route-runner failure"
+                }),
+                context,
+                retryable,
+            )
+        }
+    }
+
+    impl GatewaySessionBackend for ProviderReportedFailureBackend {
+        fn name(&self) -> &str {
+            "test-provider-reported-failure"
+        }
+
+        fn run_chat<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            _request: &'a ChatCompletionRequest,
+            _invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            let error = self.error("chat collector", false);
+            Box::pin(async move { Err(error) })
+        }
+
+        fn run_embedding<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            _request: &'a EmbeddingRequest,
+            _invocation: &'a GatewaySessionInvocation,
+        ) -> GatewayEmbeddingFuture<'a> {
+            let error = self.error("embedding collector", true);
+            Box::pin(async move { Err(error) })
+        }
+
+        fn run_image_generation<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            _request: &'a ImageGenerationRequest,
+            _invocation: &'a GatewaySessionInvocation,
+        ) -> GatewayImageGenerationFuture<'a> {
+            let error = self.error("image collector", true);
+            Box::pin(async move { Err(error) })
+        }
+
+        fn run_audio_speech<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            _request: &'a AudioSpeechRequest,
+            _invocation: &'a GatewaySessionInvocation,
+        ) -> GatewayAudioSpeechFuture<'a> {
+            let error = self.error("speech collector", true);
+            Box::pin(async move { Err(error) })
+        }
+
+        fn run_audio_transcription<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            _request: &'a AudioTranscriptionRequest,
+            _invocation: &'a GatewaySessionInvocation,
+        ) -> GatewayAudioTranscriptionFuture<'a> {
+            let error = self.error("transcription collector", true);
+            Box::pin(async move { Err(error) })
+        }
+
+        fn run_artifact_generation<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            _request: &'a ArtifactGenerationRequest,
+            _invocation: &'a GatewaySessionInvocation,
+        ) -> GatewayArtifactGenerationFuture<'a> {
+            let error = self.error("artifact collector", true);
+            Box::pin(async move { Err(error) })
+        }
+    }
+
     impl GatewaySessionBackend for BuyerLocalLimiterFailureBackend {
         fn name(&self) -> &str {
             "test-buyer-local-limiter-failure"
@@ -38735,7 +38822,8 @@ mod tests {
                 Err(error) => error,
             };
 
-        assert!(error.message.contains("failed before spend"));
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("exceeded its receive rate"));
         assert_eq!(state.ledger_balance_au(), initial_balance);
         assert!(state.receipts().is_empty());
         assert!(state
@@ -41135,54 +41223,436 @@ mod tests {
             assert_eq!(entry.observed.consecutive_failures, 0, "{modality}");
             assert_eq!(entry.observed.ewma_error_rate, 0.0, "{modality}");
             assert!(state.reputation_events().is_empty(), "{modality}");
+
+            record_route_attempt_error(
+                &state,
+                Some(route),
+                Duration::from_millis(5),
+                &provider_fault,
+            );
+            assert!(
+                state.route_provider_in_cooloff(route, now_millis_u64()),
+                "{modality} route was not cooled for a remote transport failure"
+            );
+            let entry = state
+                .provider_table
+                .lock_recover("provider table")
+                .entries(now_millis_u64())
+                .into_iter()
+                .find(|entry| entry.key == route_key(route))
+                .expect("route remains in provider table");
+            assert_eq!(entry.observed.samples, 1, "{modality}");
+            assert_eq!(entry.observed.consecutive_failures, 1, "{modality}");
         }
     }
 
     #[test]
-    fn provider_request_error_is_buyer_local_and_never_penalizes_the_route() {
-        let error = provider_reported_session_error(
-            &json!({
-                "t": "s.error",
-                "code": "request_invalid",
-                "message": "unsupported tool schema"
-            }),
-            "session request-invalid",
-            true,
-        );
-        assert_eq!(error.failure_class, GatewaySessionFailureClass::BuyerLocal);
-        assert!(!error.retryable);
+    fn provider_request_error_code_matrix_covers_every_endpoint_alias() {
+        let collectors = [
+            (
+                "chat",
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+                false,
+            ),
+            (
+                "chat-stream",
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+                false,
+            ),
+            (
+                "completions",
+                mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
+                false,
+            ),
+            ("responses", mayhem_proto::ENDPOINT_OPENAI_RESPONSES, false),
+            ("hf-chat", mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT, false),
+            ("embeddings", mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS, true),
+            (
+                "hf-embeddings",
+                mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION,
+                true,
+            ),
+            (
+                "image",
+                mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+                true,
+            ),
+            ("hf-image", mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE, true),
+            ("speech", mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH, true),
+            ("hf-speech", mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH, true),
+            (
+                "transcription",
+                mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS,
+                true,
+            ),
+            (
+                "hf-transcription",
+                mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION,
+                true,
+            ),
+            ("video", mayhem_proto::ENDPOINT_OPENAI_VIDEOS, true),
+            ("hf-video", mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO, true),
+            (
+                "audio-artifact",
+                mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+                true,
+            ),
+            (
+                "music-artifact",
+                mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+                true,
+            ),
+            (
+                "hf-audio-artifact",
+                mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO,
+                true,
+            ),
+        ];
 
-        let model = test_routed_model(1);
-        let state = test_gateway_state_from_models(vec![model.clone()]);
-        let route = &model.mayhem.route_candidates[0];
-        record_route_attempt_error(&state, Some(route), Duration::from_millis(5), &error);
-        assert!(!state.route_provider_in_cooloff(route, now_millis_u64()));
-        let entry = state
-            .provider_table
-            .lock_recover("provider table")
-            .entries(now_millis_u64())
-            .into_iter()
-            .find(|entry| entry.key == route_key(route))
-            .expect("route remains in provider table");
-        assert_eq!(entry.observed.samples, 0);
+        for (collector, endpoint_family, collector_retryable) in collectors {
+            let model = test_routed_model(1);
+            let state = test_gateway_state_from_models(vec![model.clone()]);
+            let route = &model.mayhem.route_candidates[0];
 
-        let api_error = request_scoped_api_error(&error).expect("buyer request error");
-        assert_eq!(api_error.status, StatusCode::BAD_REQUEST);
+            for (code, expected_class) in [
+                ("request_invalid", GatewaySessionFailureClass::BuyerLocal),
+                (
+                    "request_chunk_failed",
+                    GatewaySessionFailureClass::BuyerLocal,
+                ),
+                (
+                    "request_reassembly_failed",
+                    GatewaySessionFailureClass::BuyerLocal,
+                ),
+                (
+                    "model_output_invalid",
+                    GatewaySessionFailureClass::RequestScoped,
+                ),
+            ] {
+                let error = provider_reported_session_error(
+                    &json!({
+                        "t": "s.error",
+                        "code": code,
+                        "message": "request-specific failure"
+                    }),
+                    &format!("{collector} {endpoint_family} session"),
+                    collector_retryable,
+                );
+                assert_eq!(error.failure_class, expected_class, "{collector}");
+                assert!(!error.retryable, "{collector}");
+                record_route_attempt_error(&state, Some(route), Duration::from_millis(5), &error);
+                assert!(
+                    !state.route_provider_in_cooloff(route, now_millis_u64()),
+                    "{collector} cooled the route for {code}"
+                );
+                let api_error = request_scoped_api_error(&error).expect("request-scoped API error");
+                assert_eq!(api_error.status, StatusCode::BAD_REQUEST, "{collector}");
+            }
 
-        let output_error = provider_reported_session_error(
-            &json!({
-                "t": "s.error",
-                "code": "model_output_invalid",
-                "message": "model emitted invalid tool-call JSON"
-            }),
-            "session output-invalid",
-            true,
+            let entry = state
+                .provider_table
+                .lock_recover("provider table")
+                .entries(now_millis_u64())
+                .into_iter()
+                .find(|entry| entry.key == route_key(route))
+                .expect("route remains in provider table");
+            assert_eq!(entry.observed.samples, 0, "{collector}");
+            assert_eq!(entry.observed.consecutive_failures, 0, "{collector}");
+
+            let provider_fault = provider_reported_session_error(
+                &json!({
+                    "t": "s.error",
+                    "code": "provider_response_failed",
+                    "message": "worker failed"
+                }),
+                &format!("{collector} {endpoint_family} session"),
+                collector_retryable,
+            );
+            assert_eq!(
+                provider_fault.failure_class,
+                GatewaySessionFailureClass::ProviderFault,
+                "{collector}"
+            );
+            record_route_attempt_error(
+                &state,
+                Some(route),
+                Duration::from_millis(5),
+                &provider_fault,
+            );
+            assert!(
+                state.route_provider_in_cooloff(route, now_millis_u64()),
+                "{collector} did not cool a true provider fault"
+            );
+            let entry = state
+                .provider_table
+                .lock_recover("provider table")
+                .entries(now_millis_u64())
+                .into_iter()
+                .find(|entry| entry.key == route_key(route))
+                .expect("route remains in provider table");
+            assert_eq!(entry.observed.samples, 1, "{collector}");
+            assert_eq!(entry.observed.consecutive_failures, 1, "{collector}");
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum FocusedRouteRunner {
+        Chat,
+        Embedding,
+        Image,
+        Speech,
+        Transcription,
+        VideoArtifact,
+    }
+
+    impl FocusedRouteRunner {
+        const ALL: [Self; 6] = [
+            Self::Chat,
+            Self::Embedding,
+            Self::Image,
+            Self::Speech,
+            Self::Transcription,
+            Self::VideoArtifact,
+        ];
+
+        fn modalities(self) -> &'static [&'static str] {
+            match self {
+                Self::Chat => &["text"],
+                Self::Embedding => &["embedding"],
+                Self::Image => &["image"],
+                Self::Speech => &["audio"],
+                Self::Transcription => &["audio", "text"],
+                Self::VideoArtifact => &["video"],
+            }
+        }
+    }
+
+    fn focused_route_runner_model(runner: FocusedRouteRunner) -> GatewayModel {
+        let mut model = test_routed_model(1);
+        let modalities = runner
+            .modalities()
+            .iter()
+            .map(|modality| (*modality).to_owned())
+            .collect::<Vec<_>>();
+        model.mayhem.adapter.modality_set = modalities.clone();
+        model.mayhem.caps.vision = modalities.iter().any(|value| value == "image");
+        model.mayhem.caps.image = modalities.iter().any(|value| value == "image");
+        model.mayhem.caps.video = modalities.iter().any(|value| value == "video");
+        model.mayhem.caps.audio = modalities.iter().any(|value| value == "audio");
+        model.mayhem.caps.output_modality = Some(
+            match runner {
+                FocusedRouteRunner::Embedding => "embedding",
+                FocusedRouteRunner::Image => "image",
+                FocusedRouteRunner::Speech | FocusedRouteRunner::Transcription => "audio",
+                FocusedRouteRunner::VideoArtifact => "video",
+                FocusedRouteRunner::Chat => "text",
+            }
+            .to_owned(),
         );
-        assert_eq!(
-            output_error.failure_class,
-            GatewaySessionFailureClass::RequestScoped
-        );
-        assert!(!output_error.retryable);
+        model.mayhem.caps.output_modalities = modalities.clone();
+        for route in &mut model.mayhem.route_candidates {
+            route.served_modalities = modalities.clone();
+        }
+        model
+    }
+
+    fn focused_route_runner_error<T>(result: Result<T, ApiError>) -> ApiError {
+        match result {
+            Ok(_) => panic!("focused route runner unexpectedly succeeded"),
+            Err(error) => error,
+        }
+    }
+
+    async fn run_focused_route_runner_failure(
+        runner: FocusedRouteRunner,
+        code: &'static str,
+    ) -> (GatewayState, GatewayModel, ApiError) {
+        let model = focused_route_runner_model(runner);
+        let state = test_gateway_state_from_models(vec![model.clone()])
+            .with_session_backend(Arc::new(ProviderReportedFailureBackend { code }));
+        let options = GatewayRequestOptions {
+            max_wait_ms: 0,
+            ..GatewayRequestOptions::default()
+        };
+        let error = match runner {
+            FocusedRouteRunner::Chat => focused_route_runner_error(
+                run_chat_with_route_retry(&state, &model, &test_chat_request(&model.id), options)
+                    .await,
+            ),
+            FocusedRouteRunner::Embedding => {
+                let inputs = vec!["embed this".to_owned()];
+                let request = EmbeddingRequest {
+                    model: model.id.clone(),
+                    input: json!(inputs),
+                    encoding_format: None,
+                    dimensions: None,
+                    user: None,
+                    endpoint_family: None,
+                    endpoint_request: None,
+                };
+                focused_route_runner_error(
+                    run_embedding_with_route_retry(&state, &model, &request, &inputs, options)
+                        .await,
+                )
+            }
+            FocusedRouteRunner::Image => {
+                let request = ImageGenerationRequest {
+                    model: model.id.clone(),
+                    prompt: "a precise test image".to_owned(),
+                    background: None,
+                    moderation: None,
+                    n: Some(1),
+                    output_compression: None,
+                    output_format: None,
+                    partial_images: None,
+                    size: Some("512x512".to_owned()),
+                    width: None,
+                    height: None,
+                    response_format: Some("b64_json".to_owned()),
+                    quality: None,
+                    style: None,
+                    negative_prompt: None,
+                    steps: Some(4),
+                    cfg_scale: Some(1.0),
+                    shift: None,
+                    seed: Some(7),
+                    scheduler: None,
+                    stream: None,
+                    user: None,
+                    endpoint_family: None,
+                    endpoint_request: None,
+                };
+                focused_route_runner_error(
+                    run_image_generation_with_route_retry(&state, &model, &request, options).await,
+                )
+            }
+            FocusedRouteRunner::Speech => {
+                let request = AudioSpeechRequest {
+                    model: model.id.clone(),
+                    input: "speak this".to_owned(),
+                    voice: None,
+                    response_format: Some("wav".to_owned()),
+                    speed: None,
+                    instructions: None,
+                    stream_format: None,
+                    reference_audio: None,
+                    exaggeration: None,
+                    cfg_weight: None,
+                    temperature: None,
+                    min_p: None,
+                    top_p: None,
+                    repetition_penalty: None,
+                    seed: None,
+                    endpoint_family: None,
+                    endpoint_request: None,
+                };
+                focused_route_runner_error(
+                    run_audio_speech_with_route_retry(&state, &model, &request, options).await,
+                )
+            }
+            FocusedRouteRunner::Transcription => {
+                let request = AudioTranscriptionRequest {
+                    model: model.id.clone(),
+                    audio: test_wav_with_samples(8_000),
+                    audio_seconds: 1,
+                    content_type: Some("audio/wav".to_owned()),
+                    filename: Some("test.wav".to_owned()),
+                    response_format: Some("json".to_owned()),
+                    language: None,
+                    prompt: None,
+                    temperature: None,
+                    timestamp_granularities: Vec::new(),
+                    stream: false,
+                    endpoint_family: mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS.to_owned(),
+                    contract_request: json!({}),
+                };
+                focused_route_runner_error(
+                    run_audio_transcription_with_route_retry(&state, &model, &request, options)
+                        .await,
+                )
+            }
+            FocusedRouteRunner::VideoArtifact => {
+                let request = ArtifactGenerationRequest {
+                    model: model.id.clone(),
+                    prompt: "a precise test video".to_owned(),
+                    endpoint_family: mayhem_proto::ENDPOINT_OPENAI_VIDEOS.to_owned(),
+                    contract_request: json!({}),
+                    effective_specialities: BTreeMap::new(),
+                    output_modality: "video".to_owned(),
+                    transport_kind: "video_generation".to_owned(),
+                    duration_seconds: 1,
+                    requested_frame_count: 8,
+                    frame_count: 8,
+                    frame_rate: 8.0,
+                    step_count: 1,
+                    artifact_count: 1,
+                    input_image_count: 0,
+                    input_image_max_bytes: 0,
+                    input_image_max_pixels: 0,
+                    input_audio_count: 0,
+                    input_audio_max_bytes: 0,
+                    input_audio_max_seconds: 0,
+                    response_format: "mp4".to_owned(),
+                };
+                focused_route_runner_error(
+                    run_artifact_generation_with_route_retry(&state, &model, &request, options)
+                        .await,
+                )
+            }
+        };
+        (state, model, error)
+    }
+
+    #[tokio::test]
+    async fn chunk_and_reassembly_failures_do_not_penalize_any_route_runner() {
+        for code in ["request_chunk_failed", "request_reassembly_failed"] {
+            for runner in FocusedRouteRunner::ALL {
+                let (state, model, error) = run_focused_route_runner_failure(runner, code).await;
+                assert_eq!(error.status, StatusCode::BAD_REQUEST, "{runner:?} {code}");
+                let route = &model.mayhem.route_candidates[0];
+                assert!(
+                    !state.route_provider_in_cooloff(route, now_millis_u64()),
+                    "{runner:?} cooled the route for {code}"
+                );
+                let entry = state
+                    .provider_table
+                    .lock_recover("provider table")
+                    .entries(now_millis_u64())
+                    .into_iter()
+                    .find(|entry| entry.key == route_key(route))
+                    .expect("route remains in provider table");
+                assert_eq!(entry.observed.samples, 0, "{runner:?} {code}");
+                assert_eq!(entry.observed.consecutive_failures, 0, "{runner:?} {code}");
+                assert!(state
+                    .wallet_spend
+                    .lock_recover("gateway wallet spend state")
+                    .reservations
+                    .is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_faults_still_penalize_every_route_runner() {
+        for runner in FocusedRouteRunner::ALL {
+            let (state, model, error) =
+                run_focused_route_runner_failure(runner, "provider_response_failed").await;
+            assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{runner:?}");
+            let route = &model.mayhem.route_candidates[0];
+            assert!(
+                state.route_provider_in_cooloff(route, now_millis_u64()),
+                "{runner:?} did not cool a provider fault"
+            );
+            let entry = state
+                .provider_table
+                .lock_recover("provider table")
+                .entries(now_millis_u64())
+                .into_iter()
+                .find(|entry| entry.key == route_key(route))
+                .expect("route remains in provider table");
+            assert_eq!(entry.observed.samples, 1, "{runner:?}");
+            assert_eq!(entry.observed.consecutive_failures, 1, "{runner:?}");
+        }
     }
 
     #[test]

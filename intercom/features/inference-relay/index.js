@@ -19,8 +19,22 @@ const HEARTBEAT_RELAY_PROTOCOL = 'mx/hb-relay/1';
 const DEFAULT_MAX_HEARTBEAT_BYTES = 256 * 1024;
 const DEFAULT_MAX_HEARTBEAT_ROOMS_PER_CLIENT = 4096;
 const DEFAULT_MAX_HEARTBEAT_ENTRIES = 16_384;
+const DEFAULT_MAX_HEARTBEAT_ENTRIES_PER_PEER = 256;
 const DEFAULT_MAX_PENDING_HEARTBEATS_PER_CLIENT = 4096;
+const DEFAULT_MAX_HEARTBEAT_CACHE_BYTES = 32 * 1024 * 1024;
+const DEFAULT_MAX_PENDING_HEARTBEAT_BYTES = 32 * 1024 * 1024;
+const DEFAULT_MAX_HEARTBEAT_RESIDENT_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MAX_HEARTBEAT_BYTES_PER_PEER = 2 * 1024 * 1024;
+const DEFAULT_MAX_PENDING_HEARTBEAT_BYTES_PER_CLIENT = 4 * 1024 * 1024;
+const DEFAULT_MAX_PENDING_HEARTBEAT_BYTES_PER_PEER = 2 * 1024 * 1024;
+const DEFAULT_HEARTBEAT_FRESHNESS_MS = 60_000;
+const DEFAULT_MAX_HEARTBEAT_RETENTION_MS = 60_000;
+const DEFAULT_MAX_HEARTBEAT_FUTURE_SKEW_MS = 10_000;
 const HEARTBEAT_RELAY_FRAME_OVERHEAD_BYTES = 1024;
+const HEARTBEAT_REMEMBERED = 'remembered';
+const HEARTBEAT_DUPLICATE = 'duplicate';
+const HEARTBEAT_RESOURCE_REJECTED = 'resource_rejected';
+const HEARTBEAT_INVALID = 'invalid';
 const HEARTBEAT_ROOM_PATTERN = /^mx\/room\/([0-9a-f]{32})$/;
 const HEX_32_PATTERN = /^[0-9a-fA-F]{64}$/;
 const HEX_64_PATTERN = /^[0-9a-fA-F]{128}$/;
@@ -157,6 +171,10 @@ const positiveInteger = (value, fallback, minimum = 1) => (
   Number.isSafeInteger(value) && value >= minimum ? value : fallback
 );
 
+const nonnegativeInteger = (value, fallback) => (
+  Number.isSafeInteger(value) && value >= 0 ? value : fallback
+);
+
 const streamByteCount = (stream) => (
   Math.max(0, Number(stream?.bytesReceived) || 0)
   + Math.max(0, Number(stream?.bytesTransmitted) || 0)
@@ -232,10 +250,65 @@ class InferenceRelay extends Feature {
       config.maxHeartbeatEntries,
       DEFAULT_MAX_HEARTBEAT_ENTRIES
     );
+    this.maxHeartbeatEntriesPerPeer = Math.min(
+      this.maxHeartbeatEntries,
+      positiveInteger(
+        config.maxHeartbeatEntriesPerPeer,
+        DEFAULT_MAX_HEARTBEAT_ENTRIES_PER_PEER
+      )
+    );
     this.maxPendingHeartbeatsPerClient = positiveInteger(
       config.maxPendingHeartbeatsPerClient,
       DEFAULT_MAX_PENDING_HEARTBEATS_PER_CLIENT
     );
+    this.maxHeartbeatCacheBytes = positiveInteger(
+      config.maxHeartbeatCacheBytes,
+      DEFAULT_MAX_HEARTBEAT_CACHE_BYTES
+    );
+    this.maxPendingHeartbeatBytes = positiveInteger(
+      config.maxPendingHeartbeatBytes,
+      DEFAULT_MAX_PENDING_HEARTBEAT_BYTES
+    );
+    this.maxHeartbeatResidentBytes = positiveInteger(
+      config.maxHeartbeatResidentBytes,
+      DEFAULT_MAX_HEARTBEAT_RESIDENT_BYTES
+    );
+    this.maxHeartbeatBytesPerPeer = Math.min(
+      this.maxHeartbeatCacheBytes,
+      positiveInteger(
+        config.maxHeartbeatBytesPerPeer,
+        DEFAULT_MAX_HEARTBEAT_BYTES_PER_PEER
+      )
+    );
+    this.maxPendingHeartbeatBytesPerClient = Math.min(
+      this.maxPendingHeartbeatBytes,
+      positiveInteger(
+        config.maxPendingHeartbeatBytesPerClient,
+        DEFAULT_MAX_PENDING_HEARTBEAT_BYTES_PER_CLIENT
+      )
+    );
+    this.maxPendingHeartbeatBytesPerPeer = Math.min(
+      this.maxPendingHeartbeatBytesPerClient,
+      positiveInteger(
+        config.maxPendingHeartbeatBytesPerPeer,
+        DEFAULT_MAX_PENDING_HEARTBEAT_BYTES_PER_PEER
+      )
+    );
+    this.heartbeatFreshnessMs = positiveInteger(
+      config.heartbeatFreshnessMs,
+      DEFAULT_HEARTBEAT_FRESHNESS_MS
+    );
+    this.maxHeartbeatRetentionMs = positiveInteger(
+      config.maxHeartbeatRetentionMs,
+      DEFAULT_MAX_HEARTBEAT_RETENTION_MS
+    );
+    this.maxHeartbeatFutureSkewMs = nonnegativeInteger(
+      config.maxHeartbeatFutureSkewMs,
+      DEFAULT_MAX_HEARTBEAT_FUTURE_SKEW_MS
+    );
+    this.heartbeatNow = typeof config.heartbeatNow === 'function'
+      ? config.heartbeatNow
+      : Date.now;
 
     this.server = null;
     this.sessions = new Map();
@@ -262,6 +335,10 @@ class InferenceRelay extends Feature {
     this.heartbeatStateByConnection = new WeakMap();
     this.heartbeatRoomRefs = new Map();
     this.heartbeatCache = new Map();
+    this.heartbeatCacheBytes = 0;
+    this.heartbeatPendingBytes = 0;
+    this.heartbeatCachePeerUsage = new Map();
+    this.heartbeatPendingPeerUsage = new Map();
     this.heartbeatJoinedRelays = new Set();
     this.onConnection = (connection, peerInfo) => this._handleConnection(connection, peerInfo);
     this.counters = {
@@ -282,6 +359,12 @@ class InferenceRelay extends Feature {
       heartbeat_coalesced: 0,
       heartbeat_delivered: 0,
       heartbeat_pending_evicted: 0,
+      heartbeat_cache_expired: 0,
+      heartbeat_pending_expired: 0,
+      heartbeat_cache_bytes_rejected: 0,
+      heartbeat_pending_bytes_rejected: 0,
+      heartbeat_peer_quota_rejected: 0,
+      heartbeat_slow_consumers_isolated: 0,
     };
     this.lastSweepAt = null;
   }
@@ -360,12 +443,14 @@ class InferenceRelay extends Feature {
       try {
         state.channel?.close?.();
       } catch (_error) {}
-      state.pending.clear();
+      this._clearPendingHeartbeats(state);
       state.subscriptions.clear();
     }
     this.heartbeatConnectionStates.clear();
+    this.heartbeatPendingBytes = 0;
+    this.heartbeatPendingPeerUsage.clear();
     this.heartbeatRoomRefs.clear();
-    this.heartbeatCache.clear();
+    this._clearHeartbeatCache();
     this.heartbeatJoinedRelays.clear();
     for (const state of this.streams.values()) {
       state.stream.on('error', () => {});
@@ -424,8 +509,12 @@ class InferenceRelay extends Feature {
     const envelope = heartbeatEnvelope(channel, heartbeat, this.maxHeartbeatBytes);
     if (!envelope) return { heartbeat: false, emit: true };
     const locallyPublished = payload?.origin === 'local';
-    const newest = this._rememberHeartbeat(envelope, locallyPublished);
-    if (locallyPublished) {
+    const remembered = this._rememberHeartbeat(
+      envelope,
+      locallyPublished,
+      locallyPublished ? this.localKey : null
+    );
+    if (locallyPublished && remembered !== HEARTBEAT_INVALID) {
       this._ensureHeartbeatRelayConnections();
       this._sendHeartbeatControlToRelays({
         t: 'hb.publish',
@@ -434,8 +523,12 @@ class InferenceRelay extends Feature {
         heartbeat: envelope.heartbeat,
       });
     }
-    if (!newest) return { heartbeat: true, emit: false };
-    if (this.serve) this._fanoutHeartbeat(envelope);
+    if (remembered === HEARTBEAT_DUPLICATE || remembered === HEARTBEAT_INVALID) {
+      return { heartbeat: true, emit: false };
+    }
+    if (remembered === HEARTBEAT_REMEMBERED && this.serve) {
+      this._fanoutHeartbeat(envelope);
+    }
     return { heartbeat: true, emit: true };
   }
 
@@ -553,13 +646,26 @@ class InferenceRelay extends Feature {
         heartbeat_bytes: this.maxHeartbeatBytes,
         heartbeat_rooms_per_client: this.maxHeartbeatRoomsPerClient,
         heartbeat_entries: this.maxHeartbeatEntries,
+        heartbeat_entries_per_peer: this.maxHeartbeatEntriesPerPeer,
         pending_heartbeats_per_client: this.maxPendingHeartbeatsPerClient,
+        heartbeat_cache_bytes: this.maxHeartbeatCacheBytes,
+        heartbeat_pending_bytes: this.maxPendingHeartbeatBytes,
+        heartbeat_resident_bytes: this.maxHeartbeatResidentBytes,
+        heartbeat_bytes_per_peer: this.maxHeartbeatBytesPerPeer,
+        pending_heartbeat_bytes_per_client: this.maxPendingHeartbeatBytesPerClient,
+        pending_heartbeat_bytes_per_peer: this.maxPendingHeartbeatBytesPerPeer,
+        heartbeat_freshness_ms: this.heartbeatFreshnessMs,
+        heartbeat_retention_ms: this.maxHeartbeatRetentionMs,
+        heartbeat_future_skew_ms: this.maxHeartbeatFutureSkewMs,
       },
       clients: this.sessions.size,
       links: this.streams.size,
       last_sweep_at: this.lastSweepAt,
       heartbeat_rooms: Array.from(this.heartbeatRoomRefs.keys()).sort(),
       heartbeat_entries: this.heartbeatCache.size,
+      heartbeat_cache_bytes: this.heartbeatCacheBytes,
+      heartbeat_pending_bytes: this.heartbeatPendingBytes,
+      heartbeat_resident_bytes: this.heartbeatCacheBytes + this.heartbeatPendingBytes,
       heartbeat_clients: this.heartbeatConnectionStates.size,
       relay: relayStats ? {
         sessions: { ...relayStats.sessions },
@@ -626,9 +732,12 @@ class InferenceRelay extends Feature {
       message: null,
       opened: false,
       blocked: false,
+      heartbeatDisabled: false,
       subscriptions: new Set(),
       pendingControls: new Map(),
       pending: new Map(),
+      pendingBytes: 0,
+      pendingPeerUsage: new Map(),
     };
     this.heartbeatStateByConnection.set(connection, state);
     this.heartbeatConnectionStates.add(state);
@@ -637,7 +746,7 @@ class InferenceRelay extends Feature {
     });
     connection.once?.('close', () => {
       state.opened = false;
-      state.pending.clear();
+      this._clearPendingHeartbeats(state);
       state.pendingControls.clear();
       state.subscriptions.clear();
       this.heartbeatConnectionStates.delete(state);
@@ -660,6 +769,7 @@ class InferenceRelay extends Feature {
     if (
       !state
       || state.channel
+      || state.heartbeatDisabled === true
       || state.connection?.destroyed === true
       || state.connection?.closed === true
     ) {
@@ -757,24 +867,205 @@ class InferenceRelay extends Feature {
     }
   }
 
+  _heartbeatClockNow() {
+    const now = Number(this.heartbeatNow());
+    return Number.isSafeInteger(now) && now >= 0 ? now : Date.now();
+  }
+
+  _heartbeatOwner(envelope, ownerPeer = null) {
+    return normalizeKey(ownerPeer)
+      || normalizeKey(envelope?.heartbeat?.transport_peer)
+      || normalizeKey(envelope?.heartbeat?.provider);
+  }
+
+  _heartbeatTiming(envelope, now = this._heartbeatClockNow()) {
+    if (
+      !envelope
+      || !Number.isSafeInteger(envelope.ts)
+      || !Number.isSafeInteger(now)
+      || now < 0
+    ) {
+      return null;
+    }
+    if (envelope.ts > now && envelope.ts - now > this.maxHeartbeatFutureSkewMs) {
+      return null;
+    }
+    const signedAgeMs = Math.max(0, now - envelope.ts);
+    if (signedAgeMs >= this.heartbeatFreshnessMs) return null;
+    const retentionMs = Math.min(
+      this.heartbeatFreshnessMs - signedAgeMs,
+      this.maxHeartbeatRetentionMs
+    );
+    const expiresAt = now + retentionMs;
+    if (!Number.isSafeInteger(expiresAt) || expiresAt <= now) return null;
+    return { receivedAt: now, expiresAt };
+  }
+
+  _peerUsage(map, ownerPeer) {
+    return map?.get(ownerPeer) || { entries: 0, bytes: 0 };
+  }
+
+  _adjustPeerUsage(map, ownerPeer, entryDelta, byteDelta) {
+    if (!map || !ownerPeer) return;
+    const current = this._peerUsage(map, ownerPeer);
+    const entries = Math.max(0, current.entries + entryDelta);
+    const bytes = Math.max(0, current.bytes + byteDelta);
+    if (entries === 0 && bytes === 0) {
+      map.delete(ownerPeer);
+    } else {
+      map.set(ownerPeer, { entries, bytes });
+    }
+  }
+
+  _removePendingHeartbeat(state, key) {
+    const record = state?.pending?.get(key);
+    if (!record) return null;
+    state.pending.delete(key);
+    const bytes = Math.max(0, Number(record.bytes) || 0);
+    state.pendingBytes = Math.max(0, (Number(state.pendingBytes) || 0) - bytes);
+    this.heartbeatPendingBytes = Math.max(0, this.heartbeatPendingBytes - bytes);
+    this._adjustPeerUsage(state.pendingPeerUsage, record.ownerPeer, -1, -bytes);
+    this._adjustPeerUsage(this.heartbeatPendingPeerUsage, record.ownerPeer, -1, -bytes);
+    return record;
+  }
+
+  _clearPendingHeartbeats(state, predicate = null) {
+    if (!state?.pending) return;
+    for (const [key, record] of Array.from(state.pending.entries())) {
+      if (predicate && !predicate(record)) continue;
+      this._removePendingHeartbeat(state, key);
+    }
+    if (!predicate) {
+      state.pendingBytes = 0;
+      state.pendingPeerUsage?.clear?.();
+    }
+  }
+
+  _removeHeartbeatCacheEntry(key) {
+    const record = this.heartbeatCache.get(key);
+    if (!record) return null;
+    this.heartbeatCache.delete(key);
+    const bytes = Math.max(0, Number(record.bytes) || 0);
+    this.heartbeatCacheBytes = Math.max(0, this.heartbeatCacheBytes - bytes);
+    this._adjustPeerUsage(this.heartbeatCachePeerUsage, record.ownerPeer, -1, -bytes);
+    return record;
+  }
+
+  _clearHeartbeatCache() {
+    for (const key of Array.from(this.heartbeatCache.keys())) {
+      this._removeHeartbeatCacheEntry(key);
+    }
+    this.heartbeatCacheBytes = 0;
+    this.heartbeatCachePeerUsage.clear();
+  }
+
+  _isolateSlowHeartbeatConsumer(state) {
+    if (!state || state.heartbeatDisabled === true) return;
+    state.heartbeatDisabled = true;
+    this._clearPendingHeartbeats(state);
+    state.pendingControls?.clear?.();
+    state.subscriptions?.clear?.();
+    state.opened = false;
+    state.blocked = true;
+    this.heartbeatConnectionStates.delete(state);
+    this.counters.heartbeat_slow_consumers_isolated += 1;
+    try {
+      state.channel?.close?.();
+    } catch (_error) {}
+  }
+
+  _expireHeartbeatResources(now = this._heartbeatClockNow()) {
+    for (const [key, record] of this.heartbeatCache) {
+      if (record.expiresAt > now) continue;
+      this._removeHeartbeatCacheEntry(key);
+      this.counters.heartbeat_cache_expired += 1;
+    }
+    for (const state of this.heartbeatConnectionStates) {
+      for (const [key, record] of state.pending) {
+        if (record.expiresAt > now) continue;
+        this._removePendingHeartbeat(state, key);
+        this.counters.heartbeat_pending_expired += 1;
+      }
+    }
+  }
+
   _queueHeartbeatFrame(state, frame, envelope) {
-    if (!state || !envelope) return false;
-    const existing = state.pending.get(envelope.key);
+    if (!state || !envelope || state.heartbeatDisabled === true) return false;
+    if (!state.pendingPeerUsage) state.pendingPeerUsage = new Map();
+    if (!Number.isSafeInteger(state.pendingBytes)) state.pendingBytes = 0;
+    const now = this._heartbeatClockNow();
+    const timing = this._heartbeatTiming(envelope, now);
+    if (!timing) {
+      this.counters.heartbeat_frames_rejected += 1;
+      return false;
+    }
+    const ownerPeer = this._heartbeatOwner(envelope);
+    if (!ownerPeer) {
+      this.counters.heartbeat_frames_rejected += 1;
+      return false;
+    }
+    let existing = state.pending.get(envelope.key);
+    if (existing?.expiresAt <= now) {
+      this._removePendingHeartbeat(state, envelope.key);
+      this.counters.heartbeat_pending_expired += 1;
+      existing = null;
+    }
     if (existing && existing.envelope.ts >= envelope.ts) {
       this.counters.heartbeat_coalesced += 1;
       return false;
     }
-    if (existing) state.pending.delete(envelope.key);
-    while (
-      !state.pending.has(envelope.key)
-      && state.pending.size >= this.maxPendingHeartbeatsPerClient
-    ) {
-      const oldest = state.pending.keys().next().value;
-      if (oldest === undefined) break;
-      state.pending.delete(oldest);
-      this.counters.heartbeat_pending_evicted += 1;
+    if (state.opened && state.message && !state.blocked) {
+      this._flushHeartbeatState(state);
+      existing = state.pending.get(envelope.key) || null;
+      if (
+        !state.blocked
+        && state.pending.size === 0
+        && state.pendingControls.size === 0
+        && this._sendHeartbeatControlToState(state, frame)
+      ) {
+        this.counters.heartbeat_delivered += 1;
+        return true;
+      }
     }
-    state.pending.set(envelope.key, { frame, envelope });
+    const bytes = envelope.bytes;
+    const sameOwner = existing?.ownerPeer === ownerPeer;
+    const ownerUsage = this._peerUsage(state.pendingPeerUsage, ownerPeer);
+    const ownerEntries = ownerUsage.entries + (sameOwner ? 0 : 1);
+    const ownerBytes = ownerUsage.bytes + bytes - (sameOwner ? existing.bytes : 0);
+    if (
+      ownerEntries > this.maxHeartbeatEntriesPerPeer
+      || ownerBytes > this.maxPendingHeartbeatBytesPerPeer
+    ) {
+      this.counters.heartbeat_peer_quota_rejected += 1;
+      this._isolateSlowHeartbeatConsumer(state);
+      return false;
+    }
+    const pendingEntries = state.pending.size + (existing ? 0 : 1);
+    const pendingBytes = state.pendingBytes + bytes - (existing?.bytes || 0);
+    const globalPendingBytes = this.heartbeatPendingBytes + bytes - (existing?.bytes || 0);
+    const residentBytes = this.heartbeatCacheBytes + globalPendingBytes;
+    if (
+      pendingEntries > this.maxPendingHeartbeatsPerClient
+      || pendingBytes > this.maxPendingHeartbeatBytesPerClient
+      || globalPendingBytes > this.maxPendingHeartbeatBytes
+      || residentBytes > this.maxHeartbeatResidentBytes
+    ) {
+      this.counters.heartbeat_pending_bytes_rejected += 1;
+      this._isolateSlowHeartbeatConsumer(state);
+      return false;
+    }
+    if (existing) this._removePendingHeartbeat(state, envelope.key);
+    state.pending.set(envelope.key, {
+      frame,
+      envelope,
+      ownerPeer,
+      bytes,
+      ...timing,
+    });
+    state.pendingBytes += bytes;
+    this.heartbeatPendingBytes += bytes;
+    this._adjustPeerUsage(state.pendingPeerUsage, ownerPeer, 1, bytes);
+    this._adjustPeerUsage(this.heartbeatPendingPeerUsage, ownerPeer, 1, bytes);
     this._flushHeartbeatState(state);
     return true;
   }
@@ -789,13 +1080,20 @@ class InferenceRelay extends Feature {
     while (state.pending.size > 0 && !state.blocked) {
       const [key, record] = state.pending.entries().next().value;
       if (!this._sendHeartbeatControlToState(state, record.frame)) return;
-      state.pending.delete(key);
+      this._removePendingHeartbeat(state, key);
       this.counters.heartbeat_delivered += 1;
     }
   }
 
   _handleHeartbeatRelayFrame(state, frame) {
-    if (!frame || typeof frame !== 'object' || Array.isArray(frame) || frame.v !== 1) {
+    if (
+      !state
+      || state.heartbeatDisabled === true
+      || !frame
+      || typeof frame !== 'object'
+      || Array.isArray(frame)
+      || frame.v !== 1
+    ) {
       this.counters.heartbeat_frames_rejected += 1;
       return false;
     }
@@ -835,7 +1133,7 @@ class InferenceRelay extends Feature {
       }
       state.subscriptions.delete(room);
       for (const [key, record] of state.pending) {
-        if (record.envelope.channel === room) state.pending.delete(key);
+        if (record.envelope.channel === room) this._removePendingHeartbeat(state, key);
       }
       return true;
     }
@@ -849,8 +1147,12 @@ class InferenceRelay extends Feature {
       if (
         !this.serve
         || envelope.heartbeat.transport_peer?.toLowerCase() !== state.remote
-        || !this._rememberHeartbeat(envelope, false)
       ) {
+        this.counters.heartbeat_frames_rejected += 1;
+        return false;
+      }
+      const remembered = this._rememberHeartbeat(envelope, false, state.remote);
+      if (remembered !== HEARTBEAT_REMEMBERED) {
         this.counters.heartbeat_frames_rejected += 1;
         return false;
       }
@@ -861,10 +1163,11 @@ class InferenceRelay extends Feature {
       if (
         !this.relays.includes(state.remote)
         || !this.heartbeatRoomRefs.has(room)
-        || !this._rememberHeartbeat(envelope, false)
       ) {
         return false;
       }
+      const remembered = this._rememberHeartbeat(envelope, false);
+      if (remembered !== HEARTBEAT_REMEMBERED) return false;
       this.heartbeatSink?.(room, envelope.heartbeat, {
         relay: state.remote,
         authoritative: false,
@@ -875,24 +1178,55 @@ class InferenceRelay extends Feature {
     return false;
   }
 
-  _rememberHeartbeat(envelope, publishable = false) {
-    const current = this.heartbeatCache.get(envelope.key);
+  _rememberHeartbeat(envelope, publishable = false, ownerPeer = null) {
+    const now = this._heartbeatClockNow();
+    const timing = this._heartbeatTiming(envelope, now);
+    const owner = this._heartbeatOwner(envelope, ownerPeer);
+    if (!timing || !owner) return HEARTBEAT_INVALID;
+    let current = this.heartbeatCache.get(envelope.key);
+    if (current?.expiresAt <= now) {
+      this._removeHeartbeatCacheEntry(envelope.key);
+      this.counters.heartbeat_cache_expired += 1;
+      current = null;
+    }
     if (current && current.envelope.ts >= envelope.ts) {
       if (publishable) current.publishable = true;
       this.counters.heartbeat_coalesced += 1;
-      return false;
+      return HEARTBEAT_DUPLICATE;
     }
-    if (current) this.heartbeatCache.delete(envelope.key);
-    while (
-      !this.heartbeatCache.has(envelope.key)
-      && this.heartbeatCache.size >= this.maxHeartbeatEntries
+    const bytes = envelope.bytes;
+    const sameOwner = current?.ownerPeer === owner;
+    const ownerUsage = this._peerUsage(this.heartbeatCachePeerUsage, owner);
+    const ownerEntries = ownerUsage.entries + (sameOwner ? 0 : 1);
+    const ownerBytes = ownerUsage.bytes + bytes - (sameOwner ? current.bytes : 0);
+    if (
+      ownerEntries > this.maxHeartbeatEntriesPerPeer
+      || ownerBytes > this.maxHeartbeatBytesPerPeer
     ) {
-      const oldest = this.heartbeatCache.keys().next().value;
-      if (oldest === undefined) break;
-      this.heartbeatCache.delete(oldest);
+      this.counters.heartbeat_peer_quota_rejected += 1;
+      return HEARTBEAT_RESOURCE_REJECTED;
     }
-    this.heartbeatCache.set(envelope.key, { envelope, publishable });
-    return true;
+    const cacheEntries = this.heartbeatCache.size + (current ? 0 : 1);
+    const cacheBytes = this.heartbeatCacheBytes + bytes - (current?.bytes || 0);
+    if (
+      cacheEntries > this.maxHeartbeatEntries
+      || cacheBytes > this.maxHeartbeatCacheBytes
+      || cacheBytes + this.heartbeatPendingBytes > this.maxHeartbeatResidentBytes
+    ) {
+      this.counters.heartbeat_cache_bytes_rejected += 1;
+      return HEARTBEAT_RESOURCE_REJECTED;
+    }
+    if (current) this._removeHeartbeatCacheEntry(envelope.key);
+    this.heartbeatCache.set(envelope.key, {
+      envelope,
+      publishable,
+      ownerPeer: owner,
+      bytes,
+      ...timing,
+    });
+    this.heartbeatCacheBytes += bytes;
+    this._adjustPeerUsage(this.heartbeatCachePeerUsage, owner, 1, bytes);
+    return HEARTBEAT_REMEMBERED;
   }
 
   _fanoutHeartbeat(envelope) {
@@ -1365,6 +1699,7 @@ class InferenceRelay extends Feature {
   _sweep() {
     const now = Date.now();
     this.lastSweepAt = now;
+    this._expireHeartbeatResources(this._heartbeatClockNow());
     for (const state of this.sessions.values()) {
       if (state.closing) continue;
       const bytes = streamByteCount(state.connection);

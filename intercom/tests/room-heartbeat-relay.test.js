@@ -112,6 +112,7 @@ const syntheticRelayClient = (remote = 'bb'.repeat(32), opened = true) => {
       remote,
       opened,
       blocked: false,
+      heartbeatDisabled: false,
       message: {
         send(frame) {
           sent.push(frame);
@@ -121,6 +122,8 @@ const syntheticRelayClient = (remote = 'bb'.repeat(32), opened = true) => {
       subscriptions: new Set(),
       pendingControls: new Map(),
       pending: new Map(),
+      pendingBytes: 0,
+      pendingPeerUsage: new Map(),
     },
     sent,
   };
@@ -140,11 +143,49 @@ test('room heartbeat relay accepts only canonical bounded signed envelope shapes
   );
 });
 
+test('relay cache rejection never suppresses a valid direct or local heartbeat', () => {
+  const now = 1_700_000_000_050;
+  const peer = mockPeer();
+  const relay = new InferenceRelay(peer, {
+    relays: [relayKey],
+    heartbeatNow: () => now,
+    maxHeartbeatCacheBytes: 1,
+    maxHeartbeatBytesPerPeer: 1,
+  });
+  const direct = heartbeat(now);
+  const local = heartbeat(now + 1, { enclave_id: '31'.repeat(32) });
+
+  assert.deepEqual(
+    relay.observeSidechannelHeartbeat(room, { message: direct, origin: providerKey }),
+    { heartbeat: true, emit: true }
+  );
+  assert.deepEqual(
+    relay.observeSidechannelHeartbeat(room, { message: local, origin: 'local' }),
+    { heartbeat: true, emit: true }
+  );
+  assert.equal(relay.heartbeatCache.size, 0);
+  assert.equal(relay.counters.heartbeat_peer_quota_rejected, 2);
+
+  const coalescingRelay = new InferenceRelay(mockPeer(), {
+    heartbeatNow: () => now,
+  });
+  assert.deepEqual(
+    coalescingRelay.observeSidechannelHeartbeat(room, { message: direct, origin: providerKey }),
+    { heartbeat: true, emit: true }
+  );
+  assert.deepEqual(
+    coalescingRelay.observeSidechannelHeartbeat(room, { message: direct, origin: providerKey }),
+    { heartbeat: true, emit: false }
+  );
+});
+
 test('room heartbeat relay fans out by explicit room and coalesces each route to newest', () => {
+  let now = 1_700_000_000_100;
   const relay = new InferenceRelay(mockPeer(), {
     serve: true,
     maxHeartbeatEntries: 8,
     maxPendingHeartbeatsPerClient: 4,
+    heartbeatNow: () => now,
   });
   const first = syntheticRelayClient();
   const second = syntheticRelayClient('cc'.repeat(32));
@@ -221,15 +262,384 @@ test('room heartbeat relay fans out by explicit room and coalesces each route to
   ]);
   assert.deepEqual(unrelated.sent, []);
   assert.equal(slow.state.pending.size, 1);
+  now = newest.ts;
   slow.state.opened = true;
   relay._flushHeartbeatState(slow.state);
   assert.deepEqual(slow.sent.map((frame) => frame.heartbeat.ts), [newest.ts]);
   assert.equal(relay.heartbeatCache.size, 1);
 });
 
+test('room heartbeat relay strictly bounds cached and pending payload bytes', () => {
+  const now = 1_700_000_000_500;
+  const publisherKey = 'a1'.repeat(32);
+  const firstValue = heartbeat(now, {
+    enclave_id: '01'.repeat(32),
+    transport_peer: publisherKey,
+  });
+  const payloadBytes = heartbeatEnvelope(room, firstValue).bytes;
+  const relay = new InferenceRelay(mockPeer(), {
+    serve: true,
+    heartbeatNow: () => now,
+    maxHeartbeatEntries: 8,
+    maxHeartbeatEntriesPerPeer: 8,
+    maxPendingHeartbeatsPerClient: 8,
+    maxHeartbeatCacheBytes: payloadBytes * 2,
+    maxPendingHeartbeatBytes: payloadBytes,
+    maxHeartbeatResidentBytes: payloadBytes * 3,
+    maxHeartbeatBytesPerPeer: payloadBytes * 4,
+    maxPendingHeartbeatBytesPerClient: payloadBytes * 2,
+    maxPendingHeartbeatBytesPerPeer: payloadBytes * 2,
+  });
+  const slow = syntheticRelayClient('a2'.repeat(32), false);
+  slow.state.subscriptions.add(room);
+  relay.heartbeatConnectionStates.add(slow.state);
+  const publisher = syntheticRelayClient(publisherKey).state;
+  const secondPublisherKey = 'a5'.repeat(32);
+  const secondPublisher = syntheticRelayClient(secondPublisherKey).state;
+  const thirdPublisherKey = 'a6'.repeat(32);
+  const thirdPublisher = syntheticRelayClient(thirdPublisherKey).state;
+
+  assert.equal(
+    relay._handleHeartbeatRelayFrame(
+      publisher,
+      { t: 'hb.publish', v: 1, room, heartbeat: firstValue }
+    ),
+    true
+  );
+  assert.equal(
+    relay._handleHeartbeatRelayFrame(
+      secondPublisher,
+      {
+        t: 'hb.publish',
+        v: 1,
+        room,
+        heartbeat: heartbeat(now + 1, {
+          enclave_id: '02'.repeat(32),
+          transport_peer: secondPublisherKey,
+        }),
+      }
+    ),
+    true
+  );
+  assert.equal(
+    relay._handleHeartbeatRelayFrame(
+      thirdPublisher,
+      {
+        t: 'hb.publish',
+        v: 1,
+        room,
+        heartbeat: heartbeat(now + 2, {
+          enclave_id: '03'.repeat(32),
+          transport_peer: thirdPublisherKey,
+        }),
+      }
+    ),
+    false
+  );
+
+  assert.equal(relay.heartbeatCache.size, 2);
+  assert.equal(slow.state.pending.size, 0);
+  assert.equal(slow.state.heartbeatDisabled, true);
+  assert.ok(relay.heartbeatCacheBytes <= relay.maxHeartbeatCacheBytes);
+  assert.ok(relay.heartbeatPendingBytes <= relay.maxPendingHeartbeatBytes);
+  assert.ok(
+    relay.heartbeatCacheBytes + relay.heartbeatPendingBytes
+      <= relay.maxHeartbeatResidentBytes
+  );
+  assert.ok(relay.counters.heartbeat_pending_bytes_rejected >= 1);
+  assert.ok(relay.counters.heartbeat_cache_bytes_rejected >= 1);
+  assert.equal(relay.counters.heartbeat_slow_consumers_isolated, 1);
+});
+
+test('slow subscriber is isolated without starving healthy subscribers in any iteration order', () => {
+  const now = 1_700_000_002_500;
+  const publisherKey = 'a7'.repeat(32);
+  const first = heartbeat(now, {
+    enclave_id: '07'.repeat(32),
+    transport_peer: publisherKey,
+  });
+  const second = heartbeat(now + 1, {
+    enclave_id: '08'.repeat(32),
+    transport_peer: publisherKey,
+  });
+  const payloadBytes = Math.max(
+    heartbeatEnvelope(room, first).bytes,
+    heartbeatEnvelope(room, second).bytes
+  );
+  const relay = new InferenceRelay(mockPeer(), {
+    serve: true,
+    heartbeatNow: () => now,
+    maxHeartbeatCacheBytes: payloadBytes * 4,
+    maxPendingHeartbeatBytes: payloadBytes * 8,
+    maxHeartbeatResidentBytes: payloadBytes * 12,
+    maxHeartbeatBytesPerPeer: payloadBytes * 4,
+    maxPendingHeartbeatBytesPerClient: payloadBytes * 4,
+    maxPendingHeartbeatBytesPerPeer: payloadBytes,
+  });
+  const slow = syntheticRelayClient('a8'.repeat(32), false);
+  const healthy = [
+    syntheticRelayClient('a9'.repeat(32), false),
+    syntheticRelayClient('aa'.repeat(32), false),
+    syntheticRelayClient('ab'.repeat(32), false),
+  ];
+  slow.state.subscriptions.add(room);
+  relay.heartbeatConnectionStates.add(slow.state);
+  for (const subscriber of healthy) {
+    subscriber.state.opened = true;
+    subscriber.state.subscriptions.add(room);
+    relay.heartbeatConnectionStates.add(subscriber.state);
+  }
+
+  assert.equal(
+    relay._handleHeartbeatRelayFrame(
+      syntheticRelayClient(publisherKey).state,
+      { t: 'hb.publish', v: 1, room, heartbeat: first }
+    ),
+    true
+  );
+  assert.equal(
+    relay._handleHeartbeatRelayFrame(
+      syntheticRelayClient(publisherKey).state,
+      { t: 'hb.publish', v: 1, room, heartbeat: second }
+    ),
+    true
+  );
+  for (const subscriber of healthy) {
+    assert.deepEqual(
+      subscriber.sent.map((frame) => frame.heartbeat.enclave_id),
+      [first.enclave_id, second.enclave_id]
+    );
+  }
+  assert.equal(slow.state.heartbeatDisabled, true);
+  assert.equal(relay.heartbeatConnectionStates.has(slow.state), false);
+  assert.equal(slow.state.pending.size, 0);
+  assert.equal(relay.heartbeatPendingBytes, 0);
+  assert.equal(relay.heartbeatPendingPeerUsage.has(publisherKey), false);
+  assert.ok(relay.counters.heartbeat_peer_quota_rejected >= 1);
+  assert.equal(relay.counters.heartbeat_slow_consumers_isolated, 1);
+});
+
+test('heartbeat accounting stays exact across owner replacement and cleanup paths', () => {
+  let now = 1_700_000_002_800;
+  const firstOwner = 'ac'.repeat(32);
+  const secondOwner = 'ad'.repeat(32);
+  const relay = new InferenceRelay(mockPeer(), {
+    serve: true,
+    heartbeatNow: () => now,
+    heartbeatFreshnessMs: 1_000,
+    maxHeartbeatRetentionMs: 100,
+  });
+  const slow = syntheticRelayClient('ae'.repeat(32), false);
+  slow.state.subscriptions.add(room);
+  relay.heartbeatConnectionStates.add(slow.state);
+  const first = heartbeat(now, {
+    transport_peer: firstOwner,
+    model_id: 'first',
+  });
+  const firstEnvelope = heartbeatEnvelope(room, first);
+
+  assert.equal(
+    relay._handleHeartbeatRelayFrame(
+      syntheticRelayClient(firstOwner).state,
+      { t: 'hb.publish', v: 1, room, heartbeat: first }
+    ),
+    true
+  );
+  assert.equal(relay.heartbeatCacheBytes, firstEnvelope.bytes);
+  assert.equal(relay.heartbeatPendingBytes, firstEnvelope.bytes);
+  assert.deepEqual(relay.heartbeatCachePeerUsage.get(firstOwner), {
+    entries: 1,
+    bytes: firstEnvelope.bytes,
+  });
+  assert.deepEqual(relay.heartbeatPendingPeerUsage.get(firstOwner), {
+    entries: 1,
+    bytes: firstEnvelope.bytes,
+  });
+
+  const replacement = heartbeat(now + 1, {
+    transport_peer: secondOwner,
+    model_id: 'replacement-with-a-different-byte-length',
+  });
+  const replacementEnvelope = heartbeatEnvelope(room, replacement);
+  assert.equal(replacementEnvelope.key, firstEnvelope.key);
+  assert.equal(
+    relay._handleHeartbeatRelayFrame(
+      syntheticRelayClient(secondOwner).state,
+      { t: 'hb.publish', v: 1, room, heartbeat: replacement }
+    ),
+    true
+  );
+  assert.equal(relay.heartbeatCacheBytes, replacementEnvelope.bytes);
+  assert.equal(relay.heartbeatPendingBytes, replacementEnvelope.bytes);
+  assert.equal(relay.heartbeatCachePeerUsage.has(firstOwner), false);
+  assert.equal(relay.heartbeatPendingPeerUsage.has(firstOwner), false);
+  assert.deepEqual(relay.heartbeatCachePeerUsage.get(secondOwner), {
+    entries: 1,
+    bytes: replacementEnvelope.bytes,
+  });
+  assert.deepEqual(relay.heartbeatPendingPeerUsage.get(secondOwner), {
+    entries: 1,
+    bytes: replacementEnvelope.bytes,
+  });
+
+  assert.equal(
+    relay._handleHeartbeatRelayFrame(
+      slow.state,
+      { t: 'hb.unsubscribe', v: 1, room }
+    ),
+    true
+  );
+  assert.equal(slow.state.pendingBytes, 0);
+  assert.equal(relay.heartbeatPendingBytes, 0);
+  assert.equal(relay.heartbeatPendingPeerUsage.size, 0);
+
+  now += 100;
+  relay._sweep();
+  assert.equal(relay.heartbeatCache.size, 0);
+  assert.equal(relay.heartbeatCacheBytes, 0);
+  assert.equal(relay.heartbeatCachePeerUsage.size, 0);
+});
+
+test('room heartbeat relay expires signed heartbeats by freshness and local retention', () => {
+  let now = 1_700_000_003_000;
+  const publisherKey = 'a3'.repeat(32);
+  const relay = new InferenceRelay(mockPeer(), {
+    serve: true,
+    heartbeatNow: () => now,
+    heartbeatFreshnessMs: 1_000,
+    maxHeartbeatRetentionMs: 250,
+    maxHeartbeatFutureSkewMs: 50,
+  });
+  const slow = syntheticRelayClient('a4'.repeat(32), false);
+  slow.state.subscriptions.add(room);
+  relay.heartbeatConnectionStates.add(slow.state);
+  const publisher = syntheticRelayClient(publisherKey).state;
+  const value = heartbeat(now - 100, { transport_peer: publisherKey });
+  const key = heartbeatEnvelope(room, value).key;
+
+  assert.equal(
+    relay._handleHeartbeatRelayFrame(
+      publisher,
+      { t: 'hb.publish', v: 1, room, heartbeat: value }
+    ),
+    true
+  );
+  assert.equal(relay.heartbeatCache.get(key).expiresAt, now + 250);
+  assert.equal(slow.state.pending.get(key).expiresAt, now + 250);
+
+  now += 249;
+  relay._sweep();
+  assert.equal(relay.heartbeatCache.has(key), true);
+  assert.equal(slow.state.pending.has(key), true);
+
+  now += 1;
+  relay._sweep();
+  assert.equal(relay.heartbeatCache.has(key), false);
+  assert.equal(slow.state.pending.has(key), false);
+  assert.equal(relay.heartbeatCacheBytes, 0);
+  assert.equal(relay.heartbeatPendingBytes, 0);
+  assert.equal(relay.counters.heartbeat_cache_expired, 1);
+  assert.equal(relay.counters.heartbeat_pending_expired, 1);
+
+  assert.equal(
+    relay._handleHeartbeatRelayFrame(
+      publisher,
+      {
+        t: 'hb.publish',
+        v: 1,
+        room,
+        heartbeat: heartbeat(now + 51, {
+          enclave_id: '04'.repeat(32),
+          transport_peer: publisherKey,
+        }),
+      }
+    ),
+    false
+  );
+  assert.equal(
+    relay._handleHeartbeatRelayFrame(
+      publisher,
+      {
+        t: 'hb.publish',
+        v: 1,
+        room,
+        heartbeat: heartbeat(now - 1_000, {
+          enclave_id: '05'.repeat(32),
+          transport_peer: publisherKey,
+        }),
+      }
+    ),
+    false
+  );
+  assert.equal(relay.heartbeatCache.size, 0);
+});
+
+test('attacker heartbeat churn cannot evict another peer route', () => {
+  const now = 1_700_000_004_000;
+  const legitimateKey = 'b1'.repeat(32);
+  const attackerKey = 'b2'.repeat(32);
+  const legitimate = heartbeat(now, {
+    enclave_id: '10'.repeat(32),
+    transport_peer: legitimateKey,
+  });
+  const payloadBytes = heartbeatEnvelope(room, legitimate).bytes;
+  const relay = new InferenceRelay(mockPeer(), {
+    serve: true,
+    heartbeatNow: () => now,
+    maxHeartbeatEntries: 3,
+    maxHeartbeatEntriesPerPeer: 2,
+    maxPendingHeartbeatsPerClient: 3,
+    maxHeartbeatCacheBytes: payloadBytes * 4,
+    maxPendingHeartbeatBytes: payloadBytes * 4,
+    maxHeartbeatResidentBytes: payloadBytes * 8,
+    maxHeartbeatBytesPerPeer: payloadBytes * 2,
+    maxPendingHeartbeatBytesPerClient: payloadBytes * 4,
+    maxPendingHeartbeatBytesPerPeer: payloadBytes * 2,
+  });
+  const slow = syntheticRelayClient('b3'.repeat(32), false);
+  slow.state.subscriptions.add(room);
+  relay.heartbeatConnectionStates.add(slow.state);
+  const legitimatePublisher = syntheticRelayClient(legitimateKey).state;
+  const attacker = syntheticRelayClient(attackerKey).state;
+  const legitimateEnvelope = heartbeatEnvelope(room, legitimate);
+
+  assert.equal(
+    relay._handleHeartbeatRelayFrame(
+      legitimatePublisher,
+      { t: 'hb.publish', v: 1, room, heartbeat: legitimate }
+    ),
+    true
+  );
+  for (let index = 0; index < 12; index += 1) {
+    relay._handleHeartbeatRelayFrame(
+      attacker,
+      {
+        t: 'hb.publish',
+        v: 1,
+        room,
+        heartbeat: heartbeat(now + index, {
+          enclave_id: index.toString(16).padStart(64, '0'),
+          transport_peer: attackerKey,
+        }),
+      }
+    );
+  }
+
+  assert.equal(relay.heartbeatCache.has(legitimateEnvelope.key), true);
+  assert.equal(slow.state.pending.has(legitimateEnvelope.key), true);
+  assert.equal(relay.heartbeatCache.size, 3);
+  assert.equal(slow.state.pending.size, 3);
+  assert.equal(relay.heartbeatCachePeerUsage.get(attackerKey).entries, 2);
+  assert.equal(slow.state.pendingPeerUsage.get(attackerKey).entries, 2);
+  assert.ok(relay.counters.heartbeat_peer_quota_rejected >= 10);
+});
+
 test('relay fallback continues after direct heartbeat loss without becoming authoritative', () => {
   const peer = mockPeer();
-  const consumer = new InferenceRelay(peer, { relays: [relayKey] });
+  const consumer = new InferenceRelay(peer, {
+    relays: [relayKey],
+    heartbeatNow: () => 1_700_000_001_001,
+  });
   const delivered = [];
   consumer.setHeartbeatSink((channel, value, metadata) => {
     delivered.push({ channel, value, metadata });
@@ -292,9 +702,19 @@ test('three low-footprint peers deliver a heartbeat when provider-to-buyer direc
     wallet: { publicKey: b4a.toString(buyerKeyPair.publicKey, 'hex') },
     swarm: { connections: new Set([buyerPair.left]), joinPeer() {} },
   };
-  const helper = new InferenceRelay(helperPeer, { serve: true });
-  const provider = new InferenceRelay(providerPeer, { relays: [officialRelay] });
-  const buyer = new InferenceRelay(buyerPeer, { relays: [officialRelay] });
+  const relayNow = () => 1_700_000_002_000;
+  const helper = new InferenceRelay(helperPeer, {
+    serve: true,
+    heartbeatNow: relayNow,
+  });
+  const provider = new InferenceRelay(providerPeer, {
+    relays: [officialRelay],
+    heartbeatNow: relayNow,
+  });
+  const buyer = new InferenceRelay(buyerPeer, {
+    relays: [officialRelay],
+    heartbeatNow: relayNow,
+  });
   const delivered = [];
   buyer.setHeartbeatSink((channel, value, metadata) => {
     delivered.push({ channel, value, metadata });

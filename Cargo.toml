@@ -18,7 +18,7 @@ members = [
 exclude = ["third_party/xet-core"]
 
 [workspace.package]
-version = "0.2.60"
+version = "0.2.61"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
