@@ -2166,10 +2166,12 @@ export_llama_cpp_cuda_link_search() {
   local library_dirs="$1"
   local library_dir flag encoded="${CARGO_ENCODED_RUSTFLAGS-}"
   local separator=$'\x1f'
-  local -a existing_flags=() required_dirs=()
+  local -a existing_flags=() line_flags=() required_dirs=()
 
   if [[ -z "${CARGO_ENCODED_RUSTFLAGS+x}" && -n "${RUSTFLAGS:-}" ]]; then
-    read -r -a existing_flags <<< "$RUSTFLAGS"
+    while read -r -a line_flags; do
+      existing_flags+=("${line_flags[@]}")
+    done <<< "$RUSTFLAGS"
     for flag in "${existing_flags[@]}"; do
       encoded="${encoded:+$encoded$separator}$flag"
     done
@@ -2236,6 +2238,8 @@ linux_llama_cpp_features() {
       [[ -n "$feature" ]] || continue
       case "$feature" in
         mayhem-cli/llama-cpp-cuda)
+          [[ "$target_arch" == "$host_arch" ]] ||
+            die "llama.cpp CUDA source builds must target the native host architecture"
           llama_cpp_cuda_toolkit_usable ||
             die "llama.cpp CUDA source build requested, but a working nvcc was not found; install CUDA Toolkit or set MAYHEM_LLAMA_CPP_FEATURES=cpu"
           ;;

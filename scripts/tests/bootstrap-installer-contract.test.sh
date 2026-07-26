@@ -212,9 +212,9 @@ mkdir -p "$cuda_link_dir"
   eval "$installer_acceleration_functions"
   separator=$'\x1f'
   unset CARGO_ENCODED_RUSTFLAGS
-  export RUSTFLAGS="--cfg existing"
+  export RUSTFLAGS=$'--cfg existing\n-C opt-level=2'
   export_llama_cpp_cuda_link_search "$cuda_link_dir"
-  [[ "$CARGO_ENCODED_RUSTFLAGS" == "--cfg${separator}existing${separator}-Lnative=$cuda_link_dir" ]]
+  [[ "$CARGO_ENCODED_RUSTFLAGS" == "--cfg${separator}existing${separator}-C${separator}opt-level=2${separator}-Lnative=$cuda_link_dir" ]]
   [[ -z "${RUSTFLAGS+x}" ]]
 )
 (

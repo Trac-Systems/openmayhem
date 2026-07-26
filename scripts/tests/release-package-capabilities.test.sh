@@ -71,6 +71,13 @@ if (
 ) >/dev/null 2>&1; then
   fail "release packaging accepted an explicit CUDA build without working nvcc"
 fi
+if (
+  llama_cpp_cuda_toolkit_usable() { return 0; }
+  MAYHEM_LLAMA_CPP_FEATURES=cuda \
+    linux_llama_cpp_features Linux aarch64 x86_64
+) >/dev/null 2>&1; then
+  fail "release packaging accepted an explicit cross-target CUDA build"
+fi
 
 grep -F '"$root/bin/nvcc" --version' "$ROOT_DIR/scripts/package-release.sh" >/dev/null ||
   fail "release packaging accepts an nvcc path without executing it"
