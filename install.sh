@@ -1237,7 +1237,7 @@ llama_cpp_feature_name() {
 }
 
 llama_cpp_cuda_toolkit_usable() {
-  local candidate resolved
+  local candidate resolved nvcc_usable=0
   local -a candidates=()
 
   [[ -n "${CUDACXX:-}" ]] && candidates+=("$CUDACXX")
@@ -1252,10 +1252,83 @@ llama_cpp_cuda_toolkit_usable() {
     fi
     [[ -n "$resolved" && -x "$resolved" ]] || continue
     if "$resolved" --version >/dev/null 2>&1; then
-      return 0
+      nvcc_usable=1
+      break
     fi
   done
-  return 1
+  [[ "$nvcc_usable" == "1" ]] || return 1
+
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    llama_cpp_cuda_library_dirs >/dev/null
+  fi
+}
+
+llama_cpp_cuda_library_dirs() {
+  local candidate root triplet joined="" found_any=0
+  local found_cudart=0 found_cublas=0 found_cublas_lt=0 found_culibos=0
+  local -a candidates=() roots=()
+
+  if [[ -n "${CUDA_LIBRARY_PATH:-}" ]]; then
+    IFS=':' read -r -a candidates <<< "$CUDA_LIBRARY_PATH"
+  fi
+  for root in \
+    "${CUDA_HOME:-}" \
+    "${CUDA_PATH:-}" \
+    "${CUDA_ROOT:-}" \
+    "${CUDA_TOOLKIT_ROOT_DIR:-}" \
+    /usr/local/cuda \
+    /opt/cuda; do
+    [[ -n "$root" ]] && roots+=("$root")
+  done
+  for root in "${roots[@]}"; do
+    candidates+=(
+      "$root/lib64"
+      "$root/lib"
+      "$root/targets/x86_64-linux/lib"
+      "$root/targets/aarch64-linux/lib"
+    )
+  done
+  for root in /usr/local/cuda-*; do
+    [[ -d "$root" ]] || continue
+    candidates+=(
+      "$root/lib64"
+      "$root/lib"
+      "$root/targets/x86_64-linux/lib"
+      "$root/targets/aarch64-linux/lib"
+    )
+  done
+  triplet="$(gcc -print-multiarch 2>/dev/null || true)"
+  [[ -n "$triplet" ]] && candidates+=("/usr/lib/$triplet")
+  candidates+=(
+    "/usr/lib/$(uname -m)-linux-gnu"
+    /usr/lib64
+    /usr/lib
+  )
+
+  for candidate in "${candidates[@]}"; do
+    [[ -n "$candidate" && -d "$candidate" ]] || continue
+    case ":$joined:" in
+      *":$candidate:"*) continue ;;
+    esac
+    [[ -r "$candidate/libcudart_static.a" ]] && found_cudart=1
+    [[ -r "$candidate/libcublas_static.a" ]] && found_cublas=1
+    [[ -r "$candidate/libcublasLt_static.a" ]] && found_cublas_lt=1
+    [[ -r "$candidate/libculibos.a" ]] && found_culibos=1
+    if [[ -r "$candidate/libcudart_static.a" ||
+      -r "$candidate/libcublas_static.a" ||
+      -r "$candidate/libcublasLt_static.a" ||
+      -r "$candidate/libculibos.a" ]]; then
+      joined="${joined:+$joined:}$candidate"
+      found_any=1
+    fi
+  done
+
+  [[ "$found_any" == "1" &&
+    "$found_cudart" == "1" &&
+    "$found_cublas" == "1" &&
+    "$found_cublas_lt" == "1" &&
+    "$found_culibos" == "1" ]] || return 1
+  printf '%s\n' "$joined"
 }
 
 llama_cpp_vulkan_toolkit_usable() {
@@ -1443,7 +1516,7 @@ verify_source_llama_cpp_backend() {
 }
 
 install_from_source() {
-  local bin src target_root llama_cpp_features requested_features
+  local bin src target_root llama_cpp_features requested_features cuda_library_dirs
   local -a cargo_args
 
   [[ -f "$SOURCE_DIR/Cargo.toml" ]] || die "source dir does not contain Cargo.toml: $SOURCE_DIR"
@@ -1481,6 +1554,17 @@ install_from_source() {
         "$llama_cpp_features" \
         "${MAYHEM_LLAMA_CPP_FEATURES:-}"
     )"
+    if [[ "$SOURCE_LLAMA_CPP_BACKEND" == "cuda" ]]; then
+      cuda_library_dirs="$(llama_cpp_cuda_library_dirs)" ||
+        die "llama.cpp CUDA source build requires libcudart_static.a, libcublas_static.a, libcublasLt_static.a, and libculibos.a; install the CUDA development libraries or select another backend"
+      case ":${CUDA_LIBRARY_PATH:-}:" in
+        *":$cuda_library_dirs:"*) ;;
+        *)
+          export CUDA_LIBRARY_PATH="${cuda_library_dirs}${CUDA_LIBRARY_PATH:+:$CUDA_LIBRARY_PATH}"
+          ;;
+      esac
+      log "using validated CUDA static libraries from $cuda_library_dirs"
+    fi
   else
     die "unsupported source-install host: $(uname -s)"
   fi

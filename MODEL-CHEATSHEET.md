@@ -123,7 +123,13 @@ If a provider changes its committed context, it signs its own leave/rejoin.
 These are release-managed runtime identities, not commands for manual package
 installation or claims that the listed versions are universally required
 outside OpenMayhem. They are the versions bound to the current measured
-runtime/canary evidence. Full transitive hashes remain in the linked lockfiles.
+runtime/canary evidence.
+Where a platform `uv.lock` exists, it is the authoritative transitive lock.
+The older vLLM, MLX language/vision, Transformers ASR, and Sulphur CUDA
+manifests instead pin and validate their direct runtime stack; their remaining
+dependency closure is resolver-constrained rather than hash-locked. In every
+case the signed catalog, runtime selector, imports/version checks, and
+functional canary remain the admission authority.
 
 Every managed Python backend starts from the official standalone `uv 0.11.29`
 archive for its exact OS and architecture. Mayhem enforces HTTPS, redirect and
@@ -146,7 +152,7 @@ The authoritative full locks are
 [`python_runtime.rs`](crates/mayhem-cli/src/python_runtime.rs),
 [`sulphur-runtime-requirements.txt`](crates/mayhem-cli/resources/python/sulphur-runtime-requirements.txt),
 [`sulphur-mlx-runtime-requirements.txt`](crates/mayhem-cli/resources/python/sulphur-mlx-runtime-requirements.txt),
-and the three
+and the four
 [`chatterbox-runtime-*`](crates/mayhem-cli/resources/python/) lock
 directories. Stable-diffusion.cpp is the one external engine below: its
 executable version is not release-pinned, so this document does not invent one.
@@ -480,7 +486,8 @@ canonical artifact. Never mix a projector or primary across the two variants.
   upstream
   `SulphurAI/Sulphur-2-base@875e886e556b955d21149316fd631cc121db6cc1`.
   Total: 43,657,590,667 bytes.
-- MLX variant: `sulphur-mlx` / `mlx-q4` composition; mirror
+- MLX variant: catalog engine `sulphur` / `mlx-q4` composition; internal
+  managed-runtime selector `sulphur-mlx`; mirror
   `TracNetwork/mayhem-catalog-SulphurAI-Sulphur-2-base-MLX-4bit@72d1f4293e8b7ac913618cc146653acea15845a4`,
   upstream
   `MLXBits/sulphur-2-distill-mlx-q4@d210a0937cac3464ef80c74806e886beddf19a8e`.
@@ -523,10 +530,10 @@ mayhem doctor --provider-backend sulphur
 mayhem up --provider --provider-enclave SulphurAI/Sulphur-2-base --yes
 ```
 
-The doctor selector remains `sulphur`; Mayhem chooses its managed
-`sulphur-mlx` runtime for the Apple Silicon artifact. CUDA and MLX are
-canonical variants in the same model market only when their signed capability
-and canary bindings match; never cross-mix their sidecars or runtime
+The catalog and doctor selector remain `sulphur`; Mayhem chooses its internal
+managed-runtime selector `sulphur-mlx` for the Apple Silicon artifact. CUDA and
+MLX are canonical variants in the same model market only when their signed
+capability and canary bindings match; never cross-mix their sidecars or runtime
 environments.
 
 ## Chatterbox original-English TTS
@@ -550,10 +557,10 @@ environments.
 
 **Hard requirements and surface**
 
-- Linux/Windows/macOS CPU; CUDA on Linux/Windows x86_64; Metal/MPS on Apple
+- Linux/Windows CPU; CUDA on Linux/Windows x86_64; CPU or Metal/MPS on Apple
   Silicon. Linux ARM64 supports the frozen CUDA 13 runtime and falls back to
-  the frozen CPU runtime when CUDA is unavailable. Intel macOS remains
-  CPU-only; Windows ARM64 CUDA is unsupported.
+  the frozen CPU runtime when CUDA is unavailable. Intel macOS and Windows
+  ARM64 CUDA are unsupported by the current managed runtime selector.
 - 8 GiB RAM; 6 GiB full-offload target. Runtime bootstrap needs 16 GiB free
   disk.
 - Endpoints: OpenAI audio speech and HF text-to-speech. Output is mono 24 kHz

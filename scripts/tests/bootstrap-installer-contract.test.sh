@@ -110,6 +110,7 @@ installer_acceleration_functions="$(
 for function_name in \
   llama_cpp_feature_name \
   llama_cpp_cuda_toolkit_usable \
+  llama_cpp_cuda_library_dirs \
   llama_cpp_vulkan_toolkit_usable \
   linux_llama_cpp_features; do
   grep -F "${function_name}() {" <<<"$installer_acceleration_functions" >/dev/null ||
@@ -117,8 +118,63 @@ for function_name in \
 done
 grep -F '"$resolved" --version' <<<"$installer_acceleration_functions" >/dev/null ||
   fail "Unix source installer accepts an nvcc path without executing it"
+for library in \
+  libcudart_static.a \
+  libcublas_static.a \
+  libcublasLt_static.a \
+  libculibos.a; do
+  grep -F "$library" <<<"$installer_acceleration_functions" >/dev/null ||
+    fail "Unix source installer does not require CUDA static library: $library"
+done
 grep -F 'pkg-config --exists vulkan' <<<"$installer_acceleration_functions" >/dev/null ||
   fail "Unix source installer does not validate Vulkan development metadata"
+
+cuda_fixture="$(mktemp -d)"
+mkdir -p "$cuda_fixture/bin" "$cuda_fixture/lib"
+cat >"$cuda_fixture/bin/nvcc" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod 0755 "$cuda_fixture/bin/nvcc"
+for library in \
+  libcudart_static.a \
+  libcublas_static.a \
+  libcublasLt_static.a \
+  libculibos.a; do
+  : >"$cuda_fixture/lib/$library"
+done
+(
+  eval "$installer_acceleration_functions"
+  uname() {
+    case "${1:-}" in
+      -s) printf 'Linux\n' ;;
+      -m) printf 'x86_64\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  export CUDACXX="$cuda_fixture/bin/nvcc"
+  export CUDA_LIBRARY_PATH="$cuda_fixture/lib"
+  [[ "$(llama_cpp_cuda_library_dirs)" == "$cuda_fixture/lib" ]]
+  llama_cpp_cuda_toolkit_usable
+) || fail "Unix source installer rejected a complete Debian-style CUDA toolkit"
+rm -f "$cuda_fixture/lib/libculibos.a"
+if (
+  eval "$installer_acceleration_functions"
+  uname() {
+    case "${1:-}" in
+      -s) printf 'Linux\n' ;;
+      -m) printf 'x86_64\n' ;;
+      *) return 1 ;;
+    esac
+  }
+  export CUDACXX="$cuda_fixture/bin/nvcc"
+  export CUDA_LIBRARY_PATH="$cuda_fixture/lib"
+  llama_cpp_cuda_toolkit_usable
+) >/dev/null 2>&1; then
+  rm -rf "$cuda_fixture"
+  fail "Unix source installer accepted CUDA without libculibos.a"
+fi
+rm -rf "$cuda_fixture"
 installer_source_backend_functions="$(
   awk '
     /^llama_cpp_source_backend\(\) \{/ { capture = 1 }
@@ -217,6 +273,8 @@ grep -F 'linux_llama_cpp_features Linux "$(uname -m)" "$(uname -m)"' \
 grep -F 'cargo_args+=(--features "$llama_cpp_features")' \
   <<<"$shell_source_build" >/dev/null ||
   fail "Unix source build does not pass selected llama.cpp features to Cargo"
+grep -F 'export CUDA_LIBRARY_PATH=' <<<"$shell_source_build" >/dev/null ||
+  fail "Unix source build does not expose validated CUDA libraries to Cargo"
 grep -F 'mayhem-cli/llama-cpp-metal' <<<"$shell_source_build" >/dev/null ||
   fail "Unix source acceleration change removed the existing macOS Metal build"
 grep -F 'SOURCE_LLAMA_CPP_BACKEND="metal"' <<<"$shell_source_build" >/dev/null ||
