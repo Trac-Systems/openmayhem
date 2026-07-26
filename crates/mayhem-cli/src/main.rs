@@ -47181,6 +47181,19 @@ struct ProviderMemoryPool {
     available_bytes: u64,
 }
 
+fn provider_memory_pool_available_reflects_resident_memory(pool: &str, unified: bool) -> bool {
+    if unified
+        || matches!(
+            pool,
+            "system_memory" | "unified_memory" | "nvidia_unified_memory"
+        )
+    {
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ProviderMemoryClaimRecord {
     schema_version: u32,
@@ -47195,12 +47208,33 @@ struct ProviderMemoryClaimRecord {
 }
 
 struct ProviderMemoryClaimGuard {
-    path: PathBuf,
+    path: Option<PathBuf>,
+    release_after_load: bool,
+}
+
+impl ProviderMemoryClaimGuard {
+    fn release_after_model_load(&mut self) -> Result<()> {
+        if !self.release_after_load {
+            return Ok(());
+        }
+        if let Some(path) = self.path.take() {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| format!("removing {}", path.display()));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Drop for ProviderMemoryClaimGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -50312,6 +50346,13 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     let hardware_fingerprint = provider_hardware_fingerprint(&hardware);
     let identity_anchor = format!("fingerprint:{hardware_fingerprint}");
     let requested_enclave = args.enclave.clone();
+    let memory_claim_admission_lock = if args.serve_sessions {
+        let lock = lock_provider_memory_claim_admission(&home)?;
+        remove_provider_memory_claims_for_pid(&home, std::process::id())?;
+        Some(lock)
+    } else {
+        None
+    };
     let selected = select_provider_candidate_with_config_defaults(
         &contract,
         &provider_catalog.catalog_doc,
@@ -50320,6 +50361,18 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         config.as_ref(),
         requested_enclave.as_deref(),
     )?;
+    args.load_progress = Some(ProviderLoadProgressContext::new(
+        &home,
+        &wallet.public_key,
+        &selected,
+    ));
+    write_provider_load_progress_stage(&args, "selected admin enclave", "select", "complete", 100);
+    let mut memory_claim_guard = if args.serve_sessions {
+        write_provider_memory_claim(&home, &wallet.public_key, &selected)?
+    } else {
+        None
+    };
+    drop(memory_claim_admission_lock);
     let vllm_memory_utilization = ensure_provider_vllm_memory_utilization_config(
         &home,
         std::slice::from_ref(&selected),
@@ -50356,13 +50409,6 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             bail_provider_start_drained(&home, &selected.enclave.enclave_id, &path)?;
         }
     }
-    args.load_progress = Some(ProviderLoadProgressContext::new(
-        &home,
-        &wallet.public_key,
-        &selected,
-    ));
-    write_provider_load_progress_stage(&args, "selected admin enclave", "select", "complete", 100);
-
     let result: Result<()> = async {
     provider_log(
         &args,
@@ -50424,11 +50470,6 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         runtime
     } else {
         ProviderBackendRuntime::default()
-    };
-    let _memory_claim_guard = if args.serve_sessions {
-        write_provider_memory_claim(&home, &wallet.public_key, &selected)?
-    } else {
-        None
     };
     let provider_secret = derive_provider_secret(&keypair_path, &password, &wallet).await?;
     let downloads_dir = args
@@ -50579,6 +50620,9 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     let (session_responder, modality_health) = if args.serve_sessions {
         let (responder, health) =
             provider_session_responder_with_modality_health(&session_context)?;
+        if let Some(claim) = memory_claim_guard.as_mut() {
+            claim.release_after_model_load()?;
+        }
         (Some(responder), health)
     } else {
         (None, Vec::new())
@@ -56972,6 +57016,7 @@ struct ProviderLoadProgressContext {
 #[derive(Serialize)]
 struct ProviderLoadProgressReport<'a> {
     schema: u32,
+    pid: u32,
     provider: &'a str,
     model_id: &'a str,
     enclave_id: &'a str,
@@ -57051,6 +57096,7 @@ fn write_provider_load_progress_report(
     let updated_at_ms = unix_epoch_millis().unwrap_or(0);
     let report = ProviderLoadProgressReport {
         schema: 1,
+        pid: std::process::id(),
         provider: &ctx.provider,
         model_id: &ctx.model_id,
         enclave_id: &ctx.enclave_id,
@@ -58872,9 +58918,12 @@ fn provider_memory_budget(
     verdict: &BackendVerdict,
     enclave: &LedgerEnclave,
     args: &ProviderStartArgs,
-    claimed_bytes: u64,
 ) -> Result<ProviderMemoryBudget> {
     let pool = provider_memory_pool(hardware, verdict, &enclave.backend, args.gpu_layers);
+    let claimed_bytes = read_provider_memory_claimed_bytes(
+        args.home.as_deref(),
+        provider_memory_pool_available_reflects_resident_memory(&pool.pool, pool.unified),
+    )?;
     let reserve_basis = pool.total_bytes.max(pool.available_bytes);
     let (reserve_bytes, _reserve_source) =
         provider_memory_reserve_bytes(args.memory_reserve.as_deref(), reserve_basis, pool.unified)?;
@@ -59136,7 +59185,75 @@ fn provider_memory_claims_dir(home: &Path) -> PathBuf {
     home.join("provider-memory-claims")
 }
 
-fn read_provider_memory_claimed_bytes(home: Option<&Path>) -> Result<u64> {
+fn provider_memory_claim_lock_path(home: &Path) -> PathBuf {
+    provider_memory_claims_dir(home).join(".admission.lock")
+}
+
+fn lock_provider_memory_claim_admission(home: &Path) -> Result<fs::File> {
+    let dir = provider_memory_claims_dir(home);
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = provider_memory_claim_lock_path(home);
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    fs2::FileExt::lock_exclusive(&lock).with_context(|| format!("locking {}", path.display()))?;
+    Ok(lock)
+}
+
+fn remove_provider_memory_claims_for_pid(home: &Path, pid: u32) -> Result<()> {
+    let dir = provider_memory_claims_dir(home);
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(OsStr::to_str) != Some("json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<ProviderMemoryClaimRecord>(&text) else {
+            continue;
+        };
+        if record.pid == pid {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+fn provider_memory_claim_is_resident(home: &Path, record: &ProviderMemoryClaimRecord) -> bool {
+    let path = home.join("provider-load-progress").join(format!(
+        "{}-{}.json",
+        safe_path_component(&record.provider),
+        safe_path_component(&record.enclave_id)
+    ));
+    let Ok(progress) = read_json_file(&path) else {
+        return false;
+    };
+    if progress.get("provider").and_then(Value::as_str) != Some(record.provider.as_str())
+        || progress.get("enclave_id").and_then(Value::as_str) != Some(record.enclave_id.as_str())
+        || progress.get("phase").and_then(Value::as_str) != Some("serving")
+        || progress.get("status").and_then(Value::as_str) != Some("complete")
+    {
+        return false;
+    }
+    match progress.get("pid").and_then(Value::as_u64) {
+        Some(pid) => pid == u64::from(record.pid),
+        None => true,
+    }
+}
+
+fn read_provider_memory_claimed_bytes(
+    home: Option<&Path>,
+    available_reflects_resident_memory: bool,
+) -> Result<u64> {
     let Some(home) = home else {
         return Ok(0);
     };
@@ -59145,7 +59262,8 @@ fn read_provider_memory_claimed_bytes(home: Option<&Path>) -> Result<u64> {
         return Ok(0);
     }
     let now = unix_epoch_seconds().unwrap_or(0);
-    let mut total = 0_u64;
+    let mut unique =
+        BTreeMap::<(u32, String, String), (u64, PathBuf, ProviderMemoryClaimRecord)>::new();
     for entry in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
         let path = entry.path();
@@ -59157,6 +59275,7 @@ fn read_provider_memory_claimed_bytes(home: Option<&Path>) -> Result<u64> {
             Err(_) => continue,
         };
         let Ok(record) = serde_json::from_str::<ProviderMemoryClaimRecord>(&text) else {
+            let _ = fs::remove_file(&path);
             continue;
         };
         if now.saturating_sub(record.created_at) > F13_MEMORY_CLAIM_TTL_SECONDS {
@@ -59167,9 +59286,33 @@ fn read_provider_memory_claimed_bytes(home: Option<&Path>) -> Result<u64> {
             let _ = fs::remove_file(&path);
             continue;
         }
-        total = total.saturating_add(record.claimed_bytes);
+        if available_reflects_resident_memory && provider_memory_claim_is_resident(home, &record) {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+        let key = (
+            record.pid,
+            record.provider.clone(),
+            record.enclave_id.clone(),
+        );
+        match unique.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((record.created_at, path, record));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let existing = entry.get();
+                if (record.created_at, &path) > (existing.0, &existing.1) {
+                    let (_, duplicate, _) = entry.insert((record.created_at, path, record));
+                    let _ = fs::remove_file(duplicate);
+                } else {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
     }
-    Ok(total)
+    Ok(unique.values().fold(0_u64, |total, (_, _, record)| {
+        total.saturating_add(record.claimed_bytes)
+    }))
 }
 
 fn write_provider_memory_claim(
@@ -59184,6 +59327,9 @@ fn write_provider_memory_claim(
     let dir = provider_memory_claims_dir(home);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let now = unix_epoch_seconds()?;
+    let budget = &selected.feasibility.memory_budget;
+    let release_after_load =
+        provider_memory_pool_available_reflects_resident_memory(&budget.pool, budget.unified);
     let record = ProviderMemoryClaimRecord {
         schema_version: 1,
         pid: std::process::id(),
@@ -59196,14 +59342,17 @@ fn write_provider_memory_claim(
         created_at: now,
     };
     let path = dir.join(format!(
-        "{}-{}-{}-{now}.json",
+        "{}-{}-{}.json",
         short_hash(provider),
         short_hash(&selected.enclave.enclave_id),
         std::process::id()
     ));
-    fs::write(&path, serde_json::to_vec_pretty(&record)?)
+    write_json_file(&path, &serde_json::to_value(&record)?)
         .with_context(|| format!("writing {}", path.display()))?;
-    Ok(Some(ProviderMemoryClaimGuard { path }))
+    Ok(Some(ProviderMemoryClaimGuard {
+        path: Some(path),
+        release_after_load,
+    }))
 }
 
 fn provider_context_feasibility(
@@ -59220,9 +59369,7 @@ fn provider_context_feasibility(
 ) -> Result<ProviderCtxFeasibility> {
     let requested_ctx = resolve_provider_served_ctx(model, args.ctx)?;
     if enclave.model_class != DEFAULT_MODEL_CLASS || requested_ctx == 0 {
-        let claimed_bytes = read_provider_memory_claimed_bytes(args.home.as_deref())?;
-        let memory_budget =
-            provider_memory_budget(hardware, verdict, enclave, args, claimed_bytes)?;
+        let memory_budget = provider_memory_budget(hardware, verdict, enclave, args)?;
         let estimate = provider_memory_estimate(
             enclave,
             model,
@@ -59272,8 +59419,7 @@ fn provider_context_feasibility(
             memory_budget,
         });
     }
-    let claimed_bytes = read_provider_memory_claimed_bytes(args.home.as_deref())?;
-    let memory_budget = provider_memory_budget(hardware, verdict, enclave, args, claimed_bytes)?;
+    let memory_budget = provider_memory_budget(hardware, verdict, enclave, args)?;
     let requested_fit = provider_model_memory_fit(
         enclave,
         model,
@@ -85078,7 +85224,6 @@ mod tests {
             &selected.verdict,
             &selected.enclave,
             &test_provider_start_args(),
-            0,
         )
         .unwrap();
         let admin_allocation_ceiling =
@@ -85511,6 +85656,225 @@ mod tests {
         assert!(message.contains("after reserve"));
     }
 
+    fn test_provider_memory_pool(
+        pool: &str,
+        unified: bool,
+        total_bytes: u64,
+        available_bytes: u64,
+    ) -> ProviderMemoryPool {
+        ProviderMemoryPool {
+            pool: pool.to_owned(),
+            source: "test".to_owned(),
+            unified,
+            total_bytes,
+            available_bytes,
+        }
+    }
+
+    fn test_provider_memory_claim(
+        schema_version: u32,
+        claimed_bytes: u64,
+        created_at: u64,
+    ) -> ProviderMemoryClaimRecord {
+        ProviderMemoryClaimRecord {
+            schema_version,
+            pid: std::process::id(),
+            provider: "provider".to_owned(),
+            enclave_id: "aa".repeat(32),
+            model_id: "test/model@4bit".to_owned(),
+            backend: "llama.cpp".to_owned(),
+            served_ctx: 8192,
+            claimed_bytes,
+            created_at,
+        }
+    }
+
+    fn write_test_provider_memory_claim(path: &Path, record: &ProviderMemoryClaimRecord) {
+        write_json_file(path, &serde_json::to_value(record).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn provider_memory_claim_resident_legacy_host_is_not_subtracted_from_mem_available() {
+        let home = test_temp_dir("mayhem-provider-resident-host-claim");
+        let dir = provider_memory_claims_dir(&home);
+        fs::create_dir_all(&dir).unwrap();
+        let claimed_bytes = 73 * GIB_BYTES + 45 * GIB_BYTES / 100;
+        let record = test_provider_memory_claim(1, claimed_bytes, unix_epoch_seconds().unwrap());
+        let claim_path = dir.join("legacy-live.json");
+        write_test_provider_memory_claim(&claim_path, &record);
+        let progress_path = home.join("provider-load-progress").join(format!(
+            "{}-{}.json",
+            safe_path_component(&record.provider),
+            safe_path_component(&record.enclave_id)
+        ));
+        write_json_file(
+            &progress_path,
+            &json!({
+                "schema": 1,
+                "provider": record.provider,
+                "enclave_id": record.enclave_id,
+                "phase": "serving",
+                "status": "complete",
+            }),
+        )
+        .unwrap();
+        let pool = test_provider_memory_pool(
+            "nvidia_unified_memory",
+            true,
+            128 * GIB_BYTES,
+            77 * GIB_BYTES,
+        );
+        let claimed = read_provider_memory_claimed_bytes(Some(&home), true).unwrap();
+        let (reserve, _) =
+            provider_memory_reserve_bytes(None, pool.total_bytes, pool.unified).unwrap();
+        let usable = pool
+            .available_bytes
+            .saturating_sub(reserve)
+            .saturating_sub(claimed);
+
+        assert_eq!(claimed, 0);
+        assert!(!claim_path.exists());
+        assert!(usable > 573 * 1024 * 1024);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn provider_memory_claim_starting_host_still_reserves_before_residency() {
+        let home = test_temp_dir("mayhem-provider-starting-host-claim");
+        let dir = provider_memory_claims_dir(&home);
+        fs::create_dir_all(&dir).unwrap();
+        let record = test_provider_memory_claim(1, 7 * GIB_BYTES, unix_epoch_seconds().unwrap());
+        let claim_path = dir.join("starting.json");
+        write_test_provider_memory_claim(&claim_path, &record);
+        let progress_path = home.join("provider-load-progress").join(format!(
+            "{}-{}.json",
+            safe_path_component(&record.provider),
+            safe_path_component(&record.enclave_id)
+        ));
+        let other_pid = if record.pid == u32::MAX {
+            record.pid - 1
+        } else {
+            record.pid + 1
+        };
+        write_json_file(
+            &progress_path,
+            &json!({
+                "schema": 1,
+                "pid": other_pid,
+                "provider": record.provider,
+                "enclave_id": record.enclave_id,
+                "phase": "serving",
+                "status": "complete",
+            }),
+        )
+        .unwrap();
+        let claimed = read_provider_memory_claimed_bytes(Some(&home), true).unwrap();
+
+        assert_eq!(claimed, 7 * GIB_BYTES);
+        assert!(claim_path.exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn provider_memory_claim_resident_dedicated_gpu_remains_reserved() {
+        let home = test_temp_dir("mayhem-provider-resident-gpu-claim");
+        let dir = provider_memory_claims_dir(&home);
+        fs::create_dir_all(&dir).unwrap();
+        let record = test_provider_memory_claim(1, 12 * GIB_BYTES, unix_epoch_seconds().unwrap());
+        let claim_path = dir.join("gpu-live.json");
+        write_test_provider_memory_claim(&claim_path, &record);
+        let progress = ProviderLoadProgressContext {
+            dir: home.join("provider-load-progress"),
+            provider: record.provider.clone(),
+            model_id: record.model_id.clone(),
+            enclave_id: record.enclave_id.clone(),
+            artifact: "test".to_owned(),
+        };
+        write_provider_load_progress(
+            &progress,
+            "provider session server",
+            "serving",
+            "complete",
+            Some(100),
+            Some(100),
+        )
+        .unwrap();
+        let claimed = read_provider_memory_claimed_bytes(Some(&home), false).unwrap();
+
+        assert_eq!(claimed, 12 * GIB_BYTES);
+        assert!(claim_path.exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn provider_memory_claim_duplicates_are_counted_once_and_pruned() {
+        let home = test_temp_dir("mayhem-provider-duplicate-claims");
+        let dir = provider_memory_claims_dir(&home);
+        fs::create_dir_all(&dir).unwrap();
+        let now = unix_epoch_seconds().unwrap();
+        let older = test_provider_memory_claim(1, 4 * GIB_BYTES, now.saturating_sub(1));
+        let newer = ProviderMemoryClaimRecord {
+            claimed_bytes: 5 * GIB_BYTES,
+            created_at: now,
+            ..older.clone()
+        };
+        let older_path = dir.join("duplicate-old.json");
+        let newer_path = dir.join("duplicate-new.json");
+        write_test_provider_memory_claim(&older_path, &older);
+        write_test_provider_memory_claim(&newer_path, &newer);
+        let claimed = read_provider_memory_claimed_bytes(Some(&home), true).unwrap();
+
+        assert_eq!(claimed, 5 * GIB_BYTES);
+        assert!(!older_path.exists());
+        assert!(newer_path.exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn provider_memory_claim_guard_releases_only_host_claim_after_load() {
+        let home = test_temp_dir("mayhem-provider-memory-guard");
+        let host_path = home.join("host.json");
+        let dedicated_path = home.join("dedicated.json");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(&host_path, b"host").unwrap();
+        fs::write(&dedicated_path, b"dedicated").unwrap();
+        let mut host = ProviderMemoryClaimGuard {
+            path: Some(host_path.clone()),
+            release_after_load: true,
+        };
+        let mut dedicated = ProviderMemoryClaimGuard {
+            path: Some(dedicated_path.clone()),
+            release_after_load: false,
+        };
+
+        host.release_after_model_load().unwrap();
+        dedicated.release_after_model_load().unwrap();
+
+        assert!(!host_path.exists());
+        assert!(dedicated_path.exists());
+        drop(dedicated);
+        assert!(!dedicated_path.exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn provider_memory_admission_lock_serializes_claim_publication() {
+        let home = test_temp_dir("mayhem-provider-memory-claim-lock");
+        let first = lock_provider_memory_claim_admission(&home).unwrap();
+        let path = provider_memory_claim_lock_path(&home);
+        let second = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+
+        assert!(fs2::FileExt::try_lock_exclusive(&second).is_err());
+        drop(first);
+        fs2::FileExt::try_lock_exclusive(&second).unwrap();
+        fs2::FileExt::unlock(&second).unwrap();
+        fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn provider_memory_claim_reader_prunes_dead_pid_claims() {
         let home = test_temp_dir("mayhem-provider-memory-claims");
@@ -85538,7 +85902,7 @@ mod tests {
         fs::write(&live_path, serde_json::to_vec(&live).unwrap()).unwrap();
         fs::write(&dead_path, serde_json::to_vec(&dead).unwrap()).unwrap();
 
-        let claimed = read_provider_memory_claimed_bytes(Some(&home)).unwrap();
+        let claimed = read_provider_memory_claimed_bytes(Some(&home), true).unwrap();
 
         assert_eq!(claimed, 123);
         assert!(live_path.exists());
@@ -102951,6 +103315,7 @@ State initialization...
         )
         .expect("write progress");
         let value = read_json_file(&ctx.path()).expect("read progress");
+        assert_eq!(value["pid"], std::process::id());
         assert_eq!(value["provider"], "aa".repeat(32));
         assert_eq!(value["model_id"], "mayhem/test-model");
         assert_eq!(value["enclave_id"], "bb".repeat(32));

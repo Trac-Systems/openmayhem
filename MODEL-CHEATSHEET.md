@@ -15,11 +15,13 @@ routes, and revisions. Never copy an enclave ID or price from documentation:
 mayhem models --gateway
 ```
 
-## v0.2.54 runtime status
+## v0.2.55 runtime status
 
-The `0.2.54` source release adds the canonical Needle CPU/CUDA tools-only
-runtime. Needle has exactly two markets: `needle-cpu` across Linux, Windows
-x86_64, and Apple Silicon macOS, and CUDA-only `needle-gpu` on supported
+The `0.2.55` source release preserves the canonical Needle CPU/CUDA tools-only
+runtime from `0.2.54` and fixes co-resident host/unified-memory admission
+without weakening dedicated-VRAM reservations. Needle has exactly two markets:
+`needle-cpu` across Linux, Windows x86_64, and Apple Silicon macOS, and
+CUDA-only `needle-gpu` on supported
 Linux aarch64/x86_64 and Windows x86_64 hosts. Apple Metal/MPS is not eligible for the GPU market. The release
 also carries the managed Linux/aarch64 CUDA 13 Chatterbox runtime, Linux
 llama.cpp acceleration selection, platform-aware Sulphur artifact admission,
