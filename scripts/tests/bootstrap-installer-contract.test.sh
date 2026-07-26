@@ -118,7 +118,7 @@ for function_name in \
   grep -F "${function_name}() {" <<<"$installer_acceleration_functions" >/dev/null ||
     fail "Unix source installer is missing $function_name"
 done
-grep -F '"$resolved" --version' <<<"$installer_acceleration_functions" >/dev/null ||
+grep -F '"$root/bin/nvcc" --version' <<<"$installer_acceleration_functions" >/dev/null ||
   fail "Unix source installer accepts an nvcc path without executing it"
 for library in \
   libcudart_static.a \
@@ -132,6 +132,7 @@ grep -F 'pkg-config --exists vulkan' <<<"$installer_acceleration_functions" >/de
   fail "Unix source installer does not validate Vulkan development metadata"
 
 cuda_fixture="$(mktemp -d)"
+cuda_fixture_real="$(cd -P "$cuda_fixture" && pwd)"
 mkdir -p "$cuda_fixture/bin" "$cuda_fixture/include" "$cuda_fixture/lib"
 : >"$cuda_fixture/include/cuda.h"
 cat >"$cuda_fixture/bin/nvcc" <<'EOF'
@@ -156,10 +157,26 @@ done
     esac
   }
   export CUDACXX="$cuda_fixture/bin/nvcc"
-  export CUDA_LIBRARY_PATH="$cuda_fixture/lib"
-  [[ "$(llama_cpp_cuda_library_dirs)" == "$cuda_fixture/lib" ]]
+  unset CUDA_LIBRARY_PATH
+  [[ "$(llama_cpp_cuda_toolkit_root)" == "$cuda_fixture_real" ]]
+  [[ "$(llama_cpp_cuda_library_dirs "$cuda_fixture" x86_64)" == "$cuda_fixture_real/lib" ]]
   llama_cpp_cuda_toolkit_usable
 ) || fail "Unix source installer rejected a complete Debian-style CUDA toolkit"
+broken_cuda_fixture="$(mktemp -d)"
+mkdir -p "$broken_cuda_fixture/bin" "$broken_cuda_fixture/include"
+: >"$broken_cuda_fixture/include/cuda.h"
+cat >"$broken_cuda_fixture/bin/nvcc" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod 0755 "$broken_cuda_fixture/bin/nvcc"
+(
+  eval "$installer_acceleration_functions"
+  export CUDACXX="$cuda_fixture/bin/nvcc"
+  export CUDA_PATH="$broken_cuda_fixture"
+  [[ "$(llama_cpp_cuda_toolkit_root)" == "$cuda_fixture_real" ]]
+) || fail "Unix source installer selected a broken CUDA root over working CUDACXX"
+rm -rf "$broken_cuda_fixture"
 rm -f "$cuda_fixture/lib/libculibos.a"
 if (
   eval "$installer_acceleration_functions"
@@ -171,7 +188,7 @@ if (
     esac
   }
   export CUDACXX="$cuda_fixture/bin/nvcc"
-  export CUDA_LIBRARY_PATH="$cuda_fixture/lib"
+  unset CUDA_LIBRARY_PATH
   llama_cpp_cuda_toolkit_usable
 ) >/dev/null 2>&1; then
   rm -rf "$cuda_fixture"
@@ -180,23 +197,42 @@ fi
 rm -rf "$cuda_fixture"
 
 cuda_link_fixture="$(mktemp -d)"
+cuda_link_dir="$cuda_link_fixture/CUDA libraries"
+mkdir -p "$cuda_link_dir"
 (
   eval "$installer_acceleration_functions"
   unset CARGO_ENCODED_RUSTFLAGS RUSTFLAGS
-  export_llama_cpp_cuda_link_search "$cuda_link_fixture"
-  [[ "$RUSTFLAGS" == "-Lnative=$cuda_link_fixture" ]]
-  export_llama_cpp_cuda_link_search "$cuda_link_fixture"
-  [[ "$RUSTFLAGS" == "-Lnative=$cuda_link_fixture" ]]
+  export_llama_cpp_cuda_link_search "$cuda_link_dir"
+  [[ "$CARGO_ENCODED_RUSTFLAGS" == "-Lnative=$cuda_link_dir" ]]
+  [[ -z "${RUSTFLAGS+x}" ]]
+  export_llama_cpp_cuda_link_search "$cuda_link_dir"
+  [[ "$CARGO_ENCODED_RUSTFLAGS" == "-Lnative=$cuda_link_dir" ]]
+)
+(
+  eval "$installer_acceleration_functions"
+  separator=$'\x1f'
+  unset CARGO_ENCODED_RUSTFLAGS
+  export RUSTFLAGS="--cfg existing"
+  export_llama_cpp_cuda_link_search "$cuda_link_dir"
+  [[ "$CARGO_ENCODED_RUSTFLAGS" == "--cfg${separator}existing${separator}-Lnative=$cuda_link_dir" ]]
+  [[ -z "${RUSTFLAGS+x}" ]]
+)
+(
+  eval "$installer_acceleration_functions"
+  export CARGO_ENCODED_RUSTFLAGS=
+  export RUSTFLAGS="--cfg ignored_by_cargo"
+  export_llama_cpp_cuda_link_search "$cuda_link_dir"
+  [[ "$CARGO_ENCODED_RUSTFLAGS" == "-Lnative=$cuda_link_dir" ]]
 )
 (
   eval "$installer_acceleration_functions"
   separator=$'\x1f'
   unset RUSTFLAGS
   export CARGO_ENCODED_RUSTFLAGS="--cfg${separator}existing"
-  export_llama_cpp_cuda_link_search "$cuda_link_fixture"
-  [[ "$CARGO_ENCODED_RUSTFLAGS" == "--cfg${separator}existing${separator}-Lnative=$cuda_link_fixture" ]]
-  export_llama_cpp_cuda_link_search "$cuda_link_fixture"
-  [[ "$CARGO_ENCODED_RUSTFLAGS" == "--cfg${separator}existing${separator}-Lnative=$cuda_link_fixture" ]]
+  export_llama_cpp_cuda_link_search "$cuda_link_dir"
+  [[ "$CARGO_ENCODED_RUSTFLAGS" == "--cfg${separator}existing${separator}-Lnative=$cuda_link_dir" ]]
+  export_llama_cpp_cuda_link_search "$cuda_link_dir"
+  [[ "$CARGO_ENCODED_RUSTFLAGS" == "--cfg${separator}existing${separator}-Lnative=$cuda_link_dir" ]]
 )
 rm -rf "$cuda_link_fixture"
 installer_source_backend_functions="$(

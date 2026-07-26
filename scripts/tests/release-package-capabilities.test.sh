@@ -72,7 +72,7 @@ if (
   fail "release packaging accepted an explicit CUDA build without working nvcc"
 fi
 
-grep -F '"$resolved" --version' "$ROOT_DIR/scripts/package-release.sh" >/dev/null ||
+grep -F '"$root/bin/nvcc" --version' "$ROOT_DIR/scripts/package-release.sh" >/dev/null ||
   fail "release packaging accepts an nvcc path without executing it"
 grep -F 'pkg-config --exists vulkan' "$ROOT_DIR/scripts/package-release.sh" >/dev/null ||
   fail "release packaging does not validate Vulkan development metadata"
@@ -88,6 +88,9 @@ grep -F 'linux_llama_cpp_features Linux "$target_arch" "$(uname -m)"' \
 grep -F 'cargo_args+=(--features "$llama_cpp_features")' \
   <<<"$release_build_block" >/dev/null ||
   fail "release packaging does not pass selected llama.cpp features to Cargo"
+grep -F 'export_llama_cpp_cuda_link_search "$cuda_library_dirs"' \
+  <<<"$release_build_block" >/dev/null ||
+  fail "release packaging does not expose validated CUDA libraries to rustc"
 grep -F 'mayhem-cli/llama-cpp-metal' <<<"$release_build_block" >/dev/null ||
   fail "release acceleration change removed the existing macOS Metal build"
 
