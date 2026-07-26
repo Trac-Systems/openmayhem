@@ -69018,7 +69018,7 @@ fn provider_canary_self_test_body(
                     object.insert(name.to_owned(), value);
                 }
             }
-            let family = provider_canary_self_test_endpoint_family(model, &body)?;
+            let family = provider_canary_self_test_endpoint_family(model, &mut body)?;
             body["endpoint_family"] = json!(family);
             Ok(body)
         }
@@ -69421,7 +69421,7 @@ fn provider_canary_self_test_disable_reasoning(
 
 fn provider_canary_self_test_endpoint_family(
     model: &catalog::CatalogModel,
-    body: &Value,
+    body: &mut Value,
 ) -> Result<String> {
     let kind = body.get("kind").and_then(Value::as_str).unwrap_or("chat");
     let transport_kind = provider_endpoint_transport_kind(provider_local_endpoint_family(kind))?;
@@ -69433,21 +69433,53 @@ fn provider_canary_self_test_endpoint_family(
             .entry("model")
             .or_insert_with(|| json!(&model.model_id));
     }
-    model
-        .adapter
-        .endpoint_families
-        .iter()
-        .filter(|contract| {
-            provider_endpoint_transport_kind(&contract.family).ok() == Some(transport_kind)
-        })
-        .find(|contract| mayhem_proto::validate_endpoint_request(contract, &request).is_ok())
-        .map(|contract| contract.family.clone())
-        .with_context(|| {
-            format!(
-                "canary request has no compatible signed {transport_kind} endpoint family for {}",
-                model.model_id
-            )
-        })
+    let mut first_violations = None;
+    for contract in model.adapter.endpoint_families.iter().filter(|contract| {
+        provider_endpoint_transport_kind(&contract.family).ok() == Some(transport_kind)
+    }) {
+        let mut candidate = request.clone();
+        for name in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+            let Some(requested) = candidate.get(name).and_then(Value::as_u64) else {
+                continue;
+            };
+            let Some(spec) = contract.request_attribute_specs.get(name) else {
+                continue;
+            };
+            let adjusted = mayhem_proto::canonicalize_positive_integer_for_spec(requested, spec)
+                .map_err(anyhow::Error::msg)?;
+            candidate[name] = json!(adjusted);
+        }
+        match mayhem_proto::validate_endpoint_request(contract, &candidate) {
+            Ok(()) => {
+                for name in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+                    if let Some(value) = candidate.get(name) {
+                        body[name] = value.clone();
+                    }
+                }
+                return Ok(contract.family.clone());
+            }
+            Err(violations) if first_violations.is_none() => {
+                first_violations = Some(violations);
+            }
+            Err(_) => {}
+        }
+    }
+    let details = first_violations
+        .unwrap_or_default()
+        .into_iter()
+        .take(4)
+        .map(|violation| format!("{}: {}", violation.path, violation.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    bail!(
+        "canary request has no compatible signed {transport_kind} endpoint family for {}{}",
+        model.model_id,
+        if details.is_empty() {
+            String::new()
+        } else {
+            format!(": {details}")
+        }
+    )
 }
 
 const VIDEO_CANARY_FRAME_ATTRIBUTES: &[&str] =
@@ -90209,6 +90241,60 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(body["max_tokens"], 4);
         assert_eq!(body["thinking_mode"], "disabled");
         assert_eq!(body["thinking_history"], "latest_only");
+    }
+
+    #[test]
+    fn provider_text_canary_respects_signed_output_floor() {
+        let mut model = test_catalog(&"aa".repeat(32)).models.remove(0);
+        let mut contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+        )
+        .unwrap();
+        let max_tokens = contract
+            .request_attribute_specs
+            .get_mut("max_tokens")
+            .unwrap();
+        max_tokens.default = Some(json!(128));
+        max_tokens.minimum = Some(16.0);
+        max_tokens.maximum = Some(512.0);
+        contract
+            .required_request_attributes
+            .push("tools".to_owned());
+        model.adapter.endpoint_families = vec![contract];
+        let prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "tools-only-health",
+            "messages": [{
+                "role": "user",
+                "content": "What is the weather in Berlin?"
+            }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get current weather for a city.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"}
+                        },
+                        "required": ["city"],
+                        "additionalProperties": false
+                    }
+                }
+            }],
+            "max_tokens": 128
+        }))
+        .unwrap();
+
+        let body = provider_canary_self_test_body(&model, &prompt).unwrap();
+        assert_eq!(body["max_tokens"], 16);
+        assert_eq!(
+            body["endpoint_family"],
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+        );
+        let sealed =
+            provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
+        assert_eq!(sealed["contract_request"]["max_tokens"], 16);
     }
 
     #[test]
