@@ -2757,6 +2757,10 @@ struct DoctorArgs {
     #[arg(long, value_name = "BACKEND")]
     provider_backend: Option<String>,
 
+    /// Override llama.cpp GPU layer count for provider preflight. 0 forces CPU/no-GPU.
+    #[arg(long, requires = "provider_backend")]
+    gpu_layers: Option<u32>,
+
     /// Print the hardware report as JSON.
     #[arg(long)]
     json: bool,
@@ -7064,6 +7068,7 @@ fn doctor(args: DoctorArgs) -> Result<()> {
             None,
             Some(verdict),
             &report,
+            args.gpu_layers,
         )?;
         Some((backend, home, runtime))
     } else {
@@ -18107,7 +18112,7 @@ fn calibration_memory_context(
                 artifact.engine
             )
         })?;
-    let pool = provider_memory_pool(&hardware, verdict, &artifact.engine);
+    let pool = provider_memory_pool(&hardware, verdict, &artifact.engine, args.gpu_layers);
     let reserve_basis = pool.total_bytes.max(pool.available_bytes);
     let (reserve_bytes, reserve_source) =
         provider_memory_reserve_bytes(args.memory_reserve.as_deref(), reserve_basis, pool.unified)?;
@@ -32240,7 +32245,13 @@ async fn up_add_selected_provider_workers(
         .candidates
         .iter()
         .map(|candidate| {
-            provider_backend_runtime_preflight(&plan.home, candidate, hardware).with_context(|| {
+            provider_backend_runtime_preflight(
+                &plan.home,
+                candidate,
+                hardware,
+                plan.provider_gpu_layers,
+            )
+            .with_context(|| {
                 format!(
                     "provider runtime preflight failed for {} ({})",
                     candidate.model.model_id, candidate.artifact.engine
@@ -49084,13 +49095,18 @@ async fn prepare_provider_serve_worker(
             None => bail_provider_start_drained(&home, &selected.enclave.enclave_id, &path)?,
         }
     }
-    let runtime = provider_backend_runtime_preflight(&home, selected, &computed.hardware)
-        .with_context(|| {
-            format!(
-                "provider runtime preflight failed for {} ({})",
-                selected.model.model_id, selected.artifact.engine
-            )
-        })?;
+    let runtime = provider_backend_runtime_preflight(
+        &home,
+        selected,
+        &computed.hardware,
+        computed.gpu_layers,
+    )
+    .with_context(|| {
+        format!(
+            "provider runtime preflight failed for {} ({})",
+            selected.model.model_id, selected.artifact.engine
+        )
+    })?;
     let vllm_memory_utilization = ensure_provider_vllm_memory_utilization_config(
         &home,
         std::slice::from_ref(selected),
@@ -49886,6 +49902,7 @@ fn provider_backend_runtime_preflight(
     home: &Path,
     selected: &ProviderCandidate,
     hardware: &HardwareReport,
+    gpu_layers: Option<u32>,
 ) -> Result<ProviderBackendRuntime> {
     let backend = selected.artifact.engine.as_str();
     let managed_backend = managed_python_backend_for_artifact(&selected.artifact);
@@ -49895,6 +49912,7 @@ fn provider_backend_runtime_preflight(
         Some(managed_backend),
         Some(&selected.verdict),
         hardware,
+        gpu_layers,
     )
     .with_context(|| {
         format!(
@@ -49924,6 +49942,7 @@ fn provider_backend_runtime_preflight_for_backend(
     managed_backend: Option<&str>,
     verdict: Option<&BackendVerdict>,
     hardware: &HardwareReport,
+    gpu_layers: Option<u32>,
 ) -> Result<ProviderBackendRuntime> {
     let mut runtime = ProviderBackendRuntime::default();
     match backend {
@@ -50002,10 +50021,15 @@ fn provider_backend_runtime_preflight_for_backend(
                 "piper",
             )?);
         }
-        "llama.cpp" => provider_llama_accelerator_preflight(
-            verdict.and_then(|verdict| verdict.n_layers_gpu),
-            hardware,
-        )?,
+        "llama.cpp" => {
+            let effective_gpu_layers = verdict
+                .and_then(|verdict| {
+                    resolve_provider_llama_execution_plan(backend, gpu_layers, verdict)
+                })
+                .and_then(|plan| plan.gpu_layers)
+                .or(gpu_layers);
+            provider_llama_accelerator_preflight(effective_gpu_layers, hardware)?;
+        }
         other => bail!("unsupported local provider session backend {other}"),
     }
     Ok(runtime)
@@ -50388,7 +50412,8 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             "running",
             0,
         );
-        let runtime = provider_backend_runtime_preflight(&home, &selected, &hardware)?;
+        let runtime =
+            provider_backend_runtime_preflight(&home, &selected, &hardware, args.gpu_layers)?;
         write_provider_load_progress_stage(
             &args,
             "preflight backend runtime",
@@ -58668,11 +58693,51 @@ fn hardware_has_unified_accelerator(hardware: &HardwareReport) -> bool {
             .any(|gpu| gpu.unified_memory || nvidia_gpu_uses_host_unified_memory(hardware, gpu))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProviderLlamaExecutionPlan {
+    gpu_layers: Option<u32>,
+    explicitly_cpu_only: bool,
+}
+
+impl ProviderLlamaExecutionPlan {
+    fn uses_cpu_memory(self) -> bool {
+        self.gpu_layers.unwrap_or(0) == 0
+    }
+}
+
+fn resolve_provider_llama_execution_plan(
+    backend: &str,
+    requested_gpu_layers: Option<u32>,
+    verdict: &BackendVerdict,
+) -> Option<ProviderLlamaExecutionPlan> {
+    (backend == "llama.cpp").then(|| ProviderLlamaExecutionPlan {
+        gpu_layers: requested_gpu_layers.or(verdict.n_layers_gpu),
+        explicitly_cpu_only: requested_gpu_layers == Some(0),
+    })
+}
+
 fn provider_memory_pool(
     hardware: &HardwareReport,
     verdict: &BackendVerdict,
     backend: &str,
+    requested_gpu_layers: Option<u32>,
 ) -> ProviderMemoryPool {
+    let llama_plan = resolve_provider_llama_execution_plan(backend, requested_gpu_layers, verdict);
+    if llama_plan.is_some_and(ProviderLlamaExecutionPlan::uses_cpu_memory) {
+        return provider_system_memory_pool(
+            hardware,
+            "system_memory",
+            if llama_plan.is_some_and(|plan| plan.explicitly_cpu_only) {
+                "explicit llama.cpp --gpu-layers 0 uses host memory"
+            } else {
+                "llama.cpp CPU execution uses host memory"
+            },
+        );
+    }
+    let effective_gpu_layers = llama_plan
+        .and_then(|plan| plan.gpu_layers)
+        .or(verdict.n_layers_gpu)
+        .unwrap_or(0);
     match backend {
         "chatterbox" => match chatterbox_managed_device(hardware) {
             Some(ChatterboxManagedDevice::Cuda) => {
@@ -58769,9 +58834,7 @@ fn provider_memory_pool(
                 "host available memory fallback for trt-llm",
             )
         }
-        _ if verdict.n_layers_gpu.unwrap_or(0) > 0
-            && hardware_has_unified_accelerator(hardware) =>
-        {
+        _ if effective_gpu_layers > 0 && hardware_has_unified_accelerator(hardware) => {
             ProviderMemoryPool {
                 unified: true,
                 ..provider_system_memory_pool(
@@ -58781,7 +58844,7 @@ fn provider_memory_pool(
                 )
             }
         }
-        _ if verdict.n_layers_gpu.unwrap_or(0) > 0 => {
+        _ if effective_gpu_layers > 0 => {
             if let Some(total) =
                 known_total_dedicated_vram_bytes(hardware).filter(|total| *total > 0)
             {
@@ -58811,7 +58874,7 @@ fn provider_memory_budget(
     args: &ProviderStartArgs,
     claimed_bytes: u64,
 ) -> Result<ProviderMemoryBudget> {
-    let pool = provider_memory_pool(hardware, verdict, &enclave.backend);
+    let pool = provider_memory_pool(hardware, verdict, &enclave.backend, args.gpu_layers);
     let reserve_basis = pool.total_bytes.max(pool.available_bytes);
     let (reserve_bytes, _reserve_source) =
         provider_memory_reserve_bytes(args.memory_reserve.as_deref(), reserve_basis, pool.unified)?;
@@ -69509,7 +69572,12 @@ fn provider_engine_load_config(
     config.artifact = artifact;
     config.ctx_size = ctx_size.max(1);
     config.gpu_layers = if selected.artifact.engine == "llama.cpp" {
-        args.gpu_layers.or(selected.verdict.n_layers_gpu)
+        resolve_provider_llama_execution_plan(
+            &selected.artifact.engine,
+            args.gpu_layers,
+            &selected.verdict,
+        )
+        .and_then(|plan| plan.gpu_layers)
     } else {
         selected.verdict.n_layers_gpu
     };
@@ -85348,6 +85416,81 @@ mod tests {
     }
 
     #[test]
+    fn llama_cpu_override_uses_system_memory_and_matches_load_config() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0].caps.ctx_max = 8_192;
+        catalog.models[0]
+            .artifacts
+            .get_mut("gguf-q4_k_m")
+            .unwrap()
+            .weights_bytes = 8 * GIB_BYTES;
+        let mut contract = test_contract(&root);
+        contract.enclaves[0].caps = json!({ "tools": true, "json": true, "ctx": 8_192 });
+        let mut hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        hardware.memory.total_bytes = 32 * GIB_BYTES;
+        hardware.memory.available_bytes = Some(28 * GIB_BYTES);
+        hardware.gpus.truncate(1);
+        hardware.gpus[0].memory_bytes = Some(6 * GIB_BYTES);
+        hardware.gpus[0].dedicated_memory_bytes = Some(6 * GIB_BYTES);
+        hardware.gpus[0].unified_memory = false;
+        let mut args = test_provider_start_args();
+        args.ctx = Some(8_192);
+        args.gpu_layers = Some(0);
+
+        let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(selected.feasibility.memory_budget.pool, "system_memory");
+        assert!(selected.feasibility.estimated_required_bytes > 6 * GIB_BYTES);
+        assert!(
+            selected.feasibility.estimated_required_bytes
+                <= selected.feasibility.memory_budget.budget_bytes
+        );
+        let config = provider_engine_load_config(
+            &args,
+            &selected,
+            &ProviderArtifactPaths {
+                primary: PathBuf::from("/tmp/cpu-only.gguf"),
+                sidecars: BTreeMap::new(),
+            },
+            &ProviderBackendRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(config.gpu_layers, Some(0));
+    }
+
+    #[test]
+    fn llama_without_override_keeps_conservative_dedicated_gpu_admission() {
+        let hardware = {
+            let mut hardware = test_hardware(FixtureProfile::LinuxNvidia);
+            hardware.memory.total_bytes = 32 * GIB_BYTES;
+            hardware.memory.available_bytes = Some(28 * GIB_BYTES);
+            hardware.gpus.truncate(1);
+            hardware.gpus[0].memory_bytes = Some(6 * GIB_BYTES);
+            hardware.gpus[0].dedicated_memory_bytes = Some(6 * GIB_BYTES);
+            hardware.gpus[0].unified_memory = false;
+            hardware
+        };
+        let verdict = hardware
+            .backend_verdicts
+            .iter()
+            .find(|verdict| verdict.backend == "llama.cpp")
+            .unwrap();
+
+        let plan = resolve_provider_llama_execution_plan("llama.cpp", None, verdict).unwrap();
+        let pool = provider_memory_pool(&hardware, verdict, "llama.cpp", None);
+        let partial_offload_pool = provider_memory_pool(&hardware, verdict, "llama.cpp", Some(1));
+
+        assert_eq!(plan.gpu_layers, verdict.n_layers_gpu);
+        assert!(plan.gpu_layers.unwrap_or(0) > 0);
+        assert_eq!(pool.pool, "dedicated_gpu_memory");
+        assert_eq!(pool.total_bytes, 6 * GIB_BYTES);
+        assert_eq!(partial_offload_pool.pool, "dedicated_gpu_memory");
+    }
+
+    #[test]
     fn provider_candidates_refuse_when_minimum_context_cannot_fit() {
         let root = "aa".repeat(32);
         let mut catalog = test_catalog(&root);
@@ -98150,7 +98293,7 @@ State initialization...
                 .iter()
                 .find(|verdict| verdict.backend == "chatterbox")
                 .unwrap();
-            let pool = provider_memory_pool(&hardware, verdict, "chatterbox");
+            let pool = provider_memory_pool(&hardware, verdict, "chatterbox", None);
             assert_eq!(pool.pool, expected_pool, "{fixture:?}");
             assert_eq!(pool.unified, unified, "{fixture:?}");
         }
@@ -105001,7 +105144,9 @@ State initialization...
             "--home",
             "/tmp/mayhem-doctor",
             "--provider-backend",
-            "auto",
+            "llama.cpp",
+            "--gpu-layers",
+            "0",
             "--skip-disk-bench",
             "--json",
         ])
@@ -105010,7 +105155,8 @@ State initialization...
             panic!("expected doctor command");
         };
         assert_eq!(args.home.as_deref(), Some(Path::new("/tmp/mayhem-doctor")));
-        assert_eq!(args.provider_backend.as_deref(), Some("auto"));
+        assert_eq!(args.provider_backend.as_deref(), Some("llama.cpp"));
+        assert_eq!(args.gpu_layers, Some(0));
         assert!(args.skip_disk_bench);
         assert!(args.json);
     }
