@@ -2351,7 +2351,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mayhem-attestation"
-version = "0.2.57"
+version = "0.2.58"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -2373,7 +2373,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-attestation-verifier"
-version = "0.2.57"
+version = "0.2.58"
 dependencies = [
  "base64 0.22.1",
  "dcap-qvl",
@@ -2396,7 +2396,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-bridge"
-version = "0.2.57"
+version = "0.2.58"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-cli"
-version = "0.2.57"
+version = "0.2.58"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2441,11 +2441,12 @@ dependencies = [
  "tar",
  "tokio",
  "toml",
+ "zip",
 ]
 
 [[package]]
 name = "mayhem-enclave"
-version = "0.2.57"
+version = "0.2.58"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -2469,7 +2470,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-engine"
-version = "0.2.57"
+version = "0.2.58"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -2488,7 +2489,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-gateway"
-version = "0.2.57"
+version = "0.2.58"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2527,7 +2528,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-hwprobe"
-version = "0.2.57"
+version = "0.2.58"
 dependencies = [
  "fs2",
  "serde",
@@ -2537,7 +2538,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-pay"
-version = "0.2.57"
+version = "0.2.58"
 dependencies = [
  "anyhow",
  "clap",
@@ -2547,7 +2548,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-paygate"
-version = "0.2.57"
+version = "0.2.58"
 dependencies = [
  "axum",
  "blake3",
@@ -2570,7 +2571,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-proto"
-version = "0.2.57"
+version = "0.2.58"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -2582,7 +2583,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-windows-sandbox"
-version = "0.2.57"
+version = "0.2.58"
 dependencies = [
  "thiserror 2.0.18",
  "windows-sys 0.60.2",
@@ -2590,7 +2591,7 @@ dependencies = [
 
 [[package]]
 name = "mayhemd"
-version = "0.2.57"
+version = "0.2.58"
 dependencies = [
  "anyhow",
  "clap",
@@ -2598,6 +2599,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "url",
 ]
 
 [[package]]
@@ -4872,6 +4874,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ea3136b675547379c4bd395ca6b938e5ad3c3d20fad76e7fe85f9e0d011419c"
 
 [[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5891,6 +5899,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "zip"
+version = "7.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap",
+ "memchr",
+ "typed-path",
 ]
 
 [[package]]

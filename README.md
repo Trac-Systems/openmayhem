@@ -78,7 +78,7 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.57` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.58` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -87,7 +87,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.57
+git checkout --detach v0.2.58
 ./install.sh --from-source
 ```
 
@@ -96,7 +96,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.57
+git checkout --detach v0.2.58
 .\install.ps1 -FromSource
 ```
 
@@ -188,12 +188,10 @@ No GPU? CPU-only machines still serve. Embeddings, small text models, and speech
 
 ### What you need installed first
 
-For an authenticated release install, set up Node.js 20+ with npm and the
-platform's download/archive tools first. Rust and a native compiler toolchain
-are not required for that path. The source build compiles native code
-(llama.cpp via cmake, Rust bindings via bindgen), so set up the additional
-prerequisites below before running `install.sh`; `libclang` missing is the
-single most common source-build failure.
+Every release install builds locally from source. Set up Node.js 20+ with npm,
+Rust, and the native compiler toolchain before running the installer. The source
+build compiles llama.cpp through cmake and Rust bindings through bindgen;
+missing `libclang` is the single most common source-build failure.
 
 **Every OS for a source build:**
 - Rust (stable, via [rustup](https://rustup.rs)) — `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
@@ -207,7 +205,10 @@ sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config git 
 ```
 
 - GPU serving: an NVIDIA driver new enough for CUDA 12 (550+), and the CUDA toolkit (`nvcc`) so llama.cpp builds its CUDA kernels. Cloud GPU images usually ship both — check with `nvidia-smi` and `nvcc --version`.
-- vLLM or TensorRT-LLM artifacts only: Python 3.10+ with `venv` and `pip` (`sudo apt-get install -y python3 python3-venv python3-pip`). Skip if you serve llama.cpp artifacts only.
+- Managed Python backends do not require system Python, `venv`, `ensurepip`, or
+  `pip`. Mayhem downloads the exact standalone `uv` archive for the host over
+  HTTPS, verifies both archive and executable hashes, and atomically creates
+  each frozen runtime under `~/.mayhem`.
 - AMD GPUs: ROCm, or a Vulkan loader for the Vulkan path.
 - Tier 2 needs a TPM 2.0 exposed at `/dev/tpmrm0` plus `tpm2-tools` (`sudo apt-get install -y tpm2-tools`). The quote helper runs as the provider user. If the distro exposes the device as `root:tss`, add the existing login to that existing distro group once with `sudo usermod -aG tss "$USER"`, then log out and back in. Mayhem never creates users or groups, changes device ACLs, or runs hardware-proof helpers merely because it detected a TPM.
 
@@ -236,7 +237,7 @@ Most installs are driven by a coding agent. Agent: execute in THIS order, verify
 1. **Detect OS + GPU** (`uname -a` / `systeminfo`; `nvidia-smi`, or on macOS assume Metal).
 2. **Install the per-OS prerequisites above and verify each**: `rustc --version`, `node --version` (≥20), `cmake --version`, and on Linux confirm libclang (`ldconfig -p | grep libclang`) — a missing libclang is the single most common build failure and only surfaces mid-`cargo build`.
 3. **NVIDIA machines**: `nvidia-smi` proves the driver, **not** the toolkit. If the provider will serve GPU models, also verify `nvcc --version`. A missing CUDA component is rejected by the provider preflight before a worker starts.
-4. **Build/install**: `./install.sh --from-source` (Windows: `.\install.ps1 -FromSource`). Expect 20–40 min of compiling; that is normal.
+4. **Build/install**: `./install.sh --from-source` (Windows: `.\install.ps1 -FromSource`). Expect 20–40 min of compiling; that is normal. The installer selects exactly one local llama.cpp backend and verifies the installed binary's claimed capability before reporting success.
 5. **Preflight before serving**: run `mayhem doctor` and read its verdicts. It reports per-backend feasibility for this machine (which engines can run, expected tok/s, memory fit). Do not start a provider whose chosen backend the doctor marks insufficient.
 6. **Backend-specific extras — install only what the hardware/models need:**
    - **vLLM, TensorRT-LLM, and MLX**: Mayhem creates exact-version Python environments under `~/.mayhem/venvs`, discovers CUDA when applicable, and owns the backend caches. The `MAYHEM_*_PYTHON` variables are diagnostic overrides, not setup steps.
@@ -454,12 +455,11 @@ mayhem tokens revoke laptop      # immediate
 | `mayhem dispute` / `mayhem dispute-expire` | open a bonded session dispute / reclaim the bond after timeout |
 | `mayhem wallet show/backup` | your addresses / reveal the recovery mnemonic (gated) |
 | `mayhem doctor` | probe this machine's hardware and what it can run |
-| `mayhem update` | fetch, verify (signed manifest), and stage the latest release |
 | `mayhem balance` | per-rail balances |
 | `mayhem config max-price / set` | persistent spending and routing defaults |
 | `mayhem tokens create/list/revoke` | bearer tokens for shared gateways |
 | `mayhem wallet show/backup/import/passwd` | your key, your custody |
-| `mayhem update` | signed, verified, rollback-safe self-update |
+| Source release update | check out the exact new tag, then rerun the complete source installer; never replace one binary |
 
 ---
 
@@ -756,10 +756,12 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 | `google/gemma-4-E4B-it` | LLM, small + vision, laptop/CPU-friendly | A/B | **live** |
 | `HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive` (`@nvfp4`) | LLM, uncensored, 262K ctx | C | **live** |
 | `Cactus-Compute/needle` | Deterministic tools-only specialist, 30.4M, CPU/CUDA | A | **live** |
-| `NousResearch/Hermes-3-Llama-3.1-70B` (`@mlx-4bit`) | LLM, 70B, 128K ctx | D | onboarding |
+| `microsoft/Mage-Flow-Edit-Turbo` | Image editing from a reference image + instruction, 512–2048 native | B | onboarding — **next (⑩)** |
+| `microsoft/Mage-Flow-Turbo` | Image, 4-step, 512–2048 native resolution, any aspect ratio | B | onboarding — **next (⑩)** |
+| `deepreinforce-ai/Ornith-1.0-35B` | LLM, agentic MoE, 262K ctx — GGUF Q4 / MLX 4-bit / NVFP4 | B/C | onboarding — **⑪** |
+| `NousResearch/Hermes-3-Llama-3.1-70B` (`@mlx-4bit`) | LLM, 70B, 128K ctx | D | onboarding — ⑬ |
 | `openai/gpt-oss-20b` | LLM, agentic | B | onboarding |
 | `Qwen/Qwen3.6-35B-A3B` | LLM, MoE, 262K ctx | C | onboarding |
-| `deepreinforce-ai/Ornith-1.0-35B` | LLM, agentic MoE, 262K ctx — GGUF Q4 / MLX 4-bit / NVFP4 | B/C | onboarding (next) |
 | `mistralai/Devstral-Small-2-24B-Instruct-2512` | LLM, coding | C | onboarding |
 | `openai/gpt-oss-120b` | LLM, flagship | D | onboarding |
 | `HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive` | LLM, uncensored | B | onboarding |
@@ -859,7 +861,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.57` is source-only. The GitHub release contains the tagged source, not
+`v0.2.58` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -867,7 +869,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.57
+git checkout --detach v0.2.58
 ./install.sh --from-source
 ```
 
@@ -876,7 +878,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.57
+git checkout --detach v0.2.58
 .\install.ps1 -FromSource
 ```
 
@@ -888,13 +890,25 @@ runtime.
 
 Installers print a copy/paste `PATH` command even when they update your shell profile, and anything that would open a browser prints the URL first. The whole system works from a terminal alone.
 
-`mayhem update` keeps you current. It stages releases only after verifying the signed manifest, hashes, and signing key, applies with a delay window and a health check, and rolls back if the update misbehaves. Contract-changing releases version-gate explicitly: out-of-date nodes get a clear `UPGRADE_REQUIRED` instead of silent divergence.
+Current releases are source-only. To update, fetch the exact new tag and rerun
+the complete source installer so every binary and runtime asset comes from one
+revision. Never copy or replace an individual executable. The dormant
+signed-artifact updater is not the supported release path unless the project
+owner explicitly enables signed executable distribution later.
 
 When a temporary stop is needed around an update, use `mayhem down --restart`;
 the next `mayhem up` reuses durable provider registrations. Ordinary
 `mayhem down` deliberately drains and leaves those registrations.
 
 ## Development
+
+The `0.2.58` source release makes local builds self-consistent across macOS,
+Linux, and Windows. Source installers select exactly one available llama.cpp
+backend and verify the installed result; managed Python runtimes bootstrap from
+a version- and hash-pinned standalone `uv` executable without relying on system
+`venv`, `ensurepip`, or `pip`. Supervised gateway and provider children now
+wait for their configured loopback dependencies without consuming restart or
+crash-loop budgets.
 
 The `0.2.57` source release makes live route reporting use each text endpoint's
 signed default output-token allowance. Small-context providers therefore remain

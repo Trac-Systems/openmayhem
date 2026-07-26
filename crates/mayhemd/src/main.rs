@@ -9,7 +9,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -18,7 +18,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, watch, Mutex};
 use tokio::task::JoinSet;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
+use url::Url;
 
 const DEFAULT_BIND: &str = "127.0.0.1:11437";
 const DEFAULT_CONFIG_FILE: &str = "config.toml";
@@ -111,6 +112,8 @@ struct ChildConfig {
     restart_stable_after_ms: u64,
     #[serde(default = "default_crash_loop_threshold")]
     crash_loop_threshold: u64,
+    #[serde(default)]
+    startup_probes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -562,6 +565,17 @@ async fn supervise_child(
             return Ok(());
         }
 
+        if !wait_for_startup_probes(&child.startup_probes, &mut shutdown).await? {
+            runtime
+                .mark_child_stopped(
+                    &child.name,
+                    "shutdown while waiting for startup dependencies".to_owned(),
+                    None,
+                )
+                .await?;
+            return Ok(());
+        }
+
         let mut command = Command::new(&child.command);
         command.args(&child.args);
         command.env_remove(CONTROL_TOKEN_ENV);
@@ -685,6 +699,183 @@ async fn supervise_child(
         }
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
+}
+
+const STARTUP_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const STARTUP_PROBE_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const STARTUP_PROBE_MAX_BACKOFF: Duration = Duration::from_secs(2);
+
+async fn wait_for_startup_probes(
+    probes: &[String],
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<bool> {
+    if probes.is_empty() {
+        return Ok(true);
+    }
+    let mut backoff = STARTUP_PROBE_INITIAL_BACKOFF;
+    let mut waiting_logged = false;
+    loop {
+        if *shutdown.borrow() {
+            return Ok(false);
+        }
+        let mut unavailable = None;
+        for probe in probes {
+            if let Err(error) = startup_probe_ready(probe).await {
+                unavailable = Some((probe, error));
+                break;
+            }
+        }
+        if unavailable.is_none() {
+            return Ok(true);
+        }
+        if !waiting_logged {
+            let (probe, error) = unavailable.expect("unavailable startup probe");
+            eprintln!("mayhemd waiting for startup dependency {probe}: {error:#}");
+            waiting_logged = true;
+        }
+        tokio::select! {
+            _ = sleep(backoff) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(false);
+                }
+            }
+        }
+        backoff = (backoff * 2).min(STARTUP_PROBE_MAX_BACKOFF);
+    }
+}
+
+async fn startup_probe_ready(raw: &str) -> Result<()> {
+    let probe = validate_startup_probe(raw)?;
+    let host = probe
+        .host_str()
+        .with_context(|| format!("startup probe {raw} has no host"))?
+        .trim_matches(['[', ']']);
+    let port = probe
+        .port_or_known_default()
+        .with_context(|| format!("startup probe {raw} has no port"))?;
+    let mut stream = timeout(STARTUP_PROBE_TIMEOUT, TcpStream::connect((host, port)))
+        .await
+        .with_context(|| format!("startup probe {raw} timed out"))?
+        .with_context(|| format!("connecting startup probe {raw}"))?;
+    if probe.scheme() == "tcp" {
+        return Ok(());
+    }
+    ensure_http_startup_probe(&probe, raw)?;
+    let mut path = probe.path().to_owned();
+    if path.is_empty() {
+        path.push('/');
+    }
+    if let Some(query) = probe.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    let host_for_header = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_owned()
+    };
+    let host_header = if probe.port().is_some() {
+        format!("{host_for_header}:{port}")
+    } else {
+        host_for_header
+    };
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: close\r\n\r\n");
+    timeout(STARTUP_PROBE_TIMEOUT, stream.write_all(request.as_bytes()))
+        .await
+        .with_context(|| format!("writing startup probe {raw} timed out"))?
+        .with_context(|| format!("writing startup probe {raw}"))?;
+    let mut response = [0_u8; 256];
+    let read = timeout(STARTUP_PROBE_TIMEOUT, async {
+        let mut offset = 0;
+        while offset < response.len() {
+            let count = stream.read(&mut response[offset..]).await?;
+            if count == 0 {
+                break;
+            }
+            offset += count;
+            if response[..offset].contains(&b'\n') {
+                break;
+            }
+        }
+        Ok::<usize, std::io::Error>(offset)
+    })
+    .await
+    .with_context(|| format!("reading startup probe {raw} timed out"))?
+    .with_context(|| format!("reading startup probe {raw}"))?;
+    ensure!(read > 0, "startup probe {raw} returned an empty response");
+    let status_end = response[..read]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .context("startup probe returned an oversized status line")?;
+    let status_line = std::str::from_utf8(&response[..status_end])
+        .context("startup probe response is not UTF-8")?
+        .trim_end_matches('\r');
+    let status = status_line
+        .split_ascii_whitespace()
+        .nth(1)
+        .context("startup probe response has no status code")?
+        .parse::<u16>()
+        .context("startup probe status code is malformed")?;
+    ensure!(
+        (200..300).contains(&status),
+        "startup probe {raw} returned HTTP {status}"
+    );
+    Ok(())
+}
+
+fn ensure_http_startup_probe(probe: &Url, raw: &str) -> Result<()> {
+    ensure!(
+        probe.scheme() == "http",
+        "startup probe {raw} must use tcp:// or http://"
+    );
+    ensure!(
+        probe.username().is_empty() && probe.password().is_none(),
+        "startup probe {raw} must not contain credentials"
+    );
+    ensure!(
+        probe.fragment().is_none(),
+        "startup probe {raw} must not contain a fragment"
+    );
+    Ok(())
+}
+
+fn validate_startup_probe(raw: &str) -> Result<Url> {
+    let probe = Url::parse(raw).with_context(|| format!("parsing startup probe {raw}"))?;
+    let host = probe
+        .host_str()
+        .with_context(|| format!("startup probe {raw} has no host"))?
+        .trim_matches(['[', ']']);
+    let local = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    ensure!(
+        local,
+        "startup probe {raw} must target a loopback dependency"
+    );
+    match probe.scheme() {
+        "http" => ensure_http_startup_probe(&probe, raw)?,
+        "tcp" => {
+            ensure!(
+                probe.port().is_some(),
+                "TCP startup probe {raw} requires an explicit port"
+            );
+            ensure!(
+                probe.username().is_empty() && probe.password().is_none(),
+                "startup probe {raw} must not contain credentials"
+            );
+            ensure!(
+                matches!(probe.path(), "" | "/")
+                    && probe.query().is_none()
+                    && probe.fragment().is_none(),
+                "TCP startup probe {raw} must not contain a path, query, or fragment"
+            );
+        }
+        _ => bail!("startup probe {raw} must use tcp:// or http://"),
+    }
+    Ok(probe)
 }
 
 async fn supervise_status_server(
@@ -1289,6 +1480,14 @@ fn validate_children(children: &[ChildConfig]) -> Result<()> {
                 child.name
             );
         }
+        for probe in &child.startup_probes {
+            validate_startup_probe(probe).with_context(|| {
+                format!(
+                    "supervisor child {} has an invalid startup probe",
+                    child.name
+                )
+            })?;
+        }
         if names.insert(child.name.as_str(), 1).is_some() {
             bail!("duplicate supervisor child name {}", child.name);
         }
@@ -1537,6 +1736,7 @@ mod tests {
                 restart_backoff_ms: 1_000,
                 restart_stable_after_ms: DEFAULT_RESTART_STABLE_AFTER_MS,
                 crash_loop_threshold: DEFAULT_CRASH_LOOP_THRESHOLD,
+                startup_probes: Vec::new(),
             },
             ChildConfig {
                 name: "gateway".to_owned(),
@@ -1548,6 +1748,7 @@ mod tests {
                 restart_backoff_ms: 1_000,
                 restart_stable_after_ms: DEFAULT_RESTART_STABLE_AFTER_MS,
                 crash_loop_threshold: DEFAULT_CRASH_LOOP_THRESHOLD,
+                startup_probes: Vec::new(),
             },
         ];
         assert!(validate_children(&children).is_err());
@@ -1811,12 +2012,109 @@ mod tests {
             restart_backoff_ms: 1_000,
             restart_stable_after_ms: DEFAULT_RESTART_STABLE_AFTER_MS,
             crash_loop_threshold: DEFAULT_CRASH_LOOP_THRESHOLD,
+            startup_probes: Vec::new(),
         };
         let states = initial_child_states(&[child]);
         let state = states.get("peer").unwrap();
         assert!(!state.running);
         assert_eq!(state.command, "pear");
         assert_eq!(state.args, ["run", "intercom"]);
+    }
+
+    #[test]
+    fn startup_probes_are_loopback_only_and_credential_free() {
+        assert!(validate_startup_probe("http://127.0.0.1:49223/v1/health").is_ok());
+        assert!(validate_startup_probe("tcp://[::1]:49222").is_ok());
+        assert!(validate_startup_probe("https://127.0.0.1:49223/health").is_err());
+        assert!(validate_startup_probe("http://example.com/health").is_err());
+        assert!(validate_startup_probe("http://user:secret@127.0.0.1:49223/health").is_err());
+        assert!(validate_startup_probe("tcp://127.0.0.1:49222/not-a-tcp-probe").is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_dependency_wait_does_not_consume_crash_loop_budget() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temp = env::temp_dir().join(format!(
+            "mayhemd-startup-probe-test-{}-{}",
+            std::process::id(),
+            unix_epoch_millis().unwrap()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let marker = temp.join("started");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let ready = Arc::new(AtomicBool::new(false));
+        let server_ready = ready.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 512];
+                let _ = stream.read(&mut request).await.unwrap();
+                let status = if server_ready.load(Ordering::SeqCst) {
+                    "200 OK"
+                } else {
+                    "503 Service Unavailable"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{{}}"
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let child = ChildConfig {
+            name: "gateway".to_owned(),
+            command: "sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "printf ready > \"$1\"; trap 'exit 0' TERM INT; while true; do sleep 1; done"
+                    .to_owned(),
+                "mayhemd-startup-probe-test".to_owned(),
+                marker.display().to_string(),
+            ],
+            cwd: None,
+            env: BTreeMap::new(),
+            restart: true,
+            restart_backoff_ms: 25,
+            restart_stable_after_ms: 5_000,
+            crash_loop_threshold: 2,
+            startup_probes: vec![format!("http://{address}/health")],
+        };
+        let runtime = test_runtime(&temp, std::slice::from_ref(&child));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(supervise_child_component(
+            child,
+            runtime.clone(),
+            shutdown_rx,
+        ));
+
+        sleep(Duration::from_millis(350)).await;
+        let waiting = runtime.snapshot().await;
+        assert!(!marker.exists());
+        assert_eq!(waiting.children["gateway"].restarts, 0);
+        assert_eq!(waiting.children["gateway"].consecutive_failures, 0);
+        assert!(!waiting.children["gateway"].crash_loop);
+
+        ready.store(true, Ordering::SeqCst);
+        let started = wait_for_test_state(
+            Duration::from_secs(5),
+            |state| marker.exists() && state.children["gateway"].running,
+            &runtime,
+        )
+        .await;
+        assert_eq!(started.children["gateway"].restarts, 0);
+        assert_eq!(started.children["gateway"].consecutive_failures, 0);
+        assert!(!started.children["gateway"].crash_loop);
+
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("startup-probed child supervisor should stop")
+            .expect("startup-probed child task should join")
+            .expect("startup-probed child should finish cleanly");
+        server.abort();
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -1839,6 +2137,7 @@ mod tests {
             restart_backoff_ms: 1_000,
             restart_stable_after_ms: DEFAULT_RESTART_STABLE_AFTER_MS,
             crash_loop_threshold: DEFAULT_CRASH_LOOP_THRESHOLD,
+            startup_probes: Vec::new(),
         };
 
         let state = child.initial_state();
@@ -1889,6 +2188,7 @@ mod tests {
                 restart_backoff_ms: 250,
                 restart_stable_after_ms: DEFAULT_RESTART_STABLE_AFTER_MS,
                 crash_loop_threshold: DEFAULT_CRASH_LOOP_THRESHOLD,
+                startup_probes: Vec::new(),
             }
         }
         #[cfg(not(windows))]
@@ -1903,6 +2203,7 @@ mod tests {
                 restart_backoff_ms: 250,
                 restart_stable_after_ms: DEFAULT_RESTART_STABLE_AFTER_MS,
                 crash_loop_threshold: DEFAULT_CRASH_LOOP_THRESHOLD,
+                startup_probes: Vec::new(),
             }
         }
     }
@@ -1996,6 +2297,7 @@ while true; do sleep 1; done
             restart_backoff_ms: 25,
             restart_stable_after_ms: 5_000,
             crash_loop_threshold: 3,
+            startup_probes: Vec::new(),
         };
         let runtime = test_runtime(&temp, std::slice::from_ref(&child));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -2052,6 +2354,7 @@ while true; do sleep 1; done
             restart_backoff_ms: 25,
             restart_stable_after_ms: 5_000,
             crash_loop_threshold: 2,
+            startup_probes: Vec::new(),
         };
         let runtime = test_runtime(&temp, std::slice::from_ref(&child));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);

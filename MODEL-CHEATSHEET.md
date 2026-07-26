@@ -15,13 +15,17 @@ routes, and revisions. Never copy an enclave ID or price from documentation:
 mayhem models --gateway
 ```
 
-## v0.2.57 runtime status
+## v0.2.58 runtime status
 
-The `0.2.57` source release preserves the canonical Needle CPU/CUDA tools-only
+The `0.2.58` source release preserves the canonical Needle CPU/CUDA tools-only
 runtime from `0.2.54`, fixes co-resident host/unified-memory admission, makes
 startup probes honor signed endpoint output-token floors, and reports live
 small-context routes against the endpoint's signed output-token default instead
-of a global allowance. Dedicated-VRAM reservations remain enforced. Needle has exactly two markets:
+of a global allowance. It also makes supervised children wait for their
+configured loopback dependencies without spending crash-loop attempts, verifies
+the selected llama.cpp backend after every local source install, and removes
+system `venv`/`ensurepip`/`pip` as managed-runtime prerequisites. Dedicated-VRAM
+reservations remain enforced. Needle has exactly two markets:
 `needle-cpu` across Linux, Windows x86_64, and Apple Silicon macOS, and
 CUDA-only `needle-gpu` on supported
 Linux aarch64/x86_64 and Windows x86_64 hosts. Apple Metal/MPS is not eligible for the GPU market. The release
@@ -117,13 +121,20 @@ If a provider changes its committed context, it signs its own leave/rejoin.
 ## Runtime lock summary
 
 These are release-managed runtime identities, not commands for manual package
-installation. Full transitive hashes remain in the linked lockfiles.
+installation or claims that the listed versions are universally required
+outside OpenMayhem. They are the versions bound to the current measured
+runtime/canary evidence. Full transitive hashes remain in the linked lockfiles.
+
+Every managed Python backend starts from the official standalone `uv 0.11.29`
+archive for its exact OS and architecture. Mayhem enforces HTTPS, redirect and
+size bounds, pinned archive and executable SHA-256 values, safe extraction, and
+atomic activation before using it to materialize a frozen runtime.
 
 | Backend | Exact managed runtime |
 |---|---|
 | vLLM | `uv 0.11.29`, Python 3.12, `vllm 0.24.0`, `torch 2.11.0`, `transformers 5.12.1`, `tokenizers 0.22.2`, `safetensors 0.8.0`, `compressed-tensors 0.17.0`, `triton 3.6.0`, `av 18` |
 | MLX language/vision | `uv 0.11.29`, Python 3.12, `mlx-lm 0.31.3`, `mlx-vlm 0.6.3`, `mlx 0.32.0`, `llguidance 1.7.6`, `transformers 5.12.1`, `tokenizers 0.22.2`, `safetensors 0.8.0`, `av 18` |
-| llama.cpp media | `llama-cpp-2`/`llama-cpp-sys-2 0.1.150` from llama.cpp revision `7f15e87e3cb0f636e236243e6ee4fc2a4c357277`, with `llguidance` and `mtmd`; acceleration is compile-time CUDA, Metal, or Vulkan. Linux x86_64/aarch64 source builds select a working CUDA toolkit, then Vulkan, then CPU; `MAYHEM_LLAMA_CPP_FEATURES` preserves an explicit operator override. |
+| llama.cpp media | `llama-cpp-2`/`llama-cpp-sys-2 0.1.150` from llama.cpp revision `7f15e87e3cb0f636e236243e6ee4fc2a4c357277`, with `llguidance` and `mtmd`; acceleration is compile-time CUDA, Metal, or Vulkan. macOS source builds use Metal with runtime CPU fallback; Linux x86_64/aarch64 and Windows x86_64 select working CUDA, then Vulkan, then CPU; Windows ARM64 uses CPU. `MAYHEM_LLAMA_CPP_FEATURES` preserves an explicit, validated operator override. |
 | Transformers ASR | `uv 0.11.29`, Python 3.12, `transformers 5.14.1`, `torch 2.13.0`, `tokenizers 0.22.2`, `safetensors 0.8.0`, `numpy 2.4.6`, `soundfile 0.14.0`, `soxr 1.1.0`, `librosa 0.11.0` |
 | ACE-Step | Embedded ACE-Step `0.1.8` source revision `dce621408bee8c31b4fcf4811682eb9359e1bc94` (package `ace-step 1.5.0`, source archive SHA-256 `816a58b7cdc66b3817625dd67e7407b77c0d05e8526a70f6a43cd93889655080`, lock SHA-256 `0a9c8067b3299bfc6881a06e097ff95e55e1b7bb8f9d1f84192ac23e59b995ab`); direct locks include `accelerate 1.12.0`, `diffusers 0.37.1`, `transformers 4.57.6`, `tokenizers 0.22.2`, `safetensors 0.7.0`, `soundfile 0.13.1`, and `av 18.0.0`. Platform Torch is Windows `2.7.1+cu128`, Linux x86_64 `2.10.0+cu128`, Linux ARM64 `2.10.0+cu130`, or macOS ARM64 `2.10.0`; matching `torchaudio` and `torchvision` are lock-resolved. |
 | Sulphur CUDA | `diffusers 0.39.0`, `torch 2.9.1`, `torchvision 0.24.1`, `transformers 4.57.6`, `tokenizers 0.22.2`, `accelerate 1.12.0`, `bitsandbytes 0.49.1`, `peft 0.18.1`, `safetensors 0.8.0`, `gguf 0.19.0`, `huggingface-hub 0.36.0`, `av 16.1.0`, `numpy 2.2.6`, `Pillow 12.1.0`, `tqdm 4.67.1`; CUDA 13.0 wheel family |

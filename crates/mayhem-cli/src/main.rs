@@ -10913,7 +10913,6 @@ async fn update_report_inner(
             manifest.target
         );
     }
-
     let published_stage_dir = if args.dry_run {
         None
     } else {
@@ -33039,6 +33038,11 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
     writeln!(&mut out, "bind = {}", toml_string(&plan.supervisor_bind))?;
     writeln!(&mut out)?;
 
+    let rpc_port = rpc_port_from_url(&plan.rpc_url)?;
+    let sc_bridge_port = sc_bridge_port_from_url(&plan.sc_bridge_url)?;
+    let peer_health_probe = format!("{}/health", plan.rpc_url.trim_end_matches('/'));
+    let sc_bridge_probe = format!("tcp://127.0.0.1:{sc_bridge_port}");
+    let gateway_probe = format!("tcp://127.0.0.1:{}", plan.gateway_bind.port());
     let stores_directory = plan.home.join("stores").display().to_string();
     let paygate_auth_secret_path = plan.paygate_internal_auth_secret_path.display().to_string();
     let mayhem_home = plan.home.display().to_string();
@@ -33112,7 +33116,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         "--sc-bridge-host".to_owned(),
         "127.0.0.1".to_owned(),
         "--sc-bridge-port".to_owned(),
-        sc_bridge_port_from_url(&plan.sc_bridge_url)?.to_string(),
+        sc_bridge_port.to_string(),
         "--sc-bridge-token-file".to_owned(),
         sc_bridge_token_file_path(&plan.home).display().to_string(),
         "--paygate-internal-auth-secret-file".to_owned(),
@@ -33126,7 +33130,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         "--rpc-host".to_owned(),
         "127.0.0.1".to_owned(),
         "--rpc-port".to_owned(),
-        rpc_port_from_url(&plan.rpc_url)?.to_string(),
+        rpc_port.to_string(),
         "--api-tx-exposed".to_owned(),
         "1".to_owned(),
     ]);
@@ -33140,6 +33144,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
             "MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE",
             paygate_auth_secret_path.as_str(),
         )],
+        &[],
     )?;
 
     let paygate_args = vec!["--contract-rpc-url".to_owned(), plan.rpc_url.clone()];
@@ -33156,6 +33161,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
                 paygate_auth_secret_path.as_str(),
             ),
         ],
+        std::slice::from_ref(&peer_health_probe),
     )?;
 
     let mut gateway_args = vec![
@@ -33184,6 +33190,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         &gateway_args,
         None,
         &[("MAYHEM_SC_BRIDGE_TOKEN", plan.sc_bridge_token.as_str())],
+        &[peer_health_probe.clone(), sc_bridge_probe.clone()],
     )?;
 
     if plan.fraud_challenger {
@@ -33209,6 +33216,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
             &challenger_args,
             None,
             &[],
+            &[peer_health_probe.clone(), gateway_probe.clone()],
         )?;
     }
 
@@ -33257,6 +33265,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
                 &provider_args,
                 None,
                 &[("MAYHEM_SC_BRIDGE_TOKEN", plan.sc_bridge_token.as_str())],
+                &[peer_health_probe.clone(), sc_bridge_probe.clone()],
             )?;
         }
     }
@@ -33270,6 +33279,7 @@ fn write_supervisor_child(
     args: &[String],
     cwd: Option<&Path>,
     env: &[(&str, &str)],
+    startup_probes: &[String],
 ) -> Result<()> {
     writeln!(out, "[[supervisor.children]]")?;
     writeln!(out, "name = {}", toml_string(name))?;
@@ -33289,6 +33299,13 @@ fn write_supervisor_child(
             .collect::<Vec<_>>()
             .join(", ");
         writeln!(out, "env = {{ {entries} }}")?;
+    }
+    if !startup_probes.is_empty() {
+        writeln!(
+            out,
+            "startup_probes = [{}]",
+            toml_string_array(startup_probes)
+        )?;
     }
     writeln!(out, "restart = true")?;
     writeln!(out, "restart_backoff_ms = 1000")?;
@@ -49541,6 +49558,13 @@ fn provider_serve_child_config_with_pear_runtime(
         .context(
             "network.sc_bridge_token missing; run `mayhem up` before live provider serve add",
         )?;
+    let startup_probes = vec![
+        format!("{}/health", rpc_url.trim_end_matches('/')),
+        format!(
+            "tcp://127.0.0.1:{}",
+            sc_bridge_port_from_url(&sc_bridge_url)?
+        ),
+    ];
     let configured_gpu_layers = toml_get_path(&config, "provider.gpu_layers")
         .and_then(toml::Value::as_integer)
         .and_then(|value| u32::try_from(value).ok());
@@ -49616,6 +49640,7 @@ fn provider_serve_child_config_with_pear_runtime(
         "restart_backoff_ms": 1000,
         "restart_stable_after_ms": MAYHEMD_RESTART_STABLE_AFTER_MILLIS,
         "crash_loop_threshold": MAYHEMD_CRASH_LOOP_THRESHOLD,
+        "startup_probes": startup_probes,
     }))
 }
 
@@ -49707,6 +49732,7 @@ fn provider_serve_public_child_report(child: &Value) -> Value {
         "restart_backoff_ms": child.get("restart_backoff_ms"),
         "restart_stable_after_ms": child.get("restart_stable_after_ms"),
         "crash_loop_threshold": child.get("crash_loop_threshold"),
+        "startup_probes": child.get("startup_probes"),
     })
 }
 
@@ -84355,6 +84381,10 @@ mod tests {
             child["env"]["MAYHEM_PEAR_RUNTIME"],
             pear_runtime.display().to_string()
         );
+        assert_eq!(
+            child["startup_probes"],
+            json!(["http://127.0.0.1:49223/v1/health", "tcp://127.0.0.1:8001"])
+        );
 
         fs::remove_dir_all(home).unwrap();
     }
@@ -105311,6 +105341,25 @@ State initialization...
             children[1]["env"]["MAYHEM_HOME"].as_str(),
             Some(home.display().to_string().as_str())
         );
+        assert!(children[0].get("startup_probes").is_none());
+        assert_eq!(
+            children[1]["startup_probes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["http://127.0.0.1:49223/v1/health"]
+        );
+        assert_eq!(
+            children[2]["startup_probes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["http://127.0.0.1:49223/v1/health", "tcp://127.0.0.1:49222"]
+        );
         assert!(text.contains("test-token"));
         assert!(text.contains("--subnet-channel"));
         assert!(text.contains("mayhem-mainnet-v1"));
@@ -105565,6 +105614,15 @@ State initialization...
         assert!(args
             .windows(2)
             .any(|pair| pair[0] == "--home" && pair[1] == home_str));
+        assert_eq!(
+            challenger["startup_probes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["http://127.0.0.1:49223/v1/health", "tcp://127.0.0.1:11435"]
+        );
     }
 
     #[test]

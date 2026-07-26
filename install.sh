@@ -50,6 +50,7 @@ SIGNED_ARCHIVE=""
 RELEASE_FLOOR_PRESENT=0
 VERIFIED_PACKAGE_ROOT=""
 VERIFIED_PACKAGE_FILES=""
+SOURCE_LLAMA_CPP_BACKEND=""
 
 usage() {
   cat <<'USAGE'
@@ -1359,8 +1360,90 @@ install_source_binary() {
   fi
 }
 
+llama_cpp_source_backend() {
+  local features="$1"
+  local configured="${2:-}"
+  local backend="" candidate="" feature normalized token
+  local -a tokens=()
+
+  if [[ -n "${configured//[[:space:],;]/}" ]]; then
+    IFS=',; ' read -r -a tokens <<< "$configured"
+    for token in "${tokens[@]}"; do
+      [[ -n "$token" ]] || continue
+      normalized="$(printf '%s' "$token" | tr '[:upper:]' '[:lower:]')"
+      feature="$(llama_cpp_feature_name "$token")"
+      candidate=""
+      case "$feature" in
+        mayhem-cli/llama-cpp-cuda) candidate="cuda" ;;
+        mayhem-cli/llama-cpp-vulkan) candidate="vulkan" ;;
+        "")
+          case "$normalized" in
+            cpu | none) candidate="cpu" ;;
+          esac
+          ;;
+      esac
+      if [[ -n "$candidate" ]]; then
+        [[ -z "$backend" || "$backend" == "$candidate" ]] ||
+          die "MAYHEM_LLAMA_CPP_FEATURES selects conflicting llama.cpp backends '$backend' and '$candidate'; select exactly one of cuda, vulkan, or cpu"
+        backend="$candidate"
+      fi
+    done
+  fi
+
+  if [[ -z "$backend" ]]; then
+    case ",$features," in
+      *,mayhem-cli/llama-cpp-cuda,*) backend="cuda" ;;
+      *,mayhem-cli/llama-cpp-vulkan,*) backend="vulkan" ;;
+      *) backend="cpu" ;;
+    esac
+  fi
+  printf '%s\n' "$backend"
+}
+
+verify_source_llama_cpp_backend() {
+  local backend="$1"
+  local mayhem="$INSTALL_DIR/mayhem"
+  local output
+  local -a args=(
+    doctor
+    --provider-backend llama.cpp
+    --home "$TMP_ROOT/source-doctor"
+    --skip-disk-bench
+  )
+
+  case "$backend" in
+    cuda)
+      args+=(--fixture linux-nvidia --gpu-layers 1)
+      ;;
+    metal)
+      args+=(--fixture apple-silicon --gpu-layers 1)
+      ;;
+    vulkan)
+      # There is no Vulkan fixture, and NVIDIA devices may be classified as CUDA.
+      # The successful feature build proves Vulkan; doctor proves its CPU fallback.
+      args+=(--fixture cpu-only --gpu-layers 0)
+      ;;
+    cpu)
+      args+=(--fixture cpu-only --gpu-layers 0)
+      ;;
+    *)
+      die "unknown selected source llama.cpp backend: $backend"
+      ;;
+  esac
+
+  if ! output="$("$mayhem" "${args[@]}" 2>&1)"; then
+    printf '%s\n' "$output" >&2
+    die "installed source build failed llama.cpp $backend backend verification"
+  fi
+  if [[ "$backend" == "vulkan" ]]; then
+    log "verified installed llama.cpp Vulkan feature build and deterministic CPU fallback"
+  else
+    log "verified installed llama.cpp source backend: $backend"
+  fi
+}
+
 install_from_source() {
-  local bin src target_root llama_cpp_features
+  local bin src target_root llama_cpp_features requested_features
   local -a cargo_args
 
   [[ -f "$SOURCE_DIR/Cargo.toml" ]] || die "source dir does not contain Cargo.toml: $SOURCE_DIR"
@@ -1369,6 +1452,19 @@ install_from_source() {
   log "building release binaries from $SOURCE_DIR"
   cargo_args=(build --release --workspace --bins)
   if [[ "$(uname -s)" == "Darwin" ]]; then
+    requested_features="$(
+      printf '%s' "${MAYHEM_LLAMA_CPP_FEATURES:-}" |
+        tr '[:upper:]' '[:lower:]' |
+        tr -d '[:space:]'
+    )"
+    case "$requested_features" in
+      "" | auto | metal | llama-cpp-metal | mayhem-cli/llama-cpp-metal) ;;
+      *)
+        die "macOS source builds use Metal with runtime CPU fallback; unset MAYHEM_LLAMA_CPP_FEATURES or set it to metal"
+        ;;
+    esac
+    SOURCE_LLAMA_CPP_BACKEND="metal"
+    log "building llama.cpp provider backend: Metal (runtime CPU fallback remains available)"
     cargo_args+=(--features mayhem-cli/llama-cpp-metal)
   elif [[ "$(uname -s)" == "Linux" ]]; then
     llama_cpp_features="$(
@@ -1380,6 +1476,13 @@ install_from_source() {
     else
       log "building llama.cpp CPU fallback; install a usable CUDA or Vulkan toolkit, or set MAYHEM_LLAMA_CPP_FEATURES explicitly"
     fi
+    SOURCE_LLAMA_CPP_BACKEND="$(
+      llama_cpp_source_backend \
+        "$llama_cpp_features" \
+        "${MAYHEM_LLAMA_CPP_FEATURES:-}"
+    )"
+  else
+    die "unsupported source-install host: $(uname -s)"
   fi
   (cd "$SOURCE_DIR" && cargo "${cargo_args[@]}")
 
@@ -1534,6 +1637,11 @@ smoke_test() {
     log "mayhem CLI smoke test passed"
   else
     die "installed mayhem binary did not run"
+  fi
+  if [[ "$FROM_SOURCE" == "1" ]]; then
+    [[ -n "$SOURCE_LLAMA_CPP_BACKEND" ]] ||
+      die "source install did not record its selected llama.cpp backend"
+    verify_source_llama_cpp_backend "$SOURCE_LLAMA_CPP_BACKEND"
   fi
 }
 

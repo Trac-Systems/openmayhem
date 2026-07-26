@@ -119,6 +119,19 @@ grep -F '"$resolved" --version' <<<"$installer_acceleration_functions" >/dev/nul
   fail "Unix source installer accepts an nvcc path without executing it"
 grep -F 'pkg-config --exists vulkan' <<<"$installer_acceleration_functions" >/dev/null ||
   fail "Unix source installer does not validate Vulkan development metadata"
+installer_source_backend_functions="$(
+  awk '
+    /^llama_cpp_source_backend\(\) \{/ { capture = 1 }
+    /^install_from_source\(\) \{/ { capture = 0 }
+    capture { print }
+  ' "$ROOT_DIR/install.sh"
+)"
+for function_name in \
+  llama_cpp_source_backend \
+  verify_source_llama_cpp_backend; do
+  grep -F "${function_name}() {" <<<"$installer_source_backend_functions" >/dev/null ||
+    fail "Unix source installer is missing $function_name"
+done
 
 assert_installer_acceleration() {
   local expected="$1"
@@ -163,6 +176,8 @@ for linux_arch in x86_64 aarch64; do
     "" "$linux_arch" "$linux_arch" 1 1
   assert_installer_acceleration \
     "" "$linux_arch" "$linux_arch" 0 0 cpu
+  assert_installer_acceleration \
+    "mayhem-cli/llama-cpp-cuda" "$linux_arch" "$linux_arch" 0 0 cuda
 done
 assert_installer_acceleration "" x86_64 aarch64 0 0
 assert_installer_acceleration \
@@ -178,6 +193,20 @@ if (
 ) >/dev/null 2>&1; then
   fail "Unix source installer accepted an explicit CUDA build without working nvcc"
 fi
+for conflicting in cuda,vulkan cpu,cuda; do
+  if (
+    eval "$installer_acceleration_functions"
+    eval "$installer_source_backend_functions"
+    die() { exit 1; }
+    llama_cpp_cuda_toolkit_usable() { return 0; }
+    llama_cpp_vulkan_toolkit_usable() { return 0; }
+    export MAYHEM_LLAMA_CPP_FEATURES="$conflicting"
+    features="$(linux_llama_cpp_features Linux x86_64 x86_64)"
+    llama_cpp_source_backend "$features" "$MAYHEM_LLAMA_CPP_FEATURES"
+  ) >/dev/null 2>&1; then
+    fail "Unix source installer accepted conflicting backends: $conflicting"
+  fi
+done
 
 shell_source_build="$(
   sed -n '/^install_from_source() {/,/^}/p' "$ROOT_DIR/install.sh"
@@ -190,6 +219,37 @@ grep -F 'cargo_args+=(--features "$llama_cpp_features")' \
   fail "Unix source build does not pass selected llama.cpp features to Cargo"
 grep -F 'mayhem-cli/llama-cpp-metal' <<<"$shell_source_build" >/dev/null ||
   fail "Unix source acceleration change removed the existing macOS Metal build"
+grep -F 'SOURCE_LLAMA_CPP_BACKEND="metal"' <<<"$shell_source_build" >/dev/null ||
+  fail "macOS source build does not record its deterministic Metal backend"
+grep -F 'llama_cpp_source_backend \' \
+  <<<"$shell_source_build" >/dev/null ||
+  fail "Linux source build does not record its selected local backend"
+
+shell_smoke_test="$(
+  sed -n '/^smoke_test() {/,/^}/p' "$ROOT_DIR/install.sh"
+)"
+grep -F 'verify_source_llama_cpp_backend "$SOURCE_LLAMA_CPP_BACKEND"' \
+  <<<"$shell_smoke_test" >/dev/null ||
+  fail "Unix source install does not verify the selected backend with mayhem doctor"
+grep -F -- '--fixture linux-nvidia --gpu-layers 1' \
+  <<<"$installer_source_backend_functions" >/dev/null ||
+  fail "Unix source CUDA verification does not prove accelerator support"
+grep -F -- '--fixture apple-silicon --gpu-layers 1' \
+  <<<"$installer_source_backend_functions" >/dev/null ||
+  fail "macOS source verification does not prove Metal support"
+grep -F -- '--fixture cpu-only --gpu-layers 0' \
+  <<<"$installer_source_backend_functions" >/dev/null ||
+  fail "Unix source CPU verification is not pinned to CPU execution"
+vulkan_verification="$(
+  sed -n '/^[[:space:]]*vulkan)/,/^[[:space:]]*;;/p' \
+    <<<"$installer_source_backend_functions"
+)"
+grep -F -- '--fixture cpu-only --gpu-layers 0' \
+  <<<"$vulkan_verification" >/dev/null ||
+  fail "Unix Vulkan source verification can falsely depend on hwprobe GPU classification"
+grep -F 'Vulkan feature build and deterministic CPU fallback' \
+  <<<"$installer_source_backend_functions" >/dev/null ||
+  fail "Unix Vulkan source verification overclaims live Vulkan execution"
 
 grep -F '"$INSTALL_DIR/mayhem" --version' "$ROOT_DIR/install.sh" >/dev/null ||
   fail "Unix installer does not execute the installed binary version check"
@@ -241,6 +301,16 @@ if grep -F 'Unblock-File' "$ROOT_DIR/install.ps1" >/dev/null; then
 fi
 grep -F '& $mayhem --version' "$ROOT_DIR/install.ps1" >/dev/null ||
   fail "PowerShell installer does not execute the installed binary version check"
+for token in \
+  'function Test-CudaToolkitUsable' \
+  'function Test-VulkanToolkitUsable' \
+  'function Resolve-LlamaCppSourceBuild' \
+  'Windows ARM64 source builds support the llama.cpp CPU backend only' \
+  'function Confirm-SourceLlamaCppBackend' \
+  'Confirm-SourceLlamaCppBackend'; do
+  grep -F "$token" "$ROOT_DIR/install.ps1" >/dev/null ||
+    fail "PowerShell source backend contract is missing: $token"
+done
 
 mainnet_intercom_hydration="$(
   sed -n '/^hydrate_intercom_package() {/,/^}/p' \

@@ -56,6 +56,7 @@ $Bins = @(
 
 $script:PathEntries = @()
 $script:TempDirs = @()
+$script:SourceLlamaCppBackend = ""
 
 if ([string]::IsNullOrWhiteSpace($ShareDir)) {
     $ShareDir = Join-Path (Join-Path (Split-Path -Parent $InstallDir) "share") "mayhem"
@@ -117,53 +118,137 @@ function Get-LlamaCppFeatureName {
     }
 }
 
-function Get-LlamaCppFeatures {
-    $features = @()
+function Test-CudaToolkitUsable {
+    $candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:CUDACXX)) {
+        $candidates += $env:CUDACXX
+    }
+    foreach ($root in @($env:CUDA_PATH, $env:CUDA_HOME)) {
+        if (-not [string]::IsNullOrWhiteSpace($root)) {
+            $candidates += (Join-Path (Join-Path $root "bin") "nvcc.exe")
+        }
+    }
+    $command = Get-Command "nvcc.exe" -CommandType Application -ErrorAction SilentlyContinue
+    if ($null -ne $command) {
+        $candidates += $command.Path
+    }
 
+    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            continue
+        }
+        try {
+            & $candidate --version *> $null
+            if ($LASTEXITCODE -eq 0) {
+                return $true
+            }
+        } catch {
+            continue
+        }
+    }
+    return $false
+}
+
+function Test-VulkanToolkitUsable {
+    if ([string]::IsNullOrWhiteSpace($env:VULKAN_SDK)) {
+        return $false
+    }
+    $header = Join-Path (Join-Path (Join-Path $env:VULKAN_SDK "Include") "vulkan") "vulkan.h"
+    $loader = Join-Path (Join-Path $env:VULKAN_SDK "Lib") "vulkan-1.lib"
+    return (Test-Path -LiteralPath $header -PathType Leaf) -and
+        (Test-Path -LiteralPath $loader -PathType Leaf)
+}
+
+function Assert-LlamaCppFeaturePrereqs {
+    param(
+        [string[]]$Features,
+        [string]$TargetTriple = $(Get-TargetTriple)
+    )
+
+    $hasCuda = $Features -contains "mayhem-cli/llama-cpp-cuda"
+    $hasVulkan = $Features -contains "mayhem-cli/llama-cpp-vulkan"
+    if ($hasCuda -and $hasVulkan) {
+        Fail "source build selected both CUDA and Vulkan; select exactly one llama.cpp backend"
+    }
+    if ($TargetTriple -eq "aarch64-pc-windows-msvc" -and ($hasCuda -or $hasVulkan)) {
+        Fail "Windows ARM64 source builds support the llama.cpp CPU backend only; set MAYHEM_LLAMA_CPP_FEATURES=cpu"
+    }
+    if ($hasCuda -and -not (Test-CudaToolkitUsable)) {
+        Fail "llama.cpp CUDA source build requested, but a working nvcc was not found; install CUDA Toolkit or set MAYHEM_LLAMA_CPP_FEATURES=cpu"
+    }
+    if ($hasVulkan -and -not (Test-VulkanToolkitUsable)) {
+        Fail "llama.cpp Vulkan source build requested, but Vulkan headers and loader library were not found; install the Vulkan SDK or set MAYHEM_LLAMA_CPP_FEATURES=cpu"
+    }
+}
+
+function Resolve-LlamaCppSourceBuild {
+    param([string]$TargetTriple = $(Get-TargetTriple))
+
+    $features = @()
+    $backend = ""
     if (-not [string]::IsNullOrWhiteSpace($LlamaCppFeatures)) {
         foreach ($token in ($LlamaCppFeatures -split "[,; ]+")) {
             if ([string]::IsNullOrWhiteSpace($token)) {
                 continue
             }
+            $normalized = $token.Trim().ToLowerInvariant()
             $feature = Get-LlamaCppFeatureName -Token $token
+            $candidate = ""
+            switch ($feature) {
+                "mayhem-cli/llama-cpp-cuda" { $candidate = "cuda" }
+                "mayhem-cli/llama-cpp-vulkan" { $candidate = "vulkan" }
+                default {
+                    if ($normalized -in @("cpu", "none")) {
+                        $candidate = "cpu"
+                    }
+                }
+            }
+            if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                if (-not [string]::IsNullOrWhiteSpace($backend) -and $backend -ne $candidate) {
+                    Fail "MAYHEM_LLAMA_CPP_FEATURES selects conflicting llama.cpp backends '$backend' and '$candidate'; select exactly one of cuda, vulkan, or cpu"
+                }
+                $backend = $candidate
+            }
             if (-not [string]::IsNullOrWhiteSpace($feature) -and $features -notcontains $feature) {
                 $features += $feature
             }
         }
-        return $features
-    }
-
-    if ((Test-Command "nvcc") -or -not [string]::IsNullOrWhiteSpace($env:CUDA_PATH) -or -not [string]::IsNullOrWhiteSpace($env:CUDA_HOME)) {
+        if ([string]::IsNullOrWhiteSpace($backend)) {
+            $backend = "cpu"
+        }
+    } elseif ($TargetTriple -eq "aarch64-pc-windows-msvc") {
+        $backend = "cpu"
+    } elseif (Test-CudaToolkitUsable) {
+        $backend = "cuda"
         $features += "mayhem-cli/llama-cpp-cuda"
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($env:VULKAN_SDK)) {
+    } elseif (Test-VulkanToolkitUsable) {
+        $backend = "vulkan"
         $features += "mayhem-cli/llama-cpp-vulkan"
+    } else {
+        $backend = "cpu"
     }
 
-    return $features
+    Assert-LlamaCppFeaturePrereqs -Features $features -TargetTriple $TargetTriple
+    return [pscustomobject]@{
+        Backend = $backend
+        Features = [string[]]$features
+    }
 }
 
-function Assert-LlamaCppFeaturePrereqs {
-    param([string[]]$Features)
+function Get-LlamaCppFeatures {
+    param([string]$TargetTriple = $(Get-TargetTriple))
 
-    if ($Features -contains "mayhem-cli/llama-cpp-cuda") {
-        if (-not (Test-Command "nvcc") -and [string]::IsNullOrWhiteSpace($env:CUDA_PATH) -and [string]::IsNullOrWhiteSpace($env:CUDA_HOME)) {
-            Fail "llama.cpp CUDA source build requested, but CUDA Toolkit was not found; install CUDA Toolkit or set MAYHEM_LLAMA_CPP_FEATURES=cpu"
-        }
-    }
-
-    if ($Features -contains "mayhem-cli/llama-cpp-vulkan") {
-        if ([string]::IsNullOrWhiteSpace($env:VULKAN_SDK)) {
-            Fail "llama.cpp Vulkan source build requested, but VULKAN_SDK is not set; install the Vulkan SDK or set MAYHEM_LLAMA_CPP_FEATURES=cpu"
-        }
-    }
+    $selection = Resolve-LlamaCppSourceBuild -TargetTriple $TargetTriple
+    return @($selection.Features)
 }
 
 function Get-LlamaCppFeatureArgs {
-    param([string[]]$Features = $(Get-LlamaCppFeatures))
+    param(
+        [string[]]$Features = $(Get-LlamaCppFeatures),
+        [string]$TargetTriple = $(Get-TargetTriple)
+    )
 
-    Assert-LlamaCppFeaturePrereqs -Features $Features
+    Assert-LlamaCppFeaturePrereqs -Features $Features -TargetTriple $TargetTriple
 
     if ($Features.Count -eq 0) {
         Write-Log "building llama.cpp CPU fallback; set MAYHEM_LLAMA_CPP_FEATURES=cuda or vulkan for GPU source builds"
@@ -1746,13 +1831,20 @@ function Install-FromSource {
         Fail "Rust/Cargo is required for -FromSource installs"
     }
 
+    $targetTriple = Get-TargetTriple
+    $selection = Resolve-LlamaCppSourceBuild -TargetTriple $targetTriple
+    $features = @($selection.Features)
+    $script:SourceLlamaCppBackend = $selection.Backend
     $targetDir = New-WindowsSourceBuildTargetDir
-    Initialize-WindowsSourceBuildEnvironment
+    Initialize-WindowsSourceBuildEnvironment -TargetTriple $targetTriple
     Write-Log "building release binaries from $SourceDir in private target directory $targetDir"
     Push-Location $SourceDir
     try {
-        $features = @(Get-LlamaCppFeatures)
-        $featureArgs = @(Get-LlamaCppFeatureArgs -Features $features)
+        $featureArgs = @(
+            Get-LlamaCppFeatureArgs `
+                -Features $features `
+                -TargetTriple $targetTriple
+        )
         $cargoBuildArgs = @(
             Get-WindowsSourceBuildCargoArgs -LlamaCppFeatures $features
         )
@@ -1938,6 +2030,50 @@ function Update-UserPath {
     Write-Log "updated user PATH; open a new terminal to pick it up"
 }
 
+function Confirm-SourceLlamaCppBackend {
+    param(
+        [string]$MayhemPath,
+        [string]$Backend
+    )
+
+    $doctorHome = New-TempDir
+    $doctorArgs = @(
+        "doctor",
+        "--provider-backend", "llama.cpp",
+        "--home", $doctorHome,
+        "--skip-disk-bench"
+    )
+    switch ($Backend) {
+        "cuda" {
+            $doctorArgs += @("--fixture", "linux-nvidia", "--gpu-layers", "1")
+        }
+        "vulkan" {
+            # There is no Vulkan fixture, and NVIDIA devices may be classified as CUDA.
+            # The successful feature build proves Vulkan; doctor proves its CPU fallback.
+            $doctorArgs += @("--fixture", "cpu-only", "--gpu-layers", "0")
+        }
+        "cpu" {
+            $doctorArgs += @("--fixture", "cpu-only", "--gpu-layers", "0")
+        }
+        default {
+            Fail "unknown selected source llama.cpp backend: $Backend"
+        }
+    }
+
+    $output = (& $MayhemPath @doctorArgs 2>&1 | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        if (-not [string]::IsNullOrWhiteSpace($output)) {
+            Write-Host $output.TrimEnd()
+        }
+        Fail "installed source build failed llama.cpp $Backend backend verification"
+    }
+    if ($Backend -eq "vulkan") {
+        Write-Log "verified installed llama.cpp Vulkan feature build and deterministic CPU fallback"
+    } else {
+        Write-Log "verified installed llama.cpp source backend: $Backend"
+    }
+}
+
 function Smoke-Test {
     $mayhem = Join-Path $InstallDir "mayhem.exe"
     & $mayhem --version *> $null
@@ -1947,6 +2083,11 @@ function Smoke-Test {
     & $mayhem --help *> $null
     if ($LASTEXITCODE -ne 0) {
         Fail "installed mayhem binary did not run"
+    }
+    if ($FromSource) {
+        Confirm-SourceLlamaCppBackend `
+            -MayhemPath $mayhem `
+            -Backend $script:SourceLlamaCppBackend
     }
     Write-Log "mayhem CLI smoke test passed"
 }

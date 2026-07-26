@@ -2,12 +2,13 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, ensure, Context, Result};
+use flate2::read::GzDecoder;
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
 
@@ -84,6 +85,9 @@ const SULPHUR_MLX_WHEELS: &[EmbeddedPythonWheel] = &[
     },
 ];
 const MANAGED_UV_VERSION: &str = "0.11.29";
+const MANAGED_UV_MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
+const MANAGED_UV_MAX_EXECUTABLE_BYTES: u64 = 128 * 1024 * 1024;
+const MANAGED_UV_MAX_ZIP_ENTRIES: usize = 64;
 const MANAGED_PYTHON_VERSION: &str = "3.12";
 const CHATTERBOX_PYTHON_VERSION: &str = "3.11";
 const CHATTERBOX_SOURCE_TREE_SHA256: &str =
@@ -2568,68 +2572,492 @@ fn copy_regular_directory_tree(source: &Path, destination: &Path) -> Result<()> 
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedUvArchiveKind {
+    TarGz,
+    Zip,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManagedUvAsset {
+    archive_kind: ManagedUvArchiveKind,
+    archive_name: Cow<'static, str>,
+    archive_sha256: Cow<'static, str>,
+    executable_member: Cow<'static, str>,
+    executable_sha256: Cow<'static, str>,
+    url: Cow<'static, str>,
+}
+
+fn managed_uv_asset(target_os: &str, target_arch: &str) -> Result<ManagedUvAsset> {
+    let (target, archive_kind, archive_sha256, executable_sha256) = match (target_os, target_arch) {
+        ("macos", "aarch64") => (
+            "aarch64-apple-darwin",
+            ManagedUvArchiveKind::TarGz,
+            "61c04acc52a33ef0f331e494bdfbedcdb6c26c6970c022ed3699e5860f8930e3",
+            "3ac242bb6bca0841cad65b877e21a3e9f65c97141712b5c8438cc8a8c89ead54",
+        ),
+        ("macos", "x86_64") => (
+            "x86_64-apple-darwin",
+            ManagedUvArchiveKind::TarGz,
+            "c4c4de482da9ccdd076dc4fb5cfe7b740609029385c72f58606be3153602387d",
+            "3fcfeb23eb951da9c2db2ebdde52b7f83cafe3bf90f1d6225519b6d0db43c04b",
+        ),
+        ("linux", "aarch64") => (
+            "aarch64-unknown-linux-gnu",
+            ManagedUvArchiveKind::TarGz,
+            "94500fb064ae3c971a873cba64d94694c50677e0a4dbf78735c80509e7429919",
+            "40de8760ec3d368ae7a19d06392a071b761dddbe1b926d23f736ce65befe131c",
+        ),
+        ("linux", "x86_64") => (
+            "x86_64-unknown-linux-gnu",
+            ManagedUvArchiveKind::TarGz,
+            "04f8b82f5d47f0512dcd32c67a4a6f16a0ea27c81537c338fd0ad6b23cebe829",
+            "4f26786f798cce6e9f467fe917d4305b9600ef8bf14994aa016fbb32523e5ca5",
+        ),
+        ("windows", "aarch64") => (
+            "aarch64-pc-windows-msvc",
+            ManagedUvArchiveKind::Zip,
+            "55b597ae81bc29531a7c352a1431a8a73cc2755d7a5b9ec454580cbe02e5154f",
+            "bbafdd69166bdc7038b7362c0aacd44fc5a25a5e505bb7a86bdde388590197b2",
+        ),
+        ("windows", "x86_64") => (
+            "x86_64-pc-windows-msvc",
+            ManagedUvArchiveKind::Zip,
+            "a047d55651bc3e0ca24595b25ec4cfcb10f9dca9fb56514e661269b37d4fae68",
+            "6d40479cd1d0d5db7fc0fe68ad703fc8acbd84bba50d864bb97461f6af9d9561",
+        ),
+        _ => bail!(
+            "the pinned uv {} standalone bootstrap does not support {target_os}/{target_arch}",
+            MANAGED_UV_VERSION
+        ),
+    };
+    let extension = match archive_kind {
+        ManagedUvArchiveKind::TarGz => "tar.gz",
+        ManagedUvArchiveKind::Zip => "zip",
+    };
+    let archive_name = format!("uv-{target}.{extension}");
+    let executable_member = match archive_kind {
+        ManagedUvArchiveKind::TarGz => format!("uv-{target}/uv"),
+        ManagedUvArchiveKind::Zip => "uv.exe".to_owned(),
+    };
+    Ok(ManagedUvAsset {
+        archive_kind,
+        archive_sha256: Cow::Borrowed(archive_sha256),
+        executable_member: Cow::Owned(executable_member),
+        executable_sha256: Cow::Borrowed(executable_sha256),
+        url: Cow::Owned(format!(
+            "https://github.com/astral-sh/uv/releases/download/{MANAGED_UV_VERSION}/{archive_name}"
+        )),
+        archive_name: Cow::Owned(archive_name),
+    })
+}
+
 fn ensure_managed_uv(home: &Path) -> Result<PathBuf> {
+    let asset = managed_uv_asset(env::consts::OS, env::consts::ARCH)?;
     let tools = home.join("tools");
     fs::create_dir_all(&tools)
         .with_context(|| format!("creating managed tools directory {}", tools.display()))?;
-    let venv = tools.join(format!("uv-{MANAGED_UV_VERSION}"));
-    let uv = venv_executable(&venv, if cfg!(windows) { "uv.exe" } else { "uv" });
-    if validate_uv(&uv).is_ok() {
+    let installation = tools.join(format!("uv-{MANAGED_UV_VERSION}"));
+    let uv = managed_uv_executable(&installation);
+    if validate_managed_uv_install(&uv, &asset).is_ok() {
         return Ok(uv);
     }
-    if venv.exists() {
-        fs::remove_dir_all(&venv)
-            .with_context(|| format!("removing incomplete uv environment {}", venv.display()))?;
+
+    let lock_path = tools.join(format!(".uv-{MANAGED_UV_VERSION}.bootstrap.lock"));
+    let lock = open_lock_file(&lock_path)?;
+    lock.lock_exclusive()
+        .with_context(|| format!("locking managed uv bootstrap {}", lock_path.display()))?;
+    if validate_managed_uv_install(&uv, &asset).is_ok() {
+        return Ok(uv);
     }
-    let base_python = resolve_base_python()?;
-    let create = Command::new(&base_python)
-        .arg("-m")
-        .arg("venv")
-        .arg(&venv)
-        .output()
-        .with_context(|| format!("starting {} -m venv for uv", base_python.display()))?;
-    if !create.status.success() {
-        let _ = fs::remove_dir_all(&venv);
-        bail!(
-            "creating the managed uv environment failed with {}{}",
-            create.status,
+    if installation.exists() {
+        let metadata = fs::symlink_metadata(&installation)
+            .with_context(|| format!("reading managed uv path {}", installation.display()))?;
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "refusing to replace non-directory managed uv path {}",
+            installation.display()
+        );
+        fs::remove_dir_all(&installation).with_context(|| {
+            format!(
+                "removing incomplete managed uv installation {}",
+                installation.display()
+            )
+        })?;
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_nanos();
+    let staging = tools.join(format!(
+        ".uv-{MANAGED_UV_VERSION}.{}-{nonce}.tmp",
+        std::process::id()
+    ));
+    fs::create_dir(&staging)
+        .with_context(|| format!("creating managed uv staging area {}", staging.display()))?;
+    let result = (|| {
+        let archive = staging.join(asset.archive_name.as_ref());
+        download_managed_uv_archive(&asset, &archive)?;
+        extract_managed_uv_executable(&asset, &archive, &staging)?;
+        let staged_uv = managed_uv_executable(&staging);
+        validate_managed_uv_install(&staged_uv, &asset)?;
+        fs::remove_file(&archive)
+            .with_context(|| format!("removing verified uv archive {}", archive.display()))?;
+        fs::rename(&staging, &installation).with_context(|| {
+            format!(
+                "activating managed uv installation {}",
+                installation.display()
+            )
+        })?;
+        validate_managed_uv_install(&uv, &asset)?;
+        Ok(uv.clone())
+    })();
+    if staging.exists() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
+fn managed_uv_executable(installation: &Path) -> PathBuf {
+    if cfg!(windows) {
+        installation.join("Scripts").join("uv.exe")
+    } else {
+        installation.join("bin").join("uv")
+    }
+}
+
+fn download_managed_uv_archive(asset: &ManagedUvAsset, destination: &Path) -> Result<()> {
+    let client = reqwest::blocking::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .timeout(Duration::from_secs(300))
+        .user_agent(format!("openmayhem/managed-uv-{MANAGED_UV_VERSION}"))
+        .build()
+        .context("building the managed uv bootstrap client")?;
+    let mut response = client
+        .get(asset.url.as_ref())
+        .send()
+        .with_context(|| format!("downloading pinned uv from {}", asset.url))?
+        .error_for_status()
+        .with_context(|| format!("downloading pinned uv from {}", asset.url))?;
+    if let Some(length) = response.content_length() {
+        ensure!(
+            length <= MANAGED_UV_MAX_ARCHIVE_BYTES,
+            "pinned uv archive is unexpectedly large: {length} bytes"
+        );
+    }
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination)
+        .with_context(|| format!("creating {}", destination.display()))?;
+    let mut digest = Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = response
+            .read(&mut buffer)
+            .context("reading the pinned uv archive response")?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .context("pinned uv archive size overflow")?;
+        ensure!(
+            total <= MANAGED_UV_MAX_ARCHIVE_BYTES,
+            "pinned uv archive exceeds {} bytes",
+            MANAGED_UV_MAX_ARCHIVE_BYTES
+        );
+        digest.update(&buffer[..read]);
+        output
+            .write_all(&buffer[..read])
+            .with_context(|| format!("writing {}", destination.display()))?;
+    }
+    output
+        .sync_all()
+        .with_context(|| format!("syncing {}", destination.display()))?;
+    let actual = format!("{:x}", digest.finalize());
+    ensure!(
+        actual == asset.archive_sha256,
+        "pinned uv archive checksum mismatch: expected {}, got {}",
+        asset.archive_sha256,
+        actual
+    );
+    Ok(())
+}
+
+fn extract_managed_uv_executable(
+    asset: &ManagedUvAsset,
+    archive_path: &Path,
+    installation: &Path,
+) -> Result<()> {
+    let executable = managed_uv_executable(installation);
+    let executable_dir = executable
+        .parent()
+        .context("managed uv executable has no parent directory")?;
+    fs::create_dir_all(executable_dir).with_context(|| {
+        format!(
+            "creating managed uv executable directory {}",
+            executable_dir.display()
+        )
+    })?;
+    match asset.archive_kind {
+        ManagedUvArchiveKind::TarGz => {
+            ensure_safe_managed_uv_member(asset.executable_member.as_ref())?;
+            let archive_file = File::open(archive_path)
+                .with_context(|| format!("opening {}", archive_path.display()))?;
+            let mut archive = tar::Archive::new(GzDecoder::new(archive_file));
+            let mut extracted = false;
+            for entry in archive
+                .entries()
+                .with_context(|| format!("reading {}", archive_path.display()))?
             {
-                let detail = command_output_detail(&create);
-                if detail.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {detail}")
+                let entry = entry.with_context(|| format!("reading {}", archive_path.display()))?;
+                if entry
+                    .path()
+                    .context("reading pinned uv archive entry path")?
+                    != Path::new(asset.executable_member.as_ref())
+                {
+                    continue;
                 }
+                ensure!(
+                    !extracted,
+                    "pinned uv archive contains duplicate executable entries"
+                );
+                ensure!(
+                    entry.header().entry_type().is_file(),
+                    "pinned uv executable entry is not a regular file"
+                );
+                ensure!(
+                    entry.size() <= MANAGED_UV_MAX_EXECUTABLE_BYTES,
+                    "pinned uv executable is unexpectedly large"
+                );
+                let expected_size = entry.size();
+                let mut output = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&executable)
+                    .with_context(|| format!("creating {}", executable.display()))?;
+                let copied = std::io::copy(
+                    &mut entry.take(MANAGED_UV_MAX_EXECUTABLE_BYTES + 1),
+                    &mut output,
+                )
+                .with_context(|| format!("extracting {}", executable.display()))?;
+                ensure!(
+                    copied == expected_size,
+                    "pinned uv executable extraction was incomplete: expected {expected_size} bytes, got {copied}"
+                );
+                output
+                    .sync_all()
+                    .with_context(|| format!("syncing {}", executable.display()))?;
+                extracted = true;
             }
+            ensure!(extracted, "pinned uv archive has no uv executable");
+        }
+        ManagedUvArchiveKind::Zip => extract_managed_uv_zip(
+            archive_path,
+            &executable,
+            asset.executable_member.as_ref(),
+            MANAGED_UV_MAX_EXECUTABLE_BYTES,
+        )?,
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("securing {}", executable.display()))?;
+    }
+    Ok(())
+}
+
+fn ensure_safe_managed_uv_member(member: &str) -> Result<()> {
+    let path = Path::new(member);
+    ensure!(
+        !path.as_os_str().is_empty()
+            && !path.is_absolute()
+            && path
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "pinned uv executable has an unsafe archive member path"
+    );
+    Ok(())
+}
+
+fn extract_managed_uv_zip(
+    archive_path: &Path,
+    executable: &Path,
+    executable_member: &str,
+    maximum_executable_bytes: u64,
+) -> Result<()> {
+    ensure_safe_managed_uv_member(executable_member)?;
+    let mut archive_file =
+        File::open(archive_path).with_context(|| format!("opening {}", archive_path.display()))?;
+    let declared_entries = managed_uv_zip_declared_entry_count(&mut archive_file)?;
+    ensure!(
+        declared_entries <= MANAGED_UV_MAX_ZIP_ENTRIES,
+        "pinned uv ZIP contains too many entries: {declared_entries}"
+    );
+    archive_file
+        .seek(SeekFrom::Start(0))
+        .with_context(|| format!("rewinding {}", archive_path.display()))?;
+    let mut archive = zip::ZipArchive::new(archive_file)
+        .with_context(|| format!("reading {}", archive_path.display()))?;
+    ensure!(
+        archive.len() == declared_entries,
+        "pinned uv ZIP contains duplicate or ambiguous central-directory entries"
+    );
+
+    let expected_name = executable_member.as_bytes();
+    let mut executable_index = None;
+    for index in 0..archive.len() {
+        let entry = archive
+            .by_index_raw(index)
+            .with_context(|| format!("reading entry {index} from {}", archive_path.display()))?;
+        if entry.name_raw() != expected_name {
+            continue;
+        }
+        ensure!(
+            executable_index.replace(index).is_none(),
+            "pinned uv ZIP contains duplicate executable entries"
+        );
+        ensure!(
+            entry.enclosed_name().as_deref() == Some(Path::new(executable_member)),
+            "pinned uv ZIP executable has an unsafe path"
+        );
+        ensure!(
+            !entry.encrypted(),
+            "pinned uv ZIP executable must not be encrypted"
+        );
+        ensure!(
+            entry.is_file(),
+            "pinned uv ZIP executable is not a regular file"
+        );
+        if let Some(mode) = entry.unix_mode() {
+            let file_type = mode & 0o170000;
+            ensure!(
+                file_type == 0 || file_type == 0o100000,
+                "pinned uv ZIP executable is a symbolic link or special file"
+            );
+        }
+        ensure!(
+            matches!(
+                entry.compression(),
+                zip::CompressionMethod::Stored | zip::CompressionMethod::Deflated
+            ),
+            "pinned uv ZIP executable uses unsupported compression"
+        );
+        ensure!(
+            entry.compressed_size() <= MANAGED_UV_MAX_ARCHIVE_BYTES,
+            "pinned uv ZIP executable has an invalid compressed size"
+        );
+        ensure!(
+            entry.size() <= maximum_executable_bytes,
+            "pinned uv ZIP executable exceeds {maximum_executable_bytes} bytes"
         );
     }
-    let install = Command::new(venv_python(&venv))
-        .arg("-m")
-        .arg("pip")
-        .arg("install")
-        .arg("--disable-pip-version-check")
-        .arg("--no-input")
-        .arg(format!("uv=={MANAGED_UV_VERSION}"))
-        .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-        .env("PIP_NO_INPUT", "1")
-        .output()
-        .context("installing the pinned uv bootstrap")?;
-    if !install.status.success() {
-        let detail = command_output_detail(&install);
-        let _ = fs::remove_dir_all(&venv);
-        bail!(
-            "installing uv=={} failed with {}{}",
-            MANAGED_UV_VERSION,
-            install.status,
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {detail}")
-            }
-        );
-    }
-    validate_uv(&uv)?;
-    Ok(uv)
+    let executable_index =
+        executable_index.context("pinned uv ZIP has no exact uv executable entry")?;
+    let entry = archive
+        .by_index(executable_index)
+        .with_context(|| format!("opening uv executable from {}", archive_path.display()))?;
+    let expected_size = entry.size();
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(executable)
+        .with_context(|| format!("creating {}", executable.display()))?;
+    let copied = std::io::copy(
+        &mut entry.take(maximum_executable_bytes.saturating_add(1)),
+        &mut output,
+    )
+    .with_context(|| format!("extracting {}", executable.display()))?;
+    ensure!(
+        copied == expected_size && copied <= maximum_executable_bytes,
+        "pinned uv ZIP executable extraction size mismatch: expected {expected_size} bytes, got {copied}"
+    );
+    output
+        .sync_all()
+        .with_context(|| format!("syncing {}", executable.display()))?;
+    Ok(())
+}
+
+fn managed_uv_zip_declared_entry_count(archive: &mut File) -> Result<usize> {
+    const EOCD_SIZE: usize = 22;
+    const MAX_COMMENT_SIZE: usize = u16::MAX as usize;
+
+    let archive_size = archive
+        .metadata()
+        .context("reading pinned uv ZIP metadata")?
+        .len();
+    ensure!(
+        archive_size <= MANAGED_UV_MAX_ARCHIVE_BYTES,
+        "pinned uv ZIP exceeds {} bytes",
+        MANAGED_UV_MAX_ARCHIVE_BYTES
+    );
+    ensure!(
+        archive_size >= EOCD_SIZE as u64,
+        "pinned uv ZIP is missing its end-of-central-directory record"
+    );
+    let tail_size = usize::try_from(archive_size.min((EOCD_SIZE + MAX_COMMENT_SIZE) as u64))
+        .context("pinned uv ZIP tail size does not fit in memory")?;
+    archive
+        .seek(SeekFrom::End(-(tail_size as i64)))
+        .context("seeking to the pinned uv ZIP central directory")?;
+    let mut tail = vec![0_u8; tail_size];
+    archive
+        .read_exact(&mut tail)
+        .context("reading the pinned uv ZIP central directory")?;
+    let eocd_offset = (0..=tail.len() - EOCD_SIZE)
+        .rev()
+        .find(|offset| {
+            tail[*offset..].starts_with(b"PK\x05\x06")
+                && *offset
+                    + EOCD_SIZE
+                    + u16::from_le_bytes([tail[*offset + 20], tail[*offset + 21]]) as usize
+                    == tail.len()
+        })
+        .context("pinned uv ZIP has no valid end-of-central-directory record")?;
+    let eocd = &tail[eocd_offset..eocd_offset + EOCD_SIZE];
+    let disk = u16::from_le_bytes([eocd[4], eocd[5]]);
+    let directory_disk = u16::from_le_bytes([eocd[6], eocd[7]]);
+    let disk_entries = u16::from_le_bytes([eocd[8], eocd[9]]);
+    let total_entries = u16::from_le_bytes([eocd[10], eocd[11]]);
+    ensure!(
+        disk == 0 && directory_disk == 0 && disk_entries == total_entries,
+        "pinned uv ZIP must be a single-disk archive"
+    );
+    ensure!(
+        total_entries != u16::MAX,
+        "pinned uv ZIP64 archives are not accepted"
+    );
+    let directory_size = u32::from_le_bytes([eocd[12], eocd[13], eocd[14], eocd[15]]) as u64;
+    let directory_offset = u32::from_le_bytes([eocd[16], eocd[17], eocd[18], eocd[19]]) as u64;
+    let absolute_eocd_offset = archive_size - tail_size as u64 + eocd_offset as u64;
+    ensure!(
+        directory_offset.checked_add(directory_size) == Some(absolute_eocd_offset),
+        "pinned uv ZIP central-directory bounds are invalid"
+    );
+    Ok(total_entries as usize)
+}
+
+fn validate_managed_uv_install(uv: &Path, asset: &ManagedUvAsset) -> Result<()> {
+    let metadata = fs::symlink_metadata(uv).with_context(|| format!("reading {}", uv.display()))?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "{} is not a regular managed uv executable",
+        uv.display()
+    );
+    let actual = file_sha256(uv)?;
+    ensure!(
+        actual == asset.executable_sha256,
+        "{} checksum mismatch: expected {}, got {}",
+        uv.display(),
+        asset.executable_sha256,
+        actual
+    );
+    validate_uv(uv)
 }
 
 fn validate_uv(uv: &Path) -> Result<()> {
@@ -3367,16 +3795,6 @@ fn command_output_detail(output: &Output) -> String {
     let mut chars = detail.chars().rev().take(2_000).collect::<Vec<_>>();
     chars.reverse();
     chars.into_iter().collect()
-}
-
-fn resolve_base_python() -> Result<PathBuf> {
-    for candidate in ["python3", "python"] {
-        let output = Command::new(candidate).arg("--version").output();
-        if output.is_ok_and(|output| output.status.success()) {
-            return Ok(PathBuf::from(candidate));
-        }
-    }
-    bail!("Python 3 is required to bootstrap the selected backend; install python3 and retry")
 }
 
 fn venv_python(venv: &Path) -> PathBuf {
@@ -4198,6 +4616,220 @@ mod tests {
         assert!(!uv_version_output_matches("uv 0.11.28\n"));
         assert!(!uv_version_output_matches("uv 0.11.290\n"));
         assert!(!uv_version_output_matches("other 0.11.29\n"));
+    }
+
+    #[test]
+    fn managed_uv_bootstrap_assets_are_versioned_and_hash_pinned() {
+        for (target_os, target_arch, archive_sha256, executable_sha256) in [
+            (
+                "macos",
+                "aarch64",
+                "61c04acc52a33ef0f331e494bdfbedcdb6c26c6970c022ed3699e5860f8930e3",
+                "3ac242bb6bca0841cad65b877e21a3e9f65c97141712b5c8438cc8a8c89ead54",
+            ),
+            (
+                "macos",
+                "x86_64",
+                "c4c4de482da9ccdd076dc4fb5cfe7b740609029385c72f58606be3153602387d",
+                "3fcfeb23eb951da9c2db2ebdde52b7f83cafe3bf90f1d6225519b6d0db43c04b",
+            ),
+            (
+                "linux",
+                "aarch64",
+                "94500fb064ae3c971a873cba64d94694c50677e0a4dbf78735c80509e7429919",
+                "40de8760ec3d368ae7a19d06392a071b761dddbe1b926d23f736ce65befe131c",
+            ),
+            (
+                "linux",
+                "x86_64",
+                "04f8b82f5d47f0512dcd32c67a4a6f16a0ea27c81537c338fd0ad6b23cebe829",
+                "4f26786f798cce6e9f467fe917d4305b9600ef8bf14994aa016fbb32523e5ca5",
+            ),
+            (
+                "windows",
+                "aarch64",
+                "55b597ae81bc29531a7c352a1431a8a73cc2755d7a5b9ec454580cbe02e5154f",
+                "bbafdd69166bdc7038b7362c0aacd44fc5a25a5e505bb7a86bdde388590197b2",
+            ),
+            (
+                "windows",
+                "x86_64",
+                "a047d55651bc3e0ca24595b25ec4cfcb10f9dca9fb56514e661269b37d4fae68",
+                "6d40479cd1d0d5db7fc0fe68ad703fc8acbd84bba50d864bb97461f6af9d9561",
+            ),
+        ] {
+            let asset = managed_uv_asset(target_os, target_arch).unwrap();
+            assert!(asset
+                .url
+                .starts_with("https://github.com/astral-sh/uv/releases/download/0.11.29/"));
+            assert_eq!(asset.archive_sha256, archive_sha256);
+            assert_eq!(asset.executable_sha256, executable_sha256);
+            assert_eq!(asset.archive_sha256.len(), 64);
+            assert_eq!(asset.executable_sha256.len(), 64);
+        }
+        assert!(managed_uv_asset("linux", "mips64").is_err());
+    }
+
+    #[test]
+    fn managed_uv_bootstrap_extraction_never_invokes_python() {
+        let source = include_str!("python_runtime.rs");
+        let start = source.find("fn ensure_managed_uv(").unwrap();
+        let end = source[start..]
+            .find("fn validate_uv(")
+            .map(|offset| start + offset)
+            .unwrap();
+        let bootstrap = &source[start..end];
+        assert!(!bootstrap.contains("Command::new"));
+        assert!(!bootstrap.contains("resolve_base_python"));
+        assert!(!bootstrap.contains("python3"));
+        assert!(!bootstrap.contains("python.exe"));
+        assert!(!bootstrap.contains("ensurepip"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_uv_standalone_archive_bootstraps_without_python_ensurepip() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "mayhem-managed-uv-bootstrap-test-{}-{nonce}",
+            std::process::id()
+        ));
+        let archive_path = root.join("uv-fixture.tar.gz");
+        let installation = root.join("installation");
+        fs::create_dir_all(&root).unwrap();
+        let executable = b"#!/bin/sh\nprintf 'uv 0.11.29\\n'\n";
+        let archive_file = File::create(&archive_path).unwrap();
+        let encoder = GzEncoder::new(archive_file, Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(executable.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, "uv-fixture/uv", executable.as_slice())
+            .unwrap();
+        archive.into_inner().unwrap().finish().unwrap();
+
+        let asset = ManagedUvAsset {
+            archive_kind: ManagedUvArchiveKind::TarGz,
+            archive_name: Cow::Borrowed("uv-fixture.tar.gz"),
+            archive_sha256: Cow::Owned(file_sha256(&archive_path).unwrap()),
+            executable_member: Cow::Borrowed("uv-fixture/uv"),
+            executable_sha256: Cow::Owned(format!("{:x}", Sha256::digest(executable))),
+            url: Cow::Borrowed("https://example.invalid/unused"),
+        };
+        extract_managed_uv_executable(&asset, &archive_path, &installation).unwrap();
+        validate_managed_uv_install(&managed_uv_executable(&installation), &asset).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn write_managed_uv_zip_fixture(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = File::create(path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o755);
+        for (name, contents) in entries {
+            archive.start_file(*name, options).unwrap();
+            archive.write_all(contents).unwrap();
+        }
+        archive.finish().unwrap();
+    }
+
+    #[test]
+    fn managed_uv_windows_zip_fixture_extracts_cross_platform() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "mayhem-managed-uv-zip-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let archive = root.join("uv-windows.zip");
+        let executable = root.join("extracted-uv.exe");
+        let expected = b"standalone uv fixture";
+        write_managed_uv_zip_fixture(
+            &archive,
+            &[
+                ("uvw.exe", b"ignored"),
+                ("uv.exe", expected),
+                ("uvx.exe", b"ignored"),
+            ],
+        );
+
+        extract_managed_uv_zip(&archive, &executable, "uv.exe", 1024).unwrap();
+        assert_eq!(fs::read(&executable).unwrap(), expected);
+        assert!(extract_managed_uv_zip(&archive, &executable, "uv.exe", 1024).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn managed_uv_zip_rejects_unsafe_ambiguous_and_oversized_entries() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "mayhem-managed-uv-zip-negative-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        let duplicate = root.join("duplicate.zip");
+        write_managed_uv_zip_fixture(&duplicate, &[("uva.exe", b"first"), ("uvb.exe", b"second")]);
+        let mut duplicate_bytes = fs::read(&duplicate).unwrap();
+        let mut replacements = 0;
+        for name in [b"uva.exe".as_slice(), b"uvb.exe".as_slice()] {
+            for offset in 0..=duplicate_bytes.len() - name.len() {
+                if &duplicate_bytes[offset..offset + name.len()] == name {
+                    duplicate_bytes[offset..offset + name.len()].copy_from_slice(b"uvx.exe");
+                    replacements += 1;
+                }
+            }
+        }
+        assert_eq!(replacements, 4);
+        fs::write(&duplicate, duplicate_bytes).unwrap();
+        assert!(
+            extract_managed_uv_zip(&duplicate, &root.join("duplicate.exe"), "uvx.exe", 1024)
+                .is_err()
+        );
+
+        let traversal = root.join("traversal.zip");
+        write_managed_uv_zip_fixture(&traversal, &[("../uv.exe", b"unsafe")]);
+        assert!(
+            extract_managed_uv_zip(&traversal, &root.join("traversal.exe"), "../uv.exe", 1024)
+                .is_err()
+        );
+
+        let symlink = root.join("symlink.zip");
+        let file = File::create(&symlink).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        archive
+            .add_symlink(
+                "uv.exe",
+                "elsewhere.exe",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        archive.finish().unwrap();
+        assert!(
+            extract_managed_uv_zip(&symlink, &root.join("symlink.exe"), "uv.exe", 1024).is_err()
+        );
+
+        let oversized = root.join("oversized.zip");
+        write_managed_uv_zip_fixture(&oversized, &[("uv.exe", b"more-than-eight-bytes")]);
+        assert!(
+            extract_managed_uv_zip(&oversized, &root.join("oversized.exe"), "uv.exe", 8).is_err()
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

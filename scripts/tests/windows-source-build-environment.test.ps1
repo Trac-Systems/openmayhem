@@ -27,10 +27,35 @@ function Assert-True {
     }
 }
 
+function Assert-Throws {
+    param(
+        [scriptblock]$Action,
+        [string]$ExpectedMessage,
+        [string]$Message
+    )
+
+    try {
+        & $Action
+    } catch {
+        if ($_.Exception.Message.Contains($ExpectedMessage)) {
+            return
+        }
+        throw "$Message (unexpected error '$($_.Exception.Message)')"
+    }
+    throw "$Message (operation unexpectedly succeeded)"
+}
+
 $wantedFunctions = @(
     "Fail",
     "Test-Command",
     "Write-Log",
+    "Get-LlamaCppFeatureName",
+    "Test-CudaToolkitUsable",
+    "Test-VulkanToolkitUsable",
+    "Assert-LlamaCppFeaturePrereqs",
+    "Resolve-LlamaCppSourceBuild",
+    "Get-LlamaCppFeatures",
+    "Get-LlamaCppFeatureArgs",
     "Get-WindowsSourceBuildCargoArgs",
     "Get-WindowsSourceBuildArchitecture",
     "Get-VsWherePath",
@@ -42,6 +67,7 @@ $wantedFunctions = @(
     "Initialize-WindowsSourceBuildEnvironment",
     "Get-WindowsLocalAppDataPath",
     "New-WindowsSourceBuildTargetDir",
+    "Confirm-SourceLlamaCppBackend",
     "Install-FromSource"
 )
 $tokens = $null
@@ -79,6 +105,12 @@ Assert-True `
 Assert-True `
     $sourceBuild.Contains("Get-WindowsSourceBuildCargoArgs") `
     "source install does not apply Windows native-build scheduling safeguards"
+Assert-True `
+    $sourceBuild.Contains("Resolve-LlamaCppSourceBuild") `
+    "source install does not resolve one deterministic local llama.cpp backend"
+Assert-True `
+    $sourceBuild.Contains('$script:SourceLlamaCppBackend = $selection.Backend') `
+    "source install does not retain its selected backend for verification"
 Assert-True `
     $sourceBuild.Contains('Join-Path $targetDir "release"') `
     "source install does not copy binaries from its private target directory"
@@ -157,15 +189,135 @@ Assert-Equal `
     "CUDA-only source builds must retain Cargo's normal parallelism"
 $vulkanCargoArgs = @(
     Get-WindowsSourceBuildCargoArgs `
-        -LlamaCppFeatures @(
-            "mayhem-cli/llama-cpp-cuda",
-            "mayhem-cli/llama-cpp-vulkan"
-        )
+        -LlamaCppFeatures @("mayhem-cli/llama-cpp-vulkan")
 )
 Assert-Equal `
     ($vulkanCargoArgs -join " ") `
     "--jobs 1" `
     "Windows Vulkan source builds must serialize the nested MSBuild project"
+
+$cudaProbe = $definitions["Test-CudaToolkitUsable"]
+Assert-True `
+    $cudaProbe.Contains("--version") `
+    "Windows CUDA selection trusts an nvcc path without executing it"
+$vulkanProbe = $definitions["Test-VulkanToolkitUsable"]
+Assert-True `
+    ($vulkanProbe.Contains("vulkan.h") -and $vulkanProbe.Contains("vulkan-1.lib")) `
+    "Windows Vulkan selection does not require headers and the loader import library"
+$backendProof = $definitions["Confirm-SourceLlamaCppBackend"]
+Assert-True `
+    ($backendProof.Contains('"linux-nvidia"') -and
+        $backendProof.Contains('"cpu-only"') -and
+        $backendProof.Contains('"--gpu-layers"')) `
+    "Windows source install does not prove the selected backend with mayhem doctor"
+Assert-True `
+    $backendProof.Contains("There is no Vulkan fixture") `
+    "Windows Vulkan verification can falsely depend on hwprobe GPU classification"
+$vulkanBranchStart = $backendProof.IndexOf('"vulkan" {')
+$cpuBranchStart = $backendProof.IndexOf('"cpu" {', $vulkanBranchStart)
+Assert-True `
+    ($vulkanBranchStart -ge 0 -and $cpuBranchStart -gt $vulkanBranchStart) `
+    "Windows Vulkan doctor branch is missing"
+$vulkanProof = $backendProof.Substring(
+    $vulkanBranchStart,
+    $cpuBranchStart - $vulkanBranchStart)
+Assert-True `
+    ($vulkanProof.Contains('"--fixture", "cpu-only", "--gpu-layers", "0"') -and
+        -not $vulkanProof.Contains('"linux-nvidia"')) `
+    "Windows Vulkan doctor proof can falsely depend on live GPU classification"
+Assert-True `
+    $backendProof.Contains("Vulkan feature build and deterministic CPU fallback") `
+    "Windows Vulkan source verification overclaims live Vulkan execution"
+
+$script:TestCudaAvailable = $false
+$script:TestVulkanAvailable = $false
+function Test-CudaToolkitUsable {
+    return $script:TestCudaAvailable
+}
+function Test-VulkanToolkitUsable {
+    return $script:TestVulkanAvailable
+}
+function Write-Log {
+    param([string]$Message)
+}
+
+$LlamaCppFeatures = ""
+$script:TestCudaAvailable = $true
+$script:TestVulkanAvailable = $true
+$selection = Resolve-LlamaCppSourceBuild `
+    -TargetTriple "x86_64-pc-windows-msvc"
+Assert-Equal $selection.Backend "cuda" "Windows x64 auto-selection must prefer CUDA"
+Assert-Equal `
+    ($selection.Features -join ",") `
+    "mayhem-cli/llama-cpp-cuda" `
+    "Windows x64 auto-selection must choose CUDA only"
+
+$LlamaCppFeatures = "cuda"
+$selection = Resolve-LlamaCppSourceBuild `
+    -TargetTriple "x86_64-pc-windows-msvc"
+Assert-Equal $selection.Backend "cuda" "explicit Windows x64 CUDA selection failed"
+Assert-Equal `
+    ($selection.Features -join ",") `
+    "mayhem-cli/llama-cpp-cuda" `
+    "explicit Windows x64 CUDA selection enabled the wrong feature set"
+
+$LlamaCppFeatures = "cpu"
+$selection = Resolve-LlamaCppSourceBuild `
+    -TargetTriple "x86_64-pc-windows-msvc"
+Assert-Equal $selection.Backend "cpu" "explicit Windows x64 CPU selection failed"
+Assert-Equal $selection.Features.Count 0 "explicit Windows CPU build enabled an accelerator"
+
+$LlamaCppFeatures = ""
+$script:TestCudaAvailable = $false
+$selection = Resolve-LlamaCppSourceBuild `
+    -TargetTriple "x86_64-pc-windows-msvc"
+Assert-Equal $selection.Backend "vulkan" "Windows x64 must use Vulkan when CUDA is unavailable"
+Assert-Equal `
+    ($selection.Features -join ",") `
+    "mayhem-cli/llama-cpp-vulkan" `
+    "Windows x64 Vulkan selection must not include another backend"
+
+$script:TestVulkanAvailable = $false
+$selection = Resolve-LlamaCppSourceBuild `
+    -TargetTriple "x86_64-pc-windows-msvc"
+Assert-Equal $selection.Backend "cpu" "Windows x64 must use CPU when no accelerator toolchain works"
+Assert-Equal $selection.Features.Count 0 "Windows CPU selection must not enable accelerator features"
+
+$script:TestCudaAvailable = $true
+$script:TestVulkanAvailable = $true
+$selection = Resolve-LlamaCppSourceBuild `
+    -TargetTriple "aarch64-pc-windows-msvc"
+Assert-Equal $selection.Backend "cpu" "Windows ARM64 auto-selection must remain CPU-only"
+Assert-Equal $selection.Features.Count 0 "Windows ARM64 must not inherit x64 accelerator features"
+
+$LlamaCppFeatures = "cuda,vulkan"
+Assert-Throws `
+    -Action {
+        Resolve-LlamaCppSourceBuild `
+            -TargetTriple "x86_64-pc-windows-msvc"
+    } `
+    -ExpectedMessage "conflicting llama.cpp backends" `
+    -Message "Windows source installer accepted conflicting accelerator backends"
+
+$LlamaCppFeatures = "cuda"
+$script:TestCudaAvailable = $false
+Assert-Throws `
+    -Action {
+        Resolve-LlamaCppSourceBuild `
+            -TargetTriple "x86_64-pc-windows-msvc"
+    } `
+    -ExpectedMessage "working nvcc was not found" `
+    -Message "Windows x64 source installer accepted unavailable CUDA"
+
+$script:TestCudaAvailable = $true
+Assert-Throws `
+    -Action {
+        Resolve-LlamaCppSourceBuild `
+            -TargetTriple "aarch64-pc-windows-msvc"
+    } `
+    -ExpectedMessage "Windows ARM64 source builds support" `
+    -Message "Windows ARM64 source installer accepted unsupported CUDA"
+$LlamaCppFeatures = ""
 
 $temp = Join-Path ([IO.Path]::GetTempPath()) (
     "mayhem-windows-build-env-test-" + [Guid]::NewGuid().ToString("N"))
