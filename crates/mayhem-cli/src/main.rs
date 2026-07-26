@@ -49688,7 +49688,9 @@ fn provider_backend_runtime_child_env(
         "mlx" => insert_path("MAYHEM_MLX_PYTHON", runtime.python.as_deref()),
         "ace-step" => insert_path("MAYHEM_ACE_STEP_PYTHON", runtime.python.as_deref()),
         "chatterbox" => {
-            insert_path("MAYHEM_CHATTERBOX_PYTHON", runtime.python.as_deref());
+            if runtime.python_source.as_deref() == Some("explicit MAYHEM_CHATTERBOX_PYTHON") {
+                insert_path("MAYHEM_CHATTERBOX_PYTHON", runtime.python.as_deref());
+            }
             if let Some(device) = runtime.chatterbox_device {
                 child_env.insert(
                     "MAYHEM_CHATTERBOX_DEVICE".to_owned(),
@@ -84483,15 +84485,34 @@ mod tests {
 
         let chatterbox_runtime = ProviderBackendRuntime {
             python: Some(PathBuf::from("/managed/chatterbox/bin/python")),
+            python_source: Some(
+                "managed existing frozen uv runtime (cuda124-linux-x86_64)".to_owned(),
+            ),
             chatterbox_device: Some(ChatterboxManagedDevice::Cuda),
             ..ProviderBackendRuntime::default()
         };
         let chatterbox_env = provider_backend_runtime_child_env("chatterbox", &chatterbox_runtime);
+        assert!(!chatterbox_env.contains_key("MAYHEM_CHATTERBOX_PYTHON"));
         assert_eq!(
             chatterbox_env
                 .get("MAYHEM_CHATTERBOX_DEVICE")
                 .map(String::as_str),
             Some("cuda")
+        );
+
+        let explicit_chatterbox_runtime = ProviderBackendRuntime {
+            python: Some(PathBuf::from("/custom/chatterbox/bin/python")),
+            python_source: Some("explicit MAYHEM_CHATTERBOX_PYTHON".to_owned()),
+            chatterbox_device: Some(ChatterboxManagedDevice::Cuda),
+            ..ProviderBackendRuntime::default()
+        };
+        let explicit_chatterbox_env =
+            provider_backend_runtime_child_env("chatterbox", &explicit_chatterbox_runtime);
+        assert_eq!(
+            explicit_chatterbox_env
+                .get("MAYHEM_CHATTERBOX_PYTHON")
+                .map(String::as_str),
+            Some("/custom/chatterbox/bin/python")
         );
     }
 
