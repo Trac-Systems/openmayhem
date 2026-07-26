@@ -1,5 +1,8 @@
 import Feature from 'trac-peer/src/artifacts/feature.js';
 import b4a from 'b4a';
+import Protomux from 'protomux';
+import PeerWallet from 'trac-wallet';
+import { boundedJsonEncoding } from '../bounded-json.js';
 
 const DEFAULT_DIRECT_WAIT_MS = 15_000;
 const DEFAULT_RELAY_WAIT_MS = 45_000;
@@ -12,6 +15,124 @@ const DEFAULT_RATE_BURST_BYTES = 64 * 1024 * 1024;
 const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
 const DEFAULT_SWEEP_INTERVAL_MS = 1_000;
 const DEFAULT_INBOUND_RELEASE_GRACE_MS = 1_000;
+const HEARTBEAT_RELAY_PROTOCOL = 'mx/hb-relay/1';
+const DEFAULT_MAX_HEARTBEAT_BYTES = 256 * 1024;
+const DEFAULT_MAX_HEARTBEAT_ROOMS_PER_CLIENT = 4096;
+const DEFAULT_MAX_HEARTBEAT_ENTRIES = 16_384;
+const DEFAULT_MAX_PENDING_HEARTBEATS_PER_CLIENT = 4096;
+const HEARTBEAT_RELAY_FRAME_OVERHEAD_BYTES = 1024;
+const HEARTBEAT_ROOM_PATTERN = /^mx\/room\/([0-9a-f]{32})$/;
+const HEX_32_PATTERN = /^[0-9a-fA-F]{64}$/;
+const HEX_64_PATTERN = /^[0-9a-fA-F]{128}$/;
+
+const heartbeatRoom = (value) => {
+  const channel = String(value || '').trim();
+  return HEARTBEAT_ROOM_PATTERN.test(channel) ? channel : null;
+};
+
+const canonicalHeartbeatJson = (value, omitSignature = false) => {
+  if (value === null) return 'null';
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('Heartbeat contains a non-finite number.');
+    return Number.isInteger(value) ? BigInt(value).toString() : JSON.stringify(value);
+  }
+  if (typeof value === 'string') return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((child) => canonicalHeartbeatJson(child)).join(',')}]`;
+  }
+  if (!value || typeof value !== 'object') {
+    throw new Error('Heartbeat contains a non-JSON value.');
+  }
+  const keys = Object.keys(value)
+    .filter((key) => !(omitSignature && key === 'sig'))
+    .sort();
+  return `{${keys.map((key) => (
+    `${JSON.stringify(key)}:${canonicalHeartbeatJson(value[key])}`
+  )).join(',')}}`;
+};
+
+const heartbeatSignatureValid = (value) => {
+  try {
+    const signature = b4a.from(value.sig, 'hex');
+    const provider = b4a.from(value.provider, 'hex');
+    const payload = b4a.from(canonicalHeartbeatJson(value, true), 'utf8');
+    return PeerWallet.verify(signature, payload, provider) === true;
+  } catch (_error) {
+    return false;
+  }
+};
+
+const heartbeatEnvelope = (channel, value, maxBytes = DEFAULT_MAX_HEARTBEAT_BYTES) => {
+  const room = heartbeatRoom(channel);
+  if (!room || !value || typeof value !== 'object' || Array.isArray(value)) return null;
+  let bytes = 0;
+  try {
+    bytes = b4a.byteLength(JSON.stringify(value), 'utf8');
+  } catch (_error) {
+    return null;
+  }
+  if (bytes <= 0 || bytes > maxBytes) return null;
+  if (
+    value.t !== 'hb'
+    || !Number.isSafeInteger(value.v)
+    || value.v < 1
+    || !Number.isSafeInteger(value.contract_version)
+    || value.contract_version < 1
+    || typeof value.provider !== 'string'
+    || !HEX_32_PATTERN.test(value.provider)
+    || typeof value.enclave_id !== 'string'
+    || !HEX_32_PATTERN.test(value.enclave_id)
+    || typeof value.room_id !== 'string'
+    || room !== `mx/room/${value.room_id.toLowerCase()}`
+    || typeof value.model_id !== 'string'
+    || value.model_id.length === 0
+    || typeof value.accepting_new !== 'boolean'
+    || !Number.isFinite(value.sat)
+    || !value.slots
+    || typeof value.slots !== 'object'
+    || Array.isArray(value.slots)
+    || !value.q
+    || typeof value.q !== 'object'
+    || Array.isArray(value.q)
+    || !value.perf
+    || typeof value.perf !== 'object'
+    || Array.isArray(value.perf)
+    || !value.caps
+    || typeof value.caps !== 'object'
+    || Array.isArray(value.caps)
+    || !value.att
+    || typeof value.att !== 'object'
+    || Array.isArray(value.att)
+    || !Number.isSafeInteger(value.ts)
+    || value.ts < 0
+    || typeof value.nonce !== 'string'
+    || !HEX_32_PATTERN.test(value.nonce)
+    || typeof value.sig !== 'string'
+    || !HEX_64_PATTERN.test(value.sig)
+    || (
+      value.transport_peer !== undefined
+      && (
+        typeof value.transport_peer !== 'string'
+        || !HEX_32_PATTERN.test(value.transport_peer)
+      )
+    )
+  ) {
+    return null;
+  }
+  if (!heartbeatSignatureValid(value)) return null;
+  return {
+    bytes,
+    channel: room,
+    key: [
+      value.provider.toLowerCase(),
+      value.enclave_id.toLowerCase(),
+      value.room_id.toLowerCase(),
+    ].join(':'),
+    ts: value.ts,
+    heartbeat: value,
+  };
+};
 
 const normalizeKey = (value) => {
   const key = b4a.isBuffer(value)
@@ -99,6 +220,22 @@ class InferenceRelay extends Feature {
       config.inboundReleaseGraceMs,
       DEFAULT_INBOUND_RELEASE_GRACE_MS
     );
+    this.maxHeartbeatBytes = positiveInteger(
+      config.maxHeartbeatBytes,
+      DEFAULT_MAX_HEARTBEAT_BYTES
+    );
+    this.maxHeartbeatRoomsPerClient = positiveInteger(
+      config.maxHeartbeatRoomsPerClient,
+      DEFAULT_MAX_HEARTBEAT_ROOMS_PER_CLIENT
+    );
+    this.maxHeartbeatEntries = positiveInteger(
+      config.maxHeartbeatEntries,
+      DEFAULT_MAX_HEARTBEAT_ENTRIES
+    );
+    this.maxPendingHeartbeatsPerClient = positiveInteger(
+      config.maxPendingHeartbeatsPerClient,
+      DEFAULT_MAX_PENDING_HEARTBEATS_PER_CLIENT
+    );
 
     this.server = null;
     this.sessions = new Map();
@@ -120,6 +257,12 @@ class InferenceRelay extends Feature {
     this.wrappedServerEmit = null;
     this.relayCursor = 0;
     this.sweepTimer = null;
+    this.heartbeatSink = null;
+    this.heartbeatConnectionStates = new Set();
+    this.heartbeatStateByConnection = new WeakMap();
+    this.heartbeatRoomRefs = new Map();
+    this.heartbeatCache = new Map();
+    this.heartbeatJoinedRelays = new Set();
     this.onConnection = (connection, peerInfo) => this._handleConnection(connection, peerInfo);
     this.counters = {
       relay_selections: 0,
@@ -134,6 +277,11 @@ class InferenceRelay extends Feature {
       clients_idle_closed: 0,
       stream_errors: 0,
       bytes_observed: 0,
+      heartbeat_frames_rejected: 0,
+      heartbeat_clients_rejected: 0,
+      heartbeat_coalesced: 0,
+      heartbeat_delivered: 0,
+      heartbeat_pending_evicted: 0,
     };
     this.lastSweepAt = null;
   }
@@ -208,6 +356,17 @@ class InferenceRelay extends Feature {
     this.relayConnects.clear();
     this.relayOwners.clear();
     this.forcedPeers.clear();
+    for (const state of this.heartbeatConnectionStates) {
+      try {
+        state.channel?.close?.();
+      } catch (_error) {}
+      state.pending.clear();
+      state.subscriptions.clear();
+    }
+    this.heartbeatConnectionStates.clear();
+    this.heartbeatRoomRefs.clear();
+    this.heartbeatCache.clear();
+    this.heartbeatJoinedRelays.clear();
     for (const state of this.streams.values()) {
       state.stream.on('error', () => {});
       state.stream.destroy(new Error('Inference relay stopped.'));
@@ -225,6 +384,59 @@ class InferenceRelay extends Feature {
 
   hasFallback() {
     return this.relays.length > 0;
+  }
+
+  setHeartbeatSink(handler) {
+    this.heartbeatSink = typeof handler === 'function' ? handler : null;
+  }
+
+  subscribeHeartbeatRoom(channel) {
+    const room = heartbeatRoom(channel);
+    if (!room || !this.hasFallback()) return false;
+    const current = this.heartbeatRoomRefs.get(room) || 0;
+    if (current === 0 && this.heartbeatRoomRefs.size >= this.maxHeartbeatRoomsPerClient) {
+      return false;
+    }
+    this.heartbeatRoomRefs.set(room, current + 1);
+    if (current === 0) {
+      this._ensureHeartbeatRelayConnections();
+      this._sendHeartbeatControlToRelays({ t: 'hb.subscribe', v: 1, room });
+    }
+    return true;
+  }
+
+  unsubscribeHeartbeatRoom(channel) {
+    const room = heartbeatRoom(channel);
+    if (!room) return false;
+    const current = this.heartbeatRoomRefs.get(room) || 0;
+    if (current <= 0) return false;
+    if (current === 1) {
+      this.heartbeatRoomRefs.delete(room);
+      this._sendHeartbeatControlToRelays({ t: 'hb.unsubscribe', v: 1, room });
+    } else {
+      this.heartbeatRoomRefs.set(room, current - 1);
+    }
+    return true;
+  }
+
+  observeSidechannelHeartbeat(channel, payload) {
+    const heartbeat = payload?.message ?? payload;
+    const envelope = heartbeatEnvelope(channel, heartbeat, this.maxHeartbeatBytes);
+    if (!envelope) return { heartbeat: false, emit: true };
+    const locallyPublished = payload?.origin === 'local';
+    const newest = this._rememberHeartbeat(envelope, locallyPublished);
+    if (locallyPublished) {
+      this._ensureHeartbeatRelayConnections();
+      this._sendHeartbeatControlToRelays({
+        t: 'hb.publish',
+        v: 1,
+        room: envelope.channel,
+        heartbeat: envelope.heartbeat,
+      });
+    }
+    if (!newest) return { heartbeat: true, emit: false };
+    if (this.serve) this._fanoutHeartbeat(envelope);
+    return { heartbeat: true, emit: true };
   }
 
   async connectPeer(directSession, remote, waitMs) {
@@ -338,10 +550,17 @@ class InferenceRelay extends Feature {
         bytes_per_second: this.rateBytesPerSecond,
         burst_bytes: this.rateBurstBytes,
         idle_timeout_ms: this.idleTimeoutMs,
+        heartbeat_bytes: this.maxHeartbeatBytes,
+        heartbeat_rooms_per_client: this.maxHeartbeatRoomsPerClient,
+        heartbeat_entries: this.maxHeartbeatEntries,
+        pending_heartbeats_per_client: this.maxPendingHeartbeatsPerClient,
       },
       clients: this.sessions.size,
       links: this.streams.size,
       last_sweep_at: this.lastSweepAt,
+      heartbeat_rooms: Array.from(this.heartbeatRoomRefs.keys()).sort(),
+      heartbeat_entries: this.heartbeatCache.size,
+      heartbeat_clients: this.heartbeatConnectionStates.size,
       relay: relayStats ? {
         sessions: { ...relayStats.sessions },
         pairings: { ...relayStats.pairings },
@@ -351,8 +570,346 @@ class InferenceRelay extends Feature {
     };
   }
 
+  _ensureHeartbeatRelayConnections() {
+    const swarm = this.peer?.swarm;
+    if (!swarm || typeof swarm.joinPeer !== 'function') return;
+    for (const relay of this.relays) {
+      let connected = false;
+      for (const connection of swarm.connections || []) {
+        if (normalizeKey(connection?.remotePublicKey) !== relay) continue;
+        connected = true;
+        const state = this._prepareHeartbeatConnection(connection);
+        if (state) this._openHeartbeatChannel(state);
+      }
+      if (connected || this.heartbeatJoinedRelays.has(relay)) continue;
+      try {
+        swarm.joinPeer(b4a.from(relay, 'hex'));
+        this.heartbeatJoinedRelays.add(relay);
+      } catch (error) {
+        if (this.debug) {
+          console.error(
+            `[inference-relay] heartbeat relay join ${relay} failed:`,
+            error?.message ?? error
+          );
+        }
+      }
+    }
+  }
+
+  _prepareHeartbeatConnection(connection) {
+    if (!connection) return null;
+    const existing = this.heartbeatStateByConnection.get(connection);
+    if (existing) return existing;
+    const remote = normalizeKey(connection.remotePublicKey);
+    if (!remote) return null;
+    if (!this.serve && !this.relays.includes(remote)) return null;
+    if (
+      this.serve
+      && !this.relays.includes(remote)
+      && this.heartbeatConnectionStates.size >= this.maxClients
+    ) {
+      this.counters.heartbeat_clients_rejected += 1;
+      return null;
+    }
+    let mux = null;
+    try {
+      mux = Protomux.from(connection);
+      connection.userData = mux;
+    } catch (_error) {
+      return null;
+    }
+    const state = {
+      connection,
+      remote,
+      mux,
+      channel: null,
+      message: null,
+      opened: false,
+      blocked: false,
+      subscriptions: new Set(),
+      pendingControls: new Map(),
+      pending: new Map(),
+    };
+    this.heartbeatStateByConnection.set(connection, state);
+    this.heartbeatConnectionStates.add(state);
+    mux.pair?.({ protocol: HEARTBEAT_RELAY_PROTOCOL }, () => {
+      this._openHeartbeatChannel(state);
+    });
+    connection.once?.('close', () => {
+      state.opened = false;
+      state.pending.clear();
+      state.pendingControls.clear();
+      state.subscriptions.clear();
+      this.heartbeatConnectionStates.delete(state);
+      if (this.relays.includes(state.remote)) {
+        this.heartbeatJoinedRelays.delete(state.remote);
+        const needsRelay = this.heartbeatRoomRefs.size > 0
+          || Array.from(this.heartbeatCache.values()).some((record) => record.publishable);
+        if (this.started && needsRelay) {
+          setTimeout(() => {
+            if (this.started) this._ensureHeartbeatRelayConnections();
+          }, 0);
+        }
+      }
+    });
+    if (this.relays.includes(remote)) this._openHeartbeatChannel(state);
+    return state;
+  }
+
+  _openHeartbeatChannel(state) {
+    if (
+      !state
+      || state.channel
+      || state.connection?.destroyed === true
+      || state.connection?.closed === true
+    ) {
+      return;
+    }
+    let channel = null;
+    try {
+      channel = state.mux.createChannel({
+        protocol: HEARTBEAT_RELAY_PROTOCOL,
+        onopen: () => {
+          state.opened = true;
+          state.blocked = false;
+          if (this.relays.includes(state.remote)) {
+            for (const room of this.heartbeatRoomRefs.keys()) {
+              this._queueHeartbeatControl(state, { t: 'hb.subscribe', v: 1, room });
+            }
+            for (const record of this.heartbeatCache.values()) {
+              if (!record.publishable) continue;
+              this._queueHeartbeatFrame(state, {
+                t: 'hb.publish',
+                v: 1,
+                room: record.envelope.channel,
+                heartbeat: record.envelope.heartbeat,
+              }, record.envelope);
+            }
+          }
+          this._flushHeartbeatState(state);
+        },
+        onclose: () => {
+          state.opened = false;
+          state.blocked = false;
+          state.channel = null;
+          state.message = null;
+        },
+        ondrain: () => {
+          state.blocked = false;
+          this._flushHeartbeatState(state);
+        },
+      });
+      if (!channel) return;
+      state.channel = channel;
+      state.message = channel.addMessage({
+        encoding: boundedJsonEncoding(
+          this.maxHeartbeatBytes + HEARTBEAT_RELAY_FRAME_OVERHEAD_BYTES,
+          'Room heartbeat relay frame',
+          { maxStringBytes: this.maxHeartbeatBytes }
+        ),
+        onmessage: (frame) => this._handleHeartbeatRelayFrame(state, frame),
+      });
+      channel.open();
+    } catch (error) {
+      state.channel = null;
+      state.message = null;
+      if (this.debug) {
+        console.error(
+          `[inference-relay] heartbeat channel ${state.remote} failed:`,
+          error?.message ?? error
+        );
+      }
+    }
+  }
+
+  _sendHeartbeatControlToRelays(frame) {
+    for (const state of this.heartbeatConnectionStates) {
+      if (!this.relays.includes(state.remote)) continue;
+      if (frame?.t === 'hb.publish') {
+        const envelope = heartbeatEnvelope(
+          frame.room,
+          frame.heartbeat,
+          this.maxHeartbeatBytes
+        );
+        if (envelope) this._queueHeartbeatFrame(state, frame, envelope);
+      } else {
+        this._queueHeartbeatControl(state, frame);
+      }
+    }
+  }
+
+  _queueHeartbeatControl(state, frame) {
+    const room = heartbeatRoom(frame?.room);
+    if (!state || !room) return false;
+    state.pendingControls.set(room, { ...frame, room });
+    this._flushHeartbeatState(state);
+    return true;
+  }
+
+  _sendHeartbeatControlToState(state, frame) {
+    if (!state?.opened || !state.message || state.blocked) return false;
+    try {
+      const writable = state.message.send(frame);
+      if (writable === false) state.blocked = true;
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  _queueHeartbeatFrame(state, frame, envelope) {
+    if (!state || !envelope) return false;
+    const existing = state.pending.get(envelope.key);
+    if (existing && existing.envelope.ts >= envelope.ts) {
+      this.counters.heartbeat_coalesced += 1;
+      return false;
+    }
+    if (existing) state.pending.delete(envelope.key);
+    while (
+      !state.pending.has(envelope.key)
+      && state.pending.size >= this.maxPendingHeartbeatsPerClient
+    ) {
+      const oldest = state.pending.keys().next().value;
+      if (oldest === undefined) break;
+      state.pending.delete(oldest);
+      this.counters.heartbeat_pending_evicted += 1;
+    }
+    state.pending.set(envelope.key, { frame, envelope });
+    this._flushHeartbeatState(state);
+    return true;
+  }
+
+  _flushHeartbeatState(state) {
+    if (!state?.opened || !state.message || state.blocked) return;
+    while (state.pendingControls.size > 0 && !state.blocked) {
+      const [room, frame] = state.pendingControls.entries().next().value;
+      if (!this._sendHeartbeatControlToState(state, frame)) return;
+      state.pendingControls.delete(room);
+    }
+    while (state.pending.size > 0 && !state.blocked) {
+      const [key, record] = state.pending.entries().next().value;
+      if (!this._sendHeartbeatControlToState(state, record.frame)) return;
+      state.pending.delete(key);
+      this.counters.heartbeat_delivered += 1;
+    }
+  }
+
+  _handleHeartbeatRelayFrame(state, frame) {
+    if (!frame || typeof frame !== 'object' || Array.isArray(frame) || frame.v !== 1) {
+      this.counters.heartbeat_frames_rejected += 1;
+      return false;
+    }
+    const room = heartbeatRoom(frame.room);
+    if (!room) {
+      this.counters.heartbeat_frames_rejected += 1;
+      return false;
+    }
+    if (frame.t === 'hb.subscribe') {
+      if (!this.serve) {
+        this.counters.heartbeat_frames_rejected += 1;
+        return false;
+      }
+      if (
+        !state.subscriptions.has(room)
+        && state.subscriptions.size >= this.maxHeartbeatRoomsPerClient
+      ) {
+        this.counters.heartbeat_frames_rejected += 1;
+        return false;
+      }
+      state.subscriptions.add(room);
+      for (const record of this.heartbeatCache.values()) {
+        if (record.envelope.channel !== room) continue;
+        this._queueHeartbeatFrame(state, {
+          t: 'hb.event',
+          v: 1,
+          room,
+          heartbeat: record.envelope.heartbeat,
+        }, record.envelope);
+      }
+      return true;
+    }
+    if (frame.t === 'hb.unsubscribe') {
+      if (!this.serve) {
+        this.counters.heartbeat_frames_rejected += 1;
+        return false;
+      }
+      state.subscriptions.delete(room);
+      for (const [key, record] of state.pending) {
+        if (record.envelope.channel === room) state.pending.delete(key);
+      }
+      return true;
+    }
+
+    const envelope = heartbeatEnvelope(room, frame.heartbeat, this.maxHeartbeatBytes);
+    if (!envelope) {
+      this.counters.heartbeat_frames_rejected += 1;
+      return false;
+    }
+    if (frame.t === 'hb.publish') {
+      if (
+        !this.serve
+        || envelope.heartbeat.transport_peer?.toLowerCase() !== state.remote
+        || !this._rememberHeartbeat(envelope, false)
+      ) {
+        this.counters.heartbeat_frames_rejected += 1;
+        return false;
+      }
+      this._fanoutHeartbeat(envelope);
+      return true;
+    }
+    if (frame.t === 'hb.event') {
+      if (
+        !this.relays.includes(state.remote)
+        || !this.heartbeatRoomRefs.has(room)
+        || !this._rememberHeartbeat(envelope, false)
+      ) {
+        return false;
+      }
+      this.heartbeatSink?.(room, envelope.heartbeat, {
+        relay: state.remote,
+        authoritative: false,
+      });
+      return true;
+    }
+    this.counters.heartbeat_frames_rejected += 1;
+    return false;
+  }
+
+  _rememberHeartbeat(envelope, publishable = false) {
+    const current = this.heartbeatCache.get(envelope.key);
+    if (current && current.envelope.ts >= envelope.ts) {
+      if (publishable) current.publishable = true;
+      this.counters.heartbeat_coalesced += 1;
+      return false;
+    }
+    if (current) this.heartbeatCache.delete(envelope.key);
+    while (
+      !this.heartbeatCache.has(envelope.key)
+      && this.heartbeatCache.size >= this.maxHeartbeatEntries
+    ) {
+      const oldest = this.heartbeatCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.heartbeatCache.delete(oldest);
+    }
+    this.heartbeatCache.set(envelope.key, { envelope, publishable });
+    return true;
+  }
+
+  _fanoutHeartbeat(envelope) {
+    for (const state of this.heartbeatConnectionStates) {
+      if (!state.subscriptions.has(envelope.channel)) continue;
+      this._queueHeartbeatFrame(state, {
+        t: 'hb.event',
+        v: 1,
+        room: envelope.channel,
+        heartbeat: envelope.heartbeat,
+      }, envelope);
+    }
+  }
+
   _handleConnection(connection, peerInfo) {
     if (!connection) return;
+    this._prepareHeartbeatConnection(connection);
     const remote = normalizeKey(connection.remotePublicKey);
     const route = this.connectionRoutes.get(connection);
     if (!route) {
@@ -861,6 +1418,10 @@ class InferenceRelay extends Feature {
 
 export {
   BoundedPairingMap,
+  HEARTBEAT_RELAY_PROTOCOL,
+  canonicalHeartbeatJson,
+  heartbeatEnvelope,
+  heartbeatRoom,
   normalizeRelayKeys,
 };
 export default InferenceRelay;

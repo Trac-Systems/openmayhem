@@ -493,6 +493,24 @@ class NeedleWorkerTest(unittest.TestCase):
         self.assertEqual(model.decoder_steps, 3)
         self.assertEqual(result["output_text"].count('"name":"get-weather"'), 2)
 
+    def test_request_and_model_output_failures_have_distinct_classes(self):
+        self.worker._runtime = {
+            "device": "cpu",
+            "model": FakeModel(),
+            "tokenizer": FakeTokenizer(),
+            "torch": FakeTorch(),
+        }
+        with self.assertRaises(self.worker.RequestProtocolError):
+            self.worker._handle_generate(generate_payload(tools=[]))
+
+        with mock.patch.object(
+            self.worker,
+            "parse_and_validate_calls",
+            side_effect=self.worker.ProtocolError("bad model output"),
+        ):
+            with self.assertRaises(self.worker.OutputProtocolError):
+                self.worker._handle_generate(generate_payload())
+
     def test_protocol_is_exact_and_output_is_canonical(self):
         with self.assertRaisesRegex(self.worker.ProtocolError, "fields must be exactly"):
             self.worker._handle_message(

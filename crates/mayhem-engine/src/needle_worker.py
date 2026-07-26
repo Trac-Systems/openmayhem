@@ -81,6 +81,14 @@ class ProtocolError(Exception):
     pass
 
 
+class RequestProtocolError(ProtocolError):
+    pass
+
+
+class OutputProtocolError(ProtocolError):
+    pass
+
+
 class _SchemaWorkLimit(ProtocolError):
     pass
 
@@ -1177,13 +1185,16 @@ def _validate_generate_payload(payload):
 def _handle_generate(payload):
     if _runtime is None:
         raise ProtocolError("Needle model is not loaded")
-    max_new_tokens, seed, parallel_tool_calls = _validate_generate_payload(payload)
-    normalized_tools, tool_map = normalize_openai_tools(payload["tools"])
-    encoder_tokens, _ = build_encoder_tokens(
-        _runtime["tokenizer"],
-        payload["prompt"],
-        normalized_tools,
-    )
+    try:
+        max_new_tokens, seed, parallel_tool_calls = _validate_generate_payload(payload)
+        normalized_tools, tool_map = normalize_openai_tools(payload["tools"])
+        encoder_tokens, _ = build_encoder_tokens(
+            _runtime["tokenizer"],
+            payload["prompt"],
+            normalized_tools,
+        )
+    except ProtocolError as error:
+        raise RequestProtocolError(str(error)) from error
 
     torch = _runtime["torch"]
     model = _runtime["model"]
@@ -1241,7 +1252,10 @@ def _handle_generate(payload):
                     generated,
                     skip_special_tokens=False,
                 )
-                first_call = first_complete_tool_call(partial_text, tool_map)
+                try:
+                    first_call = first_complete_tool_call(partial_text, tool_map)
+                except ProtocolError as error:
+                    raise OutputProtocolError(str(error)) from error
                 if first_call is not None:
                     stopped = True
                     break
@@ -1250,11 +1264,14 @@ def _handle_generate(payload):
 
     if first_call is None:
         raw_text = tokenizer.decode(generated, skip_special_tokens=False)
-        calls = parse_and_validate_calls(raw_text, tool_map)
+        try:
+            calls = parse_and_validate_calls(raw_text, tool_map)
+        except ProtocolError as error:
+            raise OutputProtocolError(str(error)) from error
     else:
         calls = [first_call]
     if not parallel_tool_calls and len(calls) != 1:
-        raise ProtocolError(
+        raise OutputProtocolError(
             "Needle non-parallel generation must produce exactly one tool call"
         )
     text = _canonical_json(calls)
@@ -1354,7 +1371,22 @@ def main():
             if operation == "shutdown":
                 return
         except Exception as error:
-            _emit({"error": str(error), "id": message_id, "ok": False})
+            _emit(
+                {
+                    "error": str(error),
+                    "error_kind": (
+                        "request"
+                        if isinstance(error, RequestProtocolError)
+                        else (
+                            "output"
+                            if isinstance(error, OutputProtocolError)
+                            else "worker"
+                        )
+                    ),
+                    "id": message_id,
+                    "ok": False,
+                }
+            )
 
 
 if __name__ == "__main__":

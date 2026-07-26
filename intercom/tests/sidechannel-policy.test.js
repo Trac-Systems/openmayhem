@@ -477,3 +477,59 @@ test('fast PoW mining stays byte-identical to the canonical pow base', () => {
   // the mined nonce came from the identical byte stream.
   assert.equal(sidechannel._checkPow(payload, MAYHEM_RELAY_CHANNEL), true);
 });
+
+test('relay PoW mining yields while preserving deterministic validation', async () => {
+  let resolveSent = null;
+  const sent = new Promise((resolve) => {
+    resolveSent = resolve;
+  });
+  const connection = { remotePublicKey: b4a.from('dd'.repeat(32), 'hex') };
+  const sidechannel = new Sidechannel(peer, {
+    channels: [MAYHEM_RELAY_CHANNEL],
+    powEnabled: true,
+    powDifficulty: 10,
+    powRequiredChannels: [MAYHEM_RELAY_CHANNEL],
+    powYieldEvery: 32,
+  });
+  sidechannel.connections.set(connection, new Map([[
+    MAYHEM_RELAY_CHANNEL,
+    {
+      channel: { opened: true },
+      message: { send: resolveSent },
+    },
+  ]]));
+
+  let sentAlready = false;
+  let timerProgressedBeforeSend = false;
+  const heartbeat = setTimeout(() => {
+    timerProgressedBeforeSend = !sentAlready;
+  }, 0);
+
+  assert.equal(
+    sidechannel.broadcast(MAYHEM_RELAY_CHANNEL, { control: 'heartbeat-proof' }),
+    true
+  );
+  let timeout = null;
+  const payload = await Promise.race([
+    sent,
+    new Promise((_, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error('cooperative PoW send timed out')),
+        2_000
+      );
+    }),
+  ]);
+  clearTimeout(timeout);
+  sentAlready = true;
+  clearTimeout(heartbeat);
+
+  assert.equal(timerProgressedBeforeSend, true);
+  assert.equal(payload.pow.difficulty, 10);
+  assert.equal(sidechannel._checkPow(payload, MAYHEM_RELAY_CHANNEL), true);
+
+  const canonical = { ...payload };
+  delete canonical.pow;
+  delete canonical.sig;
+  sidechannel._attachPow(canonical);
+  assert.equal(payload.pow.nonce, canonical.pow.nonce);
+});

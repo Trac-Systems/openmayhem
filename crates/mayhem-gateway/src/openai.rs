@@ -3311,6 +3311,13 @@ pub struct GatewaySessionError {
 pub enum GatewaySessionFailureClass {
     ProviderFault,
     BuyerLocal,
+    RequestScoped,
+}
+
+impl GatewaySessionFailureClass {
+    fn is_request_scoped(self) -> bool {
+        matches!(self, Self::BuyerLocal | Self::RequestScoped)
+    }
 }
 
 #[derive(Debug)]
@@ -12424,6 +12431,12 @@ impl GatewaySessionError {
         error
     }
 
+    fn request_scoped(message: impl Into<String>) -> Self {
+        let mut error = Self::new(message);
+        error.failure_class = GatewaySessionFailureClass::RequestScoped;
+        error
+    }
+
     pub fn into_retryable(mut self) -> Self {
         self.retryable = true;
         self
@@ -12440,6 +12453,35 @@ impl GatewaySessionError {
         self.partial = Some(Box::new(partial));
         self
     }
+}
+
+fn provider_reported_session_error(
+    frame: &Value,
+    session_context: &str,
+    retryable: bool,
+) -> GatewaySessionError {
+    let code = frame
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or("provider_error");
+    let message = frame
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("provider returned s.error");
+    let message = format!("provider returned {code} on {session_context}: {message}");
+    match code {
+        "request_invalid" => GatewaySessionError::buyer_local(message),
+        "model_output_invalid" => GatewaySessionError::request_scoped(message),
+        _ if retryable => GatewaySessionError::retryable(message),
+        _ => GatewaySessionError::new(message),
+    }
+}
+
+fn request_scoped_api_error(error: &GatewaySessionError) -> Option<ApiError> {
+    error
+        .failure_class
+        .is_request_scoped()
+        .then(|| ApiError::bad_request(error.message.clone(), Some("model")))
 }
 
 impl GatewayRequestOptions {
@@ -16036,17 +16078,16 @@ async fn collect_direct_session_output(
                 }
             }
             Some("s.error") => {
-                let code = frame
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider_error");
-                let message = frame
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider returned s.error");
-                let err = format!("provider returned {code} on session {session_id}: {message}");
+                let error = provider_reported_session_error(
+                    &frame,
+                    &format!("session {session_id}"),
+                    false,
+                );
+                if error.failure_class.is_request_scoped() {
+                    return Err(error);
+                }
                 return Err(retryable_interrupted_direct_session_error(
-                    GatewaySessionError::new(err),
+                    error,
                     &content,
                     &reasoning_evidence,
                     tool_calls.clone(),
@@ -16315,17 +16356,11 @@ async fn collect_direct_session_embedding_output(
                 )?);
             }
             Some("s.error") => {
-                let code = frame
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider_error");
-                let message = frame
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider returned s.error");
-                return Err(GatewaySessionError::retryable(format!(
-                    "provider returned {code} on embedding session {session_id}: {message}"
-                )));
+                return Err(provider_reported_session_error(
+                    &frame,
+                    &format!("embedding session {session_id}"),
+                    true,
+                ));
             }
             Some("s.close") => {
                 let reason = frame
@@ -16454,17 +16489,11 @@ async fn collect_direct_session_image_generation_output(
                 )?);
             }
             Some("s.error") => {
-                let code = frame
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider_error");
-                let message = frame
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider returned s.error");
-                return Err(GatewaySessionError::retryable(format!(
-                    "provider returned {code} on image session {session_id}: {message}"
-                )));
+                return Err(provider_reported_session_error(
+                    &frame,
+                    &format!("image session {session_id}"),
+                    true,
+                ));
             }
             Some("s.close") => {
                 let reason = frame
@@ -16595,17 +16624,11 @@ async fn collect_direct_session_audio_speech_output(
                 )?);
             }
             Some("s.error") => {
-                let code = frame
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider_error");
-                let message = frame
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider returned s.error");
-                return Err(GatewaySessionError::retryable(format!(
-                    "provider returned {code} on audio speech session {session_id}: {message}"
-                )));
+                return Err(provider_reported_session_error(
+                    &frame,
+                    &format!("audio speech session {session_id}"),
+                    true,
+                ));
             }
             Some("s.close") => {
                 let reason = frame
@@ -16727,18 +16750,14 @@ async fn collect_direct_session_artifact_generation_output(
                 )?);
             }
             Some("s.error") => {
-                let code = frame
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider_error");
-                let message = frame
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider returned s.error");
-                return Err(GatewaySessionError::retryable(format!(
-                    "provider returned {code} on {} generation session {session_id}: {message}",
-                    request.output_modality
-                )));
+                return Err(provider_reported_session_error(
+                    &frame,
+                    &format!(
+                        "{} generation session {session_id}",
+                        request.output_modality
+                    ),
+                    true,
+                ));
             }
             Some("s.close") => {
                 let reason = frame
@@ -16914,17 +16933,11 @@ async fn collect_direct_session_audio_transcription_output(
                 )?);
             }
             Some("s.error") => {
-                let code = frame
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider_error");
-                let message = frame
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider returned s.error");
-                return Err(GatewaySessionError::retryable(format!(
-                    "provider returned {code} on audio transcription session {session_id}: {message}"
-                )));
+                return Err(provider_reported_session_error(
+                    &frame,
+                    &format!("audio transcription session {session_id}"),
+                    true,
+                ));
             }
             Some("s.close") => {
                 let reason = frame
@@ -18769,6 +18782,9 @@ async fn run_embedding_with_route_retry(
             Err(err) if is_client_disconnect_error(&err) => {
                 return Err(ApiError::client_closed_request(err.message));
             }
+            Err(err) if err.failure_class.is_request_scoped() => {
+                return Err(request_scoped_api_error(&err).expect("request-scoped error"));
+            }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 billing = billing.after_attempt(None);
@@ -18899,6 +18915,9 @@ async fn run_image_generation_with_route_retry(
             Err(err) if is_client_disconnect_error(&err) => {
                 return Err(ApiError::client_closed_request(err.message));
             }
+            Err(err) if err.failure_class.is_request_scoped() => {
+                return Err(request_scoped_api_error(&err).expect("request-scoped error"));
+            }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 billing = billing.after_attempt(None);
@@ -19024,6 +19043,9 @@ async fn run_audio_speech_with_route_retry(
             }
             Err(err) if is_client_disconnect_error(&err) => {
                 return Err(ApiError::client_closed_request(err.message));
+            }
+            Err(err) if err.failure_class.is_request_scoped() => {
+                return Err(request_scoped_api_error(&err).expect("request-scoped error"));
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -19154,6 +19176,9 @@ async fn run_audio_transcription_with_route_retry(
             }
             Err(err) if is_client_disconnect_error(&err) => {
                 return Err(ApiError::client_closed_request(err.message));
+            }
+            Err(err) if err.failure_class.is_request_scoped() => {
+                return Err(request_scoped_api_error(&err).expect("request-scoped error"));
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -19291,6 +19316,9 @@ async fn run_artifact_generation_with_route_retry(
             }
             Err(err) if is_client_disconnect_error(&err) => {
                 return Err(ApiError::client_closed_request(err.message));
+            }
+            Err(err) if err.failure_class.is_request_scoped() => {
+                return Err(request_scoped_api_error(&err).expect("request-scoped error"));
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -21478,20 +21506,16 @@ async fn run_live_direct_chat_sse_inner(
                 }
             }
             Some("s.error") => {
-                let code = frame
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider_error");
-                let message = frame
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provider returned s.error");
-                let err = format!(
-                    "provider returned {code} on session {}: {message}",
-                    session.invocation.session_id
+                let error = provider_reported_session_error(
+                    &frame,
+                    &format!("session {}", session.invocation.session_id),
+                    false,
                 );
+                if error.failure_class.is_request_scoped() {
+                    return Err(error);
+                }
                 return Err(retryable_interrupted_direct_session_error(
-                    GatewaySessionError::new(err),
+                    error,
                     &content,
                     &reasoning_evidence,
                     tool_calls.clone(),
@@ -22122,6 +22146,9 @@ async fn run_chat_with_route_retry(
             }
             Err(err) if is_client_disconnect_error(&err) => {
                 return Err(ApiError::client_closed_request(err.message));
+            }
+            Err(err) if err.failure_class.is_request_scoped() => {
+                return Err(request_scoped_api_error(&err).expect("request-scoped error"));
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -24106,7 +24133,7 @@ fn record_route_attempt_error(
     elapsed: Duration,
     err: &GatewaySessionError,
 ) {
-    if err.failure_class == GatewaySessionFailureClass::BuyerLocal {
+    if err.failure_class.is_request_scoped() {
         return;
     }
     if err.clean_refusal
@@ -41109,6 +41136,53 @@ mod tests {
             assert_eq!(entry.observed.ewma_error_rate, 0.0, "{modality}");
             assert!(state.reputation_events().is_empty(), "{modality}");
         }
+    }
+
+    #[test]
+    fn provider_request_error_is_buyer_local_and_never_penalizes_the_route() {
+        let error = provider_reported_session_error(
+            &json!({
+                "t": "s.error",
+                "code": "request_invalid",
+                "message": "unsupported tool schema"
+            }),
+            "session request-invalid",
+            true,
+        );
+        assert_eq!(error.failure_class, GatewaySessionFailureClass::BuyerLocal);
+        assert!(!error.retryable);
+
+        let model = test_routed_model(1);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let route = &model.mayhem.route_candidates[0];
+        record_route_attempt_error(&state, Some(route), Duration::from_millis(5), &error);
+        assert!(!state.route_provider_in_cooloff(route, now_millis_u64()));
+        let entry = state
+            .provider_table
+            .lock_recover("provider table")
+            .entries(now_millis_u64())
+            .into_iter()
+            .find(|entry| entry.key == route_key(route))
+            .expect("route remains in provider table");
+        assert_eq!(entry.observed.samples, 0);
+
+        let api_error = request_scoped_api_error(&error).expect("buyer request error");
+        assert_eq!(api_error.status, StatusCode::BAD_REQUEST);
+
+        let output_error = provider_reported_session_error(
+            &json!({
+                "t": "s.error",
+                "code": "model_output_invalid",
+                "message": "model emitted invalid tool-call JSON"
+            }),
+            "session output-invalid",
+            true,
+        );
+        assert_eq!(
+            output_error.failure_class,
+            GatewaySessionFailureClass::RequestScoped
+        );
+        assert!(!output_error.retryable);
     }
 
     #[test]

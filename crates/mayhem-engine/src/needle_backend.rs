@@ -178,11 +178,16 @@ impl NeedleBackend {
                 )));
             }
             if !message.ok {
-                return Err(EngineError::Needle(
-                    message
-                        .error
-                        .unwrap_or_else(|| "worker returned an unknown error".to_owned()),
-                ));
+                let error = message
+                    .error
+                    .unwrap_or_else(|| "worker returned an unknown error".to_owned());
+                if operation == "generate" && message.error_kind.as_deref() == Some("request") {
+                    return Err(EngineError::InvalidRequest(error));
+                }
+                if operation == "generate" && message.error_kind.as_deref() == Some("output") {
+                    return Err(EngineError::InvalidOutput(error));
+                }
+                return Err(EngineError::Needle(error));
             }
             let decoded = serde_json::from_value(message.result.unwrap_or(Value::Null));
             return match decoded {
@@ -415,7 +420,7 @@ fn validate_needle_request(request: &GenerateRequest) -> Result<()> {
     request.validate_sampling()?;
     needle_request_prompt(request)?;
     if request.tools.is_empty() {
-        return Err(EngineError::InvalidConfig(
+        return Err(EngineError::InvalidRequest(
             "Needle is tools-only and requires at least one tool".to_owned(),
         ));
     }
@@ -423,18 +428,18 @@ fn validate_needle_request(request: &GenerateRequest) -> Result<()> {
         && (request.messages.len() != 1
             || request.messages[0].get("role").and_then(Value::as_str) != Some("user"))
     {
-        return Err(EngineError::InvalidConfig(
+        return Err(EngineError::InvalidRequest(
             "Needle supports one single-shot user turn and refuses conversational history"
                 .to_owned(),
         ));
     }
     if !request.media.is_empty() {
-        return Err(EngineError::InvalidConfig(
+        return Err(EngineError::InvalidRequest(
             "Needle does not accept media".to_owned(),
         ));
     }
     if request.max_new_tokens == 0 || request.max_new_tokens > MAX_DECODER_TOKENS {
-        return Err(EngineError::InvalidConfig(format!(
+        return Err(EngineError::InvalidRequest(format!(
             "Needle max_new_tokens must be between 1 and {MAX_DECODER_TOKENS}"
         )));
     }
@@ -446,12 +451,12 @@ fn validate_needle_request(request: &GenerateRequest) -> Result<()> {
         || request.frequency_penalty.is_some_and(|value| value != 0.0)
         || request.presence_penalty.is_some_and(|value| value != 0.0)
     {
-        return Err(EngineError::InvalidConfig(
+        return Err(EngineError::InvalidRequest(
             "Needle supports deterministic greedy decoding only".to_owned(),
         ));
     }
     if !request.stop.is_empty() || request.ignore_eos {
-        return Err(EngineError::InvalidConfig(
+        return Err(EngineError::InvalidRequest(
             "Needle uses its pinned EOS and does not support custom stop behavior".to_owned(),
         ));
     }
@@ -461,7 +466,7 @@ fn validate_needle_request(request: &GenerateRequest) -> Result<()> {
         .is_some_and(|grammar| !matches!(grammar, GrammarSpec::ToolCall { .. }))
         || !request.speciality_parameters.is_empty()
     {
-        return Err(EngineError::InvalidConfig(
+        return Err(EngineError::InvalidRequest(
             "Needle does not accept external grammar or speciality controls".to_owned(),
         ));
     }
@@ -471,7 +476,7 @@ fn validate_needle_request(request: &GenerateRequest) -> Result<()> {
 fn needle_request_prompt(request: &GenerateRequest) -> Result<String> {
     if request.messages.is_empty() {
         if request.prompt.trim().is_empty() {
-            return Err(EngineError::InvalidConfig(
+            return Err(EngineError::InvalidRequest(
                 "Needle requires a non-empty single-shot query".to_owned(),
             ));
         }
@@ -480,13 +485,13 @@ fn needle_request_prompt(request: &GenerateRequest) -> Result<String> {
     if request.messages.len() != 1
         || request.messages[0].get("role").and_then(Value::as_str) != Some("user")
     {
-        return Err(EngineError::InvalidConfig(
+        return Err(EngineError::InvalidRequest(
             "Needle supports one single-shot user turn and refuses conversational history"
                 .to_owned(),
         ));
     }
     let content = request.messages[0].get("content").ok_or_else(|| {
-        EngineError::InvalidConfig("Needle user message has no content".to_owned())
+        EngineError::InvalidRequest("Needle user message has no content".to_owned())
     })?;
     let prompt = match content {
         Value::String(text) => text.clone(),
@@ -494,7 +499,7 @@ fn needle_request_prompt(request: &GenerateRequest) -> Result<String> {
             let mut text = Vec::with_capacity(parts.len());
             for part in parts {
                 if part.get("type").and_then(Value::as_str) != Some("text") {
-                    return Err(EngineError::InvalidConfig(
+                    return Err(EngineError::InvalidRequest(
                         "Needle accepts text message parts only".to_owned(),
                     ));
                 }
@@ -502,7 +507,7 @@ fn needle_request_prompt(request: &GenerateRequest) -> Result<String> {
                     part.get("text")
                         .and_then(Value::as_str)
                         .ok_or_else(|| {
-                            EngineError::InvalidConfig(
+                            EngineError::InvalidRequest(
                                 "Needle text message part has no text".to_owned(),
                             )
                         })?
@@ -512,13 +517,13 @@ fn needle_request_prompt(request: &GenerateRequest) -> Result<String> {
             text.join("\n")
         }
         _ => {
-            return Err(EngineError::InvalidConfig(
+            return Err(EngineError::InvalidRequest(
                 "Needle user message content must be text".to_owned(),
             ))
         }
     };
     if prompt.trim().is_empty() {
-        return Err(EngineError::InvalidConfig(
+        return Err(EngineError::InvalidRequest(
             "Needle requires a non-empty single-shot query".to_owned(),
         ));
     }
@@ -721,6 +726,8 @@ struct WorkerMessage {
     result: Option<Value>,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    error_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1257,18 +1264,18 @@ mod tests {
     #[test]
     fn ordinary_chat_and_non_greedy_sampling_are_rejected() {
         let chat = GenerateRequest::new("hello");
-        assert!(validate_needle_request(&chat)
-            .unwrap_err()
-            .to_string()
-            .contains("tools-only"));
+        assert!(matches!(
+            validate_needle_request(&chat),
+            Err(EngineError::InvalidRequest(message)) if message.contains("tools-only")
+        ));
 
         let mut sampled = GenerateRequest::new("look up one");
         sampled.tools = vec![tool()];
         sampled.temperature = Some(0.5);
-        assert!(validate_needle_request(&sampled)
-            .unwrap_err()
-            .to_string()
-            .contains("greedy"));
+        assert!(matches!(
+            validate_needle_request(&sampled),
+            Err(EngineError::InvalidRequest(message)) if message.contains("greedy")
+        ));
     }
 
     #[test]
@@ -1351,5 +1358,26 @@ mod tests {
         );
         let mut oversized = std::io::Cursor::new(vec![b'x'; 33]);
         assert!(read_bounded_line(&mut oversized, 32).is_err());
+    }
+
+    #[test]
+    fn worker_request_failures_have_a_typed_protocol_class() {
+        let message: WorkerMessage = serde_json::from_value(json!({
+            "id": 7,
+            "ok": false,
+            "error": "tool schema is unsupported",
+            "error_kind": "request"
+        }))
+        .expect("typed worker failure");
+        assert_eq!(message.error_kind.as_deref(), Some("request"));
+
+        let message: WorkerMessage = serde_json::from_value(json!({
+            "id": 8,
+            "ok": false,
+            "error": "model emitted invalid tool-call JSON",
+            "error_kind": "output"
+        }))
+        .expect("typed output failure");
+        assert_eq!(message.error_kind.as_deref(), Some("output"));
     }
 }

@@ -53,6 +53,10 @@ pub enum EngineError {
     },
     #[error("invalid engine config: {0}")]
     InvalidConfig(String),
+    #[error("invalid engine request: {0}")]
+    InvalidRequest(String),
+    #[error("invalid model output: {0}")]
+    InvalidOutput(String),
     #[error("engine request cancelled")]
     Cancelled,
     #[error("model has not been loaded")]

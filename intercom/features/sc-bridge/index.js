@@ -148,6 +148,9 @@ class ScBridge extends Feature {
 
   attachInferenceRelay(inferenceRelay) {
     this.inferenceRelay = inferenceRelay;
+    this.inferenceRelay?.setHeartbeatSink?.((channel, heartbeat, metadata) => {
+      this.handleRelayedHeartbeat(channel, heartbeat, metadata);
+    });
   }
 
   async _connectSessionPeer(remote, waitMs) {
@@ -179,6 +182,10 @@ class ScBridge extends Feature {
         (remote, sessionId) => this.directSession.close(remote, sessionId)
       );
     }
+    for (const room of client.heartbeatRelayRooms || []) {
+      this.inferenceRelay?.unsubscribeHeartbeatRoom?.(room);
+    }
+    client.heartbeatRelayRooms?.clear?.();
     client.outboundQueue.length = 0;
     client.outboundBytes = 0;
     this.clients.delete(client);
@@ -220,6 +227,21 @@ class ScBridge extends Feature {
   }
 
   handleSidechannelMessage(channel, payload, _connection) {
+    const decision = this.inferenceRelay?.observeSidechannelHeartbeat?.(channel, payload);
+    if (decision?.heartbeat === true && decision.emit !== true) return;
+    this._emitSidechannelMessage(channel, payload);
+  }
+
+  handleRelayedHeartbeat(channel, heartbeat, metadata = {}) {
+    this._emitSidechannelMessage(channel, {
+      message: heartbeat,
+      origin: 'inference-relay',
+      relayedBy: metadata?.relay ?? null,
+      ts: heartbeat?.ts ?? Date.now(),
+    });
+  }
+
+  _emitSidechannelMessage(channel, payload) {
     const messageText = normalizeText(payload?.message ?? payload);
     const event = {
       type: 'sidechannel_message',
@@ -445,9 +467,17 @@ class ScBridge extends Feature {
             ? [message.channel]
             : [];
         if (!client.channels) client.channels = new Set();
+        if (!client.heartbeatRelayRooms) client.heartbeatRelayRooms = new Set();
+        const previous = new Set(client.channels);
         if (!this._addSubscriptions(client.channels, channels)) {
           sendError('Sidechannel subscription limit reached.');
           return;
+        }
+        for (const channel of client.channels) {
+          if (previous.has(channel) || client.heartbeatRelayRooms.has(channel)) continue;
+          if (this.inferenceRelay?.subscribeHeartbeatRoom?.(channel)) {
+            client.heartbeatRelayRooms.add(channel);
+          }
         }
         client.sidechannelMuted = false;
         reply({ type: 'subscribed', channels: Array.from(client.channels) });
@@ -460,7 +490,14 @@ class ScBridge extends Feature {
             ? [message.channel]
             : [];
         if (!client.channels) client.channels = new Set();
-        for (const ch of channels) client.channels.delete(String(ch));
+        if (!client.heartbeatRelayRooms) client.heartbeatRelayRooms = new Set();
+        for (const ch of channels) {
+          const channel = String(ch);
+          client.channels.delete(channel);
+          if (client.heartbeatRelayRooms.delete(channel)) {
+            this.inferenceRelay?.unsubscribeHeartbeatRoom?.(channel);
+          }
+        }
         reply({ type: 'subscribed', channels: Array.from(client.channels) });
         return;
       }
@@ -1080,6 +1117,7 @@ class ScBridge extends Feature {
         sessionIds: null,
         sessionAll: false,
         directSessions: new Map(),
+        heartbeatRelayRooms: new Set(),
         outboundQueue: [],
         outboundBytes: 0,
         writing: false,
@@ -1126,6 +1164,7 @@ class ScBridge extends Feature {
     this.started = false;
     for (const client of this.clients) this._dropClient(client, 'bridge stopped', true);
     this.clients.clear();
+    this.inferenceRelay?.setHeartbeatSink?.(null);
   }
 }
 

@@ -63528,6 +63528,86 @@ fn contain_provider_request<T>(request: impl FnOnce() -> Result<T>) -> Result<T>
     })
 }
 
+#[derive(Debug)]
+struct ProviderSessionRequestError(String);
+
+impl std::fmt::Display for ProviderSessionRequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProviderSessionRequestError {}
+
+#[derive(Debug)]
+struct ProviderSessionOutputError(String);
+
+impl std::fmt::Display for ProviderSessionOutputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProviderSessionOutputError {}
+
+fn provider_session_request_result<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| anyhow::Error::new(ProviderSessionRequestError(format!("{error:#}"))))
+}
+
+fn provider_session_output_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(ProviderSessionOutputError(message.into()))
+}
+
+fn provider_response_error_code(error: &anyhow::Error) -> &'static str {
+    if error.chain().any(|cause| {
+        cause.is::<ProviderSessionRequestError>()
+            || cause.downcast_ref::<EngineError>().is_some_and(|error| {
+                matches!(
+                    error,
+                    EngineError::InvalidRequest(_) | EngineError::PromptTooLong { .. }
+                )
+            })
+    }) {
+        "request_invalid"
+    } else if error.chain().any(|cause| {
+        cause.is::<ProviderSessionOutputError>()
+            || cause
+                .downcast_ref::<EngineError>()
+                .is_some_and(|error| matches!(error, EngineError::InvalidOutput(_)))
+    }) {
+        "model_output_invalid"
+    } else {
+        "provider_response_failed"
+    }
+}
+
+fn provider_response_error_message(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<ProviderSessionRequestError>()
+                .map(|error| error.0.clone())
+                .or_else(|| {
+                    cause
+                        .downcast_ref::<ProviderSessionOutputError>()
+                        .map(|error| error.0.clone())
+                })
+                .or_else(|| {
+                    cause.downcast_ref::<EngineError>().and_then(|error| {
+                        matches!(
+                            error,
+                            EngineError::InvalidRequest(_)
+                                | EngineError::InvalidOutput(_)
+                                | EngineError::PromptTooLong { .. }
+                        )
+                        .then(|| error.to_string())
+                    })
+                })
+        })
+        .unwrap_or_else(|| error.to_string())
+}
+
 async fn run_provider_session_heartbeats(ctx: ProviderSessionHeartbeatTask) -> Result<()> {
     let mut retry_delay = ctx.heartbeat_reconnect_initial;
     while !ctx.load.is_stopped() {
@@ -66239,20 +66319,22 @@ async fn handle_provider_session_frame(
                     provider_session_debug(format!(
                         "response failed for session {session_id}: {err_text}"
                     ));
+                    let error_code = provider_response_error_code(&err);
+                    let error_message = provider_response_error_message(&err);
                     send_provider_session_error(
                         bridge,
                         &active.remote,
                         &active.session_id,
                         request_id,
-                        "provider_response_failed",
-                        &err.to_string(),
+                        error_code,
+                        &error_message,
                     )
                     .await?;
                     send_provider_session_close(
                         bridge,
                         &active.remote,
                         &active.session_id,
-                        "err:provider_response_failed",
+                        &format!("err:{error_code}"),
                     )
                     .await?;
                     sessions.remove(&session_id);
@@ -72921,17 +73003,25 @@ fn provider_engine_session_response_with_sampling_bounded(
     cancellation: &CancellationToken,
 ) -> Result<ProviderSessionOutput> {
     cancellation.check().context("provider request cancelled")?;
-    let verified = provider_verify_endpoint_request(body, expected_model_id, adapter)?;
+    let verified = provider_session_request_result(provider_verify_endpoint_request(
+        body,
+        expected_model_id,
+        adapter,
+    ))?;
     let endpoint_family = verified.family;
     let request_body = verified.request;
-    let protocol_prompt_tokens = provider_protocol_prompt_tokens(verified.contract, request_body)?;
+    let protocol_prompt_tokens = provider_session_request_result(provider_protocol_prompt_tokens(
+        verified.contract,
+        request_body,
+    ))?;
     if matches!(
         endpoint_family,
         mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS
             | mayhem_proto::ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION
     ) {
-        let request =
-            provider_audio_transcription_request_from_body(endpoint_family, request_body, body)?;
+        let request = provider_session_request_result(
+            provider_audio_transcription_request_from_body(endpoint_family, request_body, body),
+        )?;
         let audio_seconds = request.audio_seconds;
         let output = backend
             .transcribe(request.engine, cancellation)
@@ -72980,9 +73070,14 @@ fn provider_engine_session_response_with_sampling_bounded(
         endpoint_family,
         mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH
     ) {
-        let request = provider_speech_request_from_body(endpoint_family, request_body)?;
-        let input_characters = u64::try_from(request.input.chars().count())
-            .context("audio_speech input character count overflowed u64")?;
+        let request = provider_session_request_result(provider_speech_request_from_body(
+            endpoint_family,
+            request_body,
+        ))?;
+        let input_characters = provider_session_request_result(
+            u64::try_from(request.input.chars().count())
+                .context("audio_speech input character count overflowed u64"),
+        )?;
         let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
         let output = backend
             .synthesize_speech(
@@ -73015,7 +73110,9 @@ fn provider_engine_session_response_with_sampling_bounded(
         endpoint_family,
         mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS | mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE
     ) {
-        let request = provider_image_generation_request_from_body(endpoint_family, request_body)?;
+        let request = provider_session_request_result(
+            provider_image_generation_request_from_body(endpoint_family, request_body),
+        )?;
         let image_count = request.image_count;
         let steps = u64::from(request.steps);
         let width = request.width;
@@ -73063,16 +73160,18 @@ fn provider_engine_session_response_with_sampling_bounded(
         endpoint_family,
         mayhem_proto::ENDPOINT_OPENAI_VIDEOS | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
     ) {
-        let mut request =
-            provider_media_generation_request_from_body(endpoint_family, request_body)?;
-        let (expected_duration, expected_frames) =
-            provider_video_output_expectation(verified.contract, &request)?;
+        let mut request = provider_session_request_result(
+            provider_media_generation_request_from_body(endpoint_family, request_body),
+        )?;
+        let (expected_duration, expected_frames) = provider_session_request_result(
+            provider_video_output_expectation(verified.contract, &request),
+        )?;
         request.frame_count = Some(expected_frames);
-        provider_canonicalize_video_engine_request(
+        provider_session_request_result(provider_canonicalize_video_engine_request(
             verified.contract,
             &mut request,
             expected_frames,
-        )?;
+        ))?;
         let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
         let output = backend
             .generate_video(
@@ -73125,10 +73224,13 @@ fn provider_engine_session_response_with_sampling_bounded(
             | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
             | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
     ) {
-        let request = provider_media_generation_request_from_body(endpoint_family, request_body)?;
+        let request = provider_session_request_result(
+            provider_media_generation_request_from_body(endpoint_family, request_body),
+        )?;
         let requested_duration = request.duration_seconds;
-        let input_characters =
-            provider_media_generation_input_characters(endpoint_family, &request.request)?;
+        let input_characters = provider_session_request_result(
+            provider_media_generation_input_characters(endpoint_family, &request.request),
+        )?;
         let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
         let output = if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
             backend
@@ -73227,13 +73329,17 @@ fn provider_engine_session_response_with_sampling_bounded(
         endpoint_family,
         mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS | mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION
     ) {
-        let inputs = provider_embedding_input_texts_from_body(request_body)?;
+        let inputs = provider_session_request_result(provider_embedding_input_texts_from_body(
+            request_body,
+        ))?;
         let prompt_tokens = provider_embedding_input_token_count(&inputs);
-        let dimensions = request_body
-            .get("dimensions")
-            .and_then(Value::as_u64)
-            .map(|value| usize::try_from(value).context("embedding dimensions overflow usize"))
-            .transpose()?;
+        let dimensions = provider_session_request_result(
+            request_body
+                .get("dimensions")
+                .and_then(Value::as_u64)
+                .map(|value| usize::try_from(value).context("embedding dimensions overflow usize"))
+                .transpose(),
+        )?;
         let output = backend
             .embed(
                 mayhem_engine::EmbeddingRequest { inputs, dimensions },
@@ -73256,24 +73362,29 @@ fn provider_engine_session_response_with_sampling_bounded(
         });
     }
 
-    ensure!(
-        matches!(
-            endpoint_family,
-            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
-                | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
-                | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
-                | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
-        ),
-        "provider endpoint family {endpoint_family} has no engine execution path"
-    );
+    provider_session_request_result((|| {
+        ensure!(
+            matches!(
+                endpoint_family,
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+                    | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+            ),
+            "provider endpoint family {endpoint_family} has no engine execution path"
+        );
+        Ok(())
+    })())?;
 
-    let tool_mode = provider_engine_tool_request(request_body, adapter)?;
-    let mut request = provider_engine_request_from_endpoint_body_with_sampling(
-        endpoint_family,
-        request_body,
-        adapter,
-        sampling,
-    )?;
+    let tool_mode =
+        provider_session_request_result(provider_engine_tool_request(request_body, adapter))?;
+    let mut request =
+        provider_session_request_result(provider_engine_request_from_endpoint_body_with_sampling(
+            endpoint_family,
+            request_body,
+            adapter,
+            sampling,
+        ))?;
     if let Some(cap) = output_token_cap {
         request.max_new_tokens = request.max_new_tokens.min(cap.max(1));
     }
@@ -73339,16 +73450,16 @@ fn provider_engine_session_response_with_sampling_bounded(
         .as_ref()
         .is_some_and(|mode| !mode.parallel && tools.len() > 1)
     {
-        bail!(
+        return Err(provider_session_output_error(format!(
             "provider engine returned {} tool calls while parallel_tool_calls=false",
             tools.len()
-        );
+        )));
     }
     if tool_mode.as_ref().is_some_and(|mode| mode.required) && tools.is_empty() {
-        bail!(
+        return Err(provider_session_output_error(format!(
             "provider engine did not return a valid required tool call: {}",
             output.text.trim()
-        );
+        )));
     }
     let completion_tokens = u64::from(output.usage.completion_tokens);
     let reasoning_tokens = u64::from(output.usage.reasoning_tokens).min(completion_tokens);
@@ -91293,6 +91404,48 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             panic!("expected json schema grammar");
         };
         assert_eq!(schema["required"][0], "ok");
+    }
+
+    #[test]
+    fn provider_response_error_code_distinguishes_buyer_input_from_engine_failure() {
+        let request_error =
+            anyhow::Error::new(EngineError::InvalidRequest("bad tool schema".to_owned()))
+                .context("generating provider response");
+        assert_eq!(
+            provider_response_error_code(&request_error),
+            "request_invalid"
+        );
+
+        let common_request_error =
+            provider_session_request_result::<()>(Err(anyhow!("invalid image dimensions")))
+                .expect_err("request-phase failure");
+        assert_eq!(
+            provider_response_error_code(&common_request_error),
+            "request_invalid"
+        );
+        assert_eq!(
+            provider_response_error_message(&common_request_error),
+            "invalid image dimensions"
+        );
+
+        let output_error =
+            provider_session_output_error("model emitted malformed structured output")
+                .context("generating provider response");
+        assert_eq!(
+            provider_response_error_code(&output_error),
+            "model_output_invalid"
+        );
+        assert_eq!(
+            provider_response_error_message(&output_error),
+            "model emitted malformed structured output"
+        );
+
+        let engine_error = anyhow::Error::new(EngineError::Needle("worker exited".to_owned()))
+            .context("generating provider response");
+        assert_eq!(
+            provider_response_error_code(&engine_error),
+            "provider_response_failed"
+        );
     }
 
     #[test]

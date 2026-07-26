@@ -15,9 +15,9 @@ routes, and revisions. Never copy an enclave ID or price from documentation:
 mayhem models --gateway
 ```
 
-## v0.2.59 runtime status
+## v0.2.60 runtime status
 
-The `0.2.59` source release preserves the canonical Needle CPU/CUDA tools-only
+The `0.2.60` source release preserves the canonical Needle CPU/CUDA tools-only
 runtime from `0.2.54`, fixes co-resident host/unified-memory admission, makes
 startup probes honor signed endpoint output-token floors, and reports live
 small-context routes against the endpoint's signed output-token default instead

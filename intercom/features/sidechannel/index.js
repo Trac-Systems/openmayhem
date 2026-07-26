@@ -26,6 +26,8 @@ const DEFAULT_RELAY_BURST_BYTES = 1_000_000;
 const DEFAULT_RELAY_SOURCE_RATE_BYTES_PER_SECOND = 64_000;
 const DEFAULT_RELAY_SOURCE_BURST_BYTES = 256_000;
 const DEFAULT_MAX_RELAY_SOURCES = 1024;
+const DEFAULT_POW_YIELD_EVERY = 4_096;
+const DEFAULT_MAX_POW_QUEUE = 64;
 const MAX_MESSAGE_ID_BYTES = 256;
 
 const safeIntegerOr = (value, fallback, { min = 0 } = {}) => (
@@ -221,6 +223,18 @@ class Sidechannel extends Feature {
     this.seen = new Map();
     this.powEnabled = config.powEnabled === true;
     this.powDifficulty = Number.isInteger(config.powDifficulty) ? config.powDifficulty : 0;
+    this.powYieldEvery = safeIntegerOr(
+      config.powYieldEvery,
+      DEFAULT_POW_YIELD_EVERY,
+      { min: 1 }
+    );
+    this.maxPowQueue = safeIntegerOr(
+      config.maxPowQueue,
+      DEFAULT_MAX_POW_QUEUE,
+      { min: 1 }
+    );
+    this.powQueueDepth = 0;
+    this.powQueue = Promise.resolve();
     this.powRequireEntry = config.powRequireEntry === true;
     this.powRequiredChannels = Array.isArray(config.powRequiredChannels)
       ? new Set(config.powRequiredChannels.map((c) => String(c)))
@@ -403,7 +417,7 @@ class Sidechannel extends Feature {
     return true;
   }
 
-  _buildPayload(channel, message, invite = null) {
+  _buildPayload(channel, message, invite = null, { deferPow = false } = {}) {
     const ts = this._now();
     // Encode keys as hex strings, not Buffers, because we transmit payloads via JSON encoding.
     const from = normalizeKeyHex(this.peer?.wallet?.publicKey) ?? null;
@@ -419,10 +433,12 @@ class Sidechannel extends Feature {
       ttl: this.relayTtl,
     };
     if (invite) payload.invite = invite;
-    this._attachPow(payload);
-    // Message-level signatures allow receivers to enforce "owner-only write" even when
-    // messages are relayed (the transport peer can be a relay, not the original sender).
-    this._attachSig(payload);
+    if (!deferPow) {
+      this._attachPow(payload);
+      // Message-level signatures allow receivers to enforce "owner-only write" even when
+      // messages are relayed (the transport peer can be a relay, not the original sender).
+      this._attachSig(payload);
+    }
     return payload;
   }
 
@@ -859,6 +875,40 @@ class Sidechannel extends Feature {
         return;
       }
       nonce += 1;
+    }
+  }
+
+  async _attachPowCooperatively(payload) {
+    const channel = payload?.channel ?? '';
+    if (!this._powRequired(channel)) return;
+    const difficulty = this.powDifficulty;
+    const prefix =
+      `{"channel":${stableStringify(payload?.channel ?? null)}` +
+      `,"from":${stableStringify(payload?.from ?? null)}` +
+      `,"id":${stableStringify(payload?.id ?? null)}` +
+      `,"message":${stableStringify(payload?.message ?? null)}` +
+      ',"nonce":';
+    const suffix =
+      `,"origin":${stableStringify(payload?.origin ?? null)}` +
+      `,"ts":${stableStringify(payload?.ts ?? null)}}`;
+    const optimized = prefix + '0' + suffix === this._powBase(payload, 0);
+    let nonce = 0;
+
+    // Timers are available in both Pear/Bare and Node. Yield once before mining,
+    // then between bounded chunks so heartbeats and session traffic keep moving.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    while (true) {
+      const chunkEnd = nonce + this.powYieldEvery;
+      for (; nonce < chunkEnd; nonce += 1) {
+        const input = optimized
+          ? prefix + nonce + suffix
+          : this._powBase(payload, nonce);
+        if (countLeadingZeroBits(sha256Hex(input)) >= difficulty) {
+          payload.pow = { nonce, difficulty };
+          return;
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
     }
   }
 
@@ -1534,31 +1584,7 @@ class Sidechannel extends Feature {
     return true;
   }
 
-  broadcast(name, message, options = {}) {
-    const channel = String(name || '').trim();
-    if (!channel) return false;
-    const isAuthControl =
-      message && typeof message === 'object' && String(message.control || '') === 'auth';
-    const allowPreAuthSend = isAuthControl;
-    if (this._ownerWriteOnly(channel) && !isAuthControl) {
-      const ownerKey = this._getOwnerKey(channel);
-      const selfKey = normalizeKeyHex(this.peer?.wallet?.publicKey);
-      if (!ownerKey || !selfKey || ownerKey !== selfKey) return false;
-    }
-    if (options.invite) {
-      this._acceptLocalInvite(options.invite, channel);
-      if (options.invite?.welcome) {
-        this._verifyWelcome(options.invite.welcome, channel, null);
-      }
-    }
-    const entry = this._registerChannel(channel);
-    if (!entry) return false;
-    if (this.peer?.swarm?.connections) {
-      for (const connection of this.peer.swarm.connections) {
-        this._openChannelForConnection(connection, entry);
-      }
-    }
-    const payload = this._buildPayload(channel, message, options.invite);
+  _payloadWithinBounds(channel, payload) {
     let shapeWithinBounds = false;
     try {
       shapeWithinBounds = jsonShapeWithinBounds(
@@ -1589,6 +1615,11 @@ class Sidechannel extends Feature {
       );
       return false;
     }
+    return true;
+  }
+
+  _sendBroadcastPayload(entry, payload, allowPreAuthSend) {
+    const channel = entry.name;
     if (this.debug) {
       console.log(`[sidechannel:${channel}] sending to ${this.connections.size} connections`);
     }
@@ -1629,6 +1660,73 @@ class Sidechannel extends Feature {
         console.log(`[sidechannel:${channel}] no message session for connection.`);
       }
     }
+  }
+
+  _queuePowBroadcast(entry, payload, allowPreAuthSend) {
+    if (this.powQueueDepth >= this.maxPowQueue) return false;
+    this.powQueueDepth += 1;
+    const mineAndSend = async () => {
+      try {
+        await this._attachPowCooperatively(payload);
+        this._attachSig(payload);
+        if (this.channels.get(entry.name) !== entry) return;
+        if (!this._payloadWithinBounds(entry.name, payload)) return;
+        this._sendBroadcastPayload(entry, payload, allowPreAuthSend);
+      } catch (error) {
+        this._reportEventError(`PoW broadcast ${entry.name}`, error);
+      } finally {
+        this.powQueueDepth -= 1;
+      }
+    };
+    this.powQueue = this.powQueue.then(mineAndSend, mineAndSend);
+    return true;
+  }
+
+  broadcast(name, message, options = {}) {
+    const channel = String(name || '').trim();
+    if (!channel) return false;
+    const isAuthControl =
+      message && typeof message === 'object' && String(message.control || '') === 'auth';
+    const allowPreAuthSend = isAuthControl;
+    if (this._ownerWriteOnly(channel) && !isAuthControl) {
+      const ownerKey = this._getOwnerKey(channel);
+      const selfKey = normalizeKeyHex(this.peer?.wallet?.publicKey);
+      if (!ownerKey || !selfKey || ownerKey !== selfKey) return false;
+    }
+    if (options.invite) {
+      this._acceptLocalInvite(options.invite, channel);
+      if (options.invite?.welcome) {
+        this._verifyWelcome(options.invite.welcome, channel, null);
+      }
+    }
+    const entry = this._registerChannel(channel);
+    if (!entry) return false;
+    if (this.peer?.swarm?.connections) {
+      for (const connection of this.peer.swarm.connections) {
+        this._openChannelForConnection(connection, entry);
+      }
+    }
+    const cooperativePow = this._powRequired(channel);
+    const payload = this._buildPayload(
+      channel,
+      message,
+      options.invite,
+      { deferPow: cooperativePow }
+    );
+    if (cooperativePow) {
+      const upperBoundPayload = {
+        ...payload,
+        pow: {
+          nonce: Number.MAX_SAFE_INTEGER,
+          difficulty: this.powDifficulty,
+        },
+        sig: '0'.repeat(128),
+      };
+      if (!this._payloadWithinBounds(channel, upperBoundPayload)) return false;
+      return this._queuePowBroadcast(entry, payload, allowPreAuthSend);
+    }
+    if (!this._payloadWithinBounds(channel, payload)) return false;
+    this._sendBroadcastPayload(entry, payload, allowPreAuthSend);
     return true;
   }
 
