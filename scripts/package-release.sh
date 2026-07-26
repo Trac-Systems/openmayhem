@@ -2085,8 +2085,43 @@ llama_cpp_cuda_toolkit_usable() {
   [[ "$nvcc_usable" == "1" ]] || return 1
 
   if [[ "$(uname -s)" == "Linux" ]]; then
+    llama_cpp_cuda_toolkit_root >/dev/null &&
     llama_cpp_cuda_library_dirs >/dev/null
   fi
+}
+
+llama_cpp_cuda_toolkit_root() {
+  local candidate resolved
+  local -a candidates=()
+
+  for candidate in \
+    "${CUDA_PATH:-}" \
+    "${CUDA_HOME:-}" \
+    "${CUDA_ROOT:-}" \
+    "${CUDA_TOOLKIT_ROOT_DIR:-}"; do
+    [[ -n "$candidate" ]] && candidates+=("$candidate")
+  done
+  for candidate in \
+    "${CUDACXX:-}" \
+    "${CUDA_HOME:+$CUDA_HOME/bin/nvcc}" \
+    "${CUDA_PATH:+$CUDA_PATH/bin/nvcc}" \
+    /usr/local/cuda/bin/nvcc \
+    /opt/cuda/bin/nvcc \
+    "$(command -v nvcc 2>/dev/null || true)"; do
+    [[ -n "$candidate" && -x "$candidate" ]] || continue
+    resolved="$(cd -P "$(dirname "$candidate")/.." && pwd)"
+    candidates+=("$resolved")
+  done
+  candidates+=(/usr/local/cuda /opt/cuda /usr)
+
+  for candidate in "${candidates[@]}"; do
+    [[ -n "$candidate" &&
+      -r "$candidate/include/cuda.h" &&
+      -x "$candidate/bin/nvcc" ]] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
 }
 
 llama_cpp_cuda_library_dirs() {
@@ -2345,6 +2380,7 @@ verify_intercom_release_identity "$ROOT_DIR/intercom"
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   llama_cpp_features=""
   cuda_library_dirs=""
+  cuda_toolkit_root=""
   cargo_args=(build --release --workspace --bins)
   [[ "$SIGNED_RELEASE" == "1" ]] && cargo_args+=(--locked)
   if [[ "$TARGET_SET" -eq 1 ]]; then
@@ -2366,15 +2402,18 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
       ;;
   esac
   if [[ ",$llama_cpp_features," == *,mayhem-cli/llama-cpp-cuda,* ]]; then
+    cuda_toolkit_root="$(llama_cpp_cuda_toolkit_root)" ||
+      die "llama.cpp CUDA source build could not identify a complete CUDA Toolkit root"
     cuda_library_dirs="$(llama_cpp_cuda_library_dirs)" ||
       die "llama.cpp CUDA source build requires libcudart_static.a, libcublas_static.a, libcublasLt_static.a, and libculibos.a; install the CUDA development libraries or select another backend"
+    export CUDA_PATH="$cuda_toolkit_root"
     case ":${CUDA_LIBRARY_PATH:-}:" in
       *":$cuda_library_dirs:"*) ;;
       *)
         export CUDA_LIBRARY_PATH="${cuda_library_dirs}${CUDA_LIBRARY_PATH:+:$CUDA_LIBRARY_PATH}"
         ;;
     esac
-    log "using validated CUDA static libraries from $cuda_library_dirs"
+    log "using validated CUDA Toolkit $cuda_toolkit_root with static libraries from $cuda_library_dirs"
   fi
   log "building release binaries"
   (cd "$ROOT_DIR" && cargo "${cargo_args[@]}")

@@ -110,6 +110,7 @@ installer_acceleration_functions="$(
 for function_name in \
   llama_cpp_feature_name \
   llama_cpp_cuda_toolkit_usable \
+  llama_cpp_cuda_toolkit_root \
   llama_cpp_cuda_library_dirs \
   llama_cpp_vulkan_toolkit_usable \
   linux_llama_cpp_features; do
@@ -130,7 +131,8 @@ grep -F 'pkg-config --exists vulkan' <<<"$installer_acceleration_functions" >/de
   fail "Unix source installer does not validate Vulkan development metadata"
 
 cuda_fixture="$(mktemp -d)"
-mkdir -p "$cuda_fixture/bin" "$cuda_fixture/lib"
+mkdir -p "$cuda_fixture/bin" "$cuda_fixture/include" "$cuda_fixture/lib"
+: >"$cuda_fixture/include/cuda.h"
 cat >"$cuda_fixture/bin/nvcc" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -275,6 +277,8 @@ grep -F 'cargo_args+=(--features "$llama_cpp_features")' \
   fail "Unix source build does not pass selected llama.cpp features to Cargo"
 grep -F 'export CUDA_LIBRARY_PATH=' <<<"$shell_source_build" >/dev/null ||
   fail "Unix source build does not expose validated CUDA libraries to Cargo"
+grep -F 'export CUDA_PATH=' <<<"$shell_source_build" >/dev/null ||
+  fail "Unix source build does not expose the validated CUDA root to Cargo"
 grep -F 'mayhem-cli/llama-cpp-metal' <<<"$shell_source_build" >/dev/null ||
   fail "Unix source acceleration change removed the existing macOS Metal build"
 grep -F 'SOURCE_LLAMA_CPP_BACKEND="metal"' <<<"$shell_source_build" >/dev/null ||
