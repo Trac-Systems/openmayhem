@@ -112,7 +112,7 @@ for function_name in \
   llama_cpp_cuda_toolkit_usable \
   llama_cpp_cuda_toolkit_root \
   llama_cpp_cuda_library_dirs \
-  refresh_llama_cpp_cuda_link_cache \
+  export_llama_cpp_cuda_link_search \
   llama_cpp_vulkan_toolkit_usable \
   linux_llama_cpp_features; do
   grep -F "${function_name}() {" <<<"$installer_acceleration_functions" >/dev/null ||
@@ -179,41 +179,26 @@ if (
 fi
 rm -rf "$cuda_fixture"
 
-cuda_cache_fixture="$(mktemp -d)"
-mkdir -p \
-  "$cuda_cache_fixture/source" \
-  "$cuda_cache_fixture/release/build/llama-cpp-sys-test"
-: >"$cuda_cache_fixture/release/build/llama-cpp-sys-test/output"
+cuda_link_fixture="$(mktemp -d)"
 (
   eval "$installer_acceleration_functions"
-  log() { :; }
-  cargo() {
-    [[ "$*" == "clean -p llama-cpp-sys-2" ]]
-    : >"$cuda_cache_fixture/cleaned"
-  }
-  refresh_llama_cpp_cuda_link_cache \
-    "$cuda_cache_fixture/source" \
-    "$cuda_cache_fixture/release" \
-    /usr/lib/x86_64-linux-gnu
+  unset CARGO_ENCODED_RUSTFLAGS RUSTFLAGS
+  export_llama_cpp_cuda_link_search "$cuda_link_fixture"
+  [[ "$RUSTFLAGS" == "-Lnative=$cuda_link_fixture" ]]
+  export_llama_cpp_cuda_link_search "$cuda_link_fixture"
+  [[ "$RUSTFLAGS" == "-Lnative=$cuda_link_fixture" ]]
 )
-[[ -f "$cuda_cache_fixture/cleaned" ]] ||
-  fail "Unix source installer did not refresh stale CUDA link discovery"
-rm -f "$cuda_cache_fixture/cleaned"
-printf '%s\n' \
-  'cargo:rustc-link-search=native=/usr/lib/x86_64-linux-gnu' \
-  >"$cuda_cache_fixture/release/build/llama-cpp-sys-test/output"
 (
   eval "$installer_acceleration_functions"
-  log() { :; }
-  cargo() { : >"$cuda_cache_fixture/cleaned"; }
-  refresh_llama_cpp_cuda_link_cache \
-    "$cuda_cache_fixture/source" \
-    "$cuda_cache_fixture/release" \
-    /usr/lib/x86_64-linux-gnu
+  separator=$'\x1f'
+  unset RUSTFLAGS
+  export CARGO_ENCODED_RUSTFLAGS="--cfg${separator}existing"
+  export_llama_cpp_cuda_link_search "$cuda_link_fixture"
+  [[ "$CARGO_ENCODED_RUSTFLAGS" == "--cfg${separator}existing${separator}-Lnative=$cuda_link_fixture" ]]
+  export_llama_cpp_cuda_link_search "$cuda_link_fixture"
+  [[ "$CARGO_ENCODED_RUSTFLAGS" == "--cfg${separator}existing${separator}-Lnative=$cuda_link_fixture" ]]
 )
-[[ ! -e "$cuda_cache_fixture/cleaned" ]] ||
-  fail "Unix source installer cleaned an already-correct CUDA link cache"
-rm -rf "$cuda_cache_fixture"
+rm -rf "$cuda_link_fixture"
 installer_source_backend_functions="$(
   awk '
     /^llama_cpp_source_backend\(\) \{/ { capture = 1 }
@@ -316,6 +301,9 @@ grep -F 'export CUDA_LIBRARY_PATH=' <<<"$shell_source_build" >/dev/null ||
   fail "Unix source build does not expose validated CUDA libraries to Cargo"
 grep -F 'export CUDA_PATH=' <<<"$shell_source_build" >/dev/null ||
   fail "Unix source build does not expose the validated CUDA root to Cargo"
+grep -F 'export_llama_cpp_cuda_link_search "$cuda_library_dirs"' \
+  <<<"$shell_source_build" >/dev/null ||
+  fail "Unix source build does not expose validated CUDA libraries to rustc"
 grep -F 'mayhem-cli/llama-cpp-metal' <<<"$shell_source_build" >/dev/null ||
   fail "Unix source acceleration change removed the existing macOS Metal build"
 grep -F 'SOURCE_LLAMA_CPP_BACKEND="metal"' <<<"$shell_source_build" >/dev/null ||

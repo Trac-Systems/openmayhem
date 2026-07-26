@@ -2192,32 +2192,29 @@ llama_cpp_cuda_library_dirs() {
   printf '%s\n' "$joined"
 }
 
-refresh_llama_cpp_cuda_link_cache() {
-  local source_dir="$1"
-  local release_dir="$2"
-  local library_dirs="$3"
-  local output library_dir matched
-  local -a outputs=() required_dirs=()
-
-  shopt -s nullglob
-  outputs=("$release_dir"/build/llama-cpp-sys-*/output)
-  shopt -u nullglob
-  ((${#outputs[@]} > 0)) || return 0
+export_llama_cpp_cuda_link_search() {
+  local library_dirs="$1"
+  local library_dir flag separator=$'\x1f'
+  local -a required_dirs=()
 
   IFS=':' read -r -a required_dirs <<< "$library_dirs"
-  for output in "${outputs[@]}"; do
-    matched=1
-    for library_dir in "${required_dirs[@]}"; do
-      if ! grep -Fqx "cargo:rustc-link-search=native=$library_dir" "$output"; then
-        matched=0
-        break
-      fi
-    done
-    [[ "$matched" == "1" ]] && return 0
+  for library_dir in "${required_dirs[@]}"; do
+    [[ -d "$library_dir" ]] || continue
+    flag="-Lnative=$library_dir"
+    if [[ -n "${CARGO_ENCODED_RUSTFLAGS:-}" ]]; then
+      case "${separator}${CARGO_ENCODED_RUSTFLAGS}${separator}" in
+        *"${separator}${flag}${separator}"*) ;;
+        *)
+          export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS}${separator}${flag}"
+          ;;
+      esac
+    else
+      case " ${RUSTFLAGS:-} " in
+        *" $flag "*) ;;
+        *) export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }$flag" ;;
+      esac
+    fi
   done
-
-  log "refreshing stale llama.cpp CUDA link discovery"
-  (cd "$source_dir" && cargo clean -p llama-cpp-sys-2)
 }
 
 llama_cpp_vulkan_toolkit_usable() {
@@ -2442,10 +2439,7 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
         ;;
     esac
     log "using validated CUDA Toolkit $cuda_toolkit_root with static libraries from $cuda_library_dirs"
-    refresh_llama_cpp_cuda_link_cache \
-      "$ROOT_DIR" \
-      "$RELEASE_DIR" \
-      "$cuda_library_dirs"
+    export_llama_cpp_cuda_link_search "$cuda_library_dirs"
   fi
   log "building release binaries"
   (cd "$ROOT_DIR" && cargo "${cargo_args[@]}")
