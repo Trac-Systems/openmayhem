@@ -1366,6 +1366,34 @@ llama_cpp_cuda_library_dirs() {
   printf '%s\n' "$joined"
 }
 
+refresh_llama_cpp_cuda_link_cache() {
+  local source_dir="$1"
+  local release_dir="$2"
+  local library_dirs="$3"
+  local output library_dir matched
+  local -a outputs=() required_dirs=()
+
+  shopt -s nullglob
+  outputs=("$release_dir"/build/llama-cpp-sys-*/output)
+  shopt -u nullglob
+  ((${#outputs[@]} > 0)) || return 0
+
+  IFS=':' read -r -a required_dirs <<< "$library_dirs"
+  for output in "${outputs[@]}"; do
+    matched=1
+    for library_dir in "${required_dirs[@]}"; do
+      if ! grep -Fqx "cargo:rustc-link-search=native=$library_dir" "$output"; then
+        matched=0
+        break
+      fi
+    done
+    [[ "$matched" == "1" ]] && return 0
+  done
+
+  log "refreshing stale llama.cpp CUDA link discovery"
+  (cd "$source_dir" && cargo clean -p llama-cpp-sys-2)
+}
+
 llama_cpp_vulkan_toolkit_usable() {
   local library_dir
 
@@ -1603,6 +1631,14 @@ install_from_source() {
           ;;
       esac
       log "using validated CUDA Toolkit $cuda_toolkit_root with static libraries from $cuda_library_dirs"
+      target_root="${CARGO_TARGET_DIR:-$SOURCE_DIR/target}"
+      if [[ "$target_root" != /* ]]; then
+        target_root="$SOURCE_DIR/$target_root"
+      fi
+      refresh_llama_cpp_cuda_link_cache \
+        "$SOURCE_DIR" \
+        "$target_root/release" \
+        "$cuda_library_dirs"
     fi
   else
     die "unsupported source-install host: $(uname -s)"
