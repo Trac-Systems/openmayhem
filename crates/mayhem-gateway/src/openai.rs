@@ -4670,7 +4670,7 @@ fn gateway_reporting_requirements_for_route(
                 is_text_generation || modalities.iter().any(|modality| modality == "embedding"),
             );
             let output_tokens = if is_text_generation {
-                DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS
+                gateway_reporting_text_output_tokens(model)
             } else {
                 0
             };
@@ -4721,8 +4721,7 @@ fn gateway_reporting_requirements_for_route(
                 required_modalities: modalities,
                 modality_load,
                 min_ctx: if is_text_generation {
-                    u32::try_from(input_tokens.saturating_add(DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS))
-                        .unwrap_or(u32::MAX)
+                    u32::try_from(input_tokens.saturating_add(output_tokens)).unwrap_or(u32::MAX)
                 } else {
                     1
                 },
@@ -4735,6 +4734,38 @@ fn gateway_reporting_requirements_for_route(
             }
         })
         .collect()
+}
+
+fn gateway_reporting_text_output_tokens(model: &GatewayModel) -> u64 {
+    model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .filter(|contract| {
+            matches!(
+                contract.family.as_str(),
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+                    | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+            )
+        })
+        .filter_map(|contract| {
+            ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+                .into_iter()
+                .filter_map(|path| {
+                    contract
+                        .request_attribute_specs
+                        .get(path)
+                        .and_then(|spec| spec.default.as_ref())
+                        .and_then(Value::as_u64)
+                        .filter(|tokens| *tokens > 0)
+                })
+                .max()
+        })
+        .min()
+        .unwrap_or(DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS)
 }
 
 fn gateway_reporting_modality_shapes(
@@ -38241,6 +38272,46 @@ mod tests {
             );
             assert_eq!(!reporting_keys.is_empty(), expected, "{gate:?} eligibility");
         }
+    }
+
+    #[test]
+    fn gateway_reporting_uses_the_signed_text_output_default() {
+        let mut model = test_routed_model(1);
+        model.mayhem.caps.ctx = 1_024;
+        let contract = model
+            .mayhem
+            .adapter
+            .endpoint_families
+            .first_mut()
+            .expect("test chat contract");
+        for path in ["max_tokens", "max_completion_tokens"] {
+            contract
+                .request_attribute_specs
+                .get_mut(path)
+                .expect("signed output-token attribute")
+                .default = Some(json!(128));
+        }
+        let route = &model.mayhem.route_candidates[0];
+        let now = now_millis_u64();
+        let mut heartbeat = heartbeat_for_route(&model, route, now);
+        heartbeat.caps.ctx = 1_024;
+        heartbeat.sig = "aa".repeat(64);
+        let state = GatewayState::from_models(vec![model.clone()])
+            .with_provider_heartbeats(vec![heartbeat]);
+
+        let requirements = gateway_reporting_requirements_for_route(&state, &model, route, now);
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0].output_tokens, 128);
+        assert_eq!(requirements[0].min_ctx, 129);
+
+        let entries = state
+            .provider_table
+            .lock_recover("provider table")
+            .entries(now);
+        assert_eq!(
+            gateway_model_live_route_keys(&state, &model, &entries, now),
+            BTreeSet::from([route_key(route)])
+        );
     }
 
     #[test]

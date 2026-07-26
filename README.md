@@ -78,7 +78,7 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.56` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.57` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -87,7 +87,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.56
+git checkout --detach v0.2.57
 ./install.sh --from-source
 ```
 
@@ -96,7 +96,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.56
+git checkout --detach v0.2.57
 .\install.ps1 -FromSource
 ```
 
@@ -755,7 +755,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 | `Tongyi-MAI/Z-Image-Turbo` | Image | B/C | **live** |
 | `google/gemma-4-E4B-it` | LLM, small + vision, laptop/CPU-friendly | A/B | **live** |
 | `HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive` (`@nvfp4`) | LLM, uncensored, 262K ctx | C | **live** |
-| `Cactus-Compute/needle` | Deterministic tools-only specialist, 30.4M, CPU/CUDA | A | release in progress |
+| `Cactus-Compute/needle` | Deterministic tools-only specialist, 30.4M, CPU/CUDA | A | **live** |
 | `NousResearch/Hermes-3-Llama-3.1-70B` (`@mlx-4bit`) | LLM, 70B, 128K ctx | D | onboarding |
 | `openai/gpt-oss-20b` | LLM, agentic | B | onboarding |
 | `Qwen/Qwen3.6-35B-A3B` | LLM, MoE, 262K ctx | C | onboarding |
@@ -859,7 +859,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.56` is source-only. The GitHub release contains the tagged source, not
+`v0.2.57` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -867,7 +867,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.56
+git checkout --detach v0.2.57
 ./install.sh --from-source
 ```
 
@@ -876,7 +876,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.56
+git checkout --detach v0.2.57
 .\install.ps1 -FromSource
 ```
 
@@ -895,6 +895,11 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 `mayhem down` deliberately drains and leaves those registrations.
 
 ## Development
+
+The `0.2.57` source release makes live route reporting use each text endpoint's
+signed default output-token allowance. Small-context providers therefore remain
+visible when they can serve the signed default; request-specific dispatch still
+enforces the caller's actual context requirement.
 
 The `0.2.56` source release makes functional startup probes honor each signed
 endpoint's output-token range. A model whose endpoint minimum exceeds the
@@ -915,10 +920,16 @@ ceiling. Needle has exactly two canonical markets: `needle-cpu` on Linux,
 Windows x86_64, and Apple Silicon macOS, and `needle-gpu` for CUDA on supported
 Linux aarch64/x86_64 and Windows x86_64 hosts with NVIDIA driver r580 or newer.
 Needle GPU means CUDA, not Metal/MPS. Apple MPS measured
-about 2.5 decode tok/s cold and 10.7 warm, so it is intentionally ineligible;
-Apple CPU measured about 260-277 decode tok/s. Prior measurements were about
-89.7 cold/166 warm decode tok/s on `.70` CUDA, 122-149 on Windows CPU, and
-64-78 on `.70` CPU.
+about 2.5 decode tok/s cold and 10.7 warm, so it is intentionally ineligible.
+The focused M5 CPU proof measured 3,087 prefill / 309 decode tok/s for one
+tool and 8,964 prefill / 329 decode tok/s for two parallel tools. Windows CPU
+measured 2,675 prefill / 126 decode tok/s for one tool and 4,933 prefill /
+159 decode tok/s for two parallel tools. Prior GB10 measurements were about
+89.7 cold / 166 warm decode tok/s on CUDA and 64-78 decode tok/s on CPU.
+The immutable ten-model catalog, four Needle T1/T2 CPU/CUDA markets, and a
+permanent CUDA provider are live. A paid TAP request returned the correct
+parallel-safe tool call with nonzero usage and exactly one final signed
+receipt/ACK.
 
 The release also adds a forward-reader gate for future catalog engines while carrying
 the current PAYOUTFREE, ATTAUTO, FLOWRATE,

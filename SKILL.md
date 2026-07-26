@@ -65,14 +65,14 @@ aggregate admission refusal or compensate with an undocumented memory override.
 ## 3. Install
 
 ### 3.1 Get the code — exact source release (MANDATORY rule)
-- `v0.2.56` is source-only. Never invent or offer a native archive URL: the release has no unsigned
+- `v0.2.57` is source-only. Never invent or offer a native archive URL: the release has no unsigned
   OpenMayhem executable assets. Clone the exact release tag and build it locally.
 
   **macOS/Linux:**
   ```bash
   git clone https://github.com/Trac-Systems/openmayhem.git
   cd openmayhem
-  git checkout --detach v0.2.56
+  git checkout --detach v0.2.57
   ./install.sh --from-source
   ```
 
@@ -80,7 +80,7 @@ aggregate admission refusal or compensate with an undocumented memory override.
   ```powershell
   git clone https://github.com/Trac-Systems/openmayhem.git
   Set-Location openmayhem
-  git checkout --detach v0.2.56
+  git checkout --detach v0.2.57
   .\install.ps1 -FromSource
   ```
 On updated source checkouts, `mayhem up` verifies and, when needed, deterministically repairs only
@@ -497,9 +497,12 @@ serve, `heartbeat.live=true`, `gateway.ok=true`, `gateway.route_count>0`, and th
   `needle-gpu` is CUDA-only on Linux aarch64/x86_64 and Windows x86_64 hosts and
   requires NVIDIA driver r580 or newer for its frozen CUDA 13 runtime. There are exactly
   two markets; Apple Metal/MPS is not a third market and must not be mapped to `needle-gpu`.
-- **Measured decode:** Apple MPS was about 2.5 tok/s cold and 10.7 warm, while Apple CPU was
-  about 260-277 tok/s, so MPS is intentionally ineligible. Prior measurements were about
-  89.7 tok/s cold and 166 warm on `.70` CUDA, 122-149 on Windows CPU, and 64-78 on `.70` CPU.
+- **Measured throughput:** Apple MPS was about 2.5 decode tok/s cold and 10.7 warm,
+  so MPS is intentionally ineligible. M5 CPU measured 3,087 prefill / 309 decode
+  tok/s for one tool and 8,964 prefill / 329 decode tok/s for two parallel tools.
+  Windows CPU measured 2,675 prefill / 126 decode tok/s for one tool and 4,933
+  prefill / 159 decode tok/s for two parallel tools. Prior GB10 measurements were
+  about 89.7 decode tok/s cold and 166 warm on CUDA, and 64-78 on CPU.
 
 For every text-generation model, catalog `ctx_max` is a ceiling, not a required provider setting.
 A provider may commit a smaller fitting value with `--ctx`; Mayhem carries that exact value through
@@ -573,8 +576,8 @@ forwarded as-is.
 
 | Goal | Command |
 |---|---|
-| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.56 && ./install.sh --from-source` |
-| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.56; .\install.ps1 -FromSource` |
+| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.57 && ./install.sh --from-source` |
+| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.57; .\install.ps1 -FromSource` |
 | Start user gateway | `mayhem up --rail <fiat\|tap\|tnk> --yes` |
 | Start provider | `mayhem up --provider --yes` |
 | Stop and leave provider registrations | `mayhem down` |

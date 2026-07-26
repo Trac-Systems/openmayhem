@@ -15,12 +15,13 @@ routes, and revisions. Never copy an enclave ID or price from documentation:
 mayhem models --gateway
 ```
 
-## v0.2.56 runtime status
+## v0.2.57 runtime status
 
-The `0.2.56` source release preserves the canonical Needle CPU/CUDA tools-only
-runtime from `0.2.54`, fixes co-resident host/unified-memory admission, and
-makes startup probes honor signed endpoint output-token floors. Dedicated-VRAM
-reservations remain enforced. Needle has exactly two markets:
+The `0.2.57` source release preserves the canonical Needle CPU/CUDA tools-only
+runtime from `0.2.54`, fixes co-resident host/unified-memory admission, makes
+startup probes honor signed endpoint output-token floors, and reports live
+small-context routes against the endpoint's signed output-token default instead
+of a global allowance. Dedicated-VRAM reservations remain enforced. Needle has exactly two markets:
 `needle-cpu` across Linux, Windows x86_64, and Apple Silicon macOS, and
 CUDA-only `needle-gpu` on supported
 Linux aarch64/x86_64 and Windows x86_64 hosts. Apple Metal/MPS is not eligible for the GPU market. The release
@@ -648,10 +649,12 @@ replace the signed projector.
 **Measured guidance**
 
 - Apple MPS decode: about 2.5 tok/s cold and 10.7 tok/s warm.
-- Apple CPU decode: about 260-277 tok/s.
-- `.70` CUDA decode: about 89.7 tok/s cold and 166 tok/s warm.
-- Windows CPU decode: about 122-149 tok/s.
-- `.70` CPU decode: about 64-78 tok/s.
+- M5 Apple CPU, one tool: 3,087 prefill tok/s and 309 decode tok/s.
+- M5 Apple CPU, two parallel tools: 8,964 prefill tok/s and 329 decode tok/s.
+- GB10 CUDA decode: about 89.7 tok/s cold and 166 tok/s warm.
+- Windows CPU, one tool: 2,675 prefill tok/s and 126 decode tok/s.
+- Windows CPU, two parallel tools: 4,933 prefill tok/s and 159 decode tok/s.
+- GB10 CPU decode: about 64-78 tok/s.
 
 Apple CPU materially outperformed MPS in the measured proof, so providers on
 Apple Silicon use `needle-cpu`.
