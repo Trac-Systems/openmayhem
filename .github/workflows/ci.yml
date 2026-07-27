@@ -41,6 +41,9 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Test Python worker cancellation cleanup
+        run: python3 -m unittest crates/mayhem-engine/tests/worker_cancellation_test.py
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D clippy::correctness -D clippy::suspicious
 

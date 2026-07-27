@@ -41,11 +41,12 @@ def finish_request(request_id):
     global completed_request_id
     with cancelled_requests_lock:
         completed_request_id = max(completed_request_id, int(request_id))
-        cancelled_requests.difference_update(
-            request_id
-            for request_id in cancelled_requests
-            if request_id <= completed_request_id
-        )
+        completed_cancellations = {
+            cancelled_id
+            for cancelled_id in cancelled_requests
+            if cancelled_id <= completed_request_id
+        }
+        cancelled_requests.difference_update(completed_cancellations)
 
 
 def check_cancelled(request_id):
