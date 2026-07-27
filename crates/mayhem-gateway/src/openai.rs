@@ -32,10 +32,9 @@ use crate::{
         DEFAULT_CANARY_MATCH_MIN_BPS, MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS,
     },
     failover::{
-        effective_context_floor, midstream_stalled_after, route_wait_millis,
-        x_mayhem_hedge_requested, FailoverPolicy, RedispatchMode, SessionFailoverState,
-        SessionPriceAu, DEFAULT_MAX_OPEN_ATTEMPTS, DEFAULT_OPEN_TIMEOUT_MILLIS,
-        DEFAULT_PROVIDER_COOLOFF_MILLIS,
+        effective_context_floor, midstream_stalled_after, x_mayhem_hedge_requested, FailoverPolicy,
+        RedispatchMode, SessionFailoverState, SessionPriceAu, DEFAULT_MAX_OPEN_ATTEMPTS,
+        DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_COOLOFF_MILLIS,
     },
     job_store::{
         gateway_job_id, BeginGatewayJob, GatewayJobArtifact, GatewayJobListEntry, GatewayJobLookup,
@@ -18690,6 +18689,7 @@ async fn run_embedding_with_route_retry(
     inputs: &[String],
     options: GatewayRequestOptions,
 ) -> Result<GatewayEmbeddingRun, ApiError> {
+    let deadline = RouteWaitDeadline::new(options.max_wait_ms);
     let requirements = request_requirements_for_embedding(
         state,
         model,
@@ -18712,6 +18712,7 @@ async fn run_embedding_with_route_retry(
         model,
         &options,
         &requirements,
+        deadline,
         eligible_routes,
         || ordered_route_candidates_for_embedding_with_options(state, model, inputs, &options),
     )
@@ -18739,8 +18740,11 @@ async fn run_embedding_with_route_retry(
         ));
     }
 
-    let attempt_count =
-        preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut recovery = RouteAdmissionRecovery::new(
+        deadline,
+        route_retry_total_attempt_limit(state, model, &options),
+    );
+    let mut pending_routes = eligible_routes;
     let mut attempt_options = options.clone();
     let mut billing = options.billing.clone().unwrap_or_else(|| {
         GatewayBillingContext::initial(logical_billing_id_for(
@@ -18750,12 +18754,48 @@ async fn run_embedding_with_route_retry(
     });
     attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
-    for attempt_index in 0..attempt_count {
-        let route = eligible_routes.get(attempt_index).copied();
+    loop {
+        if !recovery.can_attempt()
+            || (recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero())
+        {
+            break;
+        }
+        pending_routes = recovery.filter_routes(state, pending_routes);
+        if pending_routes.is_empty() && recovery.has_capacity_waiters() {
+            pending_routes = wait_for_capacity_recovery(
+                state,
+                &recovery,
+                || {
+                    ordered_route_candidates_for_embedding_with_options(
+                        state,
+                        model,
+                        inputs,
+                        &attempt_options,
+                    )
+                },
+                Duration::from_millis(ROUTE_WAIT_POLL_MS),
+            )
+            .await;
+        }
+        let route = pending_routes.first().copied();
+        if route.is_none()
+            && ((!model.mayhem.route_candidates.is_empty() || !state.dev_session_shim)
+                || recovery.dev_route_attempted)
+        {
+            break;
+        }
+        recovery.begin_attempt(route);
         let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
             Ok(admission) => admission,
             Err(err) => {
+                recovery.exhaust(route);
                 last_retryable_error = Some(err);
+                pending_routes = ordered_route_candidates_for_embedding_with_options(
+                    state,
+                    model,
+                    inputs,
+                    &attempt_options,
+                );
                 continue;
             }
         };
@@ -18789,9 +18829,24 @@ async fn run_embedding_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
+                if let Some(refusal) = terminal_balance_refusal(&err) {
+                    return Err(refusal);
+                }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
+                let is_capacity = capacity_refusal(&err);
                 last_retryable_error = Some(err.message);
+                if is_capacity {
+                    recovery.record_capacity_refusal(state, route);
+                } else {
+                    recovery.exhaust(route);
+                }
+                pending_routes = ordered_route_candidates_for_embedding_with_options(
+                    state,
+                    model,
+                    inputs,
+                    &attempt_options,
+                );
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -18800,9 +18855,13 @@ async fn run_embedding_with_route_retry(
         }
     }
 
+    if recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero() {
+        return Err(route_wait_expired_error(&options));
+    }
     Err(ApiError::bad_gateway(
         format!(
-            "all {attempt_count} route attempt(s) failed before spend; last error: {}",
+            "all {} route attempt(s) failed before spend; last error: {}",
+            recovery.attempts_made,
             last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
         ),
         Some("model"),
@@ -18815,6 +18874,7 @@ async fn run_image_generation_with_route_retry(
     request: &ImageGenerationRequest,
     options: GatewayRequestOptions,
 ) -> Result<GatewayImageGenerationRun, ApiError> {
+    let deadline = RouteWaitDeadline::new(options.max_wait_ms);
     let requirements = request_requirements_for_image_generation(
         state,
         model,
@@ -18833,6 +18893,7 @@ async fn run_image_generation_with_route_retry(
         model,
         &options,
         &requirements,
+        deadline,
         eligible_routes,
         || {
             ordered_route_candidates_for_image_generation_with_options(
@@ -18864,8 +18925,11 @@ async fn run_image_generation_with_route_retry(
         ));
     }
 
-    let attempt_count =
-        preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut recovery = RouteAdmissionRecovery::new(
+        deadline,
+        route_retry_total_attempt_limit(state, model, &options),
+    );
+    let mut pending_routes = eligible_routes;
     let mut attempt_options = options.clone();
     let mut billing = options.billing.clone().unwrap_or_else(|| {
         GatewayBillingContext::initial(logical_billing_id_for(
@@ -18875,12 +18939,48 @@ async fn run_image_generation_with_route_retry(
     });
     attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
-    for attempt_index in 0..attempt_count {
-        let route = eligible_routes.get(attempt_index).copied();
+    loop {
+        if !recovery.can_attempt()
+            || (recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero())
+        {
+            break;
+        }
+        pending_routes = recovery.filter_routes(state, pending_routes);
+        if pending_routes.is_empty() && recovery.has_capacity_waiters() {
+            pending_routes = wait_for_capacity_recovery(
+                state,
+                &recovery,
+                || {
+                    ordered_route_candidates_for_image_generation_with_options(
+                        state,
+                        model,
+                        request,
+                        &attempt_options,
+                    )
+                },
+                Duration::from_millis(ROUTE_WAIT_POLL_MS),
+            )
+            .await;
+        }
+        let route = pending_routes.first().copied();
+        if route.is_none()
+            && ((!model.mayhem.route_candidates.is_empty() || !state.dev_session_shim)
+                || recovery.dev_route_attempted)
+        {
+            break;
+        }
+        recovery.begin_attempt(route);
         let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
             Ok(admission) => admission,
             Err(err) => {
+                recovery.exhaust(route);
                 last_retryable_error = Some(err);
+                pending_routes = ordered_route_candidates_for_image_generation_with_options(
+                    state,
+                    model,
+                    request,
+                    &attempt_options,
+                );
                 continue;
             }
         };
@@ -18922,9 +19022,24 @@ async fn run_image_generation_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
+                if let Some(refusal) = terminal_balance_refusal(&err) {
+                    return Err(refusal);
+                }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
+                let is_capacity = capacity_refusal(&err);
                 last_retryable_error = Some(err.message);
+                if is_capacity {
+                    recovery.record_capacity_refusal(state, route);
+                } else {
+                    recovery.exhaust(route);
+                }
+                pending_routes = ordered_route_candidates_for_image_generation_with_options(
+                    state,
+                    model,
+                    request,
+                    &attempt_options,
+                );
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -18933,9 +19048,13 @@ async fn run_image_generation_with_route_retry(
         }
     }
 
+    if recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero() {
+        return Err(route_wait_expired_error(&options));
+    }
     Err(ApiError::bad_gateway(
         format!(
-            "all {attempt_count} route attempt(s) failed before spend; last error: {}",
+            "all {} route attempt(s) failed before spend; last error: {}",
+            recovery.attempts_made,
             last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
         ),
         Some("model"),
@@ -18948,6 +19067,7 @@ async fn run_audio_speech_with_route_retry(
     request: &AudioSpeechRequest,
     options: GatewayRequestOptions,
 ) -> Result<GatewayAudioSpeechRun, ApiError> {
+    let deadline = RouteWaitDeadline::new(options.max_wait_ms);
     let requirements = request_requirements_for_audio_speech(
         state,
         model,
@@ -18966,6 +19086,7 @@ async fn run_audio_speech_with_route_retry(
         model,
         &options,
         &requirements,
+        deadline,
         eligible_routes,
         || ordered_route_candidates_for_audio_speech_with_options(state, model, request, &options),
     )
@@ -18993,8 +19114,11 @@ async fn run_audio_speech_with_route_retry(
         ));
     }
 
-    let attempt_count =
-        preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut recovery = RouteAdmissionRecovery::new(
+        deadline,
+        route_retry_total_attempt_limit(state, model, &options),
+    );
+    let mut pending_routes = eligible_routes;
     let mut attempt_options = options.clone();
     let mut billing = options.billing.clone().unwrap_or_else(|| {
         GatewayBillingContext::initial(logical_billing_id_for(
@@ -19004,12 +19128,48 @@ async fn run_audio_speech_with_route_retry(
     });
     attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
-    for attempt_index in 0..attempt_count {
-        let route = eligible_routes.get(attempt_index).copied();
+    loop {
+        if !recovery.can_attempt()
+            || (recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero())
+        {
+            break;
+        }
+        pending_routes = recovery.filter_routes(state, pending_routes);
+        if pending_routes.is_empty() && recovery.has_capacity_waiters() {
+            pending_routes = wait_for_capacity_recovery(
+                state,
+                &recovery,
+                || {
+                    ordered_route_candidates_for_audio_speech_with_options(
+                        state,
+                        model,
+                        request,
+                        &attempt_options,
+                    )
+                },
+                Duration::from_millis(ROUTE_WAIT_POLL_MS),
+            )
+            .await;
+        }
+        let route = pending_routes.first().copied();
+        if route.is_none()
+            && ((!model.mayhem.route_candidates.is_empty() || !state.dev_session_shim)
+                || recovery.dev_route_attempted)
+        {
+            break;
+        }
+        recovery.begin_attempt(route);
         let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
             Ok(admission) => admission,
             Err(err) => {
+                recovery.exhaust(route);
                 last_retryable_error = Some(err);
+                pending_routes = ordered_route_candidates_for_audio_speech_with_options(
+                    state,
+                    model,
+                    request,
+                    &attempt_options,
+                );
                 continue;
             }
         };
@@ -19051,9 +19211,24 @@ async fn run_audio_speech_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
+                if let Some(refusal) = terminal_balance_refusal(&err) {
+                    return Err(refusal);
+                }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
+                let is_capacity = capacity_refusal(&err);
                 last_retryable_error = Some(err.message);
+                if is_capacity {
+                    recovery.record_capacity_refusal(state, route);
+                } else {
+                    recovery.exhaust(route);
+                }
+                pending_routes = ordered_route_candidates_for_audio_speech_with_options(
+                    state,
+                    model,
+                    request,
+                    &attempt_options,
+                );
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -19061,9 +19236,13 @@ async fn run_audio_speech_with_route_retry(
             }
         }
     }
+    if recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero() {
+        return Err(route_wait_expired_error(&options));
+    }
     Err(ApiError::bad_gateway(
         format!(
-            "all {attempt_count} route attempt(s) failed before spend; last error: {}",
+            "all {} route attempt(s) failed before spend; last error: {}",
+            recovery.attempts_made,
             last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
         ),
         Some("model"),
@@ -19076,6 +19255,7 @@ async fn run_audio_transcription_with_route_retry(
     request: &AudioTranscriptionRequest,
     options: GatewayRequestOptions,
 ) -> Result<GatewayAudioTranscriptionRun, ApiError> {
+    let deadline = RouteWaitDeadline::new(options.max_wait_ms);
     let requirements = request_requirements_for_audio_transcription(
         state,
         model,
@@ -19095,6 +19275,7 @@ async fn run_audio_transcription_with_route_retry(
         model,
         &options,
         &requirements,
+        deadline,
         eligible_routes,
         || {
             ordered_route_candidates_for_audio_transcription_with_options(
@@ -19126,8 +19307,11 @@ async fn run_audio_transcription_with_route_retry(
         ));
     }
 
-    let attempt_count =
-        preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut recovery = RouteAdmissionRecovery::new(
+        deadline,
+        route_retry_total_attempt_limit(state, model, &options),
+    );
+    let mut pending_routes = eligible_routes;
     let mut attempt_options = options.clone();
     let mut billing = options.billing.clone().unwrap_or_else(|| {
         GatewayBillingContext::initial(logical_billing_id_for(
@@ -19137,12 +19321,48 @@ async fn run_audio_transcription_with_route_retry(
     });
     attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
-    for attempt_index in 0..attempt_count {
-        let route = eligible_routes.get(attempt_index).copied();
+    loop {
+        if !recovery.can_attempt()
+            || (recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero())
+        {
+            break;
+        }
+        pending_routes = recovery.filter_routes(state, pending_routes);
+        if pending_routes.is_empty() && recovery.has_capacity_waiters() {
+            pending_routes = wait_for_capacity_recovery(
+                state,
+                &recovery,
+                || {
+                    ordered_route_candidates_for_audio_transcription_with_options(
+                        state,
+                        model,
+                        request,
+                        &attempt_options,
+                    )
+                },
+                Duration::from_millis(ROUTE_WAIT_POLL_MS),
+            )
+            .await;
+        }
+        let route = pending_routes.first().copied();
+        if route.is_none()
+            && ((!model.mayhem.route_candidates.is_empty() || !state.dev_session_shim)
+                || recovery.dev_route_attempted)
+        {
+            break;
+        }
+        recovery.begin_attempt(route);
         let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
             Ok(admission) => admission,
             Err(err) => {
+                recovery.exhaust(route);
                 last_retryable_error = Some(err);
+                pending_routes = ordered_route_candidates_for_audio_transcription_with_options(
+                    state,
+                    model,
+                    request,
+                    &attempt_options,
+                );
                 continue;
             }
         };
@@ -19184,9 +19404,24 @@ async fn run_audio_transcription_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
+                if let Some(refusal) = terminal_balance_refusal(&err) {
+                    return Err(refusal);
+                }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
+                let is_capacity = capacity_refusal(&err);
                 last_retryable_error = Some(err.message);
+                if is_capacity {
+                    recovery.record_capacity_refusal(state, route);
+                } else {
+                    recovery.exhaust(route);
+                }
+                pending_routes = ordered_route_candidates_for_audio_transcription_with_options(
+                    state,
+                    model,
+                    request,
+                    &attempt_options,
+                );
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -19194,9 +19429,13 @@ async fn run_audio_transcription_with_route_retry(
             }
         }
     }
+    if recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero() {
+        return Err(route_wait_expired_error(&options));
+    }
     Err(ApiError::bad_gateway(
         format!(
-            "all {attempt_count} route attempt(s) failed before spend; last error: {}",
+            "all {} route attempt(s) failed before spend; last error: {}",
+            recovery.attempts_made,
             last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
         ),
         Some("model"),
@@ -19209,6 +19448,7 @@ async fn run_artifact_generation_with_route_retry(
     request: &ArtifactGenerationRequest,
     options: GatewayRequestOptions,
 ) -> Result<GatewayArtifactGenerationRun, ApiError> {
+    let deadline = RouteWaitDeadline::new(options.max_wait_ms);
     let requirements = request_requirements_for_artifact_generation(
         state,
         model,
@@ -19236,6 +19476,7 @@ async fn run_artifact_generation_with_route_retry(
         model,
         &options,
         &requirements,
+        deadline,
         eligible_routes,
         || {
             ordered_route_candidates_for_artifact_generation_with_options(
@@ -19267,8 +19508,11 @@ async fn run_artifact_generation_with_route_retry(
         ));
     }
 
-    let attempt_count =
-        preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut recovery = RouteAdmissionRecovery::new(
+        deadline,
+        route_retry_total_attempt_limit(state, model, &options),
+    );
+    let mut pending_routes = eligible_routes;
     let mut attempt_options = options.clone();
     let mut billing = options.billing.clone().unwrap_or_else(|| {
         GatewayBillingContext::initial(logical_billing_id_for(
@@ -19278,12 +19522,48 @@ async fn run_artifact_generation_with_route_retry(
     });
     attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
-    for attempt_index in 0..attempt_count {
-        let route = eligible_routes.get(attempt_index).copied();
+    loop {
+        if !recovery.can_attempt()
+            || (recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero())
+        {
+            break;
+        }
+        pending_routes = recovery.filter_routes(state, pending_routes);
+        if pending_routes.is_empty() && recovery.has_capacity_waiters() {
+            pending_routes = wait_for_capacity_recovery(
+                state,
+                &recovery,
+                || {
+                    ordered_route_candidates_for_artifact_generation_with_options(
+                        state,
+                        model,
+                        request,
+                        &attempt_options,
+                    )
+                },
+                Duration::from_millis(ROUTE_WAIT_POLL_MS),
+            )
+            .await;
+        }
+        let route = pending_routes.first().copied();
+        if route.is_none()
+            && ((!model.mayhem.route_candidates.is_empty() || !state.dev_session_shim)
+                || recovery.dev_route_attempted)
+        {
+            break;
+        }
+        recovery.begin_attempt(route);
         let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
             Ok(admission) => admission,
             Err(err) => {
+                recovery.exhaust(route);
                 last_retryable_error = Some(err);
+                pending_routes = ordered_route_candidates_for_artifact_generation_with_options(
+                    state,
+                    model,
+                    request,
+                    &attempt_options,
+                );
                 continue;
             }
         };
@@ -19324,9 +19604,24 @@ async fn run_artifact_generation_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
+                if let Some(refusal) = terminal_balance_refusal(&err) {
+                    return Err(refusal);
+                }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
+                let is_capacity = capacity_refusal(&err);
                 last_retryable_error = Some(err.message);
+                if is_capacity {
+                    recovery.record_capacity_refusal(state, route);
+                } else {
+                    recovery.exhaust(route);
+                }
+                pending_routes = ordered_route_candidates_for_artifact_generation_with_options(
+                    state,
+                    model,
+                    request,
+                    &attempt_options,
+                );
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -19334,9 +19629,13 @@ async fn run_artifact_generation_with_route_retry(
             }
         }
     }
+    if recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero() {
+        return Err(route_wait_expired_error(&options));
+    }
     Err(ApiError::bad_gateway(
         format!(
-            "all {attempt_count} route attempt(s) failed before spend; last error: {}",
+            "all {} route attempt(s) failed before spend; last error: {}",
+            recovery.attempts_made,
             last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
         ),
         Some("model"),
@@ -19403,19 +19702,16 @@ fn preferred_provider_refusal_error(
     ))
 }
 
-fn preferred_route_attempt_count(
+fn route_retry_total_attempt_limit(
     state: &GatewayState,
     model: &GatewayModel,
     options: &GatewayRequestOptions,
-    eligible_routes: usize,
 ) -> usize {
-    if eligible_routes == 0 {
-        1
-    } else if state.preferred_provider_order(model, options).is_some() {
-        eligible_routes
-    } else {
-        eligible_routes.min(usize::from(DEFAULT_MAX_OPEN_ATTEMPTS))
-    }
+    let default_limit = usize::from(DEFAULT_MAX_OPEN_ATTEMPTS);
+    state
+        .preferred_provider_order(model, options)
+        .map(|providers| providers.len().max(default_limit))
+        .unwrap_or(default_limit)
 }
 
 fn no_eligible_route_error(
@@ -19587,6 +19883,184 @@ struct RouteWaitOutcome<'a> {
     waited: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RouteWaitDeadline {
+    expires_at: Instant,
+}
+
+impl RouteWaitDeadline {
+    fn new(max_wait_ms: u64) -> Self {
+        Self {
+            expires_at: Instant::now()
+                + Duration::from_millis(max_wait_ms.min(MAX_ROUTE_MAX_WAIT_MS)),
+        }
+    }
+
+    fn remaining(self) -> Duration {
+        self.expires_at.saturating_duration_since(Instant::now())
+    }
+}
+
+#[derive(Debug)]
+struct RouteAdmissionRecovery {
+    deadline: RouteWaitDeadline,
+    total_attempt_limit: usize,
+    attempted_route_keys: BTreeSet<ProviderKey>,
+    attempted_providers: BTreeSet<String>,
+    exhausted_route_keys: BTreeSet<ProviderKey>,
+    capacity_refusal_generations: BTreeMap<ProviderKey, Option<u64>>,
+    dev_route_attempted: bool,
+    attempts_made: usize,
+}
+
+impl RouteAdmissionRecovery {
+    fn new(deadline: RouteWaitDeadline, total_attempt_limit: usize) -> Self {
+        Self {
+            deadline,
+            total_attempt_limit: total_attempt_limit.max(1),
+            attempted_route_keys: BTreeSet::new(),
+            attempted_providers: BTreeSet::new(),
+            exhausted_route_keys: BTreeSet::new(),
+            capacity_refusal_generations: BTreeMap::new(),
+            dev_route_attempted: false,
+            attempts_made: 0,
+        }
+    }
+
+    fn filter_routes<'a>(
+        &self,
+        state: &GatewayState,
+        routes: Vec<&'a GatewayRouteCandidate>,
+    ) -> Vec<&'a GatewayRouteCandidate> {
+        let table = state.provider_table.lock_recover("provider table");
+        let mut first_provider_routes = Vec::new();
+        let mut alternate_provider_routes = Vec::new();
+        let mut recovered_routes = Vec::new();
+        for route in routes {
+            let key = route_key(route);
+            if self.exhausted_route_keys.contains(&key) {
+                continue;
+            }
+            let recovered = match self.capacity_refusal_generations.get(&key) {
+                None => false,
+                Some(Some(refused_generation)) => {
+                    if !table
+                        .heartbeat_received_at_millis(&key)
+                        .is_some_and(|current| current > *refused_generation)
+                    {
+                        continue;
+                    }
+                    true
+                }
+                Some(None) => {
+                    if table.heartbeat_received_at_millis(&key).is_none() {
+                        continue;
+                    }
+                    true
+                }
+            };
+            if recovered || self.attempted_route_keys.contains(&key) {
+                recovered_routes.push(route);
+            } else if self.attempted_providers.contains(&key.provider) {
+                alternate_provider_routes.push(route);
+            } else {
+                first_provider_routes.push(route);
+            }
+        }
+        first_provider_routes.extend(alternate_provider_routes);
+        first_provider_routes.extend(recovered_routes);
+        first_provider_routes
+    }
+
+    fn filter_owned_routes(
+        &self,
+        state: &GatewayState,
+        routes: Vec<GatewayRouteCandidate>,
+    ) -> Vec<GatewayRouteCandidate> {
+        let table = state.provider_table.lock_recover("provider table");
+        let mut first_provider_routes = Vec::new();
+        let mut alternate_provider_routes = Vec::new();
+        let mut recovered_routes = Vec::new();
+        for route in routes {
+            let key = route_key(&route);
+            if self.exhausted_route_keys.contains(&key) {
+                continue;
+            }
+            let recovered = match self.capacity_refusal_generations.get(&key) {
+                None => false,
+                Some(Some(refused_generation)) => {
+                    if !table
+                        .heartbeat_received_at_millis(&key)
+                        .is_some_and(|current| current > *refused_generation)
+                    {
+                        continue;
+                    }
+                    true
+                }
+                Some(None) => {
+                    if table.heartbeat_received_at_millis(&key).is_none() {
+                        continue;
+                    }
+                    true
+                }
+            };
+            if recovered || self.attempted_route_keys.contains(&key) {
+                recovered_routes.push(route);
+            } else if self.attempted_providers.contains(&key.provider) {
+                alternate_provider_routes.push(route);
+            } else {
+                first_provider_routes.push(route);
+            }
+        }
+        first_provider_routes.extend(alternate_provider_routes);
+        first_provider_routes.extend(recovered_routes);
+        first_provider_routes
+    }
+
+    fn can_attempt(&self) -> bool {
+        self.attempts_made < self.total_attempt_limit
+    }
+
+    fn begin_attempt(&mut self, route: Option<&GatewayRouteCandidate>) {
+        self.attempts_made = self.attempts_made.saturating_add(1);
+        let Some(route) = route else {
+            self.dev_route_attempted = true;
+            return;
+        };
+        let key = route_key(route);
+        self.attempted_providers.insert(key.provider.clone());
+        self.attempted_route_keys.insert(key.clone());
+    }
+
+    fn record_capacity_refusal(
+        &mut self,
+        state: &GatewayState,
+        route: Option<&GatewayRouteCandidate>,
+    ) {
+        if let Some(route) = route {
+            let key = route_key(route);
+            let refused_generation = state
+                .provider_table
+                .lock_recover("provider table")
+                .heartbeat_received_at_millis(&key);
+            self.capacity_refusal_generations
+                .insert(key, refused_generation);
+        }
+    }
+
+    fn exhaust(&mut self, route: Option<&GatewayRouteCandidate>) {
+        if let Some(route) = route {
+            let key = route_key(route);
+            self.capacity_refusal_generations.remove(&key);
+            self.exhausted_route_keys.insert(key);
+        }
+    }
+
+    fn has_capacity_waiters(&self) -> bool {
+        !self.capacity_refusal_generations.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct KnownRouteCooloff {
     until_millis: u64,
@@ -19597,6 +20071,7 @@ async fn wait_for_eligible_routes<'a, F>(
     model: &'a GatewayModel,
     options: &GatewayRequestOptions,
     requirements: &RequestRequirements,
+    deadline: RouteWaitDeadline,
     routes: Vec<&'a GatewayRouteCandidate>,
     refresh: F,
 ) -> RouteWaitOutcome<'a>
@@ -19608,6 +20083,7 @@ where
         model,
         options,
         requirements,
+        deadline,
         routes,
         refresh,
         Duration::from_millis(ROUTE_WAIT_POLL_MS),
@@ -19620,6 +20096,7 @@ async fn wait_for_eligible_routes_with_poll<'a, F>(
     model: &'a GatewayModel,
     options: &GatewayRequestOptions,
     requirements: &RequestRequirements,
+    deadline: RouteWaitDeadline,
     mut routes: Vec<&'a GatewayRouteCandidate>,
     mut refresh: F,
     poll_interval: Duration,
@@ -19627,7 +20104,7 @@ async fn wait_for_eligible_routes_with_poll<'a, F>(
 where
     F: FnMut() -> Vec<&'a GatewayRouteCandidate>,
 {
-    if options.max_wait_ms == 0 {
+    if options.max_wait_ms == 0 || deadline.remaining().is_zero() {
         return RouteWaitOutcome {
             routes,
             waited: false,
@@ -19667,22 +20144,17 @@ where
             waited: false,
         };
     }
-    let max_wait = Duration::from_millis(route_wait_millis(
-        options.max_wait_ms.min(MAX_ROUTE_MAX_WAIT_MS),
-        now_millis,
-        known_cooloff.as_ref().map(|cooloff| cooloff.until_millis),
-    ));
+    let max_wait = deadline.remaining();
     if max_wait.is_zero() {
         return RouteWaitOutcome {
             routes,
             waited: false,
         };
     }
-    let started = Instant::now();
     let mut waited = false;
-    while started.elapsed() < max_wait {
+    while !deadline.remaining().is_zero() {
         waited = true;
-        let remaining = max_wait.saturating_sub(started.elapsed());
+        let remaining = deadline.remaining();
         let nap = remaining.min(poll_interval.max(Duration::from_millis(1)));
         tokio::time::sleep(nap).await;
         routes = refresh();
@@ -19694,6 +20166,52 @@ where
         routes = refresh();
     }
     RouteWaitOutcome { routes, waited }
+}
+
+async fn wait_for_capacity_recovery<'a, F>(
+    state: &GatewayState,
+    recovery: &RouteAdmissionRecovery,
+    mut refresh: F,
+    poll_interval: Duration,
+) -> Vec<&'a GatewayRouteCandidate>
+where
+    F: FnMut() -> Vec<&'a GatewayRouteCandidate>,
+{
+    let mut routes = recovery.filter_routes(state, refresh());
+    while routes.is_empty() && !recovery.deadline.remaining().is_zero() {
+        let nap = recovery
+            .deadline
+            .remaining()
+            .min(poll_interval.max(Duration::from_millis(1)));
+        tokio::time::sleep(nap).await;
+        routes = recovery.filter_routes(state, refresh());
+    }
+    routes
+}
+
+async fn wait_for_owned_capacity_recovery<F>(
+    state: &GatewayState,
+    recovery: &RouteAdmissionRecovery,
+    mut refresh: F,
+    poll_interval: Duration,
+) -> Vec<GatewayRouteCandidate>
+where
+    F: FnMut() -> Vec<GatewayRouteCandidate>,
+{
+    let mut routes = recovery.filter_owned_routes(state, refresh());
+    while routes.is_empty() && !recovery.deadline.remaining().is_zero() {
+        let nap = recovery
+            .deadline
+            .remaining()
+            .min(poll_interval.max(Duration::from_millis(1)));
+        tokio::time::sleep(nap).await;
+        routes = recovery.filter_owned_routes(state, refresh());
+    }
+    routes
+}
+
+fn capacity_refusal(err: &GatewaySessionError) -> bool {
+    err.clean_refusal_code.as_deref() == Some("CAPACITY")
 }
 
 fn enqueue_one_pending_tpm_route(
@@ -20300,6 +20818,7 @@ async fn prepare_live_direct_chat_session(
     created: u64,
     config: ScBridgeGatewaySessionConfig,
 ) -> Result<LiveDirectChatSession, ApiError> {
+    let deadline = RouteWaitDeadline::new(options.max_wait_ms);
     let requirements = request_requirements_for_chat(
         &state,
         &model,
@@ -20319,6 +20838,7 @@ async fn prepare_live_direct_chat_session(
         &model,
         &options,
         &requirements,
+        deadline,
         eligible_route_refs,
         || ordered_route_candidates_for_request_with_options(&state, &model, &request, &options),
     )
@@ -20357,22 +20877,75 @@ async fn prepare_live_direct_chat_session(
             eligible_route_refs.insert(0, winner_route);
         }
     }
-    let eligible_routes = eligible_route_refs.into_iter().cloned().collect::<Vec<_>>();
-
-    let attempt_count =
-        preferred_route_attempt_count(&state, &model, &options, eligible_routes.len());
+    let mut recovery = RouteAdmissionRecovery::new(
+        deadline,
+        route_retry_total_attempt_limit(&state, &model, &options),
+    );
+    let mut pending_routes = eligible_route_refs.into_iter().cloned().collect::<Vec<_>>();
+    let mut attempt_options = options.clone();
+    let mut billing = options.billing.clone().unwrap_or_else(|| {
+        GatewayBillingContext::initial(logical_billing_id_for(
+            &model.id,
+            &chat_prompt_text(&request),
+        ))
+    });
+    attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
-    for attempt_index in 0..attempt_count {
-        let route = eligible_routes.get(attempt_index);
-        let modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
-            Ok(admission) => admission,
-            Err(err) => {
-                last_retryable_error = Some(err);
-                continue;
-            }
-        };
-        let invocation =
-            state.prepare_chat_invocation_for_route(&model, &request, route, &options)?;
+    loop {
+        if !recovery.can_attempt()
+            || (recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero())
+        {
+            break;
+        }
+        pending_routes = recovery.filter_owned_routes(&state, pending_routes);
+        if pending_routes.is_empty() && recovery.has_capacity_waiters() {
+            pending_routes = wait_for_owned_capacity_recovery(
+                &state,
+                &recovery,
+                || {
+                    ordered_route_candidates_for_request_with_options(
+                        &state,
+                        &model,
+                        &request,
+                        &attempt_options,
+                    )
+                    .into_iter()
+                    .cloned()
+                    .collect()
+                },
+                Duration::from_millis(ROUTE_WAIT_POLL_MS),
+            )
+            .await;
+        }
+        let route = pending_routes.first().cloned();
+        if route.is_none() {
+            break;
+        }
+        recovery.begin_attempt(route.as_ref());
+        let modality_admission =
+            match state.try_acquire_modality_admission(route.as_ref(), &requirements) {
+                Ok(admission) => admission,
+                Err(err) => {
+                    recovery.exhaust(route.as_ref());
+                    last_retryable_error = Some(err);
+                    pending_routes = ordered_route_candidates_for_request_with_options(
+                        &state,
+                        &model,
+                        &request,
+                        &attempt_options,
+                    )
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                    continue;
+                }
+            };
+        let invocation = state.prepare_chat_invocation_for_route(
+            &model,
+            &request,
+            route.as_ref(),
+            &attempt_options,
+        )?;
         let invocation = invocation.with_hedge_probe_outcome(&hedge_probe);
         let attempt_started = Instant::now();
         match open_live_direct_chat_session(&config, &model, &request, &invocation).await {
@@ -20392,9 +20965,9 @@ async fn prepare_live_direct_chat_session(
                     state,
                     model,
                     request,
-                    options,
+                    options: attempt_options,
                     invocation,
-                    route: route.cloned(),
+                    route,
                     attempt_started,
                     bridge,
                     provider,
@@ -20410,22 +20983,43 @@ async fn prepare_live_direct_chat_session(
                 });
             }
             Err(err) if err.retryable => {
-                record_route_attempt_error(&state, route, attempt_started.elapsed(), &err);
+                record_route_attempt_error(&state, route.as_ref(), attempt_started.elapsed(), &err);
                 if let Some(refusal) = terminal_balance_refusal(&err) {
                     return Err(refusal);
                 }
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
+                let is_capacity = capacity_refusal(&err);
                 last_retryable_error = Some(err.message);
+                if is_capacity {
+                    recovery.record_capacity_refusal(&state, route.as_ref());
+                } else {
+                    recovery.exhaust(route.as_ref());
+                }
+                pending_routes = ordered_route_candidates_for_request_with_options(
+                    &state,
+                    &model,
+                    &request,
+                    &attempt_options,
+                )
+                .into_iter()
+                .cloned()
+                .collect();
             }
             Err(err) => {
-                record_route_attempt_error(&state, route, attempt_started.elapsed(), &err);
+                record_route_attempt_error(&state, route.as_ref(), attempt_started.elapsed(), &err);
                 return Err(ApiError::bad_gateway(err.message, Some("model")));
             }
         }
     }
 
+    if recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero() {
+        return Err(route_wait_expired_error(&options));
+    }
     Err(ApiError::bad_gateway(
         format!(
-            "all {attempt_count} route attempt(s) failed before streaming; last error: {}",
+            "all {} route attempt(s) failed before streaming; last error: {}",
+            recovery.attempts_made,
             last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
         ),
         Some("model"),
@@ -21979,6 +22573,7 @@ async fn run_chat_with_route_retry(
     request: &ChatCompletionRequest,
     options: GatewayRequestOptions,
 ) -> Result<GatewaySessionRun, ApiError> {
+    let deadline = RouteWaitDeadline::new(options.max_wait_ms);
     let initial_requirements = request_requirements_for_chat(
         state,
         model,
@@ -21998,6 +22593,7 @@ async fn run_chat_with_route_retry(
         model,
         &options,
         &initial_requirements,
+        deadline,
         eligible_routes,
         || ordered_route_candidates_for_request_with_options(state, model, request, &options),
     )
@@ -22045,24 +22641,42 @@ async fn run_chat_with_route_retry(
             eligible_routes.insert(0, winner_route);
         }
     }
-    let max_attempts = preferred_route_attempt_count(state, model, &options, eligible_routes.len());
+    let mut recovery = RouteAdmissionRecovery::new(
+        deadline,
+        route_retry_total_attempt_limit(state, model, &options),
+    );
+    let mut pending_routes = eligible_routes;
     let mut last_retryable_error = None;
     let mut partials = Vec::new();
-    let mut attempted_route_keys = BTreeSet::new();
-    let mut attempts_made = 0usize;
 
-    for attempt_index in 0..max_attempts {
-        if attempt_index > 0 {
-            eligible_routes = ordered_route_candidates_for_request_with_options(
-                state,
-                model,
-                &attempt_request,
-                &attempt_options,
-            );
+    loop {
+        if !recovery.can_attempt()
+            || (recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero())
+        {
+            break;
         }
-        eligible_routes.retain(|candidate| !attempted_route_keys.contains(&route_key(candidate)));
-        let route = eligible_routes.first().copied();
+        pending_routes = recovery.filter_routes(state, pending_routes);
+        if pending_routes.is_empty() && recovery.has_capacity_waiters() {
+            pending_routes = wait_for_capacity_recovery(
+                state,
+                &recovery,
+                || {
+                    ordered_route_candidates_for_request_with_options(
+                        state,
+                        model,
+                        &attempt_request,
+                        &attempt_options,
+                    )
+                },
+                Duration::from_millis(ROUTE_WAIT_POLL_MS),
+            )
+            .await;
+        }
+        let route = pending_routes.first().copied();
         if route.is_none() {
+            if recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero() {
+                break;
+            }
             if let Some(error) =
                 chat_context_capacity_error(state, model, &attempt_request, &attempt_options)
             {
@@ -22071,11 +22685,11 @@ async fn run_chat_with_route_retry(
             if !model.mayhem.route_candidates.is_empty() || !state.dev_session_shim {
                 break;
             }
+            if recovery.dev_route_attempted {
+                break;
+            }
         }
-        if let Some(route) = route {
-            attempted_route_keys.insert(route_key(route));
-        }
-        attempts_made = attempts_made.saturating_add(1);
+        recovery.begin_attempt(route);
         let requirements = request_requirements_for_chat(
             state,
             model,
@@ -22088,7 +22702,14 @@ async fn run_chat_with_route_retry(
         let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
             Ok(admission) => admission,
             Err(err) => {
+                recovery.exhaust(route);
                 last_retryable_error = Some(err);
+                pending_routes = ordered_route_candidates_for_request_with_options(
+                    state,
+                    model,
+                    &attempt_request,
+                    &attempt_options,
+                );
                 continue;
             }
         };
@@ -22123,6 +22744,13 @@ async fn run_chat_with_route_retry(
                         last_retryable_error = Some(message);
                         billing = billing.after_attempt(None);
                         attempt_options.billing = Some(billing.clone());
+                        recovery.exhaust(route);
+                        pending_routes = ordered_route_candidates_for_request_with_options(
+                            state,
+                            model,
+                            &attempt_request,
+                            &attempt_options,
+                        );
                         continue;
                     }
                 }
@@ -22161,6 +22789,7 @@ async fn run_chat_with_route_retry(
                     .partial
                     .as_ref()
                     .map(|partial| partial.provider_receipt.body.clone());
+                let is_capacity = capacity_refusal(&err);
                 if let Some(partial) = err.partial.as_ref() {
                     state.record_partial_provider_receipt(
                         model,
@@ -22181,6 +22810,17 @@ async fn run_chat_with_route_retry(
                 billing = billing.after_attempt(billed_receipt.as_ref());
                 attempt_options.billing = Some(billing.clone());
                 last_retryable_error = Some(err.message);
+                if is_capacity {
+                    recovery.record_capacity_refusal(state, route);
+                } else {
+                    recovery.exhaust(route);
+                }
+                pending_routes = ordered_route_candidates_for_request_with_options(
+                    state,
+                    model,
+                    &attempt_request,
+                    &attempt_options,
+                );
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -22189,10 +22829,14 @@ async fn run_chat_with_route_retry(
         }
     }
 
+    if recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero() {
+        return Err(route_wait_expired_error(&options));
+    }
     Err(ApiError::bad_gateway(
         format!(
-            "all {attempts_made} route attempt(s) failed before spend; last error: {}",
-            last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
+            "all {attempts_made} route attempt(s) failed before spend; last error: {last_error}",
+            attempts_made = recovery.attempts_made,
+            last_error = last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
         ),
         Some("model"),
     ))
@@ -34419,6 +35063,7 @@ mod tests {
             &model,
             &options,
             &requirements,
+            RouteWaitDeadline::new(options.max_wait_ms),
             Vec::new(),
             || {
                 if calls_for_refresh.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1 {
@@ -34444,6 +35089,7 @@ mod tests {
             &model,
             &instant,
             &requirements,
+            RouteWaitDeadline::new(instant.max_wait_ms),
             Vec::new(),
             || {
                 refresh_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -34470,6 +35116,7 @@ mod tests {
             &model,
             &options,
             &media_requirements,
+            RouteWaitDeadline::new(options.max_wait_ms),
             Vec::new(),
             || {
                 refresh_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -34498,7 +35145,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sole_known_route_cooloff_outlives_generic_wait_then_retries() {
+    async fn sole_known_route_cooloff_respects_request_deadline() {
         let model = test_routed_model(1);
         let providers = Arc::new(Mutex::new(Vec::new()));
         let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
@@ -34518,18 +35165,24 @@ mod tests {
         };
         let started = Instant::now();
 
-        let run = run_chat_with_route_retry(&state, &model, &test_chat_request(&model.id), options)
-            .await
-            .expect("the sole route should be retried after its known cooldown");
+        let error =
+            match run_chat_with_route_retry(&state, &model, &test_chat_request(&model.id), options)
+                .await
+            {
+                Ok(_) => panic!("a cooloff beyond max_wait must not extend the request deadline"),
+                Err(error) => error,
+            };
 
-        assert!(started.elapsed() >= Duration::from_millis(20));
-        assert_eq!(run.result.output.content.as_deref(), Some("ok"));
-        assert_eq!(providers.lock().expect("providers lock").len(), 1);
-        assert!(!state.route_provider_in_cooloff(route, now_millis_u64()));
+        assert!(started.elapsed() >= Duration::from_millis(8));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("X-Mayhem-Max-Wait-Ms (10)"));
+        assert!(providers.lock().expect("providers lock").is_empty());
+        assert!(state.route_provider_in_cooloff(route, now_millis_u64()));
     }
 
     #[tokio::test]
-    async fn all_known_route_cooloffs_wait_for_the_earliest_recovery() {
+    async fn all_known_route_cooloffs_respect_request_deadline() {
         let model = test_routed_model(2);
         let providers = Arc::new(Mutex::new(Vec::new()));
         let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
@@ -34555,14 +35208,19 @@ mod tests {
         };
         let started = Instant::now();
 
-        let run = run_chat_with_route_retry(&state, &model, &test_chat_request(&model.id), options)
-            .await
-            .expect("the earliest recovering route should be retried");
+        let error =
+            match run_chat_with_route_retry(&state, &model, &test_chat_request(&model.id), options)
+                .await
+            {
+                Ok(_) => panic!("route cooloffs must not extend the request deadline"),
+                Err(error) => error,
+            };
 
-        assert!(started.elapsed() >= Duration::from_millis(20));
-        assert!(started.elapsed() < Duration::from_millis(300));
-        assert_eq!(run.result.output.content.as_deref(), Some("ok"));
-        assert_eq!(providers.lock().expect("providers lock").len(), 1);
+        assert!(started.elapsed() >= Duration::from_millis(8));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("X-Mayhem-Max-Wait-Ms (10)"));
+        assert!(providers.lock().expect("providers lock").is_empty());
     }
 
     #[tokio::test]
@@ -36894,6 +37552,8 @@ mod tests {
     #[derive(Debug)]
     struct CleanRefusalThenSuccessBackend {
         providers: Arc<Mutex<Vec<String>>>,
+        billing_attempts: Arc<Mutex<Vec<u32>>>,
+        refused: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl GatewaySessionBackend for CleanRefusalThenSuccessBackend {
@@ -36908,14 +37568,22 @@ mod tests {
             invocation: &'a GatewaySessionInvocation,
         ) -> GatewaySessionFuture<'a> {
             Box::pin(async move {
+                self.billing_attempts
+                    .lock()
+                    .expect("billing attempts lock")
+                    .push(invocation.spend_voucher.body.billing_attempt);
                 let attempt = {
                     let mut providers = self.providers.lock().expect("providers lock");
                     providers.push(invocation.provider_pubkey.clone().unwrap_or_default());
                     providers.len()
                 };
                 if attempt == 1 {
-                    return Err(GatewaySessionError::clean_refusal(
+                    if let Some(refused) = self.refused.as_ref() {
+                        refused.notify_one();
+                    }
+                    return Err(GatewaySessionError::clean_refusal_with_code(
                         "provider rejected session with CAPACITY: provider full",
+                        Some("CAPACITY"),
                     ));
                 }
                 let prompt_tokens = rough_tokens(&chat_prompt_text(request));
@@ -36959,6 +37627,15 @@ mod tests {
 
     impl ProviderReportedFailureBackend {
         fn error(&self, context: &str, retryable: bool) -> GatewaySessionError {
+            if clean_provider_reject_code(self.code) {
+                return GatewaySessionError::clean_refusal_with_code(
+                    format!(
+                        "provider rejected {context} with {}: focused route-runner refusal",
+                        self.code
+                    ),
+                    Some(self.code),
+                );
+            }
             provider_reported_session_error(
                 &json!({
                     "t": "s.error",
@@ -37487,8 +38164,8 @@ mod tests {
             model.mayhem.route_candidates[1].provider
         );
         assert_eq!(
-            preferred_route_attempt_count(&state, &model, &options, selected.len()),
-            1
+            route_retry_total_attempt_limit(&state, &model, &options),
+            usize::from(DEFAULT_MAX_OPEN_ATTEMPTS)
         );
     }
 
@@ -41402,16 +42079,18 @@ mod tests {
         Image,
         Speech,
         Transcription,
+        AudioArtifact,
         VideoArtifact,
     }
 
     impl FocusedRouteRunner {
-        const ALL: [Self; 6] = [
+        const ALL: [Self; 7] = [
             Self::Chat,
             Self::Embedding,
             Self::Image,
             Self::Speech,
             Self::Transcription,
+            Self::AudioArtifact,
             Self::VideoArtifact,
         ];
 
@@ -41422,6 +42101,7 @@ mod tests {
                 Self::Image => &["image"],
                 Self::Speech => &["audio"],
                 Self::Transcription => &["audio", "text"],
+                Self::AudioArtifact => &["audio"],
                 Self::VideoArtifact => &["video"],
             }
         }
@@ -41444,6 +42124,7 @@ mod tests {
                 FocusedRouteRunner::Embedding => "embedding",
                 FocusedRouteRunner::Image => "image",
                 FocusedRouteRunner::Speech | FocusedRouteRunner::Transcription => "audio",
+                FocusedRouteRunner::AudioArtifact => "audio",
                 FocusedRouteRunner::VideoArtifact => "video",
                 FocusedRouteRunner::Chat => "text",
             }
@@ -41571,15 +42252,31 @@ mod tests {
                         .await,
                 )
             }
-            FocusedRouteRunner::VideoArtifact => {
+            FocusedRouteRunner::AudioArtifact | FocusedRouteRunner::VideoArtifact => {
+                let is_video = matches!(runner, FocusedRouteRunner::VideoArtifact);
                 let request = ArtifactGenerationRequest {
                     model: model.id.clone(),
-                    prompt: "a precise test video".to_owned(),
-                    endpoint_family: mayhem_proto::ENDPOINT_OPENAI_VIDEOS.to_owned(),
+                    prompt: if is_video {
+                        "a precise test video"
+                    } else {
+                        "a precise test audio artifact"
+                    }
+                    .to_owned(),
+                    endpoint_family: if is_video {
+                        mayhem_proto::ENDPOINT_OPENAI_VIDEOS
+                    } else {
+                        mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+                    }
+                    .to_owned(),
                     contract_request: json!({}),
                     effective_specialities: BTreeMap::new(),
-                    output_modality: "video".to_owned(),
-                    transport_kind: "video_generation".to_owned(),
+                    output_modality: if is_video { "video" } else { "audio" }.to_owned(),
+                    transport_kind: if is_video {
+                        "video_generation"
+                    } else {
+                        "audio_generation"
+                    }
+                    .to_owned(),
                     duration_seconds: 1,
                     requested_frame_count: 8,
                     frame_count: 8,
@@ -41794,9 +42491,12 @@ mod tests {
     async fn route_retry_clean_refusal_reroutes_without_failure_penalty() {
         let model = test_routed_model(2);
         let providers = Arc::new(Mutex::new(Vec::new()));
+        let billing_attempts = Arc::new(Mutex::new(Vec::new()));
         let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
             Arc::new(CleanRefusalThenSuccessBackend {
                 providers: providers.clone(),
+                billing_attempts: billing_attempts.clone(),
+                refused: None,
             }),
         );
         let request = test_chat_request(&model.id);
@@ -41810,6 +42510,13 @@ mod tests {
         let providers = providers.lock().expect("providers lock").clone();
         assert_eq!(providers.len(), 2);
         assert_ne!(providers[0], providers[1]);
+        assert_eq!(
+            billing_attempts
+                .lock()
+                .expect("billing attempts lock")
+                .as_slice(),
+            &[0, 1]
+        );
         let refused_route = model
             .mayhem
             .route_candidates
@@ -41829,6 +42536,283 @@ mod tests {
         assert_eq!(refused_entry.observed.consecutive_failures, 0);
         assert_eq!(refused_entry.observed.ewma_error_rate, 0.0);
         assert_eq!(refused_entry.observed.circuit_open_until_millis, None);
+    }
+
+    #[tokio::test]
+    async fn single_route_capacity_waits_for_new_heartbeat_then_retries_without_spend() {
+        let model = test_routed_model(1);
+        let route = model.mayhem.route_candidates[0].clone();
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let billing_attempts = Arc::new(Mutex::new(Vec::new()));
+        let refused = Arc::new(tokio::sync::Notify::new());
+        let state = Arc::new(
+            test_gateway_state_from_models(vec![model.clone()]).with_session_backend(Arc::new(
+                CleanRefusalThenSuccessBackend {
+                    providers: providers.clone(),
+                    billing_attempts: billing_attempts.clone(),
+                    refused: Some(refused.clone()),
+                },
+            )),
+        );
+        let refused_generation = state
+            .provider_table
+            .lock_recover("provider table")
+            .heartbeat_received_at_millis(&route_key(&route))
+            .expect("initial heartbeat generation");
+        let update_state = state.clone();
+        let update_model = model.clone();
+        let update_route = route.clone();
+        let updater = tokio::spawn(async move {
+            refused.notified().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let received_at = refused_generation.saturating_add(1);
+            update_state
+                .provider_table
+                .lock_recover("provider table")
+                .upsert_heartbeat(
+                    heartbeat_for_route(&update_model, &update_route, received_at),
+                    received_at,
+                );
+        });
+        let options = GatewayRequestOptions {
+            max_wait_ms: 250,
+            ..GatewayRequestOptions::default()
+        };
+
+        let run = run_chat_with_route_retry(
+            state.as_ref(),
+            &model,
+            &test_chat_request(&model.id),
+            options,
+        )
+        .await
+        .expect("new heartbeat should re-admit the same provider");
+        updater.await.expect("heartbeat updater");
+
+        assert_eq!(run.result.output.content.as_deref(), Some("recovered"));
+        assert_eq!(
+            providers.lock().expect("providers lock").as_slice(),
+            &[route.provider.clone(), route.provider.clone()]
+        );
+        assert_eq!(
+            billing_attempts
+                .lock()
+                .expect("billing attempts lock")
+                .as_slice(),
+            &[0, 1]
+        );
+        assert!(!state.route_provider_in_cooloff(&route, now_millis_u64()));
+        assert!(state.reputation_events().is_empty());
+        assert_eq!(
+            state
+                .wallet_spend
+                .lock_recover("gateway wallet spend state")
+                .reservations
+                .len(),
+            1,
+            "the successful attempt owns exactly one reservation"
+        );
+        drop(run);
+        assert!(state
+            .wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .reservations
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn single_route_capacity_expires_at_the_request_deadline_without_retrying_stale_heartbeat(
+    ) {
+        let model = test_routed_model(1);
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let billing_attempts = Arc::new(Mutex::new(Vec::new()));
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(CleanRefusalThenSuccessBackend {
+                providers: providers.clone(),
+                billing_attempts: billing_attempts.clone(),
+                refused: None,
+            }),
+        );
+        let options = GatewayRequestOptions {
+            max_wait_ms: 20,
+            ..GatewayRequestOptions::default()
+        };
+        let started = Instant::now();
+
+        let error =
+            match run_chat_with_route_retry(&state, &model, &test_chat_request(&model.id), options)
+                .await
+            {
+                Ok(_) => panic!("stale heartbeat generation must remain suppressed"),
+                Err(error) => error,
+            };
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("X-Mayhem-Max-Wait-Ms (20)"));
+        assert!(started.elapsed() >= Duration::from_millis(15));
+        assert_eq!(providers.lock().expect("providers lock").len(), 1);
+        assert_eq!(
+            billing_attempts
+                .lock()
+                .expect("billing attempts lock")
+                .as_slice(),
+            &[0]
+        );
+        assert!(state.reputation_events().is_empty());
+    }
+
+    #[test]
+    fn capacity_recovery_caps_total_attempts_and_clears_exhausted_waiters() {
+        let model = test_routed_model(1);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let route = &model.mayhem.route_candidates[0];
+        let mut recovery = RouteAdmissionRecovery::new(RouteWaitDeadline::new(100), 2);
+
+        recovery.begin_attempt(Some(route));
+        recovery.record_capacity_refusal(&state, Some(route));
+        assert!(recovery.can_attempt());
+        assert!(recovery.has_capacity_waiters());
+
+        let next_generation = state
+            .provider_table
+            .lock_recover("provider table")
+            .heartbeat_received_at_millis(&route_key(route))
+            .expect("initial heartbeat generation")
+            .saturating_add(1);
+        state
+            .provider_table
+            .lock_recover("provider table")
+            .upsert_heartbeat(
+                heartbeat_for_route(&model, route, next_generation),
+                next_generation,
+            );
+        assert_eq!(recovery.filter_routes(&state, vec![route]), vec![route]);
+
+        recovery.begin_attempt(Some(route));
+        recovery.record_capacity_refusal(&state, Some(route));
+        assert!(!recovery.can_attempt());
+        recovery.exhaust(Some(route));
+        assert!(!recovery.has_capacity_waiters());
+    }
+
+    #[test]
+    fn capacity_recovery_tries_new_providers_before_sibling_or_recovered_routes() {
+        let mut model = test_routed_model(3);
+        model.mayhem.route_candidates[1].provider =
+            model.mayhem.route_candidates[0].provider.clone();
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let first = &model.mayhem.route_candidates[0];
+        let sibling = &model.mayhem.route_candidates[1];
+        let other_provider = &model.mayhem.route_candidates[2];
+        let mut recovery = RouteAdmissionRecovery::new(
+            RouteWaitDeadline::new(100),
+            usize::from(DEFAULT_MAX_OPEN_ATTEMPTS),
+        );
+
+        recovery.begin_attempt(Some(first));
+        recovery.record_capacity_refusal(&state, Some(first));
+        let next_generation = state
+            .provider_table
+            .lock_recover("provider table")
+            .heartbeat_received_at_millis(&route_key(first))
+            .expect("initial heartbeat generation")
+            .saturating_add(1);
+        state
+            .provider_table
+            .lock_recover("provider table")
+            .upsert_heartbeat(
+                heartbeat_for_route(&model, first, next_generation),
+                next_generation,
+            );
+
+        let ordered = recovery.filter_routes(&state, vec![first, sibling, other_provider]);
+        assert_eq!(ordered, vec![other_provider, sibling, first]);
+    }
+
+    #[tokio::test]
+    async fn capacity_and_balance_semantics_cover_every_non_streaming_endpoint_runner() {
+        for runner in FocusedRouteRunner::ALL {
+            let (state, model, capacity_error) =
+                run_focused_route_runner_failure(runner, "CAPACITY").await;
+            assert_eq!(
+                capacity_error.status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{runner:?}"
+            );
+            let route = &model.mayhem.route_candidates[0];
+            assert!(
+                !state.route_provider_in_cooloff(route, now_millis_u64()),
+                "{runner:?} cooled an honest capacity refusal"
+            );
+            let entry = state
+                .provider_table
+                .lock_recover("provider table")
+                .entries(now_millis_u64())
+                .into_iter()
+                .find(|entry| entry.key == route_key(route))
+                .expect("route remains in provider table");
+            assert_eq!(entry.observed.samples, 0, "{runner:?}");
+            assert_eq!(entry.observed.consecutive_failures, 0, "{runner:?}");
+            assert!(state
+                .wallet_spend
+                .lock_recover("gateway wallet spend state")
+                .reservations
+                .is_empty());
+
+            let (_, _, balance_error) = run_focused_route_runner_failure(runner, "BALANCE").await;
+            assert_eq!(
+                balance_error.status,
+                StatusCode::PAYMENT_REQUIRED,
+                "{runner:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_owned_routes_require_a_new_heartbeat_generation_after_capacity() {
+        let model = test_routed_model(1);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let route = model.mayhem.route_candidates[0].clone();
+        let mut recovery = RouteAdmissionRecovery::new(
+            RouteWaitDeadline::new(100),
+            DEFAULT_MAX_OPEN_ATTEMPTS.into(),
+        );
+        let initial_generation = state
+            .provider_table
+            .lock_recover("provider table")
+            .heartbeat_received_at_millis(&route_key(&route))
+            .expect("initial heartbeat generation");
+        recovery.begin_attempt(Some(&route));
+        let during_attempt_generation = initial_generation.saturating_add(1);
+        state
+            .provider_table
+            .lock_recover("provider table")
+            .upsert_heartbeat(
+                heartbeat_for_route(&model, &route, during_attempt_generation),
+                during_attempt_generation,
+            );
+        recovery.record_capacity_refusal(&state, Some(&route));
+
+        assert!(recovery
+            .filter_owned_routes(&state, vec![route.clone()])
+            .is_empty());
+        let received_at = during_attempt_generation.saturating_add(1);
+        state
+            .provider_table
+            .lock_recover("provider table")
+            .upsert_heartbeat(
+                heartbeat_for_route(&model, &route, received_at),
+                received_at,
+            );
+
+        let recovered = wait_for_owned_capacity_recovery(
+            &state,
+            &recovery,
+            || model.mayhem.route_candidates.clone(),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(recovered, vec![route]);
     }
 
     #[tokio::test]

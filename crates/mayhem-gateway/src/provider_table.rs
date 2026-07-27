@@ -596,6 +596,12 @@ impl ProviderTable {
         self.upsert_heartbeat(heartbeat, received_at_millis);
     }
 
+    pub fn heartbeat_received_at_millis(&self, key: &ProviderKey) -> Option<u64> {
+        self.heartbeats
+            .get(key)
+            .map(|heartbeat| heartbeat.received_at_millis)
+    }
+
     pub fn record_observation(
         &mut self,
         key: &ProviderKey,
