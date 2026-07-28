@@ -10,6 +10,7 @@ import {
 import {
   MAYHEM_RELAY_CHANNEL,
   MAYHEM_RELAY_MAX_MESSAGE_BYTES,
+  MAYHEM_RELAY_MAX_PAYLOAD_BYTES,
   MAYHEM_RELAY_POW_EXEMPT_CONTROLS,
 } from '../features/mayhem/index.js';
 
@@ -59,7 +60,7 @@ test('relay PoW and size cap are isolated from entry and session channels', () =
     entryChannel,
     maxMessageBytes: 1_000_000,
     maxMessageBytesByChannel: {
-      [MAYHEM_RELAY_CHANNEL]: MAYHEM_RELAY_MAX_MESSAGE_BYTES,
+      [MAYHEM_RELAY_CHANNEL]: MAYHEM_RELAY_MAX_PAYLOAD_BYTES,
     },
     powEnabled: true,
     powDifficulty: 8,
@@ -73,7 +74,7 @@ test('relay PoW and size cap are isolated from entry and session channels', () =
   assert.equal(sidechannel._relayPolicyAllows(entryChannel), false);
   assert.equal(sidechannel._relayPolicyAllows(sessionChannel), false);
   assert.equal(sidechannel.relayTtl, 1);
-  assert.equal(sidechannel._maxMessageBytes(MAYHEM_RELAY_CHANNEL), 16_384);
+  assert.equal(sidechannel._maxMessageBytes(MAYHEM_RELAY_CHANNEL), MAYHEM_RELAY_MAX_PAYLOAD_BYTES);
   assert.equal(sidechannel._maxMessageBytes(entryChannel), 1_000_000);
   assert.equal(sidechannel._maxMessageBytes(sessionChannel), 1_000_000);
   assert.equal(sidechannel.rateBytesPerSecond, 64_000);
@@ -88,7 +89,9 @@ test('relay PoW and size cap are isolated from entry and session channels', () =
   assert.equal(sidechannel._buildPayload(sessionChannel, { control: 'test' }).pow, undefined);
 
   assert.equal(
-    sidechannel.broadcast(MAYHEM_RELAY_CHANNEL, { data: 'x'.repeat(20_000) }),
+    sidechannel.broadcast(MAYHEM_RELAY_CHANNEL, {
+      data: 'x'.repeat(MAYHEM_RELAY_MAX_PAYLOAD_BYTES + 1),
+    }),
     false
   );
   assert.equal(sidechannel.broadcast(sessionChannel, { data: 'x'.repeat(20_000) }), true);
@@ -98,7 +101,7 @@ test('Mayhem control envelopes bypass relay PoW but generic relay traffic still 
   const sidechannel = new Sidechannel(peer, {
     channels: [MAYHEM_RELAY_CHANNEL],
     maxMessageBytesByChannel: {
-      [MAYHEM_RELAY_CHANNEL]: MAYHEM_RELAY_MAX_MESSAGE_BYTES,
+      [MAYHEM_RELAY_CHANNEL]: MAYHEM_RELAY_MAX_PAYLOAD_BYTES,
     },
     powEnabled: true,
     powDifficulty: 8,

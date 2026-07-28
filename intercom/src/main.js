@@ -47,6 +47,7 @@ const [
     default: MayhemFeature,
     MAYHEM_RELAY_CHANNEL,
     MAYHEM_RELAY_MAX_MESSAGE_BYTES,
+    MAYHEM_RELAY_MAX_PAYLOAD_BYTES,
     MAYHEM_RELAY_POW_EXEMPT_CONTROLS,
   },
 ] = await Promise.all([
@@ -1576,7 +1577,10 @@ const sidechannel = new Sidechannel(peer, {
   debug: sidechannelDebug,
   maxMessageBytes: Number.isSafeInteger(sidechannelMaxBytes) ? sidechannelMaxBytes : undefined,
   maxMessageBytesByChannel: {
-    [MAYHEM_RELAY_CHANNEL]: mayhemRelayMaxMessageBytes,
+    [MAYHEM_RELAY_CHANNEL]: Math.max(
+      MAYHEM_RELAY_MAX_PAYLOAD_BYTES,
+      mayhemRelayMaxMessageBytes + 8_192
+    ),
   },
   muxRetryMax: sidechannelMuxRetryMax,
   muxRetryDelayMs: sidechannelMuxRetryDelayMs,

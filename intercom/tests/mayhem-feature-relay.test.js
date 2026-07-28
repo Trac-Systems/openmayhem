@@ -2472,7 +2472,10 @@ test('oversized Stripe service result returns an explicit bounded error once', a
 
   assert.equal(result.ok, false);
   assert.equal(result.status, 'rejected');
-  assert.match(result.message, /service result exceeds 16384 bytes/i);
+  assert.match(
+    result.message,
+    new RegExp(`service result exceeds ${MAYHEM_RELAY_MAX_MESSAGE_BYTES} bytes`, 'i')
+  );
   assert.equal(result.checkout_session, undefined);
   assert.deepEqual(replay, result);
   assert.equal(serviceCalls, 1);
