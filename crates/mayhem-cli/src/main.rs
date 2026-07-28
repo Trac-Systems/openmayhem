@@ -51744,7 +51744,8 @@ const RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRY_BYTES: u64 = 64 * 1024;
 const RECEIPT_SETTLEMENT_RETRY_CONCURRENCY: usize = 8;
 const RECEIPT_SETTLEMENT_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const RECEIPT_SETTLEMENT_RETRY_MAX: Duration = Duration::from_secs(60);
-const RECEIPT_SETTLEMENT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(10);
+const RECEIPT_SETTLEMENT_SUBMIT_TIMEOUT: Duration =
+    Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS);
 
 #[derive(Clone)]
 struct ReceiptSettlementOutbox {
@@ -93368,6 +93369,15 @@ esac
             assert!(delay <= RECEIPT_SETTLEMENT_RETRY_MAX);
         }
         assert!(receipt_settlement_retry_delay(5) > RECEIPT_SETTLEMENT_RETRY_INITIAL);
+    }
+
+    #[test]
+    fn receipt_settlement_submit_timeout_uses_gateway_open_budget() {
+        assert_eq!(
+            RECEIPT_SETTLEMENT_SUBMIT_TIMEOUT,
+            Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS)
+        );
+        assert!(RECEIPT_SETTLEMENT_SUBMIT_TIMEOUT > Duration::from_secs(10));
     }
 
     #[test]
