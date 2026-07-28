@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import b4a from 'b4a';
+import PeerWallet from 'trac-wallet';
 import MayhemContract, {
   CONTRACT_VERSION,
   SESSION_RECEIPT_SCHEMA_VERSION,
@@ -619,7 +620,7 @@ test('buyer expiry close is unavailable before grace and releases only after can
   assert.equal(replay.result.idempotent, true);
 });
 
-test('v17 rejects forged receipt signatures and mismatched signed bindings', async () => {
+test('v18 rejects forged receipt signatures and mismatched signed bindings', async () => {
   const ctx = await setupContract();
   const reservation = await submitReservation(ctx);
   assert.equal(reservation.result.ok, true, reservation.result.message);
@@ -667,6 +668,44 @@ test('v17 rejects forged receipt signatures and mismatched signed bindings', asy
   assert.match(
     (await submitReceipt(ctx, wrongPayout)).result.message,
     /exact targeted spend hold|terms do not match/i
+  );
+});
+
+test('v18 receipt verification does not depend on wallet hex coercion', async () => {
+  const ctx = await setupContract();
+  const reservation = await submitReservation(ctx);
+  assert.equal(reservation.result.ok, true, reservation.result.message);
+  const receipt = receiptValue(ctx, reservation);
+
+  ctx.contract.protocol.peer.wallet = {
+    verify(signature, message, publicKey) {
+      if (!b4a.isBuffer(signature) ||
+          !b4a.isBuffer(message) ||
+          !b4a.isBuffer(publicKey)) {
+        return false;
+      }
+      return PeerWallet.verify(signature, message, publicKey);
+    },
+  };
+
+  const submitted = await submitReceipt(ctx, receipt);
+  assert.equal(submitted.result.ok, true, submitted.result.message);
+});
+
+test('v18 receipt verification rejects forged signatures despite a permissive wallet wrapper', async () => {
+  const ctx = await setupContract();
+  const reservation = await submitReservation(ctx);
+  assert.equal(reservation.result.ok, true, reservation.result.message);
+  const valid = receiptValue(ctx, reservation);
+  ctx.contract.protocol.peer.wallet = { verify: () => true };
+
+  const forged = {
+    ...valid,
+    provider_sig: changedHex(valid.provider_sig),
+  };
+  assert.match(
+    (await submitReceipt(ctx, forged)).result.message,
+    /provider signature/i
   );
 });
 
@@ -1039,7 +1078,7 @@ test('empty epoch seal treats absent metadata as empty and rejects indexed recei
   assert.match(malformedSeal.message, /canonical receipts exist/i);
 });
 
-test('v17 rejects aggregate reservations and aggregate epoch apply', async () => {
+test('v18 rejects aggregate reservations and aggregate epoch apply', async () => {
   const ctx = await setupContract();
   assert.match(
     (await ctx.contract.normalizeSpendReserveValue({})).message,

@@ -87040,7 +87040,7 @@ mod tests {
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 17);
+        assert_eq!(CONTRACT_VERSION, 18);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 10);
     }
@@ -93418,6 +93418,8 @@ esac
             "locked_min_session_au": "5",
             "served_ctx": 8192,
             "required_modalities": ["text"],
+            "reservation_expires_after_epoch": 31,
+            "reservation_receipt_grace_epochs": 6,
             "ctx_bracket": "le8k",
             "ctx_bracket_table_ver": 1,
             "rules_ver": 6,
@@ -93443,6 +93445,8 @@ esac
             "rules_ver": 6,
             "served_ctx": 8192,
             "required_modalities": ["text"],
+            "reservation_expires_after_epoch": 31,
+            "reservation_receipt_grace_epochs": 6,
             "ctx_bracket": "le8k",
             "ctx_bracket_table_ver": 1,
             "max_spend_au": "1000",
@@ -93452,14 +93456,16 @@ esac
         let expected_message = concat!(
             "mayhem-targeted-spend-reservation-v1",
             "{\"payout_revision\":\"9999999999999999999999999999999999999999999999999999999999999999\",",
-            "\"reservation\":{\"at\":25200,\"contract_version\":17,\"ctx_bracket\":\"le8k\",",
+            "\"reservation\":{\"at\":25200,\"contract_version\":18,\"ctx_bracket\":\"le8k\",",
             "\"ctx_bracket_table_ver\":1,",
             "\"enclave_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
             "\"enclave_pubkey\":\"5555555555555555555555555555555555555555555555555555555555555555\",",
             "\"epoch\":7,\"max_spend_au\":\"1000\",\"model_id\":\"fixture/model\",\"price_ver\":2,",
             "\"provider\":\"3333333333333333333333333333333333333333333333333333333333333333\",",
             "\"rail\":\"tnk\",\"required_modalities\":[\"text\"],",
+            "\"reservation_expires_after_epoch\":31,",
             "\"reservation_id\":\"7777777777777777777777777777777777777777777777777777777777777777\",",
+            "\"reservation_receipt_grace_epochs\":6,",
             "\"rules_ver\":6,\"served_ctx\":8192,",
             "\"session_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
             "\"user\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
@@ -93476,7 +93482,9 @@ esac
             "\"price_ver\":2,",
             "\"provider\":\"3333333333333333333333333333333333333333333333333333333333333333\",",
             "\"rail\":\"tnk\",\"required_modalities\":[\"text\"],",
+            "\"reservation_expires_after_epoch\":31,",
             "\"reservation_id\":\"7777777777777777777777777777777777777777777777777777777777777777\",",
+            "\"reservation_receipt_grace_epochs\":6,",
             "\"rules_ver\":6,\"schema_version\":10,\"served_ctx\":8192,",
             "\"session_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
             "\"user\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
@@ -93490,7 +93498,7 @@ esac
                 "hold/targeted/tnk/",
                 "2222222222222222222222222222222222222222222222222222222222222222/7/",
                 "1111111111111111111111111111111111111111111111111111111111111111/",
-                "1d48416de361b9875397b048c24315de05da6fe68c49f3f31ee55fcdc1386608"
+                "9e47d78c1ea692060052576455edbf093412be34e537cccadf78804759290675"
             )
         );
     }

@@ -5,7 +5,7 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 17;
+export const CONTRACT_VERSION = 18;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -761,6 +761,24 @@ const stableValue = (value) => {
   return value;
 };
 const stableJson = (value) => JSON.stringify(stableValue(value));
+
+const verifyEd25519Hex = (signature, message, publicKey) => {
+  const signatureHex = String(signature ?? '').toLowerCase();
+  const publicKeyHex = String(publicKey ?? '').toLowerCase();
+  const messageBytes = b4a.isBuffer(message) ? message : b4a.from(String(message));
+  if (!/^[0-9a-f]{128}$/.test(signatureHex) ||
+      !/^[0-9a-f]{64}$/.test(publicKeyHex) ||
+      messageBytes.length === 0) {
+    return false;
+  }
+  const signatureBytes = b4a.from(signatureHex, 'hex');
+  const publicKeyBytes = b4a.from(publicKeyHex, 'hex');
+  try {
+    return PeerWallet.verify(signatureBytes, messageBytes, publicKeyBytes) === true;
+  } catch (_error) {
+    return false;
+  }
+};
 
 export const adminContractTxSigningValue = ({
   address,
@@ -3404,14 +3422,11 @@ class MayhemContract extends Contract {
     if (expectedKey instanceof Error) return expectedKey;
     if (key !== expectedKey) return new Error('Invalid record usage receipt feature key.');
     const body = normalized.receipt.body;
-    const verify = this.protocol?.peer?.wallet?.verify;
-    if (typeof verify !== 'function' ||
-        verify.call(
-          this.protocol.peer.wallet,
-          normalized.provider_sig,
-          recordUsageReceiptMessage(normalized),
-          body.provider
-        ) !== true) {
+    if (!verifyEd25519Hex(
+      normalized.provider_sig,
+      recordUsageReceiptMessage(normalized),
+      body.provider
+    )) {
       return new Error('Invalid record usage receipt provider signature.');
     }
     if (!this.verifyReceiptEnvelope(normalized.receipt)) {
@@ -20271,8 +20286,6 @@ class MayhemContract extends Contract {
   }
 
   verifyReceiptEnvelope(envelope) {
-    const verify = this.protocol?.peer?.wallet?.verify;
-    if (typeof verify !== 'function') return false;
     const signedBody = envelope.body;
     if (!signedBody || typeof signedBody !== 'object' || Array.isArray(signedBody)) return false;
     const enclaveKey = envelope.enclave_pubkey ?? (
@@ -20281,8 +20294,8 @@ class MayhemContract extends Contract {
     if (!enclaveKey) return false;
     const message = receiptMessage(signedBody);
     return (
-      verify.call(this.protocol.peer.wallet, envelope.enclave_sig, message, enclaveKey) === true &&
-      verify.call(this.protocol.peer.wallet, envelope.user_sig, message, signedBody.user) === true
+      verifyEd25519Hex(envelope.enclave_sig, message, enclaveKey) &&
+      verifyEd25519Hex(envelope.user_sig, message, signedBody.user)
     );
   }
 
