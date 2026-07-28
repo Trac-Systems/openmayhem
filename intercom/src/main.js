@@ -1214,8 +1214,8 @@ if (!Number.isSafeInteger(mayhemRelayPowDifficulty) || mayhemRelayPowDifficulty 
 }
 if (!Number.isSafeInteger(mayhemRelayMaxMessageBytes)
   || mayhemRelayMaxMessageBytes < 4_096
-  || mayhemRelayMaxMessageBytes > 65_536) {
-  throw new Error('Invalid --mayhem-relay-max-bytes. Expected integer 4096-65536.');
+  || mayhemRelayMaxMessageBytes > MAYHEM_RELAY_MAX_MESSAGE_BYTES) {
+  throw new Error(`Invalid --mayhem-relay-max-bytes. Expected integer 4096-${MAYHEM_RELAY_MAX_MESSAGE_BYTES}.`);
 }
 
 const peerDhtBootstrap = parseCsvList(
