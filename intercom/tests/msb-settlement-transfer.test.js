@@ -26,7 +26,6 @@ const amount = '0.25';
 const amountE18 = decimalStringToBigInt(amount);
 const operationId = 'b'.repeat(64);
 const txValidity = 'c'.repeat(64);
-const confirmedLength = 42;
 
 async function makeWallet() {
   const wallet = new PeerWallet({ networkPrefix: config.addressPrefix });
@@ -71,9 +70,9 @@ function makeMsb({
         shared.confirmed.has(hash) ? Buffer.from('confirmed') : null
       ),
       getSignedLength: () => shared.signedLength,
-      getTransactionConfirmedLength: async (hash) => (
-        shared.confirmed.has(hash) ? confirmedLength : null
-      ),
+      getTransactionConfirmedLength: async () => {
+        throw new Error('sparse confirmation must not scan transaction history');
+      },
     },
     broadcastPartialTransaction: async (payload) => {
       broadcasts.push(structuredClone(payload));
@@ -88,7 +87,7 @@ function makeMsb({
 }
 
 function readConfirmedTransfer(shared) {
-  return async (_msb, hash) => {
+  return async (_msb, hash, _config, confirmedLength) => {
     const payload = shared.confirmed.get(hash);
     if (!payload) return null;
     return {
@@ -159,7 +158,7 @@ test('canonical MSB payload recovers on another host without a shared journal', 
   assert.equal(hostB.broadcasts.length, 1);
   assert.deepEqual(hostB.broadcasts[0], prepared.payload);
   assert.equal(recovered.tx_hash, prepared.tx_hash);
-  assert.equal(recovered.confirmed_length, confirmedLength);
+  assert.equal(recovered.confirmed_length, shared.signedLength);
   assert.equal(recovered.rebroadcast, true);
 
   const hostC = makeMsb({ shared });

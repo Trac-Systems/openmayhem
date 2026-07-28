@@ -36,6 +36,7 @@ test('root Intercom app parses a read-only official-MSB balance helper', () => {
       '--store-name', 'balance-reader',
       '--address', 'trac1treasury',
       '--timeout-seconds', '90',
+      '--direct-peer', `${'AB'.repeat(32)},${'cd'.repeat(32)},${'ab'.repeat(32)}`,
     ]),
     {
       network: 'mainnet',
@@ -43,6 +44,7 @@ test('root Intercom app parses a read-only official-MSB balance helper', () => {
       storeName: 'balance-reader',
       address: 'trac1treasury',
       timeoutSeconds: 90,
+      directPeers: ['ab'.repeat(32), 'cd'.repeat(32)],
     }
   );
 });
@@ -96,7 +98,9 @@ test('app-owned transfer helper broadcasts and verifies exactly one canonical tr
       getFee: () => bigIntTo16ByteBuffer(10_000_000_000_000_000n),
       getIndexerSequenceState: async () => Buffer.alloc(32),
       getSigned: async (hash) => hash === txHash,
-      getTransactionConfirmedLength: async () => 77,
+      getTransactionConfirmedLength: async () => {
+        throw new Error('sparse confirmation must not scan transaction history');
+      },
       getSignedLength: () => 80,
     },
     async broadcastPartialTransaction(value) {
@@ -114,8 +118,8 @@ test('app-owned transfer helper broadcasts and verifies exactly one canonical tr
     timeoutSeconds: 1,
     stderr: { write() {} },
     buildPayload: async () => payload,
-    readConfirmedTransfer: async () => ({
-      confirmed_length: 77,
+    readConfirmedTransfer: async (_msb, _hash, _config, confirmedLength) => ({
+      confirmed_length: confirmedLength,
       txDetails: {
         address: from,
         tro: {
@@ -129,5 +133,5 @@ test('app-owned transfer helper broadcasts and verifies exactly one canonical tr
   assert.equal(broadcasts, 1);
   assert.equal(result.command, 'transfer');
   assert.equal(result.tx_hash, txHash);
-  assert.equal(result.confirmed_length, 77);
+  assert.equal(result.confirmed_length, 80);
 });

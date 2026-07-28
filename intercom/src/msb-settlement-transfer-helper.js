@@ -12,13 +12,20 @@ import {
   bufferToBigInt,
   decimalStringToBigInt,
 } from 'trac-msb/src/utils/amountSerialization.js';
-import { getExtendedTxDetailsCommand } from 'trac-msb/src/utils/cliCommands.js';
+import { get_confirmed_tx_info } from 'trac-msb/src/utils/cli.js';
 import { OperationType } from 'trac-msb/src/utils/constants.js';
-import { normalizeTransferOperation } from 'trac-msb/src/utils/normalizers.js';
+import {
+  normalizeDecodedPayloadForJson,
+  normalizeTransferOperation,
+} from 'trac-msb/src/utils/normalizers.js';
 import {
   createMayhemMsbConfig,
   MAYHEM_NETWORK_ENV,
 } from './network-config.js';
+import {
+  openMsbWithDirectPeers,
+  parseCanonicalMsbDirectPeers,
+} from './msb-direct-peers.js';
 
 const JOURNAL_SCHEMA_VERSION = 1;
 const MAX_TRANSFER_AMOUNT = 0xffffffffffffffffffffffffffffffffn;
@@ -172,15 +179,22 @@ async function waitForPreflight(msb, timeoutSeconds, stderr, sleepFn) {
 async function waitForConfirmation(msb, txHash, timeoutSeconds, sleepFn) {
   for (let waited = 0; waited <= timeoutSeconds; waited += 1) {
     if (await msb.state.getSigned(txHash)) {
-      return await msb.state.getTransactionConfirmedLength(txHash);
+      return msb.state.getSignedLength();
     }
     if (waited < timeoutSeconds) await sleepFn(1_000);
   }
   return null;
 }
 
-async function defaultReadConfirmedTransfer(msb, txHash, config) {
-  return await getExtendedTxDetailsCommand(msb.state, txHash, true, config);
+async function defaultReadConfirmedTransfer(msb, txHash, config, confirmedLength) {
+  const rawPayload = await get_confirmed_tx_info(msb.state, txHash);
+  if (!rawPayload) {
+    throw new Error(`No payload found for tx hash: ${txHash}`);
+  }
+  return {
+    txDetails: normalizeDecodedPayloadForJson(rawPayload.decoded, config),
+    confirmed_length: confirmedLength,
+  };
 }
 
 function requireExactKeys(value, expectedKeys, label) {
@@ -386,7 +400,12 @@ export async function executePreparedSettlementTransfer({
     );
   }
 
-  const confirmed = await readConfirmedTransfer(msb, canonicalTxHash, config);
+  const confirmed = await readConfirmedTransfer(
+    msb,
+    canonicalTxHash,
+    config,
+    confirmedLength
+  );
   const details = confirmed?.txDetails;
   if (
     details?.address !== from
@@ -545,6 +564,9 @@ export async function runSettlementTransferHelper(rawArgs, options = {}) {
   const timeoutSeconds = Number.parseInt(takeOption(args, '--timeout-seconds') ?? '180', 10);
   const maxRetries = Number.parseInt(takeOption(args, '--max-retries') ?? '3', 10);
   const expectedBalanceBefore = takeOption(args, '--expected-balance-before');
+  const directPeers = parseCanonicalMsbDirectPeers(
+    takeOption(args, '--direct-peer')
+  );
   if (args.length > 0) fail(`Unknown argument: ${args[0]}`);
   if (!/^[0-9a-f]{64}$/.test(operationId)) fail('--operation-id must be 64 lowercase hex characters.');
   if (!Number.isSafeInteger(timeoutSeconds) || timeoutSeconds <= 0) {
@@ -572,8 +594,16 @@ export async function runSettlementTransferHelper(rawArgs, options = {}) {
   console.info = redirect;
 
   const msb = options.msb ?? new MainSettlementBus(config);
+  let opened = Boolean(options.ready);
   try {
-    if (!options.ready) await msb.ready();
+    if (!options.ready) {
+      await openMsbWithDirectPeers(msb, {
+        directPeers,
+        timeoutSeconds,
+        ...options.opening,
+      });
+      opened = true;
+    }
     return await executeJournaledSettlementTransfer({
       msb,
       config,
@@ -590,7 +620,7 @@ export async function runSettlementTransferHelper(rawArgs, options = {}) {
   } finally {
     console.log = originalLog;
     console.info = originalInfo;
-    if (!options.keepOpen) {
+    if (!options.keepOpen && opened) {
       try {
         await msb.close();
       } catch (_error) {}
@@ -613,6 +643,9 @@ export async function runPreparedSettlementTransferHelper(command, rawArgs, opti
   const expectedBalanceBefore = takeOption(args, '--expected-balance-before');
   const payloadJson = takeOption(args, '--payload-json');
   const txHash = takeOption(args, '--tx-hash');
+  const directPeers = parseCanonicalMsbDirectPeers(
+    takeOption(args, '--direct-peer')
+  );
   if (args.length > 0) fail(`Unknown argument: ${args[0]}`);
   if (!Number.isSafeInteger(timeoutSeconds) || timeoutSeconds <= 0) {
     fail('--timeout-seconds must be a positive safe integer.');
@@ -652,8 +685,16 @@ export async function runPreparedSettlementTransferHelper(command, rawArgs, opti
   console.info = redirect;
 
   const msb = options.msb ?? new MainSettlementBus(config);
+  let opened = Boolean(options.ready);
   try {
-    if (!options.ready) await msb.ready();
+    if (!options.ready) {
+      await openMsbWithDirectPeers(msb, {
+        directPeers,
+        timeoutSeconds,
+        ...options.opening,
+      });
+      opened = true;
+    }
     if (command === 'settlement-transfer-prepare') {
       return await prepareSettlementTransferPayload({
         msb,
@@ -688,7 +729,7 @@ export async function runPreparedSettlementTransferHelper(command, rawArgs, opti
   } finally {
     console.log = originalLog;
     console.info = originalInfo;
-    if (!options.keepOpen) {
+    if (!options.keepOpen && opened) {
       try {
         await msb.close();
       } catch (_error) {}
@@ -746,7 +787,12 @@ export async function executeTransfer({
   if (confirmedLength === null) {
     fail(`MSB transfer ${txHash} was not confirmed before timeout`);
   }
-  const confirmed = await readConfirmedTransfer(msb, txHash, config);
+  const confirmed = await readConfirmedTransfer(
+    msb,
+    txHash,
+    config,
+    confirmedLength
+  );
   const details = confirmed?.txDetails;
   if (
     details?.address !== from ||
@@ -786,6 +832,9 @@ export async function runTransferHelper(rawArgs, options = {}) {
   const timeoutSeconds = Number.parseInt(takeOption(args, '--timeout-seconds') ?? '180', 10);
   const maxRetries = Number.parseInt(takeOption(args, '--max-retries') ?? '3', 10);
   const expectedBalanceBefore = takeOption(args, '--expected-balance-before');
+  const directPeers = parseCanonicalMsbDirectPeers(
+    takeOption(args, '--direct-peer')
+  );
   if (args.length > 0) fail(`Unknown argument: ${args[0]}`);
   if (!Number.isSafeInteger(timeoutSeconds) || timeoutSeconds <= 0) {
     fail('--timeout-seconds must be a positive safe integer.');
@@ -812,8 +861,16 @@ export async function runTransferHelper(rawArgs, options = {}) {
   console.info = redirect;
 
   const msb = options.msb ?? new MainSettlementBus(config);
+  let opened = Boolean(options.ready);
   try {
-    if (!options.ready) await msb.ready();
+    if (!options.ready) {
+      await openMsbWithDirectPeers(msb, {
+        directPeers,
+        timeoutSeconds,
+        ...options.opening,
+      });
+      opened = true;
+    }
     return await executeTransfer({
       msb,
       config,
@@ -828,7 +885,7 @@ export async function runTransferHelper(rawArgs, options = {}) {
   } finally {
     console.log = originalLog;
     console.info = originalInfo;
-    if (!options.keepOpen) {
+    if (!options.keepOpen && opened) {
       try {
         await msb.close();
       } catch (_error) {}

@@ -48757,21 +48757,28 @@ where
 
 async fn run_msb_transfer_helper_with_command<T>(
     command: &str,
-    helper_args: Vec<String>,
+    mut helper_args: Vec<String>,
 ) -> Result<T>
 where
     T: DeserializeOwned,
 {
+    add_canonical_msb_direct_peers(&mut helper_args)?;
     validate_external_helper_option_pairs(&helper_args)?;
+    let helper_timeout = msb_transfer_helper_process_timeout(command, &helper_args)?;
     let intercom_app = repo_path("intercom")?;
     let pear_runtime = resolve_pear_runtime_path()?;
-    let output = Command::new(&pear_runtime)
+    let mut process = Command::new(&pear_runtime);
+    process
+        .kill_on_drop(true)
         .arg("run")
         .arg(&intercom_app)
         .arg(format!("--msb-transfer-helper={command}"))
-        .args(&helper_args)
-        .output()
+        .args(&helper_args);
+    let output = timeout(helper_timeout, process.output())
         .await
+        .with_context(|| {
+            format!("MSB transfer helper {command} exceeded its configured process deadline")
+        })?
         .with_context(|| {
             format!(
                 "running MSB transfer helper via pear-runtime app {}",
@@ -48793,6 +48800,46 @@ where
         );
     }
     parse_msb_transfer_helper_json(&output.stdout, &output.stderr)
+}
+
+fn add_canonical_msb_direct_peers(args: &mut Vec<String>) -> Result<()> {
+    let network = external_helper_option(args, "--network");
+    if network != Some("mainnet") || external_helper_option(args, "--direct-peer").is_some() {
+        return Ok(());
+    }
+    args.extend([
+        "--direct-peer".to_owned(),
+        MAINNET_MSB_DIRECT_PEERS.join(","),
+    ]);
+    Ok(())
+}
+
+fn external_helper_option<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.chunks_exact(2)
+        .find(|pair| pair[0] == name)
+        .map(|pair| pair[1].as_str())
+}
+
+fn msb_transfer_helper_process_timeout(command: &str, args: &[String]) -> Result<Duration> {
+    let timeout_seconds = external_helper_option(args, "--timeout-seconds")
+        .context("MSB transfer helper requires --timeout-seconds")?
+        .parse::<u64>()
+        .context("MSB transfer helper --timeout-seconds must be an integer")?;
+    ensure!(
+        timeout_seconds > 0,
+        "MSB transfer helper --timeout-seconds must be positive"
+    );
+    let phases = match command {
+        "balance" | "settlement-transfer-prepare" => 2,
+        "settlement-transfer-execute" => 2,
+        "transfer" | "settlement-transfer" => 3,
+        _ => bail!("unsupported MSB transfer helper command {command}"),
+    };
+    let seconds = timeout_seconds
+        .checked_mul(phases)
+        .and_then(|value| value.checked_add(10))
+        .context("MSB transfer helper process deadline overflow")?;
+    Ok(Duration::from_secs(seconds))
 }
 
 fn validate_external_helper_option_pairs(args: &[String]) -> Result<()> {
@@ -101925,6 +101972,59 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             "--keypair".to_owned(),
             "--attacker-option".to_owned(),
         ])
+        .is_err());
+    }
+
+    #[test]
+    fn msb_helpers_receive_canonical_mainnet_direct_peers_and_a_process_deadline() {
+        let mut mainnet = vec![
+            "--network".to_owned(),
+            "mainnet".to_owned(),
+            "--timeout-seconds".to_owned(),
+            "180".to_owned(),
+        ];
+        add_canonical_msb_direct_peers(&mut mainnet).unwrap();
+        assert_eq!(
+            external_helper_option(&mainnet, "--direct-peer"),
+            Some(MAINNET_MSB_DIRECT_PEERS.join(",").as_str())
+        );
+        assert_eq!(
+            msb_transfer_helper_process_timeout("settlement-transfer-execute", &mainnet).unwrap(),
+            Duration::from_secs(370)
+        );
+
+        let mut testnet = vec![
+            "--network".to_owned(),
+            "testnet1".to_owned(),
+            "--timeout-seconds".to_owned(),
+            "30".to_owned(),
+        ];
+        add_canonical_msb_direct_peers(&mut testnet).unwrap();
+        assert_eq!(external_helper_option(&testnet, "--direct-peer"), None);
+
+        let explicit = "ab".repeat(32);
+        let mut overridden = vec![
+            "--network".to_owned(),
+            "mainnet".to_owned(),
+            "--timeout-seconds".to_owned(),
+            "30".to_owned(),
+            "--direct-peer".to_owned(),
+            explicit.clone(),
+        ];
+        add_canonical_msb_direct_peers(&mut overridden).unwrap();
+        assert_eq!(
+            external_helper_option(&overridden, "--direct-peer"),
+            Some(explicit.as_str())
+        );
+        assert!(msb_transfer_helper_process_timeout(
+            "settlement-transfer-execute",
+            &[
+                "--network".to_owned(),
+                "mainnet".to_owned(),
+                "--timeout-seconds".to_owned(),
+                "0".to_owned(),
+            ],
+        )
         .is_err());
     }
 

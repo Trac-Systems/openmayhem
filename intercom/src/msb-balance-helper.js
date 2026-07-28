@@ -6,6 +6,10 @@ import {
   createMayhemMsbConfig,
   MAYHEM_NETWORK_ENV,
 } from './network-config.js';
+import {
+  openMsbWithDirectPeers,
+  parseCanonicalMsbDirectPeers,
+} from './msb-direct-peers.js';
 
 function fail(message) {
   throw new Error(message);
@@ -34,6 +38,9 @@ export function parseRootMsbBalanceHelperArgs(rawArgs) {
   const storeName = takeOption(args, '--store-name') ?? fail('Missing --store-name.');
   const address = takeOption(args, '--address') ?? fail('Missing --address.');
   const timeoutSeconds = Number.parseInt(takeOption(args, '--timeout-seconds') ?? '180', 10);
+  const directPeers = parseCanonicalMsbDirectPeers(
+    takeOption(args, '--direct-peer')
+  );
   if (!Number.isSafeInteger(timeoutSeconds) || timeoutSeconds <= 0) {
     fail('--timeout-seconds must be a positive safe integer.');
   }
@@ -42,7 +49,14 @@ export function parseRootMsbBalanceHelperArgs(rawArgs) {
   if (!address.startsWith(prefix) || /\s/.test(address)) {
     fail(`--address must be a ${prefix} address.`);
   }
-  return { network, storesDirectory, storeName, address, timeoutSeconds };
+  return {
+    network,
+    storesDirectory,
+    storeName,
+    address,
+    timeoutSeconds,
+    directPeers,
+  };
 }
 
 function defaultStderr() {
@@ -78,8 +92,14 @@ export async function runRootMsbBalanceHelper(rawArgs, options = {}) {
   console.info = redirect;
 
   const msb = new MainSettlementBus(config);
+  let opened = false;
   try {
-    await msb.ready();
+    await openMsbWithDirectPeers(msb, {
+      directPeers: parsed.directPeers,
+      timeoutSeconds: parsed.timeoutSeconds,
+      ...options.opening,
+    });
+    opened = true;
     let entry = null;
     let validators = 0;
     for (let waited = 0; waited <= parsed.timeoutSeconds; waited += 1) {
@@ -107,8 +127,10 @@ export async function runRootMsbBalanceHelper(rawArgs, options = {}) {
   } finally {
     console.log = originalLog;
     console.info = originalInfo;
-    try {
-      await msb.close();
-    } catch (_error) {}
+    if (opened) {
+      try {
+        await msb.close();
+      } catch (_error) {}
+    }
   }
 }
