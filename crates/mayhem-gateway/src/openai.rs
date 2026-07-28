@@ -86,16 +86,19 @@ use mayhem_attestation::{
     DEFAULT_TPM_CHALLENGE_TTL_SECS,
 };
 use mayhem_bridge::{sc_bridge_session_transport, BridgeError, ScBridgeClient, ScBridgeConfig};
+#[cfg(test)]
+use mayhem_proto::record_usage_receipt_envelope;
 use mayhem_proto::{
     artifact_generation_inline_audio_load, ctx_bracket_for_tokens_in_schedule,
-    default_ctx_bracket_schedule, default_model_class, metered_output_units, payload_chunk_at,
-    payload_chunk_manifest, receipt_signing_bytes, record_usage_receipt_feature_key,
-    record_usage_receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
-    spend_voucher_signing_bytes, stable_json_bytes, tools_only_model_input_prompt_units,
-    validate_transcription_result, validated_audio_metadata, validated_wav_audio_metadata,
-    AdminAttestationPolicy, AdminEnclaveAttestationBinding, AttestationReport,
-    AttestationTrustDataRef, AttestationVerifierProfile, CheckpointPolicy, CtxBracketSchedule,
-    EndpointFamilyContract, EndpointValueType, HardwareQuoteKind, HardwareQuoteRouteAdvertisement,
+    default_ctx_bracket_schedule, default_model_class, metered_output_units,
+    parse_record_usage_receipt_envelope, payload_chunk_at, payload_chunk_manifest,
+    receipt_signing_bytes, record_usage_receipt_feature_key, record_usage_receipt_signing_bytes,
+    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
+    stable_json_bytes, tools_only_model_input_prompt_units, validate_transcription_result,
+    validated_audio_metadata, validated_wav_audio_metadata, AdminAttestationPolicy,
+    AdminEnclaveAttestationBinding, AttestationReport, AttestationTrustDataRef,
+    AttestationVerifierProfile, CheckpointPolicy, CtxBracketSchedule, EndpointFamilyContract,
+    EndpointValueType, HardwareQuoteKind, HardwareQuoteRouteAdvertisement,
     HardwareQuoteRoutePolicyBinding, ModelSpecialityDescriptor, MoneyAu, PayloadChunk,
     PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
     SessionReceipt, SpendVoucher, SpendVoucherBody, TpmActivateCredentialChallengeFrame,
@@ -18588,15 +18591,11 @@ fn validate_receipt_settlement_feature_for_receipt(
         enclave_pubkey: provider_receipt.enclave_pubkey.clone(),
         user_sig: receipt_ack.user_sig.clone(),
     };
-    let actual_receipt: SessionReceipt =
-        serde_json::from_value(value.get("receipt").cloned().ok_or_else(|| {
+    let actual_receipt =
+        parse_record_usage_receipt_envelope(value.get("receipt").ok_or_else(|| {
             GatewaySessionError::new("receipt settlement feature is missing receipt")
         })?)
-        .map_err(|error| {
-            GatewaySessionError::new(format!(
-                "receipt settlement feature has invalid receipt: {error}"
-            ))
-        })?;
+        .map_err(GatewaySessionError::new)?;
     if actual_receipt != expected_receipt {
         return Err(GatewaySessionError::new(
             "receipt settlement feature does not contain the exact co-signed receipt",
@@ -33991,12 +33990,13 @@ mod tests {
             user_sig: receipt_ack.user_sig.clone(),
         };
         let key = record_usage_receipt_feature_key(&receipt);
+        let receipt_envelope = record_usage_receipt_envelope(&receipt);
         let mut value = json!({
             "op": "record_usage_receipt",
             "contract_version": CONTRACT_VERSION,
             "epoch": receipt.body.billing_epoch,
             "payout_revision": receipt.body.payout_revision,
-            "receipt": receipt,
+            "receipt": receipt_envelope,
         });
         value["provider_sig"] = json!(sign_hex(
             &test_provider_seed(),

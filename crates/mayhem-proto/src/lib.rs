@@ -1292,6 +1292,41 @@ pub struct SessionReceipt {
     pub user_sig: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordUsageReceiptEnvelope {
+    body: ReceiptBody,
+    enclave_sig: String,
+    enclave_pubkey: String,
+    user_sig: String,
+}
+
+pub fn record_usage_receipt_envelope(receipt: &SessionReceipt) -> serde_json::Value {
+    serde_json::json!({
+        "body": &receipt.body,
+        "enclave_sig": &receipt.enclave_sig,
+        "enclave_pubkey": &receipt.enclave_pubkey,
+        "user_sig": &receipt.user_sig,
+    })
+}
+
+pub fn parse_record_usage_receipt_envelope(
+    value: &serde_json::Value,
+) -> Result<SessionReceipt, String> {
+    let envelope: RecordUsageReceiptEnvelope = serde_json::from_value(value.clone())
+        .map_err(|error| format!("invalid record usage receipt envelope: {error}"))?;
+    let receipt = SessionReceipt {
+        body: envelope.body,
+        enclave_sig: envelope.enclave_sig,
+        enclave_pubkey: envelope.enclave_pubkey,
+        user_sig: envelope.user_sig,
+    };
+    if record_usage_receipt_envelope(&receipt) != *value {
+        return Err("record usage receipt envelope is not canonical".to_owned());
+    }
+    Ok(receipt)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReceiptAck {
     pub session_id: String,
@@ -1304,7 +1339,7 @@ pub fn record_usage_receipt_feature_key(receipt: &SessionReceipt) -> String {
         "contract_version": CONTRACT_VERSION,
         "epoch": receipt.body.billing_epoch,
         "payout_revision": receipt.body.payout_revision,
-        "receipt": receipt,
+        "receipt": record_usage_receipt_envelope(receipt),
     });
     let key_material = serde_json::json!({
         "domain": "mayhem-record-usage-receipt-feature-v1",

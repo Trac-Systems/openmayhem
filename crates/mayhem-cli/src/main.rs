@@ -104,25 +104,26 @@ use mayhem_proto::MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN;
 use mayhem_proto::{
     artifact_generation_inline_audio_load, catalog_enclave_id, chunk_json_payload,
     ctx_bracket_for_tokens_in_schedule, ctx_bracket_table_at, default_ctx_bracket_schedule,
-    metered_output_units, payload_chunk_at, payload_chunk_manifest, reassemble_json_payload,
-    receipt_signing_bytes, record_usage_receipt_feature_key, record_usage_receipt_signing_bytes,
-    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
-    stable_json_bytes, tools_only_model_input_prompt_units, validate_ctx_bracket_schedule,
-    validated_audio_metadata, validated_wav_audio_metadata, AdminAttestationPolicy,
-    AttestationRuntimeConfig, AttestationTrustDataRef, CatalogEnclaveIdentity, CheckpointPolicy,
-    CtxBracketSchedule, HardwareQuote, HardwareQuoteKind, HardwareQuoteRoutePolicyBinding, MoneyAu,
-    PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
-    ReceiptUsage, SessionReceipt, SpendVoucher, TpmActivateCredentialChallengeFrame,
-    TpmActivateCredentialResponseFrame, TranscriptionResult, TranscriptionResultLimits,
-    TranscriptionTimestamp, ValidatedAudioFormat, VisibleToolCall, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
-    DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
-    DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
-    SESSION_RECEIPT_SCHEMA_VERSION, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
-    TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION, TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE,
-    USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
-    USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
-    VISIBLE_OUTPUT_BYTES_PER_UNIT,
+    metered_output_units, parse_record_usage_receipt_envelope, payload_chunk_at,
+    payload_chunk_manifest, reassemble_json_payload, receipt_signing_bytes,
+    record_usage_receipt_envelope, record_usage_receipt_feature_key,
+    record_usage_receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
+    spend_voucher_signing_bytes, stable_json_bytes, tools_only_model_input_prompt_units,
+    validate_ctx_bracket_schedule, validated_audio_metadata, validated_wav_audio_metadata,
+    AdminAttestationPolicy, AttestationRuntimeConfig, AttestationTrustDataRef,
+    CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind,
+    HardwareQuoteRoutePolicyBinding, MoneyAu, PayloadChunk, PayloadChunkCollector,
+    PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
+    TpmActivateCredentialChallengeFrame, TpmActivateCredentialResponseFrame, TranscriptionResult,
+    TranscriptionResultLimits, TranscriptionTimestamp, ValidatedAudioFormat, VisibleToolCall,
+    CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
+    DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
+    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
+    MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN, SESSION_RECEIPT_SCHEMA_VERSION,
+    TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
+    TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN,
+    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
+    USAGE_STEP, USAGE_VIDEO_SECOND, VISIBLE_OUTPUT_BYTES_PER_UNIT,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -51736,13 +51737,12 @@ struct ReceiptSettlementFeatureMeta {
 
 fn receipt_settlement_feature_meta(feature: &Value) -> Result<ReceiptSettlementFeatureMeta> {
     validate_receipt_settlement_feature(feature)?;
-    let receipt: SessionReceipt = serde_json::from_value(
+    let receipt = parse_record_usage_receipt_envelope(
         feature
             .pointer("/value/receipt")
-            .cloned()
             .context("receipt settlement feature is missing receipt")?,
     )
-    .context("receipt settlement feature has an invalid receipt")?;
+    .map_err(anyhow::Error::msg)?;
     let body = &receipt.body;
     let attempt_id = stable_value_hash(&json!({
         "domain": "mayhem-receipt-settlement-attempt-v1",
@@ -52266,13 +52266,12 @@ fn validate_receipt_settlement_feature(feature: &Value) -> Result<String> {
                 == Some(u64::from(CONTRACT_VERSION)),
         "receipt settlement feature has the wrong operation or contract version"
     );
-    let receipt: SessionReceipt = serde_json::from_value(
+    let receipt = parse_record_usage_receipt_envelope(
         value
             .get("receipt")
-            .cloned()
             .context("receipt settlement feature is missing receipt")?,
     )
-    .context("receipt settlement feature has an invalid receipt")?;
+    .map_err(anyhow::Error::msg)?;
     ensure!(
         receipt.body.schema_version == SESSION_RECEIPT_SCHEMA_VERSION
             && value.get("epoch").and_then(Value::as_u64) == Some(receipt.body.billing_epoch)
@@ -72422,12 +72421,13 @@ async fn provider_receipt_settlement_feature(
         user_sig: receipt_ack.user_sig.clone(),
     };
     let key = record_usage_receipt_feature_key(&receipt);
+    let receipt_envelope = record_usage_receipt_envelope(&receipt);
     let mut value = json!({
         "op": "record_usage_receipt",
         "contract_version": CONTRACT_VERSION,
         "epoch": receipt.body.billing_epoch,
         "payout_revision": receipt.body.payout_revision,
-        "receipt": receipt,
+        "receipt": receipt_envelope,
     });
     let signing_bytes = record_usage_receipt_signing_bytes(&key, &value)
         .context("building provider receipt settlement signature payload")?;
@@ -93195,12 +93195,13 @@ esac
             user_sig: hex_encode(&user_key.sign(&receipt_payload).to_bytes()),
         };
         let key = record_usage_receipt_feature_key(&receipt);
+        let receipt_envelope = record_usage_receipt_envelope(&receipt);
         let mut value = json!({
             "op": "record_usage_receipt",
             "contract_version": CONTRACT_VERSION,
             "epoch": epoch,
             "payout_revision": receipt.body.payout_revision,
-            "receipt": receipt,
+            "receipt": receipt_envelope,
         });
         let signing_bytes = record_usage_receipt_signing_bytes(&key, &value).unwrap();
         value["provider_sig"] = json!(hex_encode(&provider_key.sign(&signing_bytes).to_bytes()));
@@ -93213,6 +93214,29 @@ esac
 
     fn signed_receipt_settlement_feature_for_test(epoch: u64) -> Value {
         signed_receipt_settlement_feature_for_test_at(epoch, 3, true, 2)
+    }
+
+    #[test]
+    fn receipt_settlement_feature_uses_the_contract_envelope() {
+        let feature = signed_receipt_settlement_feature_for_test(7);
+        let envelope = &feature["value"]["receipt"];
+        assert_eq!(
+            envelope
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["body", "enclave_pubkey", "enclave_sig", "user_sig"])
+        );
+        assert!(envelope["body"]["provider"].as_str().is_some());
+        assert!(envelope.get("provider").is_none());
+        validate_receipt_settlement_feature(&feature).unwrap();
+
+        let receipt = parse_record_usage_receipt_envelope(envelope).unwrap();
+        let mut flattened = feature;
+        flattened["value"]["receipt"] = serde_json::to_value(receipt).unwrap();
+        assert!(validate_receipt_settlement_feature(&flattened).is_err());
     }
 
     #[test]
