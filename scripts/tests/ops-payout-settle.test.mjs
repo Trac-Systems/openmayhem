@@ -1502,8 +1502,9 @@ test('payout worker isolates TAP spool work and replays all rails idempotently',
   assert.equal(firstLog.filter((line) => line.startsWith('admin tnk-settlement')).length, 1);
   assert.match(
     firstLog.find((line) => line.startsWith('admin tnk-settlement')),
-    /--submit-transfer --submit/
+    /--at 1000 .*--submit-transfer --submit/
   );
+  assert.equal(fs.readFileSync(path.join(workDir, 'tnk-settlement-at'), 'utf8').trim(), '1000');
 
   const working = path.join(ctx.spool, 'working');
   fs.renameSync(

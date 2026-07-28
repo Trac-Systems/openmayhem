@@ -2389,12 +2389,27 @@ settle_tnk() {
   attempt="$(next_attempt tnk)" || attempt_result=$?
   [[ "$attempt_result" == "0" ]] || return "$attempt_result"
   error_file="$work_dir/tnk-attempt-$attempt.stderr.log"
+  local tnk_at_file="$work_dir/tnk-settlement-at"
+  if [[ ! -f "$tnk_at_file" ]]; then
+    date +%s >"$tnk_at_file.tmp"
+    mv "$tnk_at_file.tmp" "$tnk_at_file"
+  fi
+  local tnk_settlement_at
+  tnk_settlement_at="$(cat "$tnk_at_file")"
+  positive_integer "$tnk_settlement_at" || {
+    echo "abort: invalid frozen TNK settlement timestamp in $tnk_at_file" >&2
+    return 1
+  }
+  if (( tnk_settlement_at < canonical_settlement_unix )); then
+    echo "abort: frozen TNK settlement timestamp predates canonical epoch settlement time" >&2
+    return 1
+  fi
   local -a args=(
     --home "$ADMIN_HOME"
     --rpc-url "$RPC_URL"
     --peer-store-name "$ADMIN_STORE"
     --epoch "$applied_epoch"
-    --at "$settlement_at"
+    --at "$tnk_settlement_at"
     --msb-transfer-timeout-seconds "$TNK_TRANSFER_TIMEOUT_SECONDS"
     --msb-transfer-max-retries "$TNK_TRANSFER_MAX_RETRIES"
     --json
