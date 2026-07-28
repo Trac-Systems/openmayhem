@@ -487,7 +487,7 @@ class MayhemFeature extends Feature {
       throw new Error('Mayhem feature relay is not ready.');
     }
 
-    const relayedValue = value?.op === 'admin_contract_tx' ? value : stableValue(value);
+    const relayedValue = value;
     const requestId = requestIdFor(feature, key, relayedValue);
     const existing = this.pending.get(requestId);
     if (existing) return await existing.promise;
@@ -939,9 +939,7 @@ class MayhemFeature extends Feature {
       return;
     }
     if (!cached) {
-      const relayedValue = message.value?.op === 'admin_contract_tx'
-        ? message.value
-        : stableValue(message.value);
+      const relayedValue = message.value;
       const promise = this._applyRelayed(message.key, relayedValue, expectedId).catch((error) =>
         relayError(error?.message || 'Admin writer failed to apply relayed feature.', expectedId)
       );

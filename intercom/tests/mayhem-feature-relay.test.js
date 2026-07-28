@@ -441,6 +441,13 @@ test('provider receipt relay derives authority from the signed receipt and dedup
     receipt: {
       body: {
         provider: providerKey,
+        locked_rate_map: [
+          {
+            unit: 'input_token',
+            per_unit_au: '1',
+            granularity: 1_000,
+          },
+        ],
       },
       enclave_sig: '15'.repeat(64),
       enclave_pubkey: '16'.repeat(32),
@@ -473,6 +480,11 @@ test('provider receipt relay derives authority from the signed receipt and dedup
   assert.equal(writer.appended.length, 1);
   assert.equal(writer.appended[0].value.dispatch.address, adminKey);
   assert.deepEqual(writer.appended[0].value.dispatch.value, value);
+  assert.equal(
+    JSON.stringify(writer.appended[0].value.dispatch.value.receipt.body.locked_rate_map),
+    JSON.stringify(value.receipt.body.locked_rate_map),
+    'signed nested object key order must survive the relay unchanged'
+  );
 });
 
 test('reservation close relay authority is provider-only', () => {
