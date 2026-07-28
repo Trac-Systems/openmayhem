@@ -991,6 +991,89 @@ test('feature relay collapses in-flight duplicates and retries one cached result
   await writerFeature.stop();
 });
 
+test('feature result uses joined channel even when direct reconnect is unavailable', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 500,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    resultRetryMs: 100,
+    resultRetryMax: 2,
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+
+  writer.peer.base.append = async (operation) => {
+    if (operation === null) {
+      writer.flushes.push(true);
+      return;
+    }
+    writer.appended.push(operation);
+    writer.state.set(`fr/${operation.value.dispatch.hash}`, {
+      type: 'feature_result',
+      status: 'applied',
+      ok: true,
+      result: { ok: true, op: operation.value.dispatch.value.op },
+    });
+  };
+
+  let resultBroadcasts = 0;
+  let acknowledgements = 0;
+  let reconnects = 0;
+  participant.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      if (message.control === 'mayhem_feature_request') {
+        queueMicrotask(() => writerFeature.handleSidechannelMessage(
+          channel,
+          relayPayload(providerKey, message)
+        ));
+      } else if (message.control === 'mayhem_feature_result_ack') {
+        acknowledgements += 1;
+        queueMicrotask(() => writerFeature.handleSidechannelMessage(
+          channel,
+          relayPayload(providerKey, message)
+        ));
+      }
+      return true;
+    },
+  };
+  writer.peer.sidechannel = {
+    started: true,
+    async connectDirectPeer() {
+      reconnects += 1;
+      return false;
+    },
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      if (message.control !== 'mayhem_feature_result') return true;
+      resultBroadcasts += 1;
+      queueMicrotask(() => participantFeature.handleSidechannelMessage(
+        channel,
+        relayPayload(adminKey, message)
+      ));
+      return true;
+    },
+  };
+
+  const key = `consent/${providerKey}/1/rules-hash`;
+  const result = await participantFeature.relay(key, consentValue());
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(result.ok, true);
+  assert.equal(writer.appended.length, 1);
+  assert.equal(resultBroadcasts, 1);
+  assert.equal(acknowledgements, 1);
+  assert.ok(reconnects >= 1);
+  assert.equal(writerFeature.processed.values().next().value.acked, true);
+  await participantFeature.stop();
+  await writerFeature.stop();
+});
+
 test('feature relay never freezes a nonterminal pending result', async () => {
   const participant = peerFor(providerKey);
   const writer = peerFor(adminKey, { writable: true });
@@ -1984,6 +2067,88 @@ test('Stripe service result retries the exact cache after drop and reconnect unt
   assert.equal(acknowledgements, 1);
   assert.equal(reconnects, 2);
   if (reconnectTimer !== null) clearTimeout(reconnectTimer);
+  await participantFeature.stop();
+  await writerFeature.stop();
+});
+
+test('Stripe service result uses joined channel even when direct reconnect is unavailable', async () => {
+  const participant = peerFor(otherKey);
+  const signer = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  let serviceCalls = 0;
+  let resultBroadcasts = 0;
+  let acknowledgements = 0;
+  let reconnects = 0;
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 500,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    resultRetryMs: 100,
+    resultRetryMax: 2,
+    async serviceHandler() {
+      serviceCalls += 1;
+      return {
+        ok: true,
+        rail: 'fiat',
+        processor_rail: 'stripe',
+        checkout_session: {
+          id: 'cs_live_joined_channel',
+          url: 'https://checkout.stripe.com/c/pay/joined-channel',
+        },
+      };
+    },
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+
+  participant.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      if (message.control === 'mayhem_service_result_ack') acknowledgements += 1;
+      queueMicrotask(() => writerFeature.handleSidechannelMessage(
+        channel,
+        relayPayload(otherKey, message)
+      ));
+      return true;
+    },
+  };
+  writer.peer.sidechannel = {
+    started: true,
+    async connectDirectPeer() {
+      reconnects += 1;
+      return false;
+    },
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      if (message.control !== 'mayhem_service_result') return true;
+      resultBroadcasts += 1;
+      queueMicrotask(() => participantFeature.handleSidechannelMessage(
+        channel,
+        relayPayload(adminKey, message)
+      ));
+      return true;
+    },
+  };
+
+  const result = await requestStripeCheckout(
+    participant.peer,
+    signedServiceValue(signer.peer, 'stripe_checkout', stripeCheckoutValue(), otherKey)
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(result.ok, true);
+  assert.equal(result.relayed, true);
+  assert.equal(result.checkout_session.url, 'https://checkout.stripe.com/c/pay/joined-channel');
+  assert.equal(serviceCalls, 1);
+  assert.equal(resultBroadcasts, 1);
+  assert.equal(acknowledgements, 1);
+  assert.ok(reconnects >= 1);
+  assert.equal(writerFeature.serviceProcessed.values().next().value.acked, true);
   await participantFeature.stop();
   await writerFeature.stop();
 });

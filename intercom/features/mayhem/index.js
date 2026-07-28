@@ -1314,14 +1314,19 @@ class MayhemFeature extends Feature {
       try {
         const sidechannel = this.peer?.sidechannel;
         if (!sidechannel || typeof sidechannel.broadcast !== 'function') return;
+        if (!sidechannel.started) return;
         if (typeof sidechannel.connectDirectPeer === 'function') {
-          const connected = await sidechannel.connectDirectPeer(
-            cached.transport,
-            this.channel,
-            this.connectTimeoutMs
-          );
-          if (!connected || !active()) return;
-        } else if (!sidechannel.started) return;
+          try {
+            void Promise.resolve(sidechannel.connectDirectPeer(
+              cached.transport,
+              this.channel,
+              this.connectTimeoutMs
+            )).catch(() => {});
+          } catch (_error) {
+            // Direct reconnect is best-effort; the joined relay channel still carries the result.
+          }
+        }
+        if (!active()) return;
         sidechannel.broadcast(this.channel, cached.result.message);
       } catch (_error) {
         // A bounded later attempt reconnects the current result transport.
@@ -1425,14 +1430,19 @@ class MayhemFeature extends Feature {
       try {
         const sidechannel = this.peer?.sidechannel;
         if (!sidechannel || typeof sidechannel.broadcast !== 'function') return;
+        if (!sidechannel.started) return;
         if (typeof sidechannel.connectDirectPeer === 'function') {
-          const connected = await sidechannel.connectDirectPeer(
-            cached.transport,
-            this.channel,
-            this.connectTimeoutMs
-          );
-          if (!connected || !active()) return;
-        } else if (!sidechannel.started) return;
+          try {
+            void Promise.resolve(sidechannel.connectDirectPeer(
+              cached.transport,
+              this.channel,
+              this.connectTimeoutMs
+            )).catch(() => {});
+          } catch (_error) {
+            // Direct reconnect is best-effort; the joined relay channel still carries the result.
+          }
+        }
+        if (!active()) return;
         sidechannel.broadcast(this.channel, cached.result.message);
       } catch (_error) {
         // A bounded later attempt re-reads and reconnects the current sidechannel.
