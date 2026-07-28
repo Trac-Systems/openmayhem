@@ -14,7 +14,8 @@ function mockPeer({ signedLength = 9 } = {}) {
   let closed = 0;
   const makeView = () => ({
     async get(key) {
-      return entries.find((entry) => entry.key === key)?.value ?? null;
+      const entry = entries.find((candidate) => candidate.key === key);
+      return entry ? { seq: 4, ...entry } : null;
     },
     createReadStream(options) {
       const filtered = entries
@@ -80,6 +81,15 @@ test('confirmed exact reads use the requested checkout length', async () => {
   assert.equal(response.signed_length, 7);
   assert.deepEqual(response.value, { amount: 2 });
   assert.deepEqual(state.checkouts, [7]);
+});
+
+test('unconfirmed exact reads preserve values that are already unwrapped', async () => {
+  const state = mockPeer();
+  state.peer.base.view.get = async () => ({ amount: 2 });
+  const response = await getStateValue(state.peer, 'earn/fiat/b', {
+    confirmed: false,
+  });
+  assert.deepEqual(response.value, { amount: 2 });
 });
 
 test('future and unconfirmed exact checkout requests fail closed', async () => {

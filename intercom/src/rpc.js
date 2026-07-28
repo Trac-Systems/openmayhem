@@ -7,6 +7,22 @@ import { readJsonBody } from '../trac/trac-peer/rpc/utils/body.js';
 
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const normalizeKey = (value) => String(value ?? '').trim().toLowerCase();
+const stateEntryValue = (entry, key) => {
+  if (!isObject(entry)) return entry;
+  const fields = Object.keys(entry).sort();
+  if (
+    fields.length === 3 &&
+    fields[0] === 'key' &&
+    fields[1] === 'seq' &&
+    fields[2] === 'value' &&
+    entry.key === key &&
+    Number.isSafeInteger(entry.seq) &&
+    entry.seq >= 0
+  ) {
+    return entry.value;
+  }
+  return entry;
+};
 
 const stateView = (peer, confirmed, requestedSignedLength = null) => {
   if (!peer.base?.view) throw new Error('Peer view not ready.');
@@ -62,11 +78,12 @@ export async function getStateValue(
 
   const session = stateView(peer, confirmed, signedLength);
   try {
+    const entry = await session.view.get(normalizedKey);
     return {
       key: normalizedKey,
       confirmed,
       signed_length: session.signedLength,
-      value: await session.view.get(normalizedKey),
+      value: stateEntryValue(entry, normalizedKey),
     };
   } finally {
     await session.close();
