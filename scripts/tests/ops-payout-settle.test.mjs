@@ -1497,9 +1497,13 @@ test('payout worker isolates TAP spool work and replays all rails idempotently',
   assert.equal(fs.existsSync(path.join(workDir, 'tap.produced')), true);
 
   const firstLog = logLines(ctx);
-  assert.equal(firstLog.length, 3);
+  assert.equal(firstLog.length, 2);
   assert.equal(firstLog.filter((line) => line.startsWith('admin fiat-settlement')).length, 1);
-  assert.equal(firstLog.filter((line) => line.startsWith('admin tnk-settlement')).length, 2);
+  assert.equal(firstLog.filter((line) => line.startsWith('admin tnk-settlement')).length, 1);
+  assert.match(
+    firstLog.find((line) => line.startsWith('admin tnk-settlement')),
+    /--submit-transfer --submit/
+  );
 
   const working = path.join(ctx.spool, 'working');
   fs.renameSync(
@@ -2004,7 +2008,7 @@ test('payout worker records canonical no-work outcomes without requiring live ke
   }
   const calls = logLines(ctx);
   assert.equal(calls.filter((line) => line.startsWith('admin fiat-settlement')).length, 1);
-  assert.equal(calls.filter((line) => line.startsWith('admin tnk-settlement')).length, 2);
+  assert.equal(calls.filter((line) => line.startsWith('admin tnk-settlement')).length, 1);
   assert.match(calls.find((line) => line.startsWith('admin fiat-settlement') && line.includes('--submit-transfer')), /--submit/);
   assert.match(calls.find((line) => line.startsWith('admin tnk-settlement') && line.includes('--submit-transfer')), /--submit/);
 });
@@ -2057,7 +2061,7 @@ test('held-only and below-threshold payout work close as no_work or carry', (t) 
   assert.equal(fs.existsSync(path.join(workDir, 'complete')), true);
   const calls = logLines(ctx);
   assert.equal(calls.filter((line) => line.startsWith('admin fiat-settlement')).length, 1);
-  assert.equal(calls.filter((line) => line.startsWith('admin tnk-settlement')).length, 2);
+  assert.equal(calls.filter((line) => line.startsWith('admin tnk-settlement')).length, 1);
 
   writeJson(ctx.applyState, {
     key: 'epoch/apply/state',

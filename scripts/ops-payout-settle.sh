@@ -2385,11 +2385,9 @@ settle_tnk() {
     return 0
   }
 
-  local attempt attempt_result=0 plan_tmp plan_file error_file
+  local attempt attempt_result=0 error_file
   attempt="$(next_attempt tnk)" || attempt_result=$?
   [[ "$attempt_result" == "0" ]] || return "$attempt_result"
-  plan_tmp="$work_dir/tnk-plan.json.tmp"
-  plan_file="$work_dir/tnk-plan.json"
   error_file="$work_dir/tnk-attempt-$attempt.stderr.log"
   local -a args=(
     --home "$ADMIN_HOME"
@@ -2401,40 +2399,6 @@ settle_tnk() {
     --msb-transfer-max-retries "$TNK_TRANSFER_MAX_RETRIES"
     --json
   )
-
-  if ! "$MAYHEM_BIN" admin tnk-settlement "${args[@]}" >"$plan_tmp" 2>"$error_file"; then
-    rm -f "$plan_tmp"
-    echo "tnk: planning failed on attempt $attempt (see $error_file)" >&2
-    return 1
-  fi
-  mv "$plan_tmp" "$plan_file"
-  if ! validate_settlement_report "$plan_file" tnk plan; then
-    echo "tnk: plan is not bound to the current rail/epoch/apply hash (see $plan_file)" >&2
-    return 1
-  fi
-
-  local plan_state tnk_ok tnk_already tnk_blocking
-  plan_state="$(python3 - "$plan_file" <<'PY'
-import json, sys
-d = json.load(open(sys.argv[1]))
-blocking = sum(1 for item in d.get("skipped_providers", []) if item.get("blocking", True))
-print(
-    str(bool(d.get("ok"))).lower(),
-    str(d.get("already_settled") is not None).lower(),
-    blocking,
-)
-PY
-)"
-  read -r tnk_ok tnk_already tnk_blocking <<<"$plan_state"
-  if [[ "$tnk_ok" != "true" || "$tnk_blocking" != "0" ]]; then
-    echo "tnk: plan has blocking payout errors; no MSB transfer attempted (see $plan_file)" >&2
-    return 1
-  fi
-  if [[ "$tnk_already" == "true" ]]; then
-    mark_rail tnk already_settled "$plan_file"
-    echo "tnk: canonical settlement evidence already exists"
-    return 0
-  fi
 
   local final_tmp="$work_dir/tnk-settlement.json.tmp"
   local final_file="$work_dir/tnk-settlement.json"
@@ -2448,6 +2412,15 @@ PY
   if ! validate_settlement_report "$final_file" tnk final; then
     echo "tnk: final report did not prove exact settlement (see $final_file)" >&2
     return 1
+  fi
+  if python3 - "$final_file" <<'PY'
+import json, sys
+raise SystemExit(0 if json.load(open(sys.argv[1])).get("already_settled") is not None else 1)
+PY
+  then
+    mark_rail tnk already_settled "$final_file"
+    echo "tnk: canonical settlement evidence already exists"
+    return 0
   fi
   local outcome
   outcome="$(python3 - "$final_file" <<'PY'
