@@ -517,6 +517,48 @@ async function submitClose(ctx, value, { expiry = false } = {}) {
   return { key, value, result: result ?? ctx.contract._mayhemLastFeatureResult };
 }
 
+test('closed no-receipt reservation can retry the same billing attempt without duplicate active work', async () => {
+  const ctx = await setupContract();
+  const billingId = '72'.repeat(32);
+  const first = await submitReservation(ctx, {
+    billingId,
+    sessionId: '71'.repeat(32),
+    reservationId: '73'.repeat(32),
+  });
+  assert.equal(first.result.ok, true, first.result.message);
+
+  const activeDuplicate = await submitReservation(ctx, {
+    billingId,
+    sessionId: '74'.repeat(32),
+    reservationId: '75'.repeat(32),
+  });
+  assert.match(
+    activeDuplicate.result.message,
+    /active reservation|advance exactly once/i
+  );
+
+  const close = await submitClose(ctx, closeValue(ctx, first));
+  assert.equal(close.result.ok, true, close.result.message);
+
+  const retry = await submitReservation(ctx, {
+    billingId,
+    sessionId: '76'.repeat(32),
+    reservationId: '77'.repeat(32),
+  });
+  assert.equal(retry.result.ok, true, retry.result.message);
+  assert.equal(retry.value.voucher.billing_attempt, 0);
+
+  const head = await ctx.storage.get(`receipt/head/${billingId}/0`);
+  assert.equal(head, null);
+  const anchor = await ctx.storage.get(`receipt/billing/${billingId}`);
+  assert.equal(anchor.value.latest_attempt, 0);
+  const hold = await ctx.storage.get(`hold/targeted-outstanding/tnk/${ctx.user.publicKey}`);
+  assert.deepEqual(
+    hold.value.sessions.map((session) => session.session_id),
+    ['76'.repeat(32)]
+  );
+});
+
 async function submitTargetedApply(ctx, value) {
   const previousStorage = ctx.contract.storage;
   ctx.contract.storage = ctx.storage;

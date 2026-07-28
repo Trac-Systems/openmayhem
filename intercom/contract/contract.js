@@ -18018,31 +18018,56 @@ class MayhemContract extends Contract {
           existingAnchor.latest_attempt < 0) {
         return new Error('Billing id cannot move across user, rail, or epoch.');
       }
-      if (identity.billing_attempt !== existingAnchor.latest_attempt + 1) {
-        return new Error('Billing attempt must advance exactly once.');
+      if (identity.billing_attempt === existingAnchor.latest_attempt) {
+        const currentHead = await this.get(
+          this.receiptHeadKey(identity.billing_id, identity.billing_attempt)
+        );
+        if (currentHead) {
+          return new Error('Billing attempt must advance exactly once.');
+        }
+        const hold = await this.normalizeTargetedSpendHoldRecord(
+          (await this.get(this.targetedSpendHoldKey(identity.user, identity.rail))) ?? null,
+          identity.user,
+          identity.rail
+        );
+        if (hold instanceof Error) return hold;
+        if (hold.sessions.some((session) =>
+          session.billing_id === identity.billing_id &&
+          session.billing_attempt === identity.billing_attempt
+        )) {
+          return new Error('Billing attempt already has an active reservation.');
+        }
+        nextAnchor = {
+          ...existingAnchor,
+          updated_at: key,
+        };
+      } else {
+        if (identity.billing_attempt !== existingAnchor.latest_attempt + 1) {
+          return new Error('Billing attempt must advance exactly once.');
+        }
+        const priorHead = await this.get(
+          this.receiptHeadKey(identity.billing_id, identity.billing_attempt - 1)
+        );
+        if (!priorHead ||
+            priorHead.type !== 'canonical_receipt_head' ||
+            priorHead.billing_id !== identity.billing_id ||
+            priorHead.billing_attempt !== identity.billing_attempt - 1) {
+          return new Error('Higher billing attempt requires the prior canonical receipt head.');
+        }
+        if (stableJson(normalized.voucher_body.billing_prior_usage) !==
+              stableJson(priorHead.receipt.body.usage) ||
+            this.compareAu(
+              normalized.voucher_body.billing_prior_au_owed_cum,
+              priorHead.receipt.body.au_owed_cum
+            ) !== 0) {
+          return new Error('Higher billing attempt does not exactly chain from the prior attempt.');
+        }
+        nextAnchor = {
+          ...existingAnchor,
+          latest_attempt: identity.billing_attempt,
+          updated_at: key,
+        };
       }
-      const priorHead = await this.get(
-        this.receiptHeadKey(identity.billing_id, identity.billing_attempt - 1)
-      );
-      if (!priorHead ||
-          priorHead.type !== 'canonical_receipt_head' ||
-          priorHead.billing_id !== identity.billing_id ||
-          priorHead.billing_attempt !== identity.billing_attempt - 1) {
-        return new Error('Higher billing attempt requires the prior canonical receipt head.');
-      }
-      if (stableJson(normalized.voucher_body.billing_prior_usage) !==
-            stableJson(priorHead.receipt.body.usage) ||
-          this.compareAu(
-            normalized.voucher_body.billing_prior_au_owed_cum,
-            priorHead.receipt.body.au_owed_cum
-          ) !== 0) {
-        return new Error('Higher billing attempt does not exactly chain from the prior attempt.');
-      }
-      nextAnchor = {
-        ...existingAnchor,
-        latest_attempt: identity.billing_attempt,
-        updated_at: key,
-      };
     }
 
     const reservationKey = this.receiptReservationKey(identity.reservation_id);
