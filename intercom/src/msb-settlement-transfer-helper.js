@@ -1,8 +1,11 @@
 import fs from 'fs';
 import path from 'path';
 
+import b4a from 'b4a';
+import PeerWallet from 'trac-wallet';
 import { MainSettlementBus } from 'trac-msb/src/index.js';
 import { applyStateMessageFactory } from 'trac-msb/src/messages/state/applyStateMessageFactory.js';
+import { createMessage } from 'trac-msb/src/utils/buffer.js';
 import {
   bigIntTo16ByteBuffer,
   bigIntToDecimalString,
@@ -10,6 +13,8 @@ import {
   decimalStringToBigInt,
 } from 'trac-msb/src/utils/amountSerialization.js';
 import { getExtendedTxDetailsCommand } from 'trac-msb/src/utils/cliCommands.js';
+import { OperationType } from 'trac-msb/src/utils/constants.js';
+import { normalizeTransferOperation } from 'trac-msb/src/utils/normalizers.js';
 import {
   createMayhemMsbConfig,
   MAYHEM_NETWORK_ENV,
@@ -178,6 +183,237 @@ async function defaultReadConfirmedTransfer(msb, txHash, config) {
   return await getExtendedTxDetailsCommand(msb.state, txHash, true, config);
 }
 
+function requireExactKeys(value, expectedKeys, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    fail(`${label} must be a JSON object.`);
+  }
+  const actual = Object.keys(value).sort();
+  const expected = [...expectedKeys].sort();
+  if (
+    actual.length !== expected.length
+    || actual.some((key, index) => key !== expected[index])
+  ) {
+    fail(`${label} must contain exactly: ${expected.join(', ')}.`);
+  }
+}
+
+function requireCanonicalHex(value, bytes, label) {
+  if (typeof value !== 'string' || !new RegExp(`^[0-9a-f]{${bytes * 2}}$`).test(value)) {
+    fail(`${label} must be ${bytes} bytes of lowercase hexadecimal.`);
+  }
+}
+
+export async function validatePreparedSettlementTransferPayload({
+  payload,
+  config,
+  from,
+  to,
+  amount,
+  txHash = null,
+}) {
+  const amountE18 = decimalStringToBigInt(amount);
+  if (amountE18 <= 0n) fail('settlement transfer amount must be positive');
+  if (amountE18 > MAX_TRANSFER_AMOUNT) fail('settlement transfer amount exceeds MSB maximum');
+
+  requireExactKeys(payload, ['type', 'address', 'tro'], 'TNK settlement transfer payload');
+  requireExactKeys(
+    payload.tro,
+    ['tx', 'txv', 'to', 'am', 'in', 'is'],
+    'TNK settlement transfer operation'
+  );
+  if (payload.type !== OperationType.TRANSFER) {
+    fail('TNK settlement payload is not an MSB transfer operation.');
+  }
+  if (payload.address !== from) {
+    fail('TNK settlement payload sender does not match the expected treasury.');
+  }
+  if (payload.tro.to !== to) {
+    fail('TNK settlement payload recipient does not match the expected payout target.');
+  }
+  const expectedAmountHex = bigIntTo16ByteBuffer(amountE18).toString('hex');
+  if (payload.tro.am !== expectedAmountHex) {
+    fail('TNK settlement payload amount does not match the expected payout amount.');
+  }
+  requireCanonicalHex(payload.tro.tx, 32, 'TNK settlement transaction hash');
+  requireCanonicalHex(payload.tro.txv, 32, 'TNK settlement transaction validity');
+  requireCanonicalHex(payload.tro.am, 16, 'TNK settlement transfer amount');
+  requireCanonicalHex(payload.tro.in, 32, 'TNK settlement transfer nonce');
+  requireCanonicalHex(payload.tro.is, 64, 'TNK settlement transfer signature');
+  if (txHash !== null && payload.tro.tx !== txHash) {
+    fail('TNK settlement payload transaction hash does not match the canonical preparation.');
+  }
+
+  let normalized;
+  try {
+    normalized = normalizeTransferOperation(payload, config);
+  } catch (error) {
+    fail(`TNK settlement payload is invalid: ${error.message}`);
+  }
+  const message = createMessage(
+    config.networkId,
+    normalized.tro.txv,
+    normalized.tro.to,
+    normalized.tro.am,
+    normalized.tro.in,
+    OperationType.TRANSFER
+  );
+  const regeneratedHash = await PeerWallet.blake3(message);
+  if (!b4a.equals(regeneratedHash, normalized.tro.tx)) {
+    fail('TNK settlement transaction hash does not match the signed payload.');
+  }
+  const publicKey = PeerWallet.decodeBech32mSafe(from);
+  if (
+    publicKey === null
+    || !PeerWallet.verify(normalized.tro.is, regeneratedHash, publicKey)
+  ) {
+    fail('TNK settlement payload signature is invalid.');
+  }
+
+  return {
+    payload: JSON.parse(JSON.stringify(payload)),
+    tx_hash: payload.tro.tx,
+    amount_e18: amountE18.toString(),
+    amount_hex: expectedAmountHex,
+  };
+}
+
+export async function prepareSettlementTransferPayload({
+  msb,
+  config,
+  network,
+  to,
+  amount,
+  timeoutSeconds,
+  expectedBalanceBefore = null,
+  stderr,
+  sleepFn = sleep,
+  buildPayload = null,
+}) {
+  const from = msb.wallet.address;
+  const amountE18 = decimalStringToBigInt(amount);
+  if (amountE18 <= 0n) fail('settlement transfer amount must be positive');
+  if (amountE18 > MAX_TRANSFER_AMOUNT) fail('settlement transfer amount exceeds MSB maximum');
+  const preflight = await waitForPreflight(msb, timeoutSeconds, stderr, sleepFn);
+  if (expectedBalanceBefore && preflight.beforeBalance !== expectedBalanceBefore) {
+    fail(
+      `sender balance is ${preflight.beforeBalance}, expected ${expectedBalanceBefore}; refusing initial transfer`
+    );
+  }
+  const feeE18 = bufferToBigInt(msb.state.getFee());
+  const deductedE18 = from === to ? feeE18 : amountE18 + feeE18;
+  if (preflight.balanceE18 < deductedE18) {
+    fail('insufficient balance for settlement transfer and fee');
+  }
+
+  const txValidity = await msb.state.getIndexerSequenceState();
+  const payload = buildPayload
+    ? await buildPayload({ from, to, amountE18, txValidity })
+    : await applyStateMessageFactory(msb.wallet, config)
+      .buildPartialTransferOperationMessage(
+        from,
+        to,
+        bigIntTo16ByteBuffer(amountE18),
+        txValidity,
+        'json'
+      );
+  const prepared = await validatePreparedSettlementTransferPayload({
+    payload,
+    config,
+    from,
+    to,
+    amount,
+  });
+  return {
+    schema_version: JOURNAL_SCHEMA_VERSION,
+    network,
+    from,
+    to,
+    amount,
+    amount_e18: prepared.amount_e18,
+    amount_hex: prepared.amount_hex,
+    before_balance: preflight.beforeBalance,
+    validator_connections: preflight.validators,
+    tx_hash: prepared.tx_hash,
+    payload: prepared.payload,
+  };
+}
+
+export async function executePreparedSettlementTransfer({
+  msb,
+  config,
+  network,
+  to,
+  amount,
+  payload,
+  txHash = null,
+  timeoutSeconds,
+  stderr,
+  sleepFn = sleep,
+  readConfirmedTransfer = defaultReadConfirmedTransfer,
+  preflight = null,
+}) {
+  const from = msb.wallet.address;
+  const amountE18 = decimalStringToBigInt(amount);
+  const prepared = await validatePreparedSettlementTransferPayload({
+    payload,
+    config,
+    from,
+    to,
+    amount,
+    txHash,
+  });
+  const canonicalPayload = prepared.payload;
+  const canonicalTxHash = prepared.tx_hash;
+
+  let confirmedLength = await waitForConfirmation(msb, canonicalTxHash, 0, sleepFn);
+  let rebroadcast = false;
+  let activePreflight = preflight;
+  if (confirmedLength === null) {
+    activePreflight ??= await waitForPreflight(msb, timeoutSeconds, stderr, sleepFn);
+    rebroadcast = true;
+    const accepted = await msb.broadcastPartialTransaction(canonicalPayload);
+    if (!accepted) fail('MSB validators did not accept the prepared settlement transaction.');
+    confirmedLength = await waitForConfirmation(
+      msb,
+      canonicalTxHash,
+      timeoutSeconds,
+      sleepFn
+    );
+  }
+  if (confirmedLength === null) {
+    fail(
+      `MSB settlement transaction ${canonicalTxHash} was not confirmed before timeout; recover by rebroadcasting the same canonical payload`
+    );
+  }
+
+  const confirmed = await readConfirmedTransfer(msb, canonicalTxHash, config);
+  const details = confirmed?.txDetails;
+  if (
+    details?.address !== from
+    || details?.tro?.tx !== canonicalTxHash
+    || details?.tro?.to !== to
+    || details?.tro?.am !== amountE18.toString()
+    || confirmed?.confirmed_length !== confirmedLength
+  ) {
+    fail('confirmed MSB transaction does not match the canonical settlement payload');
+  }
+
+  return {
+    ok: true,
+    command: 'settlement-transfer',
+    network,
+    from,
+    to,
+    amount,
+    tx_hash: canonicalTxHash,
+    validator_connections: activePreflight?.validators ?? null,
+    confirmed_length: confirmedLength,
+    observed_signed_length: msb.state.getSignedLength(),
+    recovered: !rebroadcast,
+    rebroadcast,
+  };
+}
+
 export async function executeJournaledSettlementTransfer({
   msb,
   config,
@@ -198,35 +434,30 @@ export async function executeJournaledSettlementTransfer({
   if (amountE18 <= 0n) fail('settlement transfer amount must be positive');
   if (amountE18 > MAX_TRANSFER_AMOUNT) fail('settlement transfer amount exceeds MSB maximum');
   const expected = expectedTransfer({ operationId, network, from, to, amountE18 });
-  const preflight = await waitForPreflight(msb, timeoutSeconds, stderr, sleepFn);
 
   let recovered = fs.existsSync(journalFile);
   let journal = recovered
     ? validateSettlementTransferJournal(readJournal(journalFile), expected)
     : null;
+  let preflight = null;
 
   if (!journal) {
-    if (expectedBalanceBefore && preflight.beforeBalance !== expectedBalanceBefore) {
-      fail(
-        `sender balance is ${preflight.beforeBalance}, expected ${expectedBalanceBefore}; refusing initial transfer`
-      );
-    }
-    const feeE18 = bufferToBigInt(msb.state.getFee());
-    const deductedE18 = from === to ? feeE18 : amountE18 + feeE18;
-    if (preflight.balanceE18 < deductedE18) {
-      fail('insufficient balance for settlement transfer and fee');
-    }
-    const txValidity = await msb.state.getIndexerSequenceState();
-    const payload = buildPayload
-      ? await buildPayload({ from, to, amountE18, txValidity })
-      : await applyStateMessageFactory(msb.wallet, config)
-        .buildPartialTransferOperationMessage(
-          from,
-          to,
-          bigIntTo16ByteBuffer(amountE18),
-          txValidity,
-          'json'
-        );
+    const prepared = await prepareSettlementTransferPayload({
+      msb,
+      config,
+      network,
+      to,
+      amount,
+      timeoutSeconds,
+      expectedBalanceBefore,
+      stderr,
+      sleepFn,
+      buildPayload,
+    });
+    preflight = {
+      beforeBalance: prepared.before_balance,
+      validators: prepared.validator_connections,
+    };
     journal = validateSettlementTransferJournal({
       schema_version: JOURNAL_SCHEMA_VERSION,
       operation_id: operationId,
@@ -234,10 +465,10 @@ export async function executeJournaledSettlementTransfer({
       from,
       to,
       amount_e18: amountE18.toString(),
-      before_balance: preflight.beforeBalance,
-      tx_hash: payload?.tro?.tx,
+      before_balance: prepared.before_balance,
+      tx_hash: prepared.tx_hash,
       status: 'prepared',
-      payload,
+      payload: prepared.payload,
     }, expected);
     try {
       writeDurableExclusive(journalFile, journal);
@@ -253,32 +484,21 @@ export async function executeJournaledSettlementTransfer({
     fail('TNK transfer journal pre-broadcast balance does not match --expected-balance-before.');
   }
 
-  const txHash = journal.tx_hash;
-  let confirmedLength = await waitForConfirmation(msb, txHash, 0, sleepFn);
-  let rebroadcast = false;
-  if (confirmedLength === null) {
-    rebroadcast = recovered;
-    const accepted = await msb.broadcastPartialTransaction(journal.payload);
-    if (!accepted) fail('MSB validators did not accept the prepared settlement transaction.');
-    confirmedLength = await waitForConfirmation(msb, txHash, timeoutSeconds, sleepFn);
-  }
-  if (confirmedLength === null) {
-    fail(
-      `MSB settlement transaction ${txHash} was not confirmed before timeout; rerun the same command to recover it`
-    );
-  }
-
-  const confirmed = await readConfirmedTransfer(msb, txHash, config);
-  const details = confirmed?.txDetails;
-  if (
-    details?.address !== from
-    || details?.tro?.tx !== txHash
-    || details?.tro?.to !== to
-    || details?.tro?.am !== amountE18.toString()
-    || confirmed?.confirmed_length !== confirmedLength
-  ) {
-    fail('confirmed MSB transaction does not match the journaled settlement transfer');
-  }
+  const result = await executePreparedSettlementTransfer({
+    msb,
+    config,
+    network,
+    to,
+    amount,
+    payload: journal.payload,
+    txHash: journal.tx_hash,
+    timeoutSeconds,
+    stderr,
+    sleepFn,
+    readConfirmedTransfer,
+    preflight,
+  });
+  const confirmedLength = result.confirmed_length;
   if (journal.status !== 'confirmed' || journal.confirmed_length !== confirmedLength) {
     journal = {
       ...journal,
@@ -295,13 +515,13 @@ export async function executeJournaledSettlementTransfer({
     from,
     to,
     amount,
-    tx_hash: txHash,
+    tx_hash: result.tx_hash,
     before_balance: journal.before_balance,
-    validator_connections: preflight.validators,
+    validator_connections: result.validator_connections,
     confirmed_length: confirmedLength,
-    observed_signed_length: msb.state.getSignedLength(),
+    observed_signed_length: result.observed_signed_length,
     recovered,
-    rebroadcast,
+    rebroadcast: result.rebroadcast && recovered,
     journal_file: journalFile,
   };
 }
@@ -364,6 +584,104 @@ export async function runSettlementTransferHelper(rawArgs, options = {}) {
       journalFile,
       timeoutSeconds,
       expectedBalanceBefore,
+      stderr,
+      ...options.execution,
+    });
+  } finally {
+    console.log = originalLog;
+    console.info = originalInfo;
+    if (!options.keepOpen) {
+      try {
+        await msb.close();
+      } catch (_error) {}
+    }
+  }
+}
+
+export async function runPreparedSettlementTransferHelper(command, rawArgs, options = {}) {
+  if (!['settlement-transfer-prepare', 'settlement-transfer-execute'].includes(command)) {
+    fail('Unsupported prepared settlement transfer helper command.');
+  }
+  const args = [...rawArgs];
+  const network = normalizeNetwork(takeOption(args, '--network') ?? fail('Missing --network.'));
+  const storesDirectory = takeOption(args, '--stores-directory') ?? fail('Missing --stores-directory.');
+  const storeName = takeOption(args, '--store-name') ?? fail('Missing --store-name.');
+  const to = takeOption(args, '--to') ?? fail('Missing --to.');
+  const amount = takeOption(args, '--amount') ?? fail('Missing --amount.');
+  const timeoutSeconds = Number.parseInt(takeOption(args, '--timeout-seconds') ?? '180', 10);
+  const maxRetries = Number.parseInt(takeOption(args, '--max-retries') ?? '3', 10);
+  const expectedBalanceBefore = takeOption(args, '--expected-balance-before');
+  const payloadJson = takeOption(args, '--payload-json');
+  const txHash = takeOption(args, '--tx-hash');
+  if (args.length > 0) fail(`Unknown argument: ${args[0]}`);
+  if (!Number.isSafeInteger(timeoutSeconds) || timeoutSeconds <= 0) {
+    fail('--timeout-seconds must be a positive safe integer.');
+  }
+  if (!Number.isSafeInteger(maxRetries) || maxRetries < 0) {
+    fail('--max-retries must be a non-negative safe integer.');
+  }
+  if (command === 'settlement-transfer-prepare') {
+    if (payloadJson !== null || txHash !== null) {
+      fail('settlement-transfer-prepare does not accept a prepared payload.');
+    }
+  } else {
+    if (expectedBalanceBefore !== null) {
+      fail('settlement-transfer-execute does not accept --expected-balance-before.');
+    }
+    if (payloadJson === null || payloadJson.length > 16_384) {
+      fail('settlement-transfer-execute requires a bounded --payload-json.');
+    }
+    requireCanonicalHex(txHash, 32, 'TNK settlement transaction hash');
+  }
+
+  const environment = network === 'mainnet'
+    ? MAYHEM_NETWORK_ENV.MAINNET
+    : MAYHEM_NETWORK_ENV.TESTNET1;
+  const config = createMayhemMsbConfig(environment, {
+    storeName,
+    storesDirectory: path.resolve(storesDirectory) + path.sep,
+    enableInteractiveMode: false,
+    enableWallet: true,
+    maxRetries,
+  });
+  const stderr = options.stderr ?? defaultStderr();
+  const originalLog = console.log;
+  const originalInfo = console.info;
+  const redirect = (...items) => stderr.write(`${items.map(String).join(' ')}\n`);
+  console.log = redirect;
+  console.info = redirect;
+
+  const msb = options.msb ?? new MainSettlementBus(config);
+  try {
+    if (!options.ready) await msb.ready();
+    if (command === 'settlement-transfer-prepare') {
+      return await prepareSettlementTransferPayload({
+        msb,
+        config,
+        network,
+        to,
+        amount,
+        timeoutSeconds,
+        expectedBalanceBefore,
+        stderr,
+        ...options.execution,
+      });
+    }
+    let payload;
+    try {
+      payload = JSON.parse(payloadJson);
+    } catch {
+      fail('--payload-json must contain valid JSON.');
+    }
+    return await executePreparedSettlementTransfer({
+      msb,
+      config,
+      network,
+      to,
+      amount,
+      payload,
+      txHash,
+      timeoutSeconds,
       stderr,
       ...options.execution,
     });

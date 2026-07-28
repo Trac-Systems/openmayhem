@@ -724,6 +724,15 @@ impl PeerRpcClient {
     }
 
     pub async fn state(&self, key: Option<&str>, confirmed: Option<bool>) -> Result<Value> {
+        self.state_at(key, confirmed, None).await
+    }
+
+    pub async fn state_at(
+        &self,
+        key: Option<&str>,
+        confirmed: Option<bool>,
+        signed_length: Option<u64>,
+    ) -> Result<Value> {
         let mut url = self.endpoint("state")?;
         if let Some(key) = key {
             url.query_pairs_mut().append_pair("key", key);
@@ -731,6 +740,10 @@ impl PeerRpcClient {
         if let Some(confirmed) = confirmed {
             url.query_pairs_mut()
                 .append_pair("confirmed", if confirmed { "true" } else { "false" });
+        }
+        if let Some(signed_length) = signed_length {
+            url.query_pairs_mut()
+                .append_pair("signed_length", &signed_length.to_string());
         }
         self.request_json(self.http.get(url)).await
     }
@@ -741,6 +754,18 @@ impl PeerRpcClient {
         confirmed: Option<bool>,
         limit: Option<u64>,
     ) -> Result<Value> {
+        self.state_prefix_page(prefix, confirmed, limit, None, None)
+            .await
+    }
+
+    pub async fn state_prefix_page(
+        &self,
+        prefix: &str,
+        confirmed: Option<bool>,
+        limit: Option<u64>,
+        signed_length: Option<u64>,
+        after: Option<&str>,
+    ) -> Result<Value> {
         let mut url = self.endpoint("state")?;
         url.query_pairs_mut().append_pair("prefix", prefix);
         if let Some(confirmed) = confirmed {
@@ -750,6 +775,13 @@ impl PeerRpcClient {
         if let Some(limit) = limit {
             url.query_pairs_mut()
                 .append_pair("limit", &limit.to_string());
+        }
+        if let Some(signed_length) = signed_length {
+            url.query_pairs_mut()
+                .append_pair("signed_length", &signed_length.to_string());
+        }
+        if let Some(after) = after {
+            url.query_pairs_mut().append_pair("after", after);
         }
         self.request_json(self.http.get(url)).await
     }
@@ -864,6 +896,22 @@ mod tests {
         assert_eq!(
             url.as_str(),
             "http://127.0.0.1:49223/v1/state?prefix=enclave%2F&confirmed=false&limit=10"
+        );
+    }
+
+    #[test]
+    fn rpc_state_snapshot_page_url_carries_length_and_cursor() {
+        let client = PeerRpcClient::new(DEFAULT_RPC_URL).unwrap();
+        let mut url = client.endpoint("state").unwrap();
+        url.query_pairs_mut()
+            .append_pair("prefix", "earn/fiat/")
+            .append_pair("confirmed", "true")
+            .append_pair("limit", "500")
+            .append_pair("signed_length", "42")
+            .append_pair("after", "earn/fiat/provider-a");
+        assert_eq!(
+            url.as_str(),
+            "http://127.0.0.1:49223/v1/state?prefix=earn%2Ffiat%2F&confirmed=true&limit=500&signed_length=42&after=earn%2Ffiat%2Fprovider-a"
         );
     }
 

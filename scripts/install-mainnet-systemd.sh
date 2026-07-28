@@ -32,8 +32,14 @@ for path in \
   "$live_env" \
   "$overlay_env" \
   "$repo/ops/systemd/mayhem-stack.service" \
+  "$repo/ops/systemd/mayhem-epoch-cadence.service" \
+  "$repo/ops/systemd/mayhem-epoch-cadence.timer" \
   "$repo/ops/systemd/mayhem-payout-worker.service" \
   "$repo/ops/systemd/mayhem-payout-worker.timer" \
+  "$repo/intercom/scripts/recompute-epoch-roots.mjs" \
+  "$repo/scripts/ops-settle-epoch.sh" \
+  "$repo/scripts/ops-epoch-cadence.sh" \
+  "$repo/scripts/mainnet-proof.mjs" \
   "$repo/scripts/ops/backup-mainnet.sh"; do
   [[ -f "$path" ]] || { echo "Missing required file: $path" >&2; exit 1; }
 done
@@ -70,6 +76,7 @@ append_default MAYHEM_RPC_URL 'http://127.0.0.1:49223/v1'
 append_default MAYHEM_GATEWAY_URL 'http://127.0.0.1:11435'
 append_default MAYHEM_ADMIN_HOME "$root/.mayhem-local/live-home"
 append_default MAYHEM_CADENCE_STATE_DIR "$root/.mayhem-local/settlement"
+append_default MAYHEM_RECEIPT_QUIET_SECONDS '30'
 append_default MAYHEM_SOURCE_DIR "$repo"
 append_default MAYHEM_TAP_SETTLEMENT_SPOOL "$root/.mayhem-local/settlement/tap"
 append_default MAYHEM_PAYGATE_BIND '127.0.0.1:11436'
@@ -393,6 +400,14 @@ command -v npm >/dev/null 2>&1 || {
   echo "npm is required to install the mainnet runtime dependencies." >&2
   exit 1
 }
+command -v node >/dev/null 2>&1 || {
+  echo "node is required by canonical receipt recomputation and mainnet proof." >&2
+  exit 1
+}
+command -v curl >/dev/null 2>&1 || {
+  echo "curl is required by canonical receipt finalization." >&2
+  exit 1
+}
 command -v runuser >/dev/null 2>&1 || {
   echo "runuser is required to install dependencies as the mayhem user." >&2
   exit 1
@@ -413,6 +428,28 @@ command -v timeout >/dev/null 2>&1 || {
   echo "timeout is required to bound automatic TAP payout attempts." >&2
   exit 1
 }
+
+bash -n "$repo/scripts/ops-settle-epoch.sh"
+bash -n "$repo/scripts/ops-epoch-cadence.sh"
+node --check "$repo/intercom/scripts/recompute-epoch-roots.mjs"
+node --check "$repo/scripts/mainnet-proof.mjs"
+grep -Fq 'receipt/epoch/{epoch}/index' "$repo/scripts/ops-settle-epoch.sh" || {
+  echo "Canonical exact-key receipt finalizer wiring is missing." >&2
+  exit 1
+}
+grep -Fq 'apply_pages' "$repo/intercom/scripts/recompute-epoch-roots.mjs" || {
+  echo "Bounded targeted epoch apply-page recomputation is missing." >&2
+  exit 1
+}
+grep -Fq 'metadata_hash' "$repo/scripts/ops-epoch-cadence.sh" || {
+  echo "Canonical receipt metadata quiet-window wiring is missing." >&2
+  exit 1
+}
+if grep -Eq '/mayhem/receipts|MAYHEM_GATEWAY_URL' \
+    "$repo/scripts/ops-settle-epoch.sh" "$repo/scripts/ops-epoch-cadence.sh"; then
+  echo "Canonical receipt finalization must not depend on one gateway." >&2
+  exit 1
+fi
 
 hydrate_intercom_package
 hydrate_npm_package "$repo/contracts"
@@ -445,8 +482,8 @@ systemctl enable \
   mayhem-tnk-rate.service \
   mayhem-tap-deposit.service \
   mayhem-tnk-deposit.service \
-  mayhem-tap-settlement.service \
-  mayhem-epoch-cadence.timer
+  mayhem-tap-settlement.service
+systemctl enable --now mayhem-epoch-cadence.timer
 systemctl enable --now mayhem-payout-worker.timer
 
 echo "Mayhem mainnet units installed; payouts are enabled and quiesced backups remain disabled."

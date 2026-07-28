@@ -4,11 +4,13 @@ import { keccak256 } from 'ethereum-cryptography/keccak';
 import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import PeerWallet from 'trac-wallet';
 import {
+  CONTRACT_VERSION,
   consentMessage,
   depositTnkIntentMessage,
   probeResultMessage,
   providerKybMessage,
   providerLifecycleIntentMessage,
+  payoutPreparationMessage,
   spendReservationMessage,
   spendVoucherMessage,
   tapAccountBindingMessage,
@@ -57,6 +59,190 @@ export class MemoryStorage {
 }
 
 export const makeTxKey = (n) => n.toString(16).padStart(64, '0');
+
+const stableTestValue = (value) => {
+  if (Array.isArray(value)) return value.map(stableTestValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value).sort().map((key) => [key, stableTestValue(value[key])])
+    );
+  }
+  return value;
+};
+
+const testDigest = async (domain, value) =>
+  b4a.toString(
+    await blake3(b4a.from(JSON.stringify({ domain, value: stableTestValue(value) }))),
+    'hex'
+  );
+
+const signHex = (wallet, message) =>
+  b4a.toString(wallet.sign(b4a.from(message)), 'hex');
+
+export async function prepareTargetedPayout(
+  contract,
+  storage,
+  value,
+  admin,
+  { submit = true, preparationValue = null } = {}
+) {
+  const rail = value.rail;
+  const preparationSource = preparationValue ?? value;
+  if (preparationSource.rail !== rail ||
+      preparationSource.epoch !== value.epoch ||
+      preparationSource.epoch_apply_hash !== value.epoch_apply_hash) {
+    return new Error('Test payout preparation source does not match settlement anchor.');
+  }
+  const outputPayloads = preparationSource.outputs.map((output, outputIndex) =>
+    contract.payoutPreparationOutputPayload(
+      preparationSource,
+      output,
+      outputIndex,
+      rail
+    )
+  );
+  value.preparation_ids = [];
+  value.external_effect_ids = [];
+  for (const [outputIndex, payload] of outputPayloads.entries()) {
+    value.preparation_ids.push(await testDigest(
+      'test-targeted-payout-preparation-id-v1',
+      { rail, epoch: preparationSource.epoch, output_index: outputIndex, payload }
+    ));
+    if (rail !== 'tap') {
+      value.external_effect_ids.push(await testDigest(
+        'test-targeted-payout-effect-id-v1',
+        { rail, epoch: preparationSource.epoch, output_index: outputIndex, payload }
+      ));
+    }
+  }
+  if (rail === 'tap') {
+    value.external_effect_ids = [
+      await testDigest('test-targeted-tap-proposal-id-v1', {
+        epoch: value.epoch,
+        root: value.root,
+      }),
+      await testDigest('test-targeted-tap-execution-id-v1', {
+        epoch: value.epoch,
+        root: value.root,
+      }),
+    ];
+    value.root_preparation_id = await testDigest(
+      'test-targeted-tap-root-preparation-id-v1',
+      {
+        epoch: value.epoch,
+        root: value.root,
+        outputs: value.outputs,
+        entries: value.entries,
+      }
+    );
+  }
+  if (!submit) return value;
+
+  let normalized;
+  if (rail === 'fiat' && preparationValue !== null) {
+    const outputs = outputPayloads.map(({ output }) =>
+      contract.normalizeTargetedFiatPreparationOutput(output)
+    );
+    const outputError = outputs.find((output) => output instanceof Error);
+    if (outputError) return outputError;
+    normalized = { outputs };
+  } else {
+    normalized = rail === 'tap'
+      ? contract.normalizeTargetedTapSettlementValue(value)
+      : rail === 'tnk'
+        ? contract.normalizeTargetedTnkSettlementValue(value)
+        : contract.normalizeTargetedFiatSettlementValue(value);
+    if (normalized instanceof Error) return normalized;
+  }
+  const preparations = [];
+  for (const [outputIndex, output] of normalized.outputs.entries()) {
+    const economicOpId = value.preparation_ids[outputIndex];
+    const payload = contract.payoutPreparationOutputPayload(
+      preparationSource,
+      output,
+      outputIndex,
+      rail
+    );
+    const liability = contract.payoutPreparationLiabilityForOutput(value, output, rail);
+    preparations.push({
+      economic_op_id: economicOpId,
+      kind: liability === null ? 'fee' : 'liability',
+      output_index: outputIndex,
+      payload,
+      liability,
+      external_effect_ids: rail === 'tap'
+        ? []
+        : [value.external_effect_ids[outputIndex]],
+    });
+  }
+  if (rail === 'tap') {
+    const rootPayload = await contract.payoutPreparationTapRootPayload(
+      value,
+      normalized
+    );
+    if (rootPayload instanceof Error) return rootPayload;
+    preparations.push({
+      economic_op_id: value.root_preparation_id,
+      kind: 'tap_root',
+      output_index: 0,
+      payload: rootPayload,
+      liability: null,
+      external_effect_ids: value.external_effect_ids,
+    });
+  }
+  for (const preparation of preparations) {
+    const payloadHash = await contract.opaqueHash(
+      'mayhem-targeted-payout-preparation-payload-v1',
+      {
+        economic_op_id: preparation.economic_op_id,
+        rail,
+        epoch: preparationSource.epoch,
+        epoch_apply_hash: preparationSource.epoch_apply_hash,
+        kind: preparation.kind,
+        output_index: preparation.output_index,
+        payload: preparation.payload,
+      }
+    );
+    const unsigned = {
+      op: 'prepare_targeted_payout',
+      contract_version: CONTRACT_VERSION,
+      economic_op_id: preparation.economic_op_id,
+      rail,
+      epoch: preparationSource.epoch,
+      epoch_apply_hash: preparationSource.epoch_apply_hash,
+      prepared_at: preparationSource.at,
+      kind: preparation.kind,
+      output_index: preparation.output_index,
+      payload_hash: payloadHash,
+      payload: preparation.payload,
+      liability: preparation.liability,
+      external_effect_ids: preparation.external_effect_ids,
+      admin: admin.publicKey,
+      admin_sig: '',
+    };
+    const prepared = {
+      ...unsigned,
+      admin_sig: signHex(admin.wallet, payoutPreparationMessage(unsigned)),
+    };
+    const recordKey = contract.payoutPreparationRecordKey(
+      rail,
+      prepared.economic_op_id
+    );
+    if ((await storage.get(recordKey)) !== null) continue;
+    const key = await contract.targetedPayoutPreparationFeatureKey(prepared);
+    if (key instanceof Error) return key;
+    const result = await executeFeature(
+      contract,
+      storage,
+      'mayhem_feature',
+      key,
+      prepared,
+      admin.publicKey
+    );
+    if (!result?.ok) return result ?? new Error('Targeted payout preparation failed.');
+  }
+  return value;
+}
 
 export async function seedSpendHold(storage, { user, rail = 'fiat', epoch, au }) {
   await storage.put(`hold/${rail}/${user}/${epoch}`, {

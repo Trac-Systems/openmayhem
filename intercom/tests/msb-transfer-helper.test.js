@@ -18,6 +18,14 @@ test('root Intercom app resolves the bundled MSB transfer helper', async () => {
     runRootMsbTransferHelper('invalid'),
     /Supported MSB helper commands/
   );
+  await assert.rejects(
+    runRootMsbTransferHelper('settlement-transfer-prepare'),
+    /Missing --network/
+  );
+  await assert.rejects(
+    runRootMsbTransferHelper('settlement-transfer-execute'),
+    /Missing --network/
+  );
 });
 
 test('root Intercom app parses a read-only official-MSB balance helper', () => {

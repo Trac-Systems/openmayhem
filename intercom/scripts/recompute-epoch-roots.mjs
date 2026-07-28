@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
@@ -8,7 +9,8 @@ const LEDGER_RAILS = new Set(['fiat', 'tap', 'tnk']);
 const LEDGER_RAIL_ORDER = ['fiat', 'tap', 'tnk'];
 const MAX_OPERATOR_FEE_BPS = 1_500;
 const TAP_BURN_BPS = 1_000;
-const SESSION_RECEIPT_SCHEMA_VERSION = 9;
+const SESSION_RECEIPT_SCHEMA_VERSION = 10;
+const CANONICAL_RECEIPT_SNAPSHOT_SCHEMA_VERSION = 1;
 
 export const stableValue = (value) => {
   if (Array.isArray(value)) return value.map((item) => stableValue(item));
@@ -78,6 +80,28 @@ function normalizeLedgerRail(value) {
   const rail = value.toLowerCase();
   if (!LEDGER_RAILS.has(rail)) throw new Error('receipt rail is unsupported');
   return rail;
+}
+
+function canonicalHex(value, bytes, label) {
+  if (typeof value !== 'string' || !new RegExp(`^[0-9a-f]{${bytes * 2}}$`).test(value)) {
+    throw new Error(`${label} must be ${bytes} bytes of lowercase hex`);
+  }
+  return value;
+}
+
+function canonicalSnapshotHashValue(snapshot) {
+  return {
+    schema_version: snapshot.schema_version,
+    type: snapshot.type,
+    settlement_epoch: snapshot.settlement_epoch,
+    metadata: snapshot.metadata,
+    identities: snapshot.identities,
+    heads: snapshot.heads,
+  };
+}
+
+function sha256Stable(value) {
+  return crypto.createHash('sha256').update(stableJson(value)).digest('hex');
 }
 
 function addRailAmount(map, rail, id, amount, label) {
@@ -222,6 +246,9 @@ function normalizeCurrentReceiptBody(body) {
     throw new Error('receipt billing_id must be 32 bytes of lowercase hex');
   }
   safeCount(body.billing_attempt, 'receipt billing_attempt', { allowZero: true });
+  safeCount(body.billing_epoch, 'receipt billing_epoch');
+  canonicalHex(body.reservation_id, 32, 'receipt reservation_id');
+  canonicalHex(body.payout_revision, 32, 'receipt payout_revision');
   const billingPriorUsage = normalizeReceiptUsage(body.billing_prior_usage);
   if (stableJson(billingPriorUsage) !== stableJson(body.billing_prior_usage)) {
     throw new Error('receipt billing_prior_usage must be canonical');
@@ -262,6 +289,342 @@ function normalizeCurrentReceiptBody(body) {
   return current;
 }
 
+function canonicalReceiptHead(entry, envelope, expectedSettlementEpoch) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+    throw new Error('canonical receipt head must be an object');
+  }
+  const { body } = envelope;
+  canonicalHex(envelope.enclave_sig, 64, 'canonical receipt enclave_sig');
+  canonicalHex(envelope.enclave_pubkey, 32, 'canonical receipt enclave_pubkey');
+  canonicalHex(envelope.user_sig, 64, 'canonical receipt user_sig');
+  const settlementEpoch = safeCount(
+    entry.epoch,
+    'canonical receipt head settlement epoch'
+  );
+  const billingEpoch = safeCount(
+    entry.billing_epoch,
+    'canonical receipt head billing_epoch'
+  );
+  const billingAttempt = safeCount(
+    entry.billing_attempt,
+    'canonical receipt head billing_attempt',
+    { allowZero: true }
+  );
+  const billingId = canonicalHex(entry.billing_id, 32, 'canonical receipt head billing_id');
+  const reservationId = canonicalHex(
+    entry.reservation_id,
+    32,
+    'canonical receipt head reservation_id'
+  );
+  const payoutRevision = canonicalHex(
+    entry.payout_revision,
+    32,
+    'canonical receipt head payout_revision'
+  );
+  const receiptHash = canonicalHex(entry.receipt_hash, 32, 'canonical receipt head receipt_hash');
+  const incrementalAu = canonicalAu(
+    safeAu(entry.incremental_au, 'canonical receipt head incremental_au')
+  );
+  if (settlementEpoch !== expectedSettlementEpoch) {
+    throw new Error('canonical receipt settlement epoch does not match requested epoch');
+  }
+  if (billingEpoch !== body.billing_epoch) {
+    throw new Error('canonical receipt head billing_epoch does not match signed receipt body');
+  }
+  if (billingEpoch > settlementEpoch) {
+    throw new Error('canonical receipt billing_epoch cannot be after its settlement epoch');
+  }
+  if (billingId !== body.billing_id || billingAttempt !== body.billing_attempt) {
+    throw new Error('canonical receipt head identity does not match signed receipt body');
+  }
+  if (reservationId !== body.reservation_id) {
+    throw new Error('canonical receipt head reservation_id does not match signed receipt body');
+  }
+  if (payoutRevision !== body.payout_revision) {
+    throw new Error('canonical receipt head payout_revision does not match signed receipt body');
+  }
+  return {
+    epoch: settlementEpoch,
+    billing_epoch: billingEpoch,
+    billing_id: billingId,
+    billing_attempt: billingAttempt,
+    reservation_id: reservationId,
+    payout_revision: payoutRevision,
+    receipt_hash: receiptHash,
+    incremental_au: incrementalAu,
+  };
+}
+
+function validateCanonicalReceiptSnapshot(bundle, receipts, settlementEpoch) {
+  const snapshot = bundle.receipt_snapshot;
+  if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) {
+    throw new Error('canonical receipt_snapshot is required');
+  }
+  if (
+    snapshot.schema_version !== CANONICAL_RECEIPT_SNAPSHOT_SCHEMA_VERSION ||
+    snapshot.type !== 'canonical_epoch_receipt_snapshot' ||
+    snapshot.settlement_epoch !== settlementEpoch ||
+    Object.keys(snapshot).sort().join(',') !==
+      'heads,identities,metadata,schema_version,settlement_epoch,snapshot_sha256,type'
+  ) {
+    throw new Error('canonical receipt_snapshot identity is invalid');
+  }
+  if (!snapshot.metadata || typeof snapshot.metadata !== 'object' || Array.isArray(snapshot.metadata)) {
+    throw new Error('canonical receipt_snapshot metadata is invalid');
+  }
+  if (
+    Object.keys(snapshot.metadata).sort().join(',') !==
+    'count,epoch,page_count,page_size,revision,type,updated_at'
+  ) {
+    throw new Error('canonical receipt_snapshot metadata shape is invalid');
+  }
+  const count = safeCount(snapshot.metadata.count, 'canonical receipt metadata count', {
+    allowZero: true,
+  });
+  const pageCount = safeCount(
+    snapshot.metadata.page_count,
+    'canonical receipt metadata page_count',
+    { allowZero: true }
+  );
+  const pageSize = safeCount(
+    snapshot.metadata.page_size,
+    'canonical receipt metadata page_size'
+  );
+  const revision = safeCount(
+    snapshot.metadata.revision,
+    'canonical receipt metadata revision',
+    { allowZero: true }
+  );
+  if (
+    snapshot.metadata.type !== 'canonical_receipt_epoch_index' ||
+    snapshot.metadata.epoch !== settlementEpoch
+  ) {
+    throw new Error('canonical receipt metadata epoch does not match requested epoch');
+  }
+  if (typeof snapshot.metadata.updated_at !== 'string' || snapshot.metadata.updated_at.length === 0) {
+    throw new Error('canonical receipt metadata updated_at is invalid');
+  }
+  if ((count === 0) !== (pageCount === 0)) {
+    throw new Error('canonical receipt metadata count/page_count mismatch');
+  }
+  if (pageCount > count || Math.ceil(count / pageSize) !== pageCount) {
+    throw new Error('canonical receipt metadata page bounds are inconsistent');
+  }
+  if (pageSize > 1_000 || revision < count) {
+    throw new Error('canonical receipt metadata counters are inconsistent');
+  }
+  if (!Array.isArray(snapshot.identities) || !Array.isArray(snapshot.heads)) {
+    throw new Error('canonical receipt_snapshot identities and heads must be arrays');
+  }
+  if (
+    snapshot.identities.length !== count ||
+    snapshot.heads.length !== count ||
+    receipts.length !== count ||
+    stableJson(snapshot.heads) !== stableJson(receipts)
+  ) {
+    throw new Error('canonical receipt_snapshot count or frozen heads mismatch');
+  }
+  canonicalHex(snapshot.snapshot_sha256, 32, 'canonical receipt snapshot_sha256');
+  const expectedHash = sha256Stable(canonicalSnapshotHashValue(snapshot));
+  if (snapshot.snapshot_sha256 !== expectedHash) {
+    throw new Error('canonical receipt snapshot hash mismatch');
+  }
+  const seenIdentities = new Set();
+  for (let index = 0; index < snapshot.identities.length; index += 1) {
+    const identity = snapshot.identities[index];
+    if (
+      !identity ||
+      typeof identity !== 'object' ||
+      Array.isArray(identity) ||
+      Object.keys(identity).sort().join(',') !== 'billing_attempt,billing_id'
+    ) {
+      throw new Error('canonical receipt identity shape is invalid');
+    }
+    const normalized = {
+      billing_id: canonicalHex(identity.billing_id, 32, 'canonical receipt identity billing_id'),
+      billing_attempt: safeCount(
+        identity.billing_attempt,
+        'canonical receipt identity billing_attempt',
+        { allowZero: true }
+      ),
+    };
+    const identityKey = `${normalized.billing_id}/${normalized.billing_attempt}`;
+    if (seenIdentities.has(identityKey)) {
+      throw new Error('canonical receipt identities contain a replay');
+    }
+    seenIdentities.add(identityKey);
+    const head = snapshot.heads[index];
+    if (
+      head?.billing_id !== normalized.billing_id ||
+      head?.billing_attempt !== normalized.billing_attempt
+    ) {
+      throw new Error('canonical receipt identity does not match its head');
+    }
+  }
+  return {
+    count,
+    pageCount,
+    pageSize,
+    revision,
+    metadata: stableValue(snapshot.metadata),
+  };
+}
+
+function addTargetedEarning(map, rail, provider, payoutRevision, amount) {
+  const key = JSON.stringify([rail, provider, payoutRevision]);
+  const current = map.get(key) ?? {
+    rail,
+    provider,
+    payout_revision: payoutRevision,
+    au: 0n,
+  };
+  current.au += amount;
+  safeAu(current.au, 'targeted earning', { allowZero: true });
+  map.set(key, current);
+}
+
+function sortedTargetedEarnings(map) {
+  return Array.from(map.values()).sort((left, right) => (
+    LEDGER_RAIL_ORDER.indexOf(left.rail) - LEDGER_RAIL_ORDER.indexOf(right.rail) ||
+    left.provider.localeCompare(right.provider) ||
+    left.payout_revision.localeCompare(right.payout_revision)
+  ));
+}
+
+function applyPageLimits(bundle, receiptPageSize) {
+  const maxApplyBatch = safeCount(bundle.params?.max_apply_batch, 'params.max_apply_batch');
+  const maxMarketUsageEntries = safeCount(
+    bundle.params?.max_market_usage_entries,
+    'params.max_market_usage_entries',
+    { allowZero: true }
+  );
+  if (maxApplyBatch < 2) {
+    throw new Error('params.max_apply_batch cannot fit one debit and one earning');
+  }
+  return {
+    maxApplyBatch,
+    maxMarketUsageEntries,
+    maxAllocations: Math.min(receiptPageSize, Math.floor(maxApplyBatch / 2)),
+  };
+}
+
+function emptyApplyPageState() {
+  return {
+    allocations: [],
+    debits: new Map(),
+    earnings: new Map(),
+    marketUsage: new Map(),
+  };
+}
+
+function applyPageCanFit(state, row, limits) {
+  if (state.allocations.length + 1 > limits.maxAllocations) return false;
+  const debitKey = JSON.stringify([row.allocation.rail, row.allocation.user]);
+  const earningKey = JSON.stringify([
+    row.allocation.rail,
+    row.allocation.provider,
+    row.allocation.payout_revision,
+  ]);
+  const usageKey = marketUsageKey(row.body.enclave_id, row.body.ctx_bracket ?? null);
+  const debitCount = state.debits.size + (state.debits.has(debitKey) ? 0 : 1);
+  const earningCount = state.earnings.size + (state.earnings.has(earningKey) ? 0 : 1);
+  const marketUsageCount = state.marketUsage.size + (state.marketUsage.has(usageKey) ? 0 : 1);
+  return (
+    debitCount + earningCount <= limits.maxApplyBatch &&
+    marketUsageCount <= limits.maxMarketUsageEntries
+  );
+}
+
+function addApplyPageRow(state, row) {
+  const amount = safeAu(row.allocation.au, 'apply page allocation au');
+  state.allocations.push(row.allocation);
+  addRailAmount(
+    state.debits,
+    row.allocation.rail,
+    row.allocation.user,
+    amount,
+    'apply page debit'
+  );
+  addTargetedEarning(
+    state.earnings,
+    row.allocation.rail,
+    row.allocation.provider,
+    row.allocation.payout_revision,
+    amount
+  );
+  addMarketUsage(state.marketUsage, row.body, row.allocation.session_id, amount);
+}
+
+function materializeApplyPage(state, page, receiptIndex) {
+  const allocations = state.allocations.slice();
+  const debits = sortedRailEntries(state.debits)
+    .map(({ rail, id: user, au }) => ({ rail, user, au: canonicalAu(au) }));
+  const earnings = sortedTargetedEarnings(state.earnings)
+    .map(({ rail, provider, payout_revision, au }) => ({
+      rail,
+      provider,
+      payout_revision,
+      gross_au: canonicalAu(au),
+    }));
+  const market_usage = sortedMarketUsageEntries(state.marketUsage);
+  const pageValue = {
+    page,
+    receipt_index: receiptIndex.metadata,
+    allocations,
+    debits,
+    earnings,
+    market_usage,
+  };
+  return {
+    ...pageValue,
+    page_sha256: sha256Stable(pageValue),
+  };
+}
+
+function buildApplyPages(rows, receiptIndex, limits) {
+  const pages = [];
+  let state = emptyApplyPageState();
+  for (const row of rows) {
+    if (!applyPageCanFit(state, row, limits)) {
+      if (state.allocations.length === 0) {
+        throw new Error('one canonical receipt allocation exceeds the active apply-page limits');
+      }
+      pages.push(materializeApplyPage(state, pages.length, receiptIndex));
+      state = emptyApplyPageState();
+    }
+    if (!applyPageCanFit(state, row, limits)) {
+      throw new Error('one canonical receipt allocation exceeds the active apply-page limits');
+    }
+    addApplyPageRow(state, row);
+  }
+  if (state.allocations.length > 0) {
+    pages.push(materializeApplyPage(state, pages.length, receiptIndex));
+  }
+  let cumulativeAllocations = 0;
+  for (const page of pages) {
+    cumulativeAllocations += page.allocations.length;
+    page.last_page = cumulativeAllocations === receiptIndex.count;
+    page.page_sha256 = sha256Stable({
+      page: page.page,
+      receipt_index: page.receipt_index,
+      allocations: page.allocations,
+      debits: page.debits,
+      earnings: page.earnings,
+      market_usage: page.market_usage,
+      last_page: page.last_page,
+    });
+  }
+  if (
+    cumulativeAllocations !== receiptIndex.count ||
+    pages.length === 0 ||
+    pages.slice(0, -1).some((page) => page.last_page) ||
+    pages.at(-1)?.last_page !== true
+  ) {
+    throw new Error('bounded apply pages do not cover the frozen receipt index exactly');
+  }
+  return pages;
+}
+
 function assertUsageMonotonic(previous, current) {
   for (const [unit, previousCount] of Object.entries(previous)) {
     if ((current[unit] ?? 0) < previousCount) {
@@ -285,6 +648,7 @@ function receiptEnvelope(entry) {
   const envelope = {
     body: currentBody,
     enclave_sig: receipt.enclave_sig ?? entry.enclave_sig ?? null,
+    enclave_pubkey: receipt.enclave_pubkey ?? entry.enclave_pubkey ?? null,
     user_sig: receipt.user_sig ?? entry.user_sig ?? null,
   };
   return envelope;
@@ -294,6 +658,15 @@ function receiptLeafEnvelope(envelope) {
   return {
     body: stableValue(envelope.body),
     enclave_sig: envelope.enclave_sig,
+    user_sig: envelope.user_sig,
+  };
+}
+
+function canonicalReceiptEnvelope(envelope) {
+  return {
+    body: stableValue(envelope.body),
+    enclave_sig: envelope.enclave_sig,
+    enclave_pubkey: envelope.enclave_pubkey,
     user_sig: envelope.user_sig,
   };
 }
@@ -414,6 +787,8 @@ export async function recomputeEpoch(bundle) {
 
   const deposits = Array.isArray(bundle.deposits) ? bundle.deposits : [];
   const receipts = Array.isArray(bundle.receipts) ? bundle.receipts : [];
+  const receiptIndex = validateCanonicalReceiptSnapshot(bundle, receipts, epoch);
+  const pageLimits = applyPageLimits(bundle, receiptIndex.pageSize);
   const priceDerivations = Array.isArray(bundle.price_derivations) ? bundle.price_derivations : [];
   const payouts = Array.isArray(bundle.payouts) ? bundle.payouts : [];
   if (payouts.length > 0) {
@@ -432,41 +807,97 @@ export async function recomputeEpoch(bundle) {
   const usageLeaves = [];
   const debitMap = new Map();
   const grossEarningMap = new Map();
+  const selectedPayoutRevisions = new Map();
   const marketUsageMap = new Map();
   const billingStates = new Map();
-  const sessions = new Set();
+  const allocations = [];
+  const allocationRows = [];
+  const seenBillingAttempts = new Map();
 
   const normalizedReceipts = receipts
-    .map((entry) => ({ entry, envelope: receiptEnvelope(entry) }))
+    .map((entry) => {
+      const envelope = receiptEnvelope(entry);
+      const head = canonicalReceiptHead(entry, envelope, epoch);
+      return { entry, envelope, head };
+    })
     .sort((a, b) => (
       String(a.envelope.body.billing_id).localeCompare(String(b.envelope.body.billing_id)) ||
       Number(a.envelope.body.billing_attempt ?? 0) - Number(b.envelope.body.billing_attempt ?? 0) ||
       Number(a.envelope.body.seq ?? 0) - Number(b.envelope.body.seq ?? 0)
     ));
 
-  for (const { entry, envelope } of normalizedReceipts) {
+  for (const { entry, envelope, head } of normalizedReceipts) {
     const { body } = envelope;
     for (const field of ['session_id', 'user', 'provider']) {
       if (typeof body[field] !== 'string' || body[field].length === 0) {
         throw new Error(`receipt ${field} is required`);
       }
     }
+    const identity = `${body.billing_id}/${body.billing_attempt}`;
+    const fingerprint = stableJson({
+      head,
+      receipt: receiptLeafEnvelope(envelope),
+    });
+    const priorFingerprint = seenBillingAttempts.get(identity);
+    if (priorFingerprint !== undefined) {
+      if (priorFingerprint !== fingerprint) {
+        throw new Error('conflicting canonical receipt for billing attempt');
+      }
+      continue;
+    }
+    seenBillingAttempts.set(identity, fingerprint);
+    const computedReceiptHash = await opaqueHash(
+      'mayhem-canonical-receipt-v1',
+      canonicalReceiptEnvelope(envelope)
+    );
+    if (computedReceiptHash !== head.receipt_hash) {
+      throw new Error('canonical receipt head hash does not match signed receipt envelope');
+    }
     const settleAu = receiptAmount(entry, body, billingStates);
+    if (canonicalAu(settleAu) !== head.incremental_au) {
+      throw new Error('canonical receipt incremental_au does not match signed billing high-water');
+    }
     if (settleAu === 0n) continue;
     const rail = normalizeLedgerRail(entry.rail ?? body.rail);
-    sessions.add(body.billing_id);
     addRailAmount(debitMap, rail, body.user, settleAu, 'debit');
-    addRailAmount(grossEarningMap, rail, body.provider, settleAu, 'earning');
-    addMarketUsage(marketUsageMap, body, body.billing_id, settleAu);
+    const providerRail = JSON.stringify([rail, body.provider]);
+    const selectedRevision = selectedPayoutRevisions.get(providerRail);
+    if (selectedRevision && selectedRevision !== body.payout_revision) {
+      throw new Error('provider rail selected conflicting payout revisions within one epoch');
+    }
+    selectedPayoutRevisions.set(providerRail, body.payout_revision);
+    addTargetedEarning(
+      grossEarningMap,
+      rail,
+      body.provider,
+      body.payout_revision,
+      settleAu
+    );
+    addMarketUsage(marketUsageMap, body, body.session_id, settleAu);
     usageLeaves.push(await opaqueHash('mayhem-usage-leaf-v1', receiptLeafEnvelope(envelope)));
+    const allocation = {
+      session_id: body.session_id,
+      user: body.user,
+      rail,
+      provider: body.provider,
+      payout_revision: body.payout_revision,
+      billing_epoch: body.billing_epoch,
+      billing_id: body.billing_id,
+      billing_attempt: body.billing_attempt,
+      receipt_seq: body.seq,
+      receipt_hash: computedReceiptHash,
+      au: canonicalAu(settleAu),
+    };
+    allocations.push(allocation);
+    allocationRows.push({ allocation, body });
   }
 
   const earningEntries = [];
   let feeAu = 0n;
   let burnAu = 0n;
   let earnCumAu = 0n;
-  for (const entry of sortedRailEntries(grossEarningMap)) {
-    const { rail, id: provider, au: grossAu } = entry;
+  for (const entry of sortedTargetedEarnings(grossEarningMap)) {
+    const { rail, provider, au: grossAu } = entry;
     const providerFeeAu = (grossAu * BigInt(feeBps)) / 10_000n;
     const providerBurnAu = rail === 'tap'
       ? (grossAu * BigInt(TAP_BURN_BPS)) / 10_000n
@@ -523,14 +954,40 @@ export async function recomputeEpoch(bundle) {
 
   const debits = sortedRailEntries(debitMap)
     .map(({ rail, id: user, au }) => ({ rail, user, au: canonicalAu(au) }));
-  const earnings = sortedRailEntries(grossEarningMap)
-    .map(({ rail, id: provider, au }) => ({ rail, provider, gross_au: canonicalAu(au) }));
+  const earnings = sortedTargetedEarnings(grossEarningMap)
+    .map(({ rail, provider, payout_revision, au }) => ({
+      rail,
+      provider,
+      payout_revision,
+      gross_au: canonicalAu(au),
+    }));
+  allocations.sort((left, right) => (
+    LEDGER_RAIL_ORDER.indexOf(left.rail) - LEDGER_RAIL_ORDER.indexOf(right.rail) ||
+    left.user.localeCompare(right.user) ||
+    left.billing_epoch - right.billing_epoch ||
+    left.billing_id.localeCompare(right.billing_id) ||
+    left.billing_attempt - right.billing_attempt ||
+    left.session_id.localeCompare(right.session_id)
+  ));
+  allocationRows.sort((left, right) => (
+    LEDGER_RAIL_ORDER.indexOf(left.allocation.rail) -
+      LEDGER_RAIL_ORDER.indexOf(right.allocation.rail) ||
+    left.allocation.user.localeCompare(right.allocation.user) ||
+    left.allocation.billing_epoch - right.allocation.billing_epoch ||
+    left.allocation.billing_id.localeCompare(right.allocation.billing_id) ||
+    left.allocation.billing_attempt - right.allocation.billing_attempt ||
+    left.allocation.session_id.localeCompare(right.allocation.session_id)
+  ));
+  if (stableJson(allocations) !== stableJson(allocationRows.map((row) => row.allocation))) {
+    throw new Error('canonical allocation/page ordering diverged');
+  }
+  const apply_pages = buildApplyPages(allocationRows, receiptIndex, pageLimits);
   const market_usage = sortedMarketUsageEntries(marketUsageMap);
   const useAu = sortedRailEntries(debitMap).reduce((sum, entry) => sum + entry.au, 0n);
   const totals = {
     dep_count: dep.count,
     dep_au: dep.auTotal,
-    use_count: sessions.size,
+    use_count: receiptIndex.count,
     use_au: canonicalAu(useAu),
     provider_count: grossEarningMap.size,
     earn_au: canonicalAu(earnCumAu),
@@ -548,7 +1005,15 @@ export async function recomputeEpoch(bundle) {
     totals,
     debits,
     earnings,
+    allocations,
     market_usage,
+    receipt_index: receiptIndex.metadata,
+    apply_page_limits: {
+      max_allocations: pageLimits.maxAllocations,
+      max_apply_batch: pageLimits.maxApplyBatch,
+      max_market_usage_entries: pageLimits.maxMarketUsageEntries,
+    },
+    apply_pages,
   };
 }
 

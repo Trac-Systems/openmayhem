@@ -11,9 +11,14 @@ export async function runRootMsbTransferHelper(command, args = []) {
     const { runSettlementTransferHelper } = await import('./msb-settlement-transfer-helper.js');
     return runSettlementTransferHelper(args);
   }
+  if (['settlement-transfer-prepare', 'settlement-transfer-execute'].includes(normalizedCommand)) {
+    const { runPreparedSettlementTransferHelper } =
+      await import('./msb-settlement-transfer-helper.js');
+    return runPreparedSettlementTransferHelper(normalizedCommand, args);
+  }
   if (normalizedCommand !== 'transfer') {
     throw new Error(
-      'Supported MSB helper commands: balance, transfer, settlement-transfer.'
+      'Supported MSB helper commands: balance, transfer, settlement-transfer, settlement-transfer-prepare, settlement-transfer-execute.'
     );
   }
   const { runTransferHelper } = await import('./msb-settlement-transfer-helper.js');

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Reconcile all operator-owned payout rails for one canonically applied epoch.
 # Fiat and TNK execute from ledger liabilities through the mayhem CLI. TAP work
-# is derived only from the retained finalized-epoch bundle and handed to the
-# existing simulate-first TAP settlement worker.
+# is derived only from the retained canonical finalized-epoch snapshot and
+# handed to the existing simulate-first TAP settlement worker.
 set -euo pipefail
 
 umask 077
@@ -25,6 +25,8 @@ FIAT_TRANSFER_MAX_ATTEMPTS="${MAYHEM_FIAT_TRANSFER_MAX_ATTEMPTS:-4}"
 FIAT_TRANSFER_RETRY_MS="${MAYHEM_FIAT_TRANSFER_RETRY_MS:-500}"
 TNK_TRANSFER_TIMEOUT_SECONDS="${MAYHEM_TNK_TRANSFER_TIMEOUT_SECONDS:-180}"
 TNK_TRANSFER_MAX_RETRIES="${MAYHEM_TNK_TRANSFER_MAX_RETRIES:-3}"
+TAP_CONTRACT_WAIT_ATTEMPTS="${MAYHEM_TAP_CONTRACT_WAIT_ATTEMPTS:-120}"
+TAP_CONTRACT_WAIT_SECONDS="${MAYHEM_TAP_CONTRACT_WAIT_SECONDS:-1}"
 
 json_field() {
   python3 -c '
@@ -59,7 +61,9 @@ for value in \
   "$FIAT_TRANSFER_MAX_ATTEMPTS" \
   "$FIAT_TRANSFER_RETRY_MS" \
   "$TNK_TRANSFER_TIMEOUT_SECONDS" \
-  "$TNK_TRANSFER_MAX_RETRIES"; do
+  "$TNK_TRANSFER_MAX_RETRIES" \
+  "$TAP_CONTRACT_WAIT_ATTEMPTS" \
+  "$TAP_CONTRACT_WAIT_SECONDS"; do
   positive_integer "$value" || {
     echo "abort: payout retry and timeout settings must be positive integers" >&2
     exit 1
@@ -216,53 +220,160 @@ if [[ "${MAYHEM_PAYOUT_LOCK_HELD:-0}" != "1" ]]; then
   export MAYHEM_PAYOUT_LOCK_HELD=1
 fi
 
-apply_state="$(curl -sf -m 10 "$RPC_URL/state?key=epoch/apply/state")"
-applied_epoch="$(printf '%s' "$apply_state" | json_field value.updated_epoch)"
-pending_epoch="$(printf '%s' "$apply_state" | json_field value.pending_epoch)"
-apply_hash="$(printf '%s' "$apply_state" | json_field value.last_apply_hash)"
-requested_epoch="${1:-$applied_epoch}"
+canonical_apply_state="$(curl -sf -m 10 "$RPC_URL/state?key=epoch/apply/state&confirmed=true")"
+canonical_applied_epoch="$(
+  printf '%s' "$canonical_apply_state" | json_field value.updated_epoch
+)"
+canonical_pending_epoch="$(
+  printf '%s' "$canonical_apply_state" | json_field value.pending_epoch
+)"
+canonical_apply_hash="$(
+  printf '%s' "$canonical_apply_state" | json_field value.last_apply_hash
+)"
+canonical_settlement_unix="$(
+  printf '%s' "$canonical_apply_state" | json_field value.last_settlement_unix
+)"
+if ! python3 - "$canonical_apply_state" <<'PY'
+import json, sys
+record = json.loads(sys.argv[1])
+state = record.get("value") if isinstance(record, dict) else None
+if (
+    not isinstance(record, dict)
+    or record.get("confirmed") is not True
+    or record.get("key") not in (None, "epoch/apply/state")
+    or not isinstance(state, dict)
+):
+    raise SystemExit("epoch/apply/state is not confirmed canonical state")
+epoch = state.get("updated_epoch")
+value = state.get("last_settlement_unix")
+if (
+    not isinstance(epoch, int)
+    or isinstance(epoch, bool)
+    or epoch < 0
+    or (
+        epoch > 0
+        and (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 1
+        )
+    )
+):
+    raise SystemExit("epoch/apply/state settlement timestamp is invalid")
+PY
+then
+  echo "abort: canonical epoch/apply/state.last_settlement_unix is invalid" >&2
+  exit 1
+fi
 
-[[ "$applied_epoch" =~ ^[0-9]+$ ]] || {
+[[ "$canonical_applied_epoch" =~ ^[0-9]+$ ]] || {
   echo "abort: canonical epoch/apply/state.updated_epoch is missing or invalid" >&2
   exit 1
 }
-if [[ "$applied_epoch" == "0" ]]; then
+if [[ "$canonical_applied_epoch" == "0" ]]; then
   echo "skip: no epoch has been finalized yet"
   exit 0
 fi
-if [[ -n "$pending_epoch" ]]; then
-  echo "skip: epoch $pending_epoch still has a pending paged apply"
+if [[ -n "$canonical_pending_epoch" ]]; then
+  echo "skip: epoch $canonical_pending_epoch still has a pending paged apply"
   exit 0
 fi
-if [[ "$requested_epoch" != "$applied_epoch" ]]; then
-  echo "abort: payout epoch $requested_epoch is not the current applied epoch $applied_epoch" >&2
+[[ "$canonical_apply_hash" =~ ^[0-9a-fA-F]{64}$ ]] || {
+  echo "abort: canonical epoch/apply/state.last_apply_hash is not a 32-byte hash" >&2
   exit 1
+}
+canonical_apply_hash="$(
+  printf '%s' "$canonical_apply_hash" | tr '[:upper:]' '[:lower:]'
+)"
+positive_integer "$canonical_settlement_unix" || {
+  echo "abort: canonical epoch/apply/state.last_settlement_unix is not a positive timestamp" >&2
+  exit 1
+}
+
+resume_work_dir="${MAYHEM_PAYOUT_RESUME_WORK_DIR:-}"
+if [[ -n "$resume_work_dir" ]]; then
+  [[ "${MAYHEM_PAYOUT_RESUME_PRIOR:-0}" == "1" ]] || {
+    echo "abort: prior payout work directory requires internal resume mode" >&2
+    exit 1
+  }
+  python3 - "$resume_work_dir" "$STATE_DIR/payout" <<'PY'
+import os, re, sys
+candidate, root = map(os.path.abspath, sys.argv[1:])
+if os.path.dirname(candidate) != root:
+    raise SystemExit("prior payout work directory escapes the canonical payout state root")
+if not re.fullmatch(r"epoch-[1-9][0-9]*-[0-9a-f]{64}", os.path.basename(candidate)):
+    raise SystemExit("prior payout work directory has a non-canonical name")
+if not os.path.isdir(candidate) or os.path.islink(candidate):
+    raise SystemExit("prior payout work directory is missing, not a directory, or a symlink")
+PY
+  work_name="${resume_work_dir##*/}"
+  applied_epoch="${work_name#epoch-}"
+  applied_epoch="${applied_epoch%%-*}"
+  apply_hash="${work_name##*-}"
+  work_dir="$resume_work_dir"
+  epoch_dir="$STATE_DIR/epochs/epoch-$applied_epoch"
+  requested_epoch="${1:-$applied_epoch}"
+  [[ "$requested_epoch" == "$applied_epoch" ]] || {
+    echo "abort: internal payout resume epoch does not match its retained work directory" >&2
+    exit 1
+  }
+  apply_state_file="$work_dir/apply-state.json"
+  [[ -f "$apply_state_file" ]] || {
+    echo "abort: prior payout work lacks its frozen canonical apply state" >&2
+    exit 1
+  }
+  apply_state="$(cat "$apply_state_file")"
+  python3 - "$apply_state_file" "$applied_epoch" "$apply_hash" <<'PY'
+import json, sys
+state = json.load(open(sys.argv[1])).get("value") or {}
+if (
+    state.get("updated_epoch") != int(sys.argv[2])
+    or str(state.get("last_apply_hash", "")).lower() != sys.argv[3]
+    or not isinstance(state.get("last_settlement_unix"), int)
+    or isinstance(state.get("last_settlement_unix"), bool)
+    or state.get("last_settlement_unix") < 1
+):
+    raise SystemExit("prior payout work does not match its frozen canonical apply state")
+PY
+  canonical_settlement_unix="$(
+    printf '%s' "$apply_state" | json_field value.last_settlement_unix
+  )"
+else
+  applied_epoch="$canonical_applied_epoch"
+  apply_hash="$canonical_apply_hash"
+  requested_epoch="${1:-$applied_epoch}"
+  [[ "$requested_epoch" == "$applied_epoch" ]] || {
+    echo "abort: payout epoch $requested_epoch is not the current applied epoch $applied_epoch" >&2
+    exit 1
+  }
+  work_dir="$STATE_DIR/payout/epoch-$applied_epoch-$apply_hash"
+  epoch_dir="$STATE_DIR/epochs/epoch-$applied_epoch"
+  mkdir -p "$work_dir"
+  apply_state="$canonical_apply_state"
+  printf '%s\n' "$apply_state" >"$work_dir/apply-state.json.tmp"
+  mv "$work_dir/apply-state.json.tmp" "$work_dir/apply-state.json"
 fi
+
 [[ "$requested_epoch" =~ ^[1-9][0-9]*$ ]] || {
   echo "abort: requested payout epoch must be a positive canonical integer" >&2
   exit 1
 }
 [[ "$apply_hash" =~ ^[0-9a-fA-F]{64}$ ]] || {
-  echo "abort: canonical epoch/apply/state.last_apply_hash is not a 32-byte hash" >&2
+  echo "abort: payout work apply hash is not a 32-byte hash" >&2
   exit 1
 }
 apply_hash="$(printf '%s' "$apply_hash" | tr '[:upper:]' '[:lower:]')"
 
-work_dir="$STATE_DIR/payout/epoch-$applied_epoch-$apply_hash"
-epoch_dir="$STATE_DIR/epochs/epoch-$applied_epoch"
-mkdir -p "$work_dir"
-printf '%s\n' "$apply_state" >"$work_dir/apply-state.json.tmp"
-mv "$work_dir/apply-state.json.tmp" "$work_dir/apply-state.json"
 validate_execution_context
 
 validate_epoch_artifact() {
   local bundle="$epoch_dir/epoch-bundle.json"
   local recomputed="$epoch_dir/epoch-recomputed.json"
   local artifact="$epoch_dir/epoch-artifact.json"
-  local gateway_receipts="$epoch_dir/gateway-receipts.json"
+  local canonical_receipts="$epoch_dir/canonical-receipts.json"
   [[ -f "$bundle" ]] || return 0
-  [[ -f "$recomputed" && -f "$artifact" && -f "$gateway_receipts" ]] || {
-    echo "abort: retained epoch bundle is missing recomputed, gateway, or apply-bound evidence" >&2
+  [[ -f "$recomputed" && -f "$artifact" && -f "$canonical_receipts" ]] || {
+    echo "abort: retained epoch bundle is missing recomputed, canonical receipt, or apply-bound evidence" >&2
     return 1
   }
   local dep_state use_state earn_state fee_state price_state
@@ -271,7 +382,7 @@ validate_epoch_artifact() {
   earn_state="$(curl -sf -m 10 "$RPC_URL/state?key=ev/earn/$applied_epoch")"
   fee_state="$(curl -sf -m 10 "$RPC_URL/state?key=ev/fee/$applied_epoch")"
   price_state="$(curl -sf -m 10 "$RPC_URL/state?key=ev/price/$applied_epoch")"
-  python3 - "$bundle" "$recomputed" "$gateway_receipts" "$artifact" \
+  python3 - "$bundle" "$recomputed" "$canonical_receipts" "$artifact" \
     "$applied_epoch" "$apply_hash" \
     "$dep_state" "$use_state" "$earn_state" "$fee_state" "$price_state" <<'PY'
 import hashlib, json, re, sys
@@ -301,9 +412,15 @@ receipts_raw, receipts = load(receipts_path)
 _, artifact = load(artifact_path)
 if bundle.get("epoch") != expected_epoch or recomputed.get("epoch") != expected_epoch:
     raise SystemExit("retained epoch artifacts have the wrong epoch")
-if not isinstance(receipts, list) or bundle.get("receipts") != receipts:
-    raise SystemExit("retained bundle receipts do not match the exact gateway snapshot")
-if artifact.get("schema_version") != 1 or artifact.get("type") != "retained_epoch_artifact":
+if (
+    not isinstance(receipts, dict)
+    or bundle.get("receipt_snapshot") != receipts
+    or bundle.get("receipts") != receipts.get("heads")
+    or receipts.get("settlement_epoch") != expected_epoch
+    or "epoch" in receipts
+):
+    raise SystemExit("retained bundle receipts do not match the exact canonical snapshot")
+if artifact.get("schema_version") != 1 or artifact.get("type") != "canonical_epoch_artifact":
     raise SystemExit("retained epoch artifact has the wrong schema")
 if artifact.get("rail") != "all" or artifact.get("rails") != ["fiat", "tap", "tnk"]:
     raise SystemExit("retained epoch artifact has invalid rail binding")
@@ -313,8 +430,8 @@ if artifact.get("bundle_sha256") != hashlib.sha256(bundle_raw).hexdigest():
     raise SystemExit("retained epoch bundle hash does not match its artifact")
 if artifact.get("recomputed_sha256") != hashlib.sha256(recomputed_raw).hexdigest():
     raise SystemExit("retained recomputed report hash does not match its artifact")
-if artifact.get("gateway_receipts_sha256") != hashlib.sha256(receipts_raw).hexdigest():
-    raise SystemExit("retained gateway receipt hash does not match its artifact")
+if artifact.get("canonical_receipts_sha256") != hashlib.sha256(receipts_raw).hexdigest():
+    raise SystemExit("retained canonical receipt hash does not match its artifact")
 roots = recomputed.get("roots")
 if not isinstance(roots, dict) or any(
     not re.fullmatch(r"[0-9a-f]{64}", str(roots.get(key, "")))
@@ -379,6 +496,10 @@ positive_integer "$settlement_at" || {
   echo "abort: invalid frozen settlement timestamp in $at_file" >&2
   exit 1
 }
+if (( settlement_at < canonical_settlement_unix )); then
+  echo "abort: frozen settlement timestamp predates canonical epoch settlement time" >&2
+  exit 1
+fi
 
 next_attempt() {
   local rail="$1"
@@ -430,9 +551,9 @@ next_attempt() {
 mark_rail() {
   local rail="$1" status="$2" evidence="$3"
   python3 - "$work_dir/$rail.complete.tmp" "$rail" "$status" "$evidence" \
-    "$applied_epoch" "$apply_hash" <<'PY'
+    "$applied_epoch" "$apply_hash" "$canonical_settlement_unix" <<'PY'
 import hashlib, json, os, sys
-path, rail, status, evidence, epoch, apply_hash = sys.argv[1:]
+path, rail, status, evidence, epoch, apply_hash, settlement_unix = sys.argv[1:]
 if status == "disabled":
     evidence_sha256 = None
 elif not os.path.isfile(evidence):
@@ -446,6 +567,7 @@ with open(path, "w") as out:
         "status": status,
         "epoch": int(epoch),
         "epoch_apply_hash": apply_hash,
+        "canonical_settlement_unix": int(settlement_unix),
         "evidence": evidence,
         "evidence_sha256": evidence_sha256,
     }, out, indent=2)
@@ -456,16 +578,18 @@ PY
 
 validate_rail_marker() {
   local rail="$1"
-  python3 - "$work_dir/$rail.complete" "$rail" "$applied_epoch" "$apply_hash" <<'PY'
+  python3 - "$work_dir/$rail.complete" "$rail" "$applied_epoch" "$apply_hash" \
+    "$canonical_settlement_unix" <<'PY'
 import hashlib, json, os, sys
-path, expected_rail, expected_epoch, expected_hash = sys.argv[1:]
+path, expected_rail, expected_epoch, expected_hash, expected_settlement_unix = sys.argv[1:]
 d = json.load(open(path))
 if (
     d.get("schema_version") != 1
     or d.get("rail") != expected_rail
     or d.get("epoch") != int(expected_epoch)
     or d.get("epoch_apply_hash") != expected_hash
-    or d.get("status") not in {"settled", "already_settled", "no_work", "disabled"}
+    or d.get("canonical_settlement_unix") != int(expected_settlement_unix)
+    or d.get("status") not in {"settled", "already_settled", "carry", "no_work", "disabled"}
 ):
     raise SystemExit(f"{expected_rail} completion marker is stale or malformed")
 if d["status"] == "disabled":
@@ -515,9 +639,13 @@ settlement = d.get("settlement")
 already = d.get("already_settled")
 if not isinstance(settlement, dict):
     raise SystemExit(f"{rail} report is missing settlement payload")
-if already is not None and already != settlement:
+if (
+    already is not None
+    and settlement.get("op") != "prepare_targeted_payout_epoch"
+    and already != settlement
+):
     raise SystemExit(f"{rail} report outer and retained settlement evidence disagree")
-expected_op = f"settle_targeted_{rail}"
+expected_op = "prepare_targeted_payout_epoch"
 if (
     settlement.get("op") != expected_op
     or settlement.get("rail") != rail
@@ -525,6 +653,196 @@ if (
     or str(settlement.get("epoch_apply_hash", "")).lower() != expected_hash
 ):
     raise SystemExit(f"{rail} settlement payload is stale or rail-contaminated")
+
+skipped = d.get("skipped_providers")
+if not isinstance(skipped, list):
+    raise SystemExit(f"{rail} report is missing explicit skipped-provider evidence")
+for item in skipped:
+    if (
+        not isinstance(item, dict)
+        or not {"provider", "payout_revision", "au", "reason", "blocking"}.issubset(item)
+        or not set(item).issubset({
+            "provider", "payout_revision", "au", "payout_min_au", "reason", "blocking"
+        })
+        or not re.fullmatch(r"[0-9a-f]{64}", str(item.get("provider", "")))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(item.get("payout_revision", "")))
+        or not re.fullmatch(r"(0|[1-9][0-9]*)", str(item.get("au", "")))
+        or not isinstance(item.get("reason"), str)
+        or not isinstance(item.get("blocking"), bool)
+    ):
+        raise SystemExit(f"{rail} skipped-provider evidence is malformed")
+    if item["blocking"] is False:
+        minimum = item.get("payout_min_au")
+        if (
+            item["reason"] !=
+                "liability is below canonical payout_min_au and remains carried forward"
+            or not isinstance(minimum, str)
+            or not re.fullmatch(r"(0|[1-9][0-9]*)", minimum)
+            or not (0 < int(item["au"]) < int(minimum))
+        ):
+            raise SystemExit(f"{rail} nonblocking carry evidence omits payable work")
+
+no_work = d.get("no_work")
+carry_forward = d.get("carry_forward")
+if not isinstance(no_work, bool) or not isinstance(carry_forward, bool):
+    raise SystemExit(f"{rail} report lacks explicit no_work/carry_forward booleans")
+
+if settlement.get("op") == "prepare_targeted_payout_epoch":
+    hash_pattern = re.compile(r"^[0-9a-f]{64}$")
+    plan_fields = {
+        "op", "contract_version", "rail", "epoch", "at",
+        "epoch_apply_hash", "snapshot_signed_length", "outcome", "outputs",
+        "carry", "outputs_root", "carry_root", "plan_root", "admin", "admin_sig",
+    }
+    if set(settlement) != plan_fields:
+        raise SystemExit(f"{rail} immutable epoch plan does not have the exact v17 schema")
+    if (
+        settlement.get("rail") != rail
+        or settlement.get("epoch") != expected_epoch
+        or settlement.get("epoch_apply_hash") != expected_hash
+        or not isinstance(settlement.get("contract_version"), int)
+        or isinstance(settlement.get("contract_version"), bool)
+        or settlement.get("contract_version") < 17
+        or not isinstance(settlement.get("at"), int)
+        or isinstance(settlement.get("at"), bool)
+        or settlement.get("at") < 1
+        or not isinstance(settlement.get("snapshot_signed_length"), int)
+        or isinstance(settlement.get("snapshot_signed_length"), bool)
+        or settlement.get("snapshot_signed_length") < 1
+        or any(
+            not isinstance(settlement.get(field), str)
+            or not hash_pattern.fullmatch(settlement[field])
+            for field in ("outputs_root", "carry_root", "plan_root")
+        )
+    ):
+        raise SystemExit(f"{rail} immutable epoch plan identity is invalid")
+
+    outputs = settlement.get("outputs")
+    carry = settlement.get("carry")
+    if not isinstance(outputs, list) or not isinstance(carry, list):
+        raise SystemExit(f"{rail} immutable epoch plan lacks outputs or carry")
+    economic_ids = []
+    for index, output in enumerate(outputs):
+        if (
+            not isinstance(output, dict)
+            or output.get("output_index") != index
+            or not isinstance(output.get("economic_op_id"), str)
+            or not hash_pattern.fullmatch(output["economic_op_id"])
+        ):
+            raise SystemExit(f"{rail} immutable epoch output identity is invalid")
+        economic_ids.append(output["economic_op_id"])
+    if len(set(economic_ids)) != len(economic_ids):
+        raise SystemExit(f"{rail} immutable epoch output identities are duplicated")
+    if any(not isinstance(item, dict) for item in carry):
+        raise SystemExit(f"{rail} immutable epoch carry evidence is malformed")
+    expected_outcome = "payouts" if outputs else ("carry" if carry else "no_work")
+    if settlement.get("outcome") != expected_outcome:
+        raise SystemExit(f"{rail} immutable epoch plan outcome is inconsistent")
+    expected_no_work = already is None and (
+        expected_outcome == "no_work"
+        if rail == "fiat"
+        else not outputs
+    )
+    expected_carry = already is None and (
+        expected_outcome == "carry"
+        if rail == "fiat"
+        else not outputs
+    )
+    if no_work != expected_no_work or carry_forward != expected_carry:
+        raise SystemExit(f"{rail} report no_work/carry flags disagree with its immutable plan")
+
+    def record_value(record, expected_type, label):
+        if (
+            not isinstance(record, dict)
+            or record.get("type") != expected_type
+            or not isinstance(record.get("value"), dict)
+        ):
+            raise SystemExit(f"{rail} {label} readback is malformed")
+        return record["value"]
+
+    def validate_close(record):
+        value = record_value(record, "targeted_payout_epoch_close", "canonical close")
+        if (
+            record.get("rail") != rail
+            or record.get("epoch") != expected_epoch
+            or record.get("plan_root") != settlement["plan_root"]
+            or record.get("outcome") != expected_outcome
+            or record.get("output_count") != len(outputs)
+            or record.get("carry_count") != len(carry)
+            or record.get("outputs_root") != settlement["outputs_root"]
+            or record.get("carry_root") != settlement["carry_root"]
+            or value.get("op") != "close_targeted_payout_epoch"
+            or value.get("rail") != rail
+            or value.get("epoch") != expected_epoch
+            or value.get("epoch_apply_hash") != expected_hash
+            or value.get("plan_root") != settlement["plan_root"]
+        ):
+            raise SystemExit(f"{rail} canonical close does not match its immutable plan")
+
+    if already is not None:
+        validate_close(already)
+        if d.get("submitted") is True:
+            raise SystemExit(f"{rail} replay unexpectedly claims a new submit")
+        raise SystemExit(0)
+
+    if phase == "plan":
+        if d.get("submitted") is not False:
+            raise SystemExit(f"{rail} plan unexpectedly claims a submit")
+        raise SystemExit(0)
+
+    result = d.get("feature_result")
+    if not isinstance(result, dict):
+        raise SystemExit(f"{rail} final report is missing canonical result readbacks")
+    required_result_fields = {"plan", "outputs", "close"}
+    if not required_result_fields.issubset(result):
+        raise SystemExit(f"{rail} final report is missing plan/output/close evidence")
+
+    plan_value = record_value(
+        result.get("plan"),
+        "targeted_payout_epoch_plan",
+        "canonical plan",
+    )
+    if plan_value != settlement:
+        raise SystemExit(f"{rail} canonical plan readback differs from the immutable plan")
+
+    output_records = result.get("outputs")
+    if not isinstance(output_records, list) or len(output_records) != len(outputs):
+        raise SystemExit(f"{rail} final report does not cover every planned output")
+    output_type = (
+        "targeted_fiat_output_settlement"
+        if rail == "fiat"
+        else "targeted_tnk_output_settlement"
+    )
+    for output, record in zip(outputs, output_records):
+        value = record_value(record, output_type, "output settlement")
+        if (
+            record.get("rail") != rail
+            or record.get("epoch") != expected_epoch
+            or record.get("economic_op_id") != output["economic_op_id"]
+            or value.get("rail") != rail
+            or value.get("epoch") != expected_epoch
+            or value.get("epoch_apply_hash") != expected_hash
+            or value.get("plan_root") != settlement["plan_root"]
+            or value.get("economic_op_id") != output["economic_op_id"]
+            or value.get("output_index") != output["output_index"]
+            or (
+                rail == "fiat"
+                and (
+                    not isinstance(value.get("attempt_id"), str)
+                    or not hash_pattern.fullmatch(value["attempt_id"])
+                )
+            )
+        ):
+            raise SystemExit(f"{rail} output settlement does not match its planned output")
+
+    validate_close(result.get("close"))
+    if d.get("settlement_state") != result.get("close"):
+        raise SystemExit(f"{rail} final settlement state differs from its canonical close")
+    if d.get("submitted") is not True:
+        raise SystemExit(f"{rail} final report does not prove canonical submission")
+    raise SystemExit(0)
+
+raise SystemExit(f"{rail} report does not use the v17 immutable epoch-plan schema")
 
 if rail == "fiat":
     payload_keys = {
@@ -535,7 +853,8 @@ if rail == "fiat":
         "gross_liability_au", "gross_paid_au", "rounding_au", "dust_au",
         "source_amount_minor", "destination_totals", "outputs",
     }
-    state_keys = payload_keys | {"type", "settled_by", "settled_by_role"}
+    prepared_payload_keys = payload_keys | {"preparation_ids", "external_effect_ids"}
+    state_keys = prepared_payload_keys | {"type", "settled_by", "settled_by_role"}
     decimal_pattern = re.compile(r"^(0|[1-9][0-9]*)$")
     rate_pattern = re.compile(r"^(0|[1-9][0-9]*)(\.[0-9]+)?$")
     currency_pattern = re.compile(r"^[a-z]{3}$")
@@ -712,8 +1031,11 @@ process.stdin.on("end", async () => {
         if computed_hash != expected_hash:
             raise SystemExit("fiat FX quote readback hash disagrees with retained evidence")
 
-    def validate_base(value, *, retained=False):
-        exact_keys(value, state_keys if retained else payload_keys, "fiat settlement")
+    def validate_base(value, *, retained=False, prepared=False):
+        expected_keys = state_keys if retained else (
+            prepared_payload_keys if prepared else payload_keys
+        )
+        exact_keys(value, expected_keys, "fiat settlement")
         if (
             value.get("op") != "settle_targeted_fiat"
             or value.get("rail") != "fiat"
@@ -757,7 +1079,31 @@ process.stdin.on("end", async () => {
             decimal(value.get(field), f"fiat draft {field}")
 
     def validate_exact(value, *, retained=False):
-        validate_base(value, retained=retained)
+        candidate_outputs = value.get("outputs")
+        preparation_ids = value.get("preparation_ids")
+        effect_ids = value.get("external_effect_ids")
+        output_count = len(candidate_outputs) if isinstance(candidate_outputs, list) else -1
+        if (
+            not isinstance(preparation_ids, list)
+            or len(preparation_ids) != output_count
+            or len(set(preparation_ids)) != output_count
+            or any(not isinstance(item, str) or not hash_pattern.fullmatch(item)
+                   for item in preparation_ids)
+        ):
+            raise SystemExit(
+                "fiat final settlement lacks one unique 32-byte preparation id per output"
+            )
+        if (
+            not isinstance(effect_ids, list)
+            or len(effect_ids) != output_count
+            or len(set(effect_ids)) != output_count
+            or any(not isinstance(item, str) or not hash_pattern.fullmatch(item)
+                   for item in effect_ids)
+        ):
+            raise SystemExit(
+                "fiat final settlement lacks one unique 32-byte external effect id per output"
+            )
+        validate_base(value, retained=retained, prepared=True)
         source_currency = currency(value.get("source_currency"), "fiat source currency")
         source_amount_minor = decimal(
             value.get("source_amount_minor"),
@@ -1003,6 +1349,59 @@ process.stdin.on("end", async () => {
         ):
             raise SystemExit("fiat settlement totals do not match outputs")
         return outputs, transfers
+
+    def validate_preparation_barrier(value, outputs):
+        preparation_ids = value.get("preparation_ids")
+        effect_ids = value.get("external_effect_ids")
+        if (
+            not isinstance(preparation_ids, list)
+            or len(preparation_ids) != len(outputs)
+            or len(set(preparation_ids)) != len(outputs)
+            or any(not isinstance(item, str) or not hash_pattern.fullmatch(item)
+                   for item in preparation_ids)
+        ):
+            raise SystemExit(
+                "fiat final settlement lacks one unique 32-byte preparation id per output"
+            )
+        if (
+            not isinstance(effect_ids, list)
+            or len(effect_ids) != len(outputs)
+            or len(set(effect_ids)) != len(outputs)
+            or any(not isinstance(item, str) or not hash_pattern.fullmatch(item)
+                   for item in effect_ids)
+        ):
+            raise SystemExit(
+                "fiat final settlement lacks one unique 32-byte external effect id per output"
+            )
+        preparations = d.get("payout_preparations")
+        if not isinstance(preparations, list) or len(preparations) != len(outputs):
+            raise SystemExit(
+                "fiat final report lacks one canonical preparation readback per output"
+            )
+        by_id = {
+            item.get("economic_op_id"): item
+            for item in preparations
+            if isinstance(item, dict)
+        }
+        if len(by_id) != len(outputs):
+            raise SystemExit("fiat canonical preparation readbacks are duplicated or malformed")
+        for index, (preparation_id, effect_id) in enumerate(
+            zip(preparation_ids, effect_ids)
+        ):
+            preparation = by_id.get(preparation_id)
+            if (
+                not isinstance(preparation, dict)
+                or preparation.get("type") != "targeted_payout_preparation"
+                or preparation.get("rail") != "fiat"
+                or preparation.get("epoch") != expected_epoch
+                or preparation.get("epoch_apply_hash") != expected_hash
+                or preparation.get("output_index") != index
+                or preparation.get("external_effect_ids") != [effect_id]
+                or preparation.get("consumed") is not False
+            ):
+                raise SystemExit(
+                    "fiat canonical preparation readback does not bind its output and effect"
+                )
 
     def validate_readback(value, outputs, transfers):
         reports = d.get("stripe_transfers")
@@ -1257,7 +1656,7 @@ process.stdin.on("end", async () => {
             raise SystemExit("fiat reconciliation does not exactly match settlement/readback evidence")
 
     if already is not None:
-        validate_exact(settlement, retained=True)
+        outputs, _ = validate_exact(settlement, retained=True)
         if phase == "final" and d.get("submitted") is True:
             raise SystemExit("fiat replay unexpectedly claims a new submit")
         raise SystemExit(0)
@@ -1269,10 +1668,15 @@ process.stdin.on("end", async () => {
         raise SystemExit(0)
 
     if d.get("nothing_to_settle") is True:
+        if no_work is not True:
+            raise SystemExit("fiat nothing_to_settle disagrees with no_work")
         validate_draft(settlement)
         raise SystemExit(0)
+    if no_work:
+        raise SystemExit("fiat no_work disagrees with nothing_to_settle")
 
     outputs, transfers = validate_exact(settlement)
+    validate_preparation_barrier(settlement, outputs)
     state = d.get("settlement_state")
     if not isinstance(state, dict):
         raise SystemExit("fiat final report has no canonical settlement state")
@@ -1296,20 +1700,77 @@ if not isinstance(outputs, list) or not isinstance(transfers, list):
 if already is not None:
     if phase == "final" and d.get("submitted") is True:
         raise SystemExit(f"{rail} replay unexpectedly claims a new submit")
-elif d.get("nothing_to_settle") is True:
+elif no_work:
     if outputs or transfers:
         raise SystemExit(f"{rail} no-work report contains transfer work")
 elif phase == "final":
+    preparation_ids = settlement.get("preparation_ids")
+    effect_ids = settlement.get("external_effect_ids")
+    hash_pattern = re.compile(r"^[0-9a-f]{64}$")
+    if (
+        not isinstance(preparation_ids, list)
+        or len(preparation_ids) != len(outputs)
+        or len(set(preparation_ids)) != len(outputs)
+        or any(not isinstance(item, str) or not hash_pattern.fullmatch(item)
+               for item in preparation_ids)
+    ):
+        raise SystemExit(
+            f"{rail} final settlement lacks one unique 32-byte preparation id per output"
+        )
+    if (
+        not isinstance(effect_ids, list)
+        or len(effect_ids) != len(outputs)
+        or len(set(effect_ids)) != len(outputs)
+        or any(not isinstance(item, str) or not hash_pattern.fullmatch(item)
+               for item in effect_ids)
+    ):
+        raise SystemExit(
+            f"{rail} final settlement lacks one unique 32-byte external effect id per output"
+        )
+    preparations = d.get("payout_preparations")
+    if not isinstance(preparations, list) or len(preparations) != len(outputs):
+        raise SystemExit(
+            f"{rail} final report lacks one canonical preparation readback per output"
+        )
+    by_id = {
+        item.get("economic_op_id"): item
+        for item in preparations
+        if isinstance(item, dict)
+    }
+    if len(by_id) != len(outputs):
+        raise SystemExit(
+            f"{rail} canonical preparation readbacks are duplicated or malformed"
+        )
+    for index, (preparation_id, effect_id) in enumerate(
+        zip(preparation_ids, effect_ids)
+    ):
+        preparation = by_id.get(preparation_id)
+        if (
+            not isinstance(preparation, dict)
+            or preparation.get("type") != "targeted_payout_preparation"
+            or preparation.get("rail") != rail
+            or preparation.get("epoch") != expected_epoch
+            or preparation.get("epoch_apply_hash") != expected_hash
+            or preparation.get("output_index") != index
+            or preparation.get("external_effect_ids") != [effect_id]
+            or preparation.get("consumed") is not False
+        ):
+            raise SystemExit(
+                f"{rail} canonical preparation readback does not bind its output and effect"
+            )
     state = d.get("settlement_state")
     if not isinstance(state, dict):
         raise SystemExit(f"{rail} final report has no canonical settlement state")
-    for key in ("op", "rail", "epoch", "epoch_apply_hash", "transfer_root", "outputs", transfer_key):
+    for key in (
+        "op", "rail", "epoch", "epoch_apply_hash", "preparation_ids",
+        "external_effect_ids", "transfer_root", "outputs", transfer_key,
+    ):
         if state.get(key) != settlement.get(key):
             raise SystemExit(f"{rail} canonical state disagrees on {key}")
     if d.get("submitted") is not True or len(transfers) != len(outputs) or not transfers:
         raise SystemExit(f"{rail} final transfer evidence is incomplete")
 
-if phase == "final" and already is None:
+if phase == "final" and already is None and not no_work:
     outer_outputs = d.get("msb_outputs")
     outer = d.get("msb_transfers")
     if not isinstance(outer_outputs, list) or len(outer_outputs) != len(outputs):
@@ -1363,6 +1824,146 @@ tx = d.get("execution_tx") or d.get("proposal_tx")
 if d.get("root_already_posted") is not True:
     if d.get("posted") is not True or not isinstance(tx, str) or not re.fullmatch(r"0x[0-9a-fA-F]{64}", tx):
         raise SystemExit("TAP report has no confirmed root transaction evidence")
+
+def stable_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+def canonical_uint(value, label):
+    if not isinstance(value, str) or not re.fullmatch(r"(0|[1-9][0-9]*)", value):
+        raise SystemExit(f"{label} is not a canonical unsigned integer")
+    return int(value)
+
+checkpoint = d.get("tap_settlement_checkpoint")
+checkpoint_keys = {
+    "op", "epoch", "at", "rail", "chain_id", "token_address",
+    "pool_address", "payment_config_ver", "epoch_apply_hash",
+    "tap_rate_lock", "root", "root_confirmed", "proposal_tx",
+    "proposal_block_number", "proposal_block_hash", "execution_tx",
+    "execution_status", "execution_block_number", "execution_block_hash",
+    "finalized_block_number", "confirmation_depth", "confirmation_policy",
+    "cumulative_spent_wei", "provider_count", "provider_paid_au",
+    "provider_tap_wei", "entries", "outputs",
+}
+if (
+    not isinstance(checkpoint, dict)
+    or set(checkpoint) != checkpoint_keys
+    or checkpoint.get("op") != "settle_targeted_tap"
+    or checkpoint.get("rail") != "tap"
+    or checkpoint.get("epoch") != expected_epoch
+    or checkpoint.get("epoch_apply_hash") != expected_hash
+    or checkpoint.get("root") != d.get("root", "").lower()
+    or checkpoint.get("root_confirmed") is not True
+):
+    raise SystemExit("TAP canonical settlement checkpoint identity is invalid")
+rate_lock = d.get("tap_rate_lock")
+if (
+    not isinstance(rate_lock, dict)
+    or checkpoint.get("tap_rate_lock") != rate_lock
+    or checkpoint.get("chain_id") != rate_lock.get("chain_id")
+    or checkpoint.get("token_address") != str(rate_lock.get("token_address", "")).lower()
+    or checkpoint.get("pool_address") != str(rate_lock.get("pool_address", "")).lower()
+    or checkpoint.get("payment_config_ver") != rate_lock.get("payment_config_ver")
+):
+    raise SystemExit("TAP canonical settlement checkpoint rate lock is invalid")
+confirmation = d.get("root_confirmation")
+proposal = confirmation.get("proposal") if isinstance(confirmation, dict) else None
+execution = confirmation.get("execution") if isinstance(confirmation, dict) else None
+if (
+    not isinstance(confirmation, dict)
+    or confirmation.get("confirmed") is not True
+    or confirmation.get("onchain_epoch") != expected_epoch
+    or confirmation.get("onchain_root") != checkpoint.get("root")
+    or confirmation.get("onchain_cumulative_spent_wei") !=
+        checkpoint.get("cumulative_spent_wei")
+    or not isinstance(proposal, dict)
+    or not isinstance(execution, dict)
+    or checkpoint.get("proposal_tx") != proposal.get("tx_hash")
+    or checkpoint.get("proposal_block_number") != proposal.get("block_number")
+    or checkpoint.get("proposal_block_hash") != proposal.get("block_hash")
+    or checkpoint.get("execution_tx") != execution.get("tx_hash")
+    or checkpoint.get("execution_status") != execution.get("status")
+    or checkpoint.get("execution_block_number") != execution.get("block_number")
+    or checkpoint.get("execution_block_hash") != execution.get("block_hash")
+    or checkpoint.get("finalized_block_number") != confirmation.get("finalized_block_number")
+    or checkpoint.get("confirmation_depth") != confirmation.get("confirmation_depth")
+    or checkpoint.get("confirmation_policy") != confirmation.get("confirmation_policy")
+    or not re.fullmatch(r"0x[0-9a-f]{64}", str(checkpoint.get("proposal_tx", "")))
+    or not re.fullmatch(r"0x[0-9a-f]{64}", str(checkpoint.get("execution_tx", "")))
+    or checkpoint.get("execution_status") != 1
+    or checkpoint.get("confirmation_depth") !=
+        checkpoint.get("finalized_block_number") - checkpoint.get("execution_block_number")
+):
+    raise SystemExit("TAP canonical settlement checkpoint root confirmation is invalid")
+entries = checkpoint.get("entries")
+if not isinstance(entries, list) or not entries:
+    raise SystemExit("TAP canonical settlement checkpoint entries are invalid")
+entry_map = {}
+for entry in entries:
+    if (
+        not isinstance(entry, dict)
+        or set(entry) != {"account", "cumulative_wei"}
+        or not re.fullmatch(r"0x[0-9a-f]{40}", str(entry.get("account", "")))
+    ):
+        raise SystemExit("TAP canonical settlement checkpoint entry shape is invalid")
+    account = entry["account"]
+    if account in entry_map:
+        raise SystemExit("TAP canonical settlement checkpoint entry is duplicated")
+    entry_map[account] = canonical_uint(
+        entry.get("cumulative_wei"),
+        "TAP cumulative entry",
+    )
+if entries != sorted(entries, key=lambda entry: entry["account"]):
+    raise SystemExit("TAP canonical settlement checkpoint entries are not sorted")
+if str(sum(entry_map.values())) != checkpoint.get("cumulative_spent_wei"):
+    raise SystemExit("TAP canonical cumulative settlement total is invalid")
+outputs = checkpoint.get("outputs")
+if (
+    not isinstance(outputs, list)
+    or not outputs
+    or checkpoint.get("provider_count") != len(outputs)
+):
+    raise SystemExit("TAP canonical settlement checkpoint outputs are invalid")
+seen = set()
+net_au = 0
+tap_wei = 0
+for output in outputs:
+    if not isinstance(output, dict) or sorted(output) != [
+        "cumulative_claim_wei",
+        "paid_au",
+        "payout_revision",
+        "provider",
+        "tap_wei",
+        "to",
+    ]:
+        raise SystemExit("TAP canonical provider checkpoint output shape is invalid")
+    identity = (output.get("provider"), output.get("payout_revision"))
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", str(identity[0] or ""))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(identity[1] or ""))
+        or not re.fullmatch(r"0x[0-9a-f]{40}", str(output.get("to", "")))
+        or identity in seen
+    ):
+        raise SystemExit("TAP canonical provider checkpoint identity is invalid")
+    seen.add(identity)
+    paid_now = canonical_uint(output.get("paid_au"), "TAP paid_au")
+    output_wei = canonical_uint(output.get("tap_wei"), "TAP output tap_wei")
+    cumulative = canonical_uint(
+        output.get("cumulative_claim_wei"),
+        "TAP cumulative claim",
+    )
+    if (
+        paid_now <= 0
+        or output_wei <= 0
+        or entry_map.get(output.get("to")) != cumulative
+    ):
+        raise SystemExit("TAP canonical provider checkpoint amount is invalid")
+    net_au += paid_now
+    tap_wei += output_wei
+if (
+    str(net_au) != checkpoint.get("provider_paid_au")
+    or str(tap_wei) != checkpoint.get("provider_tap_wei")
+):
+    raise SystemExit("TAP canonical settlement checkpoint totals do not match outputs")
 for field in ("operator_fee", "burn"):
     record = d.get(field)
     if not isinstance(record, dict):
@@ -1387,6 +1988,292 @@ for field in ("operator_fee", "burn"):
 PY
 }
 
+validate_tap_no_work() {
+  local report="$1" bundle="$2"
+  python3 - "$report" "$bundle" "$applied_epoch" "$apply_hash" <<'PY'
+import hashlib, json, re, sys
+report_path, bundle_path, expected_epoch, expected_hash = sys.argv[1:]
+expected_epoch = int(expected_epoch)
+bundle_raw = open(bundle_path, "rb").read()
+bundle = json.loads(bundle_raw)
+report = json.load(open(report_path))
+
+def uint(value, label):
+    if not isinstance(value, str) or not re.fullmatch(r"(0|[1-9][0-9]*)", value):
+        raise SystemExit(f"{label} is not a canonical unsigned integer")
+    return int(value)
+
+receipts = bundle.get("receipts")
+if (
+    bundle.get("rail") != "tap"
+    or bundle.get("epoch") != expected_epoch
+    or bundle.get("epoch_apply_hash") != expected_hash
+    or not isinstance(receipts, list)
+    or not receipts
+):
+    raise SystemExit("TAP carry bundle identity is invalid")
+if (
+    report.get("rail") != "tap"
+    or report.get("epoch") != expected_epoch
+    or report.get("epoch_apply_hash") != expected_hash
+    or report.get("bundle_sha256") != hashlib.sha256(bundle_raw).hexdigest()
+    or report.get("status") != "no_work"
+    or report.get("outcome") != "carry"
+    or report.get("blocked") is True
+    or report.get("tap_settlement_checkpoint") is not None
+    or report.get("checkpoint_outputs") != []
+    or report.get("spent_au") != "0"
+    or report.get("receipt_count") != len(receipts)
+):
+    raise SystemExit("TAP carry report is stale, incomplete, or has payable output")
+
+held_count = report.get("held_receipt_count")
+threshold_count = report.get("threshold_held_provider_count")
+if (
+    not isinstance(held_count, int)
+    or isinstance(held_count, bool)
+    or held_count < 0
+    or not isinstance(threshold_count, int)
+    or isinstance(threshold_count, bool)
+    or threshold_count < 0
+    or held_count + threshold_count < 1
+):
+    raise SystemExit("TAP carry report has no explicit held or below-threshold work")
+held_au = uint(report.get("held_au"), "TAP held_au")
+threshold_au = uint(report.get("threshold_held_au"), "TAP threshold_held_au")
+payout_min_au = uint(report.get("payout_min_au"), "TAP payout_min_au")
+if held_au < threshold_au:
+    raise SystemExit("TAP carry totals regress below-threshold liability")
+if held_count == 0 and held_au != threshold_au:
+    raise SystemExit("TAP carry report omits held-liability classification")
+
+deferred = report.get("canonical_deferred_liabilities")
+if not isinstance(deferred, list) or len(deferred) != threshold_count:
+    raise SystemExit("TAP carry report does not enumerate each below-threshold liability")
+rate_lock = report.get("tap_rate_lock")
+rate = uint(
+    rate_lock.get("tap_usd_au") if isinstance(rate_lock, dict) else None,
+    "TAP locked rate",
+)
+seen = set()
+for item in deferred:
+    if not isinstance(item, dict) or set(item) != {
+        "provider", "payout_revision", "to", "payable_au", "reason"
+    }:
+        raise SystemExit("TAP deferred liability has an invalid exact shape")
+    identity = (item.get("provider"), item.get("payout_revision"), item.get("to"))
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", str(identity[0] or ""))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(identity[1] or ""))
+        or not re.fullmatch(r"0x[0-9a-f]{40}", str(identity[2] or ""))
+        or identity in seen
+    ):
+        raise SystemExit("TAP deferred liability identity is invalid or duplicated")
+    seen.add(identity)
+    payable = uint(item.get("payable_au"), "TAP deferred payable_au")
+    if payable <= 0:
+        raise SystemExit("TAP deferred liability must be positive")
+    if item.get("reason") == "below_payout_minimum":
+        if payable >= payout_min_au:
+            raise SystemExit("TAP deferred liability is not below payout_min_au")
+    elif item.get("reason") == "below_tap_wei_precision":
+        if payable * 10**18 // rate != 0:
+            raise SystemExit("TAP deferred liability is representable in TAP wei")
+    else:
+        raise SystemExit("TAP deferred liability reason is not canonical")
+
+reason = report.get("reason")
+if reason not in {
+    "provider earnings await challenge or holdback maturity",
+    "provider earnings are below payout minimum",
+}:
+    raise SystemExit("TAP carry report reason is not canonical")
+PY
+}
+
+complete_tap_processed() {
+  local report="$1" bundle="$2" status
+  status="$(printf '%s' "$(cat "$report")" | json_field status)"
+  if [[ "$status" == "no_work" ]]; then
+    validate_tap_no_work "$report" "$bundle" || return 1
+    mark_rail tap carry "$report"
+    echo "tap: canonical held/below-threshold liabilities carried forward"
+    return 0
+  fi
+  [[ -z "$status" ]] || {
+    echo "tap: processed report has unsupported status $status" >&2
+    return 1
+  }
+  validate_tap_processed "$report" "$bundle" || return 1
+  reconcile_tap_contract_checkpoint "$report"
+}
+
+validate_tap_cli_report() {
+  local report="$1" checkpoint="$2" expected_submitted="$3" expected_sim="$4"
+  python3 - "$report" "$checkpoint" "$expected_submitted" "$expected_sim" <<'PY'
+import json, re, sys
+report = json.load(open(sys.argv[1]))
+checkpoint = json.load(open(sys.argv[2]))
+expected_submitted = sys.argv[3] == "true"
+expected_sim = sys.argv[4] == "true"
+feature = report.get("feature")
+key = feature.get("key") if isinstance(feature, dict) else None
+if (
+    report.get("ok") is not True
+    or report.get("feature_type") != "settleTargetedTap"
+    or report.get("submitted") is not expected_submitted
+    or (report.get("sim") is True) is not expected_sim
+    or not isinstance(feature, dict)
+    or feature.get("feature") != "mayhem"
+    or feature.get("value") != checkpoint
+    or not isinstance(key, str)
+    or not re.fullmatch(
+        rf"settle/targeted/tap/{checkpoint['epoch']}/[0-9a-f]{{64}}",
+        key,
+    )
+):
+    raise SystemExit("TAP admin CLI report does not bind the exact checkpoint")
+PY
+}
+
+tap_contract_record_status() {
+  local checkpoint="$1" state_file="$2"
+  python3 - "$checkpoint" "$state_file" <<'PY'
+import json, re, sys
+checkpoint = json.load(open(sys.argv[1]))
+record = json.load(open(sys.argv[2])).get("value")
+if record is None:
+    raise SystemExit(2)
+if not isinstance(record, dict):
+    raise SystemExit("canonical TAP settlement state is malformed")
+expected_keys = set(checkpoint) | {"type", "settled_by", "settled_by_role"}
+if (
+    set(record) != expected_keys
+    or record.get("type") != "targeted_tap_settlement"
+    or record.get("settled_by_role") != "admin"
+    or not re.fullmatch(r"[0-9a-f]{64}", str(record.get("settled_by", "")))
+    or any(record.get(key) != value for key, value in checkpoint.items())
+):
+    raise SystemExit("canonical TAP settlement state conflicts with retained checkpoint")
+PY
+}
+
+reconcile_tap_contract_checkpoint() {
+  local processed_report="$1"
+  local checkpoint="$work_dir/tap-contract-checkpoint.json"
+  local sim_report="$work_dir/tap-contract-sim.json"
+  local submit_report="$work_dir/tap-contract-submit.json"
+  local canonical_record="$work_dir/tap-contract-record.json"
+  local reconciliation="$work_dir/tap-contract-reconciliation.json"
+  local attempt state_status
+
+  if ! python3 - "$processed_report" "$checkpoint.tmp" <<'PY'
+import json, os, sys
+report = json.load(open(sys.argv[1]))
+checkpoint = report.get("tap_settlement_checkpoint")
+if not isinstance(checkpoint, dict):
+    raise SystemExit("processed TAP report has no canonical settlement checkpoint")
+with open(sys.argv[2], "w") as out:
+    json.dump(checkpoint, out, indent=2)
+    out.write("\n")
+    out.flush()
+    os.fsync(out.fileno())
+PY
+  then
+    rm -f "$checkpoint.tmp"
+    return 1
+  fi
+  if [[ -f "$checkpoint" ]] && ! cmp -s "$checkpoint" "$checkpoint.tmp"; then
+    rm -f "$checkpoint.tmp"
+    echo "tap: retained contract checkpoint conflicts with processed roller evidence" >&2
+    return 1
+  fi
+  mv "$checkpoint.tmp" "$checkpoint"
+
+  local -a args=(
+    --home "$ADMIN_HOME"
+    --rpc-url "$RPC_URL"
+    --peer-store-name "$ADMIN_STORE"
+    --checkpoint-file "$checkpoint"
+    --json
+  )
+  if ! "$MAYHEM_BIN" admin tap-settlement "${args[@]}" \
+    --submit --sim >"$sim_report.tmp"; then
+    rm -f "$sim_report.tmp"
+    echo "tap: canonical checkpoint simulation failed" >&2
+    return 1
+  fi
+  mv "$sim_report.tmp" "$sim_report"
+  validate_tap_cli_report "$sim_report" "$checkpoint" false true || return 1
+
+  if ! "$MAYHEM_BIN" admin tap-settlement "${args[@]}" \
+    --submit >"$submit_report.tmp"; then
+    rm -f "$submit_report.tmp"
+    echo "tap: canonical checkpoint submission failed" >&2
+    return 1
+  fi
+  mv "$submit_report.tmp" "$submit_report"
+  validate_tap_cli_report "$submit_report" "$checkpoint" true false || return 1
+
+  for ((attempt = 1; attempt <= TAP_CONTRACT_WAIT_ATTEMPTS; attempt += 1)); do
+    if ! curl -sf -m 10 \
+      "$RPC_URL/state?key=settle/targeted/tap/$applied_epoch" \
+      >"$canonical_record.tmp"; then
+      rm -f "$canonical_record.tmp"
+      echo "tap: canonical settlement readback failed" >&2
+      return 1
+    fi
+    mv "$canonical_record.tmp" "$canonical_record"
+    state_status=0
+    tap_contract_record_status "$checkpoint" "$canonical_record" || state_status=$?
+    if (( state_status == 0 )); then
+      break
+    elif (( state_status != 2 )); then
+      return 1
+    fi
+    if (( attempt == TAP_CONTRACT_WAIT_ATTEMPTS )); then
+      echo "tap: canonical settlement record did not become visible" >&2
+      return 1
+    fi
+    sleep "$TAP_CONTRACT_WAIT_SECONDS"
+  done
+
+  if [[ "${MAYHEM_PAYOUT_TEST_CRASH_AFTER_TAP_CONTRACT:-0}" == "1" ]]; then
+    [[ "${MAYHEM_PAYOUT_TEST_MODE:-0}" == "1" ]] || {
+      echo "abort: TAP contract crash hook is test-mode only" >&2
+      return 1
+    }
+    echo "tap: simulated crash after canonical settlement and before completion marker" >&2
+    return 98
+  fi
+
+  python3 - "$reconciliation.tmp" "$processed_report" "$checkpoint" \
+    "$sim_report" "$submit_report" "$canonical_record" "$applied_epoch" "$apply_hash" <<'PY'
+import hashlib, json, os, sys
+target, processed, checkpoint, sim, submit, record, epoch, apply_hash = sys.argv[1:]
+def digest(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+with open(target, "w") as out:
+    json.dump({
+        "schema_version": 1,
+        "type": "canonical_tap_settlement_reconciliation",
+        "epoch": int(epoch),
+        "epoch_apply_hash": apply_hash,
+        "processed_report_sha256": digest(processed),
+        "checkpoint_sha256": digest(checkpoint),
+        "simulation_sha256": digest(sim),
+        "submission_sha256": digest(submit),
+        "canonical_record_sha256": digest(record),
+    }, out, indent=2)
+    out.write("\n")
+    out.flush()
+    os.fsync(out.fileno())
+PY
+  mv "$reconciliation.tmp" "$reconciliation"
+  mark_rail tap settled "$reconciliation"
+  echo "tap: Ethereum execution and canonical Intercom settlement reconciled"
+}
+
 settle_fiat() {
   [[ -f "$work_dir/fiat.complete" ]] && {
     validate_rail_marker fiat || return 1
@@ -1394,11 +2281,11 @@ settle_fiat() {
     return 0
   }
 
-  local attempt attempt_result=0 plan_tmp plan_file error_file
+  local attempt attempt_result=0 final_tmp final_file error_file
   attempt="$(next_attempt fiat)" || attempt_result=$?
   [[ "$attempt_result" == "0" ]] || return "$attempt_result"
-  plan_tmp="$work_dir/fiat-plan.json.tmp"
-  plan_file="$work_dir/fiat-plan.json"
+  final_tmp="$work_dir/fiat-settlement.json.tmp"
+  final_file="$work_dir/fiat-settlement.json"
   error_file="$work_dir/fiat-attempt-$attempt.stderr.log"
   local -a args=(
     --home "$ADMIN_HOME"
@@ -1413,48 +2300,6 @@ settle_fiat() {
   )
   [[ -n "$FIAT_STRIPE_ENV_FILE" ]] && args+=(--stripe-env-file "$FIAT_STRIPE_ENV_FILE")
 
-  if ! "$MAYHEM_BIN" admin fiat-settlement "${args[@]}" >"$plan_tmp" 2>"$error_file"; then
-    rm -f "$plan_tmp"
-    echo "fiat: planning failed on attempt $attempt (see $error_file)" >&2
-    return 1
-  fi
-  mv "$plan_tmp" "$plan_file"
-  if ! validate_settlement_report "$plan_file" fiat plan; then
-    echo "fiat: plan is not bound to the current rail/epoch/apply hash (see $plan_file)" >&2
-    return 1
-  fi
-
-  local plan_state fiat_ok fiat_already fiat_empty fiat_blocking
-  plan_state="$(python3 - "$plan_file" <<'PY'
-import json, sys
-d = json.load(open(sys.argv[1]))
-blocking = sum(1 for item in d.get("skipped_providers", []) if item.get("blocking", True))
-print(
-    str(bool(d.get("ok"))).lower(),
-    str(d.get("already_settled") is not None).lower(),
-    str(bool(d.get("nothing_to_settle"))).lower(),
-    blocking,
-)
-PY
-)"
-  read -r fiat_ok fiat_already fiat_empty fiat_blocking <<<"$plan_state"
-  if [[ "$fiat_ok" != "true" || "$fiat_blocking" != "0" ]]; then
-    echo "fiat: plan has blocking payout errors (see $plan_file)" >&2
-    return 1
-  fi
-  if [[ "$fiat_already" == "true" ]]; then
-    mark_rail fiat already_settled "$plan_file"
-    echo "fiat: canonical settlement evidence already exists"
-    return 0
-  fi
-  if [[ "$fiat_empty" == "true" ]]; then
-    mark_rail fiat no_work "$plan_file"
-    echo "fiat: no whole-minor-unit settlement output"
-    return 0
-  fi
-
-  local final_tmp="$work_dir/fiat-settlement.json.tmp"
-  local final_file="$work_dir/fiat-settlement.json"
   if ! "$MAYHEM_BIN" admin fiat-settlement "${args[@]}" \
     --submit-transfer --submit >"$final_tmp" 2>"$error_file"; then
     rm -f "$final_tmp"
@@ -1466,8 +2311,40 @@ PY
     echo "fiat: final report did not prove exact settlement (see $final_file)" >&2
     return 1
   fi
-  mark_rail fiat settled "$final_file"
-  echo "fiat: Stripe transfers and canonical evidence reconciled"
+  if python3 - "$final_file" <<'PY'
+import json, sys
+raise SystemExit(0 if json.load(open(sys.argv[1])).get("already_settled") is not None else 1)
+PY
+  then
+    mark_rail fiat already_settled "$final_file"
+    echo "fiat: canonical settlement evidence already exists"
+    return 0
+  fi
+  local outcome
+  outcome="$(python3 - "$final_file" <<'PY'
+import json, sys
+report = json.load(open(sys.argv[1]))
+print(report["settlement"]["outcome"])
+PY
+)"
+  case "$outcome" in
+    payouts)
+      mark_rail fiat settled "$final_file"
+      echo "fiat: Stripe transfers and canonical close reconciled"
+      ;;
+    carry)
+      mark_rail fiat carry "$final_file"
+      echo "fiat: below-threshold liabilities carried and canonically closed"
+      ;;
+    no_work)
+      mark_rail fiat no_work "$final_file"
+      echo "fiat: empty epoch plan canonically closed"
+      ;;
+    *)
+      echo "fiat: final report has an unsupported canonical outcome" >&2
+      return 1
+      ;;
+  esac
 }
 
 settle_tnk() {
@@ -1496,76 +2373,6 @@ settle_tnk() {
 
   if ! "$MAYHEM_BIN" admin tnk-settlement "${args[@]}" >"$plan_tmp" 2>"$error_file"; then
     rm -f "$plan_tmp"
-    if grep -Fq \
-      "TNK settlement has no positive provider or operator fee outputs; nothing to broadcast" \
-      "$error_file"; then
-      local liabilities fee_state outstanding
-      liabilities="$(curl -sf -m 10 \
-        "$RPC_URL/state?prefix=payout/liability/tnk/&confirmed=false&limit=1000")"
-      fee_state="$(curl -sf -m 10 "$RPC_URL/state?key=fee/tnk/cum")"
-      printf '%s\n' "$liabilities" >"$work_dir/tnk-liabilities.json.tmp"
-      mv "$work_dir/tnk-liabilities.json.tmp" "$work_dir/tnk-liabilities.json"
-      printf '%s\n' "$fee_state" >"$work_dir/tnk-fee-state.json.tmp"
-      mv "$work_dir/tnk-fee-state.json.tmp" "$work_dir/tnk-fee-state.json"
-      outstanding="$(python3 - "$liabilities" "$fee_state" <<'PY'
-import json, sys
-liabilities = json.loads(sys.argv[1]).get("values", [])
-fee = json.loads(sys.argv[2]).get("value") or {}
-if not isinstance(liabilities, list) or len(liabilities) >= 1000:
-    raise SystemExit("TNK liability proof is missing or reached the unpageable RPC limit")
-if not isinstance(fee, dict):
-    raise SystemExit("TNK fee proof is malformed")
-
-def au(value, label):
-    text = str(value)
-    if not text.isdigit():
-        raise SystemExit(f"{label} is not a canonical decimal amount")
-    return int(text)
-
-unpaid = any(
-    au(item.get("value", {}).get("total_au", "0"), "TNK liability total_au")
-    > au(item.get("value", {}).get("paid_cum_au", "0"), "TNK liability paid_cum_au")
-    for item in liabilities
-    if str(item.get("key", "")).startswith("payout/liability/tnk/")
-)
-unpaid_fee = (
-    au(fee.get("cum_au", "0"), "TNK fee cum_au")
-    > au(fee.get("swept_cum_au", "0"), "TNK fee swept_cum_au")
-)
-print("true" if unpaid or unpaid_fee else "false")
-PY
-)"
-      if [[ "$outstanding" == "true" ]]; then
-        echo "tnk: CLI produced no outputs while canonical TNK liabilities remain held or blocked" >&2
-        return 1
-      fi
-      [[ "$outstanding" == "false" ]] || {
-        echo "tnk: liability no-work proof did not return a canonical boolean" >&2
-        return 1
-      }
-      python3 - "$plan_file" "$applied_epoch" "$apply_hash" \
-        "$work_dir/tnk-liabilities.json" "$work_dir/tnk-fee-state.json" <<'PY'
-import hashlib, json, sys
-liabilities_path, fee_path = sys.argv[4:]
-with open(sys.argv[1], "w") as out:
-    json.dump({
-        "schema_version": 1,
-        "type": "tnk_no_work_proof",
-        "ok": True,
-        "nothing_to_settle": True,
-        "epoch": int(sys.argv[2]),
-        "epoch_apply_hash": sys.argv[3],
-        "rail": "tnk",
-        "outstanding": False,
-        "liabilities_sha256": hashlib.sha256(open(liabilities_path, "rb").read()).hexdigest(),
-        "fee_state_sha256": hashlib.sha256(open(fee_path, "rb").read()).hexdigest(),
-    }, out, indent=2)
-    out.write("\n")
-PY
-      mark_rail tnk no_work "$plan_file"
-      echo "tnk: no positive settlement output"
-      return 0
-    fi
     echo "tnk: planning failed on attempt $attempt (see $error_file)" >&2
     return 1
   fi
@@ -1611,8 +2418,31 @@ PY
     echo "tnk: final report did not prove exact settlement (see $final_file)" >&2
     return 1
   fi
-  mark_rail tnk settled "$final_file"
-  echo "tnk: MSB transfers and canonical evidence reconciled"
+  local outcome
+  outcome="$(python3 - "$final_file" <<'PY'
+import json, sys
+report = json.load(open(sys.argv[1]))
+print(report["settlement"]["outcome"])
+PY
+)"
+  case "$outcome" in
+    payouts)
+      mark_rail tnk settled "$final_file"
+      echo "tnk: MSB transfers and canonical close reconciled"
+      ;;
+    carry)
+      mark_rail tnk carry "$final_file"
+      echo "tnk: below-threshold liabilities carried and canonically closed"
+      ;;
+    no_work)
+      mark_rail tnk no_work "$final_file"
+      echo "tnk: empty epoch plan canonically closed"
+      ;;
+    *)
+      echo "tnk: final report has an unsupported canonical outcome" >&2
+      return 1
+      ;;
+  esac
 }
 
 produce_tap_work() {
@@ -1681,12 +2511,10 @@ PY
         ;;
       processed)
         if [[ ! -f "$processed_report" ]] || \
-          ! validate_tap_processed "$processed_report" "$spool_path"; then
+          ! complete_tap_processed "$processed_report" "$spool_path"; then
           echo "tap: processed spool item lacks exact settlement evidence at $processed_report" >&2
           return 1
         fi
-        mark_rail tap settled "$processed_report"
-        echo "tap: root, operator fee, and burn completion reconciled"
         return 0
         ;;
     esac
@@ -1800,12 +2628,10 @@ PY
         ;;
       processed)
         if [[ ! -f "$processed_report" ]] || \
-          ! validate_tap_processed "$processed_report" "$existing"; then
+          ! complete_tap_processed "$processed_report" "$existing"; then
         echo "tap: processed spool item lacks complete settlement evidence at $processed_report" >&2
         return 1
         fi
-        mark_rail tap settled "$processed_report"
-        echo "tap: canonical processed settlement evidence already exists"
         return 0
         ;;
       ready|working)
@@ -1834,43 +2660,136 @@ PY
   return 2
 }
 
+resume_prior_rail_work() {
+  local rail="$1"
+  [[ "${MAYHEM_PAYOUT_RESUME_PRIOR:-0}" != "1" ]] || return 0
+
+  local prior_dir prior_epoch resume_result
+  local resume_list="$work_dir/$rail-prior-payout-work.list"
+  if ! python3 - "$STATE_DIR/payout" "$work_dir" "$canonical_applied_epoch" "$rail" \
+    >"$resume_list.tmp" <<'PY'
+import os, re, sys
+root, current, canonical_epoch, rail = (
+    sys.argv[1],
+    os.path.abspath(sys.argv[2]),
+    int(sys.argv[3]),
+    sys.argv[4],
+)
+pattern = re.compile(r"epoch-([1-9][0-9]*)-([0-9a-f]{64})")
+pending = []
+for name in os.listdir(root):
+    match = pattern.fullmatch(name)
+    if not match:
+        continue
+    path = os.path.abspath(os.path.join(root, name))
+    if path == current:
+        continue
+    if os.path.islink(path) or not os.path.isdir(path):
+        raise SystemExit(f"payout work entry is not a real directory: {path}")
+    epoch = int(match.group(1))
+    if epoch > canonical_epoch:
+        raise SystemExit(f"future payout work directory is unsafe: {path}")
+    if not os.path.isfile(os.path.join(path, f"{rail}.complete")):
+        pending.append((epoch, match.group(2), path))
+for _, _, path in sorted(pending):
+    sys.stdout.buffer.write(os.fsencode(path) + b"\0")
+PY
+  then
+    rm -f "$resume_list.tmp"
+    echo "abort: could not enumerate retained payout operations safely" >&2
+    return 1
+  fi
+  mv "$resume_list.tmp" "$resume_list"
+
+  while IFS= read -r -d '' prior_dir; do
+    prior_epoch="${prior_dir##*/epoch-}"
+    prior_epoch="${prior_epoch%%-*}"
+    echo "recovery: resuming unresolved $rail payout work for epoch $prior_epoch before new $rail liabilities"
+    resume_result=0
+    MAYHEM_PAYOUT_RESUME_PRIOR=1 \
+      MAYHEM_PAYOUT_RESUME_RAIL="$rail" \
+      MAYHEM_PAYOUT_RESUME_WORK_DIR="$prior_dir" \
+      bash "$0" "$prior_epoch" || resume_result=$?
+    if (( resume_result != 0 )); then
+      echo "abort: prior payout work remains failed for $rail at $prior_dir" >&2
+      return 1
+    fi
+    if [[ ! -f "$prior_dir/$rail.complete" ]]; then
+      echo "recovery: prior $rail payout work remains pending at $prior_dir; current $rail liabilities deferred"
+      return 2
+    fi
+  done <"$resume_list"
+  rm -f "$resume_list"
+}
+
+resume_only_rail="${MAYHEM_PAYOUT_RESUME_RAIL:-}"
+if [[ -n "$resume_only_rail" ]]; then
+  [[ "${MAYHEM_PAYOUT_RESUME_PRIOR:-0}" == "1" && -n "$resume_work_dir" ]] || {
+    echo "abort: single-rail payout resume is internal-only" >&2
+    exit 1
+  }
+  case "$resume_only_rail" in
+    fiat|tap|tnk) ;;
+    *)
+      echo "abort: internal payout resume rail is invalid" >&2
+      exit 1
+      ;;
+  esac
+fi
+
 failed=0
 pending=0
-if [[ "$FIAT_ENABLED" == "1" ]]; then
-  fiat_result=0
-  settle_fiat || fiat_result=$?
-  if [[ "$fiat_result" == "2" ]]; then
-    pending=1
-  elif [[ "$fiat_result" != "0" ]]; then
-    failed=1
+if [[ -z "$resume_only_rail" || "$resume_only_rail" == "fiat" ]]; then
+  if [[ "$FIAT_ENABLED" == "1" ]]; then
+    fiat_result=0
+    resume_prior_rail_work fiat || fiat_result=$?
+    if [[ "$fiat_result" == "0" ]]; then
+      settle_fiat || fiat_result=$?
+    fi
+    if [[ "$fiat_result" == "2" ]]; then
+      pending=1
+    elif [[ "$fiat_result" != "0" ]]; then
+      failed=1
+    fi
+  else
+    mark_rail fiat disabled "MAYHEM_FIAT_SETTLEMENT_ENABLED=0"
   fi
-else
-  mark_rail fiat disabled "MAYHEM_FIAT_SETTLEMENT_ENABLED=0"
 fi
-if [[ "$TNK_ENABLED" == "1" ]]; then
-  tnk_result=0
-  settle_tnk || tnk_result=$?
-  if [[ "$tnk_result" == "2" ]]; then
-    pending=1
-  elif [[ "$tnk_result" != "0" ]]; then
-    failed=1
+if [[ -z "$resume_only_rail" || "$resume_only_rail" == "tnk" ]]; then
+  if [[ "$TNK_ENABLED" == "1" ]]; then
+    tnk_result=0
+    resume_prior_rail_work tnk || tnk_result=$?
+    if [[ "$tnk_result" == "0" ]]; then
+      settle_tnk || tnk_result=$?
+    fi
+    if [[ "$tnk_result" == "2" ]]; then
+      pending=1
+    elif [[ "$tnk_result" != "0" ]]; then
+      failed=1
+    fi
+  else
+    mark_rail tnk disabled "MAYHEM_TNK_SETTLEMENT_ENABLED=0"
   fi
-else
-  mark_rail tnk disabled "MAYHEM_TNK_SETTLEMENT_ENABLED=0"
 fi
-if [[ "$TAP_ENABLED" == "1" ]]; then
-  tap_result=0
-  produce_tap_work || tap_result=$?
-  if [[ "$tap_result" == "2" ]]; then
-    pending=1
-  elif [[ "$tap_result" != "0" ]]; then
-    failed=1
+if [[ -z "$resume_only_rail" || "$resume_only_rail" == "tap" ]]; then
+  if [[ "$TAP_ENABLED" == "1" ]]; then
+    tap_result=0
+    resume_prior_rail_work tap || tap_result=$?
+    if [[ "$tap_result" == "0" ]]; then
+      produce_tap_work || tap_result=$?
+    fi
+    if [[ "$tap_result" == "2" ]]; then
+      pending=1
+    elif [[ "$tap_result" != "0" ]]; then
+      failed=1
+    fi
+  else
+    mark_rail tap disabled "MAYHEM_TAP_SETTLEMENT_ENABLED=0"
   fi
-else
-  mark_rail tap disabled "MAYHEM_TAP_SETTLEMENT_ENABLED=0"
 fi
 
 for rail in fiat tap tnk; do
+  [[ -z "$resume_only_rail" || "$resume_only_rail" == "$rail" ]] || continue
   if [[ -f "$work_dir/$rail.complete" ]]; then
     validate_rail_marker "$rail" || failed=1
   fi
@@ -1899,6 +2818,23 @@ with open(target, "w") as out:
     out.write("\n")
 PY
 mv "$work_dir/summary.json.tmp" "$work_dir/summary.json"
+
+if [[ -n "$resume_only_rail" ]]; then
+  if (( failed != 0 )); then
+    echo "epoch $applied_epoch $resume_only_rail payout reconciliation remains incomplete (see $work_dir)" >&2
+    exit 1
+  fi
+  if (( pending != 0 )); then
+    echo "epoch $applied_epoch $resume_only_rail payout work remains queued"
+    exit 0
+  fi
+  [[ -f "$work_dir/$resume_only_rail.complete" ]] || {
+    echo "epoch $applied_epoch $resume_only_rail payout resume produced no completion marker" >&2
+    exit 1
+  }
+  echo "epoch $applied_epoch $resume_only_rail payout work reconciled"
+  exit 0
+fi
 
 if (( failed != 0 )); then
   echo "epoch $applied_epoch payout reconciliation remains incomplete (see $work_dir)" >&2

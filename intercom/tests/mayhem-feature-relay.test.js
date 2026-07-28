@@ -12,9 +12,11 @@ import {
   providerPayoutBindingMessage,
   providerPayoutTargetBindingMessage,
 } from '../contract/contract.js';
+import { mayhemFeatureParticipant } from '../contract/protocol.js';
 import MayhemFeature, {
   MAYHEM_RELAY_CHANNEL,
   MAYHEM_RELAY_MAX_MESSAGE_BYTES,
+  participantFor,
   requestIdFor,
   serviceRequestIdFor,
   serviceSigningMessage,
@@ -35,6 +37,7 @@ import {
 
 const adminKey = 'aa'.repeat(32);
 const providerKey = 'bb'.repeat(32);
+const outsiderKey = 'cc'.repeat(32);
 const otherKey = 'cc'.repeat(32);
 const adminTxContext = Object.freeze({
   contract_version: CONTRACT_VERSION,
@@ -418,6 +421,95 @@ test('admin writer deduplicates a retried relay request by deterministic request
   await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
 
   assert.equal(writer.appended.length, 1);
+});
+
+test('provider receipt relay derives authority from the signed receipt and deduplicates exact retry', async () => {
+  const writer = peerFor(adminKey, { writable: true });
+  const writerFeature = new MayhemFeature(writer.peer, {});
+  writerFeature.key = 'mayhem';
+  writer.peer.sidechannel = {
+    started: true,
+    verifyPayload: () => true,
+    broadcast: () => true,
+  };
+  const key = `receipt/submit/1/${'12'.repeat(32)}/0/1/${'13'.repeat(32)}`;
+  const value = {
+    op: 'record_usage_receipt',
+    contract_version: CONTRACT_VERSION,
+    epoch: 1,
+    payout_revision: '14'.repeat(32),
+    receipt: {
+      body: {
+        provider: providerKey,
+      },
+      enclave_sig: '15'.repeat(64),
+      enclave_pubkey: '16'.repeat(32),
+      user_sig: '17'.repeat(64),
+    },
+    provider_sig: '18'.repeat(64),
+  };
+  assert.equal(participantFor(value), providerKey);
+  assert.equal(participantFor({
+    ...value,
+    receipt: { ...value.receipt, body: { ...value.receipt.body, provider: null } },
+  }), null);
+  const requestId = requestIdFor('mayhem', key, value);
+  const payload = {
+    from: providerKey,
+    sig: `signed:${providerKey}`,
+    message: {
+      control: 'mayhem_feature_request',
+      version: 1,
+      request_id: requestId,
+      feature: 'mayhem',
+      key,
+      value,
+    },
+  };
+
+  await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
+  await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
+
+  assert.equal(writer.appended.length, 1);
+  assert.equal(writer.appended[0].value.dispatch.address, adminKey);
+  assert.deepEqual(writer.appended[0].value.dispatch.value, value);
+});
+
+test('reservation close relay authority is provider-only', () => {
+  const value = {
+    op: 'close_usage_reservation',
+    provider: providerKey,
+    user: outsiderKey,
+    actor: providerKey,
+    actor_role: 'provider',
+  };
+  assert.equal(participantFor(value), providerKey);
+  assert.equal(mayhemFeatureParticipant(value), providerKey);
+
+  const buyerClose = {
+    ...value,
+    actor: outsiderKey,
+    actor_role: 'user',
+  };
+  assert.equal(participantFor(buyerClose), null);
+  assert.equal(mayhemFeatureParticipant(buyerClose), null);
+
+  const buyerExpiry = {
+    ...buyerClose,
+    op: 'expire_usage_reservation',
+  };
+  assert.equal(participantFor(buyerExpiry), outsiderKey);
+  assert.equal(mayhemFeatureParticipant(buyerExpiry), outsiderKey);
+  assert.equal(participantFor({
+    ...buyerExpiry,
+    actor: providerKey,
+    actor_role: 'provider',
+  }), null);
+  assert.equal(mayhemFeatureParticipant({
+    ...buyerExpiry,
+    actor: providerKey,
+    actor_role: 'provider',
+  }), null);
 });
 
 test('admin writer rejects an oversized feature before append instead of stalling', async () => {
@@ -2468,7 +2560,7 @@ test('Mayhem-owned RPC adapters expose canonical status and bounded prefix reads
         createReadStream({ gte, lt, limit }) {
           assert.equal(gte, 'price/');
           assert.equal(lt, 'price/\xff');
-          assert.equal(limit, 2);
+          assert.equal(limit, 3);
           return (async function* () {
             yield* entries;
           })();
@@ -2501,6 +2593,9 @@ test('Mayhem-owned RPC adapters expose canonical status and bounded prefix reads
     {
       prefix: 'price/',
       confirmed: false,
+      signed_length: 12,
+      next_cursor: null,
+      truncated: false,
       values: entries,
     }
   );

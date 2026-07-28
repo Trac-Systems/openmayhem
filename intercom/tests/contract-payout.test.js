@@ -6,6 +6,7 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import MayhemContract, {
   CONTRACT_VERSION,
   SESSION_RECEIPT_SCHEMA_VERSION,
+  SPEND_VOUCHER_SCHEMA_VERSION,
   providerPayoutBindingMessage,
   providerPayoutTargetBindingMessage,
   stripePayoutProcessorRevision,
@@ -280,13 +281,22 @@ function targetedSpendReservation(ctx, {
   at = 90_000 + epoch,
 }) {
   const voucherBody = {
+    schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
     session_id: sessionId,
     billing_id: sessionId,
     billing_attempt: 0,
     billing_prior_usage: {},
     billing_prior_au_owed_cum: '0',
+    billing_epoch: epoch,
+    reservation_id: sessionId,
+    reservation_expires_after_epoch: epoch + 24,
+    reservation_receipt_grace_epochs: 6,
+    user: ctx.user.publicKey,
+    provider: ctx.provider.publicKey,
+    payout_revision: payoutRevision,
     rail: 'fiat',
     enclave_id: enclaveId,
+    model_id: modelId,
     price_ver: 1,
     locked_rate_map: payoutLockedRateMap,
     locked_per_req_au: '0',
@@ -295,6 +305,7 @@ function targetedSpendReservation(ctx, {
     required_modalities: ['text'],
     ctx_bracket: 'le8k',
     ctx_bracket_table_ver: 1,
+    rules_ver: 1,
     max_spend_au: String(maxSpendAu),
     checkpoint_every: { tokens: 8192, ms: 30_000 },
   };
@@ -303,12 +314,18 @@ function targetedSpendReservation(ctx, {
     payout_revision: payoutRevision,
     contract_version: CONTRACT_VERSION,
     session_id: sessionId,
+    reservation_id: voucherBody.reservation_id,
+    reservation_expires_after_epoch: voucherBody.reservation_expires_after_epoch,
+    reservation_receipt_grace_epochs:
+      voucherBody.reservation_receipt_grace_epochs,
     epoch,
     at,
     rail: 'fiat',
     user: ctx.user.publicKey,
     provider: ctx.provider.publicKey,
     enclave_id: enclaveId,
+    enclave_pubkey: enclaveId,
+    model_id: modelId,
     price_ver: 1,
     rules_ver: 1,
     served_ctx: 8192,
@@ -358,6 +375,9 @@ async function executeTargetedSpend(ctx, value, contract = ctx.contract) {
 async function executeTargetedEpoch(ctx, value, contract = ctx.contract) {
   contract._mayhemLastFeatureResult = undefined;
   const key = await contract.targetedEpochFeatureKey(value);
+  if (key instanceof Error) {
+    return { key: null, result: key };
+  }
   const result = await executeFeature(
     contract,
     ctx.storage,
@@ -371,6 +391,129 @@ async function executeTargetedEpoch(ctx, value, contract = ctx.contract) {
     result: result ?? contract._mayhemLastFeatureResult,
   };
 }
+
+async function seedCanonicalReceiptEpoch(
+  ctx,
+  entries,
+  { epoch, txNo }
+) {
+  const updatedAt = makeTxKey(txNo);
+  const heads = entries.map(({ reservation, au }, index) => {
+    const voucher = reservation.voucher;
+    return {
+      type: 'canonical_receipt_head',
+      billing_id: voucher.billing_id,
+      billing_attempt: voucher.billing_attempt,
+      epoch,
+      billing_epoch: voucher.billing_epoch,
+      settlement_epoch: epoch,
+      index_position: index,
+      settlement_ready: true,
+      user: voucher.user,
+      rail: voucher.rail,
+      provider: voucher.provider,
+      payout_revision: voucher.payout_revision,
+      session_id: voucher.session_id,
+      reservation_id: voucher.reservation_id,
+      receipt_seq: 1,
+      receipt_hash: (index + 1).toString(16).repeat(64),
+      incremental_au: String(au),
+      feature_key: updatedAt,
+      updated_at: updatedAt,
+    };
+  });
+  const receiptIndex = {
+    type: 'canonical_receipt_epoch_index',
+    epoch,
+    count: heads.length,
+    page_size: 128,
+    page_count: 1,
+    revision: heads.length,
+    updated_at: updatedAt,
+  };
+  await ctx.storage.put(`receipt/epoch/${epoch}/index`, receiptIndex);
+  await ctx.storage.put(`receipt/epoch/${epoch}/page/0`, {
+    type: 'canonical_receipt_epoch_page',
+    epoch,
+    page: 0,
+    identities: heads.map(({ billing_id, billing_attempt }) => ({
+      billing_id,
+      billing_attempt,
+    })),
+  });
+  for (const head of heads) {
+    await ctx.storage.put(
+      `receipt/head/${head.billing_id}/${head.billing_attempt}`,
+      head
+    );
+    const holdKey = ctx.contract.targetedSpendHoldKey(head.user, head.rail);
+    const hold = (await ctx.storage.get(holdKey)).value;
+    await ctx.storage.put(holdKey, {
+      ...hold,
+      sessions: hold.sessions.map((session) => (
+        session.reservation_id === head.reservation_id
+          ? { ...session, settlement_ready: true }
+          : session
+      )),
+      updated_at: updatedAt,
+    });
+  }
+  const useAu = heads
+    .reduce((sum, head) => sum + BigInt(head.incremental_au), 0n)
+    .toString();
+  const committed = await execute(
+    ctx.contract,
+    ctx.storage,
+    'epochCommit',
+    {
+      op: 'epoch_commit',
+      epoch,
+      at: epoch * 3_600,
+      roots: {
+        dep: '91'.repeat(32),
+        use: '92'.repeat(32),
+        earn: '93'.repeat(32),
+        fee: '94'.repeat(32),
+        price: '95'.repeat(32),
+      },
+      totals: {
+        dep_count: 0,
+        dep_au: '0',
+        use_count: heads.length,
+        use_au: useAu,
+        provider_count: new Set(heads.map((head) => head.provider)).size,
+        earn_au: '0',
+        fee_au: '0',
+        fee_cum_au: '0',
+        burn_au: '0',
+        burn_cum_au: '0',
+        price_count: 0,
+      },
+    },
+    ctx.submitter.publicKey,
+    txNo
+  );
+  assert.equal(committed.ok, true, committed.message);
+  return {
+    heads,
+    receiptIndex,
+    commitHash: committed.commit_hash,
+  };
+}
+
+const receiptBoundAllocation = (head, au = head.incremental_au) => ({
+  session_id: head.session_id,
+  billing_id: head.billing_id,
+  billing_attempt: head.billing_attempt,
+  billing_epoch: head.billing_epoch,
+  receipt_seq: head.receipt_seq,
+  receipt_hash: head.receipt_hash,
+  user: head.user,
+  rail: head.rail,
+  provider: head.provider,
+  payout_revision: head.payout_revision,
+  au: String(au),
+});
 
 async function executePayoutBinding(contract, storage, binding, admin) {
   contract._mayhemLastFeatureResult = undefined;
@@ -1283,10 +1426,17 @@ test('Stripe payout rotation freezes reserved and earned liabilities by revision
     /not active|revision is not active/i
   );
 
+  const firstCanonical = await seedCanonicalReceiptEpoch(
+    ctx,
+    [{ reservation: reservedWhileReplacementVerifies, au: '1000000' }],
+    { epoch: 1, txNo: 40 }
+  );
   const firstEpoch = {
     op: 'apply_targeted_epoch',
     epoch: 1,
     at: 90_001,
+    epoch_commit_hash: firstCanonical.commitHash,
+    receipt_index: firstCanonical.receiptIndex,
     debits: [{ rail: 'fiat', user: ctx.user.publicKey, au: '1000000' }],
     earnings: [{
       rail: 'fiat',
@@ -1294,14 +1444,9 @@ test('Stripe payout rotation freezes reserved and earned liabilities by revision
       gross_au: '1000000',
       payout_revision: firstBinding.revision,
     }],
-    allocations: [{
-      session_id: 'a'.repeat(64),
-      user: ctx.user.publicKey,
-      rail: 'fiat',
-      provider: ctx.provider.publicKey,
-      payout_revision: firstBinding.revision,
-      au: '1000000',
-    }],
+    allocations: [receiptBoundAllocation(firstCanonical.heads[0])],
+    page: 0,
+    last_page: true,
   };
   const firstApplied = await executeTargetedEpoch(ctx, firstEpoch);
   assert.equal(firstApplied.result.ok, true, firstApplied.result.message);
@@ -1340,10 +1485,17 @@ test('Stripe payout rotation freezes reserved and earned liabilities by revision
     restarted
   );
   assert.equal(secondReserve.result.ok, true, secondReserve.result.message);
+  const secondCanonical = await seedCanonicalReceiptEpoch(
+    ctx,
+    [{ reservation: reservedAfterRotation, au: '1000000' }],
+    { epoch: 2, txNo: 41 }
+  );
   const secondEpoch = {
     op: 'apply_targeted_epoch',
     epoch: 2,
-    at: 90_002,
+    at: 93_601,
+    epoch_commit_hash: secondCanonical.commitHash,
+    receipt_index: secondCanonical.receiptIndex,
     debits: [{ rail: 'fiat', user: ctx.user.publicKey, au: '1000000' }],
     earnings: [{
       rail: 'fiat',
@@ -1351,14 +1503,9 @@ test('Stripe payout rotation freezes reserved and earned liabilities by revision
       gross_au: '1000000',
       payout_revision: nextBinding.revision,
     }],
-    allocations: [{
-      session_id: 'c'.repeat(64),
-      user: ctx.user.publicKey,
-      rail: 'fiat',
-      provider: ctx.provider.publicKey,
-      payout_revision: nextBinding.revision,
-      au: '1000000',
-    }],
+    allocations: [receiptBoundAllocation(secondCanonical.heads[0])],
+    page: 0,
+    last_page: true,
   };
   const secondApplied = await executeTargetedEpoch(ctx, secondEpoch, restarted);
   assert.equal(secondApplied.result.ok, true, secondApplied.result.message);
@@ -1381,14 +1528,14 @@ test('Stripe payout rotation freezes reserved and earned liabilities by revision
   assert.equal(secondLiability.total_au, '850000');
   assert.equal(
     (await ctx.storage.get(
-      `hold/fiat/${ctx.user.publicKey}/1`
-    )).value.sessions[0].payout_revision,
+      `payout/allocation/1/${'a'.repeat(64)}`
+    )).value.payout_revision,
     firstBinding.revision
   );
   assert.equal(
     (await ctx.storage.get(
-      `hold/fiat/${ctx.user.publicKey}/2`
-    )).value.sessions[0].payout_revision,
+      `payout/allocation/2/${'c'.repeat(64)}`
+    )).value.payout_revision,
     nextBinding.revision
   );
 });
@@ -1465,6 +1612,14 @@ test('targeted epoch rejects cross-provider session amount substitution', async 
   });
   assert.equal((await executeTargetedSpend(providers[0], small)).result.ok, true);
   assert.equal((await executeTargetedSpend(providers[1], large)).result.ok, true);
+  const canonical = await seedCanonicalReceiptEpoch(
+    ctx,
+    [
+      { reservation: small, au: '1000000' },
+      { reservation: large, au: '4000000' },
+    ],
+    { epoch: 1, txNo: 40 }
+  );
 
   const earnings = providers
     .map((providerCtx, index) => ({
@@ -1478,29 +1633,22 @@ test('targeted epoch rejects cross-provider session amount substitution', async 
     op: 'apply_targeted_epoch',
     epoch: 1,
     at: 90_001,
+    epoch_commit_hash: canonical.commitHash,
+    receipt_index: canonical.receiptIndex,
     debits: [{ rail: 'fiat', user: ctx.user.publicKey, au: '5000000' }],
     earnings,
     allocations: [
-      {
-        session_id: 'a'.repeat(64),
-        user: ctx.user.publicKey,
-        rail: 'fiat',
-        provider: providers[0].provider.publicKey,
-        payout_revision: providers[0].binding.revision,
-        au: '4000000',
-      },
-      {
-        session_id: 'b'.repeat(64),
-        user: ctx.user.publicKey,
-        rail: 'fiat',
-        provider: providers[1].provider.publicKey,
-        payout_revision: providers[1].binding.revision,
-        au: '1000000',
-      },
+      receiptBoundAllocation(canonical.heads[0], '4000000'),
+      receiptBoundAllocation(canonical.heads[1], '1000000'),
     ],
+    page: 0,
+    last_page: true,
   };
   const rejected = await executeTargetedEpoch(ctx, substituted);
-  assert.match(rejected.result.message, /exceeds its session reservation/i);
+  assert.match(
+    rejected.result.message,
+    /canonical receipt head|reserved receipt/i
+  );
   assert.equal((await ctx.storage.get('epoch/apply/state')).value.updated_epoch, 0);
   assert.equal(
     await ctx.storage.get(`payout/allocation/1/${'a'.repeat(64)}`),

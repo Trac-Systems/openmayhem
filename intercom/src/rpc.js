@@ -8,14 +8,81 @@ import { readJsonBody } from '../trac/trac-peer/rpc/utils/body.js';
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const normalizeKey = (value) => String(value ?? '').trim().toLowerCase();
 
-const stateView = (peer, confirmed) => {
+const stateView = (peer, confirmed, requestedSignedLength = null) => {
   if (!peer.base?.view) throw new Error('Peer view not ready.');
-  if (!confirmed) return { view: peer.base.view, close: async () => {} };
-  const view = peer.base.view.checkout(peer.base.view.core.signedLength);
-  return { view, close: async () => view.close() };
+  const currentSignedLength = Number(peer.base.view.core?.signedLength);
+  if (!Number.isSafeInteger(currentSignedLength) || currentSignedLength < 0) {
+    throw new Error('Peer confirmed signed length is unavailable.');
+  }
+  if (!confirmed) {
+    if (requestedSignedLength !== null) {
+      throw new Error('Invalid signed_length: exact checkout requires confirmed=true.');
+    }
+    return {
+      view: peer.base.view,
+      signedLength: currentSignedLength,
+      close: async () => {},
+    };
+  }
+
+  const signedLength = requestedSignedLength === null
+    ? currentSignedLength
+    : Number(requestedSignedLength);
+  if (!Number.isSafeInteger(signedLength) || signedLength < 0) {
+    throw new Error('Invalid signed_length. Expected a non-negative safe integer.');
+  }
+  if (signedLength > currentSignedLength) {
+    throw new Error(
+      `Invalid signed_length ${signedLength}: confirmed length is ${currentSignedLength}.`
+    );
+  }
+  let view;
+  try {
+    view = peer.base.view.checkout(signedLength);
+  } catch {
+    throw new Error(`Invalid signed_length ${signedLength}: checkout is unavailable.`);
+  }
+  return {
+    view,
+    signedLength,
+    close: async () => {
+      if (typeof view.close === 'function') await view.close();
+    },
+  };
 };
 
-export async function getStatePrefix(peer, prefix, { confirmed = true, limit = 500 } = {}) {
+export async function getStateValue(
+  peer,
+  key,
+  { confirmed = true, signedLength = null } = {}
+) {
+  const normalizedKey = String(key ?? '');
+  if (!normalizedKey) throw new Error('Missing key.');
+  if (normalizedKey.length > 256) throw new Error('Invalid key: maximum length is 256.');
+
+  const session = stateView(peer, confirmed, signedLength);
+  try {
+    return {
+      key: normalizedKey,
+      confirmed,
+      signed_length: session.signedLength,
+      value: await session.view.get(normalizedKey),
+    };
+  } finally {
+    await session.close();
+  }
+}
+
+export async function getStatePrefix(
+  peer,
+  prefix,
+  {
+    confirmed = true,
+    limit = 500,
+    signedLength = null,
+    after = null,
+  } = {}
+) {
   const normalizedPrefix = String(prefix ?? '');
   if (!normalizedPrefix) throw new Error('Missing prefix.');
   if (normalizedPrefix.length > 256) throw new Error('Prefix is too long.');
@@ -23,22 +90,43 @@ export async function getStatePrefix(peer, prefix, { confirmed = true, limit = 5
   if (!Number.isInteger(normalizedLimit) || normalizedLimit < 1 || normalizedLimit > 1000) {
     throw new Error('Invalid limit. Expected an integer from 1 to 1000.');
   }
+  const normalizedAfter = after === null ? null : String(after);
+  if (normalizedAfter !== null) {
+    if (!normalizedAfter) throw new Error('Invalid after cursor.');
+    if (normalizedAfter.length > 512) throw new Error('Invalid after cursor: maximum length is 512.');
+    if (!normalizedAfter.startsWith(normalizedPrefix) ||
+        normalizedAfter >= `${normalizedPrefix}\xff`) {
+      throw new Error('Invalid after cursor: cursor is outside the requested prefix.');
+    }
+  }
 
-  const session = stateView(peer, confirmed);
+  const session = stateView(peer, confirmed, signedLength);
   const values = [];
+  let truncated = false;
   try {
     const stream = session.view.createReadStream({
-      gte: normalizedPrefix,
+      ...(normalizedAfter === null ? { gte: normalizedPrefix } : { gt: normalizedAfter }),
       lt: `${normalizedPrefix}\xff`,
-      limit: normalizedLimit,
+      limit: normalizedLimit + 1,
     });
     for await (const entry of stream) {
+      if (values.length === normalizedLimit) {
+        truncated = true;
+        break;
+      }
       values.push({ key: entry.key, value: entry.value });
     }
   } finally {
     await session.close();
   }
-  return { prefix: normalizedPrefix, confirmed, values };
+  return {
+    prefix: normalizedPrefix,
+    confirmed,
+    signed_length: session.signedLength,
+    next_cursor: truncated ? values.at(-1)?.key ?? null : null,
+    truncated,
+    values,
+  };
 }
 
 export async function getMayhemStatus(peer, metadata = {}) {
@@ -375,15 +463,35 @@ export const createServer = (
       }
       if (req.method === 'GET' && requestPath === '/v1/state') {
         const url = new URL(req.url || '/', 'http://127.0.0.1');
+        if (url.searchParams.has('key') && url.searchParams.has('prefix')) {
+          throw new Error('Invalid state query: use key or prefix, not both.');
+        }
+        const confirmedValue = url.searchParams.get('confirmed');
+        if (confirmedValue !== null && confirmedValue !== 'true' && confirmedValue !== 'false') {
+          throw new Error('Invalid confirmed value. Expected true or false.');
+        }
+        const confirmed = confirmedValue == null ? true : confirmedValue === 'true';
+        const signedLength = url.searchParams.has('signed_length')
+          ? url.searchParams.get('signed_length')
+          : null;
         if (url.searchParams.has('prefix')) {
-          const confirmed = url.searchParams.get('confirmed');
-          const confirmedBool = confirmed == null ? true : confirmed === 'true';
           const limit = url.searchParams.get('limit') ?? 500;
           return respond(
             200,
             await getStatePrefix(peer, url.searchParams.get('prefix'), {
-              confirmed: confirmedBool,
+              confirmed,
               limit,
+              signedLength,
+              after: url.searchParams.get('after'),
+            })
+          );
+        }
+        if (url.searchParams.has('key')) {
+          return respond(
+            200,
+            await getStateValue(peer, url.searchParams.get('key'), {
+              confirmed,
+              signedLength,
             })
           );
         }

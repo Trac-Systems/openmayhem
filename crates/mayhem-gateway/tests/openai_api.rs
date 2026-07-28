@@ -6160,6 +6160,17 @@ fn signed_image_provider_receipt(
         billing_attempt: invocation.spend_voucher.body.billing_attempt,
         billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
         billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
+        billing_epoch: invocation.spend_voucher.body.billing_epoch,
+        reservation_id: invocation.spend_voucher.body.reservation_id.clone(),
+        reservation_expires_after_epoch: invocation
+            .spend_voucher
+            .body
+            .reservation_expires_after_epoch,
+        reservation_receipt_grace_epochs: invocation
+            .spend_voucher
+            .body
+            .reservation_receipt_grace_epochs,
+        payout_revision: invocation.spend_voucher.body.payout_revision.clone(),
         seq: 1,
         final_receipt: true,
         rail: invocation.rail.clone(),
@@ -6242,6 +6253,17 @@ fn signed_provider_receipt_for_test(
         billing_attempt: invocation.spend_voucher.body.billing_attempt,
         billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
         billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
+        billing_epoch: invocation.spend_voucher.body.billing_epoch,
+        reservation_id: invocation.spend_voucher.body.reservation_id.clone(),
+        reservation_expires_after_epoch: invocation
+            .spend_voucher
+            .body
+            .reservation_expires_after_epoch,
+        reservation_receipt_grace_epochs: invocation
+            .spend_voucher
+            .body
+            .reservation_receipt_grace_epochs,
+        payout_revision: invocation.spend_voucher.body.payout_revision.clone(),
         seq: 1,
         final_receipt: true,
         rail: invocation.rail.clone(),
@@ -7132,6 +7154,11 @@ fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
     GatewayRouteCandidate {
         provider: provider.to_owned(),
         accepted_rails: vec!["fiat".to_owned(), "tap".to_owned(), "tnk".to_owned()],
+        payout_revisions: BTreeMap::from([
+            ("fiat".to_owned(), "11".repeat(32)),
+            ("tap".to_owned(), "22".repeat(32)),
+            ("tnk".to_owned(), "33".repeat(32)),
+        ]),
         served_modalities: vec!["text".to_owned()],
         served_specialities: BTreeMap::new(),
         enclave_id: catalog_enclave_id(&identity),

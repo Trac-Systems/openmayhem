@@ -174,10 +174,99 @@ export function validateCanonicalPaymentsState(state) {
   };
 }
 
-export function validateMainnetState(chainId, status, paymentsState) {
+export function validateCanonicalReceiptFinalizationState(applyState, indexState) {
+  const failures = [];
+  if (applyState?.confirmed !== true) failures.push('epoch/apply/state is not confirmed');
+  const apply = applyState?.value;
+  if (apply === null || typeof apply !== 'object' || Array.isArray(apply)) {
+    failures.push('epoch/apply/state has an incompatible schema');
+  }
+  const updatedEpoch = apply?.updated_epoch;
+  const pendingEpoch = apply?.pending_epoch ?? null;
+  if (!Number.isSafeInteger(updatedEpoch) || updatedEpoch < 0) {
+    failures.push('epoch/apply/state updated_epoch is invalid');
+  }
+  if (pendingEpoch !== null && (
+    !Number.isSafeInteger(pendingEpoch) ||
+    pendingEpoch !== updatedEpoch + 1
+  )) {
+    failures.push('epoch/apply/state pending_epoch is not the canonical next epoch');
+  }
+  const targetEpoch = pendingEpoch ?? (
+    Number.isSafeInteger(updatedEpoch) && updatedEpoch >= 0 ? updatedEpoch + 1 : null
+  );
+  if (indexState?.confirmed !== true) {
+    failures.push('canonical receipt epoch index is not confirmed');
+  }
+  const index = indexState?.value;
+  let receiptIndex = null;
+  if (index === null) {
+    receiptIndex = {
+      epoch: targetEpoch,
+      count: 0,
+      page_count: 0,
+      revision: 0,
+      updated_at: null,
+    };
+  } else if (
+    !exactKeys(index, [
+      'count',
+      'epoch',
+      'page_count',
+      'page_size',
+      'revision',
+      'type',
+      'updated_at',
+    ]) ||
+    index.type !== 'canonical_receipt_epoch_index' ||
+    index.epoch !== targetEpoch ||
+    !Number.isSafeInteger(index.count) ||
+    index.count < 1 ||
+    !Number.isSafeInteger(index.page_size) ||
+    index.page_size < 1 ||
+    index.page_size > 1_000 ||
+    !Number.isSafeInteger(index.page_count) ||
+    index.page_count !== Math.ceil(index.count / index.page_size) ||
+    !Number.isSafeInteger(index.revision) ||
+    index.revision < index.count ||
+    typeof index.updated_at !== 'string' ||
+    index.updated_at.length === 0
+  ) {
+    failures.push('canonical receipt epoch index has an incompatible schema');
+  } else {
+    receiptIndex = index;
+  }
+  if (pendingEpoch !== null && receiptIndex) {
+    if (
+      apply?.pending_receipt_index_count !== receiptIndex.count ||
+      apply?.pending_receipt_index_revision !== receiptIndex.revision ||
+      apply?.pending_receipt_index_page_count !== receiptIndex.page_count ||
+      apply?.pending_receipt_index_updated_at !== receiptIndex.updated_at
+    ) {
+      failures.push('pending targeted apply is not bound to the canonical receipt index');
+    }
+  }
+  return {
+    ok: failures.length === 0,
+    failures,
+    target_epoch: targetEpoch,
+    pending_apply: pendingEpoch !== null,
+    index: receiptIndex ? {
+      count: receiptIndex.count,
+      page_count: receiptIndex.page_count,
+      revision: receiptIndex.revision,
+      updated_at: receiptIndex.updated_at,
+    } : null,
+  };
+}
+
+export function validateMainnetState(chainId, status, paymentsState, receiptFinalization = null) {
   const msb = status?.msb ?? {};
   const payments = validateCanonicalPaymentsState(paymentsState);
-  const failures = [...payments.failures];
+  const failures = [
+    ...payments.failures,
+    ...(receiptFinalization?.failures ?? []),
+  ];
   if (chainId !== 1) failures.push(`Ethereum chainId is ${chainId ?? 'missing'}, expected 1`);
   if (msb.ready !== true) failures.push('MSB is not ready');
   if (msb.networkId !== MAINNET_MSB.networkId) {
@@ -211,6 +300,13 @@ export function validateMainnetState(chainId, status, paymentsState) {
       version: payments.version,
       schema_valid: payments.ok,
     },
+    ...(receiptFinalization ? {
+      receipt_finalization: {
+        target_epoch: receiptFinalization.target_epoch,
+        pending_apply: receiptFinalization.pending_apply,
+        index: receiptFinalization.index,
+      },
+    } : {}),
   };
 }
 
@@ -232,7 +328,7 @@ export async function proveMainnet({
 
   do {
     try {
-      const [chainResponse, statusResponse, paymentsResponse] = await Promise.all([
+      const [chainResponse, statusResponse, paymentsResponse, applyResponse] = await Promise.all([
         fetchWithTimeout(fetchImpl, ethRpc, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -250,16 +346,48 @@ export async function proveMainnet({
           undefined,
           attemptTimeout,
         ),
+        fetchWithTimeout(
+          fetchImpl,
+          new URL('state?key=epoch%2Fapply%2Fstate&confirmed=true', rpcBase(peerRpc)),
+          undefined,
+          attemptTimeout,
+        ),
       ]);
-      const [chainBody, status, paymentsState] = await Promise.all([
+      const [chainBody, status, paymentsState, applyState] = await Promise.all([
         responseJson(chainResponse, 'Ethereum RPC'),
         responseJson(statusResponse, 'peer status'),
         responseJson(paymentsResponse, 'payments/current'),
+        responseJson(applyResponse, 'epoch/apply/state'),
       ]);
       const chainId = typeof chainBody?.result === 'string'
         ? Number.parseInt(chainBody.result, 16)
         : null;
-      const report = validateMainnetState(chainId, status, paymentsState);
+      const updatedEpoch = applyState?.value?.updated_epoch;
+      const pendingEpoch = applyState?.value?.pending_epoch ?? null;
+      const targetEpoch = pendingEpoch ?? (
+        Number.isSafeInteger(updatedEpoch) && updatedEpoch >= 0 ? updatedEpoch + 1 : 1
+      );
+      const indexKey = `receipt/epoch/${targetEpoch}/index`;
+      const indexResponse = await fetchWithTimeout(
+        fetchImpl,
+        new URL(
+          `state?key=${encodeURIComponent(indexKey)}&confirmed=true`,
+          rpcBase(peerRpc),
+        ),
+        undefined,
+        attemptTimeout,
+      );
+      const indexState = await responseJson(indexResponse, indexKey);
+      const receiptFinalization = validateCanonicalReceiptFinalizationState(
+        applyState,
+        indexState,
+      );
+      const report = validateMainnetState(
+        chainId,
+        status,
+        paymentsState,
+        receiptFinalization,
+      );
       if (report.ok) return report;
       last = report.failures.join('; ');
     } catch (error) {

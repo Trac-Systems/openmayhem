@@ -407,6 +407,53 @@ impl GatewayJobStore {
         Ok(job)
     }
 
+    pub(crate) fn update_reconciliation_receipt(
+        &mut self,
+        id: &str,
+        receipt: Value,
+        now: u64,
+    ) -> Result<StoredGatewayJob, String> {
+        let existing = self
+            .records
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("job {id} has no durable reconciliation state"))?;
+        if existing.status != GatewayJobStatus::ReconciliationPending {
+            return Err(format!(
+                "job {id} cannot update reconciliation from {}",
+                existing.status.as_str()
+            ));
+        }
+        if existing.receipt.as_ref() == Some(&receipt) {
+            return Ok(existing);
+        }
+        let mut job = existing;
+        job.receipt = Some(receipt);
+        job.finished_at = now;
+        let sealed = seal_job(&self.key, &job)?;
+        if sealed.len() > self.max_bytes {
+            return Err(format!(
+                "job {} needs {} encrypted bytes, above the {}-byte job-vault limit",
+                job.id,
+                sealed.len(),
+                self.max_bytes
+            ));
+        }
+        self.make_room_for_bytes(sealed.len(), Some(id))?;
+        self.persist_replace(&job.id, &sealed)?;
+        let previous_size = self
+            .sealed_sizes
+            .insert(job.id.clone(), sealed.len())
+            .unwrap_or(0);
+        self.total_bytes = self
+            .total_bytes
+            .saturating_sub(previous_size)
+            .saturating_add(sealed.len());
+        self.records.insert(job.id.clone(), job.clone());
+        self.enforce_bounds(Some(&job.id))?;
+        Ok(job)
+    }
+
     pub(crate) fn get(&mut self, id: &str, now: u64) -> Result<Option<StoredGatewayJob>, String> {
         self.purge_expired(now)?;
         Ok(self.records.get(id).cloned())
@@ -428,6 +475,19 @@ impl GatewayJobStore {
             owner_token_id: job.owner_token_id.clone(),
             created_at: job.created_at,
         }))
+    }
+
+    pub(crate) fn pending_reconciliations(
+        &mut self,
+        now: u64,
+    ) -> Result<Vec<StoredGatewayJob>, String> {
+        self.purge_expired(now)?;
+        Ok(self
+            .records
+            .values()
+            .filter(|job| job.status == GatewayJobStatus::ReconciliationPending)
+            .cloned()
+            .collect())
     }
 
     pub(crate) fn is_active(&self, id: &str) -> bool {
@@ -541,7 +601,9 @@ impl GatewayJobStore {
         let expired = self
             .records
             .values()
-            .filter(|job| job.expires_at <= now)
+            .filter(|job| {
+                job.status != GatewayJobStatus::ReconciliationPending && job.expires_at <= now
+            })
             .map(|job| job.id.clone())
             .collect::<Vec<_>>();
         for id in expired {
@@ -1093,6 +1155,54 @@ mod tests {
         assert_eq!(restored.result, Some(result));
         assert_eq!(restored.artifacts, vec![artifact]);
         assert_eq!(restored.receipt, Some(receipt));
+    }
+
+    #[test]
+    fn reconciliation_pending_payload_survives_ttl_until_it_is_finished() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("jobs");
+        let seed = [23_u8; 32];
+        let id = gateway_job_id(seed, Some("buyer"), "audio", Some("ack-retry")).unwrap();
+        let receipt = serde_json::json!({
+            "body": {"session_id": "session-ack-retry"},
+            "receipt_ack": {"seq": 1}
+        });
+        let mut store =
+            GatewayJobStore::durable(seed, directory.clone(), 1, 1024 * 1024, 2, 10).unwrap();
+        store
+            .begin(
+                id.clone(),
+                "audio".to_owned(),
+                "model".to_owned(),
+                Some("buyer".to_owned()),
+                "request".to_owned(),
+                10,
+            )
+            .unwrap();
+        store
+            .complete(
+                &id,
+                GatewayJobStatus::ReconciliationPending,
+                Some(serde_json::json!({"kind": "audio_speech"})),
+                Vec::new(),
+                Some(receipt.clone()),
+                Some("signed receipt acknowledgement is pending".to_owned()),
+                11,
+            )
+            .unwrap();
+        drop(store);
+
+        let mut reopened =
+            GatewayJobStore::durable(seed, directory.clone(), 1, 1024 * 1024, 2, 100).unwrap();
+        let pending = reopened.pending_reconciliations(100).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id);
+        assert_eq!(pending[0].receipt, Some(receipt));
+        reopened
+            .finish_reconciliation(&id, GatewayJobStatus::Completed, None, 101)
+            .unwrap();
+        assert!(reopened.pending_reconciliations(101).unwrap().is_empty());
+        assert!(reopened.get(&id, 104).unwrap().is_none());
     }
 
     #[test]

@@ -4,6 +4,42 @@ import { CONTRACT_VERSION } from './contract.js';
 const DEFAULT_MAYHEM_TX_MAX_BYTES = 64_000;
 const DEFAULT_MAYHEM_FEATURE_MAX_BYTES = 64_000;
 
+export const mayhemFeatureParticipant = (value) => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (value.op === 'record_usage_receipt') {
+    const provider = String(value.receipt?.body?.provider ?? '').toLowerCase();
+    return /^[0-9a-f]{64}$/.test(provider) ? provider : null;
+  }
+  if (value.op === 'close_usage_reservation') {
+    const provider = String(value.provider ?? '').toLowerCase();
+    const actor = String(value.actor ?? '').toLowerCase();
+    if (value.actor_role === 'provider' && actor === provider &&
+        /^[0-9a-f]{64}$/.test(provider)) return provider;
+    return null;
+  }
+  if (value.op === 'expire_usage_reservation') {
+    const user = String(value.user ?? '').toLowerCase();
+    return value.actor_role === 'user' &&
+      String(value.actor ?? '').toLowerCase() === user &&
+      /^[0-9a-f]{64}$/.test(user)
+      ? user
+      : null;
+  }
+  if ([
+    'prepare_targeted_payout',
+    'prepare_targeted_payout_epoch',
+    'prepare_targeted_fiat_attempt',
+    'finalize_targeted_fiat_attempt',
+    'settle_targeted_tnk_output',
+    'settle_targeted_fiat_output',
+    'close_targeted_payout_epoch',
+  ].includes(value.op)) {
+    const admin = String(value.admin ?? '').toLowerCase();
+    return /^[0-9a-f]{64}$/.test(admin) ? admin : null;
+  }
+  return null;
+};
+
 function positiveEnvInteger(name, fallback) {
   const raw = globalThis?.process?.env?.[name];
   if (raw === undefined || raw === '') return fallback;
@@ -119,7 +155,10 @@ class MayhemProtocol extends Protocol {
     if (
       json?.op === 'consent' ||
       json?.op === 'register_provider' ||
-      json?.op === 'tap_account_bind'
+      json?.op === 'tap_account_bind' ||
+      json?.op === 'record_usage_receipt' ||
+      json?.op === 'close_usage_reservation' ||
+      json?.op === 'expire_usage_reservation'
     ) {
       return null;
     }
@@ -272,8 +311,14 @@ class MayhemProtocol extends Protocol {
       json?.op === 'verify_stripe_payout' ||
       json?.op === 'bind_provider_payout' ||
       json?.op === 'spend_reserve_targeted' ||
-      json?.op === 'settle_targeted_tnk' ||
-      json?.op === 'settle_targeted_fiat'
+      json?.op === 'prepare_targeted_payout' ||
+      json?.op === 'prepare_targeted_payout_epoch' ||
+      json?.op === 'prepare_targeted_fiat_attempt' ||
+      json?.op === 'finalize_targeted_fiat_attempt' ||
+      json?.op === 'settle_targeted_tap' ||
+      json?.op === 'settle_targeted_tnk_output' ||
+      json?.op === 'settle_targeted_fiat_output' ||
+      json?.op === 'close_targeted_payout_epoch'
     ) return null;
     if (
       json?.op === 'deposit_tnk' ||
@@ -335,8 +380,8 @@ class MayhemProtocol extends Protocol {
     console.log('- Feature { "feature": "mayhem", "key": "rep/<provider>/<epoch>/<payload_hash>", "value": { "op": "anchor_reputation", "provider": "<pubkey>", "epoch": 1, "folded_at": 3600, "events_head": "<head>", "r_bps": 8700, "raw_milli": 12345, "successful_sessions": 50 } } | admin/oracle anchors a folded rep/<provider> snapshot for free.');
     console.log('- Feature { "feature": "mayhem", "key": "dep/tnk-intent/<memo>/<payload_hash>", "value": { "op": "deposit_tnk", "sender": "<pk>", "intent": { ... }, "sig": "<sig>" } } | user-signed TNK deposit intent for free.');
     console.log('- Feature { "feature": "mayhem", "key": "dep/tnk|tap|fiat/...", "value": { "op": "tnk_deposit|tap_deposit|fiat_deposit", ... } } | admin/oracle credits deposit evidence for free; deposits fold into ev/dep roots.');
-    console.log('- Feature { "feature": "mayhem", "key": "settle/targeted/tnk/<epoch>/<payload_hash>", "value": { "op": "settle_targeted_tnk", ... } } | admin/oracle records one treasury-signed MSB transfer set whose provider outputs name their exact payout revisions.');
-    console.log('- Provider payouts are revision-bound epoch settlements: TAP roots require immutable allocation bindings; TNK and Stripe use settle_targeted_tnk and settle_targeted_fiat.');
+    console.log('- prepare_targeted_payout_epoch freezes one signed-length-pinned TNK/fiat plan; settle_targeted_tnk_output and settle_targeted_fiat_output record one irreversible output at a time; close_targeted_payout_epoch closes only a complete or explicit carry/no-work plan.');
+    console.log('- prepare_targeted_fiat_attempt and finalize_targeted_fiat_attempt bind numbered Stripe attempts; only succeeded attempts settle, and renewal requires definitive expired_pre_effect state. TAP remains one atomic settle_targeted_tap root.');
     console.log('- /tx --command \'{ "op": "read_key", "key": "<key>" }\' --sim 1 | reads a contract key.');
     console.log('- /sc_join --channel "<name>" | join an ephemeral sidechannel.');
     console.log('- /sc_open --channel "<name>" [--via "<channel>"] | request others to open a sidechannel.');

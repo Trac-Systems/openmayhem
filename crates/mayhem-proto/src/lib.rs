@@ -27,7 +27,7 @@ pub use validated_audio::{
 };
 
 pub const CRATE_NAME: &str = "mayhem-proto";
-pub const CONTRACT_VERSION: u32 = 16;
+pub const CONTRACT_VERSION: u32 = 17;
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 2;
 pub const ATTESTATION_ALG: &str = "ed25519";
 pub const ATTESTATION_POLICY_SCHEMA_VERSION: u32 = 1;
@@ -38,7 +38,7 @@ pub const TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE: &str = "tpm.activate.cha
 pub const TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE: &str = "tpm.activate.response";
 pub const TPM_PCR_POLICY_SCHEMA_VERSION: u32 = 2;
 pub const TPM_QUOTE_EVIDENCE_SCHEMA_VERSION: u32 = 1;
-pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 9;
+pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 10;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
 pub const CTX_BRACKET_TABLE_VERSION: u32 = 1;
 pub const CTX_BRACKETS: &[(u32, &str)] = &[
@@ -1009,14 +1009,23 @@ pub struct RateMapEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SpendVoucherBody {
+    pub schema_version: u32,
     pub session_id: String,
     pub billing_id: String,
     pub billing_attempt: u32,
     pub billing_prior_usage: ReceiptUsage,
     #[serde(with = "decimal_u128")]
     pub billing_prior_au_owed_cum: MoneyAu,
+    pub billing_epoch: u64,
+    pub reservation_id: String,
+    pub reservation_expires_after_epoch: u64,
+    pub reservation_receipt_grace_epochs: u64,
+    pub user: String,
+    pub provider: String,
+    pub payout_revision: String,
     pub rail: String,
     pub enclave_id: String,
+    pub model_id: String,
     pub price_ver: u64,
     pub locked_rate_map: Vec<RateMapEntry>,
     #[serde(with = "decimal_u128")]
@@ -1032,6 +1041,7 @@ pub struct SpendVoucherBody {
     pub ctx_bracket: Option<String>,
     #[serde(default)]
     pub ctx_bracket_table_ver: Option<u32>,
+    pub rules_ver: u64,
     #[serde(with = "decimal_u128")]
     pub max_spend_au: MoneyAu,
     pub checkpoint_every: CheckpointPolicy,
@@ -1239,6 +1249,11 @@ pub struct ReceiptBody {
     pub billing_prior_usage: ReceiptUsage,
     #[serde(with = "decimal_u128")]
     pub billing_prior_au_owed_cum: MoneyAu,
+    pub billing_epoch: u64,
+    pub reservation_id: String,
+    pub reservation_expires_after_epoch: u64,
+    pub reservation_receipt_grace_epochs: u64,
+    pub payout_revision: String,
     pub seq: u64,
     #[serde(rename = "final")]
     pub final_receipt: bool,
@@ -1282,6 +1297,45 @@ pub struct ReceiptAck {
     pub session_id: String,
     pub seq: u64,
     pub user_sig: String,
+}
+
+pub fn record_usage_receipt_feature_key(receipt: &SessionReceipt) -> String {
+    let evidence = serde_json::json!({
+        "contract_version": CONTRACT_VERSION,
+        "epoch": receipt.body.billing_epoch,
+        "payout_revision": receipt.body.payout_revision,
+        "receipt": receipt,
+    });
+    let key_material = serde_json::json!({
+        "domain": "mayhem-record-usage-receipt-feature-v1",
+        "evidence": evidence,
+    });
+    let digest = stable_json_bytes(&key_material)
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .expect("serializing a receipt feature key cannot fail");
+    format!(
+        "receipt/submit/{}/{}/{}/{}/{}",
+        receipt.body.billing_epoch,
+        receipt.body.billing_id,
+        receipt.body.billing_attempt,
+        receipt.body.seq,
+        digest
+    )
+}
+
+pub fn record_usage_receipt_signing_bytes(
+    _key: &str,
+    value: &serde_json::Value,
+) -> Result<Vec<u8>, serde_json::Error> {
+    let evidence = serde_json::json!({
+        "contract_version": value.get("contract_version"),
+        "epoch": value.get("epoch"),
+        "payout_revision": value.get("payout_revision"),
+        "receipt": value.get("receipt"),
+    });
+    let mut bytes = b"mayhem-record-usage-receipt-v1".to_vec();
+    bytes.extend(stable_json_bytes(&evidence)?);
+    Ok(bytes)
 }
 
 #[derive(Serialize)]
@@ -3153,11 +3207,21 @@ mod tests {
     #[test]
     fn voucher_and_receipt_signing_payloads_are_bound_to_terms() {
         let voucher = SpendVoucherBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: "sess".to_owned(),
             billing_id: "11".repeat(32),
             billing_attempt: 0,
             billing_prior_usage: ReceiptUsage::default(),
             billing_prior_au_owed_cum: 0,
+            billing_epoch: 7,
+            reservation_id: "22".repeat(32),
+            reservation_expires_after_epoch: 31,
+            reservation_receipt_grace_epochs: 6,
+            user: "33".repeat(32),
+            provider: "44".repeat(32),
+            payout_revision: "55".repeat(32),
+            model_id: "model".to_owned(),
+            rules_ver: 1,
             rail: "fiat".to_owned(),
             enclave_id: "enclave".to_owned(),
             price_ver: 1,
@@ -3195,6 +3259,11 @@ mod tests {
             billing_attempt: 0,
             billing_prior_usage: ReceiptUsage::default(),
             billing_prior_au_owed_cum: 0,
+            billing_epoch: voucher.billing_epoch,
+            reservation_id: voucher.reservation_id.clone(),
+            reservation_expires_after_epoch: voucher.reservation_expires_after_epoch,
+            reservation_receipt_grace_epochs: voucher.reservation_receipt_grace_epochs,
+            payout_revision: voucher.payout_revision.clone(),
             seq: 1,
             final_receipt: false,
             rail: "fiat".to_owned(),
@@ -3230,6 +3299,24 @@ mod tests {
         );
         changed = receipt.clone();
         changed.ctx_bracket = Some("le32k".to_owned());
+        assert_ne!(
+            receipt_signing_bytes(&receipt).unwrap(),
+            receipt_signing_bytes(&changed).unwrap()
+        );
+        changed = receipt.clone();
+        changed.billing_epoch += 1;
+        assert_ne!(
+            receipt_signing_bytes(&receipt).unwrap(),
+            receipt_signing_bytes(&changed).unwrap()
+        );
+        changed = receipt.clone();
+        changed.reservation_expires_after_epoch += 1;
+        assert_ne!(
+            receipt_signing_bytes(&receipt).unwrap(),
+            receipt_signing_bytes(&changed).unwrap()
+        );
+        changed = receipt.clone();
+        changed.reservation_receipt_grace_epochs += 1;
         assert_ne!(
             receipt_signing_bytes(&receipt).unwrap(),
             receipt_signing_bytes(&changed).unwrap()
@@ -3274,11 +3361,21 @@ mod tests {
     #[test]
     fn signing_payloads_use_current_version_only() {
         let voucher = SpendVoucherBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: "sess".to_owned(),
             billing_id: "11".repeat(32),
             billing_attempt: 0,
             billing_prior_usage: ReceiptUsage::default(),
             billing_prior_au_owed_cum: 0,
+            billing_epoch: 7,
+            reservation_id: "22".repeat(32),
+            reservation_expires_after_epoch: 31,
+            reservation_receipt_grace_epochs: 6,
+            user: "33".repeat(32),
+            provider: "44".repeat(32),
+            payout_revision: "55".repeat(32),
+            model_id: "model".to_owned(),
+            rules_ver: 1,
             rail: "fiat".to_owned(),
             enclave_id: "enclave".to_owned(),
             price_ver: 1,
@@ -3308,6 +3405,11 @@ mod tests {
             billing_attempt: 0,
             billing_prior_usage: ReceiptUsage::default(),
             billing_prior_au_owed_cum: 0,
+            billing_epoch: voucher.billing_epoch,
+            reservation_id: voucher.reservation_id.clone(),
+            reservation_expires_after_epoch: voucher.reservation_expires_after_epoch,
+            reservation_receipt_grace_epochs: voucher.reservation_receipt_grace_epochs,
+            payout_revision: voucher.payout_revision.clone(),
             seq: 1,
             final_receipt: false,
             rail: "fiat".to_owned(),
@@ -3350,11 +3452,21 @@ mod tests {
             },
         ];
         let voucher = SpendVoucherBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: "sess-au-roundtrip".to_owned(),
             billing_id: "44".repeat(32),
             billing_attempt: 0,
             billing_prior_usage: ReceiptUsage::default(),
             billing_prior_au_owed_cum: 0,
+            billing_epoch: 12,
+            reservation_id: "55".repeat(32),
+            reservation_expires_after_epoch: 31,
+            reservation_receipt_grace_epochs: 6,
+            user: "11".repeat(32),
+            provider: "22".repeat(32),
+            payout_revision: "66".repeat(32),
+            model_id: "model/atto-roundtrip".to_owned(),
+            rules_ver: 7,
             rail: "fiat".to_owned(),
             enclave_id: "enclave-au-roundtrip".to_owned(),
             price_ver: 9,
@@ -3374,16 +3486,24 @@ mod tests {
         };
         let expected_voucher = concat!(
             "{\"domain\":\"mayhem-spend-voucher\",\"signing_version\":2,\"body\":{",
-            "\"session_id\":\"sess-au-roundtrip\",",
+            "\"schema_version\":10,\"session_id\":\"sess-au-roundtrip\",",
             "\"billing_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
             "\"billing_attempt\":0,\"billing_prior_usage\":{},\"billing_prior_au_owed_cum\":\"0\",",
+            "\"billing_epoch\":12,",
+            "\"reservation_id\":\"5555555555555555555555555555555555555555555555555555555555555555\",",
+            "\"reservation_expires_after_epoch\":31,\"reservation_receipt_grace_epochs\":6,",
+            "\"user\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
+            "\"provider\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
+            "\"payout_revision\":\"6666666666666666666666666666666666666666666666666666666666666666\",",
             "\"rail\":\"fiat\",\"enclave_id\":\"enclave-au-roundtrip\",",
+            "\"model_id\":\"model/atto-roundtrip\",",
             "\"price_ver\":9,\"locked_rate_map\":[",
             "{\"unit\":\"input_token\",\"per_unit_au\":\"10000000\",\"granularity\":1},",
             "{\"unit\":\"output_token\",\"per_unit_au\":\"2500000000000000\",\"granularity\":1000}",
             "],\"locked_per_req_au\":\"1\",\"locked_min_session_au\":\"2000000000000000000000000\",",
             "\"served_ctx\":131072,\"required_modalities\":[\"text\"],",
             "\"ctx_bracket\":\"le128k\",\"ctx_bracket_table_ver\":1,",
+            "\"rules_ver\":7,",
             "\"max_spend_au\":\"2000000000000000000000001\",",
             "\"checkpoint_every\":{\"tokens\":4096,\"ms\":30000}}}"
         );
@@ -3399,6 +3519,11 @@ mod tests {
             billing_attempt: 0,
             billing_prior_usage: ReceiptUsage::default(),
             billing_prior_au_owed_cum: 0,
+            billing_epoch: voucher.billing_epoch,
+            reservation_id: voucher.reservation_id.clone(),
+            reservation_expires_after_epoch: voucher.reservation_expires_after_epoch,
+            reservation_receipt_grace_epochs: voucher.reservation_receipt_grace_epochs,
+            payout_revision: voucher.payout_revision.clone(),
             seq: 2,
             final_receipt: true,
             rail: "fiat".to_owned(),
@@ -3422,9 +3547,13 @@ mod tests {
         };
         let expected_receipt = concat!(
             "{\"domain\":\"mayhem-session-receipt\",\"signing_version\":2,\"body\":{",
-            "\"schema_version\":9,\"session_id\":\"sess-au-roundtrip\",",
+            "\"schema_version\":10,\"session_id\":\"sess-au-roundtrip\",",
             "\"billing_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
             "\"billing_attempt\":0,\"billing_prior_usage\":{},\"billing_prior_au_owed_cum\":\"0\",",
+            "\"billing_epoch\":12,",
+            "\"reservation_id\":\"5555555555555555555555555555555555555555555555555555555555555555\",",
+            "\"reservation_expires_after_epoch\":31,\"reservation_receipt_grace_epochs\":6,",
+            "\"payout_revision\":\"6666666666666666666666666666666666666666666666666666666666666666\",",
             "\"seq\":2,\"final\":true,",
             "\"rail\":\"fiat\",\"user\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
             "\"provider\":\"2222222222222222222222222222222222222222222222222222222222222222\",",

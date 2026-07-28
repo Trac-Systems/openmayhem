@@ -29,9 +29,9 @@ const versioningLockedRateMap = [
 const versioningBillingId = 'bb'.repeat(32);
 
 test('launch version gates cover A16/A17/D6/D7/M5/M6/M8 deterministic changes', () => {
-  assert.equal(CONTRACT_VERSION, 16);
+  assert.equal(CONTRACT_VERSION, 17);
   assert.deepEqual(signingMessageVersions(), [2]);
-  assert.equal(SESSION_RECEIPT_SCHEMA_VERSION, 9);
+  assert.equal(SESSION_RECEIPT_SCHEMA_VERSION, 10);
 });
 
 test('contract reports the exported contract version', async () => {
@@ -173,6 +173,11 @@ test('receipt verifier accepts only the current signing payload', async () => {
     billing_attempt: 0,
     billing_prior_usage: {},
     billing_prior_au_owed_cum: '0',
+    billing_epoch: 1,
+    reservation_id: '12'.repeat(32),
+    reservation_expires_after_epoch: 25,
+    reservation_receipt_grace_epochs: 6,
+    payout_revision: '13'.repeat(32),
     seq: 1,
     final: true,
     rail: 'fiat',
@@ -213,13 +218,22 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
     { unit: 'output_token', per_unit_au: '2500000000000000', granularity: 1000 },
   ];
   const voucher = {
+    schema_version: 10,
     session_id: 'sess-au-roundtrip',
     billing_id: '44'.repeat(32),
     billing_attempt: 0,
     billing_prior_usage: {},
     billing_prior_au_owed_cum: '0',
+    billing_epoch: 7,
+    reservation_id: '45'.repeat(32),
+    reservation_expires_after_epoch: 31,
+    reservation_receipt_grace_epochs: 6,
+    user: '11'.repeat(32),
+    provider: '22'.repeat(32),
+    payout_revision: '46'.repeat(32),
     rail: 'fiat',
     enclave_id: 'enclave-au-roundtrip',
+    model_id: 'model/atto-roundtrip',
     price_ver: 9,
     locked_rate_map: lockedRateMap,
     locked_per_req_au: '1',
@@ -228,21 +242,33 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
     required_modalities: ['text'],
     ctx_bracket: 'le128k',
     ctx_bracket_table_ver: 1,
+    rules_ver: 7,
     max_spend_au: '2000000000000000000000001',
     checkpoint_every: { tokens: 4096, ms: 30000 },
   };
   const expectedVoucher = [
     '{"domain":"mayhem-spend-voucher","signing_version":2,"body":{',
-    '"session_id":"sess-au-roundtrip","billing_id":"',
+    '"schema_version":10,"session_id":"sess-au-roundtrip","billing_id":"',
     '44'.repeat(32),
     '","billing_attempt":0,"billing_prior_usage":{},"billing_prior_au_owed_cum":"0",',
+    '"billing_epoch":7,"reservation_id":"',
+    '45'.repeat(32),
+    '","reservation_expires_after_epoch":31,"reservation_receipt_grace_epochs":6,"user":"',
+    '11'.repeat(32),
+    '","provider":"',
+    '22'.repeat(32),
+    '","payout_revision":"',
+    '46'.repeat(32),
+    '",',
     '"rail":"fiat","enclave_id":"enclave-au-roundtrip",',
+    '"model_id":"model/atto-roundtrip",',
     '"price_ver":9,"locked_rate_map":[',
     '{"unit":"input_token","per_unit_au":"10000000","granularity":1},',
     '{"unit":"output_token","per_unit_au":"2500000000000000","granularity":1000}',
     '],"locked_per_req_au":"1","locked_min_session_au":"2000000000000000000000000",',
     '"served_ctx":131072,"required_modalities":["text"],',
     '"ctx_bracket":"le128k","ctx_bracket_table_ver":1,',
+    '"rules_ver":7,',
     '"max_spend_au":"2000000000000000000000001",',
     '"checkpoint_every":{"tokens":4096,"ms":30000}}}',
   ].join('');
@@ -255,6 +281,11 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
     billing_attempt: 0,
     billing_prior_usage: {},
     billing_prior_au_owed_cum: '0',
+    billing_epoch: 7,
+    reservation_id: '45'.repeat(32),
+    reservation_expires_after_epoch: 31,
+    reservation_receipt_grace_epochs: 6,
+    payout_revision: '46'.repeat(32),
     seq: 2,
     final: true,
     rail: 'fiat',
@@ -277,9 +308,14 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
   };
   const expectedReceipt = [
     '{"domain":"mayhem-session-receipt","signing_version":2,"body":{',
-    '"schema_version":9,"session_id":"sess-au-roundtrip","billing_id":"',
+    '"schema_version":10,"session_id":"sess-au-roundtrip","billing_id":"',
     '44'.repeat(32),
     '","billing_attempt":0,"billing_prior_usage":{},"billing_prior_au_owed_cum":"0",',
+    '"billing_epoch":7,"reservation_id":"',
+    '45'.repeat(32),
+    '","reservation_expires_after_epoch":31,"reservation_receipt_grace_epochs":6,"payout_revision":"',
+    '46'.repeat(32),
+    '",',
     '"seq":2,"final":true,',
     '"rail":"fiat","user":"',
     '11'.repeat(32),
@@ -311,6 +347,11 @@ test('receipt normalization rejects old schemas and non-canonical usage', async 
     billing_attempt: 0,
     billing_prior_usage: {},
     billing_prior_au_owed_cum: '0',
+    billing_epoch: 1,
+    reservation_id: '14'.repeat(32),
+    reservation_expires_after_epoch: 25,
+    reservation_receipt_grace_epochs: 6,
+    payout_revision: '15'.repeat(32),
     seq: 1,
     final: true,
     rail: 'fiat',

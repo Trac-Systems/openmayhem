@@ -29,13 +29,20 @@ export function signedTapReceipt({
 }) {
   const providerIdentity = provider ?? makeReceiptIdentity();
   const billingId = crypto.createHash('sha256').update(String(session)).digest('hex');
+  const reservationId = crypto
+    .createHash('sha256')
+    .update(`mayhem-reservation:${session}`)
+    .digest('hex');
   const body = {
-    schema_version: 9,
+    schema_version: 10,
     session_id: session,
     billing_id: billingId,
     billing_attempt: 0,
     billing_prior_usage: {},
     billing_prior_au_owed_cum: '0',
+    billing_epoch: epoch ?? 1,
+    reservation_id: reservationId,
+    payout_revision: '11'.repeat(32),
     seq,
     final: true,
     rail: 'tap',

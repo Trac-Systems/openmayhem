@@ -1,29 +1,28 @@
 #!/usr/bin/env bash
 # OpenMayhem epoch settlement cadence (runs on the admin server via systemd timer).
 #
-# Purpose: spend-reservation holds (`hold/<rail>/<user>/<epoch>`) pin user
-# balance until the billing epoch advances, and the epoch only advances when
-# the admin settles it. This script bounds stale-hold lifetime to one cadence
-# interval by sealing the active billing epoch empty — but ONLY when it is
-# provably safe to do so:
-#   - no pending paged epoch apply,
-#   - at least one epoch window elapsed since this script last advanced,
-#   - the TAP gateway reports no active sessions,
-#   - the TAP gateway retains no receipts for the target epoch.
-# An epoch with retained receipts is NEVER sealed away. It is passed only to the
-# canonical retained-receipt finalizer, which gates finalization and payout.
+# Canonical contract receipt metadata is the sole receipt source. A persisted
+# quiet window lets both durable outboxes flush final checkpoints; it resets
+# when the exact metadata identity changes and after a machine reboot. Payout maturity and
+# retries are deliberately handled by the separate payout-worker timer.
 set -euo pipefail
 
 umask 077
 
 RPC_URL="${MAYHEM_RPC_URL:-http://127.0.0.1:49223/v1}"
-GATEWAY_URL="${MAYHEM_GATEWAY_URL:-http://127.0.0.1:11445}"
 MAYHEM_BIN="${MAYHEM_BIN:-/opt/mayhem/source/target/release/mayhem}"
 ADMIN_HOME="${MAYHEM_ADMIN_HOME:-/opt/mayhem/.mayhem-local/live-home}"
 SOURCE_DIR="${MAYHEM_SOURCE_DIR:-/opt/mayhem/source}"
 STATE_DIR="${MAYHEM_CADENCE_STATE_DIR:-/opt/mayhem/.mayhem-local/settlement}"
 LOG_FILE="$STATE_DIR/cadence.log"
 STAMP_FILE="$STATE_DIR/cadence.last-advance"
+QUIET_STATE_FILE="$STATE_DIR/cadence.receipt-quiet.json"
+QUIET_SECONDS="${MAYHEM_RECEIPT_QUIET_SECONDS:-30}"
+BOOT_ID="${MAYHEM_CADENCE_BOOT_ID:-}"
+if [[ -z "$BOOT_ID" && -r /proc/sys/kernel/random/boot_id ]]; then
+    BOOT_ID="$(cat /proc/sys/kernel/random/boot_id)"
+fi
+BOOT_ID="${BOOT_ID:-unknown-boot}"
 
 mkdir -p "$STATE_DIR"
 # Refuse to act before we can record what we did: an unwritable state dir must
@@ -60,6 +59,35 @@ non_negative_integer() {
         python3 -c 'import sys; raise SystemExit(0 if int(sys.argv[1]) <= 9007199254740991 else 1)' "$1"
 }
 
+record_advance_stamp() {
+    local advanced_at="${1:-}"
+    positive_integer "$advanced_at" || {
+        log "abort: canonical apply state did not return a positive advance timestamp"
+        return 1
+    }
+    python3 - "$STAMP_FILE" "$advanced_at" <<'PY'
+import os
+import sys
+
+path, stamp = sys.argv[1:]
+tmp = f"{path}.tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+try:
+    with os.fdopen(fd, "w", closefd=False) as target:
+        target.write(f"{stamp}\n")
+        target.flush()
+    os.fsync(fd)
+finally:
+    os.close(fd)
+os.replace(tmp, path)
+directory = os.open(os.path.dirname(path), os.O_RDONLY)
+try:
+    os.fsync(directory)
+finally:
+    os.close(directory)
+PY
+}
+
 command -v flock >/dev/null 2>&1 || {
     log "abort: flock is required for epoch/payout serialization"
     exit 1
@@ -71,10 +99,40 @@ if ! flock -n 9; then
 fi
 export MAYHEM_PAYOUT_LOCK_HELD=1
 
-apply_state="$(curl -sf -m 10 "$RPC_URL/state?key=epoch/apply/state")"
+apply_state="$(curl -sf -m 10 "$RPC_URL/state?key=epoch/apply/state&confirmed=true")"
 updated_epoch="$(printf '%s' "$apply_state" | json_field value.updated_epoch)"
 pending_epoch="$(printf '%s' "$apply_state" | json_field value.pending_epoch)"
 epoch_seconds="$(printf '%s' "$apply_state" | json_field value.last_epoch_seconds)"
+last_apply_hash="$(printf '%s' "$apply_state" | json_field value.last_apply_hash)"
+last_receipt_commit_hash="$(printf '%s' "$apply_state" | json_field value.last_receipt_commit_hash)"
+last_settlement_unix="$(printf '%s' "$apply_state" | json_field value.last_settlement_unix)"
+if ! python3 - "$apply_state" <<'PY'
+import json, sys
+record = json.loads(sys.argv[1])
+state = record.get("value") if isinstance(record, dict) else None
+if (
+    not isinstance(record, dict)
+    or record.get("confirmed") is not True
+    or record.get("key") not in (None, "epoch/apply/state")
+    or not isinstance(state, dict)
+):
+    raise SystemExit("epoch/apply/state is not confirmed canonical state")
+epoch = state.get("updated_epoch")
+value = state.get("last_settlement_unix")
+if epoch == 0:
+    if value is not None:
+        raise SystemExit("initial last_settlement_unix must be null")
+elif value is not None and (
+    not isinstance(value, int)
+    or isinstance(value, bool)
+    or value < 1
+):
+    raise SystemExit("last_settlement_unix must be a positive integer")
+PY
+then
+    log "abort: epoch/apply/state.last_settlement_unix is not a positive canonical timestamp"
+    exit 1
+fi
 epoch_seconds="${epoch_seconds:-3600}"
 if ! non_negative_integer "$updated_epoch"; then
     log "abort: epoch/apply/state.updated_epoch is not a canonical non-negative integer"
@@ -84,132 +142,307 @@ if ! positive_integer "$epoch_seconds"; then
     log "abort: epoch/apply/state.last_epoch_seconds is not a positive canonical integer"
     exit 1
 fi
-if [[ -n "$pending_epoch" ]]; then
-    log "skip: pending paged epoch apply for epoch $pending_epoch"
-    exit 0
-fi
-if [[ "$updated_epoch" != "0" ]]; then
-    apply_hash="$(printf '%s' "$apply_state" | json_field value.last_apply_hash)"
-    if [[ ! "$apply_hash" =~ ^[0-9a-fA-F]{64}$ ]]; then
-        log "abort: current applied epoch has no canonical apply hash"
+if [[ "$updated_epoch" == "0" ]]; then
+    if [[ -n "$last_settlement_unix" ]]; then
+        log "abort: epoch/apply/state.last_settlement_unix must be null before the first apply"
         exit 1
     fi
-    apply_hash="$(printf '%s' "$apply_hash" | tr '[:upper:]' '[:lower:]')"
-    if [[ -f "$STATE_DIR/epochs/epoch-$updated_epoch/epoch-bundle.json" ]]; then
-        if ! "$SOURCE_DIR/scripts/ops-settle-epoch.sh" "$updated_epoch"; then
-            log "abort: retained-artifact finalization recovery failed for current epoch $updated_epoch"
-            exit 1
-        fi
-    else
-        if ! "$SOURCE_DIR/scripts/ops-payout-settle.sh" "$updated_epoch"; then
-            log "abort: payout reconciliation failed for current epoch $updated_epoch"
-            exit 1
-        fi
+else
+    if [[ ! "$last_apply_hash" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        log "abort: epoch/apply/state.last_apply_hash is not a canonical hash"
+        exit 1
     fi
-    payout_dir="$STATE_DIR/payout/epoch-$updated_epoch-$apply_hash"
-    if [[ ! -f "$payout_dir/complete" ]]; then
-        log "skip: current epoch $updated_epoch payouts remain incomplete"
-        exit 0
+    last_apply_hash="$(printf '%s' "$last_apply_hash" | tr '[:upper:]' '[:lower:]')"
+    if [[ -z "$last_settlement_unix" ]]; then
+        last_settlement_unix="$(python3 - "$RPC_URL" "$updated_epoch" \
+            "$last_apply_hash" "$last_receipt_commit_hash" <<'PY'
+import json, re, sys, urllib.parse, urllib.request
+
+rpc, epoch_text, apply_hash, receipt_commit_hash = sys.argv[1:]
+epoch = int(epoch_text)
+
+def state(key):
+    query = urllib.parse.urlencode({"key": key, "confirmed": "true"})
+    with urllib.request.urlopen(f"{rpc}/state?{query}", timeout=10) as response:
+        record = json.load(response)
+    if (
+        not isinstance(record, dict)
+        or record.get("confirmed") is not True
+        or record.get("key") not in (None, key)
+    ):
+        raise SystemExit(f"canonical state {key} is not confirmed")
+    return record.get("value")
+
+def unix(value):
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+    )
+
+seal = state(f"epoch/seal/{epoch}")
+if seal is not None:
+    if (
+        not isinstance(seal, dict)
+        or seal.get("type") != "epoch_empty_seal"
+        or seal.get("epoch") != epoch
+        or str(seal.get("seal_hash", "")).lower() != apply_hash
+        or not unix(seal.get("at"))
+    ):
+        raise SystemExit("prior canonical empty-seal settlement identity is invalid")
+    print(seal["at"])
+    raise SystemExit(0)
+
+commit = state(f"epoch/commit/{epoch}")
+if (
+    not isinstance(commit, dict)
+    or commit.get("type") != "epoch_commit"
+    or commit.get("epoch") != epoch
+    or not unix(commit.get("at"))
+    or not re.fullmatch(r"[0-9a-f]{64}", str(commit.get("commit_hash", "")).lower())
+    or (
+        receipt_commit_hash
+        and str(commit.get("commit_hash", "")).lower() != receipt_commit_hash.lower()
+    )
+):
+    raise SystemExit("prior canonical epoch commit settlement identity is invalid")
+usage = state(f"ev/use/{epoch}")
+if (
+    not isinstance(usage, dict)
+    or usage.get("type") != "usage_root"
+    or usage.get("epoch") != epoch
+    or usage.get("ts") != commit["at"]
+    or usage.get("merkle_root") != (commit.get("roots") or {}).get("use")
+):
+    raise SystemExit("prior canonical epoch apply evidence is missing")
+print(commit["at"])
+PY
+        )" || {
+            log "abort: v16 canonical settlement timestamp could not be derived"
+            exit 1
+        }
+        log "bootstrap: using confirmed epoch $updated_epoch settlement timestamp $last_settlement_unix"
+    elif ! positive_integer "$last_settlement_unix"; then
+        log "abort: epoch/apply/state.last_settlement_unix is not a positive canonical timestamp"
+        exit 1
     fi
+    positive_integer "$last_settlement_unix" || {
+        log "abort: canonical settlement timestamp is invalid"
+        exit 1
+    }
+fi
+if ! positive_integer "$QUIET_SECONDS" || (( QUIET_SECONDS > 300 )); then
+    log "abort: MAYHEM_RECEIPT_QUIET_SECONDS must be within 1..300"
+    exit 1
 fi
 target=$((updated_epoch + 1))
+if [[ -n "$pending_epoch" ]]; then
+    if ! positive_integer "$pending_epoch" || [[ "$pending_epoch" != "$target" ]]; then
+        log "abort: pending paged apply epoch $pending_epoch is not canonical next epoch $target"
+        exit 1
+    fi
+    log "resume: pending bounded targeted apply for epoch $pending_epoch"
+    if ! "$SOURCE_DIR/scripts/ops-settle-epoch.sh" "$pending_epoch"; then
+        log "abort: pending targeted apply resume failed for epoch $pending_epoch"
+        exit 1
+    fi
+    resumed_state="$(curl -sf -m 10 "$RPC_URL/state?key=epoch/apply/state&confirmed=true")"
+    resumed_epoch="$(printf '%s' "$resumed_state" | json_field value.updated_epoch)"
+    resumed_settlement_unix="$(printf '%s' "$resumed_state" | json_field value.last_settlement_unix)"
+    if [[ "$resumed_epoch" != "$pending_epoch" ]]; then
+        log "abort: targeted apply resume returned but updated_epoch is $resumed_epoch"
+        exit 1
+    fi
+    if ! positive_integer "$resumed_settlement_unix" || \
+        (( resumed_settlement_unix < last_settlement_unix )); then
+        log "abort: targeted apply resume returned an invalid canonical settlement timestamp"
+        exit 1
+    fi
+    record_advance_stamp "$resumed_settlement_unix" || exit 1
+    log "resumed and finalized non-empty epoch $pending_epoch"
+    exit 0
+fi
 now="$(date +%s)"
 if ! positive_integer "$now"; then
     log "abort: system clock did not return a positive canonical timestamp"
     exit 1
 fi
 
-# Epoch numbers on this deployment are settlement-paced, not wall-clock-paced,
-# so the contract's own window check (at >= epoch * epoch_seconds) is vacuous.
-# Enforce the cadence locally: only advance once per epoch window.
+# Canonical contract time is authoritative. The local stamp is only a durable
+# regression detector and audit mirror of the last confirmed apply timestamp.
 if [[ -f "$STAMP_FILE" ]]; then
     last_advance="$(cat "$STAMP_FILE" 2>/dev/null || echo 0)"
     if ! non_negative_integer "$last_advance"; then
         log "abort: cadence advance stamp is not a canonical non-negative timestamp"
         exit 1
     fi
-    if (( now < last_advance + epoch_seconds )); then
-        log "skip: epoch $target window has not elapsed (last advance $last_advance)"
-        exit 0
+    if (( last_advance > last_settlement_unix )); then
+        log "abort: local cadence stamp is ahead of canonical apply time"
+        exit 1
     fi
 fi
-
-status_json="$(curl -sf -m 10 "$GATEWAY_URL/mayhem/status" || echo '')"
-if [[ -z "$status_json" ]]; then
-    log "skip: gateway status unreachable; refusing to seal blind"
-    exit 0
-fi
-sessions_active="$(printf '%s' "$status_json" | json_field sessions_active)"
-if ! non_negative_integer "$sessions_active"; then
-    log "skip: gateway sessions_active is missing or invalid"
-    exit 0
-fi
-if [[ "$sessions_active" != "0" ]]; then
-    log "skip: gateway reports sessions_active=$sessions_active"
-    exit 0
-fi
-
-receipts_json="$(curl -sf -m 10 "$GATEWAY_URL/mayhem/receipts" || echo '')"
-if [[ -z "$receipts_json" ]]; then
-    log "skip: gateway receipts unreachable; refusing to seal blind"
-    exit 0
-fi
-# Stored receipts carry no epoch field (the epoch lives in the hold record),
-# so the only safe rule is: ANY retained receipt blocks sealing. Retained
-# receipts always belong to a not-yet-settled epoch; sealing would forfeit
-# provider earnings. /mayhem/receipts returns {"object":"list","data":[...]}.
-retained_receipts="$(printf '%s' "$receipts_json" | python3 -c '
-import json, sys
-data = json.loads(sys.stdin.read())
-receipts = data if isinstance(data, list) else data.get("data", data.get("receipts", []))
-print(len(receipts))
-')"
-if ! non_negative_integer "$retained_receipts"; then
-    log "abort: gateway retained receipt count is not a canonical non-negative integer"
+if (( now < last_settlement_unix )); then
+    log "abort: canonical settlement timestamp $last_settlement_unix is in the future"
     exit 1
 fi
-if [[ "$retained_receipts" != "0" ]]; then
-    prior_receipts="$STATE_DIR/epochs/epoch-$updated_epoch/gateway-receipts.json"
-    if [[ "$updated_epoch" != "0" && -f "$prior_receipts" ]]; then
-        overlap="$(printf '%s' "$receipts_json" | python3 -c '
-import hashlib, json, sys
-prior_path = sys.argv[1]
-current_response = json.loads(sys.stdin.read())
-current = current_response if isinstance(current_response, list) else current_response.get("data")
-prior = json.load(open(prior_path))
-if not isinstance(current, list) or not isinstance(prior, list):
-    raise SystemExit("gateway receipt overlap evidence must be lists")
-def fingerprint(value):
-    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(raw).hexdigest()
-prior_hashes = {fingerprint(item) for item in prior}
-print(sum(1 for item in current if fingerprint(item) in prior_hashes))
-' "$prior_receipts")"
-        if ! non_negative_integer "$overlap"; then
-            log "abort: finalized gateway receipt overlap count is invalid"
-            exit 1
-        fi
-        if [[ "$overlap" != "0" ]]; then
-            log "skip: gateway still retains $overlap receipt(s) already bound to epoch $updated_epoch"
-            exit 0
-        fi
-    fi
-    log "finalize: gateway retains $retained_receipts receipt(s); invoking canonical finalizer for epoch $target"
+if (( now < last_settlement_unix + epoch_seconds )); then
+    log "skip: epoch $target window has not elapsed (canonical settlement $last_settlement_unix)"
+    exit 0
+fi
+
+metadata_summary="$(python3 - "$RPC_URL" "$target" <<'PY'
+import hashlib, json, sys, urllib.parse, urllib.request
+rpc, epoch_text = sys.argv[1:]
+epoch = int(epoch_text)
+
+def state(key):
+    query = urllib.parse.urlencode({"key": key, "confirmed": "true"})
+    with urllib.request.urlopen(f"{rpc}/state?{query}", timeout=10) as response:
+        record = json.load(response)
+    if (
+        not isinstance(record, dict)
+        or record.get("confirmed") is not True
+        or record.get("key") not in (None, key)
+    ):
+        raise SystemExit(f"canonical state {key} is not confirmed")
+    return record.get("value")
+
+metadata = state(f"receipt/epoch/{epoch}/index")
+empty = metadata is None
+if empty:
+    metadata = {
+        "epoch": epoch,
+        "count": 0,
+        "page_count": 0,
+        "revision": 0,
+        "updated_at": None,
+    }
+if (
+    not isinstance(metadata, dict)
+    or metadata.get("epoch") != epoch
+    or not isinstance(metadata.get("count"), int)
+    or isinstance(metadata.get("count"), bool)
+    or metadata["count"] < 0
+    or not isinstance(metadata.get("page_count"), int)
+    or isinstance(metadata.get("page_count"), bool)
+    or metadata["page_count"] < 0
+    or not isinstance(metadata.get("revision"), int)
+    or isinstance(metadata.get("revision"), bool)
+    or metadata["revision"] < 0
+):
+    raise SystemExit("canonical receipt index is malformed")
+if not empty and (
+    metadata.get("type") != "canonical_receipt_epoch_index"
+    or not isinstance(metadata.get("page_size"), int)
+    or isinstance(metadata.get("page_size"), bool)
+    or metadata["page_size"] < 1
+    or metadata["page_size"] > 1000
+    or not isinstance(metadata.get("updated_at"), str)
+    or not metadata["updated_at"]
+):
+    raise SystemExit("canonical receipt index identity is malformed")
+count = metadata["count"]
+page_count = metadata["page_count"]
+if (count == 0) != (page_count == 0) or page_count > count:
+    raise SystemExit("canonical receipt index count/page_count mismatch")
+if empty and (count != 0 or page_count != 0 or metadata["revision"] != 0):
+    raise SystemExit("canonical null receipt index is not empty")
+if not empty and page_count != ((count + metadata["page_size"] - 1) // metadata["page_size"]):
+    raise SystemExit("canonical receipt index page_count is inconsistent")
+metadata_hash = hashlib.sha256(
+    json.dumps(metadata, sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()
+print(f"{count} {metadata_hash}")
+PY
+)" || {
+    log "abort: canonical receipt metadata for epoch $target failed validation"
+    exit 1
+}
+receipt_count="${metadata_summary%% *}"
+receipt_metadata_hash="${metadata_summary##* }"
+if ! non_negative_integer "$receipt_count" || [[ ! "$receipt_metadata_hash" =~ ^[0-9a-f]{64}$ ]]; then
+    log "abort: canonical receipt metadata summary is invalid"
+    exit 1
+fi
+
+quiet_status="$(python3 - "$QUIET_STATE_FILE" "$target" "$receipt_count" \
+    "$receipt_metadata_hash" "$now" "$QUIET_SECONDS" "$BOOT_ID" <<'PY'
+import json, os, sys
+path, epoch, count, metadata_hash, now, quiet, boot_id = sys.argv[1:]
+expected = {
+    "epoch": int(epoch),
+    "count": int(count),
+    "metadata_hash": metadata_hash,
+    "boot_id": boot_id,
+}
+now = int(now)
+quiet = int(quiet)
+prior = None
+try:
+    prior = json.load(open(path))
+except (FileNotFoundError, json.JSONDecodeError, OSError):
+    pass
+same = isinstance(prior, dict) and all(prior.get(key) == value for key, value in expected.items())
+if not same:
+    state = {**expected, "observed_at": now}
+    tmp = f"{path}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", closefd=False) as target:
+            json.dump(state, target, sort_keys=True)
+            target.write("\n")
+            target.flush()
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    directory = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    print("wait")
+else:
+    observed_at = prior.get("observed_at")
+    if not isinstance(observed_at, int) or observed_at < 0:
+        raise SystemExit("persisted receipt quiet state is malformed")
+    print("ready" if now >= observed_at + quiet else "wait")
+PY
+)" || {
+    log "abort: canonical receipt quiet-window state is invalid"
+    exit 1
+}
+if [[ "$quiet_status" != "ready" ]]; then
+    log "skip: epoch $target receipt set count=$receipt_count metadata=$receipt_metadata_hash is awaiting ${QUIET_SECONDS}s quiet"
+    exit 0
+fi
+
+if [[ "$receipt_count" != "0" ]]; then
+    log "finalize: canonical epoch $target has $receipt_count receipt(s); invoking exact-key finalizer"
     if ! "$SOURCE_DIR/scripts/ops-settle-epoch.sh" "$target"; then
-        log "abort: canonical retained-receipt finalizer failed for epoch $target"
+        log "abort: canonical receipt finalizer failed for epoch $target"
         exit 1
     fi
     finalized_state="$(curl -sf -m 10 "$RPC_URL/state?key=epoch/apply/state")"
     finalized_epoch="$(printf '%s' "$finalized_state" | json_field value.updated_epoch)"
+    finalized_settlement_unix="$(
+        printf '%s' "$finalized_state" | json_field value.last_settlement_unix
+    )"
     if [[ "$finalized_epoch" != "$target" ]]; then
-        log "abort: retained-receipt finalizer returned but updated_epoch is $finalized_epoch"
+        log "abort: canonical receipt finalizer returned but updated_epoch is $finalized_epoch"
         exit 1
     fi
-    log "finalized non-empty epoch $target through the canonical gated finalizer"
+    if ! positive_integer "$finalized_settlement_unix" || \
+        (( finalized_settlement_unix < last_settlement_unix )); then
+        log "abort: canonical receipt finalizer returned an invalid settlement timestamp"
+        exit 1
+    fi
+    record_advance_stamp "$finalized_settlement_unix" || exit 1
+    log "finalized non-empty epoch $target from contract-recorded receipt heads"
     exit 0
 fi
 
-reason="cadence: no retained receipts for epoch $target"
+reason="cadence: canonical receipt metadata is empty for epoch $target"
 seal_args=(
     admin epoch-seal-empty
     --home "$ADMIN_HOME"
@@ -230,9 +463,15 @@ fi
 
 after_state="$(curl -sf -m 10 "$RPC_URL/state?key=epoch/apply/state")"
 after_epoch="$(printf '%s' "$after_state" | json_field value.updated_epoch)"
+after_settlement_unix="$(printf '%s' "$after_state" | json_field value.last_settlement_unix)"
 if [[ "$after_epoch" != "$target" ]]; then
     log "abort: sealed epoch $target but updated_epoch is $after_epoch"
     exit 1
 fi
-echo "$now" >"$STAMP_FILE"
+if ! positive_integer "$after_settlement_unix" || \
+    (( after_settlement_unix < last_settlement_unix )); then
+    log "abort: empty epoch seal returned an invalid canonical settlement timestamp"
+    exit 1
+fi
+record_advance_stamp "$after_settlement_unix" || exit 1
 log "sealed epoch $target empty; billing epoch is now $((target + 1))"

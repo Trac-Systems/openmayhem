@@ -89,26 +89,26 @@ use mayhem_bridge::{sc_bridge_session_transport, BridgeError, ScBridgeClient, Sc
 use mayhem_proto::{
     artifact_generation_inline_audio_load, ctx_bracket_for_tokens_in_schedule,
     default_ctx_bracket_schedule, default_model_class, metered_output_units, payload_chunk_at,
-    payload_chunk_manifest, receipt_signing_bytes, session_accept_signing_bytes,
-    session_frame_head, spend_voucher_signing_bytes, stable_json_bytes,
-    tools_only_model_input_prompt_units, validate_transcription_result, validated_audio_metadata,
-    validated_wav_audio_metadata, AdminAttestationPolicy, AdminEnclaveAttestationBinding,
-    AttestationReport, AttestationTrustDataRef, AttestationVerifierProfile, CheckpointPolicy,
-    CtxBracketSchedule, EndpointFamilyContract, EndpointValueType, HardwareQuoteKind,
-    HardwareQuoteRouteAdvertisement, HardwareQuoteRoutePolicyBinding, ModelSpecialityDescriptor,
-    MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
-    ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody,
-    TpmActivateCredentialChallengeFrame, TpmActivateCredentialHello,
-    TpmActivateCredentialResponseFrame, TranscriptionResult, TranscriptionResultLimits,
-    ValidatedAudioFormat, VisibleToolCall, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
-    CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
-    DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
-    DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN,
-    MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN, SESSION_RECEIPT_SCHEMA_VERSION,
-    TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
-    TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN,
-    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
-    USAGE_STEP, USAGE_VIDEO_SECOND,
+    payload_chunk_manifest, receipt_signing_bytes, record_usage_receipt_feature_key,
+    record_usage_receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
+    spend_voucher_signing_bytes, stable_json_bytes, tools_only_model_input_prompt_units,
+    validate_transcription_result, validated_audio_metadata, validated_wav_audio_metadata,
+    AdminAttestationPolicy, AdminEnclaveAttestationBinding, AttestationReport,
+    AttestationTrustDataRef, AttestationVerifierProfile, CheckpointPolicy, CtxBracketSchedule,
+    EndpointFamilyContract, EndpointValueType, HardwareQuoteKind, HardwareQuoteRouteAdvertisement,
+    HardwareQuoteRoutePolicyBinding, ModelSpecialityDescriptor, MoneyAu, PayloadChunk,
+    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SessionReceipt, SpendVoucher, SpendVoucherBody, TpmActivateCredentialChallengeFrame,
+    TpmActivateCredentialHello, TpmActivateCredentialResponseFrame, TranscriptionResult,
+    TranscriptionResultLimits, ValidatedAudioFormat, VisibleToolCall, ATTESTATION_ALG,
+    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
+    MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
+    SESSION_RECEIPT_SCHEMA_VERSION, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
+    TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION, TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE,
+    USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
+    USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 #[cfg(test)]
 use mayhem_proto::{chunk_json_payload, visible_output_units};
@@ -231,6 +231,8 @@ const CONTEXT_NEEDLE_MAX_TOKENS: u32 = 16;
 const CONTEXT_NEEDLE_FILLER_WORDS_PER_LINE: usize = 32;
 const DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS: u64 = 1_000;
 const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
+const DEFAULT_RESERVATION_MAX_LIFETIME_EPOCHS: u64 = 24;
+const DEFAULT_RESERVATION_RECEIPT_GRACE_EPOCHS: u64 = 6;
 const TPM_ACTIVATION_CACHE_TTL_MILLIS: u64 = 24 * 60 * 60 * 1_000;
 const TPM_ACTIVATION_SUPERVISOR_MAX_CONCURRENCY: usize = 2;
 const TPM_ACTIVATION_INITIAL_BACKOFF_MILLIS: u64 = 500;
@@ -251,6 +253,7 @@ pub struct GatewayState {
     receipts: Arc<Mutex<Vec<StoredReceipt>>>,
     dashboard_history_path: Arc<Option<PathBuf>>,
     dashboard_history_write: Arc<Mutex<()>>,
+    receipt_settlement_publisher: Arc<Option<Arc<dyn GatewayReceiptSettlementPublisher>>>,
     probes: Arc<Mutex<Vec<StoredProbeEvent>>>,
     reputation_events: Arc<Mutex<Vec<StoredReputationEvent>>>,
     paused_sessions: Arc<Mutex<VecDeque<PausedSession>>>,
@@ -283,6 +286,9 @@ pub struct GatewayState {
     github_update_status: Arc<Mutex<GatewayGithubUpdateStatus>>,
     github_update_check_enabled: bool,
     epoch_seconds: u64,
+    billing_epoch: Arc<Mutex<u64>>,
+    reservation_max_lifetime_epochs: u64,
+    reservation_receipt_grace_epochs: u64,
     provider_heartbeat_ttl_millis: u64,
     ctx_bracket_schedule: Arc<CtxBracketSchedule>,
     failover_policy: GatewayFailoverPolicyConfig,
@@ -311,6 +317,21 @@ struct GatewayProviderEarningsSnapshot {
 struct GatewayReceiptRecorder {
     receipts: Arc<Mutex<Vec<StoredReceipt>>>,
     spend_reservation: GatewaySpendReservation,
+    history: Option<GatewayReceiptHistoryPersistence>,
+    settlement_publisher: Arc<Option<Arc<dyn GatewayReceiptSettlementPublisher>>>,
+}
+
+#[derive(Clone, Debug)]
+struct GatewayReceiptHistoryPersistence {
+    path: Arc<Option<PathBuf>>,
+    write: Arc<Mutex<()>>,
+    paused_sessions: Arc<Mutex<VecDeque<PausedSession>>>,
+    receipt_limit: usize,
+}
+
+pub trait GatewayReceiptSettlementPublisher: Send + Sync + fmt::Debug {
+    fn admission_available(&self) -> Result<bool, String>;
+    fn queue(&self, feature: &Value) -> Result<(), String>;
 }
 
 #[derive(Debug)]
@@ -390,38 +411,63 @@ impl GatewaySpendReservation {
 
 impl GatewayReceiptRecorder {
     fn record(&self, receipt: StoredReceipt) -> Result<(), ApiError> {
-        let mut receipts = self.receipts.lock_recover("receipt store");
-        if let Some(existing) = receipts.iter().find(|existing| {
-            existing.receipt.body.session_id == receipt.receipt.body.session_id
-                && existing.receipt.body.seq == receipt.receipt.body.seq
-        }) {
-            if existing == &receipt {
-                return Ok(());
+        {
+            let mut receipts = self.receipts.lock_recover("receipt store");
+            if let Some(existing) = receipts.iter().find(|existing| {
+                existing.receipt.body.session_id == receipt.receipt.body.session_id
+                    && existing.receipt.body.seq == receipt.receipt.body.seq
+            }) {
+                if existing == &receipt {
+                    return Ok(());
+                }
+                return Err(ApiError::conflict(
+                    "receipt sequence already contains different signed settlement data",
+                    None,
+                ));
             }
-            return Err(ApiError::conflict(
-                "receipt sequence already contains different signed settlement data",
-                None,
-            ));
+            let billing_id = receipt.receipt.body.billing_id.as_str();
+            let cumulative = receipt.receipt.body.au_owed_cum;
+            let previous = receipts
+                .iter()
+                .filter(|existing| existing.receipt.body.billing_id == billing_id)
+                .map(|existing| existing.receipt.body.au_owed_cum)
+                .max()
+                .unwrap_or(0);
+            let spend_delta = cumulative.checked_sub(previous).ok_or_else(|| {
+                ApiError::conflict("logical billing cumulative amount regressed", None)
+            })?;
+            self.spend_reservation
+                .settle(spend_delta, receipt.receipt.body.final_receipt)?;
+            receipts.push(receipt);
+            if let Some(history) = &self.history {
+                if receipts.len() > history.receipt_limit {
+                    let remove = receipts.len() - history.receipt_limit;
+                    receipts.drain(..remove);
+                }
+            }
         }
-        let billing_id = receipt.receipt.body.billing_id.as_str();
-        let cumulative = receipt.receipt.body.au_owed_cum;
-        let previous = receipts
-            .iter()
-            .filter(|existing| existing.receipt.body.billing_id == billing_id)
-            .map(|existing| existing.receipt.body.au_owed_cum)
-            .max()
-            .unwrap_or(0);
-        let spend_delta = cumulative.checked_sub(previous).ok_or_else(|| {
-            ApiError::conflict("logical billing cumulative amount regressed", None)
-        })?;
-        self.spend_reservation
-            .settle(spend_delta, receipt.receipt.body.final_receipt)?;
-        receipts.push(receipt);
+        if let Some(history) = &self.history {
+            persist_gateway_dashboard_history(
+                &history.path,
+                &history.write,
+                &self.receipts,
+                &history.paused_sessions,
+            )?;
+        }
         Ok(())
     }
 
     fn release_reservation(&self) {
         self.spend_reservation.release();
+    }
+
+    fn queue_settlement_feature(&self, feature: &Value) -> Result<(), GatewaySessionError> {
+        let publisher = self.settlement_publisher.as_ref().as_ref().ok_or_else(|| {
+            GatewaySessionError::new("gateway receipt settlement publisher is not configured")
+        })?;
+        publisher.queue(feature).map_err(|err| {
+            GatewaySessionError::new(format!("queueing receipt settlement failed: {err}"))
+        })
     }
 }
 
@@ -833,6 +879,8 @@ pub struct GatewayRouteCandidate {
     pub provider: String,
     #[serde(default)]
     pub accepted_rails: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub payout_revisions: BTreeMap<String, String>,
     #[serde(default)]
     pub served_modalities: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -897,6 +945,13 @@ fn default_reputation_bps() -> u32 {
 
 fn default_quant_bucket() -> String {
     DEFAULT_QUANT_BUCKET.to_owned()
+}
+
+fn is_lower_hex_len(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -2721,11 +2776,41 @@ pub struct GatewaySessionInterrupted {
     pub reason: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProviderSignedReceipt {
     pub body: ReceiptBody,
     pub enclave_sig: String,
     pub enclave_pubkey: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GatewayJobReceiptReconciliation {
+    transport_peer: String,
+    open_timeout_millis: u64,
+    terminal_status: GatewayJobStatus,
+    terminal_error: Option<String>,
+    ack_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    settlement_feature: Option<Value>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct GatewayJobSettledReceipt {
+    body: ReceiptBody,
+    enclave_sig: String,
+    enclave_pubkey: String,
+    receipt_ack: ReceiptAck,
+    reconciliation: GatewayJobReceiptReconciliation,
+}
+
+impl GatewayJobSettledReceipt {
+    fn provider_receipt(&self) -> ProviderSignedReceipt {
+        ProviderSignedReceipt {
+            body: self.body.clone(),
+            enclave_sig: self.enclave_sig.clone(),
+            enclave_pubkey: self.enclave_pubkey.clone(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2818,6 +2903,47 @@ impl GatewayJobHandle {
         })?;
         self.unregister_cancellation();
         Ok(stored)
+    }
+
+    async fn persist_reconciliation_settlement_feature(
+        &self,
+        feature: Value,
+    ) -> Result<StoredGatewayJob, GatewaySessionError> {
+        let id = self.id.clone();
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut store = store.lock_recover("gateway job vault");
+            let pending = store
+                .get(&id, now_secs())?
+                .ok_or_else(|| format!("gateway job {id} is missing"))?;
+            let mut receipt: GatewayJobSettledReceipt = serde_json::from_value(
+                pending
+                    .receipt
+                    .ok_or_else(|| format!("gateway job {id} has no receipt recovery state"))?,
+            )
+            .map_err(|err| format!("gateway job {id} has invalid receipt recovery state: {err}"))?;
+            if let Some(existing) = receipt.reconciliation.settlement_feature.as_ref() {
+                if existing != &feature {
+                    return Err(format!(
+                        "gateway job {id} already has a different settlement feature"
+                    ));
+                }
+            } else {
+                receipt.reconciliation.settlement_feature = Some(feature);
+            }
+            let receipt = serde_json::to_value(receipt)
+                .map_err(|err| format!("serializing gateway job {id} recovery state: {err}"))?;
+            store.update_reconciliation_receipt(&id, receipt, now_secs())
+        })
+        .await
+        .map_err(|err| {
+            GatewaySessionError::new(format!("gateway job persistence task failed: {err}"))
+        })?
+        .map_err(|err| {
+            GatewaySessionError::new(format!(
+                "persisting gateway job settlement handoff failed: {err}"
+            ))
+        })
     }
 
     async fn persist_failure_if_active(&self, error: String) {
@@ -2949,12 +3075,40 @@ fn gateway_job_artifacts(artifacts: &[GatewayArtifactOutput]) -> Vec<GatewayJobA
         .collect()
 }
 
-fn gateway_job_settled_receipt(receipt: &ProviderSignedReceipt, receipt_ack: &ReceiptAck) -> Value {
-    json!({
-        "body": receipt.body,
-        "enclave_sig": receipt.enclave_sig,
-        "enclave_pubkey": receipt.enclave_pubkey,
-        "receipt_ack": receipt_ack,
+fn gateway_job_settled_receipt(
+    invocation: &GatewaySessionInvocation,
+    receipt: &ProviderSignedReceipt,
+    receipt_ack: &ReceiptAck,
+    terminal_status: GatewayJobStatus,
+    terminal_error: Option<String>,
+    ack_reason: Option<String>,
+) -> Result<Value, GatewaySessionError> {
+    if !matches!(
+        terminal_status,
+        GatewayJobStatus::Completed | GatewayJobStatus::Cancelled
+    ) {
+        return Err(GatewaySessionError::new(
+            "gateway job receipt recovery has an invalid terminal status",
+        ));
+    }
+    serde_json::to_value(GatewayJobSettledReceipt {
+        body: receipt.body.clone(),
+        enclave_sig: receipt.enclave_sig.clone(),
+        enclave_pubkey: receipt.enclave_pubkey.clone(),
+        receipt_ack: receipt_ack.clone(),
+        reconciliation: GatewayJobReceiptReconciliation {
+            transport_peer: invocation.direct_peer()?.to_owned(),
+            open_timeout_millis: invocation.failover.open_timeout_ms.max(1),
+            terminal_status,
+            terminal_error,
+            ack_reason,
+            settlement_feature: None,
+        },
+    })
+    .map_err(|err| {
+        GatewaySessionError::new(format!(
+            "serializing gateway job receipt recovery state failed: {err}"
+        ))
     })
 }
 
@@ -2971,7 +3125,14 @@ async fn stage_completed_invocation_job(
     job.persist_reconciliation_pending(
         Some(result),
         gateway_job_artifacts(artifacts),
-        Some(gateway_job_settled_receipt(provider_receipt, receipt_ack)),
+        Some(gateway_job_settled_receipt(
+            invocation,
+            provider_receipt,
+            receipt_ack,
+            GatewayJobStatus::Completed,
+            None,
+            None,
+        )?),
         Some("signed receipt acknowledgement is pending".to_owned()),
     )
     .await?;
@@ -3005,7 +3166,14 @@ async fn stage_cancelled_invocation_job(
             "au_owed_cum": provider_receipt.body.au_owed_cum,
         })),
         Vec::new(),
-        Some(gateway_job_settled_receipt(provider_receipt, receipt_ack)),
+        Some(gateway_job_settled_receipt(
+            invocation,
+            provider_receipt,
+            receipt_ack,
+            GatewayJobStatus::Cancelled,
+            Some("client disconnected before the result became deliverable".to_owned()),
+            Some("client_disconnect".to_owned()),
+        )?),
         Some("client disconnected before the result became deliverable".to_owned()),
     )
     .await?;
@@ -3047,6 +3215,44 @@ where
     finish_completed_invocation_job(invocation).await
 }
 
+async fn send_receipt_ack_and_queue_settlement(
+    bridge: &mut ScBridgeClient,
+    direct_peer: &str,
+    invocation: &GatewaySessionInvocation,
+    provider_receipt: &ProviderSignedReceipt,
+    receipt_ack: &ReceiptAck,
+    reason: Option<&str>,
+    ack_context: &str,
+) -> Result<(), GatewaySessionError> {
+    let mut frame = json!({
+        "t": "s.receipt_ack",
+        "v": 1,
+        "session_id": &receipt_ack.session_id,
+        "seq": receipt_ack.seq,
+        "user_sig": &receipt_ack.user_sig,
+    });
+    if let Some(reason) = reason {
+        frame["reason"] = json!(reason);
+    }
+    send_direct_session_frame_with_peer_reconnect(
+        bridge,
+        direct_peer,
+        &invocation.session_id,
+        frame,
+        invocation.failover.open_timeout(),
+        ack_context,
+    )
+    .await?;
+    receive_and_queue_receipt_settlement(
+        bridge,
+        direct_peer,
+        invocation,
+        provider_receipt,
+        receipt_ack,
+    )
+    .await
+}
+
 async fn reconcile_and_persist_completed_invocation_job(
     bridge: &mut ScBridgeClient,
     direct_peer: &str,
@@ -3057,29 +3263,346 @@ async fn reconcile_and_persist_completed_invocation_job(
     receipt_ack: &ReceiptAck,
     ack_context: &str,
 ) -> Result<(), GatewaySessionError> {
-    let ack_delivery = send_direct_session_frame_with_peer_reconnect(
+    if let Some(job) = invocation.job.as_ref() {
+        job.mark_settlement_reconciliation_started();
+    }
+    stage_completed_invocation_job(invocation, result, artifacts, provider_receipt, receipt_ack)
+        .await?;
+    record_direct_session_receipt(invocation, provider_receipt, receipt_ack)?;
+    send_receipt_ack_and_queue_settlement(
         bridge,
         direct_peer,
-        &invocation.session_id,
-        json!({
-            "t": "s.receipt_ack",
-            "v": 1,
-            "session_id": &receipt_ack.session_id,
-            "seq": receipt_ack.seq,
-            "user_sig": &receipt_ack.user_sig,
-        }),
-        invocation.failover.open_timeout(),
-        ack_context,
-    );
-    reconcile_and_persist_completed_invocation_job_with_ack(
         invocation,
-        result,
-        artifacts,
         provider_receipt,
         receipt_ack,
-        ack_delivery,
+        None,
+        ack_context,
     )
+    .await?;
+    finish_completed_invocation_job(invocation).await
+}
+
+type GatewayReceiptAckRecoveryFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Value, GatewaySessionError>> + Send + 'a>>;
+
+trait GatewayReceiptAckRecoveryTransport: Send + Sync + fmt::Debug {
+    fn deliver<'a>(
+        &'a self,
+        recovery: &'a GatewayJobSettledReceipt,
+    ) -> GatewayReceiptAckRecoveryFuture<'a>;
+}
+
+#[derive(Clone, Debug)]
+struct ScBridgeReceiptAckRecoveryTransport {
+    config: ScBridgeGatewaySessionConfig,
+}
+
+impl GatewayReceiptAckRecoveryTransport for ScBridgeReceiptAckRecoveryTransport {
+    fn deliver<'a>(
+        &'a self,
+        recovery: &'a GatewayJobSettledReceipt,
+    ) -> GatewayReceiptAckRecoveryFuture<'a> {
+        Box::pin(async move {
+            let session_id = recovery.body.session_id.as_str();
+            let direct_peer = recovery.reconciliation.transport_peer.as_str();
+            let timeout = Duration::from_millis(recovery.reconciliation.open_timeout_millis.max(1));
+            let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
+                &self.config.url,
+                self.config.token.clone(),
+            )?)
+            .await?;
+            bridge.session_subscribe([session_id]).await?;
+            bridge.peer_connect(direct_peer, timeout).await?;
+            let opened = bridge.session_open(direct_peer, session_id).await?;
+            if !sc_bridge_session_transport_valid(&opened) {
+                return Err(GatewaySessionError::retryable(format!(
+                    "receipt acknowledgement recovery session {session_id} did not open an authenticated direct-or-relayed transport"
+                )));
+            }
+            let mut frame = json!({
+                "t": "s.receipt_ack",
+                "v": 1,
+                "session_id": &recovery.receipt_ack.session_id,
+                "seq": recovery.receipt_ack.seq,
+                "user_sig": &recovery.receipt_ack.user_sig,
+            });
+            if let Some(reason) = recovery.reconciliation.ack_reason.as_deref() {
+                frame["reason"] = json!(reason);
+            }
+            send_direct_session_frame_with_peer_reconnect(
+                &mut bridge,
+                direct_peer,
+                session_id,
+                frame,
+                timeout,
+                "recovering durable s.receipt_ack",
+            )
+            .await?;
+            let response = next_session_frame_with_optional_wait(
+                &mut bridge,
+                session_id,
+                direct_peer,
+                Some(timeout),
+                &["s.receipt_settlement", "s.error", "s.close"],
+            )
+            .await?;
+            let feature = match response.get("t").and_then(Value::as_str) {
+                Some("s.receipt_settlement")
+                    if response.get("session_id").and_then(Value::as_str) == Some(session_id)
+                        && response.get("seq").and_then(Value::as_u64)
+                            == Some(recovery.body.seq) =>
+                {
+                    response.get("feature").cloned().ok_or_else(|| {
+                        GatewaySessionError::new(
+                            "receipt acknowledgement recovery handoff is missing signed feature",
+                        )
+                    })?
+                }
+                Some("s.error") => {
+                    return Err(GatewaySessionError::retryable(format!(
+                        "provider rejected receipt acknowledgement recovery: {}",
+                        response
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("provider error")
+                    )))
+                }
+                Some("s.close") => {
+                    return Err(GatewaySessionError::retryable(
+                        "provider closed before receipt acknowledgement recovery completed",
+                    ))
+                }
+                _ => {
+                    return Err(GatewaySessionError::retryable(
+                        "provider returned an invalid receipt acknowledgement recovery handoff",
+                    ))
+                }
+            };
+            let _ = bridge.session_close(direct_peer, session_id).await;
+            Ok(feature)
+        })
+    }
+}
+
+fn parse_gateway_job_receipt_recovery(
+    job: &StoredGatewayJob,
+) -> Result<GatewayJobSettledReceipt, GatewaySessionError> {
+    if job.status != GatewayJobStatus::ReconciliationPending {
+        return Err(GatewaySessionError::new(format!(
+            "gateway job {} is not pending receipt reconciliation",
+            job.id
+        )));
+    }
+    let recovery: GatewayJobSettledReceipt =
+        serde_json::from_value(job.receipt.clone().ok_or_else(|| {
+            GatewaySessionError::new(format!(
+                "gateway job {} has no receipt recovery state",
+                job.id
+            ))
+        })?)
+        .map_err(|err| {
+            GatewaySessionError::new(format!(
+                "gateway job {} has invalid receipt recovery state: {err}",
+                job.id
+            ))
+        })?;
+    if recovery.body.session_id != recovery.receipt_ack.session_id
+        || recovery.body.seq != recovery.receipt_ack.seq
+        || recovery.body.model_id != job.model
+        || !recovery.body.final_receipt
+        || !is_lower_hex_len(&recovery.body.session_id, 64)
+        || !is_lower_hex_len(&recovery.body.provider, 64)
+        || !is_lower_hex_len(&recovery.body.user, 64)
+        || !is_lower_hex_len(&recovery.reconciliation.transport_peer, 64)
+        || !matches!(
+            recovery.reconciliation.terminal_status,
+            GatewayJobStatus::Completed | GatewayJobStatus::Cancelled
+        )
+    {
+        return Err(GatewaySessionError::new(format!(
+            "gateway job {} receipt recovery binding is invalid",
+            job.id
+        )));
+    }
+    let provider_receipt = recovery.provider_receipt();
+    verify_provider_receipt_signature(&provider_receipt)?;
+    let user_key: [u8; 32] = hex::decode(&recovery.body.user)
+        .map_err(|err| GatewaySessionError::new(format!("receipt user key is invalid: {err}")))?
+        .try_into()
+        .map_err(|_| GatewaySessionError::new("receipt user key must contain 32 bytes"))?;
+    let user_signature: [u8; 64] = hex::decode(&recovery.receipt_ack.user_sig)
+        .map_err(|err| {
+            GatewaySessionError::new(format!(
+                "receipt acknowledgement signature is invalid: {err}"
+            ))
+        })?
+        .try_into()
+        .map_err(|_| {
+            GatewaySessionError::new("receipt acknowledgement signature must contain 64 bytes")
+        })?;
+    VerifyingKey::from_bytes(&user_key)
+        .map_err(|err| GatewaySessionError::new(format!("receipt user key is invalid: {err}")))?
+        .verify_strict(
+            &receipt_signing_bytes(&recovery.body).map_err(|err| {
+                GatewaySessionError::new(format!(
+                    "building receipt acknowledgement payload failed: {err}"
+                ))
+            })?,
+            &Signature::from_bytes(&user_signature),
+        )
+        .map_err(|err| {
+            GatewaySessionError::new(format!(
+                "receipt acknowledgement signature verification failed: {err}"
+            ))
+        })?;
+    if let Some(feature) = recovery.reconciliation.settlement_feature.as_ref() {
+        validate_receipt_settlement_feature_for_receipt(
+            &provider_receipt,
+            &recovery.receipt_ack,
+            feature,
+        )?;
+    }
+    Ok(recovery)
+}
+
+async fn persist_gateway_job_recovery_feature(
+    state: &GatewayState,
+    id: &str,
+    mut recovery: GatewayJobSettledReceipt,
+    feature: Value,
+) -> Result<GatewayJobSettledReceipt, GatewaySessionError> {
+    if let Some(existing) = recovery.reconciliation.settlement_feature.as_ref() {
+        if existing != &feature {
+            return Err(GatewaySessionError::new(format!(
+                "gateway job {id} already has a different settlement feature"
+            )));
+        }
+        return Ok(recovery);
+    }
+    recovery.reconciliation.settlement_feature = Some(feature);
+    let receipt = serde_json::to_value(&recovery).map_err(|err| {
+        GatewaySessionError::new(format!(
+            "serializing gateway job {id} receipt recovery state failed: {err}"
+        ))
+    })?;
+    let jobs = state.jobs.clone();
+    let id = id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        jobs.lock_recover("gateway job vault")
+            .update_reconciliation_receipt(&id, receipt, now_secs())
+    })
     .await
+    .map_err(|err| GatewaySessionError::new(format!("gateway job persistence task failed: {err}")))?
+    .map_err(|err| {
+        GatewaySessionError::new(format!(
+            "persisting gateway job settlement handoff failed: {err}"
+        ))
+    })?;
+    Ok(recovery)
+}
+
+async fn reconcile_pending_gateway_job_once(
+    state: &GatewayState,
+    id: &str,
+    transport: &dyn GatewayReceiptAckRecoveryTransport,
+) -> Result<(), GatewaySessionError> {
+    let job = state
+        .jobs
+        .lock_recover("gateway job vault")
+        .get(id, now_secs())
+        .map_err(GatewaySessionError::new)?;
+    let Some(job) = job else {
+        return Ok(());
+    };
+    if job.status != GatewayJobStatus::ReconciliationPending {
+        return Ok(());
+    }
+    let mut recovery = parse_gateway_job_receipt_recovery(&job)?;
+    let feature = match recovery.reconciliation.settlement_feature.clone() {
+        Some(feature) => feature,
+        None => transport.deliver(&recovery).await?,
+    };
+    validate_receipt_settlement_feature_for_receipt(
+        &recovery.provider_receipt(),
+        &recovery.receipt_ack,
+        &feature,
+    )?;
+    recovery = persist_gateway_job_recovery_feature(state, id, recovery, feature.clone()).await?;
+    let publisher = state
+        .receipt_settlement_publisher
+        .as_ref()
+        .as_ref()
+        .ok_or_else(|| {
+            GatewaySessionError::new("gateway receipt settlement publisher is not configured")
+        })?;
+    publisher.queue(&feature).map_err(|err| {
+        GatewaySessionError::new(format!("queueing receipt settlement failed: {err}"))
+    })?;
+    let status = recovery.reconciliation.terminal_status;
+    let error = recovery.reconciliation.terminal_error;
+    let jobs = state.jobs.clone();
+    let id = id.to_owned();
+    tokio::task::spawn_blocking(move || {
+        jobs.lock_recover("gateway job vault")
+            .finish_reconciliation(&id, status, error, now_secs())
+    })
+    .await
+    .map_err(|err| GatewaySessionError::new(format!("gateway job persistence task failed: {err}")))?
+    .map_err(|err| {
+        GatewaySessionError::new(format!(
+            "finishing gateway job reconciliation failed: {err}"
+        ))
+    })?;
+    Ok(())
+}
+
+fn spawn_pending_gateway_job_reconciliation(state: &GatewayState) -> Result<(), String> {
+    let pending = state
+        .jobs
+        .lock_recover("gateway job vault")
+        .pending_reconciliations(now_secs())?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let config = state
+        .session_backend
+        .bridge_stream_config()
+        .ok_or_else(|| {
+            "gateway has pending receipt acknowledgements but no SC-Bridge session backend"
+                .to_owned()
+        })?;
+    if state.receipt_settlement_publisher.as_ref().is_none() {
+        return Err(
+            "gateway has pending receipt acknowledgements but no settlement publisher".to_owned(),
+        );
+    }
+    for job in &pending {
+        parse_gateway_job_receipt_recovery(job).map_err(|err| err.message)?;
+    }
+    let transport: Arc<dyn GatewayReceiptAckRecoveryTransport> =
+        Arc::new(ScBridgeReceiptAckRecoveryTransport { config });
+    for job in pending {
+        let state = state.clone();
+        let transport = transport.clone();
+        tokio::spawn(async move {
+            let mut retry = Duration::from_secs(1);
+            loop {
+                match reconcile_pending_gateway_job_once(&state, &job.id, transport.as_ref()).await
+                {
+                    Ok(()) => return,
+                    Err(err) => {
+                        eprintln!(
+                            "Gateway receipt acknowledgement recovery for {} is pending: {}",
+                            job.id, err.message
+                        );
+                    }
+                }
+                tokio::time::sleep(retry).await;
+                retry = retry.saturating_mul(2).min(Duration::from_secs(30));
+            }
+        });
+    }
+    Ok(())
 }
 
 fn chat_job_result(output: &ChatOutput) -> Value {
@@ -3183,6 +3706,17 @@ pub struct GatewayHedgeProbeInvocation {
     pub provider_pubkey: Option<String>,
     pub transport_peer: Option<String>,
     pub failover: GatewayFailoverInvocation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GatewayVoucherSettlementBinding {
+    billing_epoch: u64,
+    reservation_id: String,
+    reservation_expires_after_epoch: u64,
+    reservation_receipt_grace_epochs: u64,
+    user: String,
+    provider: String,
+    payout_revision: String,
 }
 
 #[derive(Clone, Debug)]
@@ -3402,6 +3936,67 @@ pub struct Usage {
 }
 
 impl GatewayState {
+    fn voucher_settlement_binding(
+        &self,
+        _model: &GatewayModel,
+        route: Option<&GatewayRouteCandidate>,
+    ) -> Result<GatewayVoucherSettlementBinding, ApiError> {
+        let billing_epoch = self.billing_epoch();
+        if billing_epoch == 0 {
+            return Err(ApiError::service_unavailable(
+                "canonical billing epoch is unavailable",
+                Some("model"),
+            ));
+        }
+        let user = verifying_key_hex(&self.receipt_config.user_seed);
+        let provider = route
+            .map(|candidate| candidate.provider.clone())
+            .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
+        let payout_revision = match route {
+            Some(candidate) => candidate
+                .payout_revisions
+                .get(&self.receipt_config.rail)
+                .filter(|revision| is_lower_hex_len(revision, 64))
+                .cloned()
+                .ok_or_else(|| {
+                    ApiError::service_unavailable(
+                        format!(
+                            "provider {} has no canonical {} payout revision for billing epoch {}",
+                            candidate.provider, self.receipt_config.rail, billing_epoch
+                        ),
+                        Some("model"),
+                    )
+                })?,
+            None => stable_value_hash(&json!({
+                "domain": "mayhem-dev-payout-revision-v1",
+                "provider": provider,
+                "rail": self.receipt_config.rail,
+            })),
+        };
+        let mut reservation = [0_u8; 32];
+        getrandom::fill(&mut reservation).map_err(|err| {
+            ApiError::internal_message(format!(
+                "generating spend reservation identity failed: {err}"
+            ))
+        })?;
+        Ok(GatewayVoucherSettlementBinding {
+            billing_epoch,
+            reservation_id: hex::encode(reservation),
+            reservation_expires_after_epoch: billing_epoch
+                .checked_add(self.reservation_max_lifetime_epochs)
+                .ok_or_else(|| {
+                    ApiError::service_unavailable(
+                        "canonical reservation lifetime overflows the billing epoch",
+                        Some("model"),
+                    )
+                })?,
+            reservation_receipt_grace_epochs: self.reservation_receipt_grace_epochs,
+            user,
+            provider,
+            payout_revision,
+        })
+    }
+
     pub fn from_embedded_catalog() -> Self {
         Self::from_catalog_json(EMBEDDED_CATALOG).unwrap_or_else(|_| Self::fixture())
     }
@@ -3545,6 +4140,7 @@ impl GatewayState {
             receipts: Arc::new(Mutex::new(Vec::new())),
             dashboard_history_path: Arc::new(None),
             dashboard_history_write: Arc::new(Mutex::new(())),
+            receipt_settlement_publisher: Arc::new(None),
             probes: Arc::new(Mutex::new(Vec::new())),
             reputation_events: Arc::new(Mutex::new(Vec::new())),
             paused_sessions: Arc::new(Mutex::new(VecDeque::new())),
@@ -3584,6 +4180,9 @@ impl GatewayState {
             github_update_status: Arc::new(Mutex::new(GatewayGithubUpdateStatus::disabled())),
             github_update_check_enabled: false,
             epoch_seconds: DEFAULT_EPOCH_SECONDS,
+            billing_epoch: Arc::new(Mutex::new(1)),
+            reservation_max_lifetime_epochs: DEFAULT_RESERVATION_MAX_LIFETIME_EPOCHS,
+            reservation_receipt_grace_epochs: DEFAULT_RESERVATION_RECEIPT_GRACE_EPOCHS,
             provider_heartbeat_ttl_millis: DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
             ctx_bracket_schedule: Arc::new(default_ctx_bracket_schedule()),
             failover_policy: GatewayFailoverPolicyConfig::default(),
@@ -3664,6 +4263,25 @@ impl GatewayState {
         max_spend_au: MoneyAu,
         access_token: &Option<GatewayTokenAttribution>,
     ) -> Result<GatewaySpendReservation, ApiError> {
+        if let Some(publisher) = self.receipt_settlement_publisher.as_ref().as_ref() {
+            match publisher.admission_available() {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(ApiError::service_unavailable(
+                        "receipt settlement outbox is near capacity; paid dispatch is paused until durable evidence is relayed",
+                        Some("model"),
+                    ))
+                }
+                Err(error) => {
+                    return Err(ApiError::service_unavailable(
+                        format!(
+                            "receipt settlement outbox readiness could not be verified: {error}"
+                        ),
+                        Some("model"),
+                    ))
+                }
+            }
+        }
         self.access_control
             .reserve_budget(access_token, reservation_id, max_spend_au)?;
         let mut wallet = self.wallet_spend.lock_recover("gateway wallet spend state");
@@ -3753,6 +4371,14 @@ impl GatewayState {
             ),
         }
         self.dashboard_history_path = Arc::new(Some(path));
+        self
+    }
+
+    pub fn with_receipt_settlement_publisher(
+        mut self,
+        publisher: Arc<dyn GatewayReceiptSettlementPublisher>,
+    ) -> Self {
+        self.receipt_settlement_publisher = Arc::new(Some(publisher));
         self
     }
 
@@ -4070,6 +4696,29 @@ impl GatewayState {
         self
     }
 
+    pub fn with_billing_epoch(self, billing_epoch: u64) -> Self {
+        *self.billing_epoch.lock_recover("gateway billing epoch") = billing_epoch.max(1);
+        self
+    }
+
+    pub fn with_reservation_policy(
+        mut self,
+        max_lifetime_epochs: u64,
+        receipt_grace_epochs: u64,
+    ) -> Self {
+        self.reservation_max_lifetime_epochs = max_lifetime_epochs.max(1);
+        self.reservation_receipt_grace_epochs = receipt_grace_epochs;
+        self
+    }
+
+    pub fn update_billing_epoch(&self, billing_epoch: u64) {
+        *self.billing_epoch.lock_recover("gateway billing epoch") = billing_epoch.max(1);
+    }
+
+    fn billing_epoch(&self) -> u64 {
+        *self.billing_epoch.lock_recover("gateway billing epoch")
+    }
+
     pub fn epoch_seconds(&self) -> u64 {
         self.epoch_seconds
     }
@@ -4301,46 +4950,29 @@ impl GatewayState {
     }
 
     fn persist_dashboard_history(&self) -> Result<(), ApiError> {
-        let Some(path) = self.dashboard_history_path.as_ref().as_ref() else {
-            return Ok(());
-        };
-        let _write_guard = self
-            .dashboard_history_write
-            .lock_recover("dashboard history write");
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|err| {
-                ApiError::internal_message(format!(
-                    "creating dashboard history directory {} failed: {err}",
-                    parent.display()
-                ))
-            })?;
+        persist_gateway_dashboard_history(
+            &self.dashboard_history_path,
+            &self.dashboard_history_write,
+            &self.receipts,
+            &self.paused_sessions,
+        )
+    }
+
+    fn receipt_recorder(
+        &self,
+        spend_reservation: GatewaySpendReservation,
+    ) -> GatewayReceiptRecorder {
+        GatewayReceiptRecorder {
+            receipts: self.receipts.clone(),
+            spend_reservation,
+            history: Some(GatewayReceiptHistoryPersistence {
+                path: self.dashboard_history_path.clone(),
+                write: self.dashboard_history_write.clone(),
+                paused_sessions: self.paused_sessions.clone(),
+                receipt_limit: self.retention_limits.receipts,
+            }),
+            settlement_publisher: self.receipt_settlement_publisher.clone(),
         }
-        let history = GatewayDashboardHistory {
-            version: default_gateway_dashboard_history_version(),
-            receipts: self.receipts(),
-            paused_sessions: self.paused_sessions(),
-        };
-        let bytes = serde_json::to_vec_pretty(&history).map_err(|err| {
-            ApiError::internal_message(format!("serializing dashboard history failed: {err}"))
-        })?;
-        let temp_path = path.with_extension(
-            path.extension()
-                .map(|extension| format!("{}.tmp", extension.to_string_lossy()))
-                .unwrap_or_else(|| "tmp".to_owned()),
-        );
-        fs::write(&temp_path, bytes).map_err(|err| {
-            ApiError::internal_message(format!(
-                "writing dashboard history temporary file {} failed: {err}",
-                temp_path.display()
-            ))
-        })?;
-        fs::rename(&temp_path, path).map_err(|err| {
-            let _ = fs::remove_file(&temp_path);
-            ApiError::internal_message(format!(
-                "installing dashboard history {} failed: {err}",
-                path.display()
-            ))
-        })
     }
 
     fn model(&self, id: &str) -> Option<GatewayModel> {
@@ -4353,6 +4985,56 @@ impl GatewayState {
     fn first_model(&self) -> Option<GatewayModel> {
         self.models_snapshot().first().cloned()
     }
+}
+
+fn persist_gateway_dashboard_history(
+    path: &Arc<Option<PathBuf>>,
+    write: &Arc<Mutex<()>>,
+    receipts: &Arc<Mutex<Vec<StoredReceipt>>>,
+    paused_sessions: &Arc<Mutex<VecDeque<PausedSession>>>,
+) -> Result<(), ApiError> {
+    let Some(path) = path.as_ref().as_ref() else {
+        return Ok(());
+    };
+    let _write_guard = write.lock_recover("dashboard history write");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            ApiError::internal_message(format!(
+                "creating dashboard history directory {} failed: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    let history = GatewayDashboardHistory {
+        version: default_gateway_dashboard_history_version(),
+        receipts: receipts.lock_recover("receipt store").clone(),
+        paused_sessions: paused_sessions
+            .lock_recover("paused session store")
+            .iter()
+            .cloned()
+            .collect(),
+    };
+    let bytes = serde_json::to_vec_pretty(&history).map_err(|err| {
+        ApiError::internal_message(format!("serializing dashboard history failed: {err}"))
+    })?;
+    let temp_path = path.with_extension(
+        path.extension()
+            .map(|extension| format!("{}.tmp", extension.to_string_lossy()))
+            .unwrap_or_else(|| "tmp".to_owned()),
+    );
+    fs::write(&temp_path, bytes).map_err(|err| {
+        ApiError::internal_message(format!(
+            "writing dashboard history temporary file {} failed: {err}",
+            temp_path.display()
+        ))
+    })?;
+    fs::rename(&temp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&temp_path);
+        ApiError::internal_message(format!(
+            "installing dashboard history {} failed: {err}",
+            path.display()
+        ))
+    })
 }
 
 impl Default for ReceiptConfig {
@@ -4539,6 +5221,8 @@ pub async fn serve(bind: SocketAddr, mut state: GatewayState) -> std::io::Result
         state.replace_github_update_status(GatewayGithubUpdateStatus::disabled());
     }
     let listener = TcpListener::bind(bind).await?;
+    spawn_pending_gateway_job_reconciliation(&state)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     axum::serve(listener, openai_router(state)).await
 }
 
@@ -13336,19 +14020,18 @@ impl ScBridgeGatewaySessionBackend {
                     let receipt_ack = direct_session_partial_receipt_ack(
                         request, invocation, partial, provider, model,
                     )?;
-                    let _ = send_direct_session_frame_with_peer_reconnect(
+                    record_direct_session_receipt(
+                        invocation,
+                        &partial.provider_receipt,
+                        &receipt_ack,
+                    )?;
+                    let _ = send_receipt_ack_and_queue_settlement(
                         &mut bridge,
                         direct_peer,
-                        &invocation.session_id,
-                        json!({
-                            "t": "s.receipt_ack",
-                            "v": 1,
-                            "session_id": receipt_ack.session_id,
-                            "seq": receipt_ack.seq,
-                            "user_sig": receipt_ack.user_sig,
-                            "reason": partial.reason.as_str(),
-                        }),
-                        invocation.failover.open_timeout(),
+                        invocation,
+                        &partial.provider_receipt,
+                        &receipt_ack,
+                        Some(partial.reason.as_str()),
                         "sending partial s.receipt_ack",
                     )
                     .await;
@@ -17243,7 +17926,7 @@ fn bridge_error_missing_direct_connection(error: &BridgeError) -> bool {
 async fn maybe_ack_direct_session_checkpoint_receipt(
     bridge: &mut ScBridgeClient,
     provider: &str,
-    session_id: &str,
+    _session_id: &str,
     request: &ChatCompletionRequest,
     invocation: &GatewaySessionInvocation,
     content: &str,
@@ -17295,6 +17978,7 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     );
     let receipt_ack =
         direct_session_partial_receipt_ack(request, invocation, &partial, provider, model)?;
+    record_direct_session_receipt(invocation, receipt, &receipt_ack)?;
     let direct_peer = invocation.direct_peer()?;
     let ack_frame = json!({
         "t": "s.receipt_ack",
@@ -17304,12 +17988,13 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
         "user_sig": receipt_ack.user_sig,
         "reason": "checkpoint",
     });
-    send_direct_session_frame_with_peer_reconnect(
+    send_receipt_ack_and_queue_settlement(
         bridge,
         direct_peer,
-        session_id,
-        ack_frame.clone(),
-        invocation.failover.open_timeout(),
+        invocation,
+        receipt,
+        &receipt_ack,
+        Some("checkpoint"),
         "sending checkpoint s.receipt_ack",
     )
     .await?;
@@ -17854,6 +18539,177 @@ fn record_direct_session_receipt(
         .map_err(|error| GatewaySessionError::new(error.message))
 }
 
+fn validate_receipt_settlement_feature(
+    invocation: &GatewaySessionInvocation,
+    provider_receipt: &ProviderSignedReceipt,
+    receipt_ack: &ReceiptAck,
+    feature: &Value,
+) -> Result<(), GatewaySessionError> {
+    if invocation.provider_pubkey_required()? != provider_receipt.body.provider
+        || invocation.spend_voucher.body.billing_epoch != provider_receipt.body.billing_epoch
+        || invocation.spend_voucher.body.payout_revision != provider_receipt.body.payout_revision
+    {
+        return Err(GatewaySessionError::new(
+            "receipt settlement does not match the authenticated invocation",
+        ));
+    }
+    validate_receipt_settlement_feature_for_receipt(provider_receipt, receipt_ack, feature)
+}
+
+fn validate_receipt_settlement_feature_for_receipt(
+    provider_receipt: &ProviderSignedReceipt,
+    receipt_ack: &ReceiptAck,
+    feature: &Value,
+) -> Result<(), GatewaySessionError> {
+    if feature.get("feature").and_then(Value::as_str) != Some("mayhem") {
+        return Err(GatewaySessionError::new(
+            "receipt settlement feature must target mayhem",
+        ));
+    }
+    let key = feature
+        .get("key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| GatewaySessionError::new("receipt settlement feature is missing key"))?;
+    let value = feature
+        .get("value")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| GatewaySessionError::new("receipt settlement feature is missing value"))?;
+    if value.get("op").and_then(Value::as_str) != Some("record_usage_receipt")
+        || value.get("contract_version").and_then(Value::as_u64)
+            != Some(u64::from(CONTRACT_VERSION))
+    {
+        return Err(GatewaySessionError::new(
+            "receipt settlement feature has the wrong operation or contract version",
+        ));
+    }
+    let expected_receipt = SessionReceipt {
+        body: provider_receipt.body.clone(),
+        enclave_sig: provider_receipt.enclave_sig.clone(),
+        enclave_pubkey: provider_receipt.enclave_pubkey.clone(),
+        user_sig: receipt_ack.user_sig.clone(),
+    };
+    let actual_receipt: SessionReceipt =
+        serde_json::from_value(value.get("receipt").cloned().ok_or_else(|| {
+            GatewaySessionError::new("receipt settlement feature is missing receipt")
+        })?)
+        .map_err(|error| {
+            GatewaySessionError::new(format!(
+                "receipt settlement feature has invalid receipt: {error}"
+            ))
+        })?;
+    if actual_receipt != expected_receipt {
+        return Err(GatewaySessionError::new(
+            "receipt settlement feature does not contain the exact co-signed receipt",
+        ));
+    }
+    if value.get("epoch").and_then(Value::as_u64) != Some(provider_receipt.body.billing_epoch)
+        || value.get("payout_revision").and_then(Value::as_str)
+            != Some(provider_receipt.body.payout_revision.as_str())
+    {
+        return Err(GatewaySessionError::new(
+            "receipt settlement outer binding does not match the signed receipt",
+        ));
+    }
+    if key != record_usage_receipt_feature_key(&expected_receipt) {
+        return Err(GatewaySessionError::new(
+            "receipt settlement feature key is not canonical",
+        ));
+    }
+    let provider_signature = value
+        .get("provider_sig")
+        .and_then(Value::as_str)
+        .filter(|signature| is_lower_hex_len(signature, 128))
+        .ok_or_else(|| {
+            GatewaySessionError::new("receipt settlement feature has invalid provider_sig")
+        })?;
+    let provider = provider_receipt.body.provider.as_str();
+    let key_bytes: [u8; 32] = hex::decode(provider)
+        .map_err(|error| {
+            GatewaySessionError::new(format!("receipt provider key is invalid: {error}"))
+        })?
+        .try_into()
+        .map_err(|_| GatewaySessionError::new("receipt provider key must contain 32 bytes"))?;
+    let signature_bytes: [u8; 64] = hex::decode(provider_signature)
+        .map_err(|error| {
+            GatewaySessionError::new(format!("receipt provider_sig is invalid: {error}"))
+        })?
+        .try_into()
+        .map_err(|_| GatewaySessionError::new("receipt provider_sig must contain 64 bytes"))?;
+    let payload = record_usage_receipt_signing_bytes(key, value).map_err(|error| {
+        GatewaySessionError::new(format!(
+            "building receipt settlement signing bytes failed: {error}"
+        ))
+    })?;
+    VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|error| {
+            GatewaySessionError::new(format!("receipt provider key is invalid: {error}"))
+        })?
+        .verify_strict(&payload, &Signature::from_bytes(&signature_bytes))
+        .map_err(|error| {
+            GatewaySessionError::new(format!(
+                "receipt settlement provider_sig verification failed: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
+async fn receive_and_queue_receipt_settlement(
+    bridge: &mut ScBridgeClient,
+    direct_peer: &str,
+    invocation: &GatewaySessionInvocation,
+    provider_receipt: &ProviderSignedReceipt,
+    receipt_ack: &ReceiptAck,
+) -> Result<(), GatewaySessionError> {
+    let frame = next_session_frame_with_optional_wait(
+        bridge,
+        &invocation.session_id,
+        direct_peer,
+        Some(invocation.failover.open_timeout()),
+        &["s.receipt_settlement", "s.error", "s.close"],
+    )
+    .await?;
+    match frame.get("t").and_then(Value::as_str) {
+        Some("s.receipt_settlement") => {}
+        Some("s.error") => {
+            return Err(GatewaySessionError::new(format!(
+                "provider rejected receipt settlement handoff: {}",
+                frame
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("provider error")
+            )))
+        }
+        Some("s.close") => {
+            return Err(GatewaySessionError::new(
+                "provider closed before receipt settlement handoff",
+            ))
+        }
+        _ => {
+            return Err(GatewaySessionError::new(
+                "provider returned an invalid receipt settlement handoff",
+            ))
+        }
+    }
+    if frame.get("session_id").and_then(Value::as_str) != Some(invocation.session_id.as_str())
+        || frame.get("seq").and_then(Value::as_u64) != Some(provider_receipt.body.seq)
+    {
+        return Err(GatewaySessionError::new(
+            "receipt settlement handoff session or sequence mismatch",
+        ));
+    }
+    let feature = frame.get("feature").ok_or_else(|| {
+        GatewaySessionError::new("receipt settlement handoff is missing signed feature")
+    })?;
+    validate_receipt_settlement_feature(invocation, provider_receipt, receipt_ack, feature)?;
+    if let Some(job) = invocation.job.as_ref() {
+        job.persist_reconciliation_settlement_feature(feature.clone())
+            .await?;
+    }
+    invocation
+        .receipt_recorder
+        .queue_settlement_feature(feature)
+}
+
 async fn record_cancelled_direct_session_receipt(
     model: &GatewayModel,
     invocation: &GatewaySessionInvocation,
@@ -17968,19 +18824,13 @@ async fn cancel_and_settle_direct_session(
                     expected_seq,
                 )
                 .await?;
-                send_direct_session_frame_with_peer_reconnect(
+                send_receipt_ack_and_queue_settlement(
                     bridge,
                     direct_peer,
-                    &invocation.session_id,
-                    json!({
-                        "t": "s.receipt_ack",
-                        "v": 1,
-                        "session_id": receipt_ack.session_id,
-                        "seq": receipt_ack.seq,
-                        "user_sig": receipt_ack.user_sig,
-                        "reason": "client_disconnect",
-                    }),
-                    invocation.failover.open_timeout(),
+                    invocation,
+                    &receipt,
+                    &receipt_ack,
+                    Some("client_disconnect"),
                     "sending cancelled-session s.receipt_ack",
                 )
                 .await?;
@@ -18394,6 +19244,11 @@ fn validate_provider_receipt(
     provider_receipt: &ProviderSignedReceipt,
     expected: ExpectedProviderReceipt<'_>,
 ) -> Result<(), GatewaySessionError> {
+    if invocation.spend_voucher.body.schema_version != SESSION_RECEIPT_SCHEMA_VERSION {
+        return Err(GatewaySessionError::new(format!(
+            "spend voucher schema_version must be {SESSION_RECEIPT_SCHEMA_VERSION}"
+        )));
+    }
     if provider_receipt.body.schema_version != SESSION_RECEIPT_SCHEMA_VERSION {
         return Err(GatewaySessionError::new(format!(
             "provider receipt schema_version must be {SESSION_RECEIPT_SCHEMA_VERSION}"
@@ -18423,6 +19278,18 @@ fn validate_provider_receipt(
                 == invocation.spend_voucher.body.billing_prior_au_owed_cum,
             "provider receipt billing prior amount mismatch",
         ),
+        (
+            body.billing_epoch == invocation.spend_voucher.body.billing_epoch,
+            "provider receipt billing epoch mismatch",
+        ),
+        (
+            body.reservation_id == invocation.spend_voucher.body.reservation_id,
+            "provider receipt reservation id mismatch",
+        ),
+        (
+            body.payout_revision == invocation.spend_voucher.body.payout_revision,
+            "provider receipt payout revision mismatch",
+        ),
         (body.seq == expected.seq, "provider receipt seq mismatch"),
         (
             body.final_receipt == expected.final_receipt,
@@ -18433,18 +19300,22 @@ fn validate_provider_receipt(
             "provider receipt rail mismatch",
         ),
         (
-            body.user == invocation.user_pubkey,
+            body.user == invocation.user_pubkey && body.user == invocation.spend_voucher.body.user,
             "provider receipt user mismatch",
         ),
         (
-            body.provider == expected.provider,
+            body.provider == expected.provider
+                && body.provider == invocation.spend_voucher.body.provider,
             "provider receipt provider mismatch",
         ),
         (
             body.enclave_id == invocation.enclave_id,
             "provider receipt enclave mismatch",
         ),
-        (body.model_id == model.id, "provider receipt model mismatch"),
+        (
+            body.model_id == model.id && body.model_id == invocation.spend_voucher.body.model_id,
+            "provider receipt model mismatch",
+        ),
         (
             body.price_ver == invocation.price_ver,
             "provider receipt price_ver mismatch",
@@ -18478,7 +19349,8 @@ fn validate_provider_receipt(
             "provider receipt ctx_bracket_table_ver mismatch",
         ),
         (
-            body.rules_ver == invocation.rules_ver,
+            body.rules_ver == invocation.rules_ver
+                && body.rules_ver == invocation.spend_voucher.body.rules_ver,
             "provider receipt rules_ver mismatch",
         ),
         (
@@ -21180,6 +22052,17 @@ async fn send_open_and_validate_session_accept(
     open_head: &str,
     att_nonce: &str,
 ) -> Result<ValidatedDirectSessionAccept, GatewaySessionError> {
+    if invocation.spend_voucher.body.schema_version != SESSION_RECEIPT_SCHEMA_VERSION
+        || open_frame
+            .get("voucher")
+            .and_then(|voucher| voucher.get("schema_version"))
+            .and_then(Value::as_u64)
+            != Some(u64::from(SESSION_RECEIPT_SCHEMA_VERSION))
+    {
+        return Err(GatewaySessionError::new(format!(
+            "spend voucher schema_version must be {SESSION_RECEIPT_SCHEMA_VERSION}"
+        )));
+    }
     let result = async {
         let accept = send_open_and_await_session_accept(
             bridge,
@@ -21530,19 +22413,13 @@ async fn finish_live_direct_chat_after_client_disconnect(
                     &partial,
                 )
                 .map_err(|err| GatewaySessionError::new(err.message))?;
-            let _ = send_direct_session_frame_with_peer_reconnect(
+            let _ = send_receipt_ack_and_queue_settlement(
                 &mut session.bridge,
                 &session.transport_peer,
-                &session.invocation.session_id,
-                json!({
-                    "t": "s.receipt_ack",
-                    "v": 1,
-                    "session_id": stored.receipt_ack.session_id,
-                    "seq": stored.receipt_ack.seq,
-                    "user_sig": stored.receipt_ack.user_sig,
-                    "reason": "client_disconnect",
-                }),
-                session.invocation.failover.open_timeout(),
+                &session.invocation,
+                &partial.provider_receipt,
+                &stored.receipt_ack,
+                Some("client_disconnect"),
                 "sending client-disconnect s.receipt_ack",
             )
             .await;
@@ -22263,18 +23140,23 @@ async fn run_live_direct_chat_sse_inner(
         &session.provider,
         &session.model,
     )?;
-    send_direct_session_frame_with_peer_reconnect(
+    let receipt = session
+        .state
+        .meter_chat_session(
+            &session.model,
+            &session.request,
+            &output,
+            &session.invocation,
+            Some(&provider_receipt),
+        )
+        .map_err(|err| GatewaySessionError::new(err.message))?;
+    send_receipt_ack_and_queue_settlement(
         &mut session.bridge,
         &session.transport_peer,
-        &session.invocation.session_id,
-        json!({
-            "t": "s.receipt_ack",
-            "v": 1,
-            "session_id": receipt_ack.session_id,
-            "seq": receipt_ack.seq,
-            "user_sig": receipt_ack.user_sig,
-        }),
-        session.invocation.failover.open_timeout(),
+        &session.invocation,
+        &provider_receipt,
+        &receipt_ack,
+        None,
         "sending s.receipt_ack",
     )
     .await?;
@@ -22294,16 +23176,6 @@ async fn run_live_direct_chat_sse_inner(
         token_ids,
         quality,
     };
-    let receipt = session
-        .state
-        .meter_chat_session(
-            &session.model,
-            &session.request,
-            &output,
-            &session.invocation,
-            Some(&provider_receipt),
-        )
-        .map_err(|err| GatewaySessionError::new(err.message))?;
     record_route_observation(
         &session.state,
         session.route.as_ref(),
@@ -28682,15 +29554,26 @@ impl GatewayState {
         let spend_reservation =
             self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
+        let settlement = self.voucher_settlement_binding(model, route)?;
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let checkpoint_every = self.receipt_checkpoint_every_for_request(request);
         let voucher_body = SpendVoucherBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: session_id.clone(),
             billing_id: billing.billing_id,
             billing_attempt: billing.billing_attempt,
             billing_prior_usage: billing.prior_usage,
             billing_prior_au_owed_cum: billing.prior_au_owed_cum,
+            billing_epoch: settlement.billing_epoch,
+            reservation_id: settlement.reservation_id,
+            reservation_expires_after_epoch: settlement.reservation_expires_after_epoch,
+            reservation_receipt_grace_epochs: settlement.reservation_receipt_grace_epochs,
+            user: settlement.user,
+            provider: settlement.provider,
+            payout_revision: settlement.payout_revision,
+            model_id: model.id.clone(),
+            rules_ver: self.receipt_config.rules_ver,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -28732,10 +29615,7 @@ impl GatewayState {
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
-            receipt_recorder: GatewayReceiptRecorder {
-                receipts: self.receipts.clone(),
-                spend_reservation,
-            },
+            receipt_recorder: self.receipt_recorder(spend_reservation),
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -28798,15 +29678,26 @@ impl GatewayState {
         let spend_reservation =
             self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
+        let settlement = self.voucher_settlement_binding(model, route)?;
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: session_id.clone(),
             billing_id: billing.billing_id,
             billing_attempt: billing.billing_attempt,
             billing_prior_usage: billing.prior_usage,
             billing_prior_au_owed_cum: billing.prior_au_owed_cum,
+            billing_epoch: settlement.billing_epoch,
+            reservation_id: settlement.reservation_id,
+            reservation_expires_after_epoch: settlement.reservation_expires_after_epoch,
+            reservation_receipt_grace_epochs: settlement.reservation_receipt_grace_epochs,
+            user: settlement.user,
+            provider: settlement.provider,
+            payout_revision: settlement.payout_revision,
+            model_id: model.id.clone(),
+            rules_ver: self.receipt_config.rules_ver,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -28848,10 +29739,7 @@ impl GatewayState {
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
-            receipt_recorder: GatewayReceiptRecorder {
-                receipts: self.receipts.clone(),
-                spend_reservation,
-            },
+            receipt_recorder: self.receipt_recorder(spend_reservation),
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -28889,15 +29777,26 @@ impl GatewayState {
         let spend_reservation =
             self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
+        let settlement = self.voucher_settlement_binding(model, route)?;
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: session_id.clone(),
             billing_id: billing.billing_id,
             billing_attempt: billing.billing_attempt,
             billing_prior_usage: billing.prior_usage,
             billing_prior_au_owed_cum: billing.prior_au_owed_cum,
+            billing_epoch: settlement.billing_epoch,
+            reservation_id: settlement.reservation_id,
+            reservation_expires_after_epoch: settlement.reservation_expires_after_epoch,
+            reservation_receipt_grace_epochs: settlement.reservation_receipt_grace_epochs,
+            user: settlement.user,
+            provider: settlement.provider,
+            payout_revision: settlement.payout_revision,
+            model_id: model.id.clone(),
+            rules_ver: self.receipt_config.rules_ver,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -28939,10 +29838,7 @@ impl GatewayState {
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
-            receipt_recorder: GatewayReceiptRecorder {
-                receipts: self.receipts.clone(),
-                spend_reservation,
-            },
+            receipt_recorder: self.receipt_recorder(spend_reservation),
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -28980,15 +29876,26 @@ impl GatewayState {
         let spend_reservation =
             self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
+        let settlement = self.voucher_settlement_binding(model, route)?;
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: session_id.clone(),
             billing_id: billing.billing_id,
             billing_attempt: billing.billing_attempt,
             billing_prior_usage: billing.prior_usage,
             billing_prior_au_owed_cum: billing.prior_au_owed_cum,
+            billing_epoch: settlement.billing_epoch,
+            reservation_id: settlement.reservation_id,
+            reservation_expires_after_epoch: settlement.reservation_expires_after_epoch,
+            reservation_receipt_grace_epochs: settlement.reservation_receipt_grace_epochs,
+            user: settlement.user,
+            provider: settlement.provider,
+            payout_revision: settlement.payout_revision,
+            model_id: model.id.clone(),
+            rules_ver: self.receipt_config.rules_ver,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -29030,10 +29937,7 @@ impl GatewayState {
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
-            receipt_recorder: GatewayReceiptRecorder {
-                receipts: self.receipts.clone(),
-                spend_reservation,
-            },
+            receipt_recorder: self.receipt_recorder(spend_reservation),
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -29071,15 +29975,26 @@ impl GatewayState {
         let spend_reservation =
             self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
+        let settlement = self.voucher_settlement_binding(model, route)?;
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: session_id.clone(),
             billing_id: billing.billing_id,
             billing_attempt: billing.billing_attempt,
             billing_prior_usage: billing.prior_usage,
             billing_prior_au_owed_cum: billing.prior_au_owed_cum,
+            billing_epoch: settlement.billing_epoch,
+            reservation_id: settlement.reservation_id,
+            reservation_expires_after_epoch: settlement.reservation_expires_after_epoch,
+            reservation_receipt_grace_epochs: settlement.reservation_receipt_grace_epochs,
+            user: settlement.user,
+            provider: settlement.provider,
+            payout_revision: settlement.payout_revision,
+            model_id: model.id.clone(),
+            rules_ver: self.receipt_config.rules_ver,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -29121,10 +30036,7 @@ impl GatewayState {
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
-            receipt_recorder: GatewayReceiptRecorder {
-                receipts: self.receipts.clone(),
-                spend_reservation,
-            },
+            receipt_recorder: self.receipt_recorder(spend_reservation),
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -29166,15 +30078,26 @@ impl GatewayState {
         let spend_reservation =
             self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
+        let settlement = self.voucher_settlement_binding(model, route)?;
         let served_ctx = self.served_ctx_for_route(model, route);
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: session_id.clone(),
             billing_id: billing.billing_id,
             billing_attempt: billing.billing_attempt,
             billing_prior_usage: billing.prior_usage,
             billing_prior_au_owed_cum: billing.prior_au_owed_cum,
+            billing_epoch: settlement.billing_epoch,
+            reservation_id: settlement.reservation_id,
+            reservation_expires_after_epoch: settlement.reservation_expires_after_epoch,
+            reservation_receipt_grace_epochs: settlement.reservation_receipt_grace_epochs,
+            user: settlement.user,
+            provider: settlement.provider,
+            payout_revision: settlement.payout_revision,
+            model_id: model.id.clone(),
+            rules_ver: self.receipt_config.rules_ver,
             rail: self.receipt_config.rail.clone(),
             enclave_id: enclave_id.clone(),
             price_ver,
@@ -29216,10 +30139,7 @@ impl GatewayState {
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
-            receipt_recorder: GatewayReceiptRecorder {
-                receipts: self.receipts.clone(),
-                spend_reservation,
-            },
+            receipt_recorder: self.receipt_recorder(spend_reservation),
             receipt_cosign_enabled: self.receipt_config.cosign_enabled,
             receipt_user_seed: self.receipt_config.user_seed,
         })
@@ -29348,6 +30268,17 @@ impl GatewayState {
                 billing_attempt: invocation.spend_voucher.body.billing_attempt,
                 billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
                 billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
+                billing_epoch: invocation.spend_voucher.body.billing_epoch,
+                reservation_id: invocation.spend_voucher.body.reservation_id.clone(),
+                reservation_expires_after_epoch: invocation
+                    .spend_voucher
+                    .body
+                    .reservation_expires_after_epoch,
+                reservation_receipt_grace_epochs: invocation
+                    .spend_voucher
+                    .body
+                    .reservation_receipt_grace_epochs,
+                payout_revision: invocation.spend_voucher.body.payout_revision.clone(),
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -29450,6 +30381,17 @@ impl GatewayState {
                 billing_attempt: invocation.spend_voucher.body.billing_attempt,
                 billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
                 billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
+                billing_epoch: invocation.spend_voucher.body.billing_epoch,
+                reservation_id: invocation.spend_voucher.body.reservation_id.clone(),
+                reservation_expires_after_epoch: invocation
+                    .spend_voucher
+                    .body
+                    .reservation_expires_after_epoch,
+                reservation_receipt_grace_epochs: invocation
+                    .spend_voucher
+                    .body
+                    .reservation_receipt_grace_epochs,
+                payout_revision: invocation.spend_voucher.body.payout_revision.clone(),
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -29552,6 +30494,17 @@ impl GatewayState {
                 billing_attempt: invocation.spend_voucher.body.billing_attempt,
                 billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
                 billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
+                billing_epoch: invocation.spend_voucher.body.billing_epoch,
+                reservation_id: invocation.spend_voucher.body.reservation_id.clone(),
+                reservation_expires_after_epoch: invocation
+                    .spend_voucher
+                    .body
+                    .reservation_expires_after_epoch,
+                reservation_receipt_grace_epochs: invocation
+                    .spend_voucher
+                    .body
+                    .reservation_receipt_grace_epochs,
+                payout_revision: invocation.spend_voucher.body.payout_revision.clone(),
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -29653,6 +30606,17 @@ impl GatewayState {
                 billing_attempt: invocation.spend_voucher.body.billing_attempt,
                 billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
                 billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
+                billing_epoch: invocation.spend_voucher.body.billing_epoch,
+                reservation_id: invocation.spend_voucher.body.reservation_id.clone(),
+                reservation_expires_after_epoch: invocation
+                    .spend_voucher
+                    .body
+                    .reservation_expires_after_epoch,
+                reservation_receipt_grace_epochs: invocation
+                    .spend_voucher
+                    .body
+                    .reservation_receipt_grace_epochs,
+                payout_revision: invocation.spend_voucher.body.payout_revision.clone(),
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -29822,6 +30786,17 @@ impl GatewayState {
                 billing_attempt: invocation.spend_voucher.body.billing_attempt,
                 billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
                 billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
+                billing_epoch: invocation.spend_voucher.body.billing_epoch,
+                reservation_id: invocation.spend_voucher.body.reservation_id.clone(),
+                reservation_expires_after_epoch: invocation
+                    .spend_voucher
+                    .body
+                    .reservation_expires_after_epoch,
+                reservation_receipt_grace_epochs: invocation
+                    .spend_voucher
+                    .body
+                    .reservation_receipt_grace_epochs,
+                payout_revision: invocation.spend_voucher.body.payout_revision.clone(),
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -29924,6 +30899,17 @@ impl GatewayState {
                 billing_attempt: invocation.spend_voucher.body.billing_attempt,
                 billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
                 billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
+                billing_epoch: invocation.spend_voucher.body.billing_epoch,
+                reservation_id: invocation.spend_voucher.body.reservation_id.clone(),
+                reservation_expires_after_epoch: invocation
+                    .spend_voucher
+                    .body
+                    .reservation_expires_after_epoch,
+                reservation_receipt_grace_epochs: invocation
+                    .spend_voucher
+                    .body
+                    .reservation_receipt_grace_epochs,
+                payout_revision: invocation.spend_voucher.body.payout_revision.clone(),
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -32939,6 +33925,90 @@ mod tests {
         AttestationSigner, CTX_BRACKET_TABLE_VERSION,
     };
 
+    #[derive(Debug)]
+    struct FullReceiptSettlementPublisher;
+
+    impl GatewayReceiptSettlementPublisher for FullReceiptSettlementPublisher {
+        fn admission_available(&self) -> Result<bool, String> {
+            Ok(false)
+        }
+
+        fn queue(&self, _feature: &Value) -> Result<(), String> {
+            panic!("a full gateway outbox must reject before any settlement feature is queued")
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingReceiptSettlementPublisher {
+        features: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl GatewayReceiptSettlementPublisher for RecordingReceiptSettlementPublisher {
+        fn admission_available(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn queue(&self, feature: &Value) -> Result<(), String> {
+            let mut features = self.features.lock_recover("test settlement features");
+            if !features.iter().any(|existing| existing == feature) {
+                features.push(feature.clone());
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct RecordingReceiptAckRecoveryTransport {
+        expected_ack: ReceiptAck,
+        feature: Value,
+        deliveries: Arc<Mutex<Vec<GatewayJobSettledReceipt>>>,
+    }
+
+    impl GatewayReceiptAckRecoveryTransport for RecordingReceiptAckRecoveryTransport {
+        fn deliver<'a>(
+            &'a self,
+            recovery: &'a GatewayJobSettledReceipt,
+        ) -> GatewayReceiptAckRecoveryFuture<'a> {
+            Box::pin(async move {
+                assert_eq!(recovery.receipt_ack, self.expected_ack);
+                assert!(recovery.reconciliation.settlement_feature.is_none());
+                self.deliveries
+                    .lock_recover("test receipt ACK deliveries")
+                    .push(recovery.clone());
+                Ok(self.feature.clone())
+            })
+        }
+    }
+
+    fn test_receipt_settlement_feature(
+        provider_receipt: &ProviderSignedReceipt,
+        receipt_ack: &ReceiptAck,
+    ) -> Value {
+        let receipt = SessionReceipt {
+            body: provider_receipt.body.clone(),
+            enclave_sig: provider_receipt.enclave_sig.clone(),
+            enclave_pubkey: provider_receipt.enclave_pubkey.clone(),
+            user_sig: receipt_ack.user_sig.clone(),
+        };
+        let key = record_usage_receipt_feature_key(&receipt);
+        let mut value = json!({
+            "op": "record_usage_receipt",
+            "contract_version": CONTRACT_VERSION,
+            "epoch": receipt.body.billing_epoch,
+            "payout_revision": receipt.body.payout_revision,
+            "receipt": receipt,
+        });
+        value["provider_sig"] = json!(sign_hex(
+            &test_provider_seed(),
+            &record_usage_receipt_signing_bytes(&key, &value).unwrap(),
+        ));
+        json!({
+            "feature": "mayhem",
+            "key": key,
+            "value": value,
+        })
+    }
+
     #[test]
     fn reasoning_evidence_is_mandatory_and_independently_metered() {
         let missing = session_delta_reasoning_evidence(&json!({ "d": "" }))
@@ -34845,6 +35915,8 @@ mod tests {
                     &invocation.access_token,
                 )
                 .expect("test spend reservation"),
+            history: None,
+            settlement_publisher: Arc::new(None),
         };
 
         let stored = state
@@ -35030,6 +36102,23 @@ mod tests {
             )
             .expect("explicit redispatch release makes the full bearer budget available");
         drop(full_budget);
+    }
+
+    #[test]
+    fn full_gateway_receipt_outbox_rejects_before_spend_reservation() {
+        let state = GatewayState::from_models(vec![test_model()])
+            .with_receipt_balance_au(100)
+            .with_receipt_settlement_publisher(Arc::new(FullReceiptSettlementPublisher));
+        let error = state
+            .reserve_session_spend("outbox-full", 70, &None)
+            .expect_err("full settlement outbox must stop paid dispatch");
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.message.contains("outbox is near capacity"));
+        let wallet = state
+            .wallet_spend
+            .lock_recover("gateway wallet spend state");
+        assert_eq!(wallet.balance_au, 100);
+        assert!(wallet.reservations.is_empty());
     }
 
     #[test]
@@ -35995,6 +37084,17 @@ mod tests {
                 billing_attempt: invocation.spend_voucher.body.billing_attempt,
                 billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
                 billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
+                billing_epoch: invocation.spend_voucher.body.billing_epoch,
+                reservation_id: invocation.spend_voucher.body.reservation_id.clone(),
+                reservation_expires_after_epoch: invocation
+                    .spend_voucher
+                    .body
+                    .reservation_expires_after_epoch,
+                reservation_receipt_grace_epochs: invocation
+                    .spend_voucher
+                    .body
+                    .reservation_receipt_grace_epochs,
+                payout_revision: invocation.spend_voucher.body.payout_revision.clone(),
                 seq: 1,
                 final_receipt: true,
                 rail: invocation.rail.clone(),
@@ -36307,6 +37407,8 @@ mod tests {
         GatewayReceiptRecorder {
             receipts,
             spend_reservation: test_spend_reservation(id.to_owned(), max_spend_au),
+            history: None,
+            settlement_publisher: Arc::new(None),
         }
     }
 
@@ -36328,11 +37430,21 @@ mod tests {
             caps: json!({}),
         };
         let voucher_body = SpendVoucherBody {
+            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
             session_id: session_id.clone(),
             billing_id: session_id.clone(),
             billing_attempt: 0,
             billing_prior_usage: ReceiptUsage::default(),
             billing_prior_au_owed_cum: 0,
+            billing_epoch: 7,
+            reservation_id: "12".repeat(32),
+            reservation_expires_after_epoch: 31,
+            reservation_receipt_grace_epochs: 6,
+            user: verifying_key_hex(&test_user_seed()),
+            provider: verifying_key_hex(&test_provider_seed()),
+            payout_revision: "payout-test".to_owned(),
+            model_id: contract.model_id.clone(),
+            rules_ver: 3,
             rail: "fiat".to_owned(),
             enclave_id: enclave_id.clone(),
             price_ver: 7,
@@ -36382,6 +37494,8 @@ mod tests {
             receipt_recorder: GatewayReceiptRecorder {
                 receipts: Arc::new(Mutex::new(Vec::new())),
                 spend_reservation: test_spend_reservation("aa".repeat(32), 1_000),
+                history: None,
+                settlement_publisher: Arc::new(None),
             },
             receipt_cosign_enabled: true,
             receipt_user_seed: test_user_seed(),
@@ -37233,6 +38347,11 @@ mod tests {
         GatewayRouteCandidate {
             provider: format!("{:02x}", idx.wrapping_add(1)).repeat(32),
             accepted_rails: vec!["fiat".to_owned(), "tap".to_owned(), "tnk".to_owned()],
+            payout_revisions: BTreeMap::from([
+                ("fiat".to_owned(), "11".repeat(32)),
+                ("tap".to_owned(), "22".repeat(32)),
+                ("tnk".to_owned(), "33".repeat(32)),
+            ]),
             served_modalities: vec!["text".to_owned()],
             served_specialities: BTreeMap::new(),
             enclave_id: format!("{:02x}", idx.wrapping_add(80)).repeat(32),
@@ -40727,6 +41846,7 @@ mod tests {
             _ => panic!("fresh request must start a job"),
         };
         let mut invocation = test_invocation();
+        invocation.transport_peer = Some("ab".repeat(32));
         invocation.job = Some(job.clone());
         let model = test_model();
         let request = test_chat_request(&model.id);
@@ -40870,6 +41990,90 @@ mod tests {
                 .balance_au,
             balance_after_first_record
         );
+    }
+
+    #[tokio::test]
+    async fn restart_replays_exact_receipt_ack_and_finishes_without_duplicate_queue_or_spend() {
+        let root = tempfile::tempdir().unwrap();
+        let jobs_dir = root.path().join("jobs");
+        let seed = test_user_seed();
+        let state = GatewayState::fixture()
+            .with_receipt_user_seed(seed)
+            .with_job_store_dir(jobs_dir.clone())
+            .unwrap();
+        let model = test_model();
+        let job = match prepare_gateway_job(
+            &state,
+            &HeaderMap::new(),
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            &model.id,
+            &json!({"model": model.id, "prompt": "restart recovery"}),
+            &None,
+        )
+        .await
+        .unwrap()
+        {
+            PreparedGatewayJob::Started(job) => job,
+            _ => panic!("fresh request must start a job"),
+        };
+        let job_id = job.id.clone();
+        let mut invocation = test_invocation();
+        invocation.transport_peer = Some("ab".repeat(32));
+        invocation.job = Some(job);
+        let request = test_chat_request(&model.id);
+        let output = test_chat_output();
+        let provider_receipt = test_provider_receipt(&model, &request, &output, &invocation);
+        let receipt_ack =
+            receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).unwrap();
+        stage_completed_invocation_job(
+            &invocation,
+            chat_job_result(&output),
+            &output.artifacts,
+            &provider_receipt,
+            &receipt_ack,
+        )
+        .await
+        .unwrap();
+        drop(invocation);
+        drop(state);
+
+        let publisher = Arc::new(RecordingReceiptSettlementPublisher::default());
+        let restarted = GatewayState::fixture()
+            .with_receipt_user_seed(seed)
+            .with_job_store_dir(jobs_dir)
+            .unwrap()
+            .with_receipt_settlement_publisher(publisher.clone());
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let transport = RecordingReceiptAckRecoveryTransport {
+            expected_ack: receipt_ack.clone(),
+            feature: test_receipt_settlement_feature(&provider_receipt, &receipt_ack),
+            deliveries: deliveries.clone(),
+        };
+        let balance_before = restarted.ledger_balance_au();
+
+        reconcile_pending_gateway_job_once(&restarted, &job_id, &transport)
+            .await
+            .unwrap();
+        reconcile_pending_gateway_job_once(&restarted, &job_id, &transport)
+            .await
+            .unwrap();
+
+        let completed = restarted
+            .jobs
+            .lock_recover("gateway job vault")
+            .get(&job_id, now_secs())
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, GatewayJobStatus::Completed);
+        assert_eq!(deliveries.lock_recover("test ACK deliveries").len(), 1);
+        assert_eq!(
+            publisher
+                .features
+                .lock_recover("test settlement features")
+                .len(),
+            1
+        );
+        assert_eq!(restarted.ledger_balance_au(), balance_before);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -43615,6 +44819,17 @@ mod tests {
             billing_attempt: invocation.spend_voucher.body.billing_attempt,
             billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
             billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
+            billing_epoch: invocation.spend_voucher.body.billing_epoch,
+            reservation_id: invocation.spend_voucher.body.reservation_id.clone(),
+            reservation_expires_after_epoch: invocation
+                .spend_voucher
+                .body
+                .reservation_expires_after_epoch,
+            reservation_receipt_grace_epochs: invocation
+                .spend_voucher
+                .body
+                .reservation_receipt_grace_epochs,
+            payout_revision: invocation.spend_voucher.body.payout_revision.clone(),
             seq: 1,
             final_receipt: true,
             rail: invocation.rail.clone(),
@@ -43656,6 +44871,17 @@ mod tests {
             billing_attempt: invocation.spend_voucher.body.billing_attempt,
             billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
             billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
+            billing_epoch: invocation.spend_voucher.body.billing_epoch,
+            reservation_id: invocation.spend_voucher.body.reservation_id.clone(),
+            reservation_expires_after_epoch: invocation
+                .spend_voucher
+                .body
+                .reservation_expires_after_epoch,
+            reservation_receipt_grace_epochs: invocation
+                .spend_voucher
+                .body
+                .reservation_receipt_grace_epochs,
+            payout_revision: invocation.spend_voucher.body.payout_revision.clone(),
             seq: 1,
             final_receipt: true,
             rail: invocation.rail.clone(),
@@ -43713,6 +44939,17 @@ mod tests {
             billing_attempt: invocation.spend_voucher.body.billing_attempt,
             billing_prior_usage: invocation.spend_voucher.body.billing_prior_usage.clone(),
             billing_prior_au_owed_cum: invocation.spend_voucher.body.billing_prior_au_owed_cum,
+            billing_epoch: invocation.spend_voucher.body.billing_epoch,
+            reservation_id: invocation.spend_voucher.body.reservation_id.clone(),
+            reservation_expires_after_epoch: invocation
+                .spend_voucher
+                .body
+                .reservation_expires_after_epoch,
+            reservation_receipt_grace_epochs: invocation
+                .spend_voucher
+                .body
+                .reservation_receipt_grace_epochs,
+            payout_revision: invocation.spend_voucher.body.payout_revision.clone(),
             seq,
             final_receipt,
             rail: invocation.rail.clone(),

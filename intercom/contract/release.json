@@ -1,20 +1,20 @@
 {
   "schema": 1,
-  "release_version": "0.2.45",
-  "contract_version": 16,
-  "contract_code_sha256": "a5a18456e1e037fee42165faf2e9d996e66e206d31d756c112dc940c2b284b77",
+  "release_version": "0.2.64",
+  "contract_version": 17,
+  "contract_code_sha256": "60d08747e24bf1368045c43eb0dc50c9a9f1dc53932a3c2c1f304025eb29e66d",
   "files": [
     {
       "path": "contract/contract.js",
-      "sha256": "21edde807b61d3a799fcf4ff701d840b1d059fd544c39d63f556035a8365c471"
+      "sha256": "327056b31c530658bdf34488c32959c9dff0127c093b769d771d700d41733685"
     },
     {
       "path": "contract/protocol.js",
-      "sha256": "1d2415ed2c3f1fdfbc7661b6aa4d4ead42c2863179fc4c75a460002f9ae05aa6"
+      "sha256": "8d1c794f87b6c8c3da2e31535722bc5e2143098e6bda906d9627ef42d0cfa25f"
     },
     {
       "path": "features/mayhem/index.js",
-      "sha256": "e2d0f36ed8ef235fca1a70e2129838fbc1422620089cfe179b13042f71168da2"
+      "sha256": "e8f5a9dff7e21ac452ad105df4af05fd71df04ae8dcb3bb76f75769d7c641cfb"
     }
   ]
 }

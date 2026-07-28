@@ -5,7 +5,7 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 16;
+export const CONTRACT_VERSION = 17;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -61,13 +61,17 @@ const DEFAULT_MAX_OPEN_DISPUTES_PER_OPENER = 8;
 const DEFAULT_DISPUTE_OPENER_FAULT_FORFEIT_BPS = 2_500;
 const DEFAULT_MAX_APPLY_BATCH = 2_000;
 const DEFAULT_MAX_MARKET_USAGE_ENTRIES = 5_000;
+const DEFAULT_MAX_TAP_SETTLEMENT_OUTPUTS = 5_000;
 const DEFAULT_MAX_TNK_SETTLEMENT_OUTPUTS = 5_000;
 const DEFAULT_MAX_FIAT_SETTLEMENT_OUTPUTS = 5_000;
 const MIN_TAP_CONFIRMATION_DEPTH = 12;
+const TAP_OPERATOR_BPS = 1_500;
 const TAP_BURN_BPS = 1_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
-export const SESSION_RECEIPT_SCHEMA_VERSION = 9;
+export const SESSION_RECEIPT_SCHEMA_VERSION = 10;
+export const SPEND_VOUCHER_SCHEMA_VERSION = 10;
+const RECEIPT_EPOCH_INDEX_PAGE_SIZE = 128;
 const CTX_BRACKET_TABLE_VERSION = 1;
 const CTX_BRACKETS = Object.freeze([
   { id: 'le8k', max_ctx: 8_192 },
@@ -126,11 +130,14 @@ const PARAM_DEFINITIONS = Object.freeze({
   market_below_target_discount_bps: { default: DEFAULT_MARKET_PRICE_BELOW_TARGET_DISCOUNT_BPS, min: 0, max: 10_000 },
   market_above_target_slope_bps: { default: DEFAULT_MARKET_PRICE_ABOVE_TARGET_SLOPE_BPS, min: 0, max: 1_000_000 },
   epoch_seconds: { default: 3_600, min: 60, max: 86_400 },
+  reservation_max_lifetime_epochs: { default: 24, min: 1, max: 1_000_000 },
+  reservation_receipt_grace_epochs: { default: 6, min: 0, max: 1_000_000 },
   rate_staleness_seconds: { default: 45 * 60, min: 60, max: 86_400 },
   rules_grace_seconds: { default: 14 * 24 * 60 * 60, min: 0, max: 365 * 24 * 60 * 60 },
   challenge_epochs: { default: 6, min: 0, max: 1_000_000 },
   max_apply_batch: { default: DEFAULT_MAX_APPLY_BATCH, min: 1, max: Number.MAX_SAFE_INTEGER },
   max_market_usage_entries: { default: DEFAULT_MAX_MARKET_USAGE_ENTRIES, min: 0, max: Number.MAX_SAFE_INTEGER },
+  max_tap_settlement_outputs: { default: DEFAULT_MAX_TAP_SETTLEMENT_OUTPUTS, min: 1, max: Number.MAX_SAFE_INTEGER },
   max_tnk_settlement_outputs: { default: DEFAULT_MAX_TNK_SETTLEMENT_OUTPUTS, min: 1, max: Number.MAX_SAFE_INTEGER },
   max_fiat_settlement_outputs: { default: DEFAULT_MAX_FIAT_SETTLEMENT_OUTPUTS, min: 1, max: Number.MAX_SAFE_INTEGER },
   param_activation_delay_seconds: { default: DEFAULT_PARAM_ACTIVATION_DELAY_SECONDS, min: 0, max: 30 * DAY_SECONDS },
@@ -172,11 +179,14 @@ const EPOCH_ADMIN_PARAM_KEYS = Object.freeze([
   'market_below_target_discount_bps',
   'market_above_target_slope_bps',
   'epoch_seconds',
+  'reservation_max_lifetime_epochs',
+  'reservation_receipt_grace_epochs',
   'rate_staleness_seconds',
   'rules_grace_seconds',
   'challenge_epochs',
   'max_apply_batch',
   'max_market_usage_entries',
+  'max_tap_settlement_outputs',
   'max_tnk_settlement_outputs',
   'max_fiat_settlement_outputs',
   'param_activation_delay_seconds',
@@ -430,13 +440,22 @@ export const tapAccountBindingMessage = (value) =>
 const canonicalSpendVoucherBody = (body) => {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
   const canonical = {
+    schema_version: body.schema_version,
     session_id: body.session_id,
     billing_id: body.billing_id,
     billing_attempt: body.billing_attempt,
     billing_prior_usage: body.billing_prior_usage,
     billing_prior_au_owed_cum: body.billing_prior_au_owed_cum,
+    billing_epoch: body.billing_epoch,
+    reservation_id: body.reservation_id,
+    reservation_expires_after_epoch: body.reservation_expires_after_epoch,
+    reservation_receipt_grace_epochs: body.reservation_receipt_grace_epochs,
+    user: body.user,
+    provider: body.provider,
+    payout_revision: body.payout_revision,
     rail: body.rail,
     enclave_id: body.enclave_id,
+    model_id: body.model_id,
     price_ver: body.price_ver,
     locked_rate_map: body.locked_rate_map,
     locked_per_req_au: body.locked_per_req_au,
@@ -452,6 +471,7 @@ const canonicalSpendVoucherBody = (body) => {
   }
   if (hasOwn(body, 'ctx_bracket')) canonical.ctx_bracket = body.ctx_bracket;
   if (hasOwn(body, 'ctx_bracket_table_ver')) canonical.ctx_bracket_table_ver = body.ctx_bracket_table_ver;
+  canonical.rules_ver = body.rules_ver;
   canonical.max_spend_au = body.max_spend_au;
   canonical.checkpoint_every = body.checkpoint_every;
   return canonical;
@@ -465,6 +485,11 @@ const canonicalReceiptBody = (body) => {
     billing_attempt: body.billing_attempt,
     billing_prior_usage: body.billing_prior_usage,
     billing_prior_au_owed_cum: body.billing_prior_au_owed_cum,
+    billing_epoch: body.billing_epoch,
+    reservation_id: body.reservation_id,
+    reservation_expires_after_epoch: body.reservation_expires_after_epoch,
+    reservation_receipt_grace_epochs: body.reservation_receipt_grace_epochs,
+    payout_revision: body.payout_revision,
     seq: body.seq,
     final: body.final,
     rail: body.rail,
@@ -520,12 +545,17 @@ export const spendReservationEvidence = (value) => {
   const evidence = {
     contract_version: value.contract_version,
     session_id: value.session_id,
+    reservation_id: value.reservation_id,
+    reservation_expires_after_epoch: value.reservation_expires_after_epoch,
+    reservation_receipt_grace_epochs: value.reservation_receipt_grace_epochs,
     epoch: value.epoch,
     at: value.at,
     rail: value.rail,
     user: value.user,
     provider: value.provider,
     enclave_id: value.enclave_id,
+    enclave_pubkey: value.enclave_pubkey,
+    model_id: value.model_id,
     price_ver: value.price_ver,
     rules_ver: value.rules_ver,
     served_ctx: value.served_ctx,
@@ -551,6 +581,64 @@ export const targetedSpendReservationMessage = (value) =>
   `mayhem-targeted-spend-reservation-v1${stableJson(
     targetedSpendReservationEvidence(value)
   )}`;
+export const recordUsageReceiptEvidence = (value) => ({
+  contract_version: value.contract_version,
+  epoch: value.epoch,
+  payout_revision: value.payout_revision,
+  receipt: stableValue(value.receipt),
+});
+export const recordUsageReceiptMessage = (value) =>
+  `mayhem-record-usage-receipt-v1${stableJson(recordUsageReceiptEvidence(value))}`;
+export const closeUsageReservationEvidence = (value) => ({
+  op: value.op,
+  contract_version: value.contract_version,
+  billing_epoch: value.billing_epoch,
+  reservation_id: value.reservation_id,
+  reservation_expires_after_epoch: value.reservation_expires_after_epoch,
+  reservation_receipt_grace_epochs: value.reservation_receipt_grace_epochs,
+  billing_id: value.billing_id,
+  billing_attempt: value.billing_attempt,
+  session_id: value.session_id,
+  user: value.user,
+  rail: value.rail,
+  provider: value.provider,
+  payout_revision: value.payout_revision,
+  latest_receipt_seq: value.latest_receipt_seq,
+  latest_receipt_hash: value.latest_receipt_hash,
+  at: value.at,
+  reason: value.reason,
+  actor: value.actor,
+  actor_role: value.actor_role,
+});
+export const closeUsageReservationMessage = (value) =>
+  `mayhem-close-usage-reservation-v1${stableJson(closeUsageReservationEvidence(value))}`;
+export const expireUsageReservationMessage = (value) =>
+  `mayhem-expire-usage-reservation-v1${stableJson(closeUsageReservationEvidence(value))}`;
+export const payoutPreparationEvidence = (value) => ({
+  op: value.op,
+  contract_version: value.contract_version,
+  economic_op_id: value.economic_op_id,
+  rail: value.rail,
+  epoch: value.epoch,
+  epoch_apply_hash: value.epoch_apply_hash,
+  prepared_at: value.prepared_at,
+  kind: value.kind,
+  output_index: value.output_index,
+  payload_hash: value.payload_hash,
+  payload: stableValue(value.payload),
+  liability: stableValue(value.liability),
+  external_effect_ids: value.external_effect_ids,
+  admin: value.admin,
+});
+export const payoutPreparationMessage = (value) =>
+  `mayhem-targeted-payout-preparation-v1${stableJson(payoutPreparationEvidence(value))}`;
+export const targetedPayoutControlEvidence = (value) => {
+  const evidence = { ...value };
+  delete evidence.admin_sig;
+  return stableValue(evidence);
+};
+export const targetedPayoutControlMessage = (value) =>
+  `mayhem-targeted-payout-control-v1${stableJson(targetedPayoutControlEvidence(value))}`;
 export const probeResultEvidence = (value, auditor) => ({
   auditor,
   probe_id: value.probe_id,
@@ -1394,6 +1482,23 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
+    if (value.op === 'record_usage_receipt') {
+      const result = await this.applyRecordUsageReceiptFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'close_usage_reservation') {
+      const result = await this.applyCloseUsageReservationFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'expire_usage_reservation') {
+      const result = await this.applyCloseUsageReservationFeature(key, value, {
+        expiry: true,
+      });
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
     if (value.op === 'tap_account_bind') {
       const result = await this.applyTapAccountBindingFeature(key, value);
       this._mayhemLastFeatureResult = result;
@@ -1444,13 +1549,43 @@ class MayhemContract extends Contract {
       this._mayhemLastFeatureResult = result;
       return result;
     }
-    if (value.op === 'settle_targeted_tnk') {
-      const result = await this.applyTargetedTnkSettlementFeature(key, value);
+    if (value.op === 'prepare_targeted_payout') {
+      const result = await this.applyTargetedPayoutPreparationFeature(key, value);
       this._mayhemLastFeatureResult = result;
       return result;
     }
-    if (value.op === 'settle_targeted_fiat') {
-      const result = await this.applyTargetedFiatSettlementFeature(key, value);
+    if (value.op === 'prepare_targeted_payout_epoch') {
+      const result = await this.applyTargetedPayoutEpochFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'prepare_targeted_fiat_attempt') {
+      const result = await this.applyTargetedFiatAttemptFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'finalize_targeted_fiat_attempt') {
+      const result = await this.applyFinalizeTargetedFiatAttemptFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'settle_targeted_tap') {
+      const result = await this.applyTargetedTapSettlementFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'settle_targeted_tnk_output') {
+      const result = await this.applyTargetedTnkOutputFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'settle_targeted_fiat_output') {
+      const result = await this.applyTargetedFiatOutputFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'close_targeted_payout_epoch') {
+      const result = await this.applyCloseTargetedPayoutEpochFeature(key, value);
       this._mayhemLastFeatureResult = result;
       return result;
     }
@@ -2457,7 +2592,7 @@ class MayhemContract extends Contract {
     }
 
     const applyState = await this.epochApplyStateRecord();
-    const activeEpoch = applyState.updated_epoch + 1;
+    const activeEpoch = (applyState.pending_epoch ?? applyState.updated_epoch) + 1;
     if (normalized.epoch !== activeEpoch) {
       return new Error('Spend reservation epoch is not the active billing epoch.');
     }
@@ -2648,7 +2783,7 @@ class MayhemContract extends Contract {
     }
 
     const applyState = await this.epochApplyStateRecord();
-    const activeEpoch = applyState.updated_epoch + 1;
+    const activeEpoch = (applyState.pending_epoch ?? applyState.updated_epoch) + 1;
     if (normalized.epoch !== activeEpoch) {
       return new Error('Spend reservation epoch is not the active billing epoch.');
     }
@@ -2662,6 +2797,9 @@ class MayhemContract extends Contract {
     if (!enclave || enclave.status !== 'active') return new Error('Admin enclave is not active.');
     const enclaveError = this.requireAdminCreatedEnclave(enclave);
     if (enclaveError) return enclaveError;
+    if (enclave.model_id !== normalized.model_id) {
+      return new Error('Spend reservation model does not match admin enclave.');
+    }
     const serve = await this.get(`serve/${normalized.provider}/${normalized.enclave_id}`);
     if (!serve || serve.status !== 'active') {
       return new Error('Provider is not actively serving this admin enclave.');
@@ -2705,20 +2843,36 @@ class MayhemContract extends Contract {
     const balanceError = this.guardianValidateBalanceRecord(balance, normalized.user, normalized.rail);
     if (balanceError) return balanceError;
 
-    const holdKey = this.spendHoldKey(normalized.user, normalized.rail, normalized.epoch);
-    const hold = await this.normalizeSpendHoldRecord(
+    const holdKey = this.targetedSpendHoldKey(normalized.user, normalized.rail);
+    const hold = await this.normalizeTargetedSpendHoldRecord(
       (await this.get(holdKey)) ?? null,
       normalized.user,
-      normalized.rail,
-      normalized.epoch
+      normalized.rail
     );
     if (hold instanceof Error) return hold;
     const existing = hold.sessions.find((session) => session.session_id === normalized.session_id);
     if (existing) {
       if (
+        existing.billing_id !== normalized.voucher_body.billing_id ||
+        existing.billing_attempt !== normalized.voucher_body.billing_attempt ||
+        existing.billing_epoch !== normalized.epoch ||
+        existing.reservation_id !== normalized.voucher_body.reservation_id ||
+        existing.reservation_expires_after_epoch !== normalized.reservation_expires_after_epoch ||
+        existing.reservation_receipt_grace_epochs !== normalized.reservation_receipt_grace_epochs ||
+        existing.user !== normalized.user ||
+        existing.rail !== normalized.rail ||
         existing.provider !== normalized.provider ||
+        existing.payout_revision !== value.payout_revision ||
         existing.enclave_id !== normalized.enclave_id ||
+        existing.enclave_pubkey !== normalized.enclave_pubkey ||
+        existing.model_id !== normalized.model_id ||
         existing.price_ver !== normalized.price_ver ||
+        stableJson(existing.billing_prior_usage) !==
+          stableJson(normalized.voucher_body.billing_prior_usage) ||
+        this.compareAu(
+          existing.billing_prior_au_owed_cum,
+          normalized.voucher_body.billing_prior_au_owed_cum
+        ) !== 0 ||
         stableJson(existing.locked_rate_map) !== stableJson(normalized.locked_rate_map) ||
         this.compareAu(existing.locked_per_req_au, normalized.locked_per_req_au) !== 0 ||
         this.compareAu(existing.locked_min_session_au, normalized.locked_min_session_au) !== 0 ||
@@ -2727,12 +2881,15 @@ class MayhemContract extends Contract {
         stableJson(existing.required_specialities) !== stableJson(normalized.required_specialities) ||
         existing.ctx_bracket !== normalized.ctx_bracket ||
         existing.ctx_bracket_table_ver !== normalized.ctx_bracket_table_ver ||
+        existing.rules_ver !== normalized.rules_ver ||
         this.compareAu(existing.max_spend_au, normalized.max_spend_au) !== 0 ||
         existing.voucher_hash !== normalized.voucher_hash ||
         existing.payout_revision !== value.payout_revision
       ) {
         return new Error('Targeted spend reservation session already exists with different terms.');
       }
+      const billingError = await this.validateExistingBillingReservation(normalized);
+      if (billingError) return billingError;
       const availableAu = this.compareAu(hold.reserved_au, balance.au) >= 0
         ? ZERO_AU
         : this.safeSubAu(balance.au, hold.reserved_au);
@@ -2752,6 +2909,8 @@ class MayhemContract extends Contract {
       };
     }
 
+    const billingReservation = await this.prepareBillingReservation(normalized, key);
+    if (billingReservation instanceof Error) return billingReservation;
     const nextReservedAu = this.safeAddAu(hold.reserved_au, normalized.max_spend_au);
     if (nextReservedAu instanceof Error) return nextReservedAu;
     if (this.compareAu(nextReservedAu, balance.au) > 0) {
@@ -2759,9 +2918,21 @@ class MayhemContract extends Contract {
     }
     const session = {
       session_id: normalized.session_id,
+      billing_id: normalized.voucher_body.billing_id,
+      billing_attempt: normalized.voucher_body.billing_attempt,
+      billing_prior_usage: cloneValue(normalized.voucher_body.billing_prior_usage),
+      billing_prior_au_owed_cum: normalized.voucher_body.billing_prior_au_owed_cum,
+      billing_epoch: normalized.epoch,
+      reservation_id: normalized.voucher_body.reservation_id,
+      reservation_expires_after_epoch: normalized.reservation_expires_after_epoch,
+      reservation_receipt_grace_epochs: normalized.reservation_receipt_grace_epochs,
+      user: normalized.user,
+      rail: normalized.rail,
       provider: normalized.provider,
       payout_revision: value.payout_revision,
       enclave_id: normalized.enclave_id,
+      enclave_pubkey: normalized.enclave_pubkey,
+      model_id: normalized.model_id,
       price_ver: normalized.price_ver,
       locked_rate_map: normalized.locked_rate_map,
       locked_per_req_au: normalized.locked_per_req_au,
@@ -2786,6 +2957,8 @@ class MayhemContract extends Contract {
       updated_at: this.tx,
     };
     await this.put(holdKey, nextHold);
+    await this.put(billingReservation.anchor_key, billingReservation.anchor);
+    await this.put(billingReservation.reservation_key, billingReservation.reservation);
     const availableAu = this.safeSubAu(balance.au, nextHold.reserved_au);
     if (availableAu instanceof Error) return availableAu;
     return {
@@ -2799,6 +2972,870 @@ class MayhemContract extends Contract {
       payout_revision: value.payout_revision,
       reserved_au: nextHold.reserved_au,
       available_au: availableAu,
+      idempotent: false,
+    };
+  }
+
+  receiptAttemptTerms(body) {
+    return {
+      schema_version: body.schema_version,
+      session_id: body.session_id,
+      billing_id: body.billing_id,
+      billing_attempt: body.billing_attempt,
+      billing_prior_usage: body.billing_prior_usage,
+      billing_prior_au_owed_cum: body.billing_prior_au_owed_cum,
+      billing_epoch: body.billing_epoch,
+      reservation_id: body.reservation_id,
+      reservation_expires_after_epoch: body.reservation_expires_after_epoch,
+      reservation_receipt_grace_epochs: body.reservation_receipt_grace_epochs,
+      payout_revision: body.payout_revision,
+      rail: body.rail,
+      user: body.user,
+      provider: body.provider,
+      enclave_id: body.enclave_id,
+      model_id: body.model_id,
+      price_ver: body.price_ver,
+      locked_rate_map: body.locked_rate_map,
+      locked_per_req_au: body.locked_per_req_au,
+      locked_min_session_au: body.locked_min_session_au,
+      served_ctx: body.served_ctx,
+      ctx_bracket: body.ctx_bracket,
+      ctx_bracket_table_ver: body.ctx_bracket_table_ver,
+      rules_ver: body.rules_ver,
+      prompt_hash: body.prompt_hash,
+    };
+  }
+
+  receiptUsageIsMonotonic(previous, next) {
+    const units = new Set([...Object.keys(previous), ...Object.keys(next)]);
+    for (const unit of units) {
+      const before = previous[unit] ?? 0;
+      const after = next[unit] ?? 0;
+      if (!Number.isSafeInteger(before) ||
+          !Number.isSafeInteger(after) ||
+          after < before) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  async normalizeRecordUsageReceiptValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      ['op', 'contract_version', 'epoch', 'payout_revision', 'receipt', 'provider_sig'],
+      'record usage receipt feature'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'record_usage_receipt') {
+      return new Error('Invalid record usage receipt op.');
+    }
+    if (value.contract_version !== CONTRACT_VERSION) {
+      return new Error('Invalid record usage receipt contract version.');
+    }
+    if (!Number.isSafeInteger(value.epoch) || value.epoch < 1) {
+      return new Error('Invalid record usage receipt epoch.');
+    }
+    if (!this.isHexBytes(value.payout_revision, 32) ||
+        value.payout_revision !== value.payout_revision.toLowerCase()) {
+      return new Error('Invalid record usage receipt payout revision.');
+    }
+    if (!this.isHexBytes(value.provider_sig, 64)) {
+      return new Error('Invalid record usage receipt provider signature.');
+    }
+    const receiptShapeError = this.validateExactObjectKeys(
+      value.receipt,
+      ['body', 'enclave_sig', 'enclave_pubkey', 'user_sig'],
+      'record usage receipt envelope'
+    );
+    if (receiptShapeError) return receiptShapeError;
+    const receipt = await this.normalizeReceiptEnvelope(value.receipt, {
+      targetSchemaVersion: SESSION_RECEIPT_SCHEMA_VERSION,
+    });
+    if (receipt instanceof Error) return receipt;
+    const canonicalReceipt = {
+      body: canonicalReceiptBody(receipt.body),
+      enclave_sig: receipt.enclave_sig.toLowerCase(),
+      enclave_pubkey: receipt.enclave_pubkey.toLowerCase(),
+      user_sig: receipt.user_sig.toLowerCase(),
+    };
+    if (stableJson(value.receipt) !== stableJson(canonicalReceipt)) {
+      return new Error('Record usage receipt envelope must be canonical.');
+    }
+    if (receipt.body.billing_epoch !== value.epoch) {
+      return new Error('Record usage receipt outer epoch does not match signed receipt.');
+    }
+    if (receipt.body.payout_revision !== value.payout_revision) {
+      return new Error('Record usage receipt outer payout revision does not match signed receipt.');
+    }
+    return {
+      op: 'record_usage_receipt',
+      contract_version: CONTRACT_VERSION,
+      epoch: value.epoch,
+      payout_revision: value.payout_revision,
+      receipt: canonicalReceipt,
+      provider_sig: value.provider_sig.toLowerCase(),
+    };
+  }
+
+  async recordUsageReceiptFeatureKey(value) {
+    const normalized = await this.normalizeRecordUsageReceiptValue(value);
+    if (normalized instanceof Error) return normalized;
+    const digest = await blake3(b4a.from(stableJson({
+      domain: 'mayhem-record-usage-receipt-feature-v1',
+      evidence: recordUsageReceiptEvidence(normalized),
+    })));
+    const body = normalized.receipt.body;
+    return (
+      `receipt/submit/${body.billing_epoch}/${body.billing_id}/` +
+      `${body.billing_attempt}/${body.seq}/${b4a.toString(digest, 'hex')}`
+    );
+  }
+
+  normalizeCloseUsageReservationValue(value, { expiry = false } = {}) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'contract_version',
+        'billing_epoch',
+        'reservation_id',
+        'reservation_expires_after_epoch',
+        'reservation_receipt_grace_epochs',
+        'billing_id',
+        'billing_attempt',
+        'session_id',
+        'user',
+        'rail',
+        'provider',
+        'payout_revision',
+        'latest_receipt_seq',
+        'latest_receipt_hash',
+        'at',
+        'reason',
+        'actor',
+        'actor_role',
+        'actor_sig',
+      ],
+      'close usage reservation feature'
+    );
+    if (shapeError) return shapeError;
+    const rail = this.normalizeLedgerRail(value.rail, 'close usage reservation rail');
+    if (rail instanceof Error) return rail;
+    const expectedOp = expiry ? 'expire_usage_reservation' : 'close_usage_reservation';
+    const expectedRole = expiry ? 'user' : 'provider';
+    if (value.op !== expectedOp ||
+        value.contract_version !== CONTRACT_VERSION ||
+        !Number.isSafeInteger(value.billing_epoch) ||
+        value.billing_epoch < 1 ||
+        !this.isHexBytes(value.reservation_id, 32) ||
+        !Number.isSafeInteger(value.reservation_expires_after_epoch) ||
+        value.reservation_expires_after_epoch <= value.billing_epoch ||
+        !Number.isSafeInteger(value.reservation_receipt_grace_epochs) ||
+        value.reservation_receipt_grace_epochs < 0 ||
+        !this.isHexBytes(value.billing_id, 32) ||
+        !Number.isSafeInteger(value.billing_attempt) ||
+        value.billing_attempt < 0 ||
+        !this.isHexBytes(value.session_id, 32) ||
+        !this.isHexBytes(value.user, 32) ||
+        !this.isHexBytes(value.provider, 32) ||
+        !this.isHexBytes(value.payout_revision, 32) ||
+        !Number.isSafeInteger(value.at) ||
+        value.at < 0 ||
+        !this.isSafeKeyPart(value.reason) ||
+        !this.isHexBytes(value.actor, 32) ||
+        value.actor_role !== expectedRole ||
+        !this.isHexBytes(value.actor_sig, 64)) {
+      return new Error('Invalid close usage reservation feature.');
+    }
+    const expectedActor = expiry ? value.user : value.provider;
+    if (value.actor !== expectedActor) {
+      return new Error('Close usage reservation actor does not match its role.');
+    }
+    const hasReceipt = value.latest_receipt_seq !== null ||
+      value.latest_receipt_hash !== null;
+    if (
+      hasReceipt
+        ? (!Number.isSafeInteger(value.latest_receipt_seq) ||
+          value.latest_receipt_seq < 0 ||
+          !this.isHexBytes(value.latest_receipt_hash, 32))
+        : value.latest_receipt_seq !== null || value.latest_receipt_hash !== null
+    ) {
+      return new Error('Invalid close usage reservation receipt head.');
+    }
+    const normalized = {
+      op: expectedOp,
+      contract_version: CONTRACT_VERSION,
+      billing_epoch: value.billing_epoch,
+      reservation_id: value.reservation_id.toLowerCase(),
+      reservation_expires_after_epoch: value.reservation_expires_after_epoch,
+      reservation_receipt_grace_epochs: value.reservation_receipt_grace_epochs,
+      billing_id: value.billing_id.toLowerCase(),
+      billing_attempt: value.billing_attempt,
+      session_id: value.session_id.toLowerCase(),
+      user: value.user.toLowerCase(),
+      rail,
+      provider: value.provider.toLowerCase(),
+      payout_revision: value.payout_revision.toLowerCase(),
+      latest_receipt_seq: value.latest_receipt_seq,
+      latest_receipt_hash: value.latest_receipt_hash?.toLowerCase() ?? null,
+      at: value.at,
+      reason: value.reason,
+      actor: value.actor.toLowerCase(),
+      actor_role: value.actor_role,
+      actor_sig: value.actor_sig.toLowerCase(),
+    };
+    if (stableJson(normalized) !== stableJson(value)) {
+      return new Error('Close usage reservation feature must be canonical.');
+    }
+    return normalized;
+  }
+
+  async closeUsageReservationFeatureKey(value, { expiry = false } = {}) {
+    const normalized = this.normalizeCloseUsageReservationValue(value, { expiry });
+    if (normalized instanceof Error) return normalized;
+    const digest = await blake3(b4a.from(stableJson({
+      domain: expiry
+        ? 'mayhem-expire-usage-reservation-feature-v1'
+        : 'mayhem-close-usage-reservation-feature-v1',
+      evidence: closeUsageReservationEvidence(normalized),
+      actor_sig: normalized.actor_sig,
+    })));
+    return (
+      `receipt/${expiry ? 'expire' : 'close'}/${normalized.billing_epoch}/` +
+      `${normalized.reservation_id}/` +
+      `${b4a.toString(digest, 'hex')}`
+    );
+  }
+
+  async nextReceiptEpochIndex(epoch, billingId, billingAttempt) {
+    const indexKey = this.receiptEpochIndexKey(epoch);
+    const existingIndex = await this.get(indexKey);
+    const index = existingIndex ?? {
+      type: 'canonical_receipt_epoch_index',
+      epoch,
+      count: 0,
+      page_size: RECEIPT_EPOCH_INDEX_PAGE_SIZE,
+      page_count: 0,
+      revision: 0,
+      updated_at: null,
+    };
+    const normalizedIndex = this.normalizeReceiptEpochIndexMetadata(index, epoch, {
+      allowEmpty: true,
+    });
+    if (normalizedIndex instanceof Error) return normalizedIndex;
+    if (index.count >= Number.MAX_SAFE_INTEGER) {
+      return new Error('Canonical receipt epoch count overflow.');
+    }
+    const page = Math.floor(index.count / RECEIPT_EPOCH_INDEX_PAGE_SIZE);
+    const pageKey = this.receiptEpochPageKey(epoch, page);
+    const existingPage = await this.get(pageKey);
+    const pageRecord = existingPage ?? {
+      type: 'canonical_receipt_epoch_page',
+      epoch,
+      page,
+      identities: [],
+    };
+    if (pageRecord.type !== 'canonical_receipt_epoch_page' ||
+        pageRecord.epoch !== epoch ||
+        pageRecord.page !== page ||
+        !Array.isArray(pageRecord.identities) ||
+        Object.keys(pageRecord).sort().join(',') !== 'epoch,identities,page,type' ||
+        pageRecord.identities.length !== index.count % RECEIPT_EPOCH_INDEX_PAGE_SIZE ||
+        pageRecord.identities.length >= RECEIPT_EPOCH_INDEX_PAGE_SIZE) {
+      return new Error('Canonical receipt epoch page is invalid or full.');
+    }
+    const identities = pageRecord.identities;
+    if (
+        identities.length >= RECEIPT_EPOCH_INDEX_PAGE_SIZE) {
+      return new Error('Canonical receipt epoch page is invalid or full.');
+    }
+    const identity = { billing_id: billingId, billing_attempt: billingAttempt };
+    if (identities.some((entry) =>
+      entry?.billing_id === billingId && entry?.billing_attempt === billingAttempt
+    )) {
+      return new Error('Canonical receipt billing attempt is already indexed.');
+    }
+    return {
+      index_key: indexKey,
+      index: {
+        ...index,
+        count: index.count + 1,
+        page_count: Math.max(index.page_count, page + 1),
+      },
+      page_key: pageKey,
+      page: {
+        ...pageRecord,
+        identities: [...identities, identity],
+      },
+      position: index.count,
+    };
+  }
+
+  normalizeReceiptEpochIndexMetadata(value, epoch, { allowEmpty = false } = {}) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      ['type', 'epoch', 'count', 'page_size', 'page_count', 'revision', 'updated_at'],
+      'canonical receipt epoch metadata'
+    );
+    if (shapeError) return shapeError;
+    if (value.type !== 'canonical_receipt_epoch_index' || value.epoch !== epoch) {
+      return new Error('Canonical receipt epoch metadata identity is invalid.');
+    }
+    if (!Number.isSafeInteger(value.count) || value.count < 0 ||
+        value.page_size !== RECEIPT_EPOCH_INDEX_PAGE_SIZE ||
+        !Number.isSafeInteger(value.page_count) || value.page_count < 0 ||
+        !Number.isSafeInteger(value.revision) || value.revision < value.count) {
+      return new Error('Canonical receipt epoch metadata counters are invalid.');
+    }
+    const expectedPageCount = value.count === 0
+      ? 0
+      : Math.ceil(value.count / RECEIPT_EPOCH_INDEX_PAGE_SIZE);
+    if (value.page_count !== expectedPageCount) {
+      return new Error('Canonical receipt epoch metadata page count is invalid.');
+    }
+    if (value.count === 0) {
+      if (!allowEmpty || value.revision !== 0 || value.updated_at !== null) {
+        return new Error('Canonical receipt epoch metadata cannot be empty.');
+      }
+    } else if (typeof value.updated_at !== 'string' || value.updated_at.length === 0) {
+      return new Error('Canonical receipt epoch metadata updated_at is invalid.');
+    }
+    return {
+      type: value.type,
+      epoch: value.epoch,
+      count: value.count,
+      page_size: value.page_size,
+      page_count: value.page_count,
+      revision: value.revision,
+      updated_at: value.updated_at,
+    };
+  }
+
+  receiptSettlementEpoch(applyState) {
+    const base = applyState.pending_epoch ?? applyState.updated_epoch;
+    if (!Number.isSafeInteger(base) || base < 0 || base >= Number.MAX_SAFE_INTEGER) {
+      return new Error('Receipt settlement epoch overflow.');
+    }
+    return base + 1;
+  }
+
+  prepareTargetedReservationClosure({
+    hold,
+    session,
+    reservation,
+    head,
+    closeRecordKey,
+    closedBy,
+    closedByRole,
+    at,
+    reason,
+  }) {
+    if (reservation.status !== 'active' ||
+        reservation.closed_at !== null ||
+        reservation.close_record_key !== null) {
+      return new Error('Targeted reservation is already closed.');
+    }
+    const retainedAu = head?.incremental_au ?? ZERO_AU;
+    const releasedAu = this.safeSubAu(session.max_spend_au, retainedAu);
+    if (releasedAu instanceof Error) {
+      return new Error('Targeted reservation close exceeds its hold.');
+    }
+    const reservedAu = this.safeSubAu(hold.reserved_au, releasedAu);
+    if (reservedAu instanceof Error) {
+      return new Error('Targeted reservation close exceeds outstanding holds.');
+    }
+    const sessions = head
+      ? hold.sessions.map((entry) => (
+          entry.reservation_id === session.reservation_id
+            ? {
+                ...entry,
+                max_spend_au: retainedAu,
+                settlement_ready: true,
+                closed_at: closeRecordKey,
+              }
+            : entry
+        ))
+      : hold.sessions.filter((entry) => entry.reservation_id !== session.reservation_id);
+    const closeRecord = {
+      type: 'targeted_reservation_close',
+      reservation_id: session.reservation_id,
+      billing_id: session.billing_id,
+      billing_attempt: session.billing_attempt,
+      billing_epoch: session.billing_epoch,
+      reservation_expires_after_epoch: session.reservation_expires_after_epoch,
+      reservation_receipt_grace_epochs: session.reservation_receipt_grace_epochs,
+      session_id: session.session_id,
+      user: session.user,
+      rail: session.rail,
+      provider: session.provider,
+      payout_revision: session.payout_revision,
+      latest_receipt_seq: head?.receipt_seq ?? null,
+      latest_receipt_hash: head?.receipt_hash ?? null,
+      retained_au: retainedAu,
+      released_au: releasedAu,
+      reason,
+      closed_by: closedBy,
+      closed_by_role: closedByRole,
+      at,
+      recorded_at: closeRecordKey,
+    };
+    return {
+      hold: {
+        ...hold,
+        reserved_au: reservedAu,
+        sessions,
+        updated_at: closeRecordKey,
+      },
+      reservation: {
+        ...reservation,
+        status: 'closed',
+        closed_at: closeRecordKey,
+        close_record_key: closeRecordKey,
+      },
+      close_record: closeRecord,
+    };
+  }
+
+  async applyRecordUsageReceiptFeature(key, value) {
+    const normalized = await this.normalizeRecordUsageReceiptValue(value);
+    if (normalized instanceof Error) return normalized;
+    const expectedKey = await this.recordUsageReceiptFeatureKey(normalized);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return new Error('Invalid record usage receipt feature key.');
+    const body = normalized.receipt.body;
+    const verify = this.protocol?.peer?.wallet?.verify;
+    if (typeof verify !== 'function' ||
+        verify.call(
+          this.protocol.peer.wallet,
+          normalized.provider_sig,
+          recordUsageReceiptMessage(normalized),
+          body.provider
+        ) !== true) {
+      return new Error('Invalid record usage receipt provider signature.');
+    }
+    if (!this.verifyReceiptEnvelope(normalized.receipt)) {
+      return new Error('Invalid record usage receipt user or enclave signature.');
+    }
+
+    const receiptHash = await this.opaqueHash(
+      'mayhem-canonical-receipt-v1',
+      normalized.receipt
+    );
+    const headKey = this.receiptHeadKey(body.billing_id, body.billing_attempt);
+    const existingHead = await this.get(headKey);
+    if (existingHead) {
+      if (existingHead.type !== 'canonical_receipt_head') {
+        return new Error('Canonical receipt head is invalid.');
+      }
+      if (existingHead.receipt_hash === receiptHash &&
+          stableJson(existingHead.receipt) === stableJson(normalized.receipt)) {
+        return {
+          ok: true,
+          op: 'recordUsageReceipt',
+          epoch: existingHead.settlement_epoch ?? null,
+          billing_epoch: body.billing_epoch,
+          billing_id: body.billing_id,
+          billing_attempt: body.billing_attempt,
+          receipt_seq: body.seq,
+          receipt_hash: receiptHash,
+          idempotent: true,
+        };
+      }
+      if ((await this.get(this.receiptConsumedKey(body.billing_id, body.billing_attempt))) !== null) {
+        return new Error('A consumed canonical receipt head cannot advance.');
+      }
+      if (body.seq <= existingHead.receipt_seq) {
+        return new Error('Receipt sequence conflicts with the canonical high-water head.');
+      }
+      if (existingHead.receipt.body.final === true ||
+          existingHead.settlement_ready === true) {
+        return new Error('A finalized canonical receipt head cannot advance.');
+      }
+      if (stableJson(this.receiptAttemptTerms(existingHead.receipt.body)) !==
+          stableJson(this.receiptAttemptTerms(body))) {
+        return new Error('Higher receipt sequence changed immutable attempt terms.');
+      }
+      if (!this.receiptUsageIsMonotonic(existingHead.receipt.body.usage, body.usage) ||
+          this.compareAu(body.au_owed_cum, existingHead.receipt.body.au_owed_cum) < 0) {
+        return new Error('Higher receipt sequence is not monotonic.');
+      }
+    }
+
+    const holdKey = this.targetedSpendHoldKey(body.user, body.rail);
+    const hold = await this.normalizeTargetedSpendHoldRecord(
+      (await this.get(holdKey)) ?? null,
+      body.user,
+      body.rail
+    );
+    if (hold instanceof Error) return hold;
+    const session = hold.sessions.find((entry) =>
+      entry.session_id === body.session_id &&
+      entry.reservation_id === body.reservation_id
+    );
+    if (!session) return new Error('Receipt does not match an exact targeted spend hold session.');
+    const sessionTermsMatch =
+      session.billing_id === body.billing_id &&
+      session.billing_attempt === body.billing_attempt &&
+      session.billing_epoch === body.billing_epoch &&
+      session.reservation_id === body.reservation_id &&
+      session.reservation_expires_after_epoch === body.reservation_expires_after_epoch &&
+      session.reservation_receipt_grace_epochs === body.reservation_receipt_grace_epochs &&
+      session.user === body.user &&
+      session.rail === body.rail &&
+      session.provider === body.provider &&
+      session.payout_revision === body.payout_revision &&
+      session.enclave_id === body.enclave_id &&
+      session.enclave_pubkey === normalized.receipt.enclave_pubkey &&
+      session.model_id === body.model_id &&
+      session.price_ver === body.price_ver &&
+      stableJson(session.billing_prior_usage) === stableJson(body.billing_prior_usage) &&
+      this.compareAu(
+        session.billing_prior_au_owed_cum,
+        body.billing_prior_au_owed_cum
+      ) === 0 &&
+      stableJson(session.locked_rate_map) === stableJson(body.locked_rate_map) &&
+      this.compareAu(session.locked_per_req_au, body.locked_per_req_au) === 0 &&
+      this.compareAu(session.locked_min_session_au, body.locked_min_session_au) === 0 &&
+      session.served_ctx === body.served_ctx &&
+      session.ctx_bracket === body.ctx_bracket &&
+      session.ctx_bracket_table_ver === body.ctx_bracket_table_ver &&
+      session.rules_ver === body.rules_ver;
+    if (!sessionTermsMatch) {
+      return new Error('Receipt terms do not match the targeted spend hold session.');
+    }
+
+    const incrementalAu = this.safeSubAu(
+      body.au_owed_cum,
+      body.billing_prior_au_owed_cum
+    );
+    if (incrementalAu instanceof Error ||
+        this.isZeroAu(incrementalAu) ||
+        this.compareAu(incrementalAu, session.max_spend_au) > 0) {
+      return new Error('Receipt incremental amount is not positive or exceeds its session reservation.');
+    }
+
+    const billingAnchor = await this.get(this.receiptBillingKey(body.billing_id));
+    if (!billingAnchor ||
+        billingAnchor.type !== 'receipt_billing_anchor' ||
+        billingAnchor.user !== body.user ||
+        billingAnchor.rail !== body.rail ||
+        billingAnchor.epoch !== body.billing_epoch ||
+        billingAnchor.latest_attempt < body.billing_attempt) {
+      return new Error('Receipt billing anchor is missing or inconsistent.');
+    }
+    if (billingAnchor.latest_attempt > body.billing_attempt) {
+      return new Error('An older billing attempt cannot advance after a higher attempt exists.');
+    }
+    const reservationKey = this.receiptReservationKey(body.reservation_id);
+    const reservation = await this.get(reservationKey);
+    if (!reservation ||
+        reservation.type !== 'receipt_reservation_identity' ||
+        reservation.reservation_id !== body.reservation_id ||
+        reservation.billing_id !== body.billing_id ||
+        reservation.billing_attempt !== body.billing_attempt ||
+        reservation.billing_epoch !== body.billing_epoch ||
+        reservation.reservation_expires_after_epoch !== body.reservation_expires_after_epoch ||
+        reservation.reservation_receipt_grace_epochs !== body.reservation_receipt_grace_epochs ||
+        reservation.session_id !== body.session_id ||
+        reservation.user !== body.user ||
+        reservation.rail !== body.rail ||
+        reservation.provider !== body.provider ||
+        reservation.payout_revision !== body.payout_revision) {
+      return new Error('Receipt reservation identity is missing or inconsistent.');
+    }
+    if (reservation.status !== 'active' ||
+        reservation.closed_at !== null ||
+        reservation.close_record_key !== null) {
+      return new Error('A closed targeted reservation cannot advance.');
+    }
+    const applyState = await this.epochApplyStateRecord();
+    const settlementEpoch = this.receiptSettlementEpoch(applyState);
+    if (settlementEpoch instanceof Error) return settlementEpoch;
+    if (body.billing_epoch > settlementEpoch) {
+      return new Error('Receipt billing epoch is in the future.');
+    }
+    const isFinal = body.final === true;
+    let epochIndex = null;
+    if (isFinal) {
+      if (existingHead?.index_position !== null &&
+          existingHead?.index_position !== undefined) {
+        return new Error('Non-final canonical receipt head was unexpectedly indexed.');
+      }
+      epochIndex = await this.nextReceiptEpochIndex(
+        settlementEpoch,
+        body.billing_id,
+        body.billing_attempt
+      );
+      if (epochIndex instanceof Error) return epochIndex;
+    }
+    const head = {
+      type: 'canonical_receipt_head',
+      billing_id: body.billing_id,
+      billing_attempt: body.billing_attempt,
+      epoch: isFinal ? settlementEpoch : null,
+      billing_epoch: body.billing_epoch,
+      settlement_epoch: isFinal ? settlementEpoch : null,
+      index_position: isFinal ? epochIndex.position : null,
+      settlement_ready: isFinal,
+      user: body.user,
+      rail: body.rail,
+      provider: body.provider,
+      payout_revision: body.payout_revision,
+      session_id: body.session_id,
+      reservation_id: body.reservation_id,
+      receipt_seq: body.seq,
+      receipt_hash: receiptHash,
+      incremental_au: incrementalAu,
+      receipt: cloneValue(normalized.receipt),
+      feature_key: key,
+      updated_at: key,
+    };
+    let closure = null;
+    let nextMetadata = null;
+    if (isFinal) {
+      const closeRecordKey = this.receiptReservationCloseKey(body.reservation_id);
+      if ((await this.get(closeRecordKey)) !== null) {
+        return new Error('Targeted reservation close record already exists.');
+      }
+      closure = this.prepareTargetedReservationClosure({
+        hold,
+        session,
+        reservation,
+        head,
+        closeRecordKey,
+        closedBy: body.provider,
+        closedByRole: 'provider',
+        at: body.ts,
+        reason: 'final_receipt',
+      });
+      if (closure instanceof Error) return closure;
+      if (epochIndex.index.revision >= Number.MAX_SAFE_INTEGER) {
+        return new Error('Canonical receipt epoch revision overflow.');
+      }
+      nextMetadata = {
+        ...epochIndex.index,
+        revision: epochIndex.index.revision + 1,
+        updated_at: key,
+      };
+    }
+    await this.put(headKey, head);
+    if (isFinal) {
+      await this.put(epochIndex.page_key, epochIndex.page);
+      await this.put(epochIndex.index_key, nextMetadata);
+      await this.put(holdKey, closure.hold);
+      await this.put(reservationKey, closure.reservation);
+      await this.put(this.receiptReservationCloseKey(body.reservation_id), closure.close_record);
+    }
+    return {
+      ok: true,
+      op: 'recordUsageReceipt',
+      epoch: isFinal ? settlementEpoch : null,
+      billing_epoch: body.billing_epoch,
+      billing_id: body.billing_id,
+      billing_attempt: body.billing_attempt,
+      receipt_seq: body.seq,
+      receipt_hash: receiptHash,
+      idempotent: false,
+    };
+  }
+
+  async applyCloseUsageReservationFeature(key, value, { expiry = false } = {}) {
+    const normalized = this.normalizeCloseUsageReservationValue(value, { expiry });
+    if (normalized instanceof Error) return normalized;
+    const expectedKey = await this.closeUsageReservationFeatureKey(normalized, { expiry });
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return new Error('Invalid close usage reservation feature key.');
+    const verify = this.protocol?.peer?.wallet?.verify;
+    if (typeof verify !== 'function' ||
+        verify.call(
+          this.protocol.peer.wallet,
+          normalized.actor_sig,
+          expiry
+            ? expireUsageReservationMessage(normalized)
+            : closeUsageReservationMessage(normalized),
+          normalized.actor
+        ) !== true) {
+      return new Error('Invalid close usage reservation signature.');
+    }
+
+    const closeRecordKey = this.receiptReservationCloseKey(normalized.reservation_id);
+    const existingClose = await this.get(closeRecordKey);
+    if (existingClose !== null) {
+      if (existingClose.feature_key === key) {
+        return {
+          ok: true,
+          op: expiry ? 'expireUsageReservation' : 'closeUsageReservation',
+          billing_epoch: normalized.billing_epoch,
+          reservation_id: normalized.reservation_id,
+          settlement_epoch: existingClose.settlement_epoch,
+          idempotent: true,
+        };
+      }
+      return new Error('Targeted reservation close conflicts with its canonical close.');
+    }
+
+    const reservationKey = this.receiptReservationKey(normalized.reservation_id);
+    const reservation = await this.get(reservationKey);
+    if (!reservation ||
+        reservation.type !== 'receipt_reservation_identity' ||
+        reservation.status !== 'active' ||
+        reservation.closed_at !== null ||
+        reservation.close_record_key !== null ||
+        reservation.reservation_id !== normalized.reservation_id ||
+        reservation.billing_id !== normalized.billing_id ||
+        reservation.billing_attempt !== normalized.billing_attempt ||
+        reservation.billing_epoch !== normalized.billing_epoch ||
+        reservation.reservation_expires_after_epoch !==
+          normalized.reservation_expires_after_epoch ||
+        reservation.reservation_receipt_grace_epochs !==
+          normalized.reservation_receipt_grace_epochs ||
+        reservation.session_id !== normalized.session_id ||
+        reservation.user !== normalized.user ||
+        reservation.rail !== normalized.rail ||
+        reservation.provider !== normalized.provider ||
+        reservation.payout_revision !== normalized.payout_revision) {
+      return new Error('Close usage reservation does not match an active reservation.');
+    }
+    const holdKey = this.targetedSpendHoldKey(normalized.user, normalized.rail);
+    const hold = await this.normalizeTargetedSpendHoldRecord(
+      (await this.get(holdKey)) ?? null,
+      normalized.user,
+      normalized.rail
+    );
+    if (hold instanceof Error) return hold;
+    const session = hold.sessions.find(
+      (entry) =>
+        entry.session_id === normalized.session_id &&
+        entry.reservation_id === normalized.reservation_id
+    );
+    if (!session ||
+        session.billing_id !== normalized.billing_id ||
+        session.billing_attempt !== normalized.billing_attempt ||
+        session.billing_epoch !== normalized.billing_epoch ||
+        session.reservation_expires_after_epoch !==
+          normalized.reservation_expires_after_epoch ||
+        session.reservation_receipt_grace_epochs !==
+          normalized.reservation_receipt_grace_epochs ||
+        session.provider !== normalized.provider ||
+        session.payout_revision !== normalized.payout_revision) {
+      return new Error('Close usage reservation does not match its outstanding hold.');
+    }
+
+    const headKey = this.receiptHeadKey(
+      normalized.billing_id,
+      normalized.billing_attempt
+    );
+    const existingHead = await this.get(headKey);
+    if (existingHead === null) {
+      if (normalized.latest_receipt_seq !== null ||
+          normalized.latest_receipt_hash !== null) {
+        return new Error('Close usage reservation receipt head does not exist.');
+      }
+    } else {
+      if (existingHead.type !== 'canonical_receipt_head' ||
+          existingHead.billing_epoch !== normalized.billing_epoch ||
+          existingHead.reservation_id !== normalized.reservation_id ||
+          existingHead.session_id !== normalized.session_id ||
+          existingHead.user !== normalized.user ||
+          existingHead.rail !== normalized.rail ||
+          existingHead.provider !== normalized.provider ||
+          existingHead.payout_revision !== normalized.payout_revision ||
+          existingHead.receipt_seq !== normalized.latest_receipt_seq ||
+          existingHead.receipt_hash !== normalized.latest_receipt_hash) {
+        return new Error('Close usage reservation does not match the canonical receipt head.');
+      }
+      if (existingHead.settlement_ready === true ||
+          existingHead.receipt?.body?.final === true ||
+          (await this.get(
+            this.receiptConsumedKey(normalized.billing_id, normalized.billing_attempt)
+          )) !== null) {
+        return new Error('Finalized or consumed receipt evidence cannot be closed again.');
+      }
+    }
+
+    const applyState = await this.epochApplyStateRecord();
+    const settlementEpoch = this.receiptSettlementEpoch(applyState);
+    if (settlementEpoch instanceof Error) return settlementEpoch;
+    if (normalized.billing_epoch > settlementEpoch) {
+      return new Error('Close usage reservation billing epoch is in the future.');
+    }
+    if (expiry) {
+      if (
+        normalized.reservation_expires_after_epoch >
+          Number.MAX_SAFE_INTEGER - normalized.reservation_receipt_grace_epochs ||
+        applyState.updated_epoch <
+          normalized.reservation_expires_after_epoch +
+            normalized.reservation_receipt_grace_epochs
+      ) {
+        return new Error(
+          'Buyer reservation close is not yet past canonical expiry and receipt grace.'
+        );
+      }
+    }
+    let head = null;
+    let epochIndex = null;
+    let nextMetadata = null;
+    if (existingHead !== null) {
+      epochIndex = await this.nextReceiptEpochIndex(
+        settlementEpoch,
+        normalized.billing_id,
+        normalized.billing_attempt
+      );
+      if (epochIndex instanceof Error) return epochIndex;
+      if (epochIndex.index.revision >= Number.MAX_SAFE_INTEGER) {
+        return new Error('Canonical receipt epoch revision overflow.');
+      }
+      head = {
+        ...existingHead,
+        epoch: settlementEpoch,
+        settlement_epoch: settlementEpoch,
+        index_position: epochIndex.position,
+        settlement_ready: true,
+        updated_at: key,
+      };
+      nextMetadata = {
+        ...epochIndex.index,
+        revision: epochIndex.index.revision + 1,
+        updated_at: key,
+      };
+    }
+    const closure = this.prepareTargetedReservationClosure({
+      hold,
+      session,
+      reservation,
+      head,
+      closeRecordKey,
+      closedBy: normalized.actor,
+      closedByRole: normalized.actor_role,
+      at: normalized.at,
+      reason: normalized.reason,
+    });
+    if (closure instanceof Error) return closure;
+    const closeRecord = {
+      ...closure.close_record,
+      settlement_epoch: head?.settlement_epoch ?? null,
+      actor_sig: normalized.actor_sig,
+      feature_key: key,
+      signed_evidence: closeUsageReservationEvidence(normalized),
+    };
+
+    if (head !== null) {
+      await this.put(headKey, head);
+      await this.put(epochIndex.page_key, epochIndex.page);
+      await this.put(epochIndex.index_key, nextMetadata);
+    }
+    await this.put(holdKey, closure.hold);
+    await this.put(reservationKey, closure.reservation);
+    await this.put(closeRecordKey, closeRecord);
+    return {
+      ok: true,
+      op: expiry ? 'expireUsageReservation' : 'closeUsageReservation',
+      billing_epoch: normalized.billing_epoch,
+      reservation_id: normalized.reservation_id,
+      settlement_epoch: head?.settlement_epoch ?? null,
+      retained_au: closeRecord.retained_au,
+      released_au: closeRecord.released_au,
       idempotent: false,
     };
   }
@@ -2836,11 +3873,12 @@ class MayhemContract extends Contract {
       'canary_probe_holdback_bps',
       'canary_probe_release_min_passes',
     ]);
-    const reservationError = await this.validateTargetedEpochReservationBindings(
+    const reservationBindings = await this.validateTargetedEpochReservationBindings(
       value,
-      normalized.targeted_earnings
+      normalized.targeted_earnings,
+      key
     );
-    if (reservationError) return reservationError;
+    if (reservationBindings instanceof Error) return reservationBindings;
     const allocationUpdates = normalized.allocations.map((allocation) => ({
       key: `payout/allocation/${value.epoch}/${allocation.session_id}`,
       value: {
@@ -2851,10 +3889,20 @@ class MayhemContract extends Contract {
         feature_key: key,
       },
     }));
+    const consumptionUpdates = normalized.allocations.map((allocation) => ({
+      key: this.receiptConsumedKey(allocation.billing_id, allocation.billing_attempt),
+      value: this.receiptConsumptionRecord(value.epoch, allocation, key),
+    }));
     for (const update of allocationUpdates) {
       const existing = await this.get(update.key);
       if (existing !== null && stableJson(existing) !== stableJson(update.value)) {
         return new Error('Targeted epoch session allocation already exists.');
+      }
+    }
+    for (const update of consumptionUpdates) {
+      const existing = await this.get(update.key);
+      if (existing !== null && stableJson(existing) !== stableJson(update.value)) {
+        return new Error('Canonical receipt billing attempt is already consumed.');
       }
     }
     const liabilityUpdates = [];
@@ -2970,6 +4018,12 @@ class MayhemContract extends Contract {
         },
       });
     }
+    const liabilityIndexUpdates = await this.nextProviderPayoutLiabilityIndexes(
+      liabilityUpdates,
+      value.epoch,
+      key
+    );
+    if (liabilityIndexUpdates instanceof Error) return liabilityIndexUpdates;
 
     const previousTx = this.tx;
     this.tx = key;
@@ -2997,6 +4051,18 @@ class MayhemContract extends Contract {
           return new Error('Targeted epoch liability snapshot is missing.');
         }
       }
+      for (const update of liabilityIndexUpdates) {
+        const index = await this.get(update.key);
+        if (!index || stableJson(index) !== stableJson(update.value)) {
+          return new Error('Targeted epoch liability index is missing.');
+        }
+      }
+      for (const update of consumptionUpdates) {
+        const consumption = await this.get(update.key);
+        if (!consumption || stableJson(consumption) !== stableJson(update.value)) {
+          return new Error('Canonical receipt consumption is missing.');
+        }
+      }
       return { ...result, op: 'applyTargetedEpoch' };
     }
 
@@ -3010,7 +4076,18 @@ class MayhemContract extends Contract {
         return new Error('Targeted epoch session allocation already exists.');
       }
     }
+    for (const update of consumptionUpdates) {
+      if ((await this.get(update.key)) !== null) {
+        return new Error('Canonical receipt billing attempt is already consumed.');
+      }
+    }
+    for (const update of reservationBindings.hold_updates) {
+      await this.put(update.key, update.value);
+    }
     for (const update of allocationUpdates) {
+      await this.put(update.key, update.value);
+    }
+    for (const update of consumptionUpdates) {
       await this.put(update.key, update.value);
     }
     for (const update of liabilityUpdates) {
@@ -3031,6 +4108,9 @@ class MayhemContract extends Contract {
           updated_at: key,
         });
       }
+    }
+    for (const update of liabilityIndexUpdates) {
+      await this.put(update.key, update.value);
     }
     return { ...result, op: 'applyTargetedEpoch' };
   }
@@ -3106,6 +4186,2207 @@ class MayhemContract extends Contract {
     }
   }
 
+  async normalizeTargetedPayoutPreparationValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'contract_version',
+        'economic_op_id',
+        'rail',
+        'epoch',
+        'epoch_apply_hash',
+        'prepared_at',
+        'kind',
+        'output_index',
+        'payload_hash',
+        'payload',
+        'liability',
+        'external_effect_ids',
+        'admin',
+        'admin_sig',
+      ],
+      'targeted payout preparation'
+    );
+    if (shapeError) return shapeError;
+    const rail = this.normalizeLedgerRail(value.rail, 'targeted payout preparation rail');
+    if (rail instanceof Error) return rail;
+    if (value.op !== 'prepare_targeted_payout' ||
+        value.contract_version !== CONTRACT_VERSION ||
+        !this.isHexBytes(value.economic_op_id, 32) ||
+        value.economic_op_id !== value.economic_op_id.toLowerCase() ||
+        !Number.isSafeInteger(value.epoch) ||
+        value.epoch < 1 ||
+        !this.isHexBytes(value.epoch_apply_hash, 32) ||
+        value.epoch_apply_hash !== value.epoch_apply_hash.toLowerCase() ||
+        !Number.isSafeInteger(value.prepared_at) ||
+        value.prepared_at < 0 ||
+        !['liability', 'fee', 'tap_root'].includes(value.kind) ||
+        !Number.isSafeInteger(value.output_index) ||
+        value.output_index < 0 ||
+        !this.isHexBytes(value.payload_hash, 32) ||
+        value.payload_hash !== value.payload_hash.toLowerCase() ||
+        !value.payload ||
+        typeof value.payload !== 'object' ||
+        Array.isArray(value.payload) ||
+        !Array.isArray(value.external_effect_ids) ||
+        value.external_effect_ids.length > 2 ||
+        !this.isHexBytes(value.admin, 32) ||
+        value.admin !== value.admin.toLowerCase() ||
+        !this.isHexBytes(value.admin_sig, 64)) {
+      return new Error('Invalid targeted payout preparation.');
+    }
+    if (b4a.byteLength(stableJson(value.payload)) > 16_384) {
+      return new Error('Targeted payout preparation payload exceeds 16384 bytes.');
+    }
+    const externalEffectIds = value.external_effect_ids.map((effectId) =>
+      String(effectId).toLowerCase()
+    );
+    if (externalEffectIds.some((effectId) => !this.isHexBytes(effectId, 32)) ||
+        new Set(externalEffectIds).size !== externalEffectIds.length) {
+      return new Error('Invalid targeted payout preparation external effect ids.');
+    }
+    if ((value.kind === 'tap_root' && rail !== 'tap') ||
+        (value.kind === 'tap_root' && externalEffectIds.length !== 2) ||
+        (value.kind === 'fee' && rail === 'tap') ||
+        (value.kind === 'fee' && rail === 'tnk' &&
+          externalEffectIds.length !== 1) ||
+        (value.kind === 'fee' && rail === 'fiat' &&
+          externalEffectIds.length !== 0) ||
+        (value.kind === 'liability' && rail === 'tnk' &&
+          externalEffectIds.length !== 1) ||
+        (value.kind === 'liability' && ['tap', 'fiat'].includes(rail) &&
+          externalEffectIds.length !== 0)) {
+      return new Error('Targeted payout preparation kind does not match rail effects.');
+    }
+    let liability = null;
+    if (value.kind === 'liability') {
+      const liabilityShapeError = this.validateExactObjectKeys(
+        value.liability,
+        [
+          'provider',
+          'payout_revision',
+          'target',
+          'currency',
+          'chain_id',
+          'paid_cum_au_before',
+          'aggregate_paid_cum_au_before',
+          'liability_au',
+          'paid_au',
+        ],
+        'targeted payout preparation liability'
+      );
+      if (liabilityShapeError) return liabilityShapeError;
+      if (!this.isHexBytes(value.liability.provider, 32) ||
+          value.liability.provider !== value.liability.provider.toLowerCase() ||
+          !this.isHexBytes(value.liability.payout_revision, 32) ||
+          value.liability.payout_revision !== value.liability.payout_revision.toLowerCase() ||
+          !this.isSafeKeyPart(value.liability.target) ||
+          (value.liability.currency !== null &&
+            this.normalizeFiatCurrency(value.liability.currency) !== value.liability.currency) ||
+          (value.liability.chain_id !== null &&
+            (!Number.isSafeInteger(value.liability.chain_id) ||
+              value.liability.chain_id < 1))) {
+        return new Error('Invalid targeted payout preparation liability identity.');
+      }
+      const paidCumAuBefore = this.normalizeAu(
+        value.liability.paid_cum_au_before,
+        'targeted payout preparation liability watermark',
+        { allowZero: true }
+      );
+      const aggregatePaidCumAuBefore = this.normalizeAu(
+        value.liability.aggregate_paid_cum_au_before,
+        'targeted payout preparation aggregate watermark',
+        { allowZero: true }
+      );
+      const liabilityAu = this.normalizeAu(
+        value.liability.liability_au,
+        'targeted payout preparation liability amount',
+        { allowZero: false }
+      );
+      const paidAu = this.normalizeAu(
+        value.liability.paid_au,
+        'targeted payout preparation paid amount',
+        { allowZero: false }
+      );
+      if ([paidCumAuBefore, aggregatePaidCumAuBefore, liabilityAu, paidAu]
+        .some((entry) => entry instanceof Error) ||
+          this.compareAu(paidAu, liabilityAu) > 0) {
+        return new Error('Invalid targeted payout preparation liability amount.');
+      }
+      liability = {
+        provider: value.liability.provider,
+        payout_revision: value.liability.payout_revision,
+        target: value.liability.target,
+        currency: value.liability.currency,
+        chain_id: value.liability.chain_id,
+        paid_cum_au_before: paidCumAuBefore,
+        aggregate_paid_cum_au_before: aggregatePaidCumAuBefore,
+        liability_au: liabilityAu,
+        paid_au: paidAu,
+      };
+    } else if (value.liability !== null) {
+      return new Error('Non-liability payout preparation cannot bind a liability.');
+    }
+    let payload = stableValue(value.payload);
+    if (rail === 'fiat') {
+      payload = this.normalizeTargetedFiatPreparationPayload(
+        value,
+        payload,
+        liability
+      );
+      if (payload instanceof Error) return payload;
+    } else if (rail === 'tnk') {
+      payload = await this.normalizeTargetedTnkPreparationPayload(
+        value,
+        payload,
+        liability,
+        externalEffectIds
+      );
+      if (payload instanceof Error) return payload;
+    }
+    if (stableJson(payload) !== stableJson(value.payload)) {
+      return new Error('Targeted payout preparation payload must be canonical.');
+    }
+    const payloadHash = await this.opaqueHash(
+      'mayhem-targeted-payout-preparation-payload-v1',
+      {
+        economic_op_id: value.economic_op_id,
+        rail,
+        epoch: value.epoch,
+        epoch_apply_hash: value.epoch_apply_hash,
+        kind: value.kind,
+        output_index: value.output_index,
+        payload,
+      }
+    );
+    if (payloadHash !== value.payload_hash) {
+      return new Error('Targeted payout preparation payload hash mismatch.');
+    }
+    const normalized = {
+      op: 'prepare_targeted_payout',
+      contract_version: CONTRACT_VERSION,
+      economic_op_id: value.economic_op_id,
+      rail,
+      epoch: value.epoch,
+      epoch_apply_hash: value.epoch_apply_hash,
+      prepared_at: value.prepared_at,
+      kind: value.kind,
+      output_index: value.output_index,
+      payload_hash: value.payload_hash,
+      payload,
+      liability,
+      external_effect_ids: externalEffectIds,
+      admin: value.admin,
+      admin_sig: value.admin_sig.toLowerCase(),
+    };
+    if (stableJson(normalized) !== stableJson(value)) {
+      return new Error('Targeted payout preparation must be canonical.');
+    }
+    return normalized;
+  }
+
+  payoutPreparationRecordKey(rail, economicOpId) {
+    return `payout/preparation/${rail}/${economicOpId}`;
+  }
+
+  payoutPreparationLiabilityLockKey(rail, liability) {
+    return (
+      `payout/preparation-lock/${rail}/${liability.provider}/` +
+      `${liability.payout_revision}/${liability.paid_cum_au_before}`
+    );
+  }
+
+  payoutPreparationAggregateTailKey(rail, provider) {
+    return `payout/preparation-tail/${rail}/${provider}`;
+  }
+
+  payoutPreparationEffectLockKey(rail, effectId) {
+    return `payout/preparation-effect/${rail}/${effectId}`;
+  }
+
+  async validatePayoutPreparationLiability(value) {
+    const liability = value.liability;
+    const binding = await this.get(
+      this.providerPayoutBindingFeatureKey(
+        value.rail,
+        liability.provider,
+        liability.payout_revision
+      )
+    );
+    if (!binding ||
+        binding.verified !== true ||
+        binding.provider !== liability.provider ||
+        binding.rail !== value.rail ||
+        binding.revision !== liability.payout_revision ||
+        binding.activation_epoch > value.epoch ||
+        binding.target !== liability.target ||
+        (binding.currency ?? null) !== liability.currency ||
+        (binding.chain_id ?? null) !== liability.chain_id) {
+      return new Error('Targeted payout preparation requires its immutable payout binding.');
+    }
+    const liabilityKey = this.providerPayoutLiabilityKey(
+      liability.provider,
+      value.rail,
+      liability.payout_revision
+    );
+    const current = await this.get(liabilityKey);
+    if (!current ||
+        current.provider !== liability.provider ||
+        current.rail !== value.rail ||
+        current.revision !== liability.payout_revision ||
+        current.target !== liability.target ||
+        (current.currency ?? null) !== liability.currency ||
+        (current.chain_id ?? null) !== liability.chain_id ||
+        current.paid_cum_au !== liability.paid_cum_au_before) {
+      return new Error('Targeted payout preparation liability watermark mismatch.');
+    }
+    const payable = this.safeSubAu(
+      this.safeSubAu(current.total_au, current.held_au),
+      current.paid_cum_au
+    );
+    if (payable instanceof Error) return payable;
+    if (this.compareAu(liability.liability_au, payable) > 0) {
+      return new Error('Targeted payout preparation exceeds revision liability.');
+    }
+    const earning = await this.earningRecord(liability.provider, value.rail);
+    if (earning instanceof Error) return earning;
+    const tailKey = this.payoutPreparationAggregateTailKey(value.rail, liability.provider);
+    const tail = await this.get(tailKey);
+    if (tail &&
+        typeof tail.consumed !== 'boolean') {
+      return new Error('Targeted payout preparation aggregate tail is invalid.');
+    }
+    if (tail?.consumed === true &&
+        tail.paid_cum_au_after !== earning.paid_cum_au) {
+      return new Error('Consumed payout preparation tail does not match aggregate earnings.');
+    }
+    const expectedAggregateBefore = tail?.consumed === false
+      ? tail.paid_cum_au_after
+      : earning.paid_cum_au;
+    if (liability.aggregate_paid_cum_au_before !== expectedAggregateBefore) {
+      return new Error('Targeted payout preparation aggregate watermark mismatch.');
+    }
+    const paidCumAuAfter = this.safeAddAu(
+      liability.aggregate_paid_cum_au_before,
+      liability.paid_au
+    );
+    if (paidCumAuAfter instanceof Error) return paidCumAuAfter;
+    return {
+      liability_key: liabilityKey,
+      tail_key: tailKey,
+      paid_cum_au_after: paidCumAuAfter,
+    };
+  }
+
+  async applyTargetedPayoutPreparationFeature(key, value) {
+    const normalized = await this.normalizeTargetedPayoutPreparationValue(value);
+    if (normalized instanceof Error) return normalized;
+    const expectedKey = await this.targetedPayoutPreparationFeatureKey(normalized);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return new Error('Invalid targeted payout preparation key.');
+    const admin = await this.get('admin');
+    if (normalized.admin !== admin || this.address !== admin) {
+      return new Error('Targeted payout preparation requires canonical admin authority.');
+    }
+    const verify = this.protocol?.peer?.wallet?.verify;
+    if (typeof verify !== 'function' ||
+        verify.call(
+          this.protocol.peer.wallet,
+          normalized.admin_sig,
+          payoutPreparationMessage(normalized),
+          admin
+        ) !== true) {
+      return new Error('Invalid targeted payout preparation admin signature.');
+    }
+    const applyAnchor = await this.requireEpochApplyAnchor(
+      normalized.epoch,
+      normalized.epoch_apply_hash,
+      'Targeted payout preparation'
+    );
+    if (applyAnchor instanceof Error) return applyAnchor;
+    if (['fiat', 'tnk'].includes(normalized.rail)) {
+      const plan = await this.get(
+        this.targetedPayoutEpochPlanRecordKey(normalized.rail, normalized.epoch)
+      );
+      const output = plan?.value?.outputs?.[normalized.output_index];
+      if (!plan ||
+          plan.plan_root !== normalized.payload.plan_root ||
+          plan.value.epoch_apply_hash !== normalized.epoch_apply_hash ||
+          output?.economic_op_id !== normalized.economic_op_id ||
+          stableJson(output) !== stableJson(normalized.payload.output)) {
+        return new Error(
+          'Targeted payout preparation does not match its canonical epoch plan.'
+        );
+      }
+    }
+    if (normalized.rail === 'tnk') {
+      const payment = await this.canonicalTnkPaymentConfig();
+      if (payment instanceof Error) return payment;
+      if (normalized.payload.network !== payment.network ||
+          normalized.payload.treasury_from !== payment.treasury_address) {
+        return new Error(
+          'Targeted TNK preparation source does not match payment config.'
+        );
+      }
+    }
+    if (normalized.rail === 'tap') {
+      const params = await this.activeParamsAt(normalized.prepared_at, ['fee_bps']);
+      const split = this.targetedTapPayoutSplit(params.fee_bps);
+      if (split instanceof Error) return split;
+      if (normalized.payload.fee_bps !== split.fee_bps ||
+          normalized.payload.tap_burn_bps !== split.tap_burn_bps ||
+          normalized.payload.provider_share_bps !== split.provider_share_bps) {
+        return new Error(
+          'Targeted TAP preparation does not match the fixed on-chain split.'
+        );
+      }
+    }
+    const recordKey = this.payoutPreparationRecordKey(
+      normalized.rail,
+      normalized.economic_op_id
+    );
+    const record = {
+      type: 'targeted_payout_preparation',
+      ...normalized,
+      consumed: false,
+      consumed_by: null,
+      prepared_at_tx: this.tx,
+    };
+    const existing = await this.get(recordKey);
+    if (existing !== null) {
+      if (stableJson(existing) === stableJson(record)) {
+        return {
+          ok: true,
+          op: 'targetedPayoutPreparation',
+          rail: normalized.rail,
+          economic_op_id: normalized.economic_op_id,
+          idempotent: true,
+        };
+      }
+      return new Error('Targeted payout preparation economic operation already exists.');
+    }
+    let liabilityState = null;
+    if (normalized.liability !== null) {
+      liabilityState = await this.validatePayoutPreparationLiability(normalized);
+      if (liabilityState instanceof Error) return liabilityState;
+      const lockKey = this.payoutPreparationLiabilityLockKey(
+        normalized.rail,
+        normalized.liability
+      );
+      if ((await this.get(lockKey)) !== null) {
+        return new Error('Targeted payout liability watermark already has a preparation.');
+      }
+    }
+    for (const effectId of normalized.external_effect_ids) {
+      if ((await this.get(
+        this.payoutPreparationEffectLockKey(normalized.rail, effectId)
+      )) !== null) {
+        return new Error('Targeted payout external effect id already has a preparation.');
+      }
+    }
+    if (normalized.liability !== null) {
+      await this.put(
+        this.payoutPreparationLiabilityLockKey(normalized.rail, normalized.liability),
+        {
+          economic_op_id: normalized.economic_op_id,
+          rail: normalized.rail,
+          provider: normalized.liability.provider,
+          payout_revision: normalized.liability.payout_revision,
+          paid_cum_au_before: normalized.liability.paid_cum_au_before,
+          prepared_at: this.tx,
+        }
+      );
+      await this.put(liabilityState.tail_key, {
+        economic_op_id: normalized.economic_op_id,
+        paid_cum_au_before: normalized.liability.aggregate_paid_cum_au_before,
+        paid_cum_au_after: liabilityState.paid_cum_au_after,
+        consumed: false,
+        updated_at: this.tx,
+      });
+    }
+    for (const effectId of normalized.external_effect_ids) {
+      await this.put(this.payoutPreparationEffectLockKey(normalized.rail, effectId), {
+        economic_op_id: normalized.economic_op_id,
+        effect_id: effectId,
+        consumed: false,
+        updated_at: this.tx,
+      });
+    }
+    await this.put(recordKey, record);
+    return {
+      ok: true,
+      op: 'targetedPayoutPreparation',
+      rail: normalized.rail,
+      economic_op_id: normalized.economic_op_id,
+      idempotent: false,
+    };
+  }
+
+  async requireTargetedPayoutAdminSignature(value, label) {
+    const admin = await this.get('admin');
+    if (value.admin !== admin || this.address !== admin) {
+      return new Error(`${label} requires canonical admin authority.`);
+    }
+    const verify = this.protocol?.peer?.wallet?.verify;
+    if (typeof verify !== 'function' ||
+        verify.call(
+          this.protocol.peer.wallet,
+          value.admin_sig,
+          targetedPayoutControlMessage(value),
+          admin
+        ) !== true) {
+      return new Error(`Invalid ${label.toLowerCase()} admin signature.`);
+    }
+    return null;
+  }
+
+  targetedPayoutEpochPlanRecordKey(rail, epoch) {
+    return `payout/epoch-plan/${rail}/${epoch}`;
+  }
+
+  targetedPayoutOutputRecordKey(rail, epoch, economicOpId) {
+    return `settle/targeted/${rail}/${epoch}/output/${economicOpId}`;
+  }
+
+  targetedPayoutEpochCloseRecordKey(rail, epoch) {
+    return `settle/targeted/${rail}/${epoch}`;
+  }
+
+  targetedFiatAttemptRecordKey(economicOpId, attemptId) {
+    return `payout/attempt/fiat/${economicOpId}/${attemptId}`;
+  }
+
+  targetedFiatAttemptTailKey(economicOpId) {
+    return `payout/attempt/fiat/${economicOpId}/latest`;
+  }
+
+  targetedFiatAttemptEffectKey(effectId) {
+    return `payout/attempt-effect/fiat/${effectId}`;
+  }
+
+  normalizeTargetedPayoutPlanOutput(rail, output, expectedIndex) {
+    if (!output || typeof output !== 'object' || Array.isArray(output) ||
+        !this.isHexBytes(output.economic_op_id, 32) ||
+        output.economic_op_id !== output.economic_op_id.toLowerCase() ||
+        output.output_index !== expectedIndex) {
+      return new Error('Invalid targeted payout epoch output identity.');
+    }
+    const {
+      economic_op_id: economicOpId,
+      output_index: outputIndex,
+      ...economicOutput
+    } = output;
+    let normalized;
+    if (rail === 'tnk') {
+      const allowed = economicOutput.role === 'provider'
+        ? [
+            'role',
+            'provider',
+            'payout_revision',
+            'to',
+            'paid_cum_au_before',
+            'aggregate_paid_cum_au_before',
+            'au',
+            'tnk_e18',
+          ]
+        : ['role', 'to', 'au', 'tnk_e18'];
+      const shapeError = this.validateExactObjectKeys(
+        economicOutput,
+        allowed,
+        'targeted TNK epoch output'
+      );
+      if (shapeError) return shapeError;
+      if (economicOutput.role === 'provider') {
+        if (!this.isHexBytes(economicOutput.provider, 32) ||
+            economicOutput.provider !== economicOutput.provider.toLowerCase() ||
+            !this.isHexBytes(economicOutput.payout_revision, 32) ||
+            economicOutput.payout_revision !== economicOutput.payout_revision.toLowerCase()) {
+          return new Error('Invalid targeted TNK epoch provider identity.');
+        }
+        const paidCumAuBefore = this.normalizeAu(
+          economicOutput.paid_cum_au_before,
+          'targeted TNK epoch liability watermark',
+          { allowZero: true }
+        );
+        const aggregatePaidCumAuBefore = this.normalizeAu(
+          economicOutput.aggregate_paid_cum_au_before,
+          'targeted TNK epoch aggregate watermark',
+          { allowZero: true }
+        );
+        if (paidCumAuBefore instanceof Error ||
+            aggregatePaidCumAuBefore instanceof Error) {
+          return new Error('Invalid targeted TNK epoch output watermark.');
+        }
+        normalized = this.normalizeTargetedTnkSettlementOutput(economicOutput);
+        if (normalized instanceof Error) return normalized;
+        normalized = {
+          ...normalized,
+          payout_revision: economicOutput.payout_revision,
+          paid_cum_au_before: paidCumAuBefore,
+          aggregate_paid_cum_au_before: aggregatePaidCumAuBefore,
+        };
+      } else if (economicOutput.role === 'operator_fee') {
+        normalized = this.normalizeTargetedTnkSettlementOutput(economicOutput);
+        if (normalized instanceof Error) return normalized;
+      } else {
+        return new Error('Invalid targeted TNK epoch output role.');
+      }
+    } else if (rail === 'fiat') {
+      normalized = this.normalizeTargetedFiatPreparationOutput(economicOutput);
+      if (normalized instanceof Error) return normalized;
+    } else {
+      return new Error('Targeted payout epoch plans support only fiat and TNK.');
+    }
+    const result = {
+      economic_op_id: economicOpId,
+      output_index: outputIndex,
+      ...normalized,
+    };
+    return stableJson(result) === stableJson(output)
+      ? result
+      : new Error('Targeted payout epoch output must be canonical.');
+  }
+
+  normalizeTargetedPayoutCarry(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'provider',
+        'payout_revision',
+        'liability_au',
+        'held_au',
+        'payable_au',
+        'payout_min_au',
+        'reason',
+      ],
+      'targeted payout epoch carry'
+    );
+    if (shapeError) return shapeError;
+    if (!this.isHexBytes(value.provider, 32) ||
+        value.provider !== value.provider.toLowerCase() ||
+        !this.isHexBytes(value.payout_revision, 32) ||
+        value.payout_revision !== value.payout_revision.toLowerCase() ||
+        !['held', 'below_payout_minimum'].includes(value.reason)) {
+      return new Error('Invalid targeted payout epoch carry identity.');
+    }
+    const liabilityAu = this.normalizeAu(
+      value.liability_au,
+      'targeted payout carry liability',
+      { allowZero: false }
+    );
+    const heldAu = this.normalizeAu(
+      value.held_au,
+      'targeted payout carry held amount',
+      { allowZero: true }
+    );
+    const payableAu = this.normalizeAu(
+      value.payable_au,
+      'targeted payout carry payable amount',
+      { allowZero: true }
+    );
+    const payoutMinAu = this.normalizeAu(
+      value.payout_min_au,
+      'targeted payout carry minimum',
+      { allowZero: true }
+    );
+    if ([liabilityAu, heldAu, payableAu, payoutMinAu]
+      .some((entry) => entry instanceof Error)) {
+      return new Error('Invalid targeted payout epoch carry amount.');
+    }
+    const classified = this.safeAddAu(heldAu, payableAu);
+    if (classified instanceof Error ||
+        classified !== liabilityAu ||
+        (value.reason === 'held' &&
+          (this.isZeroAu(heldAu) || !this.isZeroAu(payableAu))) ||
+        (value.reason === 'below_payout_minimum' &&
+          (this.isZeroAu(payableAu) ||
+            this.compareAu(payableAu, payoutMinAu) >= 0))) {
+      return new Error('Targeted payout epoch carry classification is invalid.');
+    }
+    return {
+      provider: value.provider,
+      payout_revision: value.payout_revision,
+      liability_au: liabilityAu,
+      held_au: heldAu,
+      payable_au: payableAu,
+      payout_min_au: payoutMinAu,
+      reason: value.reason,
+    };
+  }
+
+  async normalizeTargetedPayoutEpochValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'contract_version',
+        'rail',
+        'epoch',
+        'at',
+        'epoch_apply_hash',
+        'snapshot_signed_length',
+        'outcome',
+        'outputs',
+        'carry',
+        'outputs_root',
+        'carry_root',
+        'plan_root',
+        'admin',
+        'admin_sig',
+      ],
+      'targeted payout epoch plan'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'prepare_targeted_payout_epoch' ||
+        value.contract_version !== CONTRACT_VERSION ||
+        !['fiat', 'tnk'].includes(value.rail) ||
+        !Number.isSafeInteger(value.epoch) ||
+        value.epoch < 1 ||
+        !Number.isSafeInteger(value.at) ||
+        value.at < 0 ||
+        !this.isHexBytes(value.epoch_apply_hash, 32) ||
+        value.epoch_apply_hash !== value.epoch_apply_hash.toLowerCase() ||
+        !Number.isSafeInteger(value.snapshot_signed_length) ||
+        value.snapshot_signed_length < 1 ||
+        !['payouts', 'carry', 'no_work'].includes(value.outcome) ||
+        !Array.isArray(value.outputs) ||
+        !Array.isArray(value.carry) ||
+        !this.isHexBytes(value.outputs_root, 32) ||
+        value.outputs_root !== value.outputs_root.toLowerCase() ||
+        !this.isHexBytes(value.carry_root, 32) ||
+        value.carry_root !== value.carry_root.toLowerCase() ||
+        !this.isHexBytes(value.plan_root, 32) ||
+        value.plan_root !== value.plan_root.toLowerCase() ||
+        !this.isHexBytes(value.admin, 32) ||
+        value.admin !== value.admin.toLowerCase() ||
+        !this.isHexBytes(value.admin_sig, 64)) {
+      return new Error('Invalid targeted payout epoch plan.');
+    }
+    const outputs = value.outputs.map((output, index) =>
+      this.normalizeTargetedPayoutPlanOutput(value.rail, output, index)
+    );
+    const outputError = outputs.find((output) => output instanceof Error);
+    if (outputError) return outputError;
+    const economicIds = new Set(outputs.map((output) => output.economic_op_id));
+    if (economicIds.size !== outputs.length) {
+      return new Error('Targeted payout epoch output identities must be unique.');
+    }
+    if (outputs.filter((output) => output.role === 'operator_fee').length > 1) {
+      return new Error('Targeted payout epoch may contain only one operator output.');
+    }
+    for (let index = 1; index < outputs.length; index += 1) {
+      const left = outputs[index - 1];
+      const right = outputs[index];
+      const order = left.role === right.role
+        ? left.role === 'provider'
+          ? compareCodepoint(left.provider, right.provider) ||
+            compareCodepoint(left.payout_revision, right.payout_revision)
+          : compareCodepoint(left.economic_op_id, right.economic_op_id)
+        : left.role === 'provider' ? -1 : 1;
+      if (order >= 0) {
+        return new Error('Targeted payout epoch outputs are not canonically ordered.');
+      }
+    }
+    const carry = value.carry.map((entry) => this.normalizeTargetedPayoutCarry(entry));
+    const carryError = carry.find((entry) => entry instanceof Error);
+    if (carryError) return carryError;
+    carry.sort((left, right) =>
+      compareCodepoint(left.provider, right.provider) ||
+      compareCodepoint(left.payout_revision, right.payout_revision)
+    );
+    if (stableJson(carry) !== stableJson(value.carry) ||
+        new Set(carry.map((entry) =>
+          `${entry.provider}/${entry.payout_revision}`
+        )).size !== carry.length) {
+      return new Error('Targeted payout epoch carries must be canonical and unique.');
+    }
+    const plannedLiabilities = new Set(
+      outputs
+        .filter((output) => output.role === 'provider')
+        .map((output) => `${output.provider}/${output.payout_revision}`)
+    );
+    if (carry.some((entry) =>
+      plannedLiabilities.has(`${entry.provider}/${entry.payout_revision}`)
+    )) {
+      return new Error('Targeted payout liability cannot be both payable and carried.');
+    }
+    const expectedOutcome = outputs.length > 0
+      ? 'payouts'
+      : carry.length > 0 ? 'carry' : 'no_work';
+    if (value.outcome !== expectedOutcome) {
+      return new Error('Targeted payout epoch outcome does not match its work.');
+    }
+    const outputsRoot = await this.opaqueHash(
+      'mayhem-targeted-payout-epoch-outputs-v1',
+      { rail: value.rail, epoch: value.epoch, outputs }
+    );
+    const carryRoot = await this.opaqueHash(
+      'mayhem-targeted-payout-epoch-carry-v1',
+      { rail: value.rail, epoch: value.epoch, carry }
+    );
+    const planRoot = await this.opaqueHash(
+      'mayhem-targeted-payout-epoch-plan-v1',
+      {
+        rail: value.rail,
+        epoch: value.epoch,
+        at: value.at,
+        epoch_apply_hash: value.epoch_apply_hash,
+        snapshot_signed_length: value.snapshot_signed_length,
+        outcome: value.outcome,
+        outputs_root: outputsRoot,
+        carry_root: carryRoot,
+      }
+    );
+    if (value.outputs_root !== outputsRoot ||
+        value.carry_root !== carryRoot ||
+        value.plan_root !== planRoot) {
+      return new Error('Targeted payout epoch root mismatch.');
+    }
+    const normalized = {
+      op: 'prepare_targeted_payout_epoch',
+      contract_version: CONTRACT_VERSION,
+      rail: value.rail,
+      epoch: value.epoch,
+      at: value.at,
+      epoch_apply_hash: value.epoch_apply_hash,
+      snapshot_signed_length: value.snapshot_signed_length,
+      outcome: value.outcome,
+      outputs,
+      carry,
+      outputs_root: outputsRoot,
+      carry_root: carryRoot,
+      plan_root: planRoot,
+      admin: value.admin,
+      admin_sig: value.admin_sig.toLowerCase(),
+    };
+    return stableJson(normalized) === stableJson(value)
+      ? normalized
+      : new Error('Targeted payout epoch plan must be canonical.');
+  }
+
+  async validateTargetedPayoutEpochCompleteness(value, params) {
+    const index = await this.providerPayoutLiabilityIndex(value.rail);
+    if (index instanceof Error) return index;
+    const providerOutputs = new Map(
+      value.outputs
+        .filter((output) => output.role === 'provider')
+        .map((output) => [
+          `${output.provider}/${output.payout_revision}`,
+          output,
+        ])
+    );
+    const carries = new Map(value.carry.map((entry) => [
+      `${entry.provider}/${entry.payout_revision}`,
+      entry,
+    ]));
+    const classified = new Set();
+    const aggregateCursors = new Map();
+
+    for (const entry of index.entries) {
+      const identity = `${entry.provider}/${entry.payout_revision}`;
+      const liability = await this.get(
+        this.providerPayoutLiabilityKey(
+          entry.provider,
+          value.rail,
+          entry.payout_revision
+        )
+      );
+      if (!liability ||
+          liability.type !== 'provider_payout_liability' ||
+          liability.provider !== entry.provider ||
+          liability.rail !== value.rail ||
+          liability.revision !== entry.payout_revision ||
+          liability.updated_epoch > value.epoch) {
+        return new Error('Targeted payout liability index does not match canonical state.');
+      }
+      const liabilityError = this.guardianValidateEarningRecord(
+        liability,
+        entry.provider,
+        value.rail
+      );
+      if (liabilityError) return liabilityError;
+      const provider = await this.get(`prov/${entry.provider}`);
+      if (!provider ||
+          (provider.status !== 'active' && provider.status !== 'banned')) {
+        return new Error('Targeted payout indexed provider status is not payable.');
+      }
+      const binding = await this.get(
+        this.providerPayoutBindingFeatureKey(
+          value.rail,
+          entry.provider,
+          entry.payout_revision
+        )
+      );
+      if (!binding ||
+          binding.verified !== true ||
+          binding.provider !== entry.provider ||
+          binding.rail !== value.rail ||
+          binding.revision !== entry.payout_revision ||
+          binding.activation_epoch > value.epoch ||
+          binding.target !== liability.target ||
+          (binding.currency ?? null) !== (liability.currency ?? null) ||
+          (binding.chain_id ?? null) !== (liability.chain_id ?? null)) {
+        return new Error('Targeted payout indexed liability binding mismatch.');
+      }
+      const probeGate = await this.probeGateForEarning(
+        entry.provider,
+        liability,
+        params
+      );
+      if (probeGate instanceof Error) return probeGate;
+      const lockedEpochs = this.providerLockedEarningEpochs(provider, params);
+      if (lockedEpochs instanceof Error) return lockedEpochs;
+      const disputeGate = await this.providerHasOpenDispute(entry.provider);
+      if (disputeGate instanceof Error) return disputeGate;
+      const refreshed = this.refreshEarningHoldback(
+        liability,
+        value.epoch,
+        lockedEpochs,
+        probeGate,
+        disputeGate
+      );
+      if (refreshed instanceof Error) return refreshed;
+      const outstanding = this.safeSubAu(
+        refreshed.total_au,
+        refreshed.paid_cum_au
+      );
+      const payable = this.safeSubAu(outstanding, refreshed.held_au);
+      if (outstanding instanceof Error || payable instanceof Error) {
+        return new Error('Targeted payout canonical liability is invalid.');
+      }
+      const output = providerOutputs.get(identity) ?? null;
+      const carry = carries.get(identity) ?? null;
+      if (this.isZeroAu(outstanding)) {
+        if (output !== null || carry !== null) {
+          return new Error('Settled targeted payout liability must be omitted.');
+        }
+        continue;
+      }
+
+      const isPayable =
+        !this.isZeroAu(payable) &&
+        this.compareAu(payable, params.payout_min_au) >= 0;
+      if (!isPayable) {
+        const expectedCarry = {
+          provider: entry.provider,
+          payout_revision: entry.payout_revision,
+          liability_au: outstanding,
+          held_au: refreshed.held_au,
+          payable_au: payable,
+          payout_min_au: params.payout_min_au,
+          reason: this.isZeroAu(payable) ? 'held' : 'below_payout_minimum',
+        };
+        if (output !== null ||
+            carry === null ||
+            stableJson(carry) !== stableJson(expectedCarry)) {
+          return new Error(
+            'Targeted payout plan must explicitly carry every held or below-minimum liability.'
+          );
+        }
+        classified.add(identity);
+        continue;
+      }
+
+      if (output === null || carry !== null ||
+          output.to !== binding.target ||
+          output.paid_cum_au_before !== refreshed.paid_cum_au ||
+          (value.rail === 'tnk' && output.au !== payable) ||
+          (value.rail === 'fiat' &&
+            (output.liability_au !== payable ||
+              output.destination_currency !== binding.currency))) {
+        return new Error(
+          'Targeted payout plan must include every payable canonical liability exactly.'
+        );
+      }
+      let aggregate = aggregateCursors.get(entry.provider);
+      if (!aggregate) {
+        const earning = await this.earningRecord(entry.provider, value.rail);
+        if (earning instanceof Error) return earning;
+        const earningError = this.guardianValidateEarningRecord(
+          earning,
+          entry.provider,
+          value.rail
+        );
+        if (earningError) return earningError;
+        const aggregateProbeGate = await this.probeGateForEarning(
+          entry.provider,
+          earning,
+          params
+        );
+        if (aggregateProbeGate instanceof Error) return aggregateProbeGate;
+        const refreshedEarning = this.refreshEarningHoldback(
+          earning,
+          value.epoch,
+          lockedEpochs,
+          aggregateProbeGate,
+          disputeGate
+        );
+        if (refreshedEarning instanceof Error) return refreshedEarning;
+        aggregate = { paid_cum_au: refreshedEarning.paid_cum_au };
+      }
+      if (output.aggregate_paid_cum_au_before !== aggregate.paid_cum_au) {
+        return new Error('Targeted payout aggregate paid watermark mismatch.');
+      }
+      const settledAu = value.rail === 'fiat' ? output.paid_au : output.au;
+      const nextPaid = this.safeAddAu(aggregate.paid_cum_au, settledAu);
+      if (nextPaid instanceof Error) return nextPaid;
+      aggregateCursors.set(entry.provider, { paid_cum_au: nextPaid });
+      classified.add(identity);
+    }
+
+    if (classified.size !== carries.size + providerOutputs.size) {
+      return new Error(
+        'Targeted payout plan contains a liability absent from the canonical index.'
+      );
+    }
+
+    const operatorOutputs = value.outputs.filter(
+      (output) => output.role === 'operator_fee'
+    );
+    const fee = await this.feeCumRecord(value.rail);
+    if (fee instanceof Error) return fee;
+    const feeError = this.guardianValidateFeeRecord(fee, value.rail);
+    if (feeError) return feeError;
+    const payableFee = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
+    if (payableFee instanceof Error) return payableFee;
+    if (this.isZeroAu(payableFee)) {
+      if (operatorOutputs.length !== 0) {
+        return new Error('Targeted payout plan includes a nonexistent operator fee.');
+      }
+    } else if (
+      operatorOutputs.length !== 1 ||
+      (value.rail === 'tnk' && operatorOutputs[0].au !== payableFee) ||
+      (value.rail === 'fiat' &&
+        operatorOutputs[0].liability_au !== payableFee)
+    ) {
+      return new Error(
+        'Targeted payout plan must include the complete canonical operator fee.'
+      );
+    }
+    return null;
+  }
+
+  async applyTargetedPayoutEpochFeature(key, value) {
+    const normalized = await this.normalizeTargetedPayoutEpochValue(value);
+    if (normalized instanceof Error) return normalized;
+    const expectedKey = await this.targetedPayoutEpochFeatureKey(normalized);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return new Error('Invalid targeted payout epoch feature key.');
+    const adminError = await this.requireTargetedPayoutAdminSignature(
+      normalized,
+      'Targeted payout epoch plan'
+    );
+    if (adminError) return adminError;
+    const applyAnchor = await this.requireEpochApplyAnchor(
+      normalized.epoch,
+      normalized.epoch_apply_hash,
+      'Targeted payout epoch plan'
+    );
+    if (applyAnchor instanceof Error) return applyAnchor;
+    const recordKey = this.targetedPayoutEpochPlanRecordKey(
+      normalized.rail,
+      normalized.epoch
+    );
+    const existing = await this.get(recordKey);
+    if (existing !== null) {
+      if (existing.plan_root === normalized.plan_root &&
+          stableJson(existing.value) === stableJson(normalized)) {
+        return {
+          ok: true,
+          op: 'targetedPayoutEpochPrepared',
+          rail: normalized.rail,
+          epoch: normalized.epoch,
+          plan_root: normalized.plan_root,
+          idempotent: true,
+        };
+      }
+      return new Error('Targeted payout epoch plan already exists.');
+    }
+    const applyState = await this.epochApplyStateRecord();
+    if (applyState.updated_epoch !== normalized.epoch ||
+        applyState.last_apply_hash !== normalized.epoch_apply_hash ||
+        (applyState.pending_epoch ?? null) !== null) {
+      return new Error(
+        'Targeted payout epoch plan must freeze the latest completed canonical apply.'
+      );
+    }
+    const params = await this.activeParamsAt(
+      normalized.at,
+      [
+        normalized.rail === 'tnk'
+          ? 'max_tnk_settlement_outputs'
+          : 'max_fiat_settlement_outputs',
+        'payout_min_au',
+        'holdback_epochs',
+        'challenge_epochs',
+        'canary_probe_holdback_bps',
+        'canary_probe_release_min_passes',
+      ]
+    );
+    const maxOutputs = normalized.rail === 'tnk'
+      ? params.max_tnk_settlement_outputs
+      : params.max_fiat_settlement_outputs;
+    if (normalized.outputs.length > maxOutputs) {
+      return new Error('Targeted payout epoch output count exceeds limit.');
+    }
+    const completenessError = await this.validateTargetedPayoutEpochCompleteness(
+      normalized,
+      params
+    );
+    if (completenessError) return completenessError;
+    await this.put(recordKey, {
+      type: 'targeted_payout_epoch_plan',
+      rail: normalized.rail,
+      epoch: normalized.epoch,
+      plan_root: normalized.plan_root,
+      value: normalized,
+      prepared_at: this.tx,
+    });
+    return {
+      ok: true,
+      op: 'targetedPayoutEpochPrepared',
+      rail: normalized.rail,
+      epoch: normalized.epoch,
+      plan_root: normalized.plan_root,
+      idempotent: false,
+    };
+  }
+
+  normalizeTargetedFiatAttemptRequest(request) {
+    const shapeError = this.validateExactObjectKeys(
+      request,
+      [
+        'processor',
+        'kind',
+        'destination',
+        'source_currency',
+        'source_amount_minor',
+        'destination_currency',
+        'destination_amount_min_minor',
+        'destination_amount_max_minor',
+        'fx_quote_id',
+        'fx_quote_hash',
+        'transfer_group',
+        'metadata_hash',
+      ],
+      'targeted fiat attempt request'
+    );
+    if (shapeError) return shapeError;
+    const sourceCurrency = this.normalizeFiatCurrency(request.source_currency);
+    const sourceAmountMinor = this.normalizeFiatMinor(request.source_amount_minor);
+    if (request.processor !== 'stripe' ||
+        !['stripe_transfer', 'platform_balance'].includes(request.kind) ||
+        !this.isSafeKeyPart(request.destination) ||
+        sourceCurrency instanceof Error ||
+        sourceCurrency !== request.source_currency ||
+        sourceAmountMinor instanceof Error ||
+        sourceAmountMinor !== request.source_amount_minor ||
+        !this.isHexBytes(request.metadata_hash, 32) ||
+        request.metadata_hash !== request.metadata_hash.toLowerCase()) {
+      return new Error('Invalid targeted fiat attempt request.');
+    }
+    if (request.kind === 'platform_balance') {
+      if (request.destination_currency !== null ||
+          request.destination_amount_min_minor !== null ||
+          request.destination_amount_max_minor !== null ||
+          request.fx_quote_id !== null ||
+          request.fx_quote_hash !== null ||
+          request.transfer_group !== null) {
+        return new Error('Platform-balance fiat attempt must not contain Stripe transfer terms.');
+      }
+      return {
+        processor: 'stripe',
+        kind: 'platform_balance',
+        destination: request.destination,
+        source_currency: sourceCurrency,
+        source_amount_minor: sourceAmountMinor,
+        destination_currency: null,
+        destination_amount_min_minor: null,
+        destination_amount_max_minor: null,
+        fx_quote_id: null,
+        fx_quote_hash: null,
+        transfer_group: null,
+        metadata_hash: request.metadata_hash,
+      };
+    }
+    const destinationCurrency = this.normalizeFiatCurrency(request.destination_currency);
+    const destinationMin = this.normalizeFiatMinor(request.destination_amount_min_minor);
+    const destinationMax = this.normalizeFiatMinor(request.destination_amount_max_minor);
+    const expectedGroup = /^mayhem_fiat_epoch_[1-9][0-9]*_[0-9a-f]{16}$/;
+    if (destinationCurrency instanceof Error ||
+        destinationCurrency !== request.destination_currency ||
+        destinationMin instanceof Error ||
+        destinationMax instanceof Error ||
+        BigInt(destinationMax) < BigInt(destinationMin) ||
+        !expectedGroup.test(String(request.transfer_group || ''))) {
+      return new Error('Invalid targeted fiat attempt destination terms.');
+    }
+    const requiresQuote = sourceCurrency !== 'usd' || destinationCurrency !== 'usd';
+    if (requiresQuote) {
+      if (!/^fxq_[A-Za-z0-9._-]+$/.test(String(request.fx_quote_id || '')) ||
+          !this.isHexBytes(request.fx_quote_hash, 32) ||
+          request.fx_quote_hash !== request.fx_quote_hash.toLowerCase()) {
+        return new Error('Targeted fiat attempt requires a canonical FX quote.');
+      }
+    } else if (request.fx_quote_id !== null || request.fx_quote_hash !== null) {
+      return new Error('Direct USD fiat attempt must not contain an FX quote.');
+    }
+    return {
+      processor: 'stripe',
+      kind: 'stripe_transfer',
+      destination: request.destination,
+      source_currency: sourceCurrency,
+      source_amount_minor: sourceAmountMinor,
+      destination_currency: destinationCurrency,
+      destination_amount_min_minor: destinationMin,
+      destination_amount_max_minor: destinationMax,
+      fx_quote_id: request.fx_quote_id,
+      fx_quote_hash: request.fx_quote_hash,
+      transfer_group: request.transfer_group,
+      metadata_hash: request.metadata_hash,
+    };
+  }
+
+  async targetedFiatAttemptId(economicOpId, attemptNo, request) {
+    return await this.opaqueHash(
+      'mayhem-targeted-fiat-attempt-id-v1',
+      {
+        economic_op_id: economicOpId,
+        attempt_no: attemptNo,
+        request,
+      }
+    );
+  }
+
+  async targetedFiatAttemptIdempotencyKeyHash(attemptId) {
+    const digest = await blake3(b4a.from(stableJson({
+      domain: 'mayhem-targeted-fiat-idempotency-key-v1',
+      key: `mayhem:fiat:attempt:v1:${attemptId}`,
+    })));
+    return b4a.toString(digest, 'hex');
+  }
+
+  async normalizePrepareTargetedFiatAttemptValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'contract_version',
+        'rail',
+        'epoch',
+        'epoch_apply_hash',
+        'plan_root',
+        'economic_op_id',
+        'output_index',
+        'attempt_id',
+        'attempt_no',
+        'prepared_at',
+        'quote_expires_at',
+        'idempotency_key_hash',
+        'request_hash',
+        'request',
+        'admin',
+        'admin_sig',
+      ],
+      'targeted fiat attempt preparation'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'prepare_targeted_fiat_attempt' ||
+        value.contract_version !== CONTRACT_VERSION ||
+        value.rail !== 'fiat' ||
+        !Number.isSafeInteger(value.epoch) ||
+        value.epoch < 1 ||
+        !this.isHexBytes(value.epoch_apply_hash, 32) ||
+        value.epoch_apply_hash !== value.epoch_apply_hash.toLowerCase() ||
+        !this.isHexBytes(value.plan_root, 32) ||
+        value.plan_root !== value.plan_root.toLowerCase() ||
+        !this.isHexBytes(value.economic_op_id, 32) ||
+        value.economic_op_id !== value.economic_op_id.toLowerCase() ||
+        !Number.isSafeInteger(value.output_index) ||
+        value.output_index < 0 ||
+        !this.isHexBytes(value.attempt_id, 32) ||
+        value.attempt_id !== value.attempt_id.toLowerCase() ||
+        !Number.isSafeInteger(value.attempt_no) ||
+        value.attempt_no < 1 ||
+        !Number.isSafeInteger(value.prepared_at) ||
+        value.prepared_at < 0 ||
+        !this.isHexBytes(value.idempotency_key_hash, 32) ||
+        value.idempotency_key_hash !== value.idempotency_key_hash.toLowerCase() ||
+        !this.isHexBytes(value.request_hash, 32) ||
+        value.request_hash !== value.request_hash.toLowerCase() ||
+        !this.isHexBytes(value.admin, 32) ||
+        value.admin !== value.admin.toLowerCase() ||
+        !this.isHexBytes(value.admin_sig, 64)) {
+      return new Error('Invalid targeted fiat attempt preparation.');
+    }
+    const request = this.normalizeTargetedFiatAttemptRequest(value.request);
+    if (request instanceof Error) return request;
+    const expectedAttemptId = await this.targetedFiatAttemptId(
+      value.economic_op_id,
+      value.attempt_no,
+      request
+    );
+    if (value.attempt_id !== expectedAttemptId) {
+      return new Error('Targeted fiat attempt id does not match its canonical request.');
+    }
+    const expectedIdempotencyKeyHash =
+      await this.targetedFiatAttemptIdempotencyKeyHash(expectedAttemptId);
+    if (value.idempotency_key_hash !== expectedIdempotencyKeyHash) {
+      return new Error(
+        'Targeted fiat attempt idempotency key hash does not match its canonical attempt.'
+      );
+    }
+    if ((request.kind === 'stripe_transfer' &&
+          (!Number.isSafeInteger(value.quote_expires_at) ||
+            value.quote_expires_at <= value.prepared_at)) ||
+        (request.kind === 'platform_balance' && value.quote_expires_at !== null)) {
+      return new Error('Invalid targeted fiat attempt quote expiry.');
+    }
+    const requestHash = await this.opaqueHash(
+      'mayhem-targeted-fiat-attempt-request-v1',
+      {
+        economic_op_id: value.economic_op_id,
+        attempt_id: value.attempt_id,
+        attempt_no: value.attempt_no,
+        request,
+      }
+    );
+    if (requestHash !== value.request_hash) {
+      return new Error('Targeted fiat attempt request hash mismatch.');
+    }
+    const normalized = {
+      op: 'prepare_targeted_fiat_attempt',
+      contract_version: CONTRACT_VERSION,
+      rail: 'fiat',
+      epoch: value.epoch,
+      epoch_apply_hash: value.epoch_apply_hash,
+      plan_root: value.plan_root,
+      economic_op_id: value.economic_op_id,
+      output_index: value.output_index,
+      attempt_id: value.attempt_id,
+      attempt_no: value.attempt_no,
+      prepared_at: value.prepared_at,
+      quote_expires_at: value.quote_expires_at,
+      idempotency_key_hash: value.idempotency_key_hash.toLowerCase(),
+      request_hash: requestHash,
+      request,
+      admin: value.admin,
+      admin_sig: value.admin_sig.toLowerCase(),
+    };
+    return stableJson(normalized) === stableJson(value)
+      ? normalized
+      : new Error('Targeted fiat attempt preparation must be canonical.');
+  }
+
+  async applyTargetedFiatAttemptFeature(key, value) {
+    const normalized = await this.normalizePrepareTargetedFiatAttemptValue(value);
+    if (normalized instanceof Error) return normalized;
+    const expectedKey = await this.targetedFiatAttemptFeatureKey(normalized);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return new Error('Invalid targeted fiat attempt feature key.');
+    const adminError = await this.requireTargetedPayoutAdminSignature(
+      normalized,
+      'Targeted fiat attempt preparation'
+    );
+    if (adminError) return adminError;
+    const plan = await this.get(
+      this.targetedPayoutEpochPlanRecordKey('fiat', normalized.epoch)
+    );
+    const output = plan?.value?.outputs?.[normalized.output_index];
+    if (!plan ||
+        plan.plan_root !== normalized.plan_root ||
+        plan.value.epoch_apply_hash !== normalized.epoch_apply_hash ||
+        output?.economic_op_id !== normalized.economic_op_id) {
+      return new Error('Targeted fiat attempt does not match the canonical epoch plan.');
+    }
+    const preparation = await this.get(
+      this.payoutPreparationRecordKey('fiat', normalized.economic_op_id)
+    );
+    if (!preparation ||
+        preparation.consumed !== false ||
+        preparation.payload?.plan_root !== normalized.plan_root ||
+        preparation.payload?.output_index !== normalized.output_index ||
+        stableJson(preparation.payload?.output) !== stableJson(output)) {
+      return new Error('Targeted fiat attempt requires its unconsumed economic preparation.');
+    }
+    const expectedKind = output.role === 'provider'
+      ? 'stripe_transfer'
+      : 'platform_balance';
+    if (normalized.request.kind !== expectedKind ||
+        normalized.request.destination !== output.to ||
+        normalized.request.source_currency !== output.source_currency ||
+        normalized.request.source_amount_minor !== output.source_amount_minor ||
+        (output.role === 'provider' &&
+          (normalized.request.destination_currency !== output.destination_currency ||
+            normalized.request.destination_amount_min_minor !==
+              output.destination_amount_min_minor ||
+            normalized.request.destination_amount_max_minor !==
+              output.destination_amount_max_minor ||
+            normalized.request.transfer_group !==
+              `mayhem_fiat_epoch_${normalized.epoch}_${normalized.epoch_apply_hash.slice(0, 16)}`))) {
+      return new Error('Targeted fiat attempt request does not match its planned output.');
+    }
+    const recordKey = this.targetedFiatAttemptRecordKey(
+      normalized.economic_op_id,
+      normalized.attempt_id
+    );
+    const existing = await this.get(recordKey);
+    if (existing !== null) {
+      if (stableJson(existing.preparation) === stableJson(normalized)) {
+        return {
+          ok: true,
+          op: 'targetedFiatAttemptPrepared',
+          economic_op_id: normalized.economic_op_id,
+          attempt_id: normalized.attempt_id,
+          status: existing.status,
+          idempotent: true,
+        };
+      }
+      return new Error('Targeted fiat attempt identity already exists.');
+    }
+    const tailKey = this.targetedFiatAttemptTailKey(normalized.economic_op_id);
+    const tail = await this.get(tailKey);
+    if ((!tail && normalized.attempt_no !== 1) ||
+        (tail &&
+          (tail.status !== 'expired_pre_effect' ||
+            normalized.attempt_no !== tail.attempt_no + 1))) {
+      return new Error(
+        'Targeted fiat attempt may renew only after definitive pre-effect expiry.'
+      );
+    }
+    if ((await this.get(
+      `payout/attempt-idempotency/fiat/${normalized.idempotency_key_hash}`
+    )) !== null) {
+      return new Error('Targeted fiat attempt idempotency key was already used.');
+    }
+    if (normalized.request.fx_quote_id !== null &&
+        (await this.get(
+          `payout/attempt-quote/fiat/${normalized.request.fx_quote_id}`
+        )) !== null) {
+      return new Error('Targeted fiat attempt FX quote was already used.');
+    }
+    const record = {
+      type: 'targeted_fiat_attempt',
+      economic_op_id: normalized.economic_op_id,
+      attempt_id: normalized.attempt_id,
+      attempt_no: normalized.attempt_no,
+      status: 'prepared',
+      preparation: normalized,
+      result: null,
+      consumed: false,
+      consumed_by: null,
+      updated_at: this.tx,
+    };
+    await this.put(recordKey, record);
+    await this.put(tailKey, {
+      economic_op_id: normalized.economic_op_id,
+      attempt_id: normalized.attempt_id,
+      attempt_no: normalized.attempt_no,
+      status: 'prepared',
+      updated_at: this.tx,
+    });
+    await this.put(
+      `payout/attempt-idempotency/fiat/${normalized.idempotency_key_hash}`,
+      {
+        economic_op_id: normalized.economic_op_id,
+        attempt_id: normalized.attempt_id,
+        updated_at: this.tx,
+      }
+    );
+    if (normalized.request.fx_quote_id !== null) {
+      await this.put(
+        `payout/attempt-quote/fiat/${normalized.request.fx_quote_id}`,
+        {
+          economic_op_id: normalized.economic_op_id,
+          attempt_id: normalized.attempt_id,
+          quote_hash: normalized.request.fx_quote_hash,
+          updated_at: this.tx,
+        }
+      );
+    }
+    return {
+      ok: true,
+      op: 'targetedFiatAttemptPrepared',
+      economic_op_id: normalized.economic_op_id,
+      attempt_id: normalized.attempt_id,
+      status: 'prepared',
+      idempotent: false,
+    };
+  }
+
+  normalizeFinalizeTargetedFiatAttemptValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'contract_version',
+        'rail',
+        'epoch',
+        'economic_op_id',
+        'attempt_id',
+        'status',
+        'at',
+        'evidence',
+        'admin',
+        'admin_sig',
+      ],
+      'targeted fiat attempt finalization'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'finalize_targeted_fiat_attempt' ||
+        value.contract_version !== CONTRACT_VERSION ||
+        value.rail !== 'fiat' ||
+        !Number.isSafeInteger(value.epoch) ||
+        value.epoch < 1 ||
+        !this.isHexBytes(value.economic_op_id, 32) ||
+        value.economic_op_id !== value.economic_op_id.toLowerCase() ||
+        !this.isHexBytes(value.attempt_id, 32) ||
+        value.attempt_id !== value.attempt_id.toLowerCase() ||
+        !['succeeded', 'expired_pre_effect'].includes(value.status) ||
+        !Number.isSafeInteger(value.at) ||
+        value.at < 0 ||
+        !this.isHexBytes(value.admin, 32) ||
+        value.admin !== value.admin.toLowerCase() ||
+        !this.isHexBytes(value.admin_sig, 64)) {
+      return new Error('Invalid targeted fiat attempt finalization.');
+    }
+    let evidence;
+    if (value.status === 'succeeded') {
+      evidence = this.normalizeStripeTransferEvidence(
+        value.evidence,
+        'targeted fiat attempt success evidence',
+        { expectedAttemptId: value.attempt_id }
+      );
+      if (evidence instanceof Error) return evidence;
+    } else {
+      const expiryShape = this.validateExactObjectKeys(
+        value.evidence,
+        [
+          'fx_quote_id',
+          'fx_quote_hash',
+          'quote_expires_at',
+          'error_code',
+          'external_effect_absent',
+        ],
+        'targeted fiat attempt expiry evidence'
+      );
+      if (expiryShape) return expiryShape;
+      if (!/^fxq_[A-Za-z0-9._-]+$/.test(String(value.evidence.fx_quote_id || '')) ||
+          !this.isHexBytes(value.evidence.fx_quote_hash, 32) ||
+          !Number.isSafeInteger(value.evidence.quote_expires_at) ||
+          value.evidence.quote_expires_at < 0 ||
+          value.evidence.error_code !== 'fx_quote_expired' ||
+          value.evidence.external_effect_absent !== true) {
+        return new Error('Invalid targeted fiat attempt expiry evidence.');
+      }
+      evidence = stableValue(value.evidence);
+    }
+    const normalized = {
+      op: 'finalize_targeted_fiat_attempt',
+      contract_version: CONTRACT_VERSION,
+      rail: 'fiat',
+      epoch: value.epoch,
+      economic_op_id: value.economic_op_id,
+      attempt_id: value.attempt_id,
+      status: value.status,
+      at: value.at,
+      evidence,
+      admin: value.admin,
+      admin_sig: value.admin_sig.toLowerCase(),
+    };
+    return stableJson(normalized) === stableJson(value)
+      ? normalized
+      : new Error('Targeted fiat attempt finalization must be canonical.');
+  }
+
+  async applyFinalizeTargetedFiatAttemptFeature(key, value) {
+    const normalized = this.normalizeFinalizeTargetedFiatAttemptValue(value);
+    if (normalized instanceof Error) return normalized;
+    const expectedKey = await this.finalizeTargetedFiatAttemptFeatureKey(normalized);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) {
+      return new Error('Invalid targeted fiat attempt finalization key.');
+    }
+    const adminError = await this.requireTargetedPayoutAdminSignature(
+      normalized,
+      'Targeted fiat attempt finalization'
+    );
+    if (adminError) return adminError;
+    const recordKey = this.targetedFiatAttemptRecordKey(
+      normalized.economic_op_id,
+      normalized.attempt_id
+    );
+    const record = await this.get(recordKey);
+    if (!record ||
+        record.type !== 'targeted_fiat_attempt' ||
+        record.preparation.epoch !== normalized.epoch) {
+      return new Error('Targeted fiat attempt preparation not found.');
+    }
+    if (record.status !== 'prepared') {
+      if (record.status === normalized.status &&
+          stableJson(record.result) === stableJson(normalized)) {
+        return {
+          ok: true,
+          op: 'targetedFiatAttemptFinalized',
+          economic_op_id: normalized.economic_op_id,
+          attempt_id: normalized.attempt_id,
+          status: normalized.status,
+          idempotent: true,
+        };
+      }
+      return new Error('Targeted fiat attempt is already terminal.');
+    }
+    const request = record.preparation.request;
+    if (normalized.status === 'expired_pre_effect') {
+      if (request.kind !== 'stripe_transfer' ||
+          normalized.at < record.preparation.quote_expires_at ||
+          normalized.evidence.fx_quote_id !== request.fx_quote_id ||
+          normalized.evidence.fx_quote_hash !== request.fx_quote_hash ||
+          normalized.evidence.quote_expires_at !==
+            record.preparation.quote_expires_at) {
+        return new Error('Targeted fiat attempt expiry does not match its prepared quote.');
+      }
+    } else {
+      const transfer = normalized.evidence;
+      const expectedKind = request.kind;
+      if (transfer.kind !== expectedKind ||
+          transfer.destination !== request.destination ||
+          transfer.source_currency !== request.source_currency ||
+          transfer.source_amount_minor !== request.source_amount_minor ||
+          (expectedKind === 'stripe_transfer' &&
+            (transfer.destination_currency !== request.destination_currency ||
+              BigInt(transfer.destination_amount_minor) <
+                BigInt(request.destination_amount_min_minor) ||
+              BigInt(transfer.destination_amount_minor) >
+                BigInt(request.destination_amount_max_minor) ||
+              transfer.fx_quote_id !== request.fx_quote_id ||
+              transfer.fx_quote_hash !== request.fx_quote_hash ||
+              transfer.transfer_group !== request.transfer_group))) {
+        return new Error('Targeted fiat attempt result does not match its prepared request.');
+      }
+      const effectKey = this.targetedFiatAttemptEffectKey(transfer.ref);
+      const priorEffect = await this.get(effectKey);
+      if (priorEffect !== null) {
+        return new Error('Targeted fiat external effect was already finalized.');
+      }
+      await this.put(effectKey, {
+        economic_op_id: normalized.economic_op_id,
+        attempt_id: normalized.attempt_id,
+        effect_id: transfer.ref,
+        consumed: false,
+        updated_at: this.tx,
+      });
+    }
+    const terminal = {
+      ...record,
+      status: normalized.status,
+      result: normalized,
+      updated_at: this.tx,
+    };
+    await this.put(recordKey, terminal);
+    await this.put(this.targetedFiatAttemptTailKey(normalized.economic_op_id), {
+      economic_op_id: normalized.economic_op_id,
+      attempt_id: normalized.attempt_id,
+      attempt_no: record.attempt_no,
+      status: normalized.status,
+      updated_at: this.tx,
+    });
+    return {
+      ok: true,
+      op: 'targetedFiatAttemptFinalized',
+      economic_op_id: normalized.economic_op_id,
+      attempt_id: normalized.attempt_id,
+      status: normalized.status,
+      idempotent: false,
+    };
+  }
+
+  normalizeTargetedTnkOutputSettlementValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'contract_version',
+        'rail',
+        'epoch',
+        'at',
+        'epoch_apply_hash',
+        'plan_root',
+        'economic_op_id',
+        'output_index',
+        'preparation_id',
+        'external_effect_id',
+        'msb_transfer',
+        'admin',
+        'admin_sig',
+      ],
+      'targeted TNK output settlement'
+    );
+    if (shapeError) return shapeError;
+    const transfer = this.normalizeMsbTransferEvidence(
+      value.msb_transfer,
+      'targeted TNK output transfer'
+    );
+    if (transfer instanceof Error) return transfer;
+    if (value.op !== 'settle_targeted_tnk_output' ||
+        value.contract_version !== CONTRACT_VERSION ||
+        value.rail !== 'tnk' ||
+        !Number.isSafeInteger(value.epoch) ||
+        value.epoch < 1 ||
+        !Number.isSafeInteger(value.at) ||
+        value.at < 0 ||
+        !this.isHexBytes(value.epoch_apply_hash, 32) ||
+        value.epoch_apply_hash !== value.epoch_apply_hash.toLowerCase() ||
+        !this.isHexBytes(value.plan_root, 32) ||
+        value.plan_root !== value.plan_root.toLowerCase() ||
+        !this.isHexBytes(value.economic_op_id, 32) ||
+        value.economic_op_id !== value.economic_op_id.toLowerCase() ||
+        !Number.isSafeInteger(value.output_index) ||
+        value.output_index < 0 ||
+        value.preparation_id !== value.economic_op_id ||
+        !this.isHexBytes(value.external_effect_id, 32) ||
+        value.external_effect_id !== transfer.tx_hash ||
+        !this.isHexBytes(value.admin, 32) ||
+        value.admin !== value.admin.toLowerCase() ||
+        !this.isHexBytes(value.admin_sig, 64)) {
+      return new Error('Invalid targeted TNK output settlement.');
+    }
+    const normalized = {
+      op: 'settle_targeted_tnk_output',
+      contract_version: CONTRACT_VERSION,
+      rail: 'tnk',
+      epoch: value.epoch,
+      at: value.at,
+      epoch_apply_hash: value.epoch_apply_hash,
+      plan_root: value.plan_root,
+      economic_op_id: value.economic_op_id,
+      output_index: value.output_index,
+      preparation_id: value.preparation_id,
+      external_effect_id: value.external_effect_id,
+      msb_transfer: transfer,
+      admin: value.admin,
+      admin_sig: value.admin_sig.toLowerCase(),
+    };
+    return stableJson(normalized) === stableJson(value)
+      ? normalized
+      : new Error('Targeted TNK output settlement must be canonical.');
+  }
+
+  normalizeTargetedFiatOutputSettlementValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'contract_version',
+        'rail',
+        'epoch',
+        'at',
+        'epoch_apply_hash',
+        'plan_root',
+        'economic_op_id',
+        'output_index',
+        'preparation_id',
+        'attempt_id',
+        'stripe_transfer',
+        'admin',
+        'admin_sig',
+      ],
+      'targeted fiat output settlement'
+    );
+    if (shapeError) return shapeError;
+    const transfer = this.normalizeStripeTransferEvidence(
+      value.stripe_transfer,
+      'targeted fiat output transfer',
+      { expectedAttemptId: value.attempt_id }
+    );
+    if (transfer instanceof Error) return transfer;
+    if (value.op !== 'settle_targeted_fiat_output' ||
+        value.contract_version !== CONTRACT_VERSION ||
+        value.rail !== 'fiat' ||
+        !Number.isSafeInteger(value.epoch) ||
+        value.epoch < 1 ||
+        !Number.isSafeInteger(value.at) ||
+        value.at < 0 ||
+        !this.isHexBytes(value.epoch_apply_hash, 32) ||
+        value.epoch_apply_hash !== value.epoch_apply_hash.toLowerCase() ||
+        !this.isHexBytes(value.plan_root, 32) ||
+        value.plan_root !== value.plan_root.toLowerCase() ||
+        !this.isHexBytes(value.economic_op_id, 32) ||
+        value.economic_op_id !== value.economic_op_id.toLowerCase() ||
+        !Number.isSafeInteger(value.output_index) ||
+        value.output_index < 0 ||
+        value.preparation_id !== value.economic_op_id ||
+        !this.isHexBytes(value.attempt_id, 32) ||
+        value.attempt_id !== value.attempt_id.toLowerCase() ||
+        !this.isHexBytes(value.admin, 32) ||
+        value.admin !== value.admin.toLowerCase() ||
+        !this.isHexBytes(value.admin_sig, 64)) {
+      return new Error('Invalid targeted fiat output settlement.');
+    }
+    const normalized = {
+      op: 'settle_targeted_fiat_output',
+      contract_version: CONTRACT_VERSION,
+      rail: 'fiat',
+      epoch: value.epoch,
+      at: value.at,
+      epoch_apply_hash: value.epoch_apply_hash,
+      plan_root: value.plan_root,
+      economic_op_id: value.economic_op_id,
+      output_index: value.output_index,
+      preparation_id: value.preparation_id,
+      attempt_id: value.attempt_id,
+      stripe_transfer: transfer,
+      admin: value.admin,
+      admin_sig: value.admin_sig.toLowerCase(),
+    };
+    return stableJson(normalized) === stableJson(value)
+      ? normalized
+      : new Error('Targeted fiat output settlement must be canonical.');
+  }
+
+  async targetedPayoutPlannedOutput(value, rail) {
+    const plan = await this.get(
+      this.targetedPayoutEpochPlanRecordKey(rail, value.epoch)
+    );
+    const output = plan?.value?.outputs?.[value.output_index];
+    if (!plan ||
+        plan.plan_root !== value.plan_root ||
+        plan.value.epoch_apply_hash !== value.epoch_apply_hash ||
+        output?.economic_op_id !== value.economic_op_id) {
+      return new Error('Targeted output settlement does not match its epoch plan.');
+    }
+    return { plan, output };
+  }
+
+  async targetedPayoutPreparationForOutput(value, output, rail) {
+    const preparation = await this.get(
+      this.payoutPreparationRecordKey(rail, value.preparation_id)
+    );
+    if (!preparation ||
+        preparation.type !== 'targeted_payout_preparation' ||
+        preparation.consumed !== false ||
+        preparation.economic_op_id !== value.economic_op_id ||
+        preparation.epoch !== value.epoch ||
+        preparation.epoch_apply_hash !== value.epoch_apply_hash ||
+        preparation.output_index !== value.output_index ||
+        preparation.payload?.plan_root !== value.plan_root ||
+        stableJson(preparation.payload?.output) !== stableJson(output)) {
+      return new Error('Targeted output settlement requires its unconsumed preparation.');
+    }
+    return preparation;
+  }
+
+  async applyTargetedTnkOutputFeature(key, value) {
+    const normalized = this.normalizeTargetedTnkOutputSettlementValue(value);
+    if (normalized instanceof Error) return normalized;
+    const expectedKey = await this.targetedTnkOutputFeatureKey(normalized);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return new Error('Invalid targeted TNK output feature key.');
+    const adminError = await this.requireTargetedPayoutAdminSignature(
+      normalized,
+      'Targeted TNK output settlement'
+    );
+    if (adminError) return adminError;
+    const recordKey = this.targetedPayoutOutputRecordKey(
+      'tnk',
+      normalized.epoch,
+      normalized.economic_op_id
+    );
+    const existing = await this.get(recordKey);
+    if (existing !== null) {
+      if (stableJson(existing.value) === stableJson(normalized)) {
+        return {
+          ok: true,
+          op: 'targetedTnkOutputSettled',
+          epoch: normalized.epoch,
+          economic_op_id: normalized.economic_op_id,
+          idempotent: true,
+        };
+      }
+      return new Error('Targeted TNK output is already settled.');
+    }
+    const planned = await this.targetedPayoutPlannedOutput(normalized, 'tnk');
+    if (planned instanceof Error) return planned;
+    const preparation = await this.targetedPayoutPreparationForOutput(
+      normalized,
+      planned.output,
+      'tnk'
+    );
+    if (preparation instanceof Error) return preparation;
+    const transfer = normalized.msb_transfer;
+    const payload = preparation.payload;
+    if (preparation.external_effect_ids.length !== 1 ||
+        preparation.external_effect_ids[0] !== normalized.external_effect_id ||
+        payload.msb_tx_hash !== normalized.external_effect_id ||
+        payload.msb_payload?.tro?.tx !== normalized.external_effect_id ||
+        transfer.network !== payload.network ||
+        transfer.from !== payload.treasury_from ||
+        transfer.to !== planned.output.to ||
+        transfer.amount_e18 !== planned.output.tnk_e18) {
+      return new Error('Targeted TNK output evidence does not match its signed preparation.');
+    }
+    const rate = await this.guardianRequireHistoricalTnkRate(payload, normalized.at);
+    if (rate instanceof Error) return rate;
+    const expectedTnkE18 = this.auToTnkE18Ceil(
+      planned.output.au,
+      payload.rate_tnk_usd_au
+    );
+    if (expectedTnkE18 instanceof Error ||
+        expectedTnkE18.toString() !== planned.output.tnk_e18) {
+      return new Error('Targeted TNK output does not match its oracle rate.');
+    }
+    if ((await this.get(this.msbTransferSeenKey(transfer))) !== null) {
+      return new Error('Targeted TNK transfer was already consumed.');
+    }
+    const preparationReady = await this.validatePayoutPreparationConsumption(
+      [preparation]
+    );
+    if (preparationReady instanceof Error) return preparationReady;
+    if (planned.output.role === 'provider') {
+      const updates = await this.targetedPayoutSettlementUpdates(
+        [planned.output],
+        'tnk',
+        normalized.epoch,
+        normalized.at,
+        [transfer.tx_hash]
+      );
+      if (updates instanceof Error) return updates;
+      for (const update of updates.liabilityUpdates) {
+        await this.put(update.key, update.value);
+      }
+      for (const earning of updates.earningUpdates) {
+        await this.put(this.earningKey(earning.provider, 'tnk'), earning);
+      }
+    } else {
+      const fee = await this.feeCumRecord('tnk');
+      if (fee instanceof Error) return fee;
+      const payable = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
+      if (payable instanceof Error || payable !== planned.output.au) {
+        return new Error('Targeted TNK fee output does not match canonical fee state.');
+      }
+      const swept = this.safeAddAu(fee.swept_cum_au, planned.output.au);
+      if (swept instanceof Error) return swept;
+      const nextFee = {
+        ...fee,
+        swept_cum_au: swept,
+        updated_epoch: Math.max(fee.updated_epoch, normalized.epoch),
+        last_targeted_settlement_epoch: normalized.epoch,
+        last_targeted_settlement_transfer: transfer.tx_hash,
+      };
+      const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'tnk');
+      if (nextFeeError) return nextFeeError;
+      await this.put(this.feeCumKey('tnk'), nextFee);
+    }
+    await this.put(this.msbTransferSeenKey(transfer), {
+      rail: 'tnk',
+      purpose: 'targeted_output_settlement',
+      epoch: normalized.epoch,
+      economic_op_id: normalized.economic_op_id,
+      consumed_at: this.tx,
+    });
+    const preparationError = await this.consumePayoutPreparations(
+      [preparation],
+      recordKey
+    );
+    if (preparationError) return preparationError;
+    await this.put(recordKey, {
+      type: 'targeted_tnk_output_settlement',
+      rail: 'tnk',
+      epoch: normalized.epoch,
+      economic_op_id: normalized.economic_op_id,
+      value: normalized,
+      settled_at: this.tx,
+    });
+    return {
+      ok: true,
+      op: 'targetedTnkOutputSettled',
+      epoch: normalized.epoch,
+      economic_op_id: normalized.economic_op_id,
+      external_effect_id: normalized.external_effect_id,
+      idempotent: false,
+    };
+  }
+
+  async applyTargetedFiatOutputFeature(key, value) {
+    const normalized = this.normalizeTargetedFiatOutputSettlementValue(value);
+    if (normalized instanceof Error) return normalized;
+    const expectedKey = await this.targetedFiatOutputFeatureKey(normalized);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return new Error('Invalid targeted fiat output feature key.');
+    const adminError = await this.requireTargetedPayoutAdminSignature(
+      normalized,
+      'Targeted fiat output settlement'
+    );
+    if (adminError) return adminError;
+    const recordKey = this.targetedPayoutOutputRecordKey(
+      'fiat',
+      normalized.epoch,
+      normalized.economic_op_id
+    );
+    const existing = await this.get(recordKey);
+    if (existing !== null) {
+      if (stableJson(existing.value) === stableJson(normalized)) {
+        return {
+          ok: true,
+          op: 'targetedFiatOutputSettled',
+          epoch: normalized.epoch,
+          economic_op_id: normalized.economic_op_id,
+          idempotent: true,
+        };
+      }
+      return new Error('Targeted fiat output is already settled.');
+    }
+    const planned = await this.targetedPayoutPlannedOutput(normalized, 'fiat');
+    if (planned instanceof Error) return planned;
+    const preparation = await this.targetedPayoutPreparationForOutput(
+      normalized,
+      planned.output,
+      'fiat'
+    );
+    if (preparation instanceof Error) return preparation;
+    const attemptKey = this.targetedFiatAttemptRecordKey(
+      normalized.economic_op_id,
+      normalized.attempt_id
+    );
+    const attempt = await this.get(attemptKey);
+    const transfer = normalized.stripe_transfer;
+    if (!attempt ||
+        attempt.status !== 'succeeded' ||
+        attempt.consumed !== false ||
+        stableJson(attempt.result?.evidence) !== stableJson(transfer)) {
+      return new Error('Targeted fiat output requires a succeeded canonical attempt.');
+    }
+    const attemptEffectKey = this.targetedFiatAttemptEffectKey(transfer.ref);
+    const attemptEffect = await this.get(attemptEffectKey);
+    if (!attemptEffect ||
+        attemptEffect.economic_op_id !== normalized.economic_op_id ||
+        attemptEffect.attempt_id !== normalized.attempt_id ||
+        attemptEffect.consumed !== false) {
+      return new Error('Targeted fiat attempt effect lock mismatch.');
+    }
+    for (const seenKey of [
+      this.stripeTransferSeenKey(transfer),
+      this.stripeFxQuoteSeenKey(transfer),
+      this.stripeDestinationPaymentSeenKey(transfer),
+    ]) {
+      if (seenKey && (await this.get(seenKey)) !== null) {
+        return new Error('Targeted Stripe transfer evidence was already consumed.');
+      }
+    }
+    const preparationReady = await this.validatePayoutPreparationConsumption(
+      [preparation]
+    );
+    if (preparationReady instanceof Error) return preparationReady;
+    if (planned.output.role === 'provider') {
+      const updates = await this.targetedPayoutSettlementUpdates(
+        [planned.output],
+        'fiat',
+        normalized.epoch,
+        normalized.at,
+        [transfer.ref]
+      );
+      if (updates instanceof Error) return updates;
+      for (const update of updates.liabilityUpdates) {
+        await this.put(update.key, update.value);
+      }
+      for (const earning of updates.earningUpdates) {
+        await this.put(this.earningKey(earning.provider, 'fiat'), earning);
+      }
+    } else {
+      const fee = await this.feeCumRecord('fiat');
+      if (fee instanceof Error) return fee;
+      const payable = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
+      if (payable instanceof Error || payable !== planned.output.liability_au ||
+          planned.output.paid_au !== planned.output.liability_au) {
+        return new Error('Targeted fiat fee output does not match canonical fee state.');
+      }
+      const swept = this.safeAddAu(fee.swept_cum_au, planned.output.paid_au);
+      if (swept instanceof Error) return swept;
+      const nextFee = {
+        ...fee,
+        swept_cum_au: swept,
+        updated_epoch: Math.max(fee.updated_epoch, normalized.epoch),
+        last_targeted_settlement_epoch: normalized.epoch,
+        last_targeted_settlement_transfer: transfer.ref,
+      };
+      const nextFeeError = this.guardianValidateFeeRecord(nextFee, 'fiat');
+      if (nextFeeError) return nextFeeError;
+      await this.put(this.feeCumKey('fiat'), nextFee);
+    }
+    for (const seenKey of [
+      this.stripeTransferSeenKey(transfer),
+      this.stripeFxQuoteSeenKey(transfer),
+      this.stripeDestinationPaymentSeenKey(transfer),
+    ]) {
+      if (!seenKey) continue;
+      await this.put(seenKey, {
+        rail: 'fiat',
+        purpose: 'targeted_output_settlement',
+        epoch: normalized.epoch,
+        economic_op_id: normalized.economic_op_id,
+        consumed_at: this.tx,
+      });
+    }
+    const preparationError = await this.consumePayoutPreparations(
+      [preparation],
+      recordKey
+    );
+    if (preparationError) return preparationError;
+    await this.put(attemptKey, {
+      ...attempt,
+      consumed: true,
+      consumed_by: recordKey,
+      updated_at: this.tx,
+    });
+    await this.put(attemptEffectKey, {
+      ...attemptEffect,
+      consumed: true,
+      consumed_by: recordKey,
+      updated_at: this.tx,
+    });
+    await this.put(recordKey, {
+      type: 'targeted_fiat_output_settlement',
+      rail: 'fiat',
+      epoch: normalized.epoch,
+      economic_op_id: normalized.economic_op_id,
+      value: normalized,
+      settled_at: this.tx,
+    });
+    return {
+      ok: true,
+      op: 'targetedFiatOutputSettled',
+      epoch: normalized.epoch,
+      economic_op_id: normalized.economic_op_id,
+      external_effect_id: transfer.ref,
+      idempotent: false,
+    };
+  }
+
+  normalizeCloseTargetedPayoutEpochValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'contract_version',
+        'rail',
+        'epoch',
+        'at',
+        'epoch_apply_hash',
+        'plan_root',
+        'admin',
+        'admin_sig',
+      ],
+      'targeted payout epoch close'
+    );
+    if (shapeError) return shapeError;
+    if (value.op !== 'close_targeted_payout_epoch' ||
+        value.contract_version !== CONTRACT_VERSION ||
+        !['fiat', 'tnk'].includes(value.rail) ||
+        !Number.isSafeInteger(value.epoch) ||
+        value.epoch < 1 ||
+        !Number.isSafeInteger(value.at) ||
+        value.at < 0 ||
+        !this.isHexBytes(value.epoch_apply_hash, 32) ||
+        value.epoch_apply_hash !== value.epoch_apply_hash.toLowerCase() ||
+        !this.isHexBytes(value.plan_root, 32) ||
+        value.plan_root !== value.plan_root.toLowerCase() ||
+        !this.isHexBytes(value.admin, 32) ||
+        value.admin !== value.admin.toLowerCase() ||
+        !this.isHexBytes(value.admin_sig, 64)) {
+      return new Error('Invalid targeted payout epoch close.');
+    }
+    const normalized = {
+      op: 'close_targeted_payout_epoch',
+      contract_version: CONTRACT_VERSION,
+      rail: value.rail,
+      epoch: value.epoch,
+      at: value.at,
+      epoch_apply_hash: value.epoch_apply_hash,
+      plan_root: value.plan_root,
+      admin: value.admin,
+      admin_sig: value.admin_sig.toLowerCase(),
+    };
+    return stableJson(normalized) === stableJson(value)
+      ? normalized
+      : new Error('Targeted payout epoch close must be canonical.');
+  }
+
+  async applyCloseTargetedPayoutEpochFeature(key, value) {
+    const normalized = this.normalizeCloseTargetedPayoutEpochValue(value);
+    if (normalized instanceof Error) return normalized;
+    const expectedKey = await this.closeTargetedPayoutEpochFeatureKey(normalized);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return new Error('Invalid targeted payout epoch close key.');
+    const adminError = await this.requireTargetedPayoutAdminSignature(
+      normalized,
+      'Targeted payout epoch close'
+    );
+    if (adminError) return adminError;
+    const recordKey = this.targetedPayoutEpochCloseRecordKey(
+      normalized.rail,
+      normalized.epoch
+    );
+    const existing = await this.get(recordKey);
+    if (existing !== null) {
+      if (stableJson(existing.value) === stableJson(normalized)) {
+        return {
+          ok: true,
+          op: 'targetedPayoutEpochClosed',
+          rail: normalized.rail,
+          epoch: normalized.epoch,
+          idempotent: true,
+        };
+      }
+      return new Error('Targeted payout epoch is already closed.');
+    }
+    const plan = await this.get(
+      this.targetedPayoutEpochPlanRecordKey(normalized.rail, normalized.epoch)
+    );
+    if (!plan ||
+        plan.plan_root !== normalized.plan_root ||
+        plan.value.epoch_apply_hash !== normalized.epoch_apply_hash) {
+      return new Error('Targeted payout epoch close does not match its plan.');
+    }
+    for (const output of plan.value.outputs) {
+      const settled = await this.get(
+        this.targetedPayoutOutputRecordKey(
+          normalized.rail,
+          normalized.epoch,
+          output.economic_op_id
+        )
+      );
+      if (!settled ||
+          settled.economic_op_id !== output.economic_op_id ||
+          settled.value.plan_root !== normalized.plan_root) {
+        return new Error('Targeted payout epoch has unsettled planned outputs.');
+      }
+    }
+    await this.put(recordKey, {
+      type: 'targeted_payout_epoch_close',
+      rail: normalized.rail,
+      epoch: normalized.epoch,
+      plan_root: normalized.plan_root,
+      outcome: plan.value.outcome,
+      output_count: plan.value.outputs.length,
+      carry_count: plan.value.carry.length,
+      outputs_root: plan.value.outputs_root,
+      carry_root: plan.value.carry_root,
+      value: normalized,
+      closed_at: this.tx,
+    });
+    return {
+      ok: true,
+      op: 'targetedPayoutEpochClosed',
+      rail: normalized.rail,
+      epoch: normalized.epoch,
+      outcome: plan.value.outcome,
+      output_count: plan.value.outputs.length,
+      carry_count: plan.value.carry.length,
+      idempotent: false,
+    };
+  }
+
   async applyTargetedTnkSettlementFeature(key, value) {
     const expectedKey = await this.targetedTnkSettlementFeatureKey(value);
     if (expectedKey instanceof Error) return expectedKey;
@@ -3114,6 +6395,19 @@ class MayhemContract extends Contract {
     this.tx = key;
     try {
       return await this.targetedTnkSettlement(value);
+    } finally {
+      this.tx = previousTx;
+    }
+  }
+
+  async applyTargetedTapSettlementFeature(key, value) {
+    const expectedKey = await this.targetedTapSettlementFeatureKey(value);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return new Error('Invalid targeted TAP settlement key.');
+    const previousTx = this.tx;
+    this.tx = key;
+    try {
+      return await this.targetedTapSettlement(value);
     } finally {
       this.tx = previousTx;
     }
@@ -3553,6 +6847,38 @@ class MayhemContract extends Contract {
 
   spendHoldKey(user, rail, epoch) {
     return `hold/${rail}/${user}/${epoch}`;
+  }
+
+  targetedSpendHoldKey(user, rail) {
+    return `hold/targeted-outstanding/${rail}/${user}`;
+  }
+
+  receiptBillingKey(billingId) {
+    return `receipt/billing/${billingId}`;
+  }
+
+  receiptReservationKey(reservationId) {
+    return `receipt/reservation/${reservationId}`;
+  }
+
+  receiptReservationCloseKey(reservationId) {
+    return `receipt/reservation-close/${reservationId}`;
+  }
+
+  receiptHeadKey(billingId, billingAttempt) {
+    return `receipt/head/${billingId}/${billingAttempt}`;
+  }
+
+  receiptConsumedKey(billingId, billingAttempt) {
+    return `receipt/consumed/${billingId}/${billingAttempt}`;
+  }
+
+  receiptEpochIndexKey(epoch) {
+    return `receipt/epoch/${epoch}/index`;
+  }
+
+  receiptEpochPageKey(epoch, page) {
+    return `receipt/epoch/${epoch}/page/${page}`;
   }
 
   disputeOpenCountKey(opener) {
@@ -5313,6 +8639,9 @@ class MayhemContract extends Contract {
   }
 
   async epochApply() {
+    if (CONTRACT_VERSION >= 17) {
+      return new Error('Aggregate epoch_apply is disabled; use receipt-bound apply_targeted_epoch.');
+    }
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
 
@@ -5685,12 +9014,15 @@ class MayhemContract extends Contract {
       lastPage,
       applyHash,
       epochSeconds: params.epoch_seconds,
+      settledAt: this.value.at,
       reservationDebitTotals,
     });
     const previousChallengeError = await this.rememberCanaryChallengeAnchor(applyState);
     if (previousChallengeError) return previousChallengeError;
     await this.put('epoch/apply/state', nextApplyState);
     if (lastPage) {
+      const anchorError = await this.rememberEpochApplyAnchor(nextApplyState);
+      if (anchorError) return anchorError;
       const challengeError = await this.rememberCanaryChallengeAnchor(nextApplyState);
       if (challengeError) return challengeError;
     }
@@ -5796,7 +9128,7 @@ class MayhemContract extends Contract {
       'canary_probe_holdback_bps',
       'canary_probe_release_min_passes',
     ]);
-    if (value.debits.length + value.earnings.length > params.max_apply_batch) {
+    if (value.debits.length + value.earnings.length + allocations.length > params.max_apply_batch) {
       return new Error('Epoch apply batch exceeds max_apply_batch.');
     }
     if ((value.market_usage?.length ?? 0) > params.max_market_usage_entries) {
@@ -5834,8 +9166,78 @@ class MayhemContract extends Contract {
       return new Error('Epoch market usage demand must equal gross provider earnings.');
     }
 
+    const receiptIndex = this.normalizeReceiptEpochIndexMetadata(
+      value.receipt_index,
+      value.epoch
+    );
+    if (receiptIndex instanceof Error) return receiptIndex;
+    const currentReceiptIndex = this.normalizeReceiptEpochIndexMetadata(
+      await this.get(this.receiptEpochIndexKey(value.epoch)),
+      value.epoch
+    );
+    if (currentReceiptIndex instanceof Error) return currentReceiptIndex;
+    if (stableJson(currentReceiptIndex) !== stableJson(receiptIndex)) {
+      return new Error('Canonical receipt epoch index changed after the apply snapshot.');
+    }
+    const epochCommit = await this.get(`epoch/commit/${value.epoch}`);
+    if (!epochCommit ||
+        epochCommit.type !== 'epoch_commit' ||
+        epochCommit.epoch !== value.epoch ||
+        epochCommit.status !== 'provisional' ||
+        epochCommit.commit_hash !== value.epoch_commit_hash) {
+      return new Error('Matching provisional epoch commit required for targeted apply.');
+    }
+    if (epochCommit.totals?.use_count !== receiptIndex.count) {
+      return new Error('Epoch commit receipt count does not match the canonical receipt index.');
+    }
+
     const applyState = await this.epochApplyStateRecord();
-    const previousApplyHash = page === 0 ? null : applyState.last_apply_hash;
+    const replayPosition = this.isEpochApplyPagePositionReplay(
+      applyState,
+      value.epoch,
+      page,
+      lastPage
+    );
+    const previousApplyHash = replayPosition
+      ? (applyState.last_apply_previous_hash ?? null)
+      : page === 0
+        ? null
+        : applyState.last_apply_hash;
+    const expectedStatePrefix = replayPosition ? 'last_receipt' : 'pending_receipt';
+    if (replayPosition || page > 0) {
+      if (
+        applyState[`${expectedStatePrefix}_index_count`] !== receiptIndex.count ||
+        applyState[`${expectedStatePrefix}_index_revision`] !== receiptIndex.revision ||
+        applyState[`${expectedStatePrefix}_index_page_count`] !== receiptIndex.page_count ||
+        applyState[`${expectedStatePrefix}_index_updated_at`] !== receiptIndex.updated_at ||
+        applyState[`${expectedStatePrefix}_commit_hash`] !== value.epoch_commit_hash
+      ) {
+        return new Error('Paged targeted apply receipt snapshot changed between pages.');
+      }
+    }
+    let cumulativeAllocationCount;
+    if (replayPosition) {
+      cumulativeAllocationCount = applyState.last_receipt_allocation_count;
+    } else {
+      const priorAllocationCount = page === 0
+        ? 0
+        : applyState.pending_receipt_allocation_count;
+      if (!Number.isSafeInteger(priorAllocationCount) || priorAllocationCount < 0) {
+        return new Error('Paged targeted apply allocation count is missing.');
+      }
+      cumulativeAllocationCount = priorAllocationCount + allocations.length;
+    }
+    if (!Number.isSafeInteger(cumulativeAllocationCount) ||
+        cumulativeAllocationCount < 1 ||
+        cumulativeAllocationCount > receiptIndex.count) {
+      return new Error('Paged targeted apply allocation count exceeds the canonical receipt index.');
+    }
+    if (lastPage && cumulativeAllocationCount !== receiptIndex.count) {
+      return new Error('Last targeted apply page does not consume the complete canonical receipt index.');
+    }
+    if (!lastPage && cumulativeAllocationCount >= receiptIndex.count) {
+      return new Error('Non-final targeted apply page already consumes the complete canonical receipt index.');
+    }
     const normalized = {
       epoch: value.epoch,
       page,
@@ -5844,6 +9246,8 @@ class MayhemContract extends Contract {
       epoch_seconds: params.epoch_seconds,
       fee_bps: params.fee_bps,
       tap_burn_bps: TAP_BURN_BPS,
+      epoch_commit_hash: value.epoch_commit_hash,
+      receipt_index: receiptIndex,
       debits: this.mapRailEntriesForHash(debitMap, 'user', 'au'),
       earnings: this.mapRailEntriesForHash(grossEarningMap, 'provider', 'gross_au'),
       roots,
@@ -5880,12 +9284,25 @@ class MayhemContract extends Contract {
       }
       return result;
     }
+    const cadenceError = await this.validateEpochCadenceTime(
+      applyState,
+      value.epoch,
+      page,
+      value.at,
+      params.epoch_seconds
+    );
+    if (cadenceError) return cadenceError;
     const pageOrderError = this.validateEpochApplyPageOrder(applyState, value.epoch, page);
     if (pageOrderError) return pageOrderError;
     const reservationDebitTotals = this.nextReservationDebitTotals(applyState, value.epoch, page, debitMap);
     if (reservationDebitTotals instanceof Error) return reservationDebitTotals;
-    const reservationError = await this.validateEpochDebitReservations(value.epoch, reservationDebitTotals);
-    if (reservationError) return reservationError;
+    if (lastPage) {
+      const cumulativeDebitAu = this.sumRailAu(reservationDebitTotals, 'au');
+      if (cumulativeDebitAu instanceof Error) return cumulativeDebitAu;
+      if (this.compareAu(cumulativeDebitAu, epochCommit.totals.use_au) !== 0) {
+        return new Error('Targeted apply cumulative debit does not match the epoch commit.');
+      }
+    }
 
     const balances = new Map();
     for (const debit of debitMap.values()) {
@@ -6140,12 +9557,23 @@ class MayhemContract extends Contract {
       lastPage,
       applyHash,
       epochSeconds: params.epoch_seconds,
+      settledAt: value.at,
       reservationDebitTotals,
+      receiptApply: {
+        index_count: receiptIndex.count,
+        index_revision: receiptIndex.revision,
+        index_page_count: receiptIndex.page_count,
+        index_updated_at: receiptIndex.updated_at,
+        commit_hash: value.epoch_commit_hash,
+        allocation_count: cumulativeAllocationCount,
+      },
     });
     const previousChallengeError = await this.rememberCanaryChallengeAnchor(applyState);
     if (previousChallengeError) return previousChallengeError;
     await this.put('epoch/apply/state', nextApplyState);
     if (lastPage) {
+      const anchorError = await this.rememberEpochApplyAnchor(nextApplyState);
+      if (anchorError) return anchorError;
       const challengeError = await this.rememberCanaryChallengeAnchor(nextApplyState);
       if (challengeError) return challengeError;
     }
@@ -6262,10 +9690,33 @@ class MayhemContract extends Contract {
       return new Error('Empty epoch seal already exists.');
     }
 
+    const receiptIndex = await this.get(this.receiptEpochIndexKey(this.value.epoch));
+    if (receiptIndex !== null) {
+      if (receiptIndex.type !== 'canonical_receipt_epoch_index' ||
+          receiptIndex.epoch !== this.value.epoch ||
+          !Number.isSafeInteger(receiptIndex.count) ||
+          receiptIndex.count < 0 ||
+          !Number.isSafeInteger(receiptIndex.revision) ||
+          receiptIndex.revision < 0) {
+        return new Error('Canonical receipt epoch index is invalid.');
+      }
+      if (receiptIndex.count !== 0 || receiptIndex.revision !== 0) {
+        return new Error('Cannot seal an epoch empty while canonical receipts exist.');
+      }
+    }
+
     const notYetActiveAt = this.value.epoch * params.epoch_seconds;
     if (this.value.at < notYetActiveAt) {
       return new Error('Empty epoch seal is not active until the epoch window ends.');
     }
+    const cadenceError = await this.validateEpochCadenceTime(
+      applyState,
+      this.value.epoch,
+      0,
+      this.value.at,
+      params.epoch_seconds
+    );
+    if (cadenceError) return cadenceError;
     const pageOrderError = this.validateEpochApplyPageOrder(applyState, this.value.epoch, 0);
     if (pageOrderError) return pageOrderError;
 
@@ -6299,10 +9750,13 @@ class MayhemContract extends Contract {
       lastPage: true,
       applyHash: sealHash,
       epochSeconds: params.epoch_seconds,
+      settledAt: this.value.at,
     });
     const previousChallengeError = await this.rememberCanaryChallengeAnchor(applyState);
     if (previousChallengeError) return previousChallengeError;
     await this.put('epoch/apply/state', nextApplyState);
+    const anchorError = await this.rememberEpochApplyAnchor(nextApplyState);
+    if (anchorError) return anchorError;
     const challengeError = await this.rememberCanaryChallengeAnchor(nextApplyState);
     if (challengeError) return challengeError;
     const result = {
@@ -6979,6 +10433,15 @@ class MayhemContract extends Contract {
       posted_by: this.address,
       posted_by_role: 'admin',
     };
+    this._mayhemApplyStage = 'rate:contract:read-history';
+    const history = await this.get(this.tx);
+    if (history && stableJson(history) !== stableJson(record)) {
+      return new Error('TAP rate oracle history collision.');
+    }
+    if (!history) {
+      this._mayhemApplyStage = 'rate:contract:write-history';
+      await this.put(this.tx, record);
+    }
     this._mayhemApplyStage = 'rate:contract:write-latest';
     await this.put('tap/rate/latest', record);
     console.log('mayhem tapRateOracle', record);
@@ -7162,17 +10625,30 @@ class MayhemContract extends Contract {
     return `rail/seen/msb/${evidence.network}/${evidence.tx_hash}`;
   }
 
-  normalizeStripeTransferEvidence(value, label = 'Stripe settlement evidence') {
+  normalizeStripeTransferEvidence(
+    value,
+    label = 'Stripe settlement evidence',
+    { expectedAttemptId = null } = {}
+  ) {
     const providerTransfer = value?.kind === 'stripe_transfer';
+    const hasAttemptId = hasOwn(value, 'attempt_id');
     const hasFxQuoteId = providerTransfer && hasOwn(value, 'fx_quote_id');
     const hasFxQuoteHash = providerTransfer && hasOwn(value, 'fx_quote_hash');
     if (hasFxQuoteId !== hasFxQuoteHash) {
       return new Error(`${label} FX quote identity must be present or absent as a pair.`);
     }
+    if ((hasAttemptId &&
+          (!this.isHexBytes(value.attempt_id, 32) ||
+            value.attempt_id !== value.attempt_id.toLowerCase())) ||
+        (expectedAttemptId !== null &&
+          (!hasAttemptId || value.attempt_id !== expectedAttemptId))) {
+      return new Error(`${label} attempt id does not match its canonical attempt.`);
+    }
     const shapeError = this.validateExactObjectKeys(value, providerTransfer
       ? [
           'schema_version',
           'kind',
+          ...(hasAttemptId ? ['attempt_id'] : []),
           'ref',
           'destination',
           'source_currency',
@@ -7186,6 +10662,7 @@ class MayhemContract extends Contract {
       : [
           'schema_version',
           'kind',
+          ...(hasAttemptId ? ['attempt_id'] : []),
           'ref',
           'destination',
           'source_currency',
@@ -7226,6 +10703,7 @@ class MayhemContract extends Contract {
     if (!providerTransfer) return {
       schema_version: STRIPE_TRANSFER_EVIDENCE_VERSION,
       kind: 'platform_balance',
+      ...(hasAttemptId ? { attempt_id: value.attempt_id } : {}),
       ref: value.ref,
       destination: value.destination,
       source_currency: sourceCurrency,
@@ -7261,6 +10739,7 @@ class MayhemContract extends Contract {
     const normalized = {
       schema_version: STRIPE_TRANSFER_EVIDENCE_VERSION,
       kind: 'stripe_transfer',
+      ...(hasAttemptId ? { attempt_id: value.attempt_id } : {}),
       ref: value.ref,
       destination: value.destination,
       source_currency: sourceCurrency,
@@ -7295,6 +10774,500 @@ class MayhemContract extends Contract {
       : null;
   }
 
+  normalizeTargetedTapRateLock(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'type',
+        'epoch',
+        'bundle_sha256',
+        'denom',
+        'tap_usd_au',
+        'source',
+        'rate_ts',
+        'rate_record_key',
+        'posted_by',
+        'posted_by_role',
+        'chain_id',
+        'token_address',
+        'pool_address',
+        'payment_config_ver',
+      ],
+      'targeted TAP settlement rate lock'
+    );
+    if (shapeError) return shapeError;
+    const tapUsdAu = this.normalizeAu(
+      value.tap_usd_au,
+      'targeted TAP settlement rate',
+      { allowZero: false }
+    );
+    if (tapUsdAu instanceof Error ||
+        value.type !== 'tap_settlement_rate_lock' ||
+        value.denom !== 'tap_usd_au' ||
+        !Number.isSafeInteger(value.epoch) ||
+        value.epoch < 1 ||
+        !this.isHexBytes(value.bundle_sha256, 32) ||
+        typeof value.source !== 'string' ||
+        !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(value.source) ||
+        !Number.isSafeInteger(value.rate_ts) ||
+        value.rate_ts < 0 ||
+        typeof value.rate_record_key !== 'string' ||
+        !value.rate_record_key.startsWith(`rate/tap/${value.rate_ts}/`) ||
+        !this.isHexBytes(value.rate_record_key.slice(`rate/tap/${value.rate_ts}/`.length), 32) ||
+        !this.isHexBytes(value.posted_by, 32) ||
+        value.posted_by_role !== 'admin' ||
+        !Number.isSafeInteger(value.chain_id) ||
+        value.chain_id < 1 ||
+        !this.isEthHexBytes(value.token_address, 20) ||
+        value.token_address !== value.token_address.toLowerCase() ||
+        !this.isEthHexBytes(value.pool_address, 20) ||
+        value.pool_address !== value.pool_address.toLowerCase() ||
+        !Number.isSafeInteger(value.payment_config_ver) ||
+        value.payment_config_ver < 1) {
+      return new Error('Invalid targeted TAP settlement rate lock.');
+    }
+    return {
+      type: value.type,
+      epoch: value.epoch,
+      bundle_sha256: value.bundle_sha256.toLowerCase(),
+      denom: value.denom,
+      tap_usd_au: tapUsdAu,
+      source: value.source,
+      rate_ts: value.rate_ts,
+      rate_record_key: value.rate_record_key,
+      posted_by: value.posted_by.toLowerCase(),
+      posted_by_role: value.posted_by_role,
+      chain_id: value.chain_id,
+      token_address: value.token_address.toLowerCase(),
+      pool_address: value.pool_address.toLowerCase(),
+      payment_config_ver: value.payment_config_ver,
+    };
+  }
+
+  normalizeTargetedTapSettlementEntry(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      ['account', 'cumulative_wei'],
+      'targeted TAP settlement distribution entry'
+    );
+    if (shapeError) return shapeError;
+    if (!this.isEthHexBytes(value.account, 20) ||
+        value.account !== value.account.toLowerCase()) {
+      return new Error('Invalid targeted TAP settlement distribution account.');
+    }
+    const cumulativeWei = this.parseTapWei(value.cumulative_wei);
+    if (cumulativeWei instanceof Error) {
+      return new Error('Invalid targeted TAP settlement cumulative claim.');
+    }
+    return {
+      account: value.account,
+      cumulative_wei: cumulativeWei.toString(),
+    };
+  }
+
+  normalizeTargetedTapSettlementOutput(value, tapUsdAu) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'provider',
+        'payout_revision',
+        'to',
+        'paid_cum_au_before',
+        'aggregate_paid_cum_au_before',
+        'paid_au',
+        'tap_wei',
+        'prior_cumulative_claim_wei',
+        'cumulative_claim_wei',
+      ],
+      'targeted TAP provider output'
+    );
+    if (shapeError) return shapeError;
+    const paidAu = this.normalizeAu(
+      value.paid_au,
+      'targeted TAP provider paid amount',
+      { allowZero: false }
+    );
+    const paidCumAuBefore = this.normalizeAu(
+      value.paid_cum_au_before,
+      'targeted TAP provider paid cumulative watermark',
+      { allowZero: true }
+    );
+    const aggregatePaidCumAuBefore = this.normalizeAu(
+      value.aggregate_paid_cum_au_before,
+      'targeted TAP provider aggregate paid cumulative watermark',
+      { allowZero: true }
+    );
+    const tapWei = this.parseTapWei(value.tap_wei);
+    const priorCumulativeClaimWei = this.parseTapWei(
+      value.prior_cumulative_claim_wei,
+      { allowZero: true }
+    );
+    const cumulativeClaimWei = this.parseTapWei(value.cumulative_claim_wei);
+    if (!this.isHexBytes(value.provider, 32) ||
+        value.provider !== value.provider.toLowerCase() ||
+        !this.isHexBytes(value.payout_revision, 32) ||
+        value.payout_revision !== value.payout_revision.toLowerCase() ||
+        !this.isEthHexBytes(value.to, 20) ||
+        value.to !== value.to.toLowerCase() ||
+        paidAu instanceof Error ||
+        paidCumAuBefore instanceof Error ||
+        aggregatePaidCumAuBefore instanceof Error ||
+        tapWei instanceof Error ||
+        priorCumulativeClaimWei instanceof Error ||
+        cumulativeClaimWei instanceof Error) {
+      return new Error('Invalid targeted TAP provider output.');
+    }
+    const rate = this.parseAu(
+      tapUsdAu,
+      'targeted TAP settlement rate',
+      { allowZero: false }
+    );
+    if (rate instanceof Error) return rate;
+    const expectedTapWei = (this.parseAu(paidAu, 'targeted TAP provider paid amount') * TAP_WEI) / rate;
+    if (expectedTapWei <= 0n || tapWei !== expectedTapWei) {
+      return new Error('Targeted TAP provider output does not match the locked rate.');
+    }
+    if (cumulativeClaimWei !== priorCumulativeClaimWei + tapWei) {
+      return new Error('Targeted TAP provider output cumulative claim chain is invalid.');
+    }
+    return {
+      provider: value.provider,
+      payout_revision: value.payout_revision,
+      to: value.to,
+      paid_cum_au_before: paidCumAuBefore,
+      aggregate_paid_cum_au_before: aggregatePaidCumAuBefore,
+      paid_au: paidAu,
+      tap_wei: tapWei.toString(),
+      prior_cumulative_claim_wei: priorCumulativeClaimWei.toString(),
+      cumulative_claim_wei: cumulativeClaimWei.toString(),
+    };
+  }
+
+  targetedTapSettlementLeaf(entry) {
+    const encoded = b4a.alloc(64);
+    encoded.set(b4a.from(entry.account.slice(2), 'hex'), 12);
+    const amount = BigInt(entry.cumulative_wei);
+    if (amount < 0n || amount >= (1n << 256n)) {
+      return new Error('Targeted TAP settlement cumulative claim exceeds uint256.');
+    }
+    const amountHex = amount.toString(16).padStart(64, '0');
+    encoded.set(b4a.from(amountHex, 'hex'), 32);
+    return keccak256(keccak256(encoded));
+  }
+
+  targetedTapSettlementRoot(entries) {
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return new Error('Targeted TAP settlement requires distribution entries.');
+    }
+    const leaves = [];
+    for (const entry of entries) {
+      const leaf = this.targetedTapSettlementLeaf(entry);
+      if (leaf instanceof Error) return leaf;
+      leaves.push(b4a.toString(leaf, 'hex'));
+    }
+    leaves.sort(compareCodepoint);
+    const tree = new Array(2 * leaves.length - 1);
+    for (const [index, leaf] of leaves.entries()) {
+      tree[tree.length - 1 - index] = leaf;
+    }
+    for (let index = tree.length - 1 - leaves.length; index >= 0; index -= 1) {
+      const left = tree[2 * index + 1];
+      const right = tree[2 * index + 2];
+      const [first, second] = compareCodepoint(left, right) <= 0
+        ? [left, right]
+        : [right, left];
+      tree[index] = b4a.toString(
+        keccak256(b4a.concat([b4a.from(first, 'hex'), b4a.from(second, 'hex')])),
+        'hex'
+      );
+    }
+    return `0x${tree[0]}`;
+  }
+
+  normalizeTargetedTapSettlementValue(value) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      [
+        'op',
+        'epoch',
+        'at',
+        'rail',
+        'chain_id',
+        'token_address',
+        'pool_address',
+        'payment_config_ver',
+        'epoch_apply_hash',
+        'preparation_ids',
+        'root_preparation_id',
+        'external_effect_ids',
+        'tap_rate_lock',
+        'root',
+        'root_confirmed',
+        'proposal_tx',
+        'proposal_block_number',
+        'proposal_block_hash',
+        'execution_tx',
+        'execution_status',
+        'execution_block_number',
+        'execution_block_hash',
+        'finalized_block_number',
+        'confirmation_depth',
+        'confirmation_policy',
+        'cumulative_spent_wei',
+        'provider_cumulative_claimed_wei',
+        'buyer_refund_wei',
+        'fee_bps',
+        'tap_burn_bps',
+        'provider_share_bps',
+        'provider_count',
+        'provider_paid_au',
+        'provider_tap_wei',
+        'provider_entries',
+        'refunds',
+        'entries',
+        'outputs',
+      ],
+      'targeted TAP settlement'
+    );
+    if (shapeError) return shapeError;
+    const rateLock = this.normalizeTargetedTapRateLock(value.tap_rate_lock);
+    if (rateLock instanceof Error) return rateLock;
+    if (value.op !== 'settle_targeted_tap' ||
+        value.rail !== 'tap' ||
+        !Number.isSafeInteger(value.epoch) ||
+        value.epoch < 1 ||
+        !Number.isSafeInteger(value.at) ||
+        value.at < 0 ||
+        !Number.isSafeInteger(value.chain_id) ||
+        value.chain_id < 1 ||
+        !this.isEthHexBytes(value.token_address, 20) ||
+        value.token_address !== value.token_address.toLowerCase() ||
+        !this.isEthHexBytes(value.pool_address, 20) ||
+        value.pool_address !== value.pool_address.toLowerCase() ||
+        !Number.isSafeInteger(value.payment_config_ver) ||
+        value.payment_config_ver < 1 ||
+        !this.isHexBytes(value.epoch_apply_hash, 32) ||
+        !Array.isArray(value.preparation_ids) ||
+        value.preparation_ids.length < 1 ||
+        !this.isHexBytes(value.root_preparation_id, 32) ||
+        !Array.isArray(value.external_effect_ids) ||
+        value.external_effect_ids.length !== 2 ||
+        !this.isEthHexBytes(value.root, 32) ||
+        value.root !== value.root.toLowerCase() ||
+        value.root_confirmed !== true ||
+        !this.isEthHexBytes(value.proposal_tx, 32) ||
+        value.proposal_tx !== value.proposal_tx.toLowerCase() ||
+        !Number.isSafeInteger(value.proposal_block_number) ||
+        value.proposal_block_number < 0 ||
+        !this.isEthHexBytes(value.proposal_block_hash, 32) ||
+        value.proposal_block_hash !== value.proposal_block_hash.toLowerCase() ||
+        !this.isEthHexBytes(value.execution_tx, 32) ||
+        value.execution_tx !== value.execution_tx.toLowerCase() ||
+        value.execution_status !== 1 ||
+        !Number.isSafeInteger(value.execution_block_number) ||
+        value.execution_block_number < value.proposal_block_number ||
+        !this.isEthHexBytes(value.execution_block_hash, 32) ||
+        value.execution_block_hash !== value.execution_block_hash.toLowerCase() ||
+        !Number.isSafeInteger(value.finalized_block_number) ||
+        value.finalized_block_number < value.execution_block_number ||
+        !Number.isSafeInteger(value.confirmation_depth) ||
+        value.confirmation_depth !== value.finalized_block_number - value.execution_block_number ||
+        value.confirmation_depth < MIN_TAP_CONFIRMATION_DEPTH ||
+        !this.isSafeKeyPart(value.confirmation_policy) ||
+        (value.chain_id === 1 && value.confirmation_policy !== 'finalized-tag') ||
+        (value.confirmation_policy !== 'finalized-tag' &&
+          value.confirmation_policy !== `depth-${value.confirmation_depth}`) ||
+        value.proposal_tx === value.execution_tx ||
+        !Number.isSafeInteger(value.provider_count) ||
+        value.provider_count < 1 ||
+        !Number.isSafeInteger(value.fee_bps) ||
+        value.fee_bps < 0 ||
+        !Number.isSafeInteger(value.tap_burn_bps) ||
+        value.tap_burn_bps !== TAP_BURN_BPS ||
+        !Number.isSafeInteger(value.provider_share_bps) ||
+        value.provider_share_bps <= 0 ||
+        value.fee_bps + value.tap_burn_bps + value.provider_share_bps !== 10_000 ||
+        !Array.isArray(value.entries) ||
+        value.entries.length < 1 ||
+        !Array.isArray(value.provider_entries) ||
+        value.provider_entries.length < 1 ||
+        !Array.isArray(value.refunds) ||
+        !Array.isArray(value.outputs) ||
+        value.outputs.length < 1) {
+      return new Error('Invalid targeted TAP settlement.');
+    }
+    if (value.preparation_ids.some((entry) => !this.isHexBytes(entry, 32)) ||
+        new Set(value.preparation_ids).size !== value.preparation_ids.length ||
+        value.external_effect_ids.some((entry) => !this.isHexBytes(entry, 32)) ||
+        new Set(value.external_effect_ids).size !== 2) {
+      return new Error('Invalid targeted TAP settlement preparation identities.');
+    }
+    if (rateLock.epoch !== value.epoch ||
+        rateLock.chain_id !== value.chain_id ||
+        rateLock.token_address !== value.token_address ||
+        rateLock.pool_address !== value.pool_address ||
+        rateLock.payment_config_ver !== value.payment_config_ver) {
+      return new Error('Targeted TAP settlement rate lock scope mismatch.');
+    }
+    const cumulativeSpentWei = this.parseTapWei(value.cumulative_spent_wei);
+    const providerCumulativeClaimedWei = this.parseTapWei(
+      value.provider_cumulative_claimed_wei
+    );
+    const buyerRefundWei = this.parseTapWei(value.buyer_refund_wei, {
+      allowZero: true,
+    });
+    const providerPaidAu = this.normalizeAu(
+      value.provider_paid_au,
+      'targeted TAP provider paid total',
+      { allowZero: false }
+    );
+    const providerTapWei = this.parseTapWei(value.provider_tap_wei);
+    if (cumulativeSpentWei instanceof Error ||
+        providerCumulativeClaimedWei instanceof Error ||
+        buyerRefundWei instanceof Error ||
+        providerPaidAu instanceof Error ||
+        providerTapWei instanceof Error) {
+      return new Error('Invalid targeted TAP settlement totals.');
+    }
+    const entries = [];
+    const seenAccounts = new Set();
+    for (const rawEntry of value.entries) {
+      const entry = this.normalizeTargetedTapSettlementEntry(rawEntry);
+      if (entry instanceof Error) return entry;
+      if (seenAccounts.has(entry.account)) {
+        return new Error('Duplicate targeted TAP settlement distribution account.');
+      }
+      seenAccounts.add(entry.account);
+      entries.push(entry);
+    }
+    entries.sort((left, right) => compareCodepoint(left.account, right.account));
+    if (stableJson(entries) !== stableJson(value.entries)) {
+      return new Error('Targeted TAP settlement distribution entries must be canonical.');
+    }
+    const normalizeClaimEntries = (rawEntries, label) => {
+      const normalizedEntries = [];
+      const seen = new Set();
+      for (const rawEntry of rawEntries) {
+        const entry = this.normalizeTargetedTapSettlementEntry(rawEntry);
+        if (entry instanceof Error) return entry;
+        if (seen.has(entry.account)) {
+          return new Error(`Duplicate targeted TAP ${label} account.`);
+        }
+        seen.add(entry.account);
+        normalizedEntries.push(entry);
+      }
+      normalizedEntries.sort((left, right) => compareCodepoint(left.account, right.account));
+      if (stableJson(normalizedEntries) !== stableJson(rawEntries)) {
+        return new Error(`Targeted TAP ${label} entries must be canonical.`);
+      }
+      return normalizedEntries;
+    };
+    const providerEntries = normalizeClaimEntries(
+      value.provider_entries,
+      'provider claim'
+    );
+    if (providerEntries instanceof Error) return providerEntries;
+    const refunds = normalizeClaimEntries(value.refunds, 'buyer refund');
+    if (refunds instanceof Error) return refunds;
+    const providerEntryTotal = providerEntries.reduce(
+      (sum, entry) => sum + BigInt(entry.cumulative_wei),
+      0n
+    );
+    const refundTotal = refunds.reduce(
+      (sum, entry) => sum + BigInt(entry.cumulative_wei),
+      0n
+    );
+    if (providerEntryTotal !== providerCumulativeClaimedWei ||
+        refundTotal !== buyerRefundWei) {
+      return new Error('Targeted TAP provider/refund totals do not match claim entries.');
+    }
+    const combinedClaims = new Map();
+    for (const entry of [...providerEntries, ...refunds]) {
+      combinedClaims.set(
+        entry.account,
+        (combinedClaims.get(entry.account) ?? 0n) + BigInt(entry.cumulative_wei)
+      );
+    }
+    const combinedEntries = [...combinedClaims.entries()]
+      .map(([account, cumulativeWei]) => ({
+        account,
+        cumulative_wei: cumulativeWei.toString(),
+      }))
+      .sort((left, right) => compareCodepoint(left.account, right.account));
+    if (stableJson(combinedEntries) !== stableJson(entries)) {
+      return new Error('Targeted TAP executed entries do not merge provider and refund claims.');
+    }
+    const outputs = [];
+    const seenLiabilities = new Set();
+    for (const rawOutput of value.outputs) {
+      const output = this.normalizeTargetedTapSettlementOutput(
+        rawOutput,
+        rateLock.tap_usd_au
+      );
+      if (output instanceof Error) return output;
+      const identity = `${output.provider}/${output.payout_revision}`;
+      if (seenLiabilities.has(identity)) {
+        return new Error('Duplicate targeted TAP settlement payout liability.');
+      }
+      seenLiabilities.add(identity);
+      outputs.push(output);
+    }
+    outputs.sort((left, right) => (
+      compareCodepoint(left.provider, right.provider) ||
+      compareCodepoint(left.payout_revision, right.payout_revision)
+    ));
+    if (stableJson(outputs) !== stableJson(value.outputs)) {
+      return new Error('Targeted TAP settlement outputs must be canonical.');
+    }
+    const paidTotal = outputs.reduce(
+      (sum, output) => sum + this.parseAu(output.paid_au, 'targeted TAP paid output'),
+      0n
+    );
+    const tapTotal = outputs.reduce(
+      (sum, output) => sum + BigInt(output.tap_wei),
+      0n
+    );
+    if (value.provider_count !== outputs.length ||
+        paidTotal.toString() !== providerPaidAu ||
+        tapTotal !== providerTapWei) {
+      return new Error('Targeted TAP settlement totals do not match outputs.');
+    }
+    const entryMap = new Map(providerEntries.map((entry) => [entry.account, entry]));
+    const targetCursors = new Map();
+    for (const output of outputs) {
+      const prior = targetCursors.get(output.to);
+      if (prior !== undefined &&
+          prior !== output.prior_cumulative_claim_wei) {
+        return new Error('Targeted TAP outputs do not form a canonical per-target claim chain.');
+      }
+      targetCursors.set(output.to, output.cumulative_claim_wei);
+    }
+    for (const [target, cumulativeClaimWei] of targetCursors) {
+      if (entryMap.get(target)?.cumulative_wei !== cumulativeClaimWei) {
+        return new Error('Targeted TAP output claim chain does not match the executed root entry.');
+      }
+    }
+    const root = this.targetedTapSettlementRoot(entries);
+    if (root instanceof Error || root !== value.root) {
+      return new Error('Targeted TAP settlement root mismatch.');
+    }
+    return {
+      rate_lock: rateLock,
+      entries,
+      provider_entries: providerEntries,
+      refunds,
+      outputs,
+      cumulative_spent_wei: cumulativeSpentWei.toString(),
+      provider_cumulative_claimed_wei: providerCumulativeClaimedWei.toString(),
+      buyer_refund_wei: buyerRefundWei.toString(),
+      fee_bps: value.fee_bps,
+      tap_burn_bps: value.tap_burn_bps,
+      provider_share_bps: value.provider_share_bps,
+      provider_paid_au: providerPaidAu,
+      provider_tap_wei: providerTapWei.toString(),
+    };
+  }
+
   normalizeTargetedTnkSettlementValue(value) {
     const shapeError = this.validateExactObjectKeys(
       value,
@@ -7307,6 +11280,8 @@ class MayhemContract extends Contract {
         'treasury_from',
         'operator_to',
         'epoch_apply_hash',
+        'preparation_ids',
+        'external_effect_ids',
         'rate_tnk_usd_au',
         'rate_source',
         'rate_ts',
@@ -7329,6 +11304,10 @@ class MayhemContract extends Contract {
         !this.isSafeKeyPart(value.treasury_from) ||
         !this.isSafeKeyPart(value.operator_to) ||
         !this.isHexBytes(value.epoch_apply_hash, 32) ||
+        !Array.isArray(value.preparation_ids) ||
+        !Array.isArray(value.external_effect_ids) ||
+        value.preparation_ids.length !== value.outputs?.length ||
+        value.external_effect_ids.length !== value.outputs?.length ||
         !this.isHexBytes(value.transfer_root, 32) ||
         !Number.isSafeInteger(value.provider_count) || value.provider_count < 0 ||
         !Number.isSafeInteger(value.rate_ts) || value.rate_ts < 0 ||
@@ -7337,6 +11316,12 @@ class MayhemContract extends Contract {
         !Array.isArray(value.msb_transfers) ||
         value.msb_transfers.length !== value.outputs.length) {
       return new Error('Invalid targeted TNK settlement.');
+    }
+    if (value.preparation_ids.some((entry) => !this.isHexBytes(entry, 32)) ||
+        new Set(value.preparation_ids).size !== value.preparation_ids.length ||
+        value.external_effect_ids.some((entry) => !this.isHexBytes(entry, 32)) ||
+        new Set(value.external_effect_ids).size !== value.external_effect_ids.length) {
+      return new Error('Invalid targeted TNK settlement preparation identities.');
     }
     if (this.normalizeAu(
       value.rate_tnk_usd_au,
@@ -7377,7 +11362,16 @@ class MayhemContract extends Contract {
       if (output?.role === 'provider') {
         const shapeError = this.validateExactObjectKeys(
           output,
-          ['role', 'provider', 'payout_revision', 'to', 'au', 'tnk_e18'],
+          [
+            'role',
+            'provider',
+            'payout_revision',
+            'to',
+            'paid_cum_au_before',
+            'aggregate_paid_cum_au_before',
+            'au',
+            'tnk_e18',
+          ],
           'targeted TNK provider output'
         );
         if (shapeError) return shapeError;
@@ -7396,7 +11390,26 @@ class MayhemContract extends Contract {
           tnk_e18: output.tnk_e18,
         });
         if (normalized instanceof Error) return normalized;
-        outputs.push({ ...normalized, payout_revision: output.payout_revision });
+        const paidCumAuBefore = this.normalizeAu(
+          output.paid_cum_au_before,
+          'targeted TNK provider paid cumulative watermark',
+          { allowZero: true }
+        );
+        if (paidCumAuBefore instanceof Error) return paidCumAuBefore;
+        const aggregatePaidCumAuBefore = this.normalizeAu(
+          output.aggregate_paid_cum_au_before,
+          'targeted TNK provider aggregate paid cumulative watermark',
+          { allowZero: true }
+        );
+        if (aggregatePaidCumAuBefore instanceof Error) {
+          return aggregatePaidCumAuBefore;
+        }
+        outputs.push({
+          ...normalized,
+          payout_revision: output.payout_revision,
+          paid_cum_au_before: paidCumAuBefore,
+          aggregate_paid_cum_au_before: aggregatePaidCumAuBefore,
+        });
       } else if (output?.role === 'operator_fee') {
         const shapeError = this.validateExactObjectKeys(
           output,
@@ -7437,6 +11450,8 @@ class MayhemContract extends Contract {
         'source_currency',
         'operator_to',
         'epoch_apply_hash',
+        'preparation_ids',
+        'external_effect_ids',
         'stripe_transfers',
         'transfer_root',
         'provider_count',
@@ -7462,6 +11477,10 @@ class MayhemContract extends Contract {
         !Number.isSafeInteger(value.at) || value.at < 0 ||
         !this.isSafeKeyPart(value.operator_to) ||
         !this.isHexBytes(value.epoch_apply_hash, 32) ||
+        !Array.isArray(value.preparation_ids) ||
+        !Array.isArray(value.external_effect_ids) ||
+        value.preparation_ids.length !== value.outputs?.length ||
+        value.external_effect_ids.length !== value.outputs?.length ||
         !this.isHexBytes(value.transfer_root, 32) ||
         !Number.isSafeInteger(value.provider_count) || value.provider_count < 0 ||
         !Array.isArray(value.outputs) || value.outputs.length === 0 ||
@@ -7469,6 +11488,12 @@ class MayhemContract extends Contract {
         !Array.isArray(value.stripe_transfers) ||
         value.stripe_transfers.length !== value.outputs.length) {
       return new Error('Invalid targeted fiat settlement.');
+    }
+    if (value.preparation_ids.some((entry) => !this.isHexBytes(entry, 32)) ||
+        new Set(value.preparation_ids).size !== value.preparation_ids.length ||
+        value.external_effect_ids.some((entry) => !this.isHexBytes(entry, 32)) ||
+        new Set(value.external_effect_ids).size !== value.external_effect_ids.length) {
+      return new Error('Invalid targeted fiat settlement preparation identities.');
     }
     const sourceCurrency = this.normalizeFiatCurrency(value.source_currency);
     if (sourceCurrency instanceof Error || sourceCurrency !== value.source_currency) {
@@ -7556,6 +11581,8 @@ class MayhemContract extends Contract {
             'provider',
             'payout_revision',
             'to',
+            'paid_cum_au_before',
+            'aggregate_paid_cum_au_before',
             'liability_au',
             'paid_au',
             'rounding_au',
@@ -7563,6 +11590,8 @@ class MayhemContract extends Contract {
             'source_currency',
             'source_amount_minor',
             'destination_currency',
+            'destination_amount_min_minor',
+            'destination_amount_max_minor',
             'destination_amount_minor',
             ...(hasFxQuoteId ? ['fx_quote_id', 'fx_quote_hash'] : []),
           ],
@@ -7577,9 +11606,30 @@ class MayhemContract extends Contract {
         if (seen.has(identity)) return new Error('Duplicate targeted fiat payout liability.');
         seen.add(identity);
         const { payout_revision: payoutRevision, ...settlementOutput } = output;
+        const paidCumAuBefore = this.normalizeAu(
+          settlementOutput.paid_cum_au_before,
+          'targeted fiat provider paid cumulative watermark',
+          { allowZero: true }
+        );
+        if (paidCumAuBefore instanceof Error) return paidCumAuBefore;
+        const aggregatePaidCumAuBefore = this.normalizeAu(
+          settlementOutput.aggregate_paid_cum_au_before,
+          'targeted fiat provider aggregate paid cumulative watermark',
+          { allowZero: true }
+        );
+        if (aggregatePaidCumAuBefore instanceof Error) {
+          return aggregatePaidCumAuBefore;
+        }
+        delete settlementOutput.paid_cum_au_before;
+        delete settlementOutput.aggregate_paid_cum_au_before;
         const normalized = this.normalizeTargetedFiatSettlementOutput(settlementOutput);
         if (normalized instanceof Error) return normalized;
-        outputs.push({ ...normalized, payout_revision: payoutRevision });
+        outputs.push({
+          ...normalized,
+          payout_revision: payoutRevision,
+          paid_cum_au_before: paidCumAuBefore,
+          aggregate_paid_cum_au_before: aggregatePaidCumAuBefore,
+        });
       } else if (output?.role === 'operator_fee') {
         const shapeError = this.validateExactObjectKeys(
           output,
@@ -7631,6 +11681,643 @@ class MayhemContract extends Contract {
       'mayhem-targeted-fiat-settlement-transfer-root-v2',
       outputs
     );
+  }
+
+  payoutPreparationLiabilityForOutput(value, output, rail) {
+    if (output.role === 'operator_fee') return null;
+    return {
+      provider: output.provider,
+      payout_revision: output.payout_revision,
+      target: output.to,
+      currency: rail === 'fiat' ? output.destination_currency : null,
+      chain_id: rail === 'tap' ? value.chain_id : null,
+      paid_cum_au_before: output.paid_cum_au_before,
+      aggregate_paid_cum_au_before: output.aggregate_paid_cum_au_before,
+      liability_au: rail === 'fiat' ? output.liability_au : (output.au ?? output.paid_au),
+      paid_au: rail === 'fiat' ? output.paid_au : (output.au ?? output.paid_au),
+    };
+  }
+
+  targetedFiatPreparationOutputProjection(output) {
+    if (output.role === 'operator_fee') {
+      return stableValue({
+        role: output.role,
+        to: output.to,
+        liability_au: output.liability_au,
+        paid_au: output.paid_au,
+        rounding_au: output.rounding_au,
+        dust_au: output.dust_au,
+        source_currency: output.source_currency,
+        source_amount_minor: output.source_amount_minor,
+      });
+    }
+    const projection = {
+      role: output.role,
+      provider: output.provider,
+      payout_revision: output.payout_revision,
+      to: output.to,
+      paid_cum_au_before: output.paid_cum_au_before,
+      aggregate_paid_cum_au_before: output.aggregate_paid_cum_au_before,
+      liability_au: output.liability_au,
+      paid_au: output.paid_au,
+      rounding_au: output.rounding_au,
+      dust_au: output.dust_au,
+      source_currency: output.source_currency,
+      source_amount_minor: output.source_amount_minor,
+      destination_currency: output.destination_currency,
+      destination_amount_min_minor: output.destination_amount_min_minor,
+      destination_amount_max_minor: output.destination_amount_max_minor,
+    };
+    return stableValue(projection);
+  }
+
+  normalizeTargetedFiatPreparationOutput(output) {
+    if (output?.role === 'operator_fee') {
+      const shapeError = this.validateExactObjectKeys(
+        output,
+        [
+          'role',
+          'to',
+          'liability_au',
+          'paid_au',
+          'rounding_au',
+          'dust_au',
+          'source_currency',
+          'source_amount_minor',
+        ],
+        'targeted fiat preparation operator output'
+      );
+      if (shapeError) return shapeError;
+      const normalized = this.normalizeTargetedFiatSettlementOutput(output);
+      if (normalized instanceof Error) return normalized;
+      if (this.compareAu(normalized.paid_au, normalized.liability_au) !== 0 ||
+          !this.isZeroAu(normalized.rounding_au) ||
+          !this.isZeroAu(normalized.dust_au)) {
+        return new Error(
+          'Targeted fiat operator fee must retain its exact AU liability with zero dust.'
+        );
+      }
+      return stableJson(normalized) === stableJson(output)
+        ? normalized
+        : new Error('Targeted fiat preparation operator output must be canonical.');
+    }
+    if (output?.role !== 'provider') {
+      return new Error('Invalid targeted fiat preparation output role.');
+    }
+    const shapeError = this.validateExactObjectKeys(
+      output,
+      [
+        'role',
+        'provider',
+        'payout_revision',
+        'to',
+        'paid_cum_au_before',
+        'aggregate_paid_cum_au_before',
+        'liability_au',
+        'paid_au',
+        'rounding_au',
+        'dust_au',
+        'source_currency',
+        'source_amount_minor',
+        'destination_currency',
+        'destination_amount_min_minor',
+        'destination_amount_max_minor',
+      ],
+      'targeted fiat preparation provider output'
+    );
+    if (shapeError) return shapeError;
+    if (!this.isHexBytes(output.payout_revision, 32) ||
+        output.payout_revision !== output.payout_revision.toLowerCase()) {
+      return new Error('Invalid targeted fiat preparation payout revision.');
+    }
+    const paidCumAuBefore = this.normalizeAu(
+      output.paid_cum_au_before,
+      'targeted fiat preparation paid cumulative watermark',
+      { allowZero: true }
+    );
+    const aggregatePaidCumAuBefore = this.normalizeAu(
+      output.aggregate_paid_cum_au_before,
+      'targeted fiat preparation aggregate paid cumulative watermark',
+      { allowZero: true }
+    );
+    if (paidCumAuBefore instanceof Error ||
+        aggregatePaidCumAuBefore instanceof Error) {
+      return new Error('Invalid targeted fiat preparation cumulative watermark.');
+    }
+    if (!this.isHexBytes(output.provider, 32) ||
+        output.provider !== output.provider.toLowerCase() ||
+        !this.isSafeKeyPart(output.to)) {
+      return new Error('Invalid targeted fiat preparation provider identity.');
+    }
+    const sourceCurrency = this.normalizeFiatCurrency(output.source_currency);
+    const destinationCurrency = this.normalizeFiatCurrency(output.destination_currency);
+    const sourceAmountMinor = this.normalizeFiatMinor(output.source_amount_minor);
+    const destinationMin = this.normalizeFiatMinor(output.destination_amount_min_minor);
+    const destinationMax = this.normalizeFiatMinor(output.destination_amount_max_minor);
+    const canonicalAu = {};
+    for (const [field, allowZero] of [
+      ['liability_au', false],
+      ['paid_au', false],
+      ['rounding_au', true],
+      ['dust_au', true],
+    ]) {
+      canonicalAu[field] = this.normalizeAu(
+        output[field],
+        `targeted fiat preparation ${field}`,
+        { allowZero }
+      );
+      if (canonicalAu[field] instanceof Error) {
+        return new Error(`Invalid targeted fiat preparation ${field}.`);
+      }
+    }
+    const paidPlusDust = this.safeAddAu(canonicalAu.paid_au, canonicalAu.dust_au);
+    if (sourceCurrency instanceof Error ||
+        sourceCurrency !== output.source_currency ||
+        destinationCurrency instanceof Error ||
+        destinationCurrency !== output.destination_currency ||
+        sourceAmountMinor instanceof Error ||
+        destinationMin instanceof Error ||
+        destinationMax instanceof Error ||
+        BigInt(destinationMax) < BigInt(destinationMin) ||
+        paidPlusDust instanceof Error ||
+        paidPlusDust !== canonicalAu.liability_au ||
+        canonicalAu.rounding_au !== canonicalAu.dust_au) {
+      return new Error('Invalid targeted fiat preparation economic terms.');
+    }
+    const projection = {
+      role: 'provider',
+      provider: output.provider,
+      to: output.to,
+      ...canonicalAu,
+      source_currency: sourceCurrency,
+      source_amount_minor: sourceAmountMinor,
+      destination_currency: destinationCurrency,
+      destination_amount_min_minor: destinationMin,
+      destination_amount_max_minor: destinationMax,
+      payout_revision: output.payout_revision,
+      paid_cum_au_before: paidCumAuBefore,
+      aggregate_paid_cum_au_before: aggregatePaidCumAuBefore,
+    };
+    return stableJson(projection) === stableJson(output)
+      ? projection
+      : new Error('Targeted fiat preparation provider output must be canonical.');
+  }
+
+  normalizeTargetedFiatPreparationPayload(value, payload, liability) {
+    const shapeError = this.validateExactObjectKeys(
+      payload,
+      [
+        'settlement_op',
+        'rail',
+        'epoch',
+        'epoch_apply_hash',
+        'plan_root',
+        'economic_op_id',
+        'output_index',
+        'output',
+        'processor',
+        'source_currency',
+      ],
+      'targeted fiat preparation payload'
+    );
+    if (shapeError) return shapeError;
+    const sourceCurrency = this.normalizeFiatCurrency(payload.source_currency);
+    if (payload.settlement_op !== 'settle_targeted_fiat_output' ||
+        payload.rail !== 'fiat' ||
+        payload.epoch !== value.epoch ||
+        payload.epoch_apply_hash !== value.epoch_apply_hash ||
+        !this.isHexBytes(payload.plan_root, 32) ||
+        payload.economic_op_id !== value.economic_op_id ||
+        payload.output_index !== value.output_index ||
+        payload.processor !== 'stripe' ||
+        sourceCurrency instanceof Error ||
+        sourceCurrency !== payload.source_currency) {
+      return new Error('Invalid targeted fiat preparation payload.');
+    }
+    const output = this.normalizeTargetedPayoutPlanOutput(
+      'fiat',
+      payload.output,
+      value.output_index
+    );
+    if (output instanceof Error) return output;
+    if (output.source_currency !== sourceCurrency) {
+      return new Error('Targeted fiat preparation source currency mismatch.');
+    }
+    if (value.kind === 'liability') {
+      const expectedLiability = this.payoutPreparationLiabilityForOutput(
+        value,
+        output,
+        'fiat'
+      );
+      if (output.role !== 'provider' ||
+          stableJson(expectedLiability) !== stableJson(liability)) {
+        return new Error('Targeted fiat preparation output does not match liability.');
+      }
+    } else if (value.kind !== 'fee' ||
+        output.role !== 'operator_fee' ||
+        liability !== null) {
+      return new Error('Targeted fiat preparation output does not match kind.');
+    }
+    return stableValue({
+      settlement_op: 'settle_targeted_fiat_output',
+      plan_root: payload.plan_root,
+      economic_op_id: value.economic_op_id,
+      rail: 'fiat',
+      epoch: value.epoch,
+      epoch_apply_hash: value.epoch_apply_hash,
+      output_index: value.output_index,
+      output,
+      processor: 'stripe',
+      source_currency: sourceCurrency,
+    });
+  }
+
+  normalizeMsbSignedPayoutPayload(payload, output, treasuryFrom) {
+    const payloadShape = this.validateExactObjectKeys(
+      payload,
+      ['type', 'address', 'tro'],
+      'targeted TNK signed MSB payload'
+    );
+    if (payloadShape) return payloadShape;
+    const transferShape = this.validateExactObjectKeys(
+      payload?.tro,
+      ['tx', 'txv', 'to', 'am', 'in', 'is'],
+      'targeted TNK signed MSB transfer'
+    );
+    if (transferShape) return transferShape;
+    const expectedAmountHex = BigInt(output.tnk_e18).toString(16).padStart(32, '0');
+    if (!Number.isSafeInteger(payload.type) ||
+        payload.type < 0 ||
+        payload.address !== treasuryFrom ||
+        !this.isHexBytes(payload.tro.tx, 32) ||
+        payload.tro.tx !== payload.tro.tx.toLowerCase() ||
+        !this.isHexBytes(payload.tro.txv, 32) ||
+        payload.tro.txv !== payload.tro.txv.toLowerCase() ||
+        payload.tro.to !== output.to ||
+        !/^[0-9a-f]{32}$/.test(payload.tro.am) ||
+        payload.tro.am !== expectedAmountHex ||
+        !this.isHexBytes(payload.tro.in, 32) ||
+        payload.tro.in !== payload.tro.in.toLowerCase() ||
+        !this.isHexBytes(payload.tro.is, 64) ||
+        payload.tro.is !== payload.tro.is.toLowerCase()) {
+      return new Error('Invalid targeted TNK signed MSB payload.');
+    }
+    return stableValue(payload);
+  }
+
+  async normalizeTargetedTnkPreparationPayload(
+    value,
+    payload,
+    liability,
+    externalEffectIds
+  ) {
+    const shapeError = this.validateExactObjectKeys(
+      payload,
+      [
+        'settlement_op',
+        'rail',
+        'epoch',
+        'epoch_apply_hash',
+        'plan_root',
+        'economic_op_id',
+        'output_index',
+        'output',
+        'network',
+        'treasury_from',
+        'rate_tnk_usd_au',
+        'rate_source',
+        'rate_ts',
+        'msb_tx_hash',
+        'msb_payload',
+      ],
+      'targeted TNK preparation payload'
+    );
+    if (shapeError) return shapeError;
+    if (payload.settlement_op !== 'settle_targeted_tnk_output' ||
+        payload.rail !== 'tnk' ||
+        payload.epoch !== value.epoch ||
+        payload.epoch_apply_hash !== value.epoch_apply_hash ||
+        !this.isHexBytes(payload.plan_root, 32) ||
+        payload.economic_op_id !== value.economic_op_id ||
+        payload.output_index !== value.output_index ||
+        !this.isSafeKeyPart(payload.network) ||
+        !this.isSafeKeyPart(payload.treasury_from) ||
+        !Number.isSafeInteger(payload.rate_ts) ||
+        payload.rate_ts < 0 ||
+        !RATE_SOURCES.has(payload.rate_source) ||
+        !this.isHexBytes(payload.msb_tx_hash, 32) ||
+        payload.msb_tx_hash !== payload.msb_tx_hash.toLowerCase() ||
+        this.normalizeAu(
+          payload.rate_tnk_usd_au,
+          'targeted TNK preparation rate',
+          { allowZero: false }
+        ) instanceof Error) {
+      return new Error('Invalid targeted TNK preparation payload.');
+    }
+    const output = this.normalizeTargetedPayoutPlanOutput(
+      'tnk',
+      payload.output,
+      value.output_index
+    );
+    if (output instanceof Error) return output;
+    const msbPayload = this.normalizeMsbSignedPayoutPayload(
+      payload.msb_payload,
+      output,
+      payload.treasury_from
+    );
+    if (msbPayload instanceof Error) return msbPayload;
+    if (payload.msb_tx_hash !== msbPayload.tro.tx ||
+        externalEffectIds.length !== 1 ||
+        externalEffectIds[0] !== payload.msb_tx_hash) {
+      return new Error('Targeted TNK preparation effect must equal its signed MSB tx hash.');
+    }
+    const expectedLiability = this.payoutPreparationLiabilityForOutput(
+      value,
+      output,
+      'tnk'
+    );
+    if ((value.kind === 'liability' &&
+          (output.role !== 'provider' ||
+            stableJson(expectedLiability) !== stableJson(liability))) ||
+        (value.kind === 'fee' &&
+          (output.role !== 'operator_fee' || liability !== null))) {
+      return new Error('Targeted TNK preparation output does not match its kind.');
+    }
+    return stableValue({
+      settlement_op: 'settle_targeted_tnk_output',
+      rail: 'tnk',
+      epoch: value.epoch,
+      epoch_apply_hash: value.epoch_apply_hash,
+      plan_root: payload.plan_root,
+      economic_op_id: value.economic_op_id,
+      output_index: value.output_index,
+      output,
+      network: payload.network,
+      treasury_from: payload.treasury_from,
+      rate_tnk_usd_au: payload.rate_tnk_usd_au,
+      rate_source: payload.rate_source,
+      rate_ts: payload.rate_ts,
+      msb_tx_hash: payload.msb_tx_hash,
+      msb_payload: msbPayload,
+    });
+  }
+
+  payoutPreparationOutputPayload(value, output, outputIndex, rail) {
+    const common = {
+      settlement_op: value.op,
+      rail,
+      epoch: value.epoch,
+      epoch_apply_hash: value.epoch_apply_hash,
+      output_index: outputIndex,
+      output: rail === 'fiat'
+        ? this.targetedFiatPreparationOutputProjection(output)
+        : stableValue(output),
+    };
+    if (rail === 'tnk') {
+      return {
+        ...common,
+        network: value.network,
+        treasury_from: value.treasury_from,
+        rate_tnk_usd_au: value.rate_tnk_usd_au,
+        rate_source: value.rate_source,
+        rate_ts: value.rate_ts,
+      };
+    }
+    if (rail === 'fiat') {
+      return {
+        ...common,
+        processor: value.processor,
+        source_currency: value.source_currency,
+      };
+    }
+    return {
+      ...common,
+      chain_id: value.chain_id,
+      token_address: value.token_address,
+      pool_address: value.pool_address,
+      payment_config_ver: value.payment_config_ver,
+      fee_bps: value.fee_bps,
+      tap_burn_bps: value.tap_burn_bps,
+      provider_share_bps: value.provider_share_bps,
+      tap_rate_lock: stableValue(value.tap_rate_lock),
+    };
+  }
+
+  targetedTapPayoutSplit(feeBps) {
+    if (!Number.isSafeInteger(feeBps) ||
+        feeBps !== TAP_OPERATOR_BPS) {
+      return new Error(
+        'Targeted TAP fee schedule does not match the fixed on-chain operator split.'
+      );
+    }
+    return {
+      fee_bps: feeBps,
+      tap_burn_bps: TAP_BURN_BPS,
+      provider_share_bps: 10_000 - feeBps - TAP_BURN_BPS,
+    };
+  }
+
+  async payoutPreparationTapRootPayload(value, normalized) {
+    return {
+      settlement_op: value.op,
+      rail: 'tap',
+      epoch: value.epoch,
+      epoch_apply_hash: value.epoch_apply_hash,
+      chain_id: value.chain_id,
+      token_address: value.token_address,
+      pool_address: value.pool_address,
+      payment_config_ver: value.payment_config_ver,
+      tap_rate_lock: stableValue(normalized.rate_lock),
+      root: value.root,
+      cumulative_spent_wei: normalized.cumulative_spent_wei,
+      provider_cumulative_claimed_wei: normalized.provider_cumulative_claimed_wei,
+      buyer_refund_wei: normalized.buyer_refund_wei,
+      provider_count: value.provider_count,
+      provider_paid_au: normalized.provider_paid_au,
+      provider_tap_wei: normalized.provider_tap_wei,
+      fee_bps: normalized.fee_bps,
+      tap_burn_bps: normalized.tap_burn_bps,
+      provider_share_bps: normalized.provider_share_bps,
+      entries_hash: await this.opaqueHash(
+        'mayhem-targeted-tap-preparation-entries-v1',
+        normalized.entries
+      ),
+      provider_entries_hash: await this.opaqueHash(
+        'mayhem-targeted-tap-preparation-provider-entries-v1',
+        normalized.provider_entries
+      ),
+      refunds_hash: await this.opaqueHash(
+        'mayhem-targeted-tap-preparation-refunds-v1',
+        normalized.refunds
+      ),
+      outputs_hash: await this.opaqueHash(
+        'mayhem-targeted-tap-preparation-outputs-v1',
+        normalized.outputs
+      ),
+    };
+  }
+
+  async validatePayoutPreparationRecord({
+    economicOpId,
+    rail,
+    epoch,
+    epochApplyHash,
+    kind,
+    outputIndex,
+    payload,
+    liability,
+    externalEffectIds,
+  }) {
+    const record = await this.get(this.payoutPreparationRecordKey(rail, economicOpId));
+    if (!record ||
+        record.type !== 'targeted_payout_preparation' ||
+        record.economic_op_id !== economicOpId ||
+        record.rail !== rail ||
+        record.epoch !== epoch ||
+        record.epoch_apply_hash !== epochApplyHash ||
+        record.kind !== kind ||
+        record.output_index !== outputIndex ||
+        record.consumed !== false ||
+        stableJson(record.payload) !== stableJson(payload) ||
+        stableJson(record.liability) !== stableJson(liability) ||
+        stableJson(record.external_effect_ids) !== stableJson(externalEffectIds)) {
+      return new Error('Targeted settlement does not match an unconsumed canonical preparation.');
+    }
+    const payloadHash = await this.opaqueHash(
+      'mayhem-targeted-payout-preparation-payload-v1',
+      {
+        economic_op_id: economicOpId,
+        rail,
+        epoch,
+        epoch_apply_hash: epochApplyHash,
+        kind,
+        output_index: outputIndex,
+        payload,
+      }
+    );
+    if (record.payload_hash !== payloadHash) {
+      return new Error('Targeted settlement preparation payload hash mismatch.');
+    }
+    if (liability !== null) {
+      const liabilityLock = await this.get(
+        this.payoutPreparationLiabilityLockKey(rail, liability)
+      );
+      if (liabilityLock?.economic_op_id !== economicOpId) {
+        return new Error('Targeted settlement preparation liability lock mismatch.');
+      }
+    }
+    for (const effectId of externalEffectIds) {
+      const effectLock = await this.get(
+        this.payoutPreparationEffectLockKey(rail, effectId)
+      );
+      if (effectLock?.economic_op_id !== economicOpId ||
+          effectLock.consumed !== false) {
+        return new Error('Targeted settlement preparation effect lock mismatch.');
+      }
+    }
+    return record;
+  }
+
+  async payoutPreparationsForSettlement(value, normalized, rail) {
+    const plans = [];
+    for (const [outputIndex, output] of normalized.outputs.entries()) {
+      const economicOpId = value.preparation_ids[outputIndex];
+      const liability = this.payoutPreparationLiabilityForOutput(value, output, rail);
+      const externalEffectIds = rail === 'tap'
+        ? []
+        : [value.external_effect_ids[outputIndex]];
+      const record = await this.validatePayoutPreparationRecord({
+        economicOpId,
+        rail,
+        epoch: value.epoch,
+        epochApplyHash: value.epoch_apply_hash,
+        kind: liability === null ? 'fee' : 'liability',
+        outputIndex,
+        payload: this.payoutPreparationOutputPayload(value, output, outputIndex, rail),
+        liability,
+        externalEffectIds,
+      });
+      if (record instanceof Error) return record;
+      plans.push(record);
+    }
+    if (rail === 'tap') {
+      const rootPayload = await this.payoutPreparationTapRootPayload(value, normalized);
+      if (rootPayload instanceof Error) return rootPayload;
+      const rootRecord = await this.validatePayoutPreparationRecord({
+        economicOpId: value.root_preparation_id,
+        rail,
+        epoch: value.epoch,
+        epochApplyHash: value.epoch_apply_hash,
+        kind: 'tap_root',
+        outputIndex: 0,
+        payload: rootPayload,
+        liability: null,
+        externalEffectIds: value.external_effect_ids,
+      });
+      if (rootRecord instanceof Error) return rootRecord;
+      plans.push(rootRecord);
+    }
+    return plans;
+  }
+
+  async validatePayoutPreparationConsumption(plans) {
+    const lastByProvider = new Map();
+    for (const record of plans) {
+      if (record.liability !== null) {
+        lastByProvider.set(
+          `${record.rail}/${record.liability.provider}`,
+          record
+        );
+      }
+    }
+    const validatedTails = [];
+    for (const record of lastByProvider.values()) {
+      const tailKey = this.payoutPreparationAggregateTailKey(
+        record.rail,
+        record.liability.provider
+      );
+      const tail = await this.get(tailKey);
+      if (!tail ||
+          tail.economic_op_id !== record.economic_op_id ||
+          tail.consumed !== false) {
+        return new Error('Targeted payout preparation aggregate tail mismatch.');
+      }
+      validatedTails.push({ key: tailKey, value: tail });
+    }
+    return validatedTails;
+  }
+
+  async consumePayoutPreparations(plans, settlementKey) {
+    const validatedTails = await this.validatePayoutPreparationConsumption(plans);
+    if (validatedTails instanceof Error) return validatedTails;
+    for (const record of plans) {
+      await this.put(
+        this.payoutPreparationRecordKey(record.rail, record.economic_op_id),
+        {
+          ...record,
+          consumed: true,
+          consumed_by: settlementKey,
+        }
+      );
+      for (const effectId of record.external_effect_ids) {
+        await this.put(this.payoutPreparationEffectLockKey(record.rail, effectId), {
+          economic_op_id: record.economic_op_id,
+          effect_id: effectId,
+          consumed: true,
+          consumed_by: settlementKey,
+          updated_at: this.tx,
+        });
+      }
+    }
+    for (const tail of validatedTails) {
+      await this.put(tail.key, {
+        ...tail.value,
+        consumed: true,
+        consumed_by: settlementKey,
+        updated_at: this.tx,
+      });
+    }
+    return null;
   }
 
   async targetedPayoutSettlementUpdates(outputs, rail, epoch, at, transferIds) {
@@ -7704,22 +12391,26 @@ class MayhemContract extends Contract {
         refreshed.paid_cum_au
       );
       if (payable instanceof Error) return payable;
+      if (refreshed.paid_cum_au !== output.paid_cum_au_before) {
+        return new Error('Targeted settlement paid cumulative watermark mismatch.');
+      }
       let settledAu = output.au;
       if (rail === 'fiat') {
-        const dust = this.safeSubAu(payable, output.paid_au);
+        const dust = this.safeSubAu(output.liability_au, output.paid_au);
         if (dust instanceof Error ||
-            this.compareAu(output.liability_au, payable) !== 0 ||
+            this.isZeroAu(output.liability_au) ||
+            this.compareAu(output.liability_au, payable) > 0 ||
             this.compareAu(output.dust_au, dust) !== 0 ||
             this.compareAu(output.rounding_au, dust) !== 0) {
-          return new Error('Targeted fiat settlement does not match revision liability and dust.');
+          return new Error('Targeted fiat settlement exceeds its frozen revision liability or mismatches dust.');
         }
         settledAu = output.paid_au;
       }
       if (this.isZeroAu(settledAu)) {
         return new Error('Targeted settlement liability has no payable earnings.');
       }
-      if (rail !== 'fiat' && this.compareAu(output.au, payable) !== 0) {
-        return new Error('Targeted settlement amount does not match revision liability.');
+      if (rail !== 'fiat' && this.compareAu(output.au, payable) > 0) {
+        return new Error('Targeted settlement amount exceeds revision liability.');
       }
       const paidCumAu = this.safeAddAu(refreshed.paid_cum_au, settledAu);
       if (paidCumAu instanceof Error) return paidCumAu;
@@ -7734,16 +12425,29 @@ class MayhemContract extends Contract {
           updated_at: this.tx,
         },
       });
-      const nextProviderPaid = this.safeAddAu(
-        paidByProvider.get(output.provider) ?? ZERO_AU,
-        settledAu
+      const providerPaid = paidByProvider.get(output.provider) ?? {
+        aggregate_paid_cum_au_before: output.aggregate_paid_cum_au_before,
+        paid_au: ZERO_AU,
+      };
+      const expectedWatermark = this.safeAddAu(
+        providerPaid.aggregate_paid_cum_au_before,
+        providerPaid.paid_au
       );
+      if (expectedWatermark instanceof Error) return expectedWatermark;
+      if (expectedWatermark !== output.aggregate_paid_cum_au_before) {
+        return new Error('Targeted settlement provider outputs have a discontinuous aggregate paid watermark.');
+      }
+      const nextProviderPaid = this.safeAddAu(providerPaid.paid_au, settledAu);
       if (nextProviderPaid instanceof Error) return nextProviderPaid;
-      paidByProvider.set(output.provider, nextProviderPaid);
+      paidByProvider.set(output.provider, {
+        aggregate_paid_cum_au_before: providerPaid.aggregate_paid_cum_au_before,
+        paid_au: nextProviderPaid,
+      });
     }
 
     const earningUpdates = [];
-    for (const [providerId, paidAu] of paidByProvider) {
+    for (const [providerId, providerPaid] of paidByProvider) {
+      const paidAu = providerPaid.paid_au;
       const provider = await this.get(`prov/${providerId}`);
       const earning = await this.earningRecord(providerId, rail);
       if (earning instanceof Error) return earning;
@@ -7772,6 +12476,9 @@ class MayhemContract extends Contract {
         refreshed.paid_cum_au
       );
       if (payable instanceof Error) return payable;
+      if (refreshed.paid_cum_au !== providerPaid.aggregate_paid_cum_au_before) {
+        return new Error('Targeted settlement aggregate paid cumulative watermark mismatch.');
+      }
       if (this.compareAu(paidAu, payable) > 0) {
         return new Error('Targeted settlement exceeds aggregate provider earnings.');
       }
@@ -7793,6 +12500,326 @@ class MayhemContract extends Contract {
       earningUpdates.push(nextEarning);
     }
     return { liabilityUpdates, earningUpdates };
+  }
+
+  async targetedTapSettlement(value) {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const normalized = this.normalizeTargetedTapSettlementValue(value);
+    if (normalized instanceof Error) return normalized;
+    const settlementParams = await this.activeParamsAt(
+      value.at,
+      ['max_tap_settlement_outputs', 'fee_bps']
+    );
+    const payoutSplit = this.targetedTapPayoutSplit(settlementParams.fee_bps);
+    if (payoutSplit instanceof Error) return payoutSplit;
+    if (normalized.fee_bps !== payoutSplit.fee_bps ||
+        normalized.tap_burn_bps !== payoutSplit.tap_burn_bps ||
+        normalized.provider_share_bps !== payoutSplit.provider_share_bps) {
+      return new Error(
+        'Targeted TAP settlement fee/burn split does not match the historical schedule.'
+      );
+    }
+    if (normalized.outputs.length > settlementParams.max_tap_settlement_outputs) {
+      return new Error('Targeted TAP settlement output count exceeds limit.');
+    }
+
+    const admin = await this.get('admin');
+    const payments = await this.get('payments/current');
+    if (!payments || payments.set_by !== admin || payments.set_by_role !== 'admin' ||
+        payments.ver !== value.payment_config_ver ||
+        payments.tap?.chain_id !== value.chain_id ||
+        payments.tap?.token_address?.toLowerCase() !== value.token_address ||
+        payments.tap?.pool_address?.toLowerCase() !== value.pool_address) {
+      return new Error('Targeted TAP settlement does not match canonical payment configuration.');
+    }
+    const rate = await this.guardianRequireHistoricalTapRateLock(
+      normalized.rate_lock,
+      value.at
+    );
+    if (rate instanceof Error) return rate;
+
+    const record = {
+      type: 'targeted_tap_settlement',
+      ...value,
+      tap_rate_lock: normalized.rate_lock,
+      entries: normalized.entries,
+      outputs: normalized.outputs,
+      fee_bps: payoutSplit.fee_bps,
+      tap_burn_bps: payoutSplit.tap_burn_bps,
+      provider_share_bps: payoutSplit.provider_share_bps,
+      settled_by: this.address,
+      settled_by_role: 'admin',
+    };
+    const recordKey = `settle/targeted/tap/${value.epoch}`;
+    const existing = await this.get(recordKey);
+    if (existing) {
+      if (stableJson(existing) === stableJson(record)) {
+        return {
+          ok: true,
+          op: 'targetedTapSettlement',
+          epoch: value.epoch,
+          rail: 'tap',
+          root: value.root,
+          execution_tx: value.execution_tx,
+          idempotent: true,
+        };
+      }
+      return new Error('Targeted TAP settlement already exists for epoch.');
+    }
+
+    const applyAnchor = await this.requireEpochApplyAnchor(
+      value.epoch,
+      value.epoch_apply_hash,
+      'Targeted TAP settlement'
+    );
+    if (applyAnchor instanceof Error) return applyAnchor;
+    const preparations = await this.payoutPreparationsForSettlement(
+      value,
+      normalized,
+      'tap'
+    );
+    if (preparations instanceof Error) return preparations;
+
+    const scope = `${value.chain_id}/${value.pool_address}`;
+    const rootSeenKey = `rail/seen/tap-settlement-root/${scope}/${value.root}`;
+    const proposalSeenKey = `rail/seen/tap-settlement-proposal/${scope}/${value.proposal_tx}`;
+    const executionSeenKey = `rail/seen/tap-settlement-execution/${scope}/${value.execution_tx}`;
+    if ((await this.get(rootSeenKey)) !== null) {
+      return new Error('Targeted TAP settlement root was already consumed.');
+    }
+    if ((await this.get(proposalSeenKey)) !== null) {
+      return new Error('Targeted TAP settlement proposal transaction was already consumed.');
+    }
+    if ((await this.get(executionSeenKey)) !== null) {
+      return new Error('Targeted TAP settlement execution transaction was already consumed.');
+    }
+
+    const stateKey = `settle/targeted/tap/state/${scope}`;
+    const state = (await this.get(stateKey)) ?? {
+      type: 'targeted_tap_settlement_state',
+      chain_id: value.chain_id,
+      token_address: value.token_address,
+      pool_address: value.pool_address,
+      payment_config_ver: value.payment_config_ver,
+      last_epoch: 0,
+      cumulative_spent_wei: '0',
+      cumulative_provider_claimed_wei: '0',
+      cumulative_buyer_refund_wei: '0',
+      last_root: null,
+      last_execution_tx: null,
+      updated_at: null,
+    };
+    if (state.type !== 'targeted_tap_settlement_state' ||
+        state.chain_id !== value.chain_id ||
+        state.token_address !== value.token_address ||
+        state.pool_address !== value.pool_address ||
+        state.payment_config_ver !== value.payment_config_ver ||
+        !Number.isSafeInteger(state.last_epoch) ||
+        state.last_epoch < 0 ||
+        typeof state.cumulative_spent_wei !== 'string' ||
+        !/^(0|[1-9][0-9]*)$/.test(state.cumulative_spent_wei) ||
+        typeof state.cumulative_provider_claimed_wei !== 'string' ||
+        !/^(0|[1-9][0-9]*)$/.test(state.cumulative_provider_claimed_wei) ||
+        typeof state.cumulative_buyer_refund_wei !== 'string' ||
+        !/^(0|[1-9][0-9]*)$/.test(state.cumulative_buyer_refund_wei)) {
+      return new Error('Invalid targeted TAP settlement state.');
+    }
+    if (value.epoch <= state.last_epoch) {
+      return new Error('Targeted TAP settlement epoch must advance.');
+    }
+    const priorSpentWei = BigInt(state.cumulative_spent_wei);
+    const nextSpentWei = BigInt(normalized.cumulative_spent_wei);
+    const priorProviderClaimedWei = BigInt(state.cumulative_provider_claimed_wei);
+    const nextProviderClaimedWei = BigInt(normalized.provider_cumulative_claimed_wei);
+    const priorBuyerRefundWei = BigInt(state.cumulative_buyer_refund_wei);
+    const nextBuyerRefundWei = BigInt(normalized.buyer_refund_wei);
+    if (nextSpentWei <= priorSpentWei) {
+      return new Error('Targeted TAP cumulative gross spend must advance.');
+    }
+    const grossSpendDeltaWei = nextSpentWei - priorSpentWei;
+    const expectedProviderDeltaWei =
+      (grossSpendDeltaWei * BigInt(payoutSplit.provider_share_bps)) / 10_000n;
+    if (BigInt(normalized.provider_tap_wei) !== expectedProviderDeltaWei ||
+        nextProviderClaimedWei !==
+          priorProviderClaimedWei + BigInt(normalized.provider_tap_wei)) {
+      return new Error(
+        'Targeted TAP provider entitlement does not match the historical fee/burn split.'
+      );
+    }
+    if (nextBuyerRefundWei < priorBuyerRefundWei) {
+      return new Error('Targeted TAP cumulative buyer refunds cannot decrease.');
+    }
+
+    const outputsByTarget = new Map();
+    for (const output of normalized.outputs) {
+      const targetOutputs = outputsByTarget.get(output.to) ?? [];
+      targetOutputs.push(output);
+      outputsByTarget.set(output.to, targetOutputs);
+    }
+    const claimUpdates = [];
+    for (const entry of normalized.provider_entries) {
+      const claimKey = `settle/targeted/tap/claim/${scope}/${entry.account}`;
+      const claim = (await this.get(claimKey)) ?? {
+        type: 'targeted_tap_cumulative_claim',
+        chain_id: value.chain_id,
+        token_address: value.token_address,
+        pool_address: value.pool_address,
+        account: entry.account,
+        cumulative_claim_wei: '0',
+        updated_epoch: 0,
+        updated_at: null,
+      };
+      if (claim.type !== 'targeted_tap_cumulative_claim' ||
+          claim.chain_id !== value.chain_id ||
+          claim.token_address !== value.token_address ||
+          claim.pool_address !== value.pool_address ||
+          claim.account !== entry.account ||
+          typeof claim.cumulative_claim_wei !== 'string' ||
+          !/^(0|[1-9][0-9]*)$/.test(claim.cumulative_claim_wei)) {
+        return new Error('Invalid targeted TAP cumulative claim state.');
+      }
+      const targetOutputs = outputsByTarget.get(entry.account) ?? [];
+      let cursor = BigInt(claim.cumulative_claim_wei);
+      for (const output of targetOutputs) {
+        const prior = BigInt(output.prior_cumulative_claim_wei);
+        const next = BigInt(output.cumulative_claim_wei);
+        if (prior !== cursor || next !== prior + BigInt(output.tap_wei)) {
+          return new Error('Targeted TAP cumulative claim output chain does not advance from canonical state.');
+        }
+        cursor = next;
+      }
+      if (BigInt(entry.cumulative_wei) !== cursor) {
+        return new Error('Targeted TAP cumulative claim chain does not match executed root.');
+      }
+      outputsByTarget.delete(entry.account);
+      claimUpdates.push({
+        key: claimKey,
+        value: {
+          ...claim,
+          cumulative_claim_wei: entry.cumulative_wei,
+          updated_epoch: value.epoch,
+          updated_at: this.tx,
+        },
+      });
+    }
+    if (outputsByTarget.size !== 0) {
+      return new Error('Targeted TAP provider output target is missing from executed root.');
+    }
+    const priorSettlement = state.last_epoch === 0
+      ? null
+      : await this.get(`settle/targeted/tap/${state.last_epoch}`);
+    const priorRefunds = priorSettlement?.refunds ?? [];
+    if (state.last_epoch > 0 && !Array.isArray(priorRefunds)) {
+      return new Error('Prior targeted TAP refund distribution is invalid.');
+    }
+    const refundUpdates = [];
+    const refundMap = new Map(normalized.refunds.map((entry) => [entry.account, entry]));
+    for (const priorRefund of priorRefunds) {
+      const nextRefund = refundMap.get(priorRefund.account);
+      if (!nextRefund ||
+          BigInt(nextRefund.cumulative_wei) < BigInt(priorRefund.cumulative_wei)) {
+        return new Error('Targeted TAP refund claim cannot be removed or decreased.');
+      }
+    }
+    for (const entry of normalized.refunds) {
+      const refundKey = `settle/targeted/tap/refund/${scope}/${entry.account}`;
+      const refund = (await this.get(refundKey)) ?? {
+        type: 'targeted_tap_cumulative_refund',
+        chain_id: value.chain_id,
+        token_address: value.token_address,
+        pool_address: value.pool_address,
+        account: entry.account,
+        cumulative_refund_wei: '0',
+        updated_epoch: 0,
+        updated_at: null,
+      };
+      if (refund.type !== 'targeted_tap_cumulative_refund' ||
+          refund.chain_id !== value.chain_id ||
+          refund.token_address !== value.token_address ||
+          refund.pool_address !== value.pool_address ||
+          refund.account !== entry.account ||
+          typeof refund.cumulative_refund_wei !== 'string' ||
+          !/^(0|[1-9][0-9]*)$/.test(refund.cumulative_refund_wei) ||
+          BigInt(entry.cumulative_wei) < BigInt(refund.cumulative_refund_wei)) {
+        return new Error('Invalid or decreasing targeted TAP cumulative refund state.');
+      }
+      refundUpdates.push({
+        key: refundKey,
+        value: {
+          ...refund,
+          cumulative_refund_wei: entry.cumulative_wei,
+          updated_epoch: value.epoch,
+          updated_at: this.tx,
+        },
+      });
+    }
+
+    const settlementOutputs = normalized.outputs.map((output) => ({
+      role: 'provider',
+      provider: output.provider,
+      payout_revision: output.payout_revision,
+      to: output.to,
+      paid_cum_au_before: output.paid_cum_au_before,
+      aggregate_paid_cum_au_before: output.aggregate_paid_cum_au_before,
+      au: output.paid_au,
+    }));
+    const updates = await this.targetedPayoutSettlementUpdates(
+      settlementOutputs,
+      'tap',
+      value.epoch,
+      value.at,
+      normalized.outputs.map(() => value.execution_tx)
+    );
+    if (updates instanceof Error) return updates;
+
+    for (const update of updates.liabilityUpdates) await this.put(update.key, update.value);
+    for (const earning of updates.earningUpdates) {
+      await this.put(this.earningKey(earning.provider, 'tap'), earning);
+    }
+    for (const update of claimUpdates) await this.put(update.key, update.value);
+    for (const update of refundUpdates) await this.put(update.key, update.value);
+    const replayEvidence = {
+      rail: 'tap',
+      purpose: 'targeted_settlement',
+      epoch: value.epoch,
+      root: value.root,
+      proposal_tx: value.proposal_tx,
+      execution_tx: value.execution_tx,
+      epoch_apply_hash: value.epoch_apply_hash,
+      consumed_at: this.tx,
+    };
+    await this.put(rootSeenKey, replayEvidence);
+    await this.put(proposalSeenKey, replayEvidence);
+    await this.put(executionSeenKey, replayEvidence);
+    await this.put(stateKey, {
+      ...state,
+      last_epoch: value.epoch,
+      cumulative_spent_wei: normalized.cumulative_spent_wei,
+      cumulative_provider_claimed_wei: normalized.provider_cumulative_claimed_wei,
+      cumulative_buyer_refund_wei: normalized.buyer_refund_wei,
+      last_root: value.root,
+      last_execution_tx: value.execution_tx,
+      updated_at: this.tx,
+    });
+    const preparationError = await this.consumePayoutPreparations(
+      preparations,
+      recordKey
+    );
+    if (preparationError) return preparationError;
+    await this.put(recordKey, record);
+    return {
+      ok: true,
+      op: 'targetedTapSettlement',
+      epoch: value.epoch,
+      rail: 'tap',
+      provider_paid_au: normalized.provider_paid_au,
+      provider_tap_wei: normalized.provider_tap_wei,
+      cumulative_spent_wei: normalized.cumulative_spent_wei,
+      root: value.root,
+      execution_tx: value.execution_tx,
+      idempotent: false,
+    };
   }
 
   async targetedTnkSettlement(value) {
@@ -7870,11 +12897,18 @@ class MayhemContract extends Contract {
       }
       return new Error('Targeted TNK settlement already exists for epoch.');
     }
-    const applyState = await this.epochApplyStateRecord();
-    if (applyState.updated_epoch !== value.epoch ||
-        applyState.last_apply_hash !== value.epoch_apply_hash) {
-      return new Error('Targeted TNK settlement apply hash mismatch.');
-    }
+    const applyAnchor = await this.requireEpochApplyAnchor(
+      value.epoch,
+      value.epoch_apply_hash,
+      'Targeted TNK settlement'
+    );
+    if (applyAnchor instanceof Error) return applyAnchor;
+    const preparations = await this.payoutPreparationsForSettlement(
+      value,
+      normalized,
+      'tnk'
+    );
+    if (preparations instanceof Error) return preparations;
     for (const transfer of transfers) {
       if ((await this.get(this.msbTransferSeenKey(transfer))) !== null) {
         return new Error('Targeted TNK transfer was already consumed.');
@@ -7935,6 +12969,11 @@ class MayhemContract extends Contract {
       });
     }
     await this.put(this.feeCumKey('tnk'), nextFee);
+    const preparationError = await this.consumePayoutPreparations(
+      preparations,
+      recordKey
+    );
+    if (preparationError) return preparationError;
     await this.put(recordKey, record);
     return {
       ok: true,
@@ -8055,11 +13094,18 @@ class MayhemContract extends Contract {
       }
       return new Error('Targeted fiat settlement already exists for epoch.');
     }
-    const applyState = await this.epochApplyStateRecord();
-    if (applyState.updated_epoch !== value.epoch ||
-        applyState.last_apply_hash !== value.epoch_apply_hash) {
-      return new Error('Targeted fiat settlement apply hash mismatch.');
-    }
+    const applyAnchor = await this.requireEpochApplyAnchor(
+      value.epoch,
+      value.epoch_apply_hash,
+      'Targeted fiat settlement'
+    );
+    if (applyAnchor instanceof Error) return applyAnchor;
+    const preparations = await this.payoutPreparationsForSettlement(
+      value,
+      normalized,
+      'fiat'
+    );
+    if (preparations instanceof Error) return preparations;
     for (const transfer of transfers) {
       for (const seenKey of [
         this.stripeTransferSeenKey(transfer),
@@ -8133,6 +13179,11 @@ class MayhemContract extends Contract {
       }
     }
     await this.put(this.feeCumKey('fiat'), nextFee);
+    const preparationError = await this.consumePayoutPreparations(
+      preparations,
+      recordKey
+    );
+    if (preparationError) return preparationError;
     await this.put(recordKey, record);
     return {
       ok: true,
@@ -8428,6 +13479,22 @@ class MayhemContract extends Contract {
     if (destinationAmountMinor instanceof Error || destinationAmountMinor === '0') {
       return new Error('Fiat settlement destination amount must be positive.');
     }
+    const destinationAmountMinMinor = this.normalizeFiatMinor(
+      output.destination_amount_min_minor
+    );
+    const destinationAmountMaxMinor = this.normalizeFiatMinor(
+      output.destination_amount_max_minor
+    );
+    if (destinationAmountMinMinor instanceof Error ||
+        destinationAmountMaxMinor instanceof Error ||
+        destinationAmountMinMinor === '0' ||
+        BigInt(destinationAmountMaxMinor) < BigInt(destinationAmountMinMinor) ||
+        BigInt(destinationAmountMinor) < BigInt(destinationAmountMinMinor) ||
+        BigInt(destinationAmountMinor) > BigInt(destinationAmountMaxMinor)) {
+      return new Error(
+        'Fiat settlement destination amount must be within its authorized range.'
+      );
+    }
     const hasFxQuoteId = hasOwn(output, 'fx_quote_id');
     const hasFxQuoteHash = hasOwn(output, 'fx_quote_hash');
     if (hasFxQuoteId !== hasFxQuoteHash) {
@@ -8454,6 +13521,8 @@ class MayhemContract extends Contract {
       source_currency: sourceCurrency,
       source_amount_minor: sourceAmountMinor,
       destination_currency: destinationCurrency,
+      destination_amount_min_minor: destinationAmountMinMinor,
+      destination_amount_max_minor: destinationAmountMaxMinor,
       destination_amount_minor: destinationAmountMinor,
     };
     if (hasFxQuoteId) {
@@ -10285,6 +15354,119 @@ class MayhemContract extends Contract {
     return `payout/liability/${rail}/${provider}/${revision}`;
   }
 
+  providerPayoutLiabilityIndexKey(rail) {
+    return `payout/liability-index/${rail}`;
+  }
+
+  normalizeProviderPayoutLiabilityIndex(value, rail) {
+    const shapeError = this.validateExactObjectKeys(
+      value,
+      ['type', 'rail', 'entries', 'updated_epoch', 'updated_at'],
+      'provider payout liability index'
+    );
+    if (shapeError) return shapeError;
+    if (value.type !== 'provider_payout_liability_index' ||
+        value.rail !== rail ||
+        !PROVIDER_PAYOUT_BINDING_RAILS.has(rail) ||
+        !Array.isArray(value.entries) ||
+        !Number.isSafeInteger(value.updated_epoch) ||
+        value.updated_epoch < 0 ||
+        (value.updated_at !== null &&
+          (typeof value.updated_at !== 'string' || value.updated_at.length === 0))) {
+      return new Error('Invalid provider payout liability index.');
+    }
+    const entries = [];
+    for (const entry of value.entries) {
+      const entryError = this.validateExactObjectKeys(
+        entry,
+        ['provider', 'payout_revision'],
+        'provider payout liability index entry'
+      );
+      if (entryError) return entryError;
+      if (!this.isHexBytes(entry.provider, 32) ||
+          entry.provider !== entry.provider.toLowerCase() ||
+          !this.isHexBytes(entry.payout_revision, 32) ||
+          entry.payout_revision !== entry.payout_revision.toLowerCase()) {
+        return new Error('Invalid provider payout liability index entry.');
+      }
+      entries.push({
+        provider: entry.provider,
+        payout_revision: entry.payout_revision,
+      });
+    }
+    entries.sort((left, right) =>
+      compareCodepoint(left.provider, right.provider) ||
+      compareCodepoint(left.payout_revision, right.payout_revision)
+    );
+    const identities = entries.map((entry) =>
+      `${entry.provider}/${entry.payout_revision}`
+    );
+    if (new Set(identities).size !== entries.length ||
+        stableJson(entries) !== stableJson(value.entries)) {
+      return new Error('Provider payout liability index must be canonical and unique.');
+    }
+    return {
+      type: 'provider_payout_liability_index',
+      rail,
+      entries,
+      updated_epoch: value.updated_epoch,
+      updated_at: value.updated_at,
+    };
+  }
+
+  async providerPayoutLiabilityIndex(rail) {
+    if (!PROVIDER_PAYOUT_BINDING_RAILS.has(rail)) {
+      return new Error('Invalid provider payout liability index rail.');
+    }
+    const current = await this.get(this.providerPayoutLiabilityIndexKey(rail));
+    if (current === null) {
+      return {
+        type: 'provider_payout_liability_index',
+        rail,
+        entries: [],
+        updated_epoch: 0,
+        updated_at: null,
+      };
+    }
+    return this.normalizeProviderPayoutLiabilityIndex(current, rail);
+  }
+
+  async nextProviderPayoutLiabilityIndexes(liabilityUpdates, epoch, featureKey) {
+    const byRail = new Map();
+    for (const update of liabilityUpdates) {
+      const { provider, rail, revision: payoutRevision } = update.value;
+      let index = byRail.get(rail);
+      if (!index) {
+        index = await this.providerPayoutLiabilityIndex(rail);
+        if (index instanceof Error) return index;
+      }
+      const identity = `${provider}/${payoutRevision}`;
+      if (!index.entries.some((entry) =>
+        `${entry.provider}/${entry.payout_revision}` === identity
+      )) {
+        index = {
+          ...index,
+          entries: [
+            ...index.entries,
+            { provider, payout_revision: payoutRevision },
+          ].sort((left, right) =>
+            compareCodepoint(left.provider, right.provider) ||
+            compareCodepoint(left.payout_revision, right.payout_revision)
+          ),
+        };
+      }
+      byRail.set(rail, {
+        ...index,
+        updated_epoch: Math.max(index.updated_epoch, epoch),
+        updated_at: featureKey,
+      });
+    }
+    return [...byRail.values()].map((value) => ({
+      key: this.providerPayoutLiabilityIndexKey(value.rail),
+      value,
+    }));
+  }
+
   providerStripePayoutVerificationTargetKey(provider, target) {
     return `payout/stripe-verified/target/${provider}/${target}`;
   }
@@ -10394,7 +15576,27 @@ class MayhemContract extends Contract {
     return binding;
   }
 
-  async validateTargetedEpochReservationBindings(value, earnings) {
+  receiptConsumptionRecord(epoch, allocation, featureKey) {
+    return {
+      type: 'canonical_receipt_consumption',
+      epoch,
+      billing_epoch: allocation.billing_epoch,
+      billing_id: allocation.billing_id,
+      billing_attempt: allocation.billing_attempt,
+      receipt_seq: allocation.receipt_seq,
+      receipt_hash: allocation.receipt_hash,
+      session_id: allocation.session_id,
+      user: allocation.user,
+      rail: allocation.rail,
+      provider: allocation.provider,
+      payout_revision: allocation.payout_revision,
+      au: allocation.au,
+      feature_key: featureKey,
+      consumed_at: featureKey,
+    };
+  }
+
+  async validateTargetedEpochReservationBindings(value, earnings, featureKey) {
     const debitTotals = new Map();
     for (const debit of value.debits) {
       const rail = this.normalizeLedgerRail(debit.rail, 'targeted epoch debit rail');
@@ -10412,40 +15614,100 @@ class MayhemContract extends Contract {
     );
     const allocatedDebits = new Map();
     const allocatedEarnings = new Map();
-    const allocatedHolds = new Map();
     const holds = new Map();
     const sessions = new Set();
+    const billingAttempts = new Set();
     for (const allocation of value.allocations) {
       if (sessions.has(allocation.session_id)) {
         return new Error('Targeted epoch session allocation is duplicated.');
       }
       sessions.add(allocation.session_id);
-      const holdIdentity = stableJson([allocation.rail, allocation.user]);
-      let hold = holds.get(holdIdentity);
-      if (!hold) {
-        hold = await this.normalizeSpendHoldRecord(
-          (
-            await this.get(
-              this.spendHoldKey(allocation.user, allocation.rail, value.epoch)
-            )
-          ) ?? null,
-          allocation.user,
-          allocation.rail,
-          value.epoch
-        );
-        if (hold instanceof Error) return hold;
-        holds.set(holdIdentity, hold);
+      const billingAttempt = `${allocation.billing_id}:${allocation.billing_attempt}`;
+      if (billingAttempts.has(billingAttempt)) {
+        return new Error('Targeted epoch billing attempt allocation is duplicated.');
       }
-      const session = hold.sessions.find(
-        (entry) => entry.session_id === allocation.session_id
+      billingAttempts.add(billingAttempt);
+      const head = await this.get(
+        this.receiptHeadKey(allocation.billing_id, allocation.billing_attempt)
       );
-      if (!session ||
-          session.provider !== allocation.provider ||
-          session.payout_revision !== allocation.payout_revision) {
-        return new Error('Targeted epoch allocation does not match its reserved session.');
+      if (!head ||
+          head.type !== 'canonical_receipt_head' ||
+          head.epoch !== value.epoch ||
+          head.settlement_epoch !== value.epoch ||
+          head.billing_epoch !== allocation.billing_epoch ||
+          head.settlement_ready !== true ||
+          head.billing_id !== allocation.billing_id ||
+          head.billing_attempt !== allocation.billing_attempt ||
+          head.receipt_seq !== allocation.receipt_seq ||
+          head.receipt_hash !== allocation.receipt_hash ||
+          head.session_id !== allocation.session_id ||
+          head.user !== allocation.user ||
+          head.rail !== allocation.rail ||
+          head.provider !== allocation.provider ||
+          head.payout_revision !== allocation.payout_revision ||
+          this.compareAu(head.incremental_au, allocation.au) !== 0) {
+        return new Error('Targeted epoch allocation does not match its canonical receipt head.');
       }
-      if (this.compareAu(allocation.au, session.max_spend_au) > 0) {
-        return new Error('Targeted epoch allocation exceeds its session reservation.');
+      const consumeKey = this.receiptConsumedKey(
+        allocation.billing_id,
+        allocation.billing_attempt
+      );
+      const expectedConsumption = this.receiptConsumptionRecord(
+        value.epoch,
+        allocation,
+        featureKey
+      );
+      const existingConsumption = await this.get(consumeKey);
+      if (existingConsumption !== null &&
+          stableJson(existingConsumption) !== stableJson(expectedConsumption)) {
+        return new Error('Canonical receipt billing attempt is already consumed.');
+      }
+      if (existingConsumption === null) {
+        const holdIdentity = stableJson([allocation.rail, allocation.user]);
+        let hold = holds.get(holdIdentity);
+        if (!hold) {
+          hold = await this.normalizeTargetedSpendHoldRecord(
+            (
+              await this.get(
+                this.targetedSpendHoldKey(allocation.user, allocation.rail)
+              )
+            ) ?? null,
+            allocation.user,
+            allocation.rail
+          );
+          if (hold instanceof Error) return hold;
+        }
+        const session = hold.sessions.find(
+          (entry) => entry.session_id === allocation.session_id
+        );
+        if (!session ||
+            session.billing_id !== allocation.billing_id ||
+            session.billing_attempt !== allocation.billing_attempt ||
+            session.billing_epoch !== allocation.billing_epoch ||
+            session.provider !== allocation.provider ||
+            session.payout_revision !== allocation.payout_revision ||
+            session.settlement_ready !== true) {
+          return new Error('Targeted epoch allocation does not match its reserved session.');
+        }
+        if (session.reservation_id !== head.reservation_id ||
+            session.user !== allocation.user ||
+            session.rail !== allocation.rail ||
+            this.compareAu(allocation.au, session.max_spend_au) !== 0 ||
+            this.compareAu(allocation.au, head.incremental_au) !== 0) {
+          return new Error('Targeted epoch allocation does not exactly consume its reserved receipt.');
+        }
+        const nextReservedAu = this.safeSubAu(hold.reserved_au, allocation.au);
+        if (nextReservedAu instanceof Error) {
+          return new Error('Targeted epoch allocation exceeds outstanding holds.');
+        }
+        holds.set(holdIdentity, {
+          ...hold,
+          reserved_au: nextReservedAu,
+          sessions: hold.sessions.filter(
+            (entry) => entry.reservation_id !== session.reservation_id
+          ),
+          updated_at: featureKey,
+        });
       }
       const debitKey = stableJson([allocation.rail, allocation.user]);
       const nextDebit = this.safeAddAu(
@@ -10454,7 +15716,6 @@ class MayhemContract extends Contract {
       );
       if (nextDebit instanceof Error) return nextDebit;
       allocatedDebits.set(debitKey, nextDebit);
-      allocatedHolds.set(holdIdentity, nextDebit);
       const earningKey = stableJson([
         allocation.rail,
         allocation.provider,
@@ -10483,13 +15744,12 @@ class MayhemContract extends Contract {
     if (allocatedEarnings.size !== earningTotals.size) {
       return new Error('Targeted epoch allocation has no matching earning.');
     }
-    for (const [key, total] of allocatedHolds) {
-      const hold = holds.get(key);
-      if (!hold || this.compareAu(total, hold.reserved_au) > 0) {
-        return new Error('Targeted epoch allocations exceed reserved user credit.');
-      }
-    }
-    return null;
+    return {
+      hold_updates: Array.from(holds.values()).map((hold) => ({
+        key: this.targetedSpendHoldKey(hold.user, hold.rail),
+        value: hold,
+      })),
+    };
   }
 
   async spendReservationFeatureKey(value) {
@@ -12060,13 +17320,22 @@ class MayhemContract extends Contract {
 
   async normalizeSpendVoucherForReserve(voucher) {
     const voucherFields = [
+      'schema_version',
       'session_id',
       'billing_id',
       'billing_attempt',
       'billing_prior_usage',
       'billing_prior_au_owed_cum',
+      'billing_epoch',
+      'reservation_id',
+      'reservation_expires_after_epoch',
+      'reservation_receipt_grace_epochs',
+      'user',
+      'provider',
+      'payout_revision',
       'rail',
       'enclave_id',
+      'model_id',
       'price_ver',
       'locked_rate_map',
       'locked_per_req_au',
@@ -12075,6 +17344,7 @@ class MayhemContract extends Contract {
       'required_modalities',
       'ctx_bracket',
       'ctx_bracket_table_ver',
+      'rules_ver',
       'max_spend_au',
       'checkpoint_every',
       'user_sig',
@@ -12086,6 +17356,9 @@ class MayhemContract extends Contract {
       'spend voucher'
     );
     if (shapeError) return shapeError;
+    if (voucher.schema_version !== SPEND_VOUCHER_SCHEMA_VERSION) {
+      return new Error('Unsupported spend voucher schema version.');
+    }
     const checkpointError = this.validateExactObjectKeys(
       voucher.checkpoint_every,
       ['tokens', 'ms'],
@@ -12098,6 +17371,23 @@ class MayhemContract extends Contract {
     if (!this.isHexBytes(voucher.billing_id, 32)) return new Error('Invalid spend voucher billing id.');
     if (!Number.isSafeInteger(voucher.billing_attempt) || voucher.billing_attempt < 0) {
       return new Error('Invalid spend voucher billing attempt.');
+    }
+    if (!Number.isSafeInteger(voucher.billing_epoch) || voucher.billing_epoch < 1) {
+      return new Error('Invalid spend voucher billing epoch.');
+    }
+    if (!this.isHexBytes(voucher.reservation_id, 32)) {
+      return new Error('Invalid spend voucher reservation id.');
+    }
+    if (!Number.isSafeInteger(voucher.reservation_expires_after_epoch) ||
+        voucher.reservation_expires_after_epoch <= voucher.billing_epoch ||
+        !Number.isSafeInteger(voucher.reservation_receipt_grace_epochs) ||
+        voucher.reservation_receipt_grace_epochs < 0) {
+      return new Error('Invalid spend voucher reservation expiry policy.');
+    }
+    if (!this.isHexBytes(voucher.user, 32)) return new Error('Invalid spend voucher user.');
+    if (!this.isHexBytes(voucher.provider, 32)) return new Error('Invalid spend voucher provider.');
+    if (!this.isHexBytes(voucher.payout_revision, 32)) {
+      return new Error('Invalid spend voucher payout revision.');
     }
     const billingPriorUsage = this.normalizeReceiptUsage(voucher.billing_prior_usage);
     if (billingPriorUsage instanceof Error) return billingPriorUsage;
@@ -12121,8 +17411,16 @@ class MayhemContract extends Contract {
       return new Error('Spend voucher billing prior usage requires a prior cumulative amount.');
     }
     if (!this.isHexBytes(voucher.enclave_id, 32)) return new Error('Invalid spend voucher enclave id.');
+    if (typeof voucher.model_id !== 'string' ||
+        voucher.model_id.length === 0 ||
+        voucher.model_id.length > 256) {
+      return new Error('Invalid spend voucher model id.');
+    }
     if (!Number.isSafeInteger(voucher.price_ver) || voucher.price_ver < 1) {
       return new Error('Invalid spend voucher price version.');
+    }
+    if (!Number.isSafeInteger(voucher.rules_ver) || voucher.rules_ver < 1) {
+      return new Error('Invalid spend voucher rules version.');
     }
     const lockedRateMap = this.normalizeLockedRateMap(voucher.locked_rate_map, 'spend voucher locked_rate_map');
     if (lockedRateMap instanceof Error) return lockedRateMap;
@@ -12176,13 +17474,22 @@ class MayhemContract extends Contract {
     }
     if (!this.isHexBytes(voucher.user_sig, 64)) return new Error('Invalid spend voucher user signature.');
     const body = {
+      schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
       session_id: voucher.session_id.toLowerCase(),
       billing_id: voucher.billing_id.toLowerCase(),
       billing_attempt: voucher.billing_attempt,
       billing_prior_usage: billingPriorUsage,
       billing_prior_au_owed_cum: billingPriorAuOwedCum,
+      billing_epoch: voucher.billing_epoch,
+      reservation_id: voucher.reservation_id.toLowerCase(),
+      reservation_expires_after_epoch: voucher.reservation_expires_after_epoch,
+      reservation_receipt_grace_epochs: voucher.reservation_receipt_grace_epochs,
+      user: voucher.user.toLowerCase(),
+      provider: voucher.provider.toLowerCase(),
+      payout_revision: voucher.payout_revision.toLowerCase(),
       rail,
       enclave_id: voucher.enclave_id.toLowerCase(),
+      model_id: voucher.model_id,
       price_ver: voucher.price_ver,
       locked_rate_map: lockedRateMap,
       locked_per_req_au: lockedPerReqAu,
@@ -12192,6 +17499,7 @@ class MayhemContract extends Contract {
       required_specialities: normalizedSpecialities,
       ctx_bracket: ctxMeta.ctx_bracket,
       ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
+      rules_ver: voucher.rules_ver,
       max_spend_au: maxSpendAu,
       checkpoint_every: {
         tokens: voucher.checkpoint_every.tokens,
@@ -12211,12 +17519,17 @@ class MayhemContract extends Contract {
       'payout_revision',
       'contract_version',
       'session_id',
+      'reservation_id',
+      'reservation_expires_after_epoch',
+      'reservation_receipt_grace_epochs',
       'epoch',
       'at',
       'rail',
       'user',
       'provider',
       'enclave_id',
+      'enclave_pubkey',
+      'model_id',
       'price_ver',
       'rules_ver',
       'served_ctx',
@@ -12241,6 +17554,16 @@ class MayhemContract extends Contract {
     }
     if (value.contract_version !== CONTRACT_VERSION) return new Error('Invalid spend reservation contract version.');
     if (!this.isHexBytes(value.session_id, 32)) return new Error('Invalid spend reservation session id.');
+    if (!this.isHexBytes(value.reservation_id, 32) ||
+        value.reservation_id !== value.reservation_id.toLowerCase()) {
+      return new Error('Invalid spend reservation reservation id.');
+    }
+    if (!Number.isSafeInteger(value.reservation_expires_after_epoch) ||
+        value.reservation_expires_after_epoch <= value.epoch ||
+        !Number.isSafeInteger(value.reservation_receipt_grace_epochs) ||
+        value.reservation_receipt_grace_epochs < 0) {
+      return new Error('Invalid spend reservation expiry policy.');
+    }
     if (!Number.isSafeInteger(value.epoch) || value.epoch < 1) return new Error('Invalid spend reservation epoch.');
     if (!Number.isSafeInteger(value.at) || value.at < 0) return new Error('Invalid spend reservation timestamp.');
     const rail = this.normalizeLedgerRail(value.rail, 'spend reservation rail');
@@ -12248,6 +17571,14 @@ class MayhemContract extends Contract {
     if (!this.isHexBytes(value.user, 32)) return new Error('Invalid spend reservation user.');
     if (!this.isHexBytes(value.provider, 32)) return new Error('Invalid spend reservation provider.');
     if (!this.isHexBytes(value.enclave_id, 32)) return new Error('Invalid spend reservation enclave.');
+    if (!this.isHexBytes(value.enclave_pubkey, 32)) {
+      return new Error('Invalid spend reservation enclave public key.');
+    }
+    if (typeof value.model_id !== 'string' ||
+        value.model_id.length === 0 ||
+        value.model_id.length > 256) {
+      return new Error('Invalid spend reservation model id.');
+    }
     if (!Number.isSafeInteger(value.price_ver) || value.price_ver < 1) {
       return new Error('Invalid spend reservation price version.');
     }
@@ -12299,9 +17630,31 @@ class MayhemContract extends Contract {
     if (voucher.session_id !== value.session_id.toLowerCase()) {
       return new Error('Spend reservation voucher session mismatch.');
     }
+    if (voucher.reservation_id !== value.reservation_id.toLowerCase()) {
+      return new Error('Spend reservation voucher reservation mismatch.');
+    }
+    if (voucher.reservation_expires_after_epoch !== value.reservation_expires_after_epoch ||
+        voucher.reservation_receipt_grace_epochs !== value.reservation_receipt_grace_epochs) {
+      return new Error('Spend reservation voucher expiry policy mismatch.');
+    }
+    if (voucher.billing_epoch !== value.epoch) {
+      return new Error('Spend reservation voucher billing epoch mismatch.');
+    }
+    if (voucher.user !== value.user.toLowerCase()) {
+      return new Error('Spend reservation voucher user mismatch.');
+    }
+    if (voucher.provider !== value.provider.toLowerCase()) {
+      return new Error('Spend reservation voucher provider mismatch.');
+    }
+    if (voucher.payout_revision !== value.payout_revision.toLowerCase()) {
+      return new Error('Spend reservation voucher payout revision mismatch.');
+    }
     if (voucher.rail !== rail) return new Error('Spend reservation voucher rail mismatch.');
     if (voucher.enclave_id !== value.enclave_id.toLowerCase()) {
       return new Error('Spend reservation voucher enclave mismatch.');
+    }
+    if (voucher.model_id !== value.model_id) {
+      return new Error('Spend reservation voucher model mismatch.');
     }
     if (voucher.price_ver !== value.price_ver) {
       return new Error('Spend reservation voucher price mismatch.');
@@ -12321,20 +17674,41 @@ class MayhemContract extends Contract {
     if (voucher.body.ctx_bracket_table_ver !== value.ctx_bracket_table_ver) {
       return new Error('Spend reservation voucher context bracket table version mismatch.');
     }
+    if (voucher.rules_ver !== value.rules_ver) {
+      return new Error('Spend reservation voucher rules version mismatch.');
+    }
     if (this.compareAu(voucher.max_spend_au, maxSpendAu) !== 0) {
       return new Error('Spend reservation voucher max spend mismatch.');
+    }
+    const reservationParams = await this.activeParamsAt(value.at, [
+      'reservation_max_lifetime_epochs',
+      'reservation_receipt_grace_epochs',
+    ]);
+    if (
+      value.epoch > Number.MAX_SAFE_INTEGER - reservationParams.reservation_max_lifetime_epochs ||
+      value.reservation_expires_after_epoch !==
+        value.epoch + reservationParams.reservation_max_lifetime_epochs ||
+      value.reservation_receipt_grace_epochs !==
+        reservationParams.reservation_receipt_grace_epochs
+    ) {
+      return new Error('Spend reservation expiry policy does not match active parameters.');
     }
     return {
       op: 'spend_reserve_targeted',
       payout_revision: value.payout_revision,
       contract_version: CONTRACT_VERSION,
       session_id: value.session_id.toLowerCase(),
+      reservation_id: value.reservation_id.toLowerCase(),
+      reservation_expires_after_epoch: value.reservation_expires_after_epoch,
+      reservation_receipt_grace_epochs: value.reservation_receipt_grace_epochs,
       epoch: value.epoch,
       at: value.at,
       rail,
       user: value.user.toLowerCase(),
       provider: value.provider.toLowerCase(),
       enclave_id: value.enclave_id.toLowerCase(),
+      enclave_pubkey: value.enclave_pubkey.toLowerCase(),
+      model_id: value.model_id,
       price_ver: value.price_ver,
       locked_rate_map: voucher.body.locked_rate_map,
       locked_per_req_au: voucher.body.locked_per_req_au,
@@ -12346,27 +17720,7 @@ class MayhemContract extends Contract {
       ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
       rules_ver: value.rules_ver,
       max_spend_au: maxSpendAu,
-      voucher: {
-        session_id: voucher.body.session_id,
-        billing_id: voucher.body.billing_id,
-        billing_attempt: voucher.body.billing_attempt,
-        billing_prior_usage: voucher.body.billing_prior_usage,
-        billing_prior_au_owed_cum: voucher.body.billing_prior_au_owed_cum,
-        rail: voucher.body.rail,
-        enclave_id: voucher.body.enclave_id,
-        price_ver: voucher.body.price_ver,
-        locked_rate_map: voucher.body.locked_rate_map,
-        locked_per_req_au: voucher.body.locked_per_req_au,
-        locked_min_session_au: voucher.body.locked_min_session_au,
-        served_ctx: voucher.body.served_ctx,
-        required_modalities: voucher.body.required_modalities,
-        required_specialities: voucher.body.required_specialities,
-        ctx_bracket: voucher.body.ctx_bracket,
-        ctx_bracket_table_ver: voucher.body.ctx_bracket_table_ver,
-        max_spend_au: voucher.body.max_spend_au,
-        checkpoint_every: voucher.body.checkpoint_every,
-        user_sig: voucher.user_sig,
-      },
+      voucher: { ...cloneValue(voucher.body), user_sig: voucher.user_sig },
       voucher_body: voucher.body,
       provider_sig: value.provider_sig.toLowerCase(),
     };
@@ -12375,6 +17729,9 @@ class MayhemContract extends Contract {
 
 
   async normalizeSpendReserveValue(value) {
+    if (CONTRACT_VERSION >= 17) {
+      return new Error('Aggregate spend reservations are disabled; use spend_reserve_targeted.');
+    }
     const reserveFields = [
       'op',
       'contract_version',
@@ -12535,23 +17892,154 @@ class MayhemContract extends Contract {
     };
   }
 
-  async normalizeSpendHoldRecord(record, user, rail, epoch) {
+  billingReservationIdentity(normalized) {
+    return {
+      billing_id: normalized.voucher_body.billing_id,
+      billing_attempt: normalized.voucher_body.billing_attempt,
+      billing_epoch: normalized.epoch,
+      reservation_id: normalized.voucher_body.reservation_id,
+      reservation_expires_after_epoch: normalized.reservation_expires_after_epoch,
+      reservation_receipt_grace_epochs: normalized.reservation_receipt_grace_epochs,
+      session_id: normalized.session_id,
+      user: normalized.user,
+      provider: normalized.provider,
+      rail: normalized.rail,
+      payout_revision: normalized.payout_revision,
+    };
+  }
+
+  async validateExistingBillingReservation(normalized) {
+    const identity = this.billingReservationIdentity(normalized);
+    const anchor = await this.get(this.receiptBillingKey(identity.billing_id));
+    if (!anchor ||
+        anchor.type !== 'receipt_billing_anchor' ||
+        anchor.billing_id !== identity.billing_id ||
+        anchor.user !== identity.user ||
+        anchor.rail !== identity.rail ||
+        anchor.epoch !== identity.billing_epoch ||
+        !Number.isSafeInteger(anchor.latest_attempt) ||
+        anchor.latest_attempt < identity.billing_attempt) {
+      return new Error('Billing reservation anchor is missing or inconsistent.');
+    }
+    const reservation = await this.get(this.receiptReservationKey(identity.reservation_id));
+    if (!reservation ||
+        reservation.type !== 'receipt_reservation_identity' ||
+        reservation.status !== 'active' ||
+        stableJson({
+          billing_id: reservation.billing_id,
+          billing_attempt: reservation.billing_attempt,
+          billing_epoch: reservation.billing_epoch,
+          reservation_id: reservation.reservation_id,
+          reservation_expires_after_epoch: reservation.reservation_expires_after_epoch,
+          reservation_receipt_grace_epochs: reservation.reservation_receipt_grace_epochs,
+          session_id: reservation.session_id,
+          user: reservation.user,
+          provider: reservation.provider,
+          rail: reservation.rail,
+          payout_revision: reservation.payout_revision,
+        }) !== stableJson(identity)) {
+      return new Error('Reservation identity is missing or inconsistent.');
+    }
+    return null;
+  }
+
+  async prepareBillingReservation(normalized, key) {
+    const identity = this.billingReservationIdentity(normalized);
+    const anchorKey = this.receiptBillingKey(identity.billing_id);
+    const existingAnchor = await this.get(anchorKey);
+    let nextAnchor;
+    if (existingAnchor === null) {
+      if (identity.billing_attempt !== 0) {
+        return new Error('Initial billing reservation attempt must be zero.');
+      }
+      nextAnchor = {
+        type: 'receipt_billing_anchor',
+        billing_id: identity.billing_id,
+        user: identity.user,
+        rail: identity.rail,
+        epoch: identity.billing_epoch,
+        latest_attempt: 0,
+        created_at: key,
+        updated_at: key,
+      };
+    } else {
+      if (existingAnchor.type !== 'receipt_billing_anchor' ||
+          existingAnchor.billing_id !== identity.billing_id ||
+          existingAnchor.user !== identity.user ||
+          existingAnchor.rail !== identity.rail ||
+          existingAnchor.epoch !== identity.billing_epoch ||
+          !Number.isSafeInteger(existingAnchor.latest_attempt) ||
+          existingAnchor.latest_attempt < 0) {
+        return new Error('Billing id cannot move across user, rail, or epoch.');
+      }
+      if (identity.billing_attempt !== existingAnchor.latest_attempt + 1) {
+        return new Error('Billing attempt must advance exactly once.');
+      }
+      const priorHead = await this.get(
+        this.receiptHeadKey(identity.billing_id, identity.billing_attempt - 1)
+      );
+      if (!priorHead ||
+          priorHead.type !== 'canonical_receipt_head' ||
+          priorHead.billing_id !== identity.billing_id ||
+          priorHead.billing_attempt !== identity.billing_attempt - 1) {
+        return new Error('Higher billing attempt requires the prior canonical receipt head.');
+      }
+      if (stableJson(normalized.voucher_body.billing_prior_usage) !==
+            stableJson(priorHead.receipt.body.usage) ||
+          this.compareAu(
+            normalized.voucher_body.billing_prior_au_owed_cum,
+            priorHead.receipt.body.au_owed_cum
+          ) !== 0) {
+        return new Error('Higher billing attempt does not exactly chain from the prior attempt.');
+      }
+      nextAnchor = {
+        ...existingAnchor,
+        latest_attempt: identity.billing_attempt,
+        updated_at: key,
+      };
+    }
+
+    const reservationKey = this.receiptReservationKey(identity.reservation_id);
+    if ((await this.get(reservationKey)) !== null) {
+      return new Error('Reservation id is already in use.');
+    }
+    return {
+      anchor_key: anchorKey,
+      anchor: nextAnchor,
+      reservation_key: reservationKey,
+      reservation: {
+        type: 'receipt_reservation_identity',
+        ...identity,
+        status: 'active',
+        closed_at: null,
+        close_record_key: null,
+        recorded_at: key,
+      },
+    };
+  }
+
+  async normalizeSpendHoldRecord(record, user, rail, epoch, { targeted = false } = {}) {
     if (!record) {
-      return {
+      const empty = {
         user,
         rail,
         denom: PRICE_DENOMINATION,
-        epoch,
         reserved_au: ZERO_AU,
         balance_au_at_last_reserve: null,
         sessions: [],
         updated_at: null,
       };
+      return targeted
+        ? { type: 'targeted_spend_hold', ...empty }
+        : { ...empty, epoch };
     }
     if (typeof record !== 'object' || Array.isArray(record)) {
       return new Error('Spend hold record must be an object.');
     }
-    if (record.user !== user || record.rail !== rail || record.epoch !== epoch) {
+    if (record.user !== user || record.rail !== rail ||
+        (targeted
+          ? record.type !== 'targeted_spend_hold' || hasOwn(record, 'epoch')
+          : record.epoch !== epoch)) {
       return new Error('Spend hold record key mismatch.');
     }
     if (record.denom !== PRICE_DENOMINATION) return new Error('Spend hold denomination mismatch.');
@@ -12560,15 +18048,63 @@ class MayhemContract extends Contract {
       return new Error('Invalid spend hold reserved amount.');
     }
     if (!Array.isArray(record.sessions)) return new Error('Spend hold sessions must be an array.');
+    let targetedReservedAu = ZERO_AU;
     for (const session of record.sessions) {
       if (!session || typeof session !== 'object' || Array.isArray(session)) {
         return new Error('Invalid spend hold session.');
       }
       if (!this.isHexBytes(session.session_id, 32)) return new Error('Invalid spend hold session id.');
+      if (!this.isHexBytes(session.billing_id, 32)) return new Error('Invalid spend hold billing id.');
+      if (!Number.isSafeInteger(session.billing_attempt) || session.billing_attempt < 0) {
+        return new Error('Invalid spend hold billing attempt.');
+      }
+      if (!Number.isSafeInteger(session.billing_epoch) ||
+          session.billing_epoch < 1 ||
+          (!targeted && session.billing_epoch !== epoch)) {
+        return new Error('Invalid spend hold billing epoch.');
+      }
+      if (!this.isHexBytes(session.reservation_id, 32)) {
+        return new Error('Invalid spend hold reservation id.');
+      }
+      if (!Number.isSafeInteger(session.reservation_expires_after_epoch) ||
+          session.reservation_expires_after_epoch <= session.billing_epoch ||
+          !Number.isSafeInteger(session.reservation_receipt_grace_epochs) ||
+          session.reservation_receipt_grace_epochs < 0) {
+        return new Error('Invalid spend hold reservation expiry policy.');
+      }
+      if (session.user !== user || session.rail !== rail) {
+        return new Error('Spend hold session user or rail mismatch.');
+      }
       if (!this.isHexBytes(session.provider, 32)) return new Error('Invalid spend hold provider.');
+      if (!this.isHexBytes(session.payout_revision, 32)) {
+        return new Error('Invalid spend hold payout revision.');
+      }
       if (!this.isHexBytes(session.enclave_id, 32)) return new Error('Invalid spend hold enclave.');
+      if (!this.isHexBytes(session.enclave_pubkey, 32)) {
+        return new Error('Invalid spend hold enclave public key.');
+      }
+      if (typeof session.model_id !== 'string' ||
+          session.model_id.length === 0 ||
+          session.model_id.length > 256) {
+        return new Error('Invalid spend hold model id.');
+      }
+      const billingPriorUsage = this.normalizeReceiptUsage(session.billing_prior_usage);
+      if (billingPriorUsage instanceof Error ||
+          stableJson(billingPriorUsage) !== stableJson(session.billing_prior_usage)) {
+        return new Error('Invalid spend hold billing prior usage.');
+      }
+      const billingPriorAuOwedCum = this.normalizeAu(
+        session.billing_prior_au_owed_cum,
+        'spend hold billing prior cumulative amount'
+      );
+      if (billingPriorAuOwedCum instanceof Error) {
+        return new Error('Invalid spend hold billing prior cumulative amount.');
+      }
       if (!Number.isSafeInteger(session.price_ver) || session.price_ver < 1) {
         return new Error('Invalid spend hold price version.');
+      }
+      if (!Number.isSafeInteger(session.rules_ver) || session.rules_ver < 1) {
+        return new Error('Invalid spend hold rules version.');
       }
       const lockedRateMap = this.normalizeLockedRateMap(
         session.locked_rate_map,
@@ -12616,13 +18152,25 @@ class MayhemContract extends Contract {
       if (maxSpendAu instanceof Error) {
         return new Error('Invalid spend hold max spend.');
       }
+      if (targeted) {
+        targetedReservedAu = this.safeAddAu(targetedReservedAu, maxSpendAu);
+        if (targetedReservedAu instanceof Error) return targetedReservedAu;
+      }
       if (!this.isHexBytes(session.voucher_hash, 32)) return new Error('Invalid spend hold voucher hash.');
+    }
+    if (targeted && this.compareAu(targetedReservedAu, reservedAu) !== 0) {
+      return new Error('Targeted spend hold reserved amount does not equal its sessions.');
     }
     return {
       ...record,
       reserved_au: reservedAu,
       sessions: record.sessions.map((session) => ({
         ...session,
+        billing_prior_usage: this.normalizeReceiptUsage(session.billing_prior_usage),
+        billing_prior_au_owed_cum: this.normalizeAu(
+          session.billing_prior_au_owed_cum,
+          'spend hold billing prior cumulative amount'
+        ),
         locked_per_req_au: this.normalizeAu(session.locked_per_req_au, 'spend hold locked per-request price'),
         locked_min_session_au: this.normalizeAu(session.locked_min_session_au, 'spend hold locked minimum session price'),
         required_modalities: session.required_modalities.slice(),
@@ -12630,6 +18178,16 @@ class MayhemContract extends Contract {
         max_spend_au: this.normalizeAu(session.max_spend_au, 'spend hold max spend', { allowZero: false }),
       })),
     };
+  }
+
+  async normalizeTargetedSpendHoldRecord(record, user, rail) {
+    return await this.normalizeSpendHoldRecord(
+      record,
+      user,
+      rail,
+      null,
+      { targeted: true }
+    );
   }
 
   normalizePendingReservationDebitTotals(entries) {
@@ -12812,8 +18370,8 @@ class MayhemContract extends Contract {
     return value.last_page;
   }
 
-  isIdempotentEpochApplyPage(applyState, epoch, page, lastPage, applyHash) {
-    if (applyState.last_apply_hash !== applyHash) return false;
+  isEpochApplyPagePositionReplay(applyState, epoch, page, lastPage) {
+    if (applyState.last_page !== page) return false;
     if (lastPage) {
       return applyState.updated_epoch === epoch && (applyState.pending_epoch ?? null) === null;
     }
@@ -12821,6 +18379,11 @@ class MayhemContract extends Contract {
       applyState.pending_epoch === epoch &&
       applyState.pending_next_page === page + 1
     );
+  }
+
+  isIdempotentEpochApplyPage(applyState, epoch, page, lastPage, applyHash) {
+    if (applyState.last_apply_hash !== applyHash) return false;
+    return this.isEpochApplyPagePositionReplay(applyState, epoch, page, lastPage);
   }
 
   validateEpochApplyPageOrder(applyState, epoch, page) {
@@ -12848,20 +18411,131 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  nextEpochApplyState({ applyState, epoch, page, lastPage, applyHash, epochSeconds, reservationDebitTotals = null }) {
+  async validateEpochCadenceTime(applyState, epoch, page, settledAt, epochSeconds) {
+    if (!Number.isSafeInteger(settledAt) || settledAt < 0 ||
+        !Number.isSafeInteger(epochSeconds) || epochSeconds < 1) {
+      return new Error('Invalid canonical epoch settlement time.');
+    }
+    if (page > 0) {
+      if (applyState.pending_epoch !== epoch ||
+          applyState.pending_settlement_unix !== settledAt) {
+        return new Error('Paged epoch apply settlement time changed between pages.');
+      }
+      return null;
+    }
+    if (applyState.updated_epoch === 0) return null;
+    const priorSettlementUnix = await this.priorEpochSettlementUnix(applyState);
+    if (priorSettlementUnix instanceof Error) return priorSettlementUnix;
+    if (priorSettlementUnix > Number.MAX_SAFE_INTEGER - epochSeconds) {
+      return new Error('Canonical epoch settlement time overflow.');
+    }
+    if (settledAt < priorSettlementUnix + epochSeconds) {
+      return new Error('Epoch settlement cadence has not matured.');
+    }
+    return null;
+  }
+
+  async priorEpochSettlementUnix(applyState) {
+    if (Number.isSafeInteger(applyState.last_settlement_unix) &&
+        applyState.last_settlement_unix >= 0) {
+      return applyState.last_settlement_unix;
+    }
+    const epoch = applyState.updated_epoch;
+    if (!Number.isSafeInteger(epoch) || epoch < 1 ||
+        !this.isHexBytes(applyState.last_apply_hash, 32)) {
+      return new Error('Prior canonical epoch settlement identity is invalid.');
+    }
+    const seal = await this.get(`epoch/seal/${epoch}`);
+    if (seal !== null) {
+      if (seal.type !== 'epoch_empty_seal' ||
+          seal.epoch !== epoch ||
+          seal.seal_hash !== applyState.last_apply_hash ||
+          !Number.isSafeInteger(seal.at) ||
+          seal.at < 0) {
+        return new Error('Prior canonical empty-seal settlement identity is invalid.');
+      }
+      const expectedSealHash = await this.epochEmptySealHash(
+        this.epochEmptySealHashValue(seal)
+      );
+      if (expectedSealHash !== seal.seal_hash) {
+        return new Error('Prior canonical empty-seal settlement hash is invalid.');
+      }
+      return seal.at;
+    }
+    const commit = await this.get(`epoch/commit/${epoch}`);
+    if (!commit ||
+        commit.type !== 'epoch_commit' ||
+        commit.epoch !== epoch ||
+        !Number.isSafeInteger(commit.at) ||
+        commit.at < 0 ||
+        !this.isHexBytes(commit.commit_hash, 32)) {
+      return new Error('Prior canonical epoch commit settlement identity is invalid.');
+    }
+    const expectedCommitHash = await this.epochCommitHash({
+      epoch,
+      epoch_seconds: commit.epoch_seconds,
+      roots: commit.roots,
+      totals: commit.totals,
+    });
+    if (expectedCommitHash !== commit.commit_hash ||
+        (applyState.last_receipt_commit_hash != null &&
+          applyState.last_receipt_commit_hash !== commit.commit_hash)) {
+      return new Error('Prior canonical epoch commit settlement hash is invalid.');
+    }
+    const usageRoot = await this.get(`ev/use/${epoch}`);
+    if (!usageRoot ||
+        usageRoot.type !== 'usage_root' ||
+        usageRoot.epoch !== epoch ||
+        usageRoot.ts !== commit.at ||
+        usageRoot.merkle_root !== commit.roots?.use) {
+      return new Error('Prior canonical epoch apply evidence is missing.');
+    }
+    return commit.at;
+  }
+
+  nextEpochApplyState({
+    applyState,
+    epoch,
+    page,
+    lastPage,
+    applyHash,
+    epochSeconds,
+    settledAt,
+    reservationDebitTotals = null,
+    receiptApply = null,
+  }) {
     const base = {
       ...applyState,
       updated_at: this.tx,
+      last_apply_previous_hash: applyState.last_apply_hash ?? null,
       last_apply_hash: applyHash,
       last_epoch_seconds: epochSeconds,
+      ...(receiptApply ? {
+        last_receipt_index_count: receiptApply.index_count,
+        last_receipt_index_revision: receiptApply.index_revision,
+        last_receipt_index_page_count: receiptApply.index_page_count,
+        last_receipt_index_updated_at: receiptApply.index_updated_at,
+        last_receipt_commit_hash: receiptApply.commit_hash,
+        last_receipt_allocation_count: receiptApply.allocation_count,
+      } : {}),
     };
     if (lastPage) {
       return {
         ...base,
         updated_epoch: epoch,
+        last_settlement_unix: settledAt,
         pending_epoch: null,
         pending_next_page: 0,
+        pending_settlement_unix: null,
         pending_reserved_debits: null,
+        ...(receiptApply ? {
+          pending_receipt_index_count: null,
+          pending_receipt_index_revision: null,
+          pending_receipt_index_page_count: null,
+          pending_receipt_index_updated_at: null,
+          pending_receipt_commit_hash: null,
+          pending_receipt_allocation_count: null,
+        } : {}),
         last_page: page,
       };
     }
@@ -12869,13 +18543,25 @@ class MayhemContract extends Contract {
       ...base,
       pending_epoch: epoch,
       pending_next_page: page + 1,
+      pending_settlement_unix: settledAt,
       pending_reserved_debits: this.reservationDebitTotalEntries(reservationDebitTotals),
+      ...(receiptApply ? {
+        pending_receipt_index_count: receiptApply.index_count,
+        pending_receipt_index_revision: receiptApply.index_revision,
+        pending_receipt_index_page_count: receiptApply.index_page_count,
+        pending_receipt_index_updated_at: receiptApply.index_updated_at,
+        pending_receipt_commit_hash: receiptApply.commit_hash,
+        pending_receipt_allocation_count: receiptApply.allocation_count,
+      } : {}),
       updated_epoch: applyState.updated_epoch,
       last_page: page,
     };
   }
 
   validateEpochApplyFeatureValue(value) {
+    if (CONTRACT_VERSION >= 17) {
+      return new Error('Aggregate epoch_apply is disabled; use receipt-bound apply_targeted_epoch.');
+    }
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return new Error('epochApply feature value must be an object.');
     }
@@ -12906,8 +18592,19 @@ class MayhemContract extends Contract {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return new Error('Targeted epoch feature value must be an object.');
     }
-    const required = ['op', 'epoch', 'at', 'debits', 'earnings', 'allocations'];
-    const allowed = new Set([...required, 'market_usage', 'roots', 'totals', 'page', 'last_page']);
+    const required = [
+      'op',
+      'epoch',
+      'at',
+      'epoch_commit_hash',
+      'receipt_index',
+      'debits',
+      'earnings',
+      'allocations',
+      'page',
+      'last_page',
+    ];
+    const allowed = new Set([...required, 'market_usage']);
     const unknown = Object.keys(value).filter((key) => !allowed.has(key)).sort();
     if (unknown.length > 0) {
       return new Error(`Targeted epoch feature does not accept fields: ${unknown.join(', ')}.`);
@@ -12917,6 +18614,18 @@ class MayhemContract extends Contract {
     }
     if (value.op !== 'apply_targeted_epoch') {
       return new Error('Invalid targeted epoch feature op.');
+    }
+    if (!this.isHexBytes(value.epoch_commit_hash, 32) ||
+        value.epoch_commit_hash !== value.epoch_commit_hash.toLowerCase()) {
+      return new Error('Invalid targeted epoch commit hash.');
+    }
+    const receiptIndex = this.normalizeReceiptEpochIndexMetadata(
+      value.receipt_index,
+      value.epoch
+    );
+    if (receiptIndex instanceof Error) return receiptIndex;
+    if (stableJson(receiptIndex) !== stableJson(value.receipt_index)) {
+      return new Error('Targeted epoch receipt index snapshot must be canonical.');
     }
     if (!Array.isArray(value.earnings)) {
       return new Error('Targeted epoch earnings must be an array.');
@@ -12929,22 +18638,44 @@ class MayhemContract extends Contract {
     for (const entry of value.allocations) {
       const entryError = this.validateExactObjectKeys(
         entry,
-        ['session_id', 'user', 'rail', 'provider', 'payout_revision', 'au'],
+        [
+          'session_id',
+          'billing_id',
+          'billing_attempt',
+          'billing_epoch',
+          'receipt_seq',
+          'receipt_hash',
+          'user',
+          'rail',
+          'provider',
+          'payout_revision',
+          'au',
+        ],
         'targeted epoch allocation'
       );
       if (entryError) return entryError;
       const rail = this.normalizeLedgerRail(entry.rail, 'targeted epoch allocation rail');
       if (rail instanceof Error) return rail;
       if (!this.isHexBytes(entry.session_id, 32) ||
+          !this.isHexBytes(entry.billing_id, 32) ||
+          !this.isHexBytes(entry.receipt_hash, 32) ||
           !this.isHexBytes(entry.user, 32) ||
           !this.isHexBytes(entry.provider, 32) ||
           !this.isHexBytes(entry.payout_revision, 32)) {
         return new Error('Invalid targeted epoch allocation identity.');
       }
-      if (allocationSessions.has(entry.session_id)) {
-        return new Error('Duplicate targeted epoch session allocation.');
+      if (!Number.isSafeInteger(entry.billing_attempt) || entry.billing_attempt < 0 ||
+          !Number.isSafeInteger(entry.billing_epoch) || entry.billing_epoch < 1 ||
+          !Number.isSafeInteger(entry.receipt_seq) || entry.receipt_seq < 0) {
+        return new Error('Invalid targeted epoch allocation receipt position.');
+      }
+      const attemptIdentity = `${entry.billing_id}:${entry.billing_attempt}`;
+      if (allocationSessions.has(entry.session_id) ||
+          allocationSessions.has(attemptIdentity)) {
+        return new Error('Duplicate targeted epoch receipt allocation.');
       }
       allocationSessions.add(entry.session_id);
+      allocationSessions.add(attemptIdentity);
       const au = this.normalizeAu(
         entry.au,
         'targeted epoch allocation amount',
@@ -12953,6 +18684,11 @@ class MayhemContract extends Contract {
       if (au instanceof Error) return au;
       allocations.push({
         session_id: entry.session_id,
+        billing_id: entry.billing_id,
+        billing_attempt: entry.billing_attempt,
+        billing_epoch: entry.billing_epoch,
+        receipt_seq: entry.receipt_seq,
+        receipt_hash: entry.receipt_hash,
         user: entry.user,
         rail,
         provider: entry.provider,
@@ -12964,6 +18700,8 @@ class MayhemContract extends Contract {
       PROVIDER_PAYOUT_BINDING_RAIL_ORDER.indexOf(left.rail) -
         PROVIDER_PAYOUT_BINDING_RAIL_ORDER.indexOf(right.rail) ||
       compareCodepoint(left.user, right.user) ||
+      compareCodepoint(left.billing_id, right.billing_id) ||
+      left.billing_attempt - right.billing_attempt ||
       compareCodepoint(left.session_id, right.session_id)
     ));
     if (stableJson(allocations) !== stableJson(value.allocations)) {
@@ -13028,6 +18766,7 @@ class MayhemContract extends Contract {
     } = value;
     const ledgerValue = {
       ...ledgerFields,
+      receipt_index: receiptIndex,
       earnings: targetedEarnings.map(({ payout_revision: _revision, ...earning }) => earning),
     };
     if (!Number.isSafeInteger(ledgerValue.epoch) || ledgerValue.epoch < 1) {
@@ -14348,6 +20087,11 @@ class MayhemContract extends Contract {
       billing_attempt: bodySource.billing_attempt,
       billing_prior_usage: cloneValue(bodySource.billing_prior_usage),
       billing_prior_au_owed_cum: bodySource.billing_prior_au_owed_cum,
+      billing_epoch: bodySource.billing_epoch,
+      reservation_id: bodySource.reservation_id,
+      reservation_expires_after_epoch: bodySource.reservation_expires_after_epoch,
+      reservation_receipt_grace_epochs: bodySource.reservation_receipt_grace_epochs,
+      payout_revision: bodySource.payout_revision,
       seq: bodySource.seq,
       final: bodySource.final,
       rail: bodySource.rail,
@@ -14389,9 +20133,10 @@ class MayhemContract extends Contract {
     };
     if (!this.isHexBytes(envelope.enclave_sig, 64)) return new Error('Invalid enclave receipt signature.');
     if (!this.isHexBytes(envelope.user_sig, 64)) return new Error('Invalid user receipt signature.');
-    if (envelope.enclave_pubkey !== null && !this.isHexBytes(envelope.enclave_pubkey, 32)) {
+    if (!this.isHexBytes(envelope.enclave_pubkey, 32)) {
       return new Error('Invalid enclave receipt public key.');
     }
+    envelope.enclave_pubkey = envelope.enclave_pubkey.toLowerCase();
     return envelope;
   }
 
@@ -14407,6 +20152,21 @@ class MayhemContract extends Contract {
     if (!this.isHexBytes(body.billing_id, 32)) return new Error('Invalid receipt billing id.');
     if (!Number.isSafeInteger(body.billing_attempt) || body.billing_attempt < 0) {
       return new Error('Invalid receipt billing attempt.');
+    }
+    if (!Number.isSafeInteger(body.billing_epoch) || body.billing_epoch < 1) {
+      return new Error('Invalid receipt billing epoch.');
+    }
+    if (!this.isHexBytes(body.reservation_id, 32)) {
+      return new Error('Invalid receipt reservation id.');
+    }
+    if (!Number.isSafeInteger(body.reservation_expires_after_epoch) ||
+        body.reservation_expires_after_epoch <= body.billing_epoch ||
+        !Number.isSafeInteger(body.reservation_receipt_grace_epochs) ||
+        body.reservation_receipt_grace_epochs < 0) {
+      return new Error('Invalid receipt reservation expiry policy.');
+    }
+    if (!this.isHexBytes(body.payout_revision, 32)) {
+      return new Error('Invalid receipt payout revision.');
     }
     const billingPriorUsage = this.normalizeReceiptUsage(body.billing_prior_usage);
     if (billingPriorUsage instanceof Error) return billingPriorUsage;
@@ -15404,7 +21164,89 @@ class MayhemContract extends Contract {
       updated_epoch: 0,
       updated_at: null,
       last_apply_hash: null,
+      last_settlement_unix: null,
     };
+  }
+
+  epochApplyAnchorKey(epoch) {
+    return `epoch/apply-anchor/${epoch}`;
+  }
+
+  async rememberEpochApplyAnchor(state) {
+    if (
+      !state ||
+      !Number.isSafeInteger(state.updated_epoch) ||
+      state.updated_epoch < 1 ||
+      !this.isHexBytes(state.last_apply_hash, 32) ||
+      !Number.isSafeInteger(state.last_settlement_unix) ||
+      state.last_settlement_unix < 0 ||
+      (state.pending_epoch ?? null) !== null
+    ) {
+      return new Error('Cannot anchor an incomplete epoch apply.');
+    }
+    const key = this.epochApplyAnchorKey(state.updated_epoch);
+    const record = {
+      type: 'epoch_apply_anchor',
+      epoch: state.updated_epoch,
+      apply_hash: state.last_apply_hash.toLowerCase(),
+      settlement_unix: state.last_settlement_unix,
+      applied_at: state.updated_at,
+    };
+    const existing = await this.get(key);
+    if (existing !== null) {
+      return stableJson(existing) === stableJson(record)
+        ? null
+        : new Error('Epoch apply anchor conflict.');
+    }
+    await this.put(key, record);
+    return null;
+  }
+
+  async epochApplyAnchor(epoch) {
+    if (!Number.isSafeInteger(epoch) || epoch < 1) {
+      return new Error('Invalid epoch apply anchor epoch.');
+    }
+    const historical = await this.get(this.epochApplyAnchorKey(epoch));
+    if (historical !== null) {
+      if (
+        historical.type !== 'epoch_apply_anchor' ||
+        historical.epoch !== epoch ||
+        !this.isHexBytes(historical.apply_hash, 32) ||
+        !Number.isSafeInteger(historical.settlement_unix) ||
+        historical.settlement_unix < 0 ||
+        typeof historical.applied_at !== 'string' ||
+        historical.applied_at.length === 0
+      ) {
+        return new Error('Epoch apply anchor is invalid.');
+      }
+      return historical;
+    }
+    const current = await this.epochApplyStateRecord();
+    if (
+      current.updated_epoch === epoch &&
+      this.isHexBytes(current.last_apply_hash, 32) &&
+      (current.pending_epoch ?? null) === null
+    ) {
+      const settlementUnix = await this.priorEpochSettlementUnix(current);
+      if (settlementUnix instanceof Error) return settlementUnix;
+      return {
+        type: 'epoch_apply_anchor',
+        epoch,
+        apply_hash: current.last_apply_hash.toLowerCase(),
+        settlement_unix: settlementUnix,
+        applied_at: current.updated_at,
+      };
+    }
+    return null;
+  }
+
+  async requireEpochApplyAnchor(epoch, applyHash, label) {
+    const anchor = await this.epochApplyAnchor(epoch);
+    if (anchor instanceof Error) return anchor;
+    if (!anchor || anchor.apply_hash !== applyHash) {
+      return new Error(`${label} apply hash mismatch.`);
+    }
+    return anchor;
   }
 
   async rememberCanaryChallengeAnchor(state) {
@@ -15461,12 +21303,14 @@ class MayhemContract extends Contract {
     return parsed;
   }
 
-  parseTapWei(value) {
+  parseTapWei(value, { allowZero = false } = {}) {
     if (typeof value !== 'string' || !/^[0-9]+$/.test(value)) {
       return new Error('tap_wei must be a decimal integer string.');
     }
     const parsed = BigInt(value);
-    if (parsed <= 0n) return new Error('tap_wei must be positive.');
+    if (parsed < 0n || (!allowZero && parsed === 0n)) {
+      return new Error('tap_wei must be positive.');
+    }
     return parsed;
   }
 
@@ -15581,6 +21425,47 @@ class MayhemContract extends Contract {
     const params = await this.activeParamsAt(at, ['rate_staleness_seconds']);
     if (at - rate.ts > params.rate_staleness_seconds) {
       return new Error('Guardian TNK settlement rate invariant failed: oracle is stale.');
+    }
+    return rate;
+  }
+
+  async guardianRequireHistoricalTapRateLock(lock, at) {
+    const oracleValue = {
+      op: 'tap_rate_oracle',
+      tap_usd_au: lock.tap_usd_au,
+      source: lock.source,
+      ts: lock.rate_ts,
+    };
+    const key = await this.rateFeatureKey(oracleValue);
+    if (key instanceof Error) {
+      return new Error(`Guardian TAP settlement rate invariant failed: ${key.message}`);
+    }
+    if (key !== lock.rate_record_key) {
+      return new Error('Guardian TAP settlement rate invariant failed: rate record key mismatch.');
+    }
+    const rate = await this.get(key);
+    const admin = await this.get('admin');
+    if (!rate || admin === null) {
+      return new Error('Guardian TAP settlement rate invariant failed: exact admin-posted oracle history required.');
+    }
+    if (
+      rate.denom !== 'tap_usd_au' ||
+      this.compareAu(rate.tap_usd_au, lock.tap_usd_au) !== 0 ||
+      rate.source !== lock.source ||
+      rate.ts !== lock.rate_ts ||
+      rate.updated_at !== key ||
+      rate.posted_by !== admin ||
+      rate.posted_by !== lock.posted_by ||
+      rate.posted_by_role !== 'admin'
+    ) {
+      return new Error('Guardian TAP settlement rate invariant failed: oracle history is invalid.');
+    }
+    if (rate.ts > at) {
+      return new Error('Guardian TAP settlement rate invariant failed: oracle timestamp is in the future.');
+    }
+    const params = await this.activeParamsAt(at, ['rate_staleness_seconds']);
+    if (at - rate.ts > params.rate_staleness_seconds) {
+      return new Error('Guardian TAP settlement rate invariant failed: oracle is stale.');
     }
     return rate;
   }
@@ -15814,6 +21699,112 @@ class MayhemContract extends Contract {
     return `rate/${kind}/${value.ts}/${digest}`;
   }
 
+  async targetedPayoutPreparationFeatureKey(value) {
+    const normalized = await this.normalizeTargetedPayoutPreparationValue(value);
+    if (normalized instanceof Error) return normalized;
+    const digest = b4a.toString(
+      await blake3(b4a.from(stableJson({
+        domain: 'mayhem-targeted-payout-preparation-feature-v1',
+        value: normalized,
+      }))),
+      'hex'
+    );
+    return (
+      `payout/preparation-submit/${normalized.rail}/` +
+      `${normalized.economic_op_id}/${digest}`
+    );
+  }
+
+  async targetedPayoutEpochFeatureKey(value) {
+    const normalized = await this.normalizeTargetedPayoutEpochValue(value);
+    if (normalized instanceof Error) return normalized;
+    const digest = b4a.toString(
+      await blake3(b4a.from(stableJson({
+        domain: 'mayhem-targeted-payout-epoch-feature-v1',
+        value: normalized,
+      }))),
+      'hex'
+    );
+    return `payout/epoch-plan-submit/${normalized.rail}/${normalized.epoch}/${digest}`;
+  }
+
+  async targetedFiatAttemptFeatureKey(value) {
+    const normalized = await this.normalizePrepareTargetedFiatAttemptValue(value);
+    if (normalized instanceof Error) return normalized;
+    const digest = b4a.toString(
+      await blake3(b4a.from(stableJson({
+        domain: 'mayhem-targeted-fiat-attempt-feature-v1',
+        value: normalized,
+      }))),
+      'hex'
+    );
+    return (
+      `payout/attempt-submit/fiat/${normalized.economic_op_id}/` +
+      `${normalized.attempt_id}/${digest}`
+    );
+  }
+
+  async finalizeTargetedFiatAttemptFeatureKey(value) {
+    const normalized = this.normalizeFinalizeTargetedFiatAttemptValue(value);
+    if (normalized instanceof Error) return normalized;
+    const digest = b4a.toString(
+      await blake3(b4a.from(stableJson({
+        domain: 'mayhem-finalize-targeted-fiat-attempt-feature-v1',
+        value: normalized,
+      }))),
+      'hex'
+    );
+    return (
+      `payout/attempt-finalize/fiat/${normalized.economic_op_id}/` +
+      `${normalized.attempt_id}/${digest}`
+    );
+  }
+
+  async targetedTnkOutputFeatureKey(value) {
+    const normalized = this.normalizeTargetedTnkOutputSettlementValue(value);
+    if (normalized instanceof Error) return normalized;
+    const digest = b4a.toString(
+      await blake3(b4a.from(stableJson({
+        domain: 'mayhem-targeted-tnk-output-feature-v1',
+        value: normalized,
+      }))),
+      'hex'
+    );
+    return (
+      `settle/targeted/tnk/${normalized.epoch}/output/` +
+      `${normalized.economic_op_id}/${digest}`
+    );
+  }
+
+  async targetedFiatOutputFeatureKey(value) {
+    const normalized = this.normalizeTargetedFiatOutputSettlementValue(value);
+    if (normalized instanceof Error) return normalized;
+    const digest = b4a.toString(
+      await blake3(b4a.from(stableJson({
+        domain: 'mayhem-targeted-fiat-output-feature-v1',
+        value: normalized,
+      }))),
+      'hex'
+    );
+    return (
+      `settle/targeted/fiat/${normalized.epoch}/output/` +
+      `${normalized.economic_op_id}/${digest}`
+    );
+  }
+
+  async closeTargetedPayoutEpochFeatureKey(value) {
+    const normalized = this.normalizeCloseTargetedPayoutEpochValue(value);
+    if (normalized instanceof Error) return normalized;
+    const digest = b4a.toString(
+      await blake3(b4a.from(stableJson({
+        domain: 'mayhem-close-targeted-payout-epoch-feature-v1',
+        value: normalized,
+      }))),
+      'hex'
+    );
+    return `settle/targeted/${normalized.rail}/${normalized.epoch}/close/${digest}`;
+  }
+
   async targetedTnkSettlementFeatureKey(value) {
     const normalized = this.normalizeTargetedTnkSettlementValue(value);
     if (normalized instanceof Error) return normalized;
@@ -15825,6 +21816,19 @@ class MayhemContract extends Contract {
       'hex'
     );
     return `settle/targeted/tnk/${value.epoch}/${digest}`;
+  }
+
+  async targetedTapSettlementFeatureKey(value) {
+    const normalized = this.normalizeTargetedTapSettlementValue(value);
+    if (normalized instanceof Error) return normalized;
+    const digest = b4a.toString(
+      await blake3(b4a.from(stableJson({
+        domain: 'mayhem-targeted-tap-settlement-feature-v1',
+        value,
+      }))),
+      'hex'
+    );
+    return `settle/targeted/tap/${value.epoch}/${digest}`;
   }
 
   async targetedFiatSettlementFeatureKey(value) {

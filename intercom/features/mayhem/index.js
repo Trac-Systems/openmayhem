@@ -253,6 +253,37 @@ const participantFor = (value) => {
   if (value.op === 'spend_reserve_targeted') {
     return normalizeKey(value.provider);
   }
+  if (value.op === 'record_usage_receipt') {
+    const provider = normalizeKey(value.receipt?.body?.provider);
+    return /^[0-9a-f]{64}$/.test(provider) ? provider : null;
+  }
+  if (value.op === 'close_usage_reservation') {
+    const provider = normalizeKey(value.provider);
+    const actor = normalizeKey(value.actor);
+    if (value.actor_role === 'provider' && actor === provider &&
+        /^[0-9a-f]{64}$/.test(provider)) return provider;
+    return null;
+  }
+  if (value.op === 'expire_usage_reservation') {
+    const user = normalizeKey(value.user);
+    return value.actor_role === 'user' &&
+      normalizeKey(value.actor) === user &&
+      /^[0-9a-f]{64}$/.test(user)
+      ? user
+      : null;
+  }
+  if ([
+    'prepare_targeted_payout',
+    'prepare_targeted_payout_epoch',
+    'prepare_targeted_fiat_attempt',
+    'finalize_targeted_fiat_attempt',
+    'settle_targeted_tnk_output',
+    'settle_targeted_fiat_output',
+    'close_targeted_payout_epoch',
+  ].includes(value.op)) {
+    const admin = normalizeKey(value.admin);
+    return /^[0-9a-f]{64}$/.test(admin) ? admin : null;
+  }
   return null;
 };
 
