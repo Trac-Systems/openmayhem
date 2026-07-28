@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import b4a from 'b4a';
 import sodium from 'sodium-universal';
@@ -391,7 +392,8 @@ test('read-only participant relays a signed feature to the sole admin writer', a
   assert.equal(writer.appended[0].value.dispatch.address, adminKey);
   assert.equal(writer.appended[0].value.dispatch.contract_version, CONTRACT_VERSION);
   assert.deepEqual(writer.appended[0].value.dispatch.value, value);
-  assert.equal(writer.appended[0].value.dispatch.nonce, requestIdFor('mayhem', key, value));
+  assert.notEqual(writer.appended[0].value.dispatch.nonce, requestIdFor('mayhem', key, value));
+  assert.match(writer.appended[0].value.dispatch.nonce, /^[0-9a-f]{64}$/);
 });
 
 test('admin writer deduplicates a retried relay request by deterministic request id', async () => {
@@ -602,9 +604,12 @@ test('admin writer bounds concurrent remote relay work and returns retryable bus
   assert.match(replies[0].response.message, /busy/);
 });
 
-test('admin writer returns a stored rejection without replaying its burned feature hash', async () => {
+test('admin writer can retry a transient rejection under a fresh feature hash', async () => {
   const writer = peerFor(adminKey, { writable: true });
+  writer.peer.wallet.sign = (message) =>
+    createHash('sha512').update(String(message)).digest('hex');
   const replies = [];
+  let rejectNext = true;
   writer.peer.base.append = async (op) => {
     if (op === null) {
       writer.flushes.push(true);
@@ -612,13 +617,23 @@ test('admin writer returns a stored rejection without replaying its burned featu
     }
     writer.appended.push(op);
     const hash = op.value.dispatch.hash;
-    writer.state.set(`fr/${hash}`, {
-      type: 'feature_result',
-      status: 'rejected',
-      ok: false,
-      result: null,
-      error: { message: 'Consent required for rules version 1.' },
-    });
+    if (rejectNext) {
+      rejectNext = false;
+      writer.state.set(`fr/${hash}`, {
+        type: 'feature_result',
+        status: 'rejected',
+        ok: false,
+        result: null,
+        error: { message: 'Consent required for rules version 1.' },
+      });
+    } else {
+      writer.state.set(`fr/${hash}`, {
+        type: 'feature_result',
+        status: 'applied',
+        ok: true,
+        result: { ok: true, op: op.value.dispatch.value.op },
+      });
+    }
   };
   const writerFeature = new MayhemFeature(writer.peer, {});
   writerFeature.key = 'mayhem';
@@ -647,11 +662,16 @@ test('admin writer returns a stored rejection without replaying its burned featu
   writerFeature.processed.clear();
   await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
 
-  assert.equal(writer.appended.length, 1);
-  assert.equal(writer.flushes.length, 1);
+  assert.equal(writer.appended.length, 2);
+  assert.equal(writer.flushes.length, 2);
+  assert.notEqual(
+    writer.appended[0].value.dispatch.hash,
+    writer.appended[1].value.dispatch.hash
+  );
   assert.equal(replies.length, 2);
   assert.equal(replies[0].response.ok, false);
-  assert.deepEqual(replies[1].response, replies[0].response);
+  assert.match(replies[0].response.message, /Consent required/);
+  assert.equal(replies[1].response.ok, true);
 });
 
 test('lost rejection result is replayed from settled cache without duplicate append', async () => {

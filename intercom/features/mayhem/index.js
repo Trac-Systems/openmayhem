@@ -1591,7 +1591,10 @@ class MayhemFeature extends Feature {
   }
 
   async _submitRelayedFeature(key, value, requestId) {
-    let response = await this.submit(key, value, { nonce: requestId });
+    // The sidechannel request id dedupes in-flight relay delivery. The writer
+    // append itself needs a fresh nonce so a transient contract rejection does
+    // not permanently burn the same fr/<hash> for later valid retries.
+    let response = await this.submit(key, value);
     while (!this.stopped && response?.status === 'pending') {
       const featureResult = await this._waitForResult(
         response.result_key,
