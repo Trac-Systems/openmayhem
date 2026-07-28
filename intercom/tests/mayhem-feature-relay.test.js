@@ -600,61 +600,135 @@ test('admin writer bounds concurrent remote relay work and returns retryable bus
   assert.match(replies[0].response.message, /busy/);
 });
 
-test('admin writer retries a previously rejected deterministic relay request', async () => {
-  const participant = peerFor(providerKey);
+test('admin writer returns a stored rejection without replaying its burned feature hash', async () => {
   const writer = peerFor(adminKey, { writable: true });
-  let attempts = 0;
+  const replies = [];
   writer.peer.base.append = async (op) => {
     if (op === null) {
       writer.flushes.push(true);
       return;
     }
     writer.appended.push(op);
-    attempts += 1;
     const hash = op.value.dispatch.hash;
-    writer.state.set(
-      `fr/${hash}`,
-      attempts === 1
-        ? {
-            type: 'feature_result',
-            status: 'rejected',
-            ok: false,
-            result: null,
-            error: { message: 'Consent required for rules version 1.' },
-          }
-        : {
-            type: 'feature_result',
-            status: 'applied',
-            ok: true,
-            result: { ok: true, op: op.value.dispatch.value.op },
-            error: null,
-          }
-    );
+    writer.state.set(`fr/${hash}`, {
+      type: 'feature_result',
+      status: 'rejected',
+      ok: false,
+      result: null,
+      error: { message: 'Consent required for rules version 1.' },
+    });
   };
-  const participantFeature = new MayhemFeature(participant.peer, {
-    timeoutMs: 1_000,
-    retryMs: 100,
-  });
-  const writerFeature = new MayhemFeature(writer.peer, { timeoutMs: 1_000, retryMs: 100 });
-  participantFeature.key = 'mayhem';
+  const writerFeature = new MayhemFeature(writer.peer, {});
   writerFeature.key = 'mayhem';
-  participant.peer.protocol.instance.features.mayhem = participantFeature;
-  writer.peer.protocol.instance.features.mayhem = writerFeature;
-  connect(participant.peer, participantFeature, writer.peer, writerFeature);
-  connect(writer.peer, writerFeature, participant.peer, participantFeature);
+  writer.peer.sidechannel = {
+    started: true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(_channel, message) {
+      replies.push(message);
+      return true;
+    },
+  };
 
   const key = `consent/${providerKey}/1/rules-hash`;
   const value = consentValue();
-  const first = await submitMayhemFeature(participant.peer, { feature: 'mayhem', key, value });
-  const second = await submitMayhemFeature(participant.peer, { feature: 'mayhem', key, value });
+  const requestId = requestIdFor('mayhem', key, value);
+  const payload = relayPayload(providerKey, {
+    control: 'mayhem_feature_request',
+    version: 1,
+    request_id: requestId,
+    feature: 'mayhem',
+    key,
+    value,
+  });
 
-  assert.equal(first.ok, false);
-  assert.equal(second.ok, true);
-  assert.equal(writer.appended.length, 2);
-  assert.equal(
-    writer.appended[0].value.dispatch.hash,
-    writer.appended[1].value.dispatch.hash
-  );
+  await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
+  writerFeature.processed.clear();
+  await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
+
+  assert.equal(writer.appended.length, 1);
+  assert.equal(writer.flushes.length, 1);
+  assert.equal(replies.length, 2);
+  assert.equal(replies[0].response.ok, false);
+  assert.deepEqual(replies[1].response, replies[0].response);
+});
+
+test('lost rejection result is replayed from settled cache without duplicate append', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  writer.peer.base.append = async (op) => {
+    if (op === null) {
+      writer.flushes.push(true);
+      return;
+    }
+    writer.appended.push(op);
+    const hash = op.value.dispatch.hash;
+    writer.state.set(`fr/${hash}`, {
+      type: 'feature_result',
+      status: 'rejected',
+      ok: false,
+      result: null,
+      error: { message: 'Receipt rejected for focused retry proof.' },
+    });
+  };
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 500,
+    retryMs: 5,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {});
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  let resultBroadcasts = 0;
+  participant.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      queueMicrotask(() => writerFeature.handleSidechannelMessage(
+        channel,
+        relayPayload(providerKey, message)
+      ));
+      return true;
+    },
+  };
+  writer.peer.sidechannel = {
+    started: true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      resultBroadcasts += 1;
+      if (resultBroadcasts > 1) {
+        queueMicrotask(() => participantFeature.handleSidechannelMessage(
+          channel,
+          relayPayload(adminKey, message)
+        ));
+      }
+      return true;
+    },
+  };
+
+  const key = `consent/${providerKey}/1/rules-hash`;
+  const value = consentValue();
+  const requestId = requestIdFor('mayhem', key, value);
+  const result = await participantFeature.relay(key, value);
+  const cached = writerFeature.processed.get(requestId);
+
+  assert.equal(result.ok, false);
+  assert.match(result.message, /focused retry proof/);
+  assert.equal(writer.appended.length, 1);
+  assert.equal(writer.flushes.length, 1);
+  assert.ok(resultBroadcasts >= 2);
+  assert.equal(cached.pending, false);
+  cached.at = 0;
+  writerFeature._pruneProcessed();
+  assert.equal(writerFeature.processed.has(requestId), false);
+  await participantFeature.stop();
+  await writerFeature.stop();
+});
+
+test('feature result polling remains finite when zero is configured', () => {
+  const writer = peerFor(adminKey, { writable: true });
+  const feature = new MayhemFeature(writer.peer, { resultTimeoutMs: 0 });
+
+  assert.equal(feature.resultTimeoutMs, 120_000);
 });
 
 test('relay rejects admin operations before network send', async () => {

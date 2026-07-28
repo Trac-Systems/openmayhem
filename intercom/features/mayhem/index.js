@@ -27,6 +27,7 @@ const MAYHEM_RELAY_MAX_MESSAGE_BYTES = 16_384;
 const DEFAULT_TIMEOUT_MS = 0;
 const DEFAULT_RETRY_MS = 1_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
+const DEFAULT_RESULT_TIMEOUT_MS = 120_000;
 const DEFAULT_RESULT_POLL_MS = 50;
 const DEFAULT_CACHE_TTL_MS = 300_000;
 const DEFAULT_CACHE_MAX = 2_048;
@@ -339,9 +340,9 @@ class MayhemFeature extends Feature {
         ? Math.min(this.timeoutMs, DEFAULT_CONNECT_TIMEOUT_MS)
         : DEFAULT_CONNECT_TIMEOUT_MS;
     this.resultTimeoutMs = Number.isSafeInteger(config.resultTimeoutMs) &&
-      config.resultTimeoutMs >= 0
+      config.resultTimeoutMs > 0
       ? config.resultTimeoutMs
-      : DEFAULT_TIMEOUT_MS;
+      : DEFAULT_RESULT_TIMEOUT_MS;
     this.resultPollMs = Number.isSafeInteger(config.resultPollMs) && config.resultPollMs > 0
       ? config.resultPollMs
       : DEFAULT_RESULT_POLL_MS;
@@ -404,7 +405,7 @@ class MayhemFeature extends Feature {
     const hash = this.peer.wallet.sign(`${JSON.stringify(value)}${featureNonce}`);
     const resultKey = `fr/${hash}`;
     const previousResult = (await this.peer.base.view.get(resultKey))?.value ?? null;
-    if (previousResult?.ok === true) {
+    if (previousResult?.ok === true || previousResult?.ok === false) {
       return this._featureResponse(key, hash, resultKey, previousResult);
     }
     const operation = {
@@ -436,8 +437,11 @@ class MayhemFeature extends Feature {
     }
     await this.peer.base.append(operation);
     await this.peer.base.append(null);
-    const featureResult =
-      (await this._waitForResult(resultKey, this.resultTimeoutMs, previousResult)) ?? previousResult;
+    const featureResult = await this._waitForResult(
+      resultKey,
+      this.resultTimeoutMs,
+      previousResult
+    );
     if (!featureResult) {
       return {
         ok: false,
@@ -949,7 +953,6 @@ class MayhemFeature extends Feature {
     const response = await cached.promise;
     cached.pending = false;
     cached.at = Date.now();
-    if (response?.ok !== true) this.processed.delete(expectedId);
     this.peer.sidechannel.broadcast(this.channel, {
       control: RELAY_CONTROL_RESULT,
       version: RELAY_VERSION,
@@ -1541,10 +1544,13 @@ class MayhemFeature extends Feature {
     };
   }
 
-  async _waitForResult(key, timeoutMs = 0, previousResult = null) {
-    const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : null;
+  async _waitForResult(key, timeoutMs = DEFAULT_RESULT_TIMEOUT_MS, previousResult = null) {
+    const boundedTimeoutMs = Number.isSafeInteger(timeoutMs) && timeoutMs > 0
+      ? timeoutMs
+      : DEFAULT_RESULT_TIMEOUT_MS;
+    const deadline = Date.now() + boundedTimeoutMs;
     const previousJson = previousResult === null ? null : stableJson(previousResult);
-    while (!this.stopped && (deadline === null || Date.now() <= deadline)) {
+    while (!this.stopped && Date.now() <= deadline) {
       const result = await this.peer.base.view.get(key);
       if (result !== null && (previousJson === null || stableJson(result.value) !== previousJson)) {
         return result.value;

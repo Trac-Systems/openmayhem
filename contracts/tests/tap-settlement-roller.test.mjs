@@ -12,6 +12,7 @@ import Ganache from 'ganache';
 import { ethers } from 'ethers';
 import b4a from '../../intercom/node_modules/b4a/index.js';
 import PeerWallet from '../../intercom/node_modules/trac-wallet/index.js';
+import { receiptMessage as contractReceiptMessage } from '../../intercom/contract/contract.js';
 
 import { deployPool } from '../scripts/deploy-local.mjs';
 import { distribution } from '../scripts/merkle.mjs';
@@ -89,6 +90,21 @@ function receipt(options) {
     },
   });
 }
+
+test('TAP roller uses the canonical contract schema-10 receipt bytes', () => {
+  const body = receipt({
+    session: 'tap-contract-golden',
+    au: '123',
+    epoch: 17,
+    extraBody: {
+      reservation_expires_after_epoch: 23,
+      reservation_receipt_grace_epochs: 6,
+      payout_revision: '42'.repeat(32),
+    },
+  }).receipt.body;
+
+  assert.equal(receiptMessage(body), contractReceiptMessage(body));
+});
 
 function targetedBindingsFor(bundle, providerAccounts, revisions = {}) {
   bundle.params ??= {};

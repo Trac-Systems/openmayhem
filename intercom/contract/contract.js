@@ -5,7 +5,7 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 18;
+export const CONTRACT_VERSION = 19;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -3975,6 +3975,13 @@ class MayhemContract extends Contract {
       ) {
         return new Error('Provider payout liability binding mismatch.');
       }
+      const existingLiabilityError = this.guardianValidatePayoutLiabilityRecord(
+        existing,
+        earning.provider,
+        earning.rail,
+        earning.payout_revision
+      );
+      if (existingLiabilityError) return existingLiabilityError;
       const aggregate = await this.earningRecord(earning.provider, earning.rail);
       if (aggregate instanceof Error) return aggregate;
       const probeGate = await this.probeGateForEarning(earning.provider, aggregate, params);
@@ -4002,16 +4009,24 @@ class MayhemContract extends Contract {
         lockedEarningEpochs
       );
       if (holdbacks instanceof Error) return holdbacks;
+      const nextLiability = {
+        ...refreshed,
+        total_au: totalAu,
+        held_au: heldAu,
+        holdbacks,
+        updated_epoch: value.epoch,
+        updated_at: key,
+      };
+      const nextLiabilityError = this.guardianValidatePayoutLiabilityRecord(
+        nextLiability,
+        earning.provider,
+        earning.rail,
+        earning.payout_revision
+      );
+      if (nextLiabilityError) return nextLiabilityError;
       liabilityUpdates.push({
         key: liabilityKey,
-        value: {
-          ...refreshed,
-          total_au: totalAu,
-          held_au: heldAu,
-          holdbacks,
-          updated_epoch: value.epoch,
-          updated_at: key,
-        },
+        value: nextLiability,
         snapshot_key: this.providerPayoutEpochSnapshotKey(
           value.epoch,
           page,
@@ -5015,10 +5030,11 @@ class MayhemContract extends Contract {
           liability.updated_epoch > value.epoch) {
         return new Error('Targeted payout liability index does not match canonical state.');
       }
-      const liabilityError = this.guardianValidateEarningRecord(
+      const liabilityError = this.guardianValidatePayoutLiabilityRecord(
         liability,
         entry.provider,
-        value.rail
+        value.rail,
+        entry.payout_revision
       );
       if (liabilityError) return liabilityError;
       const provider = await this.get(`prov/${entry.provider}`);
@@ -12387,6 +12403,13 @@ class MayhemContract extends Contract {
           (liability.chain_id ?? null) !== binding.chain_id) {
         return new Error('Targeted settlement payout liability mismatch.');
       }
+      const liabilityError = this.guardianValidatePayoutLiabilityRecord(
+        liability,
+        output.provider,
+        rail,
+        output.payout_revision
+      );
+      if (liabilityError) return liabilityError;
       const probeGate = await this.probeGateForEarning(output.provider, liability, params);
       if (probeGate instanceof Error) return probeGate;
       const lockedEarningEpochs = this.providerLockedEarningEpochs(provider, params);
@@ -12429,16 +12452,24 @@ class MayhemContract extends Contract {
       }
       const paidCumAu = this.safeAddAu(refreshed.paid_cum_au, settledAu);
       if (paidCumAu instanceof Error) return paidCumAu;
+      const nextLiability = {
+        ...refreshed,
+        paid_cum_au: paidCumAu,
+        updated_epoch: Math.max(refreshed.updated_epoch, epoch),
+        last_settlement_epoch: epoch,
+        last_settlement_transfer: transferIds[outputIndex],
+        updated_at: this.tx,
+      };
+      const nextLiabilityError = this.guardianValidatePayoutLiabilityRecord(
+        nextLiability,
+        output.provider,
+        rail,
+        output.payout_revision
+      );
+      if (nextLiabilityError) return nextLiabilityError;
       liabilityUpdates.push({
         key: liabilityKey,
-        value: {
-          ...refreshed,
-          paid_cum_au: paidCumAu,
-          updated_epoch: Math.max(refreshed.updated_epoch, epoch),
-          last_settlement_epoch: epoch,
-          last_settlement_transfer: transferIds[outputIndex],
-          updated_at: this.tx,
-        },
+        value: nextLiability,
       });
       const providerPaid = paidByProvider.get(output.provider) ?? {
         aggregate_paid_cum_au_before: output.aggregate_paid_cum_au_before,
@@ -19070,6 +19101,71 @@ class MayhemContract extends Contract {
         'earning'
       );
       if (scopeError) return scopeError;
+    }
+    return null;
+  }
+
+  guardianValidatePayoutLiabilityRecord(
+    record,
+    provider = null,
+    rail = null,
+    revision = null
+  ) {
+    if (!record ||
+        typeof record !== 'object' ||
+        Array.isArray(record) ||
+        record.type !== 'provider_payout_liability') {
+      return new Error('Guardian payout liability shape invariant failed.');
+    }
+    if (!PROVIDER_PAYOUT_BINDING_RAILS.has(record.rail) ||
+        (rail !== null && record.rail !== rail)) {
+      return new Error('Guardian payout liability rail invariant failed.');
+    }
+    if (!this.isHexBytes(record.provider, 32) ||
+        (provider !== null && record.provider !== provider)) {
+      return new Error('Guardian payout liability owner invariant failed.');
+    }
+    if (!this.isHexBytes(record.revision, 32) ||
+        (revision !== null && record.revision !== revision)) {
+      return new Error('Guardian payout liability revision invariant failed.');
+    }
+    if (!this.isSafeKeyPart(record.target)) {
+      return new Error('Guardian payout liability target invariant failed.');
+    }
+    if (record.rail === 'fiat') {
+      if (!this.isSafeKeyPart(record.currency) || record.chain_id !== null) {
+        return new Error('Guardian payout liability fiat scope invariant failed.');
+      }
+    } else if (record.rail === 'tap') {
+      if (record.currency !== null ||
+          !Number.isSafeInteger(record.chain_id) ||
+          record.chain_id < 1 ||
+          !this.isEthHexBytes(record.target, 20)) {
+        return new Error('Guardian payout liability TAP scope invariant failed.');
+      }
+    } else if (record.currency !== null || record.chain_id !== null) {
+      return new Error('Guardian payout liability TNK scope invariant failed.');
+    }
+    for (const key of ['total_au', 'held_au', 'paid_cum_au']) {
+      if (this.normalizeAu(record[key], `payout liability ${key}`) instanceof Error) {
+        return new Error('Guardian non-negative payout liability invariant failed.');
+      }
+    }
+    if (!Number.isSafeInteger(record.updated_epoch) || record.updated_epoch < 0) {
+      return new Error('Guardian payout liability epoch invariant failed.');
+    }
+    const payableAu = this.safeSubAu(record.total_au, record.held_au);
+    if (payableAu instanceof Error ||
+        this.compareAu(record.held_au, record.total_au) > 0 ||
+        this.compareAu(record.paid_cum_au, payableAu) > 0) {
+      return new Error('Guardian payout liability conservation invariant failed.');
+    }
+    const holdbacks = this.normalizeHoldbackBuckets(record);
+    if (holdbacks instanceof Error) return holdbacks;
+    const heldAu = this.holdbackBucketTotal(holdbacks);
+    if (heldAu instanceof Error ||
+        this.compareAu(heldAu, record.held_au) !== 0) {
+      return new Error('Guardian payout liability conservation invariant failed.');
     }
     return null;
   }

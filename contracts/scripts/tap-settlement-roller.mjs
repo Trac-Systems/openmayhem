@@ -25,7 +25,7 @@ const PROVIDER_CAP_TOLERANCE_WEI = 0n;
 const SESSION_RECEIPT_SCHEMA_VERSION = 10;
 const SIGNING_MESSAGE_VERSION = 2;
 const DEFAULT_TAP_CHALLENGE_EPOCHS = 6;
-const CONTRACT_VERSION = 18;
+const CONTRACT_VERSION = 19;
 const TAP_BURN_BPS = 1_000n;
 const MIN_TAP_CONFIRMATION_DEPTH = 12;
 const PREPARATION_CONFIRM_TIMEOUT_MS = 30_000;
@@ -250,6 +250,11 @@ export function canonicalReceiptBody(body) {
     billing_attempt: body.billing_attempt,
     billing_prior_usage: body.billing_prior_usage,
     billing_prior_au_owed_cum: body.billing_prior_au_owed_cum,
+    billing_epoch: body.billing_epoch,
+    reservation_id: body.reservation_id,
+    reservation_expires_after_epoch: body.reservation_expires_after_epoch,
+    reservation_receipt_grace_epochs: body.reservation_receipt_grace_epochs,
+    payout_revision: body.payout_revision,
     seq: body.seq,
     final: body.final,
     rail: body.rail,

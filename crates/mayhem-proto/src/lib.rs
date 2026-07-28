@@ -27,7 +27,7 @@ pub use validated_audio::{
 };
 
 pub const CRATE_NAME: &str = "mayhem-proto";
-pub const CONTRACT_VERSION: u32 = 18;
+pub const CONTRACT_VERSION: u32 = 19;
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 2;
 pub const ATTESTATION_ALG: &str = "ed25519";
 pub const ATTESTATION_POLICY_SCHEMA_VERSION: u32 = 1;

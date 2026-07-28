@@ -11,6 +11,7 @@ import MayhemContract, {
   receiptMessage,
   recordUsageReceiptMessage,
   spendVoucherMessage,
+  targetedPayoutControlMessage,
   targetedSpendReservationMessage,
 } from '../contract/contract.js';
 import {
@@ -898,6 +899,119 @@ test('receipt-bound targeted apply consumes a final head once and rejects later 
     (await submitReceipt(ctx, higher)).result.message,
     /consumed canonical receipt head cannot advance/i
   );
+});
+
+test('targeted payout planning consumes a liability created by targeted epoch apply', async () => {
+  const ctx = await setupContract();
+  const reservation = await submitReservation(ctx);
+  const receipt = receiptValue(ctx, reservation, { final: true });
+  const recorded = await submitReceipt(ctx, receipt);
+  assert.equal(recorded.result.ok, true, recorded.result.message);
+  const head = (
+    await ctx.storage.get(`receipt/head/${receipt.receipt.body.billing_id}/0`)
+  ).value;
+  const commit = await commitEpoch(ctx, { count: 1, useAu: '100' });
+  const applyValue = await targetedApplyValue(ctx, {
+    heads: [head],
+    commitHash: commit.commit_hash,
+  });
+  const applied = await submitTargetedApply(ctx, applyValue);
+  assert.equal(applied.result.ok, true, applied.result.message);
+
+  const liability = (
+    await ctx.storage.get(
+      `payout/liability/tnk/${ctx.provider.publicKey}/${PAYOUT_REVISION}`
+    )
+  ).value;
+  assert.equal(liability.type, 'provider_payout_liability');
+  assert.equal(Object.hasOwn(liability, 'denom'), false);
+
+  const applyState = (await ctx.storage.get('epoch/apply/state')).value;
+  const carry = [{
+    provider: ctx.provider.publicKey,
+    payout_revision: PAYOUT_REVISION,
+    liability_au: liability.total_au,
+    held_au: liability.held_au,
+    payable_au: (
+      BigInt(liability.total_au) -
+      BigInt(liability.held_au) -
+      BigInt(liability.paid_cum_au)
+    ).toString(),
+    payout_min_au: '1000000000000000000',
+    reason: 'held',
+  }];
+  const fee = (await ctx.storage.get('fee/tnk/cum')).value;
+  const outputs = [{
+    economic_op_id: 'a1'.repeat(32),
+    output_index: 0,
+    role: 'operator_fee',
+    to: 'trac1receiptsettlementoperator',
+    au: fee.cum_au,
+    tnk_e18: fee.cum_au,
+  }];
+  const outputsRoot = await ctx.contract.opaqueHash(
+    'mayhem-targeted-payout-epoch-outputs-v1',
+    { rail: 'tnk', epoch: 1, outputs }
+  );
+  const carryRoot = await ctx.contract.opaqueHash(
+    'mayhem-targeted-payout-epoch-carry-v1',
+    { rail: 'tnk', epoch: 1, carry }
+  );
+  const unsigned = {
+    op: 'prepare_targeted_payout_epoch',
+    contract_version: CONTRACT_VERSION,
+    rail: 'tnk',
+    epoch: 1,
+    at: 3600,
+    epoch_apply_hash: applyState.last_apply_hash,
+    snapshot_signed_length: 1,
+    outcome: 'payouts',
+    outputs,
+    carry,
+    outputs_root: outputsRoot,
+    carry_root: carryRoot,
+    plan_root: await ctx.contract.opaqueHash(
+      'mayhem-targeted-payout-epoch-plan-v1',
+      {
+        rail: 'tnk',
+        epoch: 1,
+        at: 3600,
+        epoch_apply_hash: applyState.last_apply_hash,
+        snapshot_signed_length: 1,
+        outcome: 'payouts',
+        outputs_root: outputsRoot,
+        carry_root: carryRoot,
+      }
+    ),
+    admin: ctx.admin.publicKey,
+    admin_sig: '',
+  };
+  const plan = {
+    ...unsigned,
+    admin_sig: signHex(
+      ctx.admin.wallet,
+      targetedPayoutControlMessage(unsigned)
+    ),
+  };
+  const previousStorage = ctx.contract.storage;
+  ctx.contract.storage = ctx.storage;
+  let key;
+  try {
+    key = await ctx.contract.targetedPayoutEpochFeatureKey(plan);
+  } finally {
+    ctx.contract.storage = previousStorage;
+  }
+  assert.equal(key instanceof Error, false, key.message);
+  const prepared = await executeFeature(
+    ctx.contract,
+    ctx.storage,
+    'mayhem_feature',
+    key,
+    plan,
+    ctx.admin.publicKey
+  );
+  const result = prepared ?? ctx.contract._mayhemLastFeatureResult;
+  assert.equal(result.ok, true, result.message);
 });
 
 test('paged targeted apply is bounded, commit-bound, complete, and idempotent', async () => {
