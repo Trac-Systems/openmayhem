@@ -15046,11 +15046,16 @@ fn clean_provider_reject_code(code: &str) -> bool {
     )
 }
 
-/// BALANCE means the end user's credit cannot cover the session's spend
-/// reservation. That is a property of the user, not the route, so retrying
-/// this or any other provider cannot succeed until the wallet changes.
+/// Only the contract's explicit insufficient-credit error is terminal for the
+/// buyer. Providers also use BALANCE for pre-serve accounting admission
+/// failures such as relay/result timeouts or payout-binding drift; those must
+/// remain route-retryable so another eligible provider can be tried.
 fn terminal_balance_refusal(err: &GatewaySessionError) -> Option<ApiError> {
-    (err.clean_refusal_code.as_deref() == Some("BALANCE"))
+    (err.clean_refusal_code.as_deref() == Some("BALANCE")
+        && err
+            .message
+            .to_ascii_lowercase()
+            .contains("insufficient unreserved credit balance"))
         .then(|| ApiError::payment_required(err.message.clone(), Some("model")))
 }
 
@@ -43621,6 +43626,25 @@ mod tests {
             assert!(
                 terminal_balance_refusal(&err).is_none(),
                 "{code} must stay route-retryable"
+            );
+        }
+
+        for reason in [
+            "spend reservation did not complete within the 90000 ms provider admission budget; no work was served",
+            "contract spend reservation rejected before serving: Mayhem feature relay accepted the append but no canonical result appeared before the relay result budget.",
+            "provider has no active verified fiat payout binding: missing payout binding",
+        ] {
+            let err = provider_reject_session_error(
+                &json!({
+                    "t": "s.reject",
+                    "code": "BALANCE",
+                    "reason": reason,
+                }),
+                "session-a",
+            );
+            assert!(
+                terminal_balance_refusal(&err).is_none(),
+                "{reason} must stay route-retryable"
             );
         }
     }

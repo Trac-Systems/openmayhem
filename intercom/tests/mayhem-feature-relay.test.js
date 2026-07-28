@@ -750,7 +750,47 @@ test('feature result polling remains finite when zero is configured', () => {
   const writer = peerFor(adminKey, { writable: true });
   const feature = new MayhemFeature(writer.peer, { resultTimeoutMs: 0 });
 
-  assert.equal(feature.resultTimeoutMs, 120_000);
+  assert.equal(feature.resultTimeoutMs, 15_000);
+});
+
+test('admin writer returns a bounded relay error when an accepted feature never applies', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  writer.peer.base.append = async (operation) => {
+    if (operation === null) {
+      writer.flushes.push(true);
+      return;
+    }
+    writer.appended.push(operation);
+  };
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 500,
+    retryMs: 5,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    resultTimeoutMs: 5,
+    resultWaitMaxMs: 20,
+    resultPollMs: 1,
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  connect(participant.peer, participantFeature, writer.peer, writerFeature);
+  connect(writer.peer, writerFeature, participant.peer, participantFeature);
+
+  const result = await participantFeature.relay(
+    `consent/${providerKey}/1/rules-hash`,
+    consentValue()
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.relayed, true);
+  assert.match(result.message, /no canonical result appeared before the relay result budget/);
+  assert.equal(writer.appended.length, 1);
+  assert.equal(writer.flushes.length, 1);
+  await participantFeature.stop();
+  await writerFeature.stop();
 });
 
 test('relay rejects admin operations before network send', async () => {
@@ -1121,6 +1161,7 @@ test('feature relay never freezes a nonterminal pending result', async () => {
   });
   const writerFeature = new MayhemFeature(writer.peer, {
     resultTimeoutMs: 5,
+    resultWaitMaxMs: 30,
     resultPollMs: 1,
     resultRetryMs: 5,
   });

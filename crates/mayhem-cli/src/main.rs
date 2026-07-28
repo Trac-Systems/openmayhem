@@ -89,10 +89,10 @@ use mayhem_gateway::{
     rate_gate_basis_au, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_au,
     valid_video_av_fingerprint, video_av_fingerprint, video_av_fingerprint_similarity_bps,
     HardwareQuoteVerifierCommand, HeartbeatModalityCapacity, HeartbeatReceiver,
-    ModalityRequestLoad, ProviderProbation, RateMapEntry, ADMIN_RELAY_CONNECT_BUDGET_MILLIS,
-    ADMIN_RELAY_RESULT_BUDGET_MILLIS, DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS,
-    DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, HEARTBEAT_SCHEMA_VERSION,
-    INPUT_TOKEN_UNIT, MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS, OUTPUT_TOKEN_UNIT,
+    ModalityRequestLoad, ProviderProbation, RateMapEntry,
+    DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS, DEFAULT_OPEN_TIMEOUT_MILLIS,
+    DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS, HEARTBEAT_SCHEMA_VERSION, INPUT_TOKEN_UNIT,
+    MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS, OUTPUT_TOKEN_UNIT,
 };
 use mayhem_hwprobe::{
     chatterbox_managed_device, human_report, model_memory_fit, probe, BackendVerdict,
@@ -276,8 +276,7 @@ const DEFAULT_PROVIDER_SC_BRIDGE_OPERATION_TIMEOUT_MILLIS: u64 = 15_000;
 const DEFAULT_PROVIDER_SC_BRIDGE_LIVENESS_INTERVAL_MILLIS: u64 = 10_000;
 const DEFAULT_PROVIDER_ADMISSION_RELAY_RETRY_WINDOW_MILLIS: u64 = 30_000;
 const DEFAULT_PROVIDER_ADMISSION_RELAY_RETRY_INTERVAL_MILLIS: u64 = 2_000;
-const DEFAULT_PROVIDER_ADMISSION_TIMEOUT_MILLIS: u64 =
-    ADMIN_RELAY_CONNECT_BUDGET_MILLIS + ADMIN_RELAY_RESULT_BUDGET_MILLIS;
+const DEFAULT_PROVIDER_ADMISSION_TIMEOUT_MILLIS: u64 = DEFAULT_OPEN_TIMEOUT_MILLIS;
 const DEFAULT_PROVIDER_SESSION_REJECT_REPLAY_MAX: usize = 4_096;
 const DEFAULT_PROVIDER_HEARTBEAT_INTERVAL_MILLIS: u64 = 2_000;
 const DEFAULT_PROVIDER_HEARTBEAT_RECONNECT_INITIAL_MILLIS: u64 = 250;
@@ -93014,7 +93013,10 @@ esac
             provider_session_admission_timeout_from(None).unwrap(),
             Duration::from_millis(DEFAULT_PROVIDER_ADMISSION_TIMEOUT_MILLIS)
         );
-        assert!(DEFAULT_PROVIDER_ADMISSION_TIMEOUT_MILLIS < DEFAULT_OPEN_TIMEOUT_MILLIS);
+        assert_eq!(
+            DEFAULT_PROVIDER_ADMISSION_TIMEOUT_MILLIS,
+            DEFAULT_OPEN_TIMEOUT_MILLIS
+        );
         assert_eq!(
             provider_session_admission_timeout_from(Some("1234")).unwrap(),
             Duration::from_millis(1_234)

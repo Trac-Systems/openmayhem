@@ -918,6 +918,10 @@ const mayhemRelayResultTimeoutMs = parseInteger(
   flagValue('mayhem-relay-result-timeout-ms', env.MAYHEM_RELAY_RESULT_TIMEOUT_MS || ''),
   0
 );
+const mayhemRelayResultWaitMaxMs = parseInteger(
+  flagValue('mayhem-relay-result-wait-max-ms', env.MAYHEM_RELAY_RESULT_WAIT_MAX_MS || ''),
+  0
+);
 const mayhemRelayResultPollMs = parseInteger(
   flagValue('mayhem-relay-result-poll-ms', env.MAYHEM_RELAY_RESULT_POLL_MS || ''),
   50
@@ -1380,6 +1384,7 @@ let mayhemFeature = null;
     retryMs: mayhemRelayRetryMs,
     connectTimeoutMs: mayhemRelayConnectTimeoutMs,
     resultTimeoutMs: mayhemRelayResultTimeoutMs,
+    resultWaitMaxMs: mayhemRelayResultWaitMaxMs,
     resultPollMs: mayhemRelayResultPollMs,
     serviceHandler: stripeAdminService(peer),
   });

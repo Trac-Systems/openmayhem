@@ -29,7 +29,8 @@ const MAYHEM_RELAY_MAX_MESSAGE_BYTES = 16_384;
 const DEFAULT_TIMEOUT_MS = 0;
 const DEFAULT_RETRY_MS = 1_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
-const DEFAULT_RESULT_TIMEOUT_MS = 120_000;
+const DEFAULT_RESULT_TIMEOUT_MS = 15_000;
+const DEFAULT_RESULT_WAIT_MAX_MS = 60_000;
 const DEFAULT_RESULT_POLL_MS = 50;
 const DEFAULT_CACHE_TTL_MS = 300_000;
 const DEFAULT_CACHE_MAX = 2_048;
@@ -359,6 +360,10 @@ class MayhemFeature extends Feature {
       config.resultTimeoutMs > 0
       ? config.resultTimeoutMs
       : DEFAULT_RESULT_TIMEOUT_MS;
+    this.resultWaitMaxMs = Number.isSafeInteger(config.resultWaitMaxMs) &&
+      config.resultWaitMaxMs > 0
+      ? config.resultWaitMaxMs
+      : DEFAULT_RESULT_WAIT_MAX_MS;
     this.resultPollMs = Number.isSafeInteger(config.resultPollMs) && config.resultPollMs > 0
       ? config.resultPollMs
       : DEFAULT_RESULT_POLL_MS;
@@ -1594,11 +1599,14 @@ class MayhemFeature extends Feature {
     // The sidechannel request id dedupes in-flight relay delivery. The writer
     // append itself needs a fresh nonce so a transient contract rejection does
     // not permanently burn the same fr/<hash> for later valid retries.
+    const deadline = Date.now() + this.resultWaitMaxMs;
     let response = await this.submit(key, value);
     while (!this.stopped && response?.status === 'pending') {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
       const featureResult = await this._waitForResult(
         response.result_key,
-        this.resultTimeoutMs
+        Math.min(this.resultTimeoutMs, remaining)
       );
       if (!featureResult) continue;
       response = this._featureResponse(
@@ -1608,9 +1616,16 @@ class MayhemFeature extends Feature {
         featureResult
       );
     }
-    return this.stopped && response?.status === 'pending'
-      ? relayError('Mayhem feature relay stopped before the canonical result appeared.', requestId)
-      : response;
+    if (this.stopped && response?.status === 'pending') {
+      return relayError('Mayhem feature relay stopped before the canonical result appeared.', requestId);
+    }
+    if (response?.status === 'pending') {
+      return relayError(
+        'Mayhem feature relay accepted the append but no canonical result appeared before the relay result budget.',
+        requestId
+      );
+    }
+    return response;
   }
 
   async _applyRelayedAdminTx(key, value, requestId) {
