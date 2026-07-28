@@ -226,6 +226,8 @@ const stripeCheckoutValue = (who = providerKey) => ({
   au: '1000000000000000000',
   success_url: 'https://stripe.com',
   cancel_url: 'https://stripe.com',
+  presentation: 'auto',
+  locale: 'en',
   idempotency_key: 'checkout-test-1',
   request_nonce: '34'.repeat(32),
 });
@@ -1983,6 +1985,34 @@ test('Stripe checkout relay rejects caller-selected currency before forwarding',
     ),
     /Invalid Mayhem service request signature/
   );
+  assert.equal(broadcasts, 0);
+});
+
+test('Stripe checkout relay rejects noncanonical presentation and locale before forwarding', async () => {
+  const participant = peerFor(otherKey);
+  const signer = peerFor(providerKey);
+  const participantFeature = new MayhemFeature(participant.peer, {});
+  participantFeature.key = 'mayhem';
+  let broadcasts = 0;
+  participant.peer.sidechannel = {
+    started: true,
+    broadcast() {
+      broadcasts += 1;
+      return true;
+    },
+  };
+  for (const checkout of [
+    { ...stripeCheckoutValue(), presentation: 'manual' },
+    { ...stripeCheckoutValue(), locale: 'de' },
+  ]) {
+    await assert.rejects(
+      participantFeature.requestService(
+        'stripe_checkout',
+        signedServiceValue(signer.peer, 'stripe_checkout', checkout, otherKey)
+      ),
+      /Invalid Mayhem service request signature/
+    );
+  }
   assert.equal(broadcasts, 0);
 });
 

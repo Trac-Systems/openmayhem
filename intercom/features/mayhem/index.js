@@ -232,12 +232,14 @@ const validStripeCheckoutPayload = (value) => {
     'success_url',
     'cancel_url',
   ];
-  const allowedKeys = new Set([...requiredKeys, 'idempotency_key']);
+  const allowedKeys = new Set([...requiredKeys, 'idempotency_key', 'presentation', 'locale']);
   if (requiredKeys.some((key) => !Object.hasOwn(value, key)) ||
       Object.keys(value).some((key) => !allowedKeys.has(key)) ||
       !/^[0-9a-f]{64}$/.test(String(value.who ?? '')) ||
       !/^[1-9][0-9]*$/.test(String(value.au ?? '')) ||
       !/^[0-9a-f]{64}$/.test(String(value.request_nonce ?? '')) ||
+      (value.presentation !== undefined && value.presentation !== 'auto') ||
+      (value.locale !== undefined && value.locale !== 'en') ||
       (value.idempotency_key !== undefined &&
         (typeof value.idempotency_key !== 'string' || value.idempotency_key.length > 255))) {
     return false;

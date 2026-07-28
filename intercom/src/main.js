@@ -171,6 +171,8 @@ const stripeCheckoutRequest = async (peer, value) => {
     'request_nonce',
     'success_url',
     'cancel_url',
+    'presentation',
+    'locale',
   ]);
   const unknownKeys = Object.keys(value).filter((key) => !allowedKeys.has(key));
   if (unknownKeys.length > 0) {
@@ -198,6 +200,12 @@ const stripeCheckoutRequest = async (peer, value) => {
       (typeof value.idempotency_key !== 'string' || value.idempotency_key.length > 255)) {
     throw new Error('Invalid Stripe checkout idempotency key.');
   }
+  if (value.presentation !== undefined && value.presentation !== 'auto') {
+    throw new Error('Stripe checkout presentation must be auto.');
+  }
+  if (value.locale !== undefined && value.locale !== 'en') {
+    throw new Error('Stripe checkout locale must be en.');
+  }
   const requestNonce = String(value.request_nonce || '').toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(requestNonce)) {
     throw new Error('Invalid Stripe checkout request nonce.');
@@ -215,6 +223,8 @@ const stripeCheckoutRequest = async (peer, value) => {
   );
   const workerValue = { ...value };
   delete workerValue.request_nonce;
+  delete workerValue.presentation;
+  delete workerValue.locale;
   if (!workerValue.idempotency_key) {
     workerValue.idempotency_key = `mayhem-checkout-${requestNonce}`;
   }
