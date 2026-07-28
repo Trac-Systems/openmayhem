@@ -17,6 +17,8 @@ const SERVICE = path.join(ROOT, 'ops/systemd/mayhem-payout-worker.service');
 const TIMER = path.join(ROOT, 'ops/systemd/mayhem-payout-worker.timer');
 const APPLY_HASH = 'a'.repeat(64);
 const NEXT_APPLY_HASH = 'b'.repeat(64);
+const EPOCH_COMMIT_HASH = '0'.repeat(64);
+const EPOCH_APPLIED_AT = 'f'.repeat(64);
 const FIAT_ROOT = 'b'.repeat(64);
 const TNK_ROOT = 'c'.repeat(64);
 const TAP_ROOT = `0x${'d'.repeat(64)}`;
@@ -979,6 +981,13 @@ function harness({ bundle = true, emptySeal = !bundle } = {}) {
       pending_epoch: null,
       last_apply_hash: APPLY_HASH.toUpperCase(),
       last_settlement_unix: 900,
+      last_receipt_commit_hash: EPOCH_COMMIT_HASH,
+      last_receipt_index_count: 3,
+      last_receipt_index_revision: 3,
+      last_receipt_index_page_count: 1,
+      last_receipt_index_updated_at: EPOCH_APPLIED_AT,
+      last_receipt_allocation_count: 3,
+      updated_at: EPOCH_APPLIED_AT,
     },
   });
   const nowFile = path.join(root, 'now');
@@ -995,20 +1004,18 @@ elif [[ "$*" == *"key=settle/targeted/tap/"* ]]; then
   fi
 elif [[ "$*" == *"key=fee/tnk/cum"* ]]; then
   printf '%s\\n' '{"value":{"cum_au":"0","swept_cum_au":"0"}}'
-elif [[ "$*" == *"key=ev/dep/7"* ]]; then
-  printf '%s\\n' '{"value":{"type":"deposit_root","epoch":7,"merkle_root":"${'1'.repeat(64)}","count":0,"au_total":"0"}}'
-elif [[ "$*" == *"key=ev/use/7"* ]]; then
-  printf '%s\\n' '{"value":{"type":"usage_root","epoch":7,"merkle_root":"${'2'.repeat(64)}","sessions":3,"au_total":"30","providers":3}}'
-elif [[ "$*" == *"key=ev/earn/7"* ]]; then
+elif [[ "$*" == *"key=epoch/commit/7"* ]]; then
   if [[ "\${MOCK_STALE_ROOT:-0}" == "1" ]]; then
-    printf '%s\\n' '{"value":{"type":"earn_root","epoch":7,"merkle_root":"${'9'.repeat(64)}","provider_count":3,"au_cum_total":"20"}}'
+    printf '%s\\n' '{"key":"epoch/commit/7","confirmed":true,"value":{"type":"epoch_commit","epoch":7,"roots":{"dep":"${'1'.repeat(64)}","use":"${'2'.repeat(64)}","earn":"${'9'.repeat(64)}","fee":"${'4'.repeat(64)}","price":"${'5'.repeat(64)}"},"totals":{"dep_count":0,"dep_au":"0","use_count":3,"use_au":"30","provider_count":3,"earn_au":"20","fee_au":"5","fee_cum_au":"5","burn_au":"1","burn_cum_au":"1","price_count":0},"status":"provisional","commit_hash":"${EPOCH_COMMIT_HASH}","at":900}}'
   else
-    printf '%s\\n' '{"value":{"type":"earn_root","epoch":7,"merkle_root":"${'3'.repeat(64)}","provider_count":3,"au_cum_total":"20"}}'
+    printf '%s\\n' '{"key":"epoch/commit/7","confirmed":true,"value":{"type":"epoch_commit","epoch":7,"roots":{"dep":"${'1'.repeat(64)}","use":"${'2'.repeat(64)}","earn":"${'3'.repeat(64)}","fee":"${'4'.repeat(64)}","price":"${'5'.repeat(64)}"},"totals":{"dep_count":0,"dep_au":"0","use_count":3,"use_au":"30","provider_count":3,"earn_au":"20","fee_au":"5","fee_cum_au":"5","burn_au":"1","burn_cum_au":"1","price_count":0},"status":"provisional","commit_hash":"${EPOCH_COMMIT_HASH}","at":900}}'
   fi
-elif [[ "$*" == *"key=ev/fee/7"* ]]; then
-  printf '%s\\n' '{"value":{"type":"fee_root","epoch":7,"merkle_root":"${'4'.repeat(64)}","au_fee_epoch":"5","au_fee_cum":"5","au_burn_epoch":"1","au_burn_cum":"1"}}'
-elif [[ "$*" == *"key=ev/price/7"* ]]; then
-  printf '%s\\n' '{"value":{"type":"price_root","epoch":7,"merkle_root":"${'5'.repeat(64)}","price_count":0}}'
+elif [[ "$*" == *"key=epoch/apply-anchor/7"* ]]; then
+  if [[ "\${MOCK_STALE_ANCHOR:-0}" == "1" ]]; then
+    printf '%s\\n' '{"key":"epoch/apply-anchor/7","confirmed":true,"value":{"type":"epoch_apply_anchor","epoch":7,"apply_hash":"${NEXT_APPLY_HASH}","settlement_unix":900,"applied_at":"${EPOCH_APPLIED_AT}"}}'
+  else
+    printf '%s\\n' '{"key":"epoch/apply-anchor/7","confirmed":true,"value":{"type":"epoch_apply_anchor","epoch":7,"apply_hash":"${APPLY_HASH}","settlement_unix":900,"applied_at":"${EPOCH_APPLIED_AT}"}}'
+  fi
 elif [[ "$*" == *"key=epoch/seal/7"* ]]; then
   if [[ "\${MOCK_EMPTY_SEAL:-${emptySealDefault}}" == "1" ]]; then
     printf '%s\\n' '{"value":{"type":"epoch_empty_seal","epoch":7,"seal_hash":"${APPLY_HASH}","totals":{"debited_au":"0","earned_au":"0","fee_au":"0","burn_au":"0"}}}'
@@ -1953,12 +1960,21 @@ test('stale retained epoch artifact and inherited live credentials are refused',
     assert.deepEqual(logLines(ctx), []);
   });
 
-  await t.test('stale canonical root evidence', () => {
+  await t.test('stale canonical commit root evidence', () => {
     const ctx = harness();
     t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));
     const result = runWorker(ctx, { MOCK_STALE_ROOT: '1' });
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /canonical ev\/earn root does not match retained epoch evidence/);
+    assert.match(result.stderr, /canonical epoch commit does not match retained epoch evidence/);
+    assert.deepEqual(logLines(ctx), []);
+  });
+
+  await t.test('stale canonical apply anchor', () => {
+    const ctx = harness();
+    t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));
+    const result = runWorker(ctx, { MOCK_STALE_ANCHOR: '1' });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /canonical epoch apply anchor does not match retained epoch evidence/);
     assert.deepEqual(logLines(ctx), []);
   });
 

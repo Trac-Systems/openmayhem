@@ -376,15 +376,17 @@ validate_epoch_artifact() {
     echo "abort: retained epoch bundle is missing recomputed, canonical receipt, or apply-bound evidence" >&2
     return 1
   }
-  local dep_state use_state earn_state fee_state price_state
-  dep_state="$(curl -sf -m 10 "$RPC_URL/state?key=ev/dep/$applied_epoch")"
-  use_state="$(curl -sf -m 10 "$RPC_URL/state?key=ev/use/$applied_epoch")"
-  earn_state="$(curl -sf -m 10 "$RPC_URL/state?key=ev/earn/$applied_epoch")"
-  fee_state="$(curl -sf -m 10 "$RPC_URL/state?key=ev/fee/$applied_epoch")"
-  price_state="$(curl -sf -m 10 "$RPC_URL/state?key=ev/price/$applied_epoch")"
+  local epoch_commit apply_anchor
+  epoch_commit="$(
+    curl -sf -m 10 \
+      "$RPC_URL/state?key=epoch/commit/$applied_epoch&confirmed=true"
+  )"
+  apply_anchor="$(
+    curl -sf -m 10 \
+      "$RPC_URL/state?key=epoch/apply-anchor/$applied_epoch&confirmed=true"
+  )"
   python3 - "$bundle" "$recomputed" "$canonical_receipts" "$artifact" \
-    "$applied_epoch" "$apply_hash" \
-    "$dep_state" "$use_state" "$earn_state" "$fee_state" "$price_state" <<'PY'
+    "$applied_epoch" "$apply_hash" "$apply_state" "$epoch_commit" "$apply_anchor" <<'PY'
 import hashlib, json, re, sys
 (
     bundle_path,
@@ -393,11 +395,9 @@ import hashlib, json, re, sys
     artifact_path,
     expected_epoch,
     expected_hash,
-    dep_raw,
-    use_raw,
-    earn_raw,
-    fee_raw,
-    price_raw,
+    apply_state_raw,
+    commit_raw,
+    anchor_raw,
 ) = sys.argv[1:]
 expected_epoch = int(expected_epoch)
 
@@ -443,44 +443,75 @@ if artifact.get("roots") != roots or artifact.get("totals") != recomputed.get("t
 totals = recomputed.get("totals")
 if not isinstance(totals, dict):
     raise SystemExit("retained epoch totals are invalid")
-states = {
-    "dep": (json.loads(dep_raw).get("value"), "deposit_root"),
-    "use": (json.loads(use_raw).get("value"), "usage_root"),
-    "earn": (json.loads(earn_raw).get("value"), "earn_root"),
-    "fee": (json.loads(fee_raw).get("value"), "fee_root"),
-    "price": (json.loads(price_raw).get("value"), "price_root"),
-}
-for kind, (state, expected_type) in states.items():
+
+def confirmed_value(raw, expected_key, label):
+    record = json.loads(raw)
     if (
-        not isinstance(state, dict)
-        or state.get("type") != expected_type
-        or state.get("epoch") != expected_epoch
-        or state.get("merkle_root") != roots[kind]
+        not isinstance(record, dict)
+        or record.get("confirmed") is not True
+        or record.get("key") not in (None, expected_key)
+        or not isinstance(record.get("value"), dict)
     ):
-        raise SystemExit(f"canonical ev/{kind} root does not match retained epoch evidence")
-checks = {
-    "dep": {"count": totals.get("dep_count"), "au_total": totals.get("dep_au")},
-    "use": {
-        "sessions": totals.get("use_count"),
-        "au_total": totals.get("use_au"),
-        "providers": totals.get("provider_count"),
-    },
-    "earn": {
-        "provider_count": totals.get("provider_count"),
-        "au_cum_total": totals.get("earn_au"),
-    },
-    "fee": {
-        "au_fee_epoch": totals.get("fee_au"),
-        "au_fee_cum": totals.get("fee_cum_au"),
-        "au_burn_epoch": totals.get("burn_au"),
-        "au_burn_cum": totals.get("burn_cum_au"),
-    },
-    "price": {"price_count": totals.get("price_count")},
-}
-for kind, fields in checks.items():
-    for field, expected in fields.items():
-        if states[kind][0].get(field) != expected:
-            raise SystemExit(f"canonical ev/{kind}.{field} does not match retained epoch totals")
+        raise SystemExit(f"{label} is not confirmed canonical state")
+    return record["value"]
+
+apply_state = confirmed_value(
+    apply_state_raw,
+    "epoch/apply/state",
+    "canonical epoch apply state",
+)
+commit = confirmed_value(
+    commit_raw,
+    f"epoch/commit/{expected_epoch}",
+    "canonical epoch commit",
+)
+anchor = confirmed_value(
+    anchor_raw,
+    f"epoch/apply-anchor/{expected_epoch}",
+    "canonical epoch apply anchor",
+)
+commit_hash = commit.get("commit_hash")
+if (
+    commit.get("type") != "epoch_commit"
+    or commit.get("epoch") != expected_epoch
+    or commit.get("status") != "provisional"
+    or not re.fullmatch(r"[0-9a-f]{64}", str(commit_hash))
+    or commit.get("roots") != roots
+    or commit.get("totals") != totals
+):
+    raise SystemExit("canonical epoch commit does not match retained epoch evidence")
+if (
+    anchor.get("type") != "epoch_apply_anchor"
+    or anchor.get("epoch") != expected_epoch
+    or anchor.get("apply_hash") != expected_hash
+    or not isinstance(anchor.get("settlement_unix"), int)
+    or isinstance(anchor.get("settlement_unix"), bool)
+    or anchor.get("settlement_unix") < 1
+    or not isinstance(anchor.get("applied_at"), str)
+    or not anchor.get("applied_at")
+):
+    raise SystemExit("canonical epoch apply anchor does not match retained epoch evidence")
+metadata = receipts.get("metadata")
+if (
+    not isinstance(metadata, dict)
+    or metadata.get("type") != "canonical_receipt_epoch_index"
+    or metadata.get("epoch") != expected_epoch
+    or metadata.get("count") != len(receipts.get("heads", []))
+    or commit["totals"].get("use_count") != metadata.get("count")
+    or apply_state.get("updated_epoch") != expected_epoch
+    or apply_state.get("pending_epoch") is not None
+    or str(apply_state.get("last_apply_hash", "")).lower() != expected_hash
+    or apply_state.get("last_receipt_commit_hash") != commit_hash
+    or apply_state.get("last_receipt_index_count") != metadata.get("count")
+    or apply_state.get("last_receipt_index_revision") != metadata.get("revision")
+    or apply_state.get("last_receipt_index_page_count") != metadata.get("page_count")
+    or apply_state.get("last_receipt_index_updated_at") != metadata.get("updated_at")
+    or apply_state.get("last_receipt_allocation_count") != metadata.get("count")
+    or apply_state.get("last_settlement_unix") != anchor.get("settlement_unix")
+    or apply_state.get("updated_at") != anchor.get("applied_at")
+    or commit.get("at") != anchor.get("settlement_unix")
+):
+    raise SystemExit("canonical targeted epoch apply does not match retained receipt evidence")
 PY
 }
 
