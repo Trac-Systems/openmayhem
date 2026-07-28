@@ -10,6 +10,7 @@ import {
 import {
   MAYHEM_RELAY_CHANNEL,
   MAYHEM_RELAY_MAX_MESSAGE_BYTES,
+  MAYHEM_RELAY_POW_EXEMPT_CONTROLS,
 } from '../features/mayhem/index.js';
 
 const entryChannel = '0000intercom';
@@ -91,6 +92,34 @@ test('relay PoW and size cap are isolated from entry and session channels', () =
     false
   );
   assert.equal(sidechannel.broadcast(sessionChannel, { data: 'x'.repeat(20_000) }), true);
+});
+
+test('Mayhem control envelopes bypass relay PoW but generic relay traffic still pays it', () => {
+  const sidechannel = new Sidechannel(peer, {
+    channels: [MAYHEM_RELAY_CHANNEL],
+    maxMessageBytesByChannel: {
+      [MAYHEM_RELAY_CHANNEL]: MAYHEM_RELAY_MAX_MESSAGE_BYTES,
+    },
+    powEnabled: true,
+    powDifficulty: 8,
+    powRequiredChannels: [MAYHEM_RELAY_CHANNEL],
+    powExemptControlsByChannel: {
+      [MAYHEM_RELAY_CHANNEL]: MAYHEM_RELAY_POW_EXEMPT_CONTROLS,
+    },
+  });
+
+  const mayhemPayload = sidechannel._buildPayload(MAYHEM_RELAY_CHANNEL, {
+    control: 'mayhem_feature_request',
+    request_id: '11'.repeat(32),
+  });
+  assert.equal(mayhemPayload.pow, undefined);
+  assert.equal(sidechannel._checkPow(mayhemPayload, MAYHEM_RELAY_CHANNEL), true);
+
+  const genericPayload = sidechannel._buildPayload(MAYHEM_RELAY_CHANNEL, {
+    control: 'wire_probe',
+  });
+  assert.ok(Number.isInteger(genericPayload.pow?.nonce));
+  assert.equal(sidechannel._checkPow(genericPayload, MAYHEM_RELAY_CHANNEL), true);
 });
 
 test('a rejected remote message handler is contained and later messages still run', async () => {

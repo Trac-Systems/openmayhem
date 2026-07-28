@@ -19,6 +19,14 @@ const RELAY_CONTROL_RESULT_ACK = 'mayhem_feature_result_ack';
 const SERVICE_CONTROL_REQUEST = 'mayhem_service_request';
 const SERVICE_CONTROL_RESULT = 'mayhem_service_result';
 const SERVICE_CONTROL_RESULT_ACK = 'mayhem_service_result_ack';
+const MAYHEM_RELAY_POW_EXEMPT_CONTROLS = Object.freeze([
+  RELAY_CONTROL_REQUEST,
+  RELAY_CONTROL_RESULT,
+  RELAY_CONTROL_RESULT_ACK,
+  SERVICE_CONTROL_REQUEST,
+  SERVICE_CONTROL_RESULT,
+  SERVICE_CONTROL_RESULT_ACK,
+]);
 const RELAY_VERSION = 1;
 const SERVICE_SIGNING_VERSION = 1;
 const SERVICE_SIGNING_DOMAIN = 'mayhem-service-request';
@@ -1804,6 +1812,7 @@ class MayhemFeature extends Feature {
 export {
   MAYHEM_RELAY_CHANNEL,
   MAYHEM_RELAY_MAX_MESSAGE_BYTES,
+  MAYHEM_RELAY_POW_EXEMPT_CONTROLS,
   participantFor,
   requestIdFor,
   serviceRequestIdFor,

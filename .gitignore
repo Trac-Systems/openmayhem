@@ -74,5 +74,7 @@ stores/
 **/keypair.json
 # docs/ is internal working material — purged from git history 2026-07-09, never re-add
 /docs/
+# demos/ holds local demo apps with sponsored gateway credentials — never track
+/demos/
 target/
 dist/

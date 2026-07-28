@@ -239,6 +239,22 @@ class Sidechannel extends Feature {
     this.powRequiredChannels = Array.isArray(config.powRequiredChannels)
       ? new Set(config.powRequiredChannels.map((c) => String(c)))
       : null;
+    this.powExemptControlsByChannel = new Map();
+    const powExemptEntries = config.powExemptControlsByChannel instanceof Map
+      ? Array.from(config.powExemptControlsByChannel.entries())
+      : config.powExemptControlsByChannel && typeof config.powExemptControlsByChannel === 'object'
+        ? Object.entries(config.powExemptControlsByChannel)
+        : [];
+    for (const [channel, controls] of powExemptEntries) {
+      if (!Array.isArray(controls)) continue;
+      const normalizedChannel = normalizeChannel(channel);
+      const normalizedControls = controls
+        .map((control) => String(control || '').trim())
+        .filter(Boolean);
+      if (normalizedChannel && normalizedControls.length > 0) {
+        this.powExemptControlsByChannel.set(normalizedChannel, new Set(normalizedControls));
+      }
+    }
     this.inviteRequired = config.inviteRequired === true;
     this.inviteRequiredChannels = Array.isArray(config.inviteRequiredChannels)
       ? new Set(config.inviteRequiredChannels.map((c) => String(c)))
@@ -595,7 +611,14 @@ class Sidechannel extends Feature {
     );
   }
 
-  _powRequired(channel) {
+  _powExempt(channel, message = null) {
+    const control = typeof message?.control === 'string' ? message.control : '';
+    if (!control) return false;
+    return this.powExemptControlsByChannel.get(normalizeChannel(channel))?.has(control) === true;
+  }
+
+  _powRequired(channel, message = null) {
+    if (this._powExempt(channel, message)) return false;
     if (!this.powEnabled || this.powDifficulty <= 0) return false;
     if (this.powRequiredChannels) return this.powRequiredChannels.has(channel);
     if (this.powRequireEntry) return channel === this.entryChannel;
@@ -836,7 +859,7 @@ class Sidechannel extends Feature {
 
   _attachPow(payload) {
     const channel = payload?.channel ?? '';
-    if (!this._powRequired(channel)) return;
+    if (!this._powRequired(channel, payload?.message)) return;
     const difficulty = this.powDifficulty;
     // The mining loop runs ~2^difficulty iterations. Re-serializing the whole
     // payload per nonce froze the event loop for tens of seconds per message
@@ -880,7 +903,7 @@ class Sidechannel extends Feature {
 
   async _attachPowCooperatively(payload) {
     const channel = payload?.channel ?? '';
-    if (!this._powRequired(channel)) return;
+    if (!this._powRequired(channel, payload?.message)) return;
     const difficulty = this.powDifficulty;
     const prefix =
       `{"channel":${stableStringify(payload?.channel ?? null)}` +
@@ -913,7 +936,7 @@ class Sidechannel extends Feature {
   }
 
   _checkPow(payload, channel) {
-    if (!this._powRequired(channel)) return true;
+    if (!this._powRequired(channel, payload?.message)) return true;
     const pow = payload?.pow;
     if (!pow || typeof pow.nonce !== 'number') return false;
     const difficulty = this.powDifficulty;
@@ -1706,7 +1729,7 @@ class Sidechannel extends Feature {
         this._openChannelForConnection(connection, entry);
       }
     }
-    const cooperativePow = this._powRequired(channel);
+    const cooperativePow = this._powRequired(channel, message);
     const payload = this._buildPayload(
       channel,
       message,

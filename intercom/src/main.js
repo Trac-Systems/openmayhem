@@ -47,6 +47,7 @@ const [
     default: MayhemFeature,
     MAYHEM_RELAY_CHANNEL,
     MAYHEM_RELAY_MAX_MESSAGE_BYTES,
+    MAYHEM_RELAY_POW_EXEMPT_CONTROLS,
   },
 ] = await Promise.all([
   import('../contract/protocol.js'),
@@ -904,7 +905,7 @@ const mayhemRelayMaxMessageBytes = parseInteger(
 );
 const mayhemRelayTimeoutMs = parseInteger(
   flagValue('mayhem-relay-timeout-ms', env.MAYHEM_RELAY_TIMEOUT_MS || ''),
-  0
+  75_000
 );
 const mayhemRelayRetryMs = parseInteger(
   flagValue('mayhem-relay-retry-ms', env.MAYHEM_RELAY_RETRY_MS || ''),
@@ -1591,6 +1592,9 @@ const sidechannel = new Sidechannel(peer, {
   powEnabled: true,
   powDifficulty: mayhemRelayPowDifficulty,
   powRequiredChannels: [MAYHEM_RELAY_CHANNEL],
+  powExemptControlsByChannel: {
+    [MAYHEM_RELAY_CHANNEL]: MAYHEM_RELAY_POW_EXEMPT_CONTROLS,
+  },
   entryChannel: sidechannelEntry,
   allowRemoteOpen: sidechannelAllowRemoteOpen,
   autoJoinOnOpen: sidechannelAutoJoin,
