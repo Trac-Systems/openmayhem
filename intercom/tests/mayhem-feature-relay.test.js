@@ -883,6 +883,186 @@ test('participant reconnects the direct admin channel while a relay is pending',
   assert.equal(writer.appended.length, 1);
 });
 
+test('feature relay collapses in-flight duplicates and retries one cached result until ACK', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 500,
+    retryMs: 1_000,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    resultRetryMs: 5,
+    resultRetryMax: 4,
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+
+  let releaseApply;
+  const applyGate = new Promise((resolve) => {
+    releaseApply = resolve;
+  });
+  let markAppendStarted;
+  const appendStarted = new Promise((resolve) => {
+    markAppendStarted = resolve;
+  });
+  writer.peer.base.append = async (operation) => {
+    if (operation === null) {
+      writer.flushes.push(true);
+      return;
+    }
+    writer.appended.push(operation);
+    markAppendStarted();
+    await applyGate;
+    writer.state.set(`fr/${operation.value.dispatch.hash}`, {
+      type: 'feature_result',
+      status: 'applied',
+      ok: true,
+      result: { ok: true, op: operation.value.dispatch.value.op },
+    });
+  };
+
+  let requestMessage = null;
+  let requestBroadcasts = 0;
+  let resultBroadcasts = 0;
+  let acknowledgements = 0;
+  participant.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      if (message.control === 'mayhem_feature_request') {
+        requestBroadcasts += 1;
+        requestMessage = message;
+        queueMicrotask(() => writerFeature.handleSidechannelMessage(
+          channel,
+          relayPayload(providerKey, message)
+        ));
+      } else if (message.control === 'mayhem_feature_result_ack') {
+        acknowledgements += 1;
+        queueMicrotask(() => writerFeature.handleSidechannelMessage(
+          channel,
+          relayPayload(providerKey, message)
+        ));
+      }
+      return true;
+    },
+  };
+  writer.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      if (message.control !== 'mayhem_feature_result') return true;
+      resultBroadcasts += 1;
+      if (resultBroadcasts > 1) {
+        queueMicrotask(() => participantFeature.handleSidechannelMessage(
+          channel,
+          relayPayload(adminKey, message)
+        ));
+      }
+      return true;
+    },
+  };
+
+  const key = `consent/${providerKey}/1/rules-hash`;
+  const relayed = participantFeature.relay(key, consentValue());
+  await appendStarted;
+  const duplicates = Array.from({ length: 11 }, () =>
+    writerFeature.handleSidechannelMessage(
+      MAYHEM_RELAY_CHANNEL,
+      relayPayload(providerKey, requestMessage)
+    )
+  );
+  releaseApply();
+
+  const result = await relayed;
+  await Promise.all(duplicates);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.equal(result.ok, true);
+  assert.equal(writer.appended.length, 1);
+  assert.equal(resultBroadcasts, 2);
+  assert.equal(acknowledgements, 1);
+  assert.equal(writerFeature.processed.values().next().value.acked, true);
+  const requestsBeforeCachedRetry = requestBroadcasts;
+  assert.deepEqual(await participantFeature.relay(key, consentValue()), result);
+  assert.equal(requestBroadcasts, requestsBeforeCachedRetry);
+  await participantFeature.stop();
+  await writerFeature.stop();
+});
+
+test('feature relay never freezes a nonterminal pending result', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  writer.peer.base.append = async (operation) => {
+    if (operation === null) {
+      writer.flushes.push(true);
+      return;
+    }
+    writer.appended.push(operation);
+    const hash = operation.value.dispatch.hash;
+    setTimeout(() => {
+      writer.state.set(`fr/${hash}`, {
+        type: 'feature_result',
+        status: 'applied',
+        ok: true,
+        result: { ok: true, op: operation.value.dispatch.value.op },
+      });
+    }, 15);
+  };
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 500,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    resultTimeoutMs: 5,
+    resultPollMs: 1,
+    resultRetryMs: 5,
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  const deliveredStatuses = [];
+
+  participant.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      queueMicrotask(() => writerFeature.handleSidechannelMessage(
+        channel,
+        relayPayload(providerKey, message)
+      ));
+      return true;
+    },
+  };
+  writer.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      if (message.control === 'mayhem_feature_result') {
+        deliveredStatuses.push(message.response?.status);
+      }
+      queueMicrotask(() => participantFeature.handleSidechannelMessage(
+        channel,
+        relayPayload(adminKey, message)
+      ));
+      return true;
+    },
+  };
+
+  const result = await participantFeature.relay(
+    `consent/${providerKey}/1/rules-hash`,
+    consentValue()
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(writer.appended.length, 1);
+  assert.deepEqual(deliveredStatuses, ['applied']);
+  await participantFeature.stop();
+  await writerFeature.stop();
+});
+
 test('relay accepts only the dedicated channel and drops oversized feature envelopes', async () => {
   const writer = peerFor(adminKey, { writable: true });
   const writerFeature = new MayhemFeature(writer.peer, { maxMessageBytes: 512 });

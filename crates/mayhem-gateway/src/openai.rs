@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -11639,13 +11639,15 @@ impl GatewayBillingContext {
     }
 
     fn after_attempt(&self, receipt: Option<&ReceiptBody>) -> Self {
-        let mut next = self.clone();
-        next.billing_attempt = next.billing_attempt.saturating_add(1);
-        if let Some(receipt) = receipt {
-            next.prior_usage = receipt.usage.clone();
-            next.prior_au_owed_cum = receipt.au_owed_cum;
+        let Some(receipt) = receipt else {
+            return self.clone();
+        };
+        Self {
+            billing_id: self.billing_id.clone(),
+            billing_attempt: self.billing_attempt.saturating_add(1),
+            prior_usage: receipt.usage.clone(),
+            prior_au_owed_cum: receipt.au_owed_cum,
         }
-        next
     }
 }
 
@@ -32775,11 +32777,9 @@ fn calculate_au_owed(price: &PriceRefAu, usage: &ReceiptUsage) -> MoneyAu {
     )
 }
 
-fn session_id_for(model_id: &str, prompt_text: &str) -> String {
-    blake3_hex(format!("{model_id}:{prompt_text}:{}", now_millis()).as_bytes())
-}
+static FALLBACK_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn logical_billing_id_for(model_id: &str, prompt_text: &str) -> String {
+fn random_scoped_id(domain: &str, model_id: &str, prompt_text: &str) -> String {
     let mut random = [0_u8; 32];
     if getrandom::fill(&mut random).is_ok() {
         return hex_encode(&random);
@@ -32788,13 +32788,16 @@ fn logical_billing_id_for(model_id: &str, prompt_text: &str) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
-    blake3_hex(
-        format!(
-            "mayhem-logical-billing:{model_id}:{prompt_text}:{now_nanos}:{}",
-            random.as_ptr() as usize
-        )
-        .as_bytes(),
-    )
+    let counter = FALLBACK_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    blake3_hex(format!("{domain}:{model_id}:{prompt_text}:{now_nanos}:{counter}").as_bytes())
+}
+
+fn session_id_for(model_id: &str, prompt_text: &str) -> String {
+    random_scoped_id("mayhem-session", model_id, prompt_text)
+}
+
+fn logical_billing_id_for(model_id: &str, prompt_text: &str) -> String {
+    random_scoped_id("mayhem-logical-billing", model_id, prompt_text)
 }
 
 fn enclave_id_for_model(model_id: &str) -> String {
@@ -43719,7 +43722,7 @@ mod tests {
                 .lock()
                 .expect("billing attempts lock")
                 .as_slice(),
-            &[0, 1]
+            &[0, 0]
         );
         let refused_route = model
             .mayhem
@@ -43740,6 +43743,21 @@ mod tests {
         assert_eq!(refused_entry.observed.consecutive_failures, 0);
         assert_eq!(refused_entry.observed.ewma_error_rate, 0.0);
         assert_eq!(refused_entry.observed.circuit_open_until_millis, None);
+    }
+
+    #[test]
+    fn pre_spend_retry_preserves_attempt_until_a_receipt_exists() {
+        let billing = GatewayBillingContext::initial("11".repeat(32));
+        assert_eq!(billing.after_attempt(None), billing);
+    }
+
+    #[test]
+    fn simultaneous_equal_requests_receive_distinct_session_ids() {
+        let ids = (0..256)
+            .map(|_| session_id_for("model", "same prompt"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), 256);
+        assert!(ids.iter().all(|id| is_hex_len(id, 64)));
     }
 
     #[tokio::test]
@@ -43803,7 +43821,7 @@ mod tests {
                 .lock()
                 .expect("billing attempts lock")
                 .as_slice(),
-            &[0, 1]
+            &[0, 0]
         );
         assert!(!state.route_provider_in_cooloff(&route, now_millis_u64()));
         assert!(state.reputation_events().is_empty());

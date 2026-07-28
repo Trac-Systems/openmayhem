@@ -795,6 +795,17 @@ test('final receipt heads reject higher sequence updates', async () => {
 test('redispatch attempts must exactly chain and freeze older attempts', async () => {
   const ctx = await setupContract();
   const firstReservation = await submitReservation(ctx);
+  const prematureRedispatch = await submitReservation(ctx, {
+    sessionId: '74'.repeat(32),
+    billingId: '72'.repeat(32),
+    billingAttempt: 1,
+    reservationId: '75'.repeat(32),
+  });
+  assert.match(
+    prematureRedispatch.result.message,
+    /prior canonical receipt head/i
+  );
+
   const firstReceipt = receiptValue(ctx, firstReservation, {
     seq: 1,
     usage: { input_token: 10 },

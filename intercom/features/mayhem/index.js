@@ -15,12 +15,14 @@ import {
 
 const RELAY_CONTROL_REQUEST = 'mayhem_feature_request';
 const RELAY_CONTROL_RESULT = 'mayhem_feature_result';
+const RELAY_CONTROL_RESULT_ACK = 'mayhem_feature_result_ack';
 const SERVICE_CONTROL_REQUEST = 'mayhem_service_request';
 const SERVICE_CONTROL_RESULT = 'mayhem_service_result';
 const SERVICE_CONTROL_RESULT_ACK = 'mayhem_service_result_ack';
 const RELAY_VERSION = 1;
 const SERVICE_SIGNING_VERSION = 1;
 const SERVICE_SIGNING_DOMAIN = 'mayhem-service-request';
+const FEATURE_RESULT_DIGEST_DOMAIN = 'mayhem-feature-result-v1';
 const SERVICE_RESULT_DIGEST_DOMAIN = 'mayhem-service-result-v1';
 const MAYHEM_RELAY_CHANNEL = '0000mayhem-relay';
 const MAYHEM_RELAY_MAX_MESSAGE_BYTES = 16_384;
@@ -117,6 +119,18 @@ const serviceRequestIdFor = (service, value) =>
         domain: 'mayhem-service-relay-v1',
         service,
         value,
+      })
+    )
+    .digest('hex');
+
+const featureResultDigestFor = (requestId, response) =>
+  crypto
+    .createHash('sha256')
+    .update(
+      stableJson({
+        domain: FEATURE_RESULT_DIGEST_DOMAIN,
+        request_id: String(requestId ?? ''),
+        response: stableValue(response),
       })
     )
     .digest('hex');
@@ -370,6 +384,7 @@ class MayhemFeature extends Feature {
         };
     this.pending = new Map();
     this.processed = new Map();
+    this.completed = new Map();
     this.servicePending = new Map();
     this.serviceProcessed = new Map();
     this.serviceCompleted = new Map();
@@ -461,6 +476,7 @@ class MayhemFeature extends Feature {
     const control = payload?.message?.control;
     return control === RELAY_CONTROL_REQUEST ||
       control === RELAY_CONTROL_RESULT ||
+      control === RELAY_CONTROL_RESULT_ACK ||
       control === SERVICE_CONTROL_REQUEST ||
       control === SERVICE_CONTROL_RESULT ||
       control === SERVICE_CONTROL_RESULT_ACK;
@@ -493,6 +509,12 @@ class MayhemFeature extends Feature {
 
     const relayedValue = value;
     const requestId = requestIdFor(feature, key, relayedValue);
+    this._pruneMap(this.completed);
+    const completed = this.completed.get(requestId);
+    if (completed) {
+      completed.at = Date.now();
+      return completed.response;
+    }
     const existing = this.pending.get(requestId);
     if (existing) return await existing.promise;
     if (this.pending.size >= this.pendingMax) {
@@ -656,6 +678,8 @@ class MayhemFeature extends Feature {
       await this._handleRequest(payload);
     } else if (payload.message.control === RELAY_CONTROL_RESULT) {
       await this._handleResult(payload);
+    } else if (payload.message.control === RELAY_CONTROL_RESULT_ACK) {
+      await this._handleResultAck(payload);
     } else if (payload.message.control === SERVICE_CONTROL_REQUEST) {
       await this._handleServiceRequest(payload);
     } else if (payload.message.control === SERVICE_CONTROL_RESULT) {
@@ -920,46 +944,57 @@ class MayhemFeature extends Feature {
       message.value?.op === 'bind_provider_payout' &&
       !(await this._validateProviderPayoutBinding(message.key, message.value, admin))
     ) {
-      this.peer.sidechannel.broadcast(this.channel, {
-        control: RELAY_CONTROL_RESULT,
-        version: RELAY_VERSION,
-        request_id: expectedId,
-        to: transport,
-        response: relayError('Provider payout binding failed relay verification.', expectedId),
-      });
+      const rejected = this._prepareFeatureResult(
+        expectedId,
+        transport,
+        relayError('Provider payout binding failed relay verification.', expectedId)
+      );
+      this.peer.sidechannel.broadcast(this.channel, rejected.message);
       return;
     }
 
     this._pruneProcessed();
     let cached = this.processed.get(expectedId);
     if (!cached && this._processedInFlight(this.processed) >= this.processedInFlightMax) {
+      const busy = this._prepareFeatureResult(
+        expectedId,
+        transport,
+        relayError('Admin feature relay is busy; retry this signed request.', expectedId)
+      );
       this.peer.sidechannel.broadcast(this.channel, {
-        control: RELAY_CONTROL_RESULT,
-        version: RELAY_VERSION,
-        request_id: expectedId,
-        to: transport,
-        response: relayError('Admin feature relay is busy; retry this signed request.', expectedId),
+        ...busy.message,
       });
       return;
     }
+    let created = false;
     if (!cached) {
       const relayedValue = message.value;
       const promise = this._applyRelayed(message.key, relayedValue, expectedId).catch((error) =>
         relayError(error?.message || 'Admin writer failed to apply relayed feature.', expectedId)
-      );
-      cached = { at: Date.now(), pending: true, promise };
+      ).then((response) => this._prepareFeatureResult(expectedId, transport, response));
+      cached = {
+        at: Date.now(),
+        pending: true,
+        promise,
+        transport,
+        result: null,
+        resultTimer: null,
+      };
       this.processed.set(expectedId, cached);
+      created = true;
     }
-    const response = await cached.promise;
+    if (!created) {
+      cached.at = Date.now();
+      if (cached.pending) return;
+      this._clearServiceResultRetry(cached);
+      this._startFeatureResultDelivery(expectedId, cached);
+      return;
+    }
+    const result = await cached.promise;
+    cached.result = result;
     cached.pending = false;
     cached.at = Date.now();
-    this.peer.sidechannel.broadcast(this.channel, {
-      control: RELAY_CONTROL_RESULT,
-      version: RELAY_VERSION,
-      request_id: expectedId,
-      to: transport,
-      response,
-    });
+    this._startFeatureResultDelivery(expectedId, cached);
   }
 
   async _validateProviderPayoutBinding(key, value, admin) {
@@ -1189,19 +1224,148 @@ class MayhemFeature extends Feature {
     const message = payload.message;
     const requestId = String(message.request_id || '');
     const pending = this.pending.get(requestId);
-    if (!pending) return;
+    this._pruneMap(this.completed);
+    const completed = this.completed.get(requestId);
+    if (!pending && !completed) return;
     const admin = await this._adminKey();
     const self = normalizeKey(this.peer?.wallet?.publicKey);
+    const resultDigest = normalizeKey(message.result_digest);
     if (
       message.version !== RELAY_VERSION ||
       normalizeKey(message.to) !== self ||
       normalizeKey(payload.from) !== admin ||
-      !this._verifyEnvelope(payload, admin)
+      !this._verifyEnvelope(payload, admin) ||
+      !/^[0-9a-f]{64}$/.test(resultDigest) ||
+      featureResultDigestFor(requestId, message.response) !== resultDigest ||
+      (completed && completed.resultDigest !== resultDigest)
     ) {
       return;
     }
+    this._sendFeatureResultAck(admin, requestId, resultDigest);
+    if (!pending) {
+      completed.at = Date.now();
+      return;
+    }
     this.pending.delete(requestId);
-    pending.resolve({ ...message.response, relayed: true, request_id: requestId });
+    const response = { ...message.response, relayed: true, request_id: requestId };
+    this.completed.set(requestId, {
+      at: Date.now(),
+      response,
+      resultDigest,
+    });
+    this._pruneMap(this.completed);
+    pending.resolve(response);
+  }
+
+  _prepareFeatureResult(requestId, transport, response) {
+    const build = (boundedResponse) => {
+      const resultDigest = featureResultDigestFor(requestId, boundedResponse);
+      return {
+        resultDigest,
+        message: {
+          control: RELAY_CONTROL_RESULT,
+          version: RELAY_VERSION,
+          request_id: requestId,
+          result_digest: resultDigest,
+          to: transport,
+          response: boundedResponse,
+        },
+      };
+    };
+    let result = build(stableValue(response));
+    if (this.relayMessageBytes(result.message) <= this.maxMessageBytes) return result;
+    result = build(relayError(
+      `Mayhem feature result exceeds ${this.maxMessageBytes} bytes.`,
+      requestId
+    ));
+    return result;
+  }
+
+  _startFeatureResultDelivery(requestId, cached) {
+    if (cached.deliveryStarted || !cached.result?.message) return;
+    cached.deliveryStarted = true;
+    cached.acked = false;
+    cached.resultAttempts = 0;
+    cached.deliveryToken = (cached.deliveryToken ?? 0) + 1;
+    const deliveryToken = cached.deliveryToken;
+    let retryDelay = this.resultRetryMs;
+    const active = () => (
+      !this.stopped &&
+      !cached.acked &&
+      cached.deliveryStarted &&
+      cached.deliveryToken === deliveryToken &&
+      this.processed.get(requestId) === cached
+    );
+    const schedule = () => {
+      if (!active() || cached.resultAttempts >= this.resultRetryMax) {
+        if (cached.deliveryToken === deliveryToken) cached.deliveryStarted = false;
+        return;
+      }
+      cached.resultTimer = setTimeout(() => {
+        cached.resultTimer = null;
+        void attempt();
+      }, retryDelay);
+      if (typeof cached.resultTimer?.unref === 'function') cached.resultTimer.unref();
+      retryDelay = Math.min(retryDelay * 2, this.resultRetryMs * 8);
+    };
+    const attempt = async () => {
+      if (!active() || cached.resultAttempts >= this.resultRetryMax) return;
+      cached.resultAttempts += 1;
+      try {
+        const sidechannel = this.peer?.sidechannel;
+        if (!sidechannel || typeof sidechannel.broadcast !== 'function') return;
+        if (typeof sidechannel.connectDirectPeer === 'function') {
+          const connected = await sidechannel.connectDirectPeer(
+            cached.transport,
+            this.channel,
+            this.connectTimeoutMs
+          );
+          if (!connected || !active()) return;
+        } else if (!sidechannel.started) return;
+        sidechannel.broadcast(this.channel, cached.result.message);
+      } catch (_error) {
+        // A bounded later attempt reconnects the current result transport.
+      } finally {
+        schedule();
+      }
+    };
+    void attempt();
+  }
+
+  _sendFeatureResultAck(admin, requestId, resultDigest) {
+    const sidechannel = this.peer?.sidechannel;
+    if (!sidechannel?.started || typeof sidechannel.broadcast !== 'function') return false;
+    return sidechannel.broadcast(this.channel, {
+      control: RELAY_CONTROL_RESULT_ACK,
+      version: RELAY_VERSION,
+      request_id: requestId,
+      result_digest: resultDigest,
+      to: admin,
+    }) === true;
+  }
+
+  async _handleResultAck(payload) {
+    if (!this.peer.base?.writable) return;
+    const message = payload.message;
+    const requestId = String(message.request_id || '');
+    const cached = this.processed.get(requestId);
+    if (!cached?.result) return;
+    const admin = await this._adminKey();
+    const self = normalizeKey(this.peer?.wallet?.publicKey);
+    const transport = normalizeKey(payload.from);
+    if (
+      message.version !== RELAY_VERSION ||
+      normalizeKey(message.to) !== self ||
+      self !== admin ||
+      transport !== cached.transport ||
+      normalizeKey(message.result_digest) !== cached.result.resultDigest ||
+      !this._verifyEnvelope(payload, cached.transport)
+    ) {
+      return;
+    }
+    cached.acked = true;
+    cached.at = Date.now();
+    this._clearServiceResultRetry(cached);
   }
 
   _prepareServiceResult(requestId, transport, response) {
@@ -1411,13 +1575,33 @@ class MayhemFeature extends Feature {
     if (value?.op === 'admin_contract_tx') {
       return await this._applyRelayedAdminTx(key, value, requestId);
     }
-    return await this.submit(key, value, { nonce: requestId });
+    return await this._submitRelayedFeature(key, value, requestId);
+  }
+
+  async _submitRelayedFeature(key, value, requestId) {
+    let response = await this.submit(key, value, { nonce: requestId });
+    while (!this.stopped && response?.status === 'pending') {
+      const featureResult = await this._waitForResult(
+        response.result_key,
+        this.resultTimeoutMs
+      );
+      if (!featureResult) continue;
+      response = this._featureResponse(
+        key,
+        response.hash,
+        response.result_key,
+        featureResult
+      );
+    }
+    return this.stopped && response?.status === 'pending'
+      ? relayError('Mayhem feature relay stopped before the canonical result appeared.', requestId)
+      : response;
   }
 
   async _applyRelayedAdminTx(key, value, requestId) {
     const validationError = await this._validateAdminTx(key, value);
     if (validationError) return relayError(validationError, requestId);
-    if (!value.sim) return await this.submit(key, value, { nonce: requestId });
+    if (!value.sim) return await this._submitRelayedFeature(key, value, requestId);
     const response = await this._simulateAdminTx(value);
     return {
       ...response,
@@ -1570,7 +1754,11 @@ class MayhemFeature extends Feature {
       pending.resolve(relayError('Mayhem feature relay stopped.', requestId));
     }
     this.pending.clear();
+    for (const cached of this.processed.values()) {
+      this._clearServiceResultRetry(cached);
+    }
     this.processed.clear();
+    this.completed.clear();
     for (const [requestId, pending] of this.servicePending) {
       pending.resolve(relayError('Mayhem service relay stopped.', requestId));
     }
