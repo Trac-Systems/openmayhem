@@ -1158,6 +1158,10 @@ const scBridgeMaxCliQueue = parseInteger(
   flagValue('sc-bridge-max-cli-queue', env.SC_BRIDGE_MAX_CLI_QUEUE || ''),
   64
 );
+const scBridgeHeapSnapshotDir =
+  (flags['sc-bridge-heap-snapshot-dir'] && String(flags['sc-bridge-heap-snapshot-dir'])) ||
+  env.MAYHEM_SC_BRIDGE_HEAP_SNAPSHOT_DIR ||
+  '';
 if (
   scBridgeMaxClients <= 0 ||
   scBridgeMaxMessageBytes <= 0 ||
@@ -1501,6 +1505,7 @@ if (scBridgeEnabled) {
     maxOutboundBytesPerClient: scBridgeMaxOutboundBytesPerClient,
     authTimeoutMs: scBridgeAuthTimeoutMs,
     maxCliQueue: scBridgeMaxCliQueue,
+    heapSnapshotDir: scBridgeHeapSnapshotDir,
     info: {
       app: 'mayhem',
       network: networkEnv,

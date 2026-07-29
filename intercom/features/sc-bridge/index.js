@@ -24,6 +24,7 @@ import {
   sessionOwnershipKey,
   sessionSubscriptionMatches,
 } from './session-ownership.js';
+import { writeBareHeapSnapshot } from './heap-snapshot.js';
 
 const DEFAULT_MAX_CLIENTS = 64;
 const DEFAULT_MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
@@ -128,6 +129,11 @@ class ScBridge extends Feature {
     );
     this.authTimeoutMs = safePositiveInteger(config.authTimeoutMs, DEFAULT_AUTH_TIMEOUT_MS);
     this.maxCliQueue = safePositiveInteger(config.maxCliQueue, DEFAULT_MAX_CLI_QUEUE);
+    this.heapSnapshotDir =
+      typeof config.heapSnapshotDir === 'string' && config.heapSnapshotDir.trim()
+        ? config.heapSnapshotDir.trim()
+        : null;
+    this.heapSnapshotInFlight = false;
 
     this.defaultFilterRaw = typeof config.filter === 'string' ? config.filter : '';
     this.defaultFilter = parseFilter(this.defaultFilterRaw);
@@ -367,6 +373,21 @@ class ScBridge extends Feature {
 
   _sendError(client, error) {
     this._broadcastToClient(client, { type: 'error', error });
+  }
+
+  async _takeHeapSnapshot(label = '') {
+    if (!this.heapSnapshotDir) {
+      throw new Error('Heap snapshots are disabled.');
+    }
+    if (this.heapSnapshotInFlight) {
+      throw new Error('Heap snapshot already in progress.');
+    }
+    this.heapSnapshotInFlight = true;
+    try {
+      return await writeBareHeapSnapshot(this.heapSnapshotDir, label);
+    } finally {
+      this.heapSnapshotInFlight = false;
+    }
   }
 
   _handleClientMessage(client, message) {
@@ -714,6 +735,20 @@ class ScBridge extends Feature {
           ...this.directSession.stats(),
           inference_relay: this.inferenceRelay?.stats?.() ?? null,
         });
+        return;
+      }
+      case 'take_heap_snapshot': {
+        this._takeHeapSnapshot(message.label)
+          .then((snapshot) => {
+            reply({
+              type: 'heap_snapshot',
+              ...snapshot,
+              ts: Date.now(),
+            });
+          })
+          .catch((err) => {
+            sendError(err?.message ? `Heap snapshot failed: ${err.message}` : 'Heap snapshot failed.');
+          });
         return;
       }
       case 'send': {

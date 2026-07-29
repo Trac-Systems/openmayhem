@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 
 import { dispatchContainedClientRequest } from '../features/sc-bridge/containment.js';
 import {
@@ -11,6 +12,10 @@ import {
   sidechannelSubscriptionMatches,
   writeBoundedClientPayload,
 } from '../features/sc-bridge/bounded-client.js';
+import {
+  safeHeapSnapshotLabel,
+  writeBareHeapSnapshot,
+} from '../features/sc-bridge/heap-snapshot.js';
 import {
   canOwnSession,
   closeOwnedSessions,
@@ -61,6 +66,60 @@ test('failed async client request is contained and the bridge serves the next re
   );
 
   assert.deepEqual(events, ['error:injected session_open failure', 'pong']);
+});
+
+test('SC-Bridge heap snapshot helper writes a private sanitized artifact', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mayhem-sc-bridge-heap-'));
+  let connected = false;
+  let destroyed = false;
+  class FakeSession {
+    connect() {
+      connected = true;
+    }
+
+    destroy() {
+      destroyed = true;
+    }
+  }
+  class FakeHeapSnapshot extends Readable {
+    _read() {
+      this.push('heap');
+      this.push(null);
+    }
+  }
+
+  try {
+    assert.equal(safeHeapSnapshotLabel('../bad label/?token'), 'bad-label-token');
+    const result = await writeBareHeapSnapshot(root, '../bad label/?token', {
+      fs,
+      path,
+      inspector: {
+        Session: FakeSession,
+        HeapSnapshot: FakeHeapSnapshot,
+      },
+    });
+
+    assert.equal(connected, true);
+    assert.equal(destroyed, true);
+    assert.equal(path.dirname(result.path), root);
+    assert.equal(path.basename(result.path).includes('bad-label-token'), true);
+    assert.equal(fs.readFileSync(result.path, 'utf8'), 'heap');
+    assert.equal(result.bytes, 4);
+    assert.equal(fs.statSync(result.path).mode & 0o777, 0o600);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('SC-Bridge heap snapshot helper remains disabled until a directory is configured', async () => {
+  await assert.rejects(
+    writeBareHeapSnapshot('', 'ignored', {
+      fs,
+      path,
+      inspector: {},
+    }),
+    /Heap snapshots are disabled/
+  );
 });
 
 const queuedClient = (id = 1) => {
