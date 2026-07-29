@@ -81491,21 +81491,22 @@ where
     validate_wallet_helper_public_args(&helper_args)?;
     secrets.apply_environment_fallbacks();
     let intercom_app = repo_path("intercom")?;
-    let node = wallet_helper_node_command();
-    let launcher_args =
-        wallet_helper_pear_runtime_launcher_args(&intercom_app, command, &helper_args);
-    let mut process = Command::new(&node);
+    let pear_runtime = resolve_pear_runtime_path()?;
+    let mut process = Command::new(&pear_runtime);
     process
-        .args(&launcher_args)
+        .arg("run")
+        .arg(".")
+        .arg(format!("--wallet-helper={command}"))
+        .args(&helper_args)
         .current_dir(&intercom_app)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = process.spawn().with_context(|| {
         format!(
-            "running wallet helper via pear-runtime module app {} with {}",
+            "running wallet helper via pear-runtime app {} with {}",
             intercom_app.display(),
-            PathBuf::from(&node).display()
+            pear_runtime.display()
         )
     })?;
     let encoded_secrets =
@@ -81541,52 +81542,6 @@ where
 
     parse_msb_transfer_helper_json(&output.stdout, &output.stderr)
         .context("parsing Pear wallet helper JSON output")
-}
-
-const WALLET_HELPER_PEAR_RUNTIME_LAUNCHER: &str = r#"
-const { createRequire } = require('module')
-const path = require('path')
-
-const [intercomDir, ...args] = process.argv.slice(1)
-const requireFromIntercom = createRequire(path.join(intercomDir, 'package.json'))
-const PearRuntime = requireFromIntercom('pear-runtime')
-const worker = PearRuntime.run(path.join(intercomDir, 'src', 'main.js'), args)
-
-if (!worker.stdin || !worker.stdout || !worker.stderr) {
-  throw new Error('pear-runtime worker stdio is unavailable')
-}
-
-process.stdin.pipe(worker.stdin)
-worker.stdout.pipe(process.stdout)
-worker.stderr.pipe(process.stderr)
-worker.on('exit', (code, signal) => {
-  if (signal) process.kill(process.pid, signal)
-  process.exitCode = code ?? 1
-})
-worker.on('error', (error) => {
-  console.error(error?.stack ?? error?.message ?? String(error))
-  process.exitCode = 1
-})
-"#;
-
-fn wallet_helper_node_command() -> std::ffi::OsString {
-    env::var_os("MAYHEM_NODE_BIN").unwrap_or_else(|| "node".into())
-}
-
-fn wallet_helper_pear_runtime_launcher_args(
-    intercom_app: &Path,
-    command: &str,
-    helper_args: &[String],
-) -> Vec<String> {
-    let mut args = vec![
-        "-e".to_owned(),
-        WALLET_HELPER_PEAR_RUNTIME_LAUNCHER.to_owned(),
-        "--".to_owned(),
-        intercom_app.display().to_string(),
-        format!("--wallet-helper={command}"),
-    ];
-    args.extend(helper_args.iter().cloned());
-    args
 }
 
 fn validate_wallet_helper_public_args(args: &[String]) -> Result<()> {
@@ -82835,28 +82790,6 @@ mod tests {
         let serialized = serde_json::to_string(&secrets).unwrap();
         assert!(serialized.contains("old-password"));
         assert!(serialized.contains("ethereum mnemonic"));
-    }
-
-    #[test]
-    fn wallet_helper_launches_via_embedded_pear_runtime_module() {
-        let intercom = Path::new(r"C:\Mayhem\share\mayhem\intercom");
-        let public_args = vec![
-            "--keypair".to_owned(),
-            r"C:\Mayhem\wallets\provider\keypair.json".to_owned(),
-            "--force".to_owned(),
-        ];
-
-        let argv = wallet_helper_pear_runtime_launcher_args(&intercom, "import", &public_args);
-
-        assert_eq!(argv[0], "-e");
-        assert!(argv[1].contains("requireFromIntercom('pear-runtime')"));
-        assert!(argv[1].contains("PearRuntime.run"));
-        assert!(argv[1].contains("process.stdin.pipe(worker.stdin)"));
-        assert_eq!(argv[2], "--");
-        assert_eq!(argv[3], intercom.display().to_string());
-        assert_eq!(argv[4], "--wallet-helper=import");
-        assert_eq!(&argv[5..], public_args.as_slice());
-        assert!(!argv.iter().any(|arg| arg == "run"));
     }
 
     #[test]
