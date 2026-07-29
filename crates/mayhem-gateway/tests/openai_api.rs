@@ -3275,10 +3275,10 @@ async fn audio_and_music_generation_routes_remain_distinct_and_hf_compatible() {
     .await;
     assert_eq!(music_status, StatusCode::OK, "{music}");
     assert_eq!(music["object"], "music.generation");
-    assert_eq!(music["data"].as_array().unwrap().len(), 2);
+    assert_eq!(music["data"].as_array().unwrap().len(), 1);
     assert_eq!(music["music"], music["data"][0]["music"]);
     assert_eq!(music["usage"][USAGE_INPUT_CHARACTER], 77);
-    assert_eq!(music["usage"][USAGE_AUDIO_SECOND], 20);
+    assert_eq!(music["usage"][USAGE_AUDIO_SECOND], 10);
     assert_eq!(music["mayhem"]["receipt"]["rail"], "fiat");
 
     let (hf_status, hf_headers, hf_audio) = raw_request(
@@ -3693,9 +3693,9 @@ async fn music_generation_uses_signed_defaults_and_ranges() {
     )
     .await;
     assert_eq!(default_status, StatusCode::OK, "{defaulted}");
-    assert_eq!(defaulted["data"].as_array().unwrap().len(), 2);
+    assert_eq!(defaulted["data"].as_array().unwrap().len(), 1);
     assert_eq!(defaulted["usage"][USAGE_INPUT_CHARACTER], 87);
-    assert_eq!(defaulted["usage"][USAGE_AUDIO_SECOND], 2);
+    assert_eq!(defaulted["usage"][USAGE_AUDIO_SECOND], 1);
 
     let (range_status, rejected) = json_request(
         app,
@@ -3715,7 +3715,7 @@ async fn music_generation_uses_signed_defaults_and_ranges() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].duration_seconds, 1);
     assert_eq!(requests[0].step_count, 50);
-    assert_eq!(requests[0].artifact_count, 2);
+    assert_eq!(requests[0].artifact_count, 1);
     assert_eq!(requests[0].response_format, "flac");
     assert_eq!(requests[0].contract_request["guidance_scale"], 7.0);
     assert_eq!(requests[0].contract_request["thinking"], false);
