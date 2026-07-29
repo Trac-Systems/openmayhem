@@ -1,6 +1,7 @@
 /** @typedef {import('pear-interface')} */ /* global Pear */
 import ReadyResource from "ready-resource";
 import Corestore from "corestore";
+import Rache from "rache";
 import PeerWallet from "trac-wallet";
 import b4a from "b4a";
 import readline from "readline";
@@ -60,7 +61,9 @@ export class MainSettlementBus extends ReadyResource {
     constructor(config) {
         super();
         this.#config = config
-        this.#store = new Corestore(this.#config.storesFullPath);
+        this.#store = new Corestore(this.#config.storesFullPath, {
+            globalCache: new Rache({ maxSize: this.#config.hyperbeeCacheMaxEntries })
+        });
         this.#wallet = new PeerWallet({ networkPrefix: this.#config.addressPrefix });
         this.#readline_instance = null;
 

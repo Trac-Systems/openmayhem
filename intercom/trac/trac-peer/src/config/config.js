@@ -1,6 +1,8 @@
 import b4a from "b4a";
 import path from "path";
 
+const DEFAULT_HYPERBEE_CACHE_MAX_ENTRIES = 128;
+
 export class Config {
     #options;
 
@@ -40,6 +42,14 @@ export class Config {
             throw new Error("Peer: maxTxDelay must be a safe integer.");
         }
         this.maxTxDelay = maxTxDelay;
+
+        const hyperbeeCacheMaxEntries =
+            this.#select("hyperbeeCacheMaxEntries", options, defaults) ??
+            DEFAULT_HYPERBEE_CACHE_MAX_ENTRIES;
+        if (!Number.isSafeInteger(hyperbeeCacheMaxEntries) || hyperbeeCacheMaxEntries < 1) {
+            throw new Error("Peer: hyperbeeCacheMaxEntries must be a positive safe integer.");
+        }
+        this.hyperbeeCacheMaxEntries = hyperbeeCacheMaxEntries;
 
         const maxMsbSignedLength = this.#select("maxMsbSignedLength", options, defaults);
         if (!Number.isSafeInteger(maxMsbSignedLength)) {

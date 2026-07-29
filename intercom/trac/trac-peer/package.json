@@ -91,6 +91,7 @@
     "process": "npm:bare-node-process",
     "protomux": "^3.10.1",
     "protomux-wakeup": "^2.4.0",
+    "rache": "1.0.0",
     "readline": "npm:bare-node-readline",
     "ready-resource": "1.1.2",
     "repl": "npm:bare-node-repl",

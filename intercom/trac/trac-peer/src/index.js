@@ -5,6 +5,7 @@ import ReadyResource from 'ready-resource';
 import b4a from 'b4a';
 import Hyperbee from 'hyperbee';
 import Corestore from 'corestore';
+import Rache from 'rache';
 import w from 'protomux-wakeup';
 const wakeup = new w();
 import Protomux from 'protomux'
@@ -30,7 +31,9 @@ export class Peer extends ReadyResource {
         this.config = config;
 
         this.keyPair = null;
-        this.store = new Corestore(this.config.fullStoresDirectory);
+        this.store = new Corestore(this.config.fullStoresDirectory, {
+            globalCache: new Rache({ maxSize: this.config.hyperbeeCacheMaxEntries })
+        });
         this.msbClient = new MsbClient(msb);
         this.swarm = null;
         this.base = null;

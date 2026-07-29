@@ -1,5 +1,7 @@
 import b4a from 'b4a'
 
+const DEFAULT_HYPERBEE_CACHE_MAX_ENTRIES = 128
+
 export class Config {
     #options
     #config
@@ -13,6 +15,7 @@ export class Config {
         this.#bootstrap = b4a.from(this.#options.bootstrap || this.#config.bootstrap, 'hex')
         // Ensure a 32-byte channel buffer (repeat-fill from string/Buffer if provided)
         this.#channel = b4a.alloc(32).fill(this.#options.channel || this.#config.channel)
+        void this.hyperbeeCacheMaxEntries
     }
 
     get addressLength() {
@@ -90,6 +93,16 @@ export class Config {
     get maxRetries() {
         if (this.#isOverriden('maxRetries')) return this.#options.maxRetries
         return this.#config.maxRetries
+    }
+
+    get hyperbeeCacheMaxEntries() {
+        const value = this.#isOverriden('hyperbeeCacheMaxEntries')
+            ? this.#options.hyperbeeCacheMaxEntries
+            : this.#config.hyperbeeCacheMaxEntries ?? DEFAULT_HYPERBEE_CACHE_MAX_ENTRIES
+        if (!Number.isSafeInteger(value) || value < 1) {
+            throw new Error("MainSettlementBus: hyperbeeCacheMaxEntries must be a positive safe integer.")
+        }
+        return value
     }
 
     get maxValidators() {
