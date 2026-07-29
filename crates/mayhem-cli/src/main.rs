@@ -68364,17 +68364,29 @@ async fn serve_provider_sessions(
             match bridge.next_session_event(wait).await {
                 Ok(event) => {
                     if event.get("type").and_then(Value::as_str) == Some("session_closed") {
-                        provider_session_debug(format!(
-                            "direct transport closed for session {}; preserving admission state for an identical s.open replay: {}",
-                            event
-                                .get("session_id")
-                                .and_then(Value::as_str)
-                                .unwrap_or(""),
-                            event
-                                .get("reason")
-                                .and_then(Value::as_str)
-                                .unwrap_or("transport closed")
-                        ));
+                        let session_id = event
+                            .get("session_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let reason = event
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("transport closed");
+                        if discard_pre_request_provider_session_on_close(
+                            &mut sessions,
+                            &mut pending_requests,
+                            &mut pending_payloads,
+                            &heartbeat_load,
+                            &event,
+                        ) {
+                            provider_session_debug(format!(
+                                "direct transport closed before s.req for session {session_id}; released admission slot: {reason}"
+                            ));
+                        } else {
+                            provider_session_debug(format!(
+                                "direct transport closed for session {session_id}; preserving admission state for an identical s.open replay: {reason}"
+                            ));
+                        }
                         continue;
                     }
                     let frame_type = event
@@ -68756,6 +68768,30 @@ fn discard_provider_session_state(
     sessions.remove(session_id);
     pending_requests.remove(session_id);
     remove_provider_session_pending_payloads(pending_payloads, session_id);
+}
+
+fn discard_pre_request_provider_session_on_close(
+    sessions: &mut HashMap<String, ActiveProviderSession>,
+    pending_requests: &mut HashMap<String, Instant>,
+    pending_payloads: &mut HashMap<String, PendingProviderPayload>,
+    heartbeat_load: &ProviderHeartbeatLoad,
+    event: &Value,
+) -> bool {
+    let Some(session_id) = event.get("session_id").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(remote) = event.get("remote").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(active) = sessions.get(session_id) else {
+        return false;
+    };
+    if active.remote != remote || !pending_requests.contains_key(session_id) {
+        return false;
+    }
+    discard_provider_session_state(sessions, pending_requests, pending_payloads, session_id);
+    heartbeat_load.set_active_sessions(sessions.len());
+    true
 }
 
 async fn expire_provider_pending_sessions(
@@ -81455,20 +81491,21 @@ where
     validate_wallet_helper_public_args(&helper_args)?;
     secrets.apply_environment_fallbacks();
     let intercom_app = repo_path("intercom")?;
-    let pear_runtime = resolve_pear_runtime_path()?;
-    let mut process = Command::new(&pear_runtime);
+    let node = wallet_helper_node_command();
+    let launcher_args =
+        wallet_helper_pear_runtime_launcher_args(&intercom_app, command, &helper_args);
+    let mut process = Command::new(&node);
     process
-        .arg("run")
-        .arg(&intercom_app)
-        .arg(format!("--wallet-helper={command}"))
-        .args(&helper_args)
+        .args(&launcher_args)
+        .current_dir(&intercom_app)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = process.spawn().with_context(|| {
         format!(
-            "running wallet helper via pear-runtime app {}",
-            intercom_app.display()
+            "running wallet helper via pear-runtime module app {} with {}",
+            intercom_app.display(),
+            PathBuf::from(&node).display()
         )
     })?;
     let encoded_secrets =
@@ -81504,6 +81541,52 @@ where
 
     parse_msb_transfer_helper_json(&output.stdout, &output.stderr)
         .context("parsing Pear wallet helper JSON output")
+}
+
+const WALLET_HELPER_PEAR_RUNTIME_LAUNCHER: &str = r#"
+const { createRequire } = require('module')
+const path = require('path')
+
+const [intercomDir, ...args] = process.argv.slice(1)
+const requireFromIntercom = createRequire(path.join(intercomDir, 'package.json'))
+const PearRuntime = requireFromIntercom('pear-runtime')
+const worker = PearRuntime.run(path.join(intercomDir, 'src', 'main.js'), args)
+
+if (!worker.stdin || !worker.stdout || !worker.stderr) {
+  throw new Error('pear-runtime worker stdio is unavailable')
+}
+
+process.stdin.pipe(worker.stdin)
+worker.stdout.pipe(process.stdout)
+worker.stderr.pipe(process.stderr)
+worker.on('exit', (code, signal) => {
+  if (signal) process.kill(process.pid, signal)
+  process.exitCode = code ?? 1
+})
+worker.on('error', (error) => {
+  console.error(error?.stack ?? error?.message ?? String(error))
+  process.exitCode = 1
+})
+"#;
+
+fn wallet_helper_node_command() -> std::ffi::OsString {
+    env::var_os("MAYHEM_NODE_BIN").unwrap_or_else(|| "node".into())
+}
+
+fn wallet_helper_pear_runtime_launcher_args(
+    intercom_app: &Path,
+    command: &str,
+    helper_args: &[String],
+) -> Vec<String> {
+    let mut args = vec![
+        "-e".to_owned(),
+        WALLET_HELPER_PEAR_RUNTIME_LAUNCHER.to_owned(),
+        "--".to_owned(),
+        intercom_app.display().to_string(),
+        format!("--wallet-helper={command}"),
+    ];
+    args.extend(helper_args.iter().cloned());
+    args
 }
 
 fn validate_wallet_helper_public_args(args: &[String]) -> Result<()> {
@@ -82752,6 +82835,28 @@ mod tests {
         let serialized = serde_json::to_string(&secrets).unwrap();
         assert!(serialized.contains("old-password"));
         assert!(serialized.contains("ethereum mnemonic"));
+    }
+
+    #[test]
+    fn wallet_helper_launches_via_embedded_pear_runtime_module() {
+        let intercom = Path::new(r"C:\Mayhem\share\mayhem\intercom");
+        let public_args = vec![
+            "--keypair".to_owned(),
+            r"C:\Mayhem\wallets\provider\keypair.json".to_owned(),
+            "--force".to_owned(),
+        ];
+
+        let argv = wallet_helper_pear_runtime_launcher_args(&intercom, "import", &public_args);
+
+        assert_eq!(argv[0], "-e");
+        assert!(argv[1].contains("requireFromIntercom('pear-runtime')"));
+        assert!(argv[1].contains("PearRuntime.run"));
+        assert!(argv[1].contains("process.stdin.pipe(worker.stdin)"));
+        assert_eq!(argv[2], "--");
+        assert_eq!(argv[3], intercom.display().to_string());
+        assert_eq!(argv[4], "--wallet-helper=import");
+        assert_eq!(&argv[5..], public_args.as_slice());
+        assert!(!argv.iter().any(|arg| arg == "run"));
     }
 
     #[test]
@@ -99487,6 +99592,77 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(pending_payloads
             .keys()
             .any(|key| key.starts_with("healthy:")));
+    }
+
+    #[test]
+    fn provider_session_transport_close_before_request_releases_capacity() {
+        let terms = test_provider_session_terms();
+        let mut sessions = HashMap::new();
+        let mut pending_requests = HashMap::new();
+        let mut pending_payloads = HashMap::new();
+        let active = test_active_provider_session(&terms, vec!["text".to_owned()]);
+        let session_id = active.session_id.clone();
+        let remote = active.remote.clone();
+        sessions.insert(session_id.clone(), active);
+        pending_requests.insert(session_id.clone(), Instant::now() + Duration::from_secs(30));
+        pending_payloads.insert(
+            provider_session_payload_key(&session_id, "rid", &"bb".repeat(32)),
+            PendingProviderPayload::default(),
+        );
+        let load = ProviderHeartbeatLoad::default();
+        load.set_active_sessions(sessions.len());
+
+        let released = discard_pre_request_provider_session_on_close(
+            &mut sessions,
+            &mut pending_requests,
+            &mut pending_payloads,
+            &load,
+            &json!({
+                "type": "session_closed",
+                "session_id": session_id,
+                "remote": remote,
+                "reason": "closed before request",
+            }),
+        );
+
+        assert!(released);
+        assert!(sessions.is_empty());
+        assert!(pending_requests.is_empty());
+        assert!(pending_payloads.is_empty());
+        assert_eq!(load.snapshot(1).active_slots, 0);
+        assert_eq!(load.snapshot(1).free_slots, 1);
+    }
+
+    #[test]
+    fn provider_session_transport_close_after_request_dispatch_keeps_inflight_state() {
+        let terms = test_provider_session_terms();
+        let mut sessions = HashMap::new();
+        let mut pending_requests = HashMap::new();
+        let mut pending_payloads = HashMap::new();
+        let active = test_active_provider_session(&terms, vec!["text".to_owned()]);
+        let session_id = active.session_id.clone();
+        let remote = active.remote.clone();
+        sessions.insert(session_id.clone(), active);
+        let load = ProviderHeartbeatLoad::default();
+        load.set_active_sessions(sessions.len());
+
+        let released = discard_pre_request_provider_session_on_close(
+            &mut sessions,
+            &mut pending_requests,
+            &mut pending_payloads,
+            &load,
+            &json!({
+                "type": "session_closed",
+                "session_id": session_id,
+                "remote": remote,
+                "reason": "closed after dispatch",
+            }),
+        );
+
+        assert!(!released);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(load.snapshot(1).active_slots, 1);
+        assert_eq!(load.snapshot(1).free_slots, 0);
     }
 
     #[test]
