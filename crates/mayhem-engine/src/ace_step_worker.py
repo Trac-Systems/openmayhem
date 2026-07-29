@@ -7,6 +7,7 @@ import pathlib
 import secrets
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 
@@ -30,6 +31,7 @@ _CONTENT_TYPES = {
     "wav": "audio/wav",
     "wav32": "audio/wav",
 }
+_FFMPEG_AUDIO_FORMATS = {"mp3", "opus", "aac"}
 _INPUT_SUFFIXES = {
     "audio/aac": ".aac",
     "audio/flac": ".flac",
@@ -133,6 +135,30 @@ def _validate_audio_byte_length(length, maximum, label):
         raise ValueError(f"{label} audio byte length is out of bounds")
 
 
+def _ffmpeg_program():
+    return shutil.which("ffmpeg")
+
+
+def _can_transcode_with_ffmpeg(audio_format):
+    return audio_format in _FFMPEG_AUDIO_FORMATS and _ffmpeg_program() is not None
+
+
+def _samples_for_soundfile(tensor):
+    with contextlib.redirect_stdout(sys.stderr):
+        import numpy
+
+        samples = tensor.detach().cpu().float().numpy()
+        if (
+            samples.ndim != 2
+            or samples.shape[0] <= 0
+            or samples.shape[0] > 8
+            or samples.shape[1] <= 0
+            or not numpy.isfinite(samples).all()
+        ):
+            raise RuntimeError("ACE-Step returned an invalid generated audio tensor")
+        return numpy.ascontiguousarray(samples.T, dtype=numpy.float32)
+
+
 def _validate_generated_audio(path, data, audio_format, expected_duration):
     signature_matches = {
         "flac": lambda: data.startswith(b"fLaC"),
@@ -182,19 +208,9 @@ def _canonicalize_generated_wave(path, tensor, sample_rate, audio_format):
     if audio_format not in ("wav", "wav32"):
         return
     with contextlib.redirect_stdout(sys.stderr):
-        import numpy
         import soundfile
 
-        samples = tensor.detach().cpu().float().numpy()
-        if (
-            samples.ndim != 2
-            or samples.shape[0] <= 0
-            or samples.shape[0] > 8
-            or samples.shape[1] <= 0
-            or not numpy.isfinite(samples).all()
-        ):
-            raise RuntimeError("ACE-Step returned an invalid generated audio tensor")
-        samples = numpy.ascontiguousarray(samples.T, dtype=numpy.float32)
+        samples = _samples_for_soundfile(tensor)
         temporary = path.with_name(f".{path.name}.mayhem-canonical.wav")
         try:
             soundfile.write(
@@ -206,6 +222,69 @@ def _canonicalize_generated_wave(path, tensor, sample_rate, audio_format):
             )
             temporary.replace(path)
         finally:
+            temporary.unlink(missing_ok=True)
+
+
+def _transcode_generated_audio(path, tensor, sample_rate, audio_format, config):
+    if audio_format not in _FFMPEG_AUDIO_FORMATS:
+        return path
+    ffmpeg = _ffmpeg_program()
+    if ffmpeg is None:
+        return path
+    with contextlib.redirect_stdout(sys.stderr):
+        import soundfile
+
+        samples = _samples_for_soundfile(tensor)
+        source = path.with_name(f".{path.stem}.mayhem-source.wav")
+        target = path.with_suffix(f".{audio_format}")
+        temporary = target.with_name(f".{target.name}.mayhem-transcode")
+        try:
+            soundfile.write(str(source), samples, sample_rate, format="WAV", subtype="PCM_16")
+            command = [
+                ffmpeg,
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(source),
+            ]
+            if audio_format == "mp3":
+                bitrate = str(config.get("mp3_bitrate") or "128k").strip().lower()
+                if bitrate not in {"128k", "192k", "256k", "320k"}:
+                    bitrate = "128k"
+                target_sample_rate = int(config.get("mp3_sample_rate") or 48_000)
+                if target_sample_rate not in (44_100, 48_000):
+                    target_sample_rate = 48_000
+                command.extend([
+                    "-codec:a",
+                    "libmp3lame",
+                    "-ar",
+                    str(target_sample_rate),
+                    "-b:a",
+                    bitrate,
+                    "-f",
+                    "mp3",
+                ])
+            elif audio_format == "opus":
+                command.extend(["-codec:a", "libopus", "-f", "opus"])
+            elif audio_format == "aac":
+                command.extend(["-codec:a", "aac", "-f", "adts"])
+            duration = float(tensor.shape[-1]) / float(sample_rate or 1)
+            timeout = max(120, min(900, int(duration * 3.0) + 30))
+            command.append(str(temporary))
+            subprocess.run(command, check=True, capture_output=True, timeout=timeout)
+            temporary.replace(target)
+            return target
+        except FileNotFoundError as exc:
+            raise RuntimeError("ffmpeg executable not found. Install ffmpeg or add it to PATH.") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"ffmpeg {audio_format} export timed out") from exc
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr.decode("utf-8", errors="ignore") if exc.stderr else str(exc)
+            raise RuntimeError(f"ffmpeg {audio_format} export failed: {stderr}") from exc
+        finally:
+            source.unlink(missing_ok=True)
             temporary.unlink(missing_ok=True)
 
 
@@ -898,6 +977,8 @@ def _generate(payload):
             _reference_duration,
         ) = _prepare_generation(payload, temporary, True)
         audio_format = payload["config"]["audio_format"]
+        if _can_transcode_with_ffmpeg(audio_format):
+            config.audio_format = "flac"
         with contextlib.redirect_stdout(sys.stderr):
             result = generate_music(
                 _dit_handler,
@@ -925,6 +1006,9 @@ def _generate(payload):
                 raise RuntimeError("generated ACE-Step audio duration is out of bounds")
             _canonicalize_generated_wave(
                 output_path, tensor, sample_rate, audio_format
+            )
+            output_path = _transcode_generated_audio(
+                output_path, tensor, sample_rate, audio_format, payload["config"]
             )
             data = output_path.read_bytes()
             try:

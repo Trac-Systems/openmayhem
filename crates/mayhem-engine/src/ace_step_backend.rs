@@ -4539,6 +4539,138 @@ print("ok")
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
     }
 
+    #[test]
+    fn embedded_worker_transcodes_compressed_formats_from_lossless_carrier() {
+        let worker = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ace_step_worker.py");
+        let probe = r#"
+import json
+import pathlib
+import runpy
+import sys
+import tempfile
+import types
+
+module = runpy.run_path(sys.argv[1], run_name="ace_step_transcode_test")
+state = {"commands": []}
+
+class FakeFinite:
+    @staticmethod
+    def all():
+        return True
+
+class FakeArray:
+    ndim = 2
+    shape = (2, 48000)
+    T = "samples-first"
+
+class FakeTensor:
+    shape = (2, 48000)
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def float(self):
+        return self
+
+    @staticmethod
+    def numpy():
+        return FakeArray()
+
+class FakeResult:
+    success = True
+    error = None
+    status_message = None
+
+    @property
+    def audios(self):
+        carrier = state["outputs"] / "result.flac"
+        carrier.write_bytes(b"fLaCcarrier")
+        return [{
+            "path": str(carrier),
+            "tensor": FakeTensor(),
+            "sample_rate": 48000,
+        }]
+
+def fake_generate_music(_dit, _lm, _params, config, save_dir):
+    state["requested_worker_format"] = config.audio_format
+    return FakeResult()
+
+def fake_prepare(payload, temporary, apply_preprocess):
+    outputs = pathlib.Path(temporary) / "outputs"
+    outputs.mkdir()
+    state["outputs"] = outputs
+    return ({}, object(), types.SimpleNamespace(audio_format=payload["config"]["audio_format"]), 1, "audio/mpeg", outputs, None, None)
+
+numpy = types.ModuleType("numpy")
+numpy.float32 = "float32"
+numpy.isfinite = lambda _samples: FakeFinite()
+numpy.ascontiguousarray = lambda samples, dtype: (samples, dtype)
+sys.modules["numpy"] = numpy
+
+soundfile = types.ModuleType("soundfile")
+soundfile.write = lambda path, samples, sample_rate, *, format, subtype: pathlib.Path(path).write_bytes(b"RIFF0000WAVE")
+sys.modules["soundfile"] = soundfile
+
+inference = types.ModuleType("acestep.inference")
+inference.generate_music = fake_generate_music
+package = types.ModuleType("acestep")
+package.__path__ = []
+package.inference = inference
+sys.modules["acestep"] = package
+sys.modules["acestep.inference"] = inference
+
+class FakeCompleted:
+    stderr = b""
+
+worker_globals = module["_generate"].__globals__
+worker_globals["shutil"].which = lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None
+def fake_run(command, *, check, capture_output, timeout):
+    state["commands"].append(command)
+    pathlib.Path(command[-1]).write_bytes(b"ID3encoded")
+    return FakeCompleted()
+worker_globals["subprocess"].run = fake_run
+worker_globals["_prepare_generation"] = fake_prepare
+worker_globals["_validate_generated_audio"] = lambda path, data, audio_format, duration: state.setdefault("validated", []).append((path.name, data[:3].decode("ascii"), audio_format))
+
+with tempfile.TemporaryDirectory() as root:
+    root = pathlib.Path(root)
+    worker_globals["_dit_handler"] = object()
+    worker_globals["_llm_handler"] = object()
+    worker_globals["_model_root"] = root
+    worker_globals["_worker_cache"] = root
+    result = module["_generate"]({
+        "config": {
+            "audio_format": "mp3",
+            "mp3_bitrate": "256k",
+            "mp3_sample_rate": 44100,
+        }
+    })
+
+assert state["requested_worker_format"] == "flac"
+assert state["commands"] and "-f" in state["commands"][0] and "mp3" in state["commands"][0]
+assert state["validated"] == [("result.mp3", "ID3", "mp3")]
+assert result["artifacts"][0]["content_type"] == "audio/mpeg"
+assert result["artifacts"][0]["data_base64"] == "SUQzZW5jb2RlZA=="
+print("ok")
+"#;
+        let python = resolve_python_program(Path::new("python3"))
+            .expect("find Python for compressed transcode test");
+        let output = std::process::Command::new(python)
+            .args(["-I", "-c", probe])
+            .arg(worker)
+            .output()
+            .expect("run embedded worker compressed transcode probe");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
+    }
+
     #[cfg(unix)]
     #[test]
     fn load_uses_derived_components_pinned_source_and_offline_environment() {
