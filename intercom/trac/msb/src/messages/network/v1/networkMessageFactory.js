@@ -3,7 +3,7 @@ import NetworkMessageBuilder from "./NetworkMessageBuilder.js";
 
 /**
  * Factory helper to create a director with a fresh builder instance.
- * @param {PeerWallet} wallet
+ * @param {IWallet} wallet
  * @param {object} config
  * @returns {NetworkMessageDirector}
  */

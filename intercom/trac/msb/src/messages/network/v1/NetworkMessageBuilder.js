@@ -1,14 +1,14 @@
-import PeerWallet from 'trac-wallet';
+import tracCryptoApi from 'trac-crypto-api';
 import b4a from 'b4a';
 import {createMessage, safeWriteUInt32BE, idToBuffer, timestampToBuffer} from "../../../utils/buffer.js";
 import {NetworkOperationType, ResultCode} from '../../../utils/constants.js';
-import {addressToBuffer, isAddressValid} from "../../../core/state/utils/address.js";
+import {isAddressValid} from "../../../core/state/utils/address.js";
 import {encodeCapabilities} from "../../../utils/buffer.js";
 
 /**
  * Builder for v1 internal network protocol messages.
- * @param {PeerWallet} wallet
- * @param {object} config
+ * @param {IWallet} wallet
+ * @param {Config} config
  */
 class NetworkMessageBuilder {
     #wallet;
@@ -16,17 +16,18 @@ class NetworkMessageBuilder {
     #capabilities;
     #id;
     #timestamp;
-    #issuerAddress;
     #resultCode;
     #data;
+    #proof;
+    #timestamp_ledger;
     #header;
     #payloadKey;
     #body;
     #config;
 
     /**
-     * @param {PeerWallet} wallet
-     * @param {object} config
+     * @param {IWallet} wallet
+     * @param {Config} config
      */
     constructor(wallet, config) {
         this.#config = config;
@@ -47,14 +48,6 @@ class NetworkMessageBuilder {
 
     setTimestamp() {
         this.#timestamp = Date.now();
-        return this;
-    }
-
-    setIssuerAddress(issuerAddress) {
-        if (!isAddressValid(issuerAddress, this.#config.addressPrefix)) {
-            throw new Error('Issuer TRAC address must be valid.');
-        }
-        this.#issuerAddress = issuerAddress;
         return this;
     }
 
@@ -85,10 +78,37 @@ class NetworkMessageBuilder {
     }
 
     setData(data) {
+        // case when response have to be empty.
+        if (data === undefined || data === null) data = b4a.alloc(0);
+
         if (!b4a.isBuffer(data)) {
             throw new Error(`Data must be a buffer.`);
         }
         this.#data = data;
+        return this;
+    }
+
+    setProof(proof) {
+        if (proof === undefined || proof === null) proof = b4a.alloc(0);
+        if (!b4a.isBuffer(proof)) {
+            throw new Error(`Proof must be a buffer.`);
+        }
+        this.#proof = proof;
+        return this;
+    }
+
+    setTimestampLedger(timestamp) {
+        if (timestamp === undefined || timestamp === null) {
+            this.#timestamp_ledger = null;
+            return this;
+        }
+
+        const value = timestamp instanceof Date ? timestamp.getTime() : timestamp;
+        if (!Number.isSafeInteger(value) || value < 0) {
+            throw new Error('timestamp must be a non-negative safe integer or Date.');
+        }
+
+        this.#timestamp_ledger = value;
         return this;
     }
 
@@ -107,78 +127,8 @@ class NetworkMessageBuilder {
         return this;
     }
 
-    async #buildValidatorConnectionRequestPayload() {
-        const issuer = this.#issuerAddress
-        if (!isAddressValid(issuer, this.#config.addressPrefix)) {
-            throw new Error('Issuer address must be a valid TRAC address');
-        }
-
-        if (this.#issuerAddress !== this.#wallet.address) {
-            throw new Error('Issuer address must be the signer address');
-        }
-
-        const nonce = PeerWallet.generateNonce();
-        const tsBuf = timestampToBuffer(this.#timestamp);
-        const idBuf = idToBuffer(this.#id);
-        const message = createMessage(
-            this.#type,
-            idBuf,
-            tsBuf,
-            addressToBuffer(issuer, this.#config.addressPrefix),
-            nonce,
-            encodeCapabilities(this.#capabilities),
-        );
-        const hash = await PeerWallet.blake3(message);
-        const signature = this.#wallet.sign(hash);
-
-        this.#payloadKey = 'validator_connection_request';
-        this.#body = {
-            issuer_address: issuer,
-            nonce,
-            signature
-        };
-    }
-
-    async #buildValidatorConnectionResponsePayload() {
-        const issuer = this.#issuerAddress
-        if (!isAddressValid(issuer, this.#config.addressPrefix)) {
-            throw new Error('Issuer address must be a valid TRAC address');
-        }
-
-        if (this.#issuerAddress === this.#wallet.address) {
-            throw new Error('Issuer address must be the different than the signer address');
-        }
-
-        if (this.#resultCode === null || this.#resultCode === undefined) {
-            throw new Error('Result code must be set before building validator connection response');
-        }
-
-        const nonce = PeerWallet.generateNonce();
-        const tsBuf = timestampToBuffer(this.#timestamp);
-        const idBuf = idToBuffer(this.#id);
-        const message = createMessage(
-            this.#type,
-            idBuf,
-            tsBuf,
-            addressToBuffer(issuer, this.#config.addressPrefix),
-            nonce,
-            safeWriteUInt32BE(this.#resultCode, 0),
-            encodeCapabilities(this.#capabilities),
-        );
-        const hash = await PeerWallet.blake3(message);
-        const signature = this.#wallet.sign(hash);
-
-        this.#payloadKey = 'validator_connection_response';
-        this.#body = {
-            issuer_address: issuer,
-            nonce,
-            signature,
-            result: this.#resultCode
-        };
-    }
-
     async #buildLivenessRequestPayload() {
-        const nonce = PeerWallet.generateNonce();
+        const nonce = tracCryptoApi.nonce.generate();
         const tsBuf = timestampToBuffer(this.#timestamp);
         const idBuf = idToBuffer(this.#id);
         const message = createMessage(
@@ -188,7 +138,7 @@ class NetworkMessageBuilder {
             nonce,
             encodeCapabilities(this.#capabilities),
         );
-        const hash = await PeerWallet.blake3(message);
+        const hash = await tracCryptoApi.hash.blake3(message);
         const signature = this.#wallet.sign(hash);
 
         this.#payloadKey = 'liveness_request';
@@ -203,7 +153,7 @@ class NetworkMessageBuilder {
             throw new Error('Result code must be set before building liveness response');
         }
 
-        const nonce = PeerWallet.generateNonce();
+        const nonce = tracCryptoApi.nonce.generate();
         const tsBuf = timestampToBuffer(this.#timestamp);
         const idBuf = idToBuffer(this.#id);
         const message = createMessage(
@@ -214,7 +164,7 @@ class NetworkMessageBuilder {
             safeWriteUInt32BE(this.#resultCode, 0),
             encodeCapabilities(this.#capabilities),
         );
-        const hash = await PeerWallet.blake3(message);
+        const hash = await tracCryptoApi.hash.blake3(message);
         const signature = this.#wallet.sign(hash);
 
         this.#payloadKey = 'liveness_response';
@@ -229,7 +179,7 @@ class NetworkMessageBuilder {
         if (!b4a.isBuffer(this.#data)) {
             throw new Error('Data must be set before building broadcast transaction request');
         }
-        const nonce = PeerWallet.generateNonce();
+        const nonce = tracCryptoApi.nonce.generate();
         const tsBuf = timestampToBuffer(this.#timestamp);
         const idBuf = idToBuffer(this.#id);
         const message = createMessage(
@@ -240,7 +190,7 @@ class NetworkMessageBuilder {
             nonce,
             encodeCapabilities(this.#capabilities),
         );
-        const hash = await PeerWallet.blake3(message);
+        const hash = await tracCryptoApi.hash.blake3(message);
         const signature = this.#wallet.sign(hash);
 
         this.#payloadKey = 'broadcast_transaction_request';
@@ -255,24 +205,53 @@ class NetworkMessageBuilder {
         if (this.#resultCode === null || this.#resultCode === undefined) {
             throw new Error('Result code must be set before building broadcast transaction response');
         }
-        const nonce = PeerWallet.generateNonce();
+        const nonce = tracCryptoApi.nonce.generate();
         const tsBuf = timestampToBuffer(this.#timestamp);
         const idBuf = idToBuffer(this.#id);
+        const proof = b4a.isBuffer(this.#proof) ? this.#proof : b4a.alloc(0);
+        const hasProof = proof.length > 0;
+        const timestamp = Number.isSafeInteger(this.#timestamp_ledger) ? this.#timestamp_ledger : 0;
+        const hasTimestamp = timestamp > 0;
+
+        if (this.#resultCode === ResultCode.OK) {
+            if (!hasProof || !hasTimestamp) {
+                throw new Error('Result code OK requires non-empty proof and timestamp > 0.');
+            }
+        } else if (this.#resultCode === ResultCode.TX_ACCEPTED_PROOF_UNAVAILABLE) {
+            if (hasProof) {
+                throw new Error('Result code TX_ACCEPTED_PROOF_UNAVAILABLE requires empty proof.');
+            }
+            if (!hasTimestamp) {
+                throw new Error('Result code TX_ACCEPTED_PROOF_UNAVAILABLE requires timestamp > 0.');
+            }
+        } else {
+            if (hasProof) {
+                throw new Error('Non-OK result code requires empty proof.');
+            }
+            if (timestamp !== 0) {
+                throw new Error('Non-OK result code requires timestamp to be 0, except TX_ACCEPTED_PROOF_UNAVAILABLE.');
+            }
+        }
+
         const message = createMessage(
             this.#type,
             idBuf,
             tsBuf,
             nonce,
+            proof,
+            timestampToBuffer(timestamp),
             safeWriteUInt32BE(this.#resultCode, 0),
             encodeCapabilities(this.#capabilities),
         );
-        const hash = await PeerWallet.blake3(message);
-        const signature = this.#wallet.sign(hash);
 
+        const hash = await tracCryptoApi.hash.blake3(message);
+        const signature = this.#wallet.sign(hash);
         this.#payloadKey = 'broadcast_transaction_response';
         this.#body = {
             nonce,
             signature,
+            proof,
+            timestamp: timestamp,
             result: this.#resultCode
         };
     }
@@ -281,14 +260,6 @@ class NetworkMessageBuilder {
         this.#setHeader();
 
         switch (this.#type) {
-            case NetworkOperationType.VALIDATOR_CONNECTION_REQUEST: {
-                await this.#buildValidatorConnectionRequestPayload();
-                break;
-            }
-            case NetworkOperationType.VALIDATOR_CONNECTION_RESPONSE: {
-                await this.#buildValidatorConnectionResponsePayload();
-                break;
-            }
             case NetworkOperationType.LIVENESS_REQUEST: {
                 await this.#buildLivenessRequestPayload();
                 break;

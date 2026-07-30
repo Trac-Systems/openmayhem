@@ -12,12 +12,12 @@ import {
   bufferToBigInt,
   decimalStringToBigInt,
 } from 'trac-msb/src/utils/amountSerialization.js';
-import { get_confirmed_tx_info } from 'trac-msb/src/utils/cli.js';
 import { OperationType } from 'trac-msb/src/utils/constants.js';
 import {
   normalizeDecodedPayloadForJson,
   normalizeTransferOperation,
 } from 'trac-msb/src/utils/normalizers.js';
+import { safeDecodeApplyOperation } from 'trac-msb/src/utils/protobuf/operationHelpers.js';
 import {
   createMayhemMsbConfig,
   MAYHEM_NETWORK_ENV,
@@ -187,12 +187,16 @@ async function waitForConfirmation(msb, txHash, timeoutSeconds, sleepFn) {
 }
 
 async function defaultReadConfirmedTransfer(msb, txHash, config, confirmedLength) {
-  const rawPayload = await get_confirmed_tx_info(msb.state, txHash);
-  if (!rawPayload) {
+  const rawPayload = typeof msb.getConfirmedTxInfo === 'function'
+    ? await msb.getConfirmedTxInfo(txHash)
+    : null;
+  const fallbackPayload = rawPayload ? null : await msb.state.getSigned(txHash);
+  const decoded = rawPayload?.decoded ?? safeDecodeApplyOperation(fallbackPayload);
+  if (!decoded) {
     throw new Error(`No payload found for tx hash: ${txHash}`);
   }
   return {
-    txDetails: normalizeDecodedPayloadForJson(rawPayload.decoded, config),
+    txDetails: normalizeDecodedPayloadForJson(decoded, config),
     confirmed_length: confirmedLength,
   };
 }

@@ -1,4 +1,5 @@
 import {
+    handleHealth,
     handleBalance,
     handleTxv,
     handleFee,
@@ -9,10 +10,11 @@ import {
     handleTransactionDetails,
     handleFetchBulkTxPayloads,
     handleTransactionExtendedDetails,
-    handleAccountDetails
+    handleAccountDetails,
 } from '../handlers.js';
 
 export const v1Routes = [
+    { method: 'GET', path: '/health', handler: handleHealth },
     { method: 'GET', path: '/balance', handler: handleBalance },
     { method: 'GET', path: '/txv', handler: handleTxv },
     { method: 'GET', path: '/fee', handler: handleFee },

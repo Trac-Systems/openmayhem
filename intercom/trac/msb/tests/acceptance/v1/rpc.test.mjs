@@ -13,6 +13,7 @@ import { registerTxDetailsTests } from "./tx-details/tx-details.test.mjs"
 import { registerTxTests } from "./tx/tx.test.mjs"
 import { registerTxvTests } from "./txv/txv.test.mjs"
 import { registerUnconfirmedLengthTests } from "./unconfirmed-length/unconfirmed-length.test.mjs"
+import { registerHealthTests } from "./health/health.test.mjs"
 
 let toClose
 let tmpDirectory
@@ -30,15 +31,14 @@ const setupNetwork = async () => {
     tmpDirectory = await initTemporaryDirectory()
     const rpcOpts = {
         bootstrap: randomBytes(32).toString('hex'),
-        channel: randomBytes(32).toString('hex'),
+        channel: randomBytes(16).toString('hex'),
         enableRoleRequester: false,
         enableWallet: true,
         enableValidatorObserver: true,
         enableInteractiveMode: false,
         disableRateLimit: true,
         enableTxApplyLogs: false,
-        storesDirectory: `${tmpDirectory}/stores/`,
-        storeName: '/admin'
+        storesDirectory: `${tmpDirectory}`
     }
 
     const admin = await setupMsbAdmin(testKeyPair1, tmpDirectory, rpcOpts)
@@ -91,4 +91,5 @@ describe("API acceptance tests", () => {
     registerTxPayloadsBulkTests(testContext)
     registerTxDetailsTests(testContext)
     registerAccountTests(testContext)
+    registerHealthTests(testContext)
 })

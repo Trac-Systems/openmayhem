@@ -2,10 +2,6 @@ import PeerWallet from "trac-wallet"
 import b4a from "b4a";
 
 class Wallet extends PeerWallet {
-    constructor() {
-        super();
-    }
-
     get publicKey() {
         const pk = super.publicKey;
         if (!pk) return null;
@@ -30,7 +26,7 @@ class Wallet extends PeerWallet {
         const pkBuf = b4a.isBuffer(publicKey) ? publicKey : b4a.from(String(publicKey), "hex");
         return PeerWallet.verify(sigBuf, msgBuf, pkBuf);
     }
-    
+
 }
 
 export default Wallet;

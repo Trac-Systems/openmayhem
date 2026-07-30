@@ -3,6 +3,7 @@ import { normalizeHex } from './helpers.js';
 import { addressToBuffer, bufferToAddress } from '../core/state/utils/address.js';
 import b4a from 'b4a';
 import { bufferToBigInt } from './amountSerialization.js'
+import {isBootstrapDeployment, isRoleAccess, isTransaction, isTransfer} from './applyOperations.js';
 
 /**
  * Normalizes the payload for a transfer operation.
@@ -198,4 +199,41 @@ export function normalizeBootstrapDeploymentOperation(payload, config) {
         address: addressToBuffer(address, config.addressPrefix),
         bdo: normalizedBdo
     };
+}
+
+/**
+ * Normalizes an incoming partial operation message based on its operation type.
+ *
+ * @param {Object} message The raw incoming message.
+ * @param {object} config The environment configuration object.
+ * @returns {Object} Normalized payload.
+ * @throws {Error} If message is invalid or operation type is unsupported.
+ */
+export function normalizeMessageByOperationType(message, config) {
+    if (!message || typeof message !== 'object') {
+        throw new Error('Invalid message for normalization.');
+    }
+
+    const { type } = message;
+    if (!Number.isInteger(type) || type <= 0) {
+        throw new Error('Message type is missing or invalid.');
+    }
+
+    if (isRoleAccess(type)) {
+        return normalizeRoleAccessOperation(message, config);
+    }
+
+    if (isTransaction(type)) {
+        return normalizeTransactionOperation(message, config);
+    }
+
+    if (isBootstrapDeployment(type)) {
+        return normalizeBootstrapDeploymentOperation(message, config);
+    }
+
+    if (isTransfer(type)) {
+        return normalizeTransferOperation(message, config);
+    }
+
+    throw new Error(`Unsupported operation type for normalization: ${type}`);
 }

@@ -8,12 +8,12 @@ import {
   Peer,
   ENV as PEER_ENV,
   createConfig as createPeerConfig,
-} from '../trac/trac-peer/src/index.js';
+} from 'trac-peer/src/index.js';
 import {
   ENV as MSB_ENV,
   createConfig as createMsbConfig,
-} from '../trac/msb/src/config/env.js';
-import '../trac/msb/src/index.js';
+} from 'trac-msb/src/config/env.js';
+import 'trac-msb/src/index.js';
 
 function tempStore(prefix) {
   return `${fs.mkdtempSync(path.join(os.tmpdir(), prefix))}/`;

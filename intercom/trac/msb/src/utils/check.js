@@ -26,7 +26,7 @@ class Check {
     #config
 
     /**
-     * @param {object} config
+     * @param {Config} config
      **/
     constructor(config) {
         this.#config = config
@@ -41,7 +41,7 @@ class Check {
             },
         });
         const isBuffer = b4a.isBuffer;
-        this.#validator.add("buffer", function ({ schema, messages }, path, context) {
+        this.#validator.add("buffer", function ({ schema, messages }, _path, _context) {
             return {
                 source:
                     `
@@ -50,11 +50,11 @@ class Check {
                         }
                         if (value.length !== ${schema.length}) {
                             ${this.makeError({
-                        type: "bufferLength",
-                        expected: schema.length,
-                        actual: "value.length",
-                        messages
-                    })}
+        type: "bufferLength",
+        expected: schema.length,
+        actual: "value.length",
+        messages
+    })}
                         }
                         let isEmpty = true;
                             for (let i = 0; i < value.length; i++) {
@@ -71,7 +71,7 @@ class Check {
             };
         });
 
-        this.#validator.add("buffer_amount", function ({ schema, messages }, path, context) {
+        this.#validator.add("buffer_amount", function ({ schema, messages }, _path, _context) {
             return {
                 source:
                     `
@@ -80,11 +80,11 @@ class Check {
                         }
                         if (value.length !== ${schema.length}) {
                             ${this.makeError({
-                        type: "bufferLength",
-                        expected: schema.length,
-                        actual: "value.length",
-                        messages
-                    })}
+        type: "bufferLength",
+        expected: schema.length,
+        actual: "value.length",
+        messages
+    })}
                         }
                         return value;
                     `
@@ -523,4 +523,3 @@ class Check {
 }
 
 export default Check;
-

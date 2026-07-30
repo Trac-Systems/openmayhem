@@ -3,10 +3,10 @@
 import { default as test } from 'brittle';
 
 async function runTests() {
-	test.pause();
-	await import('./applyOperations.test.js');
-	await import('./operationHelpers.test.js');
-	test.resume();
+    test.pause();
+    await import('./applyOperations.test.js');
+    await import('./operationHelpers.test.js');
+    test.resume();
 }
 
 await runTests();

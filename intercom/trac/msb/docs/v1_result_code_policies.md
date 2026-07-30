@@ -1,0 +1,70 @@
+# V1 Result Code Policies
+
+This table shows, for each V1 `ResultCode`, the boolean policy flags that determine whether the sender rotates the validator and whether the validator closes the connection after sending the response.
+
+`true` in `Sender` means the sender rotates the validator for that result code. `true` in `Validator` means the validator closes the connection after sending the response. `false` means the corresponding action is not executed for that result code. These columns should be interpreted as boolean flags that control execution for each code, not as descriptive status fields.
+
+| Sender | Validator | ResultCode | Value |
+| --- | --- | --- | --- |
+| true | true | UNSPECIFIED | 0 |
+| false | false | OK | 1 |
+| true | true | INVALID_PAYLOAD | 2 |
+| true | true | RATE_LIMITED | 3 |
+| true | true | SIGNATURE_INVALID | 4 |
+| true | true | UNEXPECTED_ERROR | 5 |
+| true | false | TIMEOUT | 6 |
+| true | true | NODE_HAS_NO_WRITE_ACCESS | 7 |
+| true | false | TX_ACCEPTED_PROOF_UNAVAILABLE | 8 |
+| true | true | NODE_OVERLOADED | 9 |
+| false | false | TX_ALREADY_PENDING | 10 |
+| true | true | OPERATION_TYPE_UNKNOWN | 11 |
+| true | true | SCHEMA_VALIDATION_FAILED | 12 |
+| true | true | REQUESTER_ADDRESS_INVALID | 13 |
+| true | true | REQUESTER_PUBLIC_KEY_INVALID | 14 |
+| true | true | TX_HASH_MISMATCH | 15 |
+| true | true | TX_SIGNATURE_INVALID | 16 |
+| true | true | TX_EXPIRED | 17 |
+| true | true | TX_ALREADY_EXISTS | 18 |
+| true | true | OPERATION_ALREADY_COMPLETED | 19 |
+| true | true | REQUESTER_NOT_FOUND | 20 |
+| true | true | INSUFFICIENT_FEE_BALANCE | 21 |
+| true | true | EXTERNAL_BOOTSTRAP_EQUALS_MSB_BOOTSTRAP | 22 |
+| true | true | SELF_VALIDATION_FORBIDDEN | 23 |
+| true | true | ROLE_NODE_ENTRY_NOT_FOUND | 24 |
+| true | true | ROLE_NODE_ALREADY_WRITER | 25 |
+| true | true | ROLE_NODE_NOT_WHITELISTED | 26 |
+| true | true | ROLE_NODE_NOT_WRITER | 27 |
+| true | true | ROLE_NODE_IS_INDEXER | 28 |
+| true | true | ROLE_ADMIN_ENTRY_MISSING | 29 |
+| true | true | ROLE_INVALID_RECOVERY_CASE | 30 |
+| true | true | ROLE_UNKNOWN_OPERATION | 31 |
+| true | true | ROLE_INVALID_WRITER_KEY | 32 |
+| true | true | ROLE_INSUFFICIENT_FEE_BALANCE | 33 |
+| true | true | MSB_BOOTSTRAP_MISMATCH | 34 |
+| true | true | EXTERNAL_BOOTSTRAP_NOT_DEPLOYED | 35 |
+| true | true | EXTERNAL_BOOTSTRAP_TX_MISSING | 36 |
+| true | true | EXTERNAL_BOOTSTRAP_MISMATCH | 37 |
+| true | true | BOOTSTRAP_ALREADY_EXISTS | 38 |
+| true | true | TRANSFER_RECIPIENT_ADDRESS_INVALID | 39 |
+| true | true | TRANSFER_RECIPIENT_PUBLIC_KEY_INVALID | 40 |
+| true | true | TRANSFER_AMOUNT_TOO_LARGE | 41 |
+| true | true | TRANSFER_SENDER_NOT_FOUND | 42 |
+| true | true | TRANSFER_INSUFFICIENT_BALANCE | 43 |
+| true | true | TRANSFER_RECIPIENT_BALANCE_OVERFLOW | 44 |
+| true | false | TX_HASH_INVALID_FORMAT | 45 |
+| true | false | INTERNAL_ENQUEUE_VALIDATION_FAILED | 46 |
+| true | false | TX_COMMITTED_RECEIPT_MISSING | 47 |
+| true | false | VALIDATOR_RESPONSE_TX_TYPE_INVALID | 48 |
+| true | false | VALIDATOR_RESPONSE_TX_TYPE_UNKNOWN | 49 |
+| true | false | VALIDATOR_RESPONSE_TX_TYPE_UNSUPPORTED | 50 |
+| true | false | VALIDATOR_RESPONSE_SCHEMA_INVALID | 51 |
+| true | false | PENDING_REQUEST_MISSING_TX_DATA | 52 |
+| true | false | PROOF_PAYLOAD_MISMATCH | 53 |
+| true | false | VALIDATOR_WRITER_KEY_NOT_REGISTERED | 54 |
+| true | false | VALIDATOR_ADDRESS_MISMATCH | 55 |
+| true | false | VALIDATOR_NODE_ENTRY_NOT_FOUND | 56 |
+| true | false | VALIDATOR_NODE_NOT_WRITER | 57 |
+| true | false | VALIDATOR_WRITER_KEY_MISMATCH | 58 |
+| true | false | VALIDATOR_TX_OBJECT_INVALID | 59 |
+| true | false | VALIDATOR_VA_MISSING | 60 |
+| true | true | TX_INVALID_PAYLOAD | 61 |

@@ -6,12 +6,10 @@ import txOperationDifferentValidatorCreatorHappyPathScenario from './txOperation
 import InvalidPayloadValidationScenario from '../common/payload-structure/invalidPayloadValidationScenario.js';
 import InvalidHashValidationScenario from '../common/payload-structure/invalidHashValidationScenario.js';
 import PartialOperationValidationScenario, {
-	PartialOperationMutationStrategy
+    PartialOperationMutationStrategy
 } from '../common/payload-structure/partialOperationValidationScenario.js';
 import OperationValidationScenarioBase from '../common/base/OperationValidationScenarioBase.js';
-import InvalidSignatureValidationScenario, {
-	SignatureMutationStrategy
-} from '../common/payload-structure/invalidSignatureValidationScenario.js';
+import InvalidSignatureValidationScenario from '../common/payload-structure/invalidSignatureValidationScenario.js';
 import RequesterAddressValidationScenario from '../common/requesterAddressValidationScenario.js';
 import createRequesterPublicKeyValidationScenario from '../common/requesterPublicKeyValidationScenario.js';
 import InvalidAddressValidationScenario from '../common/payload-structure/invalidAddressValidationScenario.js';
@@ -20,22 +18,22 @@ import IndexerSequenceStateInvalidScenario from '../common/indexer/indexerSequen
 import TransactionValidityMismatchScenario from '../common/transactionValidityMismatchScenario.js';
 import OperationAlreadyAppliedScenario from '../common/operationAlreadyAppliedScenario.js';
 import ValidatorConsistencyScenarioBase, {
-	ValidatorEntryMutation
+    ValidatorEntryMutation
 } from '../common/validatorConsistency/base/validatorConsistencyScenarioBase.js';
 import ValidatorEntryDecodeFailureScenario from '../common/validatorConsistency/validatorEntryDecodeFailureScenario.js';
 import ValidatorInactiveScenario from '../common/validatorConsistency/validatorInactiveScenario.js';
 import ValidatorWriterKeyMismatchScenario from '../common/validatorConsistency/validatorWriterKeyMismatchScenario.js';
 import { safeDecodeApplyOperation, safeEncodeApplyOperation } from '../../../../../src/utils/protobuf/operationHelpers.js';
 import {
-	setupTxOperationScenario,
-	buildTxOperationPayload,
-	buildTxOperationPayloadWithTxValidity,
-	assertTxOperationFailureState,
-	assertTxOperationSuccessState,
-	mutateBootstrapEqualMbs,
-	mutateMbsMismatch,
-	appendInvalidTxPayload,
-	mutateValidatorSignature
+    setupTxOperationScenario,
+    buildTxOperationPayload,
+    buildTxOperationPayloadWithTxValidity,
+    assertTxOperationFailureState,
+    assertTxOperationSuccessState,
+    mutateBootstrapEqualMbs,
+    mutateMbsMismatch,
+    appendInvalidTxPayload,
+    mutateValidatorSignature
 } from './txOperationScenarioHelpers.js';
 import txOperationBootstrapNotRegisteredScenario from './txOperationBootstrapNotRegisteredScenario.js';
 import txOperationInvalidDeploymentEntryScenario from './txOperationInvalidDeploymentEntryScenario.js';
@@ -59,10 +57,10 @@ import txOperationTransferFeeInvalidCreatorBalanceScenario from './txOperationTr
 import txOperationTransferFeeAddCreatorBalanceFailureScenario from './txOperationTransferFeeAddCreatorBalanceFailureScenario.js';
 import txOperationTransferFeeUpdateCreatorBalanceFailureScenario from './txOperationTransferFeeUpdateCreatorBalanceFailureScenario.js';
 import {
-	txOperationTransferFeeResultNullScenario,
-	txOperationTransferFeeResultIgnoredScenario,
-	txOperationTransferFeeRequesterEntryMissingScenario,
-	txOperationTransferFeeValidatorEntryMissingScenario
+    txOperationTransferFeeResultNullScenario,
+    txOperationTransferFeeResultIgnoredScenario,
+    txOperationTransferFeeRequesterEntryMissingScenario,
+    txOperationTransferFeeValidatorEntryMissingScenario
 } from './txOperationTransferFeeGuardBypassScenario.js';
 
 txOperationStandardHappyPathScenario();
@@ -71,221 +69,221 @@ txOperationRequesterCreatorHappyPathScenario();
 txOperationDifferentValidatorCreatorHappyPathScenario();
 
 new InvalidPayloadValidationScenario({
-	title: 'State.apply txOperation rejects payloads that fail contract validation',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	mutatePayload: (t, validPayload) => {
-		const decoded = safeDecodeApplyOperation(validPayload);
-		t.ok(decoded, 'valid payload decodes before mutation');
-		if (!decoded) return validPayload;
-		return safeEncodeApplyOperation({ ...decoded, address: b4a.alloc(1) });
-	},
-	applyInvalidPayload: appendInvalidTxPayload,
-	assertStateUnchanged: (t, context, _valid, invalidPayload) =>
-		assertTxOperationFailureState(t, context, { payload: invalidPayload }),
-	expectedLogs: ['Contract schema validation failed.']
+    title: 'State.apply txOperation rejects payloads that fail contract validation',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    mutatePayload: (t, validPayload) => {
+        const decoded = safeDecodeApplyOperation(validPayload);
+        t.ok(decoded, 'valid payload decodes before mutation');
+        if (!decoded) return validPayload;
+        return safeEncodeApplyOperation({ ...decoded, address: b4a.alloc(1) });
+    },
+    applyInvalidPayload: appendInvalidTxPayload,
+    assertStateUnchanged: (t, context, _valid, invalidPayload) =>
+        assertTxOperationFailureState(t, context, { payload: invalidPayload }),
+    expectedLogs: ['Contract schema validation failed.']
 }).performScenario();
 
 // validator cannot sign own tx
 new PartialOperationValidationScenario({
-	title: 'State.apply txOperation rejects payloads when validator signs own transaction',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	assertStateUnchanged: (t, context, _valid, invalid) =>
-		assertTxOperationFailureState(t, context, { payload: invalid }),
-	strategy: PartialOperationMutationStrategy.ADDRESS_MATCH,
-	parentKey: 'txo',
-	expectedLogs: ['Validator cannot sign its own transaction.']
+    title: 'State.apply txOperation rejects payloads when validator signs own transaction',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    assertStateUnchanged: (t, context, _valid, invalid) =>
+        assertTxOperationFailureState(t, context, { payload: invalid }),
+    strategy: PartialOperationMutationStrategy.ADDRESS_MATCH,
+    parentKey: 'txo',
+    expectedLogs: ['Validator cannot sign its own transaction.']
 }).performScenario();
 
 // nonces and signatures equality checks
 new PartialOperationValidationScenario({
-	title: 'State.apply txOperation rejects payloads when nonces match',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	assertStateUnchanged: (t, context, _valid, invalid) =>
-		assertTxOperationFailureState(t, context, { payload: invalid }),
-	strategy: PartialOperationMutationStrategy.NONCE_MATCH,
-	parentKey: 'txo',
-	expectedLogs: ['Nonces should not be the same.']
+    title: 'State.apply txOperation rejects payloads when nonces match',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    assertStateUnchanged: (t, context, _valid, invalid) =>
+        assertTxOperationFailureState(t, context, { payload: invalid }),
+    strategy: PartialOperationMutationStrategy.NONCE_MATCH,
+    parentKey: 'txo',
+    expectedLogs: ['Nonces should not be the same.']
 }).performScenario();
 
 new PartialOperationValidationScenario({
-	title: 'State.apply txOperation rejects payloads when signatures match',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	assertStateUnchanged: (t, context, _valid, invalid) =>
-		assertTxOperationFailureState(t, context, { payload: invalid }),
-	strategy: PartialOperationMutationStrategy.SIGNATURE_MATCH,
-	parentKey: 'txo',
-	expectedLogs: ['Signatures should not be the same.']
+    title: 'State.apply txOperation rejects payloads when signatures match',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    assertStateUnchanged: (t, context, _valid, invalid) =>
+        assertTxOperationFailureState(t, context, { payload: invalid }),
+    strategy: PartialOperationMutationStrategy.SIGNATURE_MATCH,
+    parentKey: 'txo',
+    expectedLogs: ['Signatures should not be the same.']
 }).performScenario();
 
 // bootstrap consistency
 new OperationValidationScenarioBase({
-	title: 'State.apply txOperation rejects payloads when external bootstrap matches MSB bootstrap',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	mutatePayload: (t, validPayload) => mutateBootstrapEqualMbs(t, validPayload),
-	applyInvalidPayload: appendInvalidTxPayload,
-	assertStateUnchanged: (t, context, _valid, invalidPayload) =>
-		assertTxOperationFailureState(t, context, { payload: invalidPayload }),
-	expectedLogs: ['Network and external bootstrap cannot be the same.']
+    title: 'State.apply txOperation rejects payloads when external bootstrap matches MSB bootstrap',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    mutatePayload: (t, validPayload) => mutateBootstrapEqualMbs(t, validPayload),
+    applyInvalidPayload: appendInvalidTxPayload,
+    assertStateUnchanged: (t, context, _valid, invalidPayload) =>
+        assertTxOperationFailureState(t, context, { payload: invalidPayload }),
+    expectedLogs: ['Network and external bootstrap cannot be the same.']
 }).performScenario();
 
 new OperationValidationScenarioBase({
-	title: 'State.apply txOperation rejects payloads when declared MSB bootstrap mismatches network',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	mutatePayload: (t, validPayload) => mutateMbsMismatch(t, validPayload),
-	applyInvalidPayload: appendInvalidTxPayload,
-	assertStateUnchanged: (t, context, _valid, invalidPayload) =>
-		assertTxOperationFailureState(t, context, { payload: invalidPayload }),
-	expectedLogs: ['Declared MSB bootstrap is different than real MSB bootstrap.']
+    title: 'State.apply txOperation rejects payloads when declared MSB bootstrap mismatches network',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    mutatePayload: (t, validPayload) => mutateMbsMismatch(t, validPayload),
+    applyInvalidPayload: appendInvalidTxPayload,
+    assertStateUnchanged: (t, context, _valid, invalidPayload) =>
+        assertTxOperationFailureState(t, context, { payload: invalidPayload }),
+    expectedLogs: ['Declared MSB bootstrap is different than real MSB bootstrap.']
 }).performScenario();
 
 // requester identity
 new RequesterAddressValidationScenario({
-	title: 'State.apply txOperation rejects invalid requester address',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	assertStateUnchanged: (t, context, _valid, invalidPayload) =>
-		assertTxOperationFailureState(t, context, { payload: invalidPayload }),
-	expectedLogs: ['Invalid requester address.']
+    title: 'State.apply txOperation rejects invalid requester address',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    assertStateUnchanged: (t, context, _valid, invalidPayload) =>
+        assertTxOperationFailureState(t, context, { payload: invalidPayload }),
+    expectedLogs: ['Invalid requester address.']
 }).performScenario();
 
 createRequesterPublicKeyValidationScenario({
-	title: 'State.apply txOperation rejects requester public key decode failures',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	assertStateUnchanged: (t, context, _valid, invalidPayload) =>
-		assertTxOperationFailureState(t, context, { payload: invalidPayload }),
-	expectedLogs: ['Failed to decode requester public key.']
+    title: 'State.apply txOperation rejects requester public key decode failures',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    assertStateUnchanged: (t, context, _valid, invalidPayload) =>
+        assertTxOperationFailureState(t, context, { payload: invalidPayload }),
+    expectedLogs: ['Failed to decode requester public key.']
 }).performScenario();
 
 new InvalidHashValidationScenario({
-	title: 'State.apply txOperation rejects payloads when requester hash mismatches tx_hash',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	assertStateUnchanged: (t, context, _valid, invalidPayload) =>
-		assertTxOperationFailureState(t, context, { payload: invalidPayload }),
-	applyInvalidPayload: appendInvalidTxPayload,
-	expectedLogs: ['Message hash does not match the tx_hash.']
+    title: 'State.apply txOperation rejects payloads when requester hash mismatches tx_hash',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    assertStateUnchanged: (t, context, _valid, invalidPayload) =>
+        assertTxOperationFailureState(t, context, { payload: invalidPayload }),
+    applyInvalidPayload: appendInvalidTxPayload,
+    expectedLogs: ['Message hash does not match the tx_hash.']
 }).performScenario();
 
 new InvalidSignatureValidationScenario({
-	title: 'State.apply txOperation rejects payloads when requester signature verification fails',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	assertStateUnchanged: (t, context, _valid, invalidPayload) =>
-		assertTxOperationFailureState(t, context, { payload: invalidPayload }),
-	applyInvalidPayload: appendInvalidTxPayload,
-	expectedLogs: ['Failed to verify message signature.']
+    title: 'State.apply txOperation rejects payloads when requester signature verification fails',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    assertStateUnchanged: (t, context, _valid, invalidPayload) =>
+        assertTxOperationFailureState(t, context, { payload: invalidPayload }),
+    applyInvalidPayload: appendInvalidTxPayload,
+    expectedLogs: ['Failed to verify message signature.']
 }).performScenario();
 
 // validator identity
 new InvalidAddressValidationScenario({
-	title: 'State.apply txOperation rejects invalid validator address',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	assertStateUnchanged: (t, context, _valid, invalidPayload) =>
-		assertTxOperationFailureState(t, context, { payload: invalidPayload }),
-	addressPath: ['txo', 'va'],
-	expectedLogs: ['Invalid validator address.']
+    title: 'State.apply txOperation rejects invalid validator address',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    assertStateUnchanged: (t, context, _valid, invalidPayload) =>
+        assertTxOperationFailureState(t, context, { payload: invalidPayload }),
+    addressPath: ['txo', 'va'],
+    expectedLogs: ['Invalid validator address.']
 }).performScenario();
 
 createAddressWithInvalidPublicKeyScenario({
-	title: 'State.apply txOperation rejects validator public key decode failures',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	assertStateUnchanged: (t, context, _valid, invalidPayload) =>
-		assertTxOperationFailureState(t, context, { payload: invalidPayload }),
-	addressPath: ['txo', 'va'],
-	expectedLogs: ['Failed to decode validator public key.']
+    title: 'State.apply txOperation rejects validator public key decode failures',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    assertStateUnchanged: (t, context, _valid, invalidPayload) =>
+        assertTxOperationFailureState(t, context, { payload: invalidPayload }),
+    addressPath: ['txo', 'va'],
+    expectedLogs: ['Failed to decode validator public key.']
 }).performScenario();
 
 new OperationValidationScenarioBase({
-	title: 'State.apply txOperation rejects validator message signature verification failures',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	mutatePayload: (t, validPayload) => mutateValidatorSignature(t, validPayload),
-	applyInvalidPayload: appendInvalidTxPayload,
-	assertStateUnchanged: (t, context, _valid, invalidPayload) =>
-		assertTxOperationFailureState(t, context, { payload: invalidPayload }),
-	expectedLogs: ['Failed to verify validator message signature.']
+    title: 'State.apply txOperation rejects validator message signature verification failures',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    mutatePayload: (t, validPayload) => mutateValidatorSignature(t, validPayload),
+    applyInvalidPayload: appendInvalidTxPayload,
+    assertStateUnchanged: (t, context, _valid, invalidPayload) =>
+        assertTxOperationFailureState(t, context, { payload: invalidPayload }),
+    expectedLogs: ['Failed to verify validator message signature.']
 }).performScenario();
 
 // indexer sequence + tx validity
 new IndexerSequenceStateInvalidScenario({
-	title: 'State.apply txOperation rejects payloads when indexer sequence state is invalid',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	assertStateUnchanged: (t, context, _valid, invalidPayload) =>
-		assertTxOperationFailureState(t, context, { payload: invalidPayload }),
-	expectedLogs: ['Indexer sequence state is invalid.']
+    title: 'State.apply txOperation rejects payloads when indexer sequence state is invalid',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    assertStateUnchanged: (t, context, _valid, invalidPayload) =>
+        assertTxOperationFailureState(t, context, { payload: invalidPayload }),
+    expectedLogs: ['Indexer sequence state is invalid.']
 }).performScenario();
 
 new TransactionValidityMismatchScenario({
-	title: 'State.apply txOperation rejects payloads when tx validity mismatches indexer state',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	assertStateUnchanged: (t, context, _valid, invalidPayload) =>
-		assertTxOperationFailureState(t, context, { payload: invalidPayload }),
-	txValidityPath: ['txo', 'txv'],
-	rebuildPayloadWithTxValidity: ({ context, mutatedTxValidity }) =>
-		buildTxOperationPayloadWithTxValidity(context, mutatedTxValidity),
-	expectedLogs: ['Transaction was not executed.']
+    title: 'State.apply txOperation rejects payloads when tx validity mismatches indexer state',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    assertStateUnchanged: (t, context, _valid, invalidPayload) =>
+        assertTxOperationFailureState(t, context, { payload: invalidPayload }),
+    txValidityPath: ['txo', 'txv'],
+    rebuildPayloadWithTxValidity: ({ context, mutatedTxValidity }) =>
+        buildTxOperationPayloadWithTxValidity(context, mutatedTxValidity),
+    expectedLogs: ['Transaction was not executed.']
 }).performScenario();
 
 new ValidatorConsistencyScenarioBase({
-	title: 'State.apply txOperation rejects payloads when validator entry is missing',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	assertStateUnchanged: (t, context, _valid, invalidPayload) =>
-		assertTxOperationFailureState(t, context, { payload: invalidPayload }),
-	mutateEntry: () => ValidatorEntryMutation.DELETE,
-	validatorAddressPath: ['txo', 'va'],
-	expectedLogs: ['Incoming validator entry is null.']
+    title: 'State.apply txOperation rejects payloads when validator entry is missing',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    assertStateUnchanged: (t, context, _valid, invalidPayload) =>
+        assertTxOperationFailureState(t, context, { payload: invalidPayload }),
+    mutateEntry: () => ValidatorEntryMutation.DELETE,
+    validatorAddressPath: ['txo', 'va'],
+    expectedLogs: ['Incoming validator entry is null.']
 }).performScenario();
 
 new ValidatorEntryDecodeFailureScenario({
-	title: 'State.apply txOperation rejects payloads when validator entry cannot be decoded',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	assertStateUnchanged: (t, context, _valid, invalidPayload) =>
-		assertTxOperationFailureState(t, context, { payload: invalidPayload, skipSync: true }),
-	validatorAddressPath: ['txo', 'va'],
-	expectedLogs: ['Failed to decode validator entry.']
+    title: 'State.apply txOperation rejects payloads when validator entry cannot be decoded',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    assertStateUnchanged: (t, context, _valid, invalidPayload) =>
+        assertTxOperationFailureState(t, context, { payload: invalidPayload, skipSync: true }),
+    validatorAddressPath: ['txo', 'va'],
+    expectedLogs: ['Failed to decode validator entry.']
 }).performScenario();
 
 new ValidatorInactiveScenario({
-	title: 'State.apply txOperation rejects payloads when validator is not an active writer',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	assertStateUnchanged: (t, context, _valid, invalidPayload) =>
-		assertTxOperationFailureState(t, context, { payload: invalidPayload, skipSync: true }),
-	validatorAddressPath: ['txo', 'va'],
-	expectedLogs: ['Operation validator is not active']
+    title: 'State.apply txOperation rejects payloads when validator is not an active writer',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    assertStateUnchanged: (t, context, _valid, invalidPayload) =>
+        assertTxOperationFailureState(t, context, { payload: invalidPayload, skipSync: true }),
+    validatorAddressPath: ['txo', 'va'],
+    expectedLogs: ['Operation validator is not active']
 }).performScenario();
 
 new ValidatorWriterKeyMismatchScenario({
-	title: 'State.apply txOperation rejects payloads when validator writer key mismatches requester',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	assertStateUnchanged: (t, context, _valid, invalidPayload) =>
-		assertTxOperationFailureState(t, context, { payload: invalidPayload, skipSync: true }),
-	validatorAddressPath: ['txo', 'va'],
-	expectedLogs: ['Validator cannot be the same as requester.']
+    title: 'State.apply txOperation rejects payloads when validator writer key mismatches requester',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    assertStateUnchanged: (t, context, _valid, invalidPayload) =>
+        assertTxOperationFailureState(t, context, { payload: invalidPayload, skipSync: true }),
+    validatorAddressPath: ['txo', 'va'],
+    expectedLogs: ['Validator cannot be the same as requester.']
 }).performScenario();
 
 new OperationAlreadyAppliedScenario({
-	title: 'State.apply txOperation rejects duplicate operations',
-	setupScenario: setupTxOperationScenario,
-	buildValidPayload: buildTxOperationPayload,
-	selectNode: context => context.txOperation?.validatorPeer ?? context.peers?.[1],
-	assertStateUnchanged: (t, context, validPayload) =>
-		assertTxOperationSuccessState(t, context, { payload: validPayload, skipSync: true }),
-	expectedLogs: ['Operation has already been applied.']
+    title: 'State.apply txOperation rejects duplicate operations',
+    setupScenario: setupTxOperationScenario,
+    buildValidPayload: buildTxOperationPayload,
+    selectNode: context => context.txOperation?.validatorPeer ?? context.peers?.[1],
+    assertStateUnchanged: (t, context, validPayload) =>
+        assertTxOperationSuccessState(t, context, { payload: validPayload, skipSync: true }),
+    expectedLogs: ['Operation has already been applied.']
 }).performScenario();
 
 txOperationBootstrapNotRegisteredScenario();

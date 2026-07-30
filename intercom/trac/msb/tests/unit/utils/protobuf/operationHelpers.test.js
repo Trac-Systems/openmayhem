@@ -85,8 +85,8 @@ test('Decode throws on buffer with unknown wire type (skip case)', t => {
     const bufWithWire7 = b4a.from([0x0F]);
     try {
         applyOperations.Operation.decode(bufWithWire7);
+        t.fail('Expected decode to throw on unknown wire type');
     } catch (err) {
-        console.error('Caught error:', err);
         t.ok(err instanceof Error && err.message.includes('Could not decode varint'), 'Should throw an error instance to be thrown for unknown wire type');
     }
 });
@@ -242,8 +242,6 @@ test('Protobuf encode/decode is order-independent for all operation types', t =>
 
 test('encodeV1networkOperation/decodeV1networkOperation roundtrip for network v1 payloads', t => {
     const payloadsHashMap = new Map([
-        ['validatorConnectionRequest', networkV1Fixtures.payloadValidatorConnectionRequest],
-        ['validatorConnectionResponse', networkV1Fixtures.payloadValidatorConnectionResponse],
         ['livenessRequest', networkV1Fixtures.payloadLivenessRequest],
         ['livenessResponse', networkV1Fixtures.payloadLivenessResponse],
         ['broadcastTransactionRequest', networkV1Fixtures.payloadBroadcastTransactionRequest],
@@ -254,7 +252,7 @@ test('encodeV1networkOperation/decodeV1networkOperation roundtrip for network v1
         const encoded = encodeV1networkOperation(payload);
         const decoded = decodeV1networkOperation(encoded);
         t.ok(b4a.isBuffer(encoded) && encoded.length > 0, `Payload ${key} encodes to a non-empty buffer`);
-        t.ok(JSON.stringify(decoded) === JSON.stringify(payload), `Payload ${key} decodes back correctly`);
+        t.alike(decoded, payload, `Payload ${key} decodes back correctly`);
     }
 });
 

@@ -108,11 +108,17 @@ export const registerAccountTests = (context) => {
 
         it("returns 500 on internal error", async () => {
             const originalGetNodeEntry = context.rpcMsb.state.getNodeEntry
+            const failingAddress = randomAddress(context.rpcMsb.config.addressPrefix)
 
-            context.rpcMsb.state.getNodeEntry = async () => { throw new Error("test") }
+            context.rpcMsb.state.getNodeEntry = async (address) => {
+                if (address === failingAddress) {
+                    throw new Error("test")
+                }
+                return originalGetNodeEntry.call(context.rpcMsb.state, address)
+            }
 
             try {
-                const res = await request(context.server).get(`/v1/account/${context.wallet.address}`)
+                const res = await request(context.server).get(`/v1/account/${failingAddress}`)
                 expect(res.statusCode).toBe(500)
                 expect(res.body).toEqual({ error: 'An error occurred processing the request.' })
             } finally {

@@ -1,7 +1,6 @@
 import { test } from 'brittle';
 import b4a from 'b4a';
-import PeerWallet from 'trac-wallet';
-
+import { WalletProvider } from 'trac-wallet';
 import ApplyStateMessageBuilder from '../../../../src/messages/state/ApplyStateMessageBuilder.js';
 import { OperationType } from '../../../../src/utils/constants.js';
 import { config } from '../../../helpers/config.js';
@@ -12,9 +11,7 @@ const hex = (value, bytes) => value.repeat(bytes);
 const toBuf = value => b4a.from(value, 'hex');
 
 async function createWallet(mnemonic) {
-    const wallet = new PeerWallet({ mnemonic, networkPrefix: config.addressPrefix });
-    await wallet.ready;
-    return wallet;
+    return await new WalletProvider(config).fromMnemonic({ mnemonic, derivationPath: config.derivationPath })
 }
 
 function expectBufferField(t, value, bytes, label) {

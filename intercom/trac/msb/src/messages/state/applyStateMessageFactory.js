@@ -3,7 +3,7 @@ import ApplyStateMessageBuilder from "./ApplyStateMessageBuilder.js";
 
 /**
  * Factory helper to create a director with a builder instance.
- * @param {PeerWallet} wallet
+ * @param {IWallet} wallet
  * @param {object} config
  * @returns {ApplyStateMessageDirector}
  */

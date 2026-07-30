@@ -1,11 +1,11 @@
 import sodium from 'sodium-native';
-import {generateMnemonic, mnemonicToSeed} from 'bip39-mnemonic';
 import b4a from 'b4a'
-import PeerWallet from "trac-wallet"
+import tracCryptoApi from 'trac-crypto-api';
+import { WalletProvider, exportWallet } from "trac-wallet"
 import path from 'path';
 import {MainSettlementBus} from '../../src/index.js'
 import { createConfig, ENV } from '../../src/config/env.js'
-import fileUtils from '../../src/utils/fileUtils.js'
+import fileUtils, { verifyWalletPath } from '../../src/utils/fileUtils.js'
 import {EntryType} from '../../src/utils/constants.js';
 import {sleep} from '../../src/utils/helpers.js'
 import {formatIndexersEntry} from '../../src/utils/helpers.js';
@@ -42,26 +42,6 @@ export function randomBytes(num) {
     return buf;
 }
 
-async function randomKeypair() {
-    const keypair = {};
-    const mnemonic = generateMnemonic();
-    const seed = await mnemonicToSeed(mnemonic);
-
-    const publicKey = b4a.alloc(sodium.crypto_sign_PUBLICKEYBYTES);
-    const secretKey = b4a.alloc(sodium.crypto_sign_SECRETKEYBYTES);
-
-    const hash = b4a.alloc(sodium.crypto_hash_sha256_BYTES);
-    sodium.crypto_hash_sha256(hash, b4a.from(seed));
-
-    const seed32 = b4a.from(hash, 'hex');
-
-    sodium.crypto_sign_seed_keypair(publicKey, secretKey, seed32);
-
-    keypair.publicKey = publicKey;
-    keypair.secretKey = secretKey;
-    return keypair;
-}
-
 export const tick = () => new Promise(resolve => setImmediate(resolve));
 
 export async function fundPeer(admin, toFund, amount) {
@@ -82,18 +62,18 @@ export async function fundPeer(admin, toFund, amount) {
 }
 
 export async function initMsbPeer(peerName, peerKeyPair, temporaryDirectory, options = {}) {
-    const peer = await initDirectoryStructure(peerName, peerKeyPair, temporaryDirectory);
-    peer.options = options
-    peer.options.storesDirectory = peer.storesDirectory;
-    peer.options.storeName = peer.storeName;
-    peer.config = createConfig(ENV.DEVELOPMENT, peer.options)
-    const msb = new MainSettlementBus(peer.config);
+    const config = createConfig(ENV.DEVELOPMENT, { ...options, storesDirectory: `${temporaryDirectory}/${peerName}` })
+    const wallet = await initDirectoryStructure(peerKeyPair, config);
+    const peerOptions = { ...options, storesDirectory: config.storesDirectory }
+    const msb = new MainSettlementBus(config, wallet);
 
-    peer.msb = msb;
-    peer.wallet = msb.wallet;
-    peer.name = peerName;
-
-    return peer;
+    return {
+        config,
+        msb,
+        wallet,
+        options: peerOptions,
+        name: peerName
+    }
 }
 
 export async function setupMsbPeer(peerName, peerKeyPair, temporaryDirectory, options = {}) {
@@ -111,7 +91,7 @@ export async function initMsbAdmin(keyPair, temporaryDirectory, options = {}) {
     admin.config = new Config(admin.options, admin.config)
     await admin.msb.close();
 
-    admin.msb = new MainSettlementBus(admin.config);
+    admin.msb = new MainSettlementBus(admin.config, admin.wallet);
     await admin.msb.ready();
     await admin.msb.state.append(null); // before initialization system.indexers is empty, we need to initialize first block to create system.indexers array
     return admin;
@@ -128,39 +108,7 @@ export async function setupMsbAdmin(keyPair, temporaryDirectory, options = {}) {
     return admin;
 }
 
-export async function setupNodeAsWriter(admin, writerCandidate) {
-    try {
-        await setupWhitelist(admin, [writerCandidate.wallet.address]); // ensure if is whitelisted
-
-        const validity = await admin.msb.getIndexerSequenceState()
-        const req = await applyStateMessageFactory(writerCandidate.wallet, admin.config)
-            .buildPartialAddWriterMessage(
-                writerCandidate.wallet.address,
-                b4a.toString(writerCandidate.msb.state.writingKey, 'hex'),
-                b4a.toString(validity, 'hex'),
-                'json'
-            );
-
-        await waitWritable(admin, writerCandidate, async () => {
-            const payload = await applyStateMessageFactory(admin.wallet, admin.config)
-                .buildCompleteAddWriterMessage(
-                    admin.wallet.address,
-                    b4a.from(req.rao.tx, 'hex'),
-                    b4a.from(req.rao.txv, 'hex'),
-                    b4a.from(req.rao.iw, 'hex'),
-                    b4a.from(req.rao.in, 'hex'),
-                    b4a.from(req.rao.is, 'hex')
-                );
-            await admin.msb.state.append(safeEncodeApplyOperation(payload))
-        })
-
-        return writerCandidate;
-    } catch (error) {
-        throw new Error('Error setting up MSB writer: ', error.message || error);
-    }
-}
-
-export async function promoteToWriter(admin, writerCandidate) {
+async function promoteToWriter(admin, writerCandidate) {
     await setupWhitelist(admin, [writerCandidate.wallet.address]);
     await waitForNodeState(writerCandidate,
         writerCandidate.wallet.address,
@@ -207,9 +155,9 @@ export async function setupMsbWriter(admin, peerName, peerKeyPair, temporaryDire
 
 export async function setupMsbIndexer(indexerCandidate, admin) {
     try {
-    const validity = await admin.msb.state.getIndexerSequenceState()
-    const payload = await applyStateMessageFactory(admin.wallet, admin.config)
-        .buildCompleteAddIndexerMessage(admin.wallet.address, indexerCandidate.wallet.address, validity);
+        const validity = await admin.msb.state.getIndexerSequenceState()
+        const payload = await applyStateMessageFactory(admin.wallet, admin.config)
+            .buildCompleteAddIndexerMessage(admin.wallet.address, indexerCandidate.wallet.address, validity);
 
         await admin.msb.state.append(safeEncodeApplyOperation(payload));
         await tick(); // wait for the request to be processed
@@ -276,8 +224,8 @@ export async function initTemporaryDirectory() {
     await ensureEnvReady();
     const tmpDir = os.tmpdir();
     const unique = `tempTestStore-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const temporaryDirectory = path.join(tmpDir, unique);
-    await fsp.mkdir(temporaryDirectory, {recursive: true});
+    const temporaryDirectory = path.join(tmpDir, unique, 'stores');
+    await fsp.mkdir(temporaryDirectory, { recursive: true });
     console.log('temporary directory: ', temporaryDirectory);
     return temporaryDirectory;
 }
@@ -287,27 +235,20 @@ export async function removeTemporaryDirectory(temporaryDirectory) {
     await fsp.rm(temporaryDirectory, {recursive: true, force: true})
 }
 
-export async function initDirectoryStructure(peerName, keyPair, temporaryDirectory) {
+export async function initDirectoryStructure(keyPair, config) {
     try {
         await ensureEnvReady();
-        const storesDirectory = temporaryDirectory + '/stores/';
-        const storeName = peerName + '/';
-        const corestoreDbDirectory = path.join(storesDirectory, storeName, 'db');
-        await fsp.mkdir(corestoreDbDirectory, {recursive: true});
+        await fsp.mkdir(config.keyPairDirectoryPath, { recursive: true });
 
-        const keypath = path.join(corestoreDbDirectory, 'keypair.json');
         if (!keyPair || !keyPair.publicKey || !keyPair.secretKey) {
-            keyPair = await randomKeypair();
+            keyPair = await new WalletProvider(config).generate({ derivationPath: config.derivationPath });
         }
-        const wallet = new PeerWallet(keyPair)
-        await wallet.ready
-        await wallet.exportToFile(keypath)
-        return {
-            storesDirectory,
-            storeName,
-            corestoreDbDirectory,
-            keypath,
+
+        const wallet = await new WalletProvider(config).fromSecretKey(keyPair.secretKey)
+        if (!verifyWalletPath(config)) {
+            await exportWallet(wallet, config.keyPairPath)
         }
+        return wallet
     } catch (error) {
         throw new Error('Error creating directory structure: ' + error)
     }
@@ -316,7 +257,7 @@ export async function initDirectoryStructure(peerName, keyPair, temporaryDirecto
 export const deployExternalBootstrap = async (writer, externalNode) => {
     const externalBootstrap = randomBytes(32).toString('hex');
     const txValidity = await writer.msb.state.getIndexerSequenceState();
-    const payload = await applyStateMessageFactory(externalNode.msb.wallet, admin.config)
+    const payload = await applyStateMessageFactory(externalNode.msb.wallet, externalNode.config)
         .buildPartialBootstrapDeploymentMessage(
             externalNode.msb.wallet.address,
             externalBootstrap,
@@ -325,7 +266,7 @@ export const deployExternalBootstrap = async (writer, externalNode) => {
             'json'
         );
 
-    const rawPayload = await applyStateMessageFactory(writer.msb.wallet, admin.config)
+    const rawPayload = await applyStateMessageFactory(writer.msb.wallet, externalNode.config)
         .buildCompleteBootstrapDeploymentMessage(
             payload.address,
             b4a.from(payload.bdo.tx, 'hex'),
@@ -355,9 +296,9 @@ export const generatePostTx = async (writer, externalNode, externalContractBoots
         }
     };
 
-    const contentHash = await PeerWallet.blake3(JSON.stringify(testObj));
+    const contentHash = await tracCryptoApi.hash.blake3(JSON.stringify(testObj));
     const validity = await writer.msb.state.getIndexerSequenceState()
-    const tx = await applyStateMessageFactory(externalNode.wallet, admin.config)
+    const tx = await applyStateMessageFactory(externalNode.wallet, externalNode.config)
         .buildPartialTransactionOperationMessage(
             externalNode.wallet.address,
             peerWriterKey,
@@ -368,7 +309,7 @@ export const generatePostTx = async (writer, externalNode, externalContractBoots
             'json'
         )
 
-    const postTxPayload = await applyStateMessageFactory(writer.wallet, admin.config)
+    const postTxPayload = await applyStateMessageFactory(writer.wallet, externalNode.config)
         .buildCompleteTransactionOperationMessage(
             tx.address,
             b4a.from(tx.txo.tx, 'hex'),
@@ -394,7 +335,7 @@ export const generatePostTx = async (writer, externalNode, externalContractBoots
  */
 export const tryToSyncWriters = async (...args) => {
     try {
-        const [first, ..._] = args
+        const [first] = args
         await first.msb.state.base.forceFastForward()
         await first.msb.state.base.view.update()
         let attempts = 0;
@@ -431,7 +372,7 @@ export async function waitForNotIndexer(indexer) {
             if (!indexersEntry) {
                 notIndexer = true;
             } else {
-                const formatted = formatIndexersEntry(indexersEntry, admin.config.addressLength);
+                const formatted = formatIndexersEntry(indexersEntry, indexer.config.addressLength);
                 if (!formatted || !formatted.addresses) {
                     notIndexer = true;
                 } else if (!formatted.addresses.includes(indexer.wallet.address)) {
@@ -578,7 +519,7 @@ export async function waitForIndexersEntry(node, expected) {
                 await sleep(250);
                 continue;
             }
-            const formatted = formatIndexersEntry(indexersEntry, admin.config.addressLength);
+            const formatted = formatIndexersEntry(indexersEntry, node.config.addressLength);
             if (formatted && formatted.addresses && formatted.addresses.includes(expected.address)) {
                 break;
             }

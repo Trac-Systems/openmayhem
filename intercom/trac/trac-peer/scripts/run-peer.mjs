@@ -1,6 +1,7 @@
 import b4a from "b4a";
 import path from "path";
 import fs from "fs";
+import process from "process";
 import PeerWallet from "trac-wallet";
 import { Peer, Wallet, createConfig as createPeerConfig, ENV as PEER_ENV } from "../src/index.js";
 import { MainSettlementBus } from "trac-msb/src/index.js";
@@ -9,24 +10,23 @@ import { startRpcServer } from "../rpc/rpc_server.js";
 import { DEFAULT_RPC_HOST, DEFAULT_RPC_PORT, DEFAULT_MAX_BODY_BYTES } from "../rpc/constants.js";
 import { Terminal } from "../src/terminal/index.js";
 import { ensureTextCodecs } from "../src/textCodec.js";
-import PokemonProtocol from "../dev/pokemonProtocol.js";
-import PokemonContract from "../dev/pokemonContract.js";
-
-let process = globalThis.process;
-if (globalThis.Pear !== undefined) {
-  const { default: bareProcess } = await import("bare-process");
-  process = bareProcess;
-}
+import TuxemonProtocol from "../dev/tuxemonProtocol.js";
+import TuxemonContract from "../dev/tuxemonContract.js";
 
 const pearApp = typeof Pear !== "undefined" ? (Pear.app ?? Pear.config) : undefined;
 const runtimeArgs = typeof process !== "undefined" ? process.argv.slice(2) : [];
 const argv = pearApp?.args ?? runtimeArgs;
 const positionalStoreName = argv.find((a) => a !== undefined && !String(a).startsWith("--")) ?? null;
 
-const createMsb = (options) => {
-  const config = createMsbConfig(MSB_ENV.MAINNET, options)
-  return new MainSettlementBus(config);
-}
+const resolveEnvironment = (network) => {
+  if (network === PEER_ENV.DEVELOPMENT) {
+    return { peer: PEER_ENV.DEVELOPMENT, msb: MSB_ENV.DEVELOPMENT };
+  }
+  if (network === PEER_ENV.TESTNET1 || network === "testnet") {
+    return { peer: PEER_ENV.TESTNET1, msb: MSB_ENV.TESTNET1 };
+  }
+  return { peer: PEER_ENV.MAINNET, msb: MSB_ENV.MAINNET };
+};
 
 const toArgMap = (argv) => {
   const out = {};
@@ -54,17 +54,26 @@ const toArgMap = (argv) => {
 
 const ensureTrailingSlash = (value) => (value.endsWith("/") ? value : `${value}/`);
 
-const ensureKeypairFile = async (keyPairPath) => {
-  if (fs.existsSync(keyPairPath)) return;
+const loadOrCreateWallet = async (keyPairPath, walletOptions) => {
   fs.mkdirSync(path.dirname(keyPairPath), { recursive: true });
   await ensureTextCodecs();
-  const wallet = new PeerWallet();
+  const wallet = new PeerWallet(walletOptions);
   await wallet.ready;
+  if (fs.existsSync(keyPairPath)) {
+    wallet.importFromFile(keyPairPath, b4a.alloc(0));
+    return wallet;
+  }
   if (!wallet.secretKey) {
-    await wallet.generateKeyPair();
+    await wallet.generateKeyPair(null, walletOptions?.derivationPath ?? null);
     await wallet.ready;
   }
   wallet.exportToFile(keyPairPath, b4a.alloc(0));
+  return wallet;
+};
+
+const ensureKeypairFile = async (keyPairPath, walletOptions) => {
+  if (fs.existsSync(keyPairPath)) return;
+  await loadOrCreateWallet(keyPairPath, walletOptions);
 };
 
 const readHexFile = (filePath, byteLength) => {
@@ -78,6 +87,11 @@ const readHexFile = (filePath, byteLength) => {
 };
 
 const args = toArgMap(argv);
+const selectedEnvironment = resolveEnvironment(
+  (args["network"] && String(args["network"]).trim().toLowerCase()) ||
+  (process.env.NETWORK && String(process.env.NETWORK).trim().toLowerCase()) ||
+  PEER_ENV.MAINNET
+);
 
 const rpcEnabled =
   args["rpc"] === true || args["rpc"] === "true" || process.env.PEER_RPC === "true" || process.env.PEER_RPC === "1";
@@ -172,18 +186,6 @@ if (!msbBootstrapHex || !msbChannel) {
 // trac-peer currently requires an MSB instance to broadcast and to observe confirmed state.
 
 const effectiveMsbStoreName = msbStoreName ?? `${peerStoreNameRaw}-msb`;
-const msbStoresFullPath = path.join(ensureTrailingSlash(msbStoresDirectory), effectiveMsbStoreName);
-const msbKeyPairPath = path.join(msbStoresFullPath, "db", "keypair.json");
-await ensureKeypairFile(msbKeyPairPath);
-
-const peerKeyPairPath = path.join(
-  peerStoresDirectory,
-  peerStoreNameRaw,
-  "db",
-  "keypair.json"
-);
-
-await ensureKeypairFile(peerKeyPairPath);
 
 const subnetBootstrapFile = path.join(
   peerStoresDirectory,
@@ -208,11 +210,20 @@ if (subnetBootstrap) {
   }
 }
 
-const msb = createMsb({ bootstrap: msbBootstrap, channel: msbChannel, storeName: effectiveMsbStoreName, storesDirectory: msbStoresDirectory})
-await msb.ready();
+const msbConfig = createMsbConfig(selectedEnvironment.msb, {
+  bootstrap: msbBootstrap,
+  channel: msbChannel,
+  storeName: effectiveMsbStoreName,
+  storesDirectory: msbStoresDirectory,
+});
+const walletOptions = {
+  networkPrefix: msbConfig.addressPrefix,
+  derivationPath: msbConfig.derivationPath
+};
+const msbWallet = await loadOrCreateWallet(msbConfig.keyPairPath, walletOptions);
+const msb = new MainSettlementBus(msbConfig, msbWallet);
 
-// DevProtocol and DevContract moved to shared src files
-const peerConfig = createPeerConfig(PEER_ENV.MAINNET, {
+const peerConfig = createPeerConfig(selectedEnvironment.peer, {
   storesDirectory: ensureTrailingSlash(peerStoresDirectory),
   storeName: peerStoreNameRaw,
   bootstrap: subnetBootstrap ? b4a.from(subnetBootstrap, "hex") : null,
@@ -221,12 +232,17 @@ const peerConfig = createPeerConfig(PEER_ENV.MAINNET, {
   apiTxExposed: apiTxExposedEffective,
 });
 
+await ensureKeypairFile(peerConfig.keyPairPath, walletOptions);
+await msb.ready();
+
+// DevProtocol and DevContract moved to shared src files
+
 const peer = new Peer({
   config: peerConfig,
   msb,
-  wallet: new Wallet(),
-  protocol: PokemonProtocol,
-  contract: PokemonContract,
+  wallet: new Wallet(walletOptions),
+  protocol: TuxemonProtocol,
+  contract: TuxemonContract,
 });
 await peer.ready();
 
@@ -277,8 +293,16 @@ if (peer.config.enableInteractiveMode) {
   console.log("Interactive CLI disabled.");
 }
 
-process.on("SIGINT", async () => {
+let shuttingDown = false;
+
+const shutdown = async (signal) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
   if (rpcServer) await new Promise((resolve) => rpcServer.close(resolve));
   await Promise.allSettled([peer.close(), msb.close()]);
-  process.exit(130);
-});
+  process.exit(signal === "SIGINT" ? 130 : 143);
+};
+
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));

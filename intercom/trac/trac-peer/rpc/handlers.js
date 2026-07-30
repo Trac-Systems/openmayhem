@@ -5,7 +5,7 @@ import {
   getState,
   getContractSchema,
   contractGenerateNonce,
-  contractPrepareTx,
+  contractTxContext,
   contractTx,
 } from "./services.js";
 
@@ -36,14 +36,8 @@ export async function handleContractNonce({ respond, peer }) {
   respond(200, { nonce });
 }
 
-export async function handleContractPrepareTx({ req, respond, peer, maxBodyBytes }) {
-  const body = await readJsonBody(req, { maxBytes: maxBodyBytes });
-  if (!body || typeof body !== "object") return respond(400, { error: "Missing JSON body." });
-  const payload = await contractPrepareTx(peer, {
-    prepared_command: body.prepared_command,
-    address: body.address,
-    nonce: body.nonce,
-  });
+export async function handleContractTxContext({ req, respond, peer, maxBodyBytes }) {
+  const payload = await contractTxContext(peer);
   respond(200, payload);
 }
 

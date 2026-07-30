@@ -15,12 +15,14 @@ import { handlerFor } from './operations/index.js';
 import TransactionPool from './transaction/transactionPool.js';
 import { TransactionObserver } from './tasks/transactionObserver.js';
 import { Updater } from './tasks/updater.js';
+export { ensureTextCodecs } from './textCodec.js';
 export {default as Protocol} from "./artifacts/protocol.js";
 export {default as Contract} from "./artifacts/contract.js";
 export {default as Feature} from "./artifacts/feature.js";
 export {default as Wallet} from "./wallet.js";
 export { ENV, createConfig } from './config/env.js';
 export { Config } from './config/config.js';
+export { Terminal } from './terminal/index.js';
 
 export class Peer extends ReadyResource {
     constructor(options) {
@@ -32,7 +34,6 @@ export class Peer extends ReadyResource {
 
         this.keyPair = null;
         this.store = new Corestore(this.config.fullStoresDirectory, {
-            // MAYHEM PATCH: keep sparse peer Corestore memory bounded under relay load.
             globalCache: new Rache({ maxSize: this.config.hyperbeeCacheMaxEntries })
         });
         this.msbClient = new MsbClient(msb);
@@ -44,15 +45,13 @@ export class Peer extends ReadyResource {
         this.updaterTask = null;
         this.writerLocalKey = null;
 
-        this.wallet = wallet        
+        this.wallet = wallet
         this.protocol = { Class: protocol, instance: null }
         this.contract = { Class: contract, instance: null }
         this.features = features || [];
-        
+
         // In bare runtime, Buffer#fill(undefined) throws; default to 0 when channel not provided.
         this.bee = null;
-        this.connectedNodes = 1;
-        this.connectedPeers = new Set();
         this.readlineInstance = readlineInstance || null;
     }
 
@@ -240,18 +239,12 @@ export class Peer extends ReadyResource {
                     tryInvite().catch(() => {});
                 }
 
-                const remotePublicKey = b4a.toString(connection.remotePublicKey, 'hex');
-
-                this.connectedPeers.add(remotePublicKey);
                 const stream = this.store.replicate(connection);
                 stream.on('error', (error) => { });
                 wakeup.addStream(stream);
-                this.connectedNodes++;
 
                 connection.on('close', () => {
                     try{ message_channel.close() }catch(e){}
-                    this.connectedNodes--;
-                    this.connectedPeers.delete(remotePublicKey);
                 });
 
                 connection.on('error', (error) => { });

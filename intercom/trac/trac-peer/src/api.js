@@ -225,19 +225,20 @@ export class ProtocolApi {
         let _tx = await this.generateTx(address, content_hash, nonce);
         if(tx !== _tx) throw new Error('Invalid TX.');
         const surrogate = { tx : _tx, nonce : ''+nonce, signature : ''+signature, address : ''+address };
-        let res = false;
-        try{
-            res = await this.peer.protocol.instance.broadcastTransaction({
+        const res = await this.peer.protocol.instance.broadcastTransaction(
+            {
                 type: prepared_command.type,
                 value: prepared_command.value
-            }, sim === true, surrogate);
-        } catch(e){ console.log(e) }
-        if(res !== false) {
+            },
+            sim === true,
+            surrogate
+        );
+
+        if (sim === true) {
             const err = this.peer.protocol.instance.getError(res);
-            if (null !== err) {
-                console.log(err.message);
-            }
+            if (null !== err) throw err;
         }
+
         return res;
     }
 

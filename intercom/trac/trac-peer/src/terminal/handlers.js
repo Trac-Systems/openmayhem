@@ -1,4 +1,5 @@
 import b4a from "b4a";
+import process from "process";
 import { createMessage } from 'trac-msb/src/utils/buffer.js';
 import { blake3 } from '@tracsystems/blake3';
 import { MSB_OPERATION_TYPE } from '../msbClient.js';
@@ -486,7 +487,7 @@ class TerminalHandlers {
         console.log('Exiting...');
         if(rl) rl.close();
         await this.#peer.close();
-        typeof process !== "undefined" ? process.exit(0) : Pear.exit(0);
+        process.exit(0);
         return { exit: true };
     }
 }

@@ -5,8 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 
 import b4a from 'b4a';
-import { Peer, createConfig, ENV } from '../trac/trac-peer/src/index.js';
-import Wallet from '../trac/trac-peer/src/wallet.js';
+import { Peer, createConfig, ENV } from 'trac-peer/src/index.js';
+import Wallet from 'trac-peer/src/wallet.js';
 
 class TestProtocol {
   async extendApi() {}

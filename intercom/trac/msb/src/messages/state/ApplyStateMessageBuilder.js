@@ -1,5 +1,5 @@
 import b4a from 'b4a';
-import PeerWallet from 'trac-wallet';
+import tracCryptoApi from 'trac-crypto-api';
 
 import { createMessage } from '../../utils/buffer.js';
 import { OperationType } from '../../utils/constants.js';
@@ -22,8 +22,8 @@ import { isHexString } from '../../utils/helpers.js';
 
 /**
  * Builder for partial/complete ApplyState messages.
- * @param {PeerWallet} wallet
- * @param {object} config
+ * @param {IWallet} wallet
+ * @param {Config} config
  */
 class ApplyStateMessageBuilder {
     #address;
@@ -257,7 +257,7 @@ class ApplyStateMessageBuilder {
             throw new Error(`Operation type ${this.#operationType} is not supported for partial build.`);
         }
 
-        const nonce = PeerWallet.generateNonce();
+        const nonce = tracCryptoApi.nonce.generate();
         let msg;
 
         switch (this.#operationType) {
@@ -329,7 +329,7 @@ class ApplyStateMessageBuilder {
                 throw new Error(`Unsupported operation type: ${this.#operationType}`);
         }
 
-        const tx = await PeerWallet.blake3(msg);
+        const tx = await tracCryptoApi.hash.blake3(msg);
         const signature = this.#wallet.sign(tx);
 
         if (isBootstrapDeployment(this.#operationType)) {
@@ -378,7 +378,7 @@ class ApplyStateMessageBuilder {
     }
 
     async #buildCompleteBody() {
-        const nonce = PeerWallet.generateNonce();
+        const nonce = tracCryptoApi.nonce.generate();
         let msg;
 
         switch (this.#operationType) {
@@ -503,7 +503,7 @@ class ApplyStateMessageBuilder {
                 throw new Error(`Unsupported operation type: ${this.#operationType}`);
         }
 
-        const tx = await PeerWallet.blake3(msg);
+        const tx = await tracCryptoApi.hash.blake3(msg);
         const signature = this.#wallet.sign(tx);
         const validatorAddress = addressToBuffer(this.#wallet.address, this.#config.addressPrefix);
 

@@ -1,0 +1,889 @@
+openapi: 3.0.3
+info:
+  title: Trac Network RPC API
+  version: "1.0.2"
+  description: |
+    OpenAPI specification for Trac Network mainnet RPC endpoints (`v1`).
+
+    This file is optimized for GitBook API Reference import and reflects
+    current behavior of handlers in `rpc/`.
+servers:
+  - url: https://tracapi.trac.network
+    description: Trac Network Mainnet
+tags:
+  - name: Wallet
+  - name: Network
+  - name: Transactions
+
+paths:
+  /v1/health:
+      get:
+        tags: [Network]
+        summary: Check API health status
+        description: Returns the connectivity status of the RPC node based on the internal MSB state.
+        responses:
+          "200":
+            description: Service is healthy and synchronized.
+            content:
+              application/json:
+                schema:
+                  $ref: "#/components/schemas/HealthResponse"
+          "503":
+            description: Service Unavailable - RPC node is down or state is initializing.
+            content:
+              application/json:
+                schema:
+                  $ref: "#/components/schemas/ErrorResponse"
+                example:
+                  error: "Could not connect to RPC server"
+
+  /v1/balance/{address}:
+    get:
+      tags: [Wallet]
+      summary: Get wallet balance
+      description: |
+        Returns balance for the specified wallet address.
+
+        `confirmed` query behavior:
+        - missing: defaults to confirmed view
+        - `true`: confirmed view
+        - `false`: unconfirmed view
+        - any other value: falls back to unconfirmed view
+      parameters:
+        - $ref: "#/components/parameters/AddressParam"
+        - $ref: "#/components/parameters/ConfirmedQueryParamLenient"
+      responses:
+        "200":
+          description: Balance returned successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BalanceResponse"
+              examples:
+                success:
+                  value:
+                    address: trac1hyg3mv57fph35qev4xsa74n7rey2lkg9puq9yzq6aq84r023ldcqyk889z
+                    balance: "782500000000000000"
+                unknownAddress:
+                  value:
+                    address: trac1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq
+                    balance: "0"
+        "400":
+          description: Missing address.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: Wallet address is required
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/account/{address}:
+    get:
+      tags: [Wallet]
+      summary: Get account details
+      description: |
+        Returns account details (roles, keys, balances and license).
+
+        `confirmed` must be exactly `true` or `false`.
+      parameters:
+        - $ref: "#/components/parameters/AddressParam"
+        - $ref: "#/components/parameters/ConfirmedQueryParamStrict"
+      responses:
+        "200":
+          description: Account details returned successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AccountDetailsResponse"
+              examples:
+                existing:
+                  value:
+                    address: trac1xljl28ugeskpcswxdxlsx7f9n7jtt5pxusf6qmq08na0j30f6n9smus3rh
+                    writingKey: "0000000000000000000000000000000000000000000000000000000000000000"
+                    isWhitelisted: false
+                    isValidator: false
+                    isIndexer: false
+                    license: null
+                    balance: "49630000000000000000"
+                    stakedBalance: "0"
+                writerAssigned:
+                  value:
+                    address: trac1exampleaddressxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+                    writingKey: "5d9683f6f39d7a0ce7f88d7a6de7c57e6d6e1c8e9571f8d18a6d13ad2d7c48af"
+                    isWhitelisted: true
+                    isValidator: true
+                    isIndexer: false
+                    license: "2"
+                    balance: "1000000000000000000"
+                    stakedBalance: "300000000000000000"
+                notFound:
+                  value:
+                    address: trac1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq
+                    writingKey: "0000000000000000000000000000000000000000000000000000000000000000"
+                    isWhitelisted: false
+                    isValidator: false
+                    isIndexer: false
+                    license: null
+                    balance: "0"
+                    stakedBalance: "0"
+        "400":
+          description: Invalid address or invalid `confirmed` parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                missingAddress:
+                  value:
+                    error: Account address is required
+                invalidAddress:
+                  value:
+                    error: Invalid account address format
+                invalidConfirmed:
+                  value:
+                    error: Parameter "confirmed" must be exactly "true" or "false"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/txv:
+    get:
+      tags: [Network]
+      summary: Get current TXV
+      description: Returns the current transaction validity hash (`txv`) as hex.
+      responses:
+        "200":
+          description: TXV returned successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxvResponse"
+              example:
+                txv: 54f57c8d3c4fb3e653201aa9a040e3f673e80c939a95f0a477b18fe51dbfd186
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/fee:
+    get:
+      tags: [Network]
+      summary: Get current transaction fee
+      responses:
+        "200":
+          description: Fee returned successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FeeResponse"
+              example:
+                fee: "30000000000000000"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/confirmed-length:
+    get:
+      tags: [Network]
+      summary: Get confirmed ledger length
+      responses:
+        "200":
+          description: Confirmed length returned successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfirmedLengthResponse"
+              example:
+                confirmed_length: 63
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/unconfirmed-length:
+    get:
+      tags: [Network]
+      summary: Get unconfirmed ledger length
+      responses:
+        "200":
+          description: Unconfirmed length returned successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UnconfirmedLengthResponse"
+              example:
+                unconfirmed_length: 63
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/broadcast-transaction:
+    post:
+      tags: [Transactions]
+      summary: Broadcast signed transaction
+      description: |
+        Broadcasts a signed transaction payload.
+
+        Request requirements:
+        - body must be valid JSON
+        - body must contain `payload`
+        - `payload` must be valid Base64 string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BroadcastTransactionRequest"
+            example:
+              payload: BASE64_ENCODED_TRANSACTION
+      responses:
+        "200":
+          description: Transaction accepted and broadcasted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BroadcastTransactionResponse"
+              example:
+                result:
+                  message: Transaction broadcasted successfully.
+                  signedLength: 123
+                  unsignedLength: 122
+                  tx: 6641baabac7e4815815876f90a7529f230a3d996209561803c1e05789b06c300
+        "400":
+          description: Invalid request payload.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                missing:
+                  value:
+                    error: Payload is missing.
+                invalidBase64:
+                  value:
+                    error: Payload must be a valid base64 string.
+                invalidJson:
+                  value:
+                    error: Invalid JSON payload.
+        "429":
+          description: Broadcast retry limit reached.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: Failed to broadcast transaction after multiple attempts.
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                generic:
+                  value:
+                    error: An error occurred processing the transaction.
+                streamError:
+                  value:
+                    error: Request stream failed during body transfer.
+
+  /v1/tx-hashes/{start_confirmed_length}/{end_confirmed_length}:
+    get:
+      tags: [Transactions]
+      summary: Get transaction hashes by confirmed-length range
+      description: |
+        Returns transaction hashes in inclusive range.
+
+        Rules:
+        - both params must be integers
+        - both params must be non-negative
+        - end must be greater than or equal to start
+        - max difference is 1000
+      parameters:
+        - $ref: "#/components/parameters/StartConfirmedLengthParam"
+        - $ref: "#/components/parameters/EndConfirmedLengthParam"
+      responses:
+        "200":
+          description: Hashes returned successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxHashesResponse"
+              example:
+                hashes:
+                  - hash: 6641baabac7e4815815876f90a7529f230a3d996209561803c1e05789b06c300
+                    confirmed_length: 11
+                  - hash: 2acc0ca12abad63222e06193820cf1ee8599aeb7d720d57ffad0311a0cd27a4a
+                    confirmed_length: 15
+        "400":
+          description: Invalid range parameters.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                integer:
+                  value:
+                    error: Params must be integer
+                nonNegative:
+                  value:
+                    error: Params must be non-negative
+                order:
+                  value:
+                    error: endSignedLength must be greater than or equal to startSignedLength.
+                maxRange:
+                  value:
+                    error: The max range for signedLength must be 1000.
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/tx/{transactionHash}:
+    get:
+      tags: [Transactions]
+      summary: Get confirmed transaction details
+      description: |
+        Returns normalized details for confirmed transaction hash.
+
+        Current handler behavior:
+        - if not found, returns `404` with `{ "txDetails": null }`
+        - hash format is not strictly validated at handler layer
+      parameters:
+        - $ref: "#/components/parameters/TransactionHashParamLoose"
+      responses:
+        "200":
+          description: Transaction details returned successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxDetailsResponse"
+              example:
+                txDetails:
+                  type: 13
+                  address: trac1xljl28ugeskpcswxdxlsx7f9n7jtt5pxusf6qmq08na0j30f6n9smus3rh
+                  tro:
+                    tx: 0b4d1c1dac48af13212f616601d7399457476a0b644850875b7f4b79df6ff89c
+                    txv: 54f57c8d3c4fb3e653201aa9a040e3f673e80c939a95f0a477b18fe51dbfd186
+                    to: trac1fxmkmd4p4sn7aqsya7tuuc9dzhs4zp8pnwfz8msnyfvf5n6g0lqqg6uz0a
+                    am: "1000000000000000000"
+                    in: 40bb3aca8b4fda5afa8bc1558843ff81727d9ccc84953050d3359c0e5733dc69
+                    is: 2f3639d487bc502961a80240f9ab4adbc671eb93ba08286383a615a4cfa95826b57b4b339502eae3de5a6b7bfd080cd0d68ffa2c042453a308ca9afc5e8c100b
+                    va: trac1hyg3mv57fph35qev4xsa74n7rey2lkg9puq9yzq6aq84r023ldcqyk889z
+                    vn: b68a83b508ffa35b1984c1835905b2ba8ab230a202cf62f3d58e109f77f97804
+                    vs: ab3b4049a552b0b1a1a455e4b1f33c367a86f0312ba5c08050fdac1446a927236b43d79f4d16c260b5dbe96b4b1355dddc9c16174b9c2ed813368e33acf8600f
+        "404":
+          description: Transaction not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxDetailsNotFoundResponse"
+              example:
+                txDetails: null
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+
+  /v1/tx-payloads-bulk:
+    post:
+      tags: [Transactions]
+      summary: Get transaction payloads in bulk
+      description: |
+        Returns payloads for provided transaction hash list.
+
+        Limits:
+        - max `1500` hashes per request
+        - request body limit: `1_000_000` bytes
+        - response body limit: `2_000_000` bytes
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TxPayloadsBulkRequest"
+            example:
+              hashes:
+                - d9ecb7020563f99cc171a1fa3d57e05ed001fac5ca58789f7a21cd1afdceb05b
+                - test
+      responses:
+        "200":
+          description: Payloads returned successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxPayloadsBulkResponse"
+              example:
+                results:
+                  - hash: d9ecb7020563f99cc171a1fa3d57e05ed001fac5ca58789f7a21cd1afdceb05b
+                    payload:
+                      type: 5
+                      address: trac1j79k35xyz2v8zzw59xdlyptj56yd47zjdtmyq3mcd073t0c5kjjqfrr05t
+                      tro:
+                        tx: d9ecb7020563f99cc171a1fa3d57e05ed001fac5ca58789f7a21cd1afdceb05b
+                        txv: f8f8f5ae1a45aee14ea196e3ed97bbb2fb52708cb775de24c4b2b9af86a70624
+                        to: trac1fxmkmd4p4sn7aqsya7tuuc9dzhs4zp8pnwfz8msnyfvf5n6g0lqqg6uz0a
+                        am: "1000000000000000000"
+                        in: 0936963ac9e56707b27e0d215cdb6deeb4f654f26e1516373f49c417c3b57df8
+                        is: 4e4b056f083a49de45a4ca5d0f8ddf5b813b5ecceaaea969a191ff491f5b68a3faa5f9d5dbdf907550b1e50da1293c64b6604a77caeba7fe448ff82efb66070c
+                        va: trac1hyg3mv57fph35qev4xsa74n7rey2lkg9puq9yzq6aq84r023ldcqyk889z
+                        vn: 8a1eb8d0923e662bb6f2082931b3b7132a94bff3e5beb68a9c72c37cd6e82d14
+                        vs: 9d141b9e891fc0d837db79ab36417c4dc530c80556896111ae5611af4f54c2259b1a37c1815efa2c59381db0c537c132b031253b846244c492cd8c3052b96708
+                missing:
+                  - test
+        "400":
+          description: Invalid request body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                missingPayload:
+                  value:
+                    error: Missing payload.
+                invalidPayload:
+                  value:
+                    error: Invalid payload.
+                missingHashList:
+                  value:
+                    error: Missing hash list.
+                invalidFormat:
+                  value:
+                    error: Invalid request body format.
+        "413":
+          description: Request/response size limits exceeded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                requestTooLarge:
+                  value:
+                    error: Request body too large.
+                tooManyHashes:
+                  value:
+                    error: Too many hashes. Max 1500 allowed per request.
+                responseTooLarge:
+                  value:
+                    error: Response too large. Reduce number of hashes.
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                generic:
+                  value:
+                    error: An internal error occurred.
+                streamError:
+                  value:
+                    error: Request stream failed during body transfer.
+
+  /v1/tx/details/{transactionHash}:
+    get:
+      tags: [Transactions]
+      summary: Get transaction details with confirmation metadata
+      description: |
+        Returns transaction details with `confirmed_length` and `fee`.
+
+        `confirmed` must be exactly `true` or `false`.
+      parameters:
+        - $ref: "#/components/parameters/TransactionHashParamStrict"
+        - $ref: "#/components/parameters/ConfirmedQueryParamStrict"
+      responses:
+        "200":
+          description: Transaction details returned successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TxDetailsWithMetaResponse"
+              example:
+                txDetails:
+                  type: 13
+                  address: trac1xljl28ugeskpcswxdxlsx7f9n7jtt5pxusf6qmq08na0j30f6n9smus3rh
+                  tro:
+                    tx: 0b4d1c1dac48af13212f616601d7399457476a0b644850875b7f4b79df6ff89c
+                    txv: 54f57c8d3c4fb3e653201aa9a040e3f673e80c939a95f0a477b18fe51dbfd186
+                    to: trac1fxmkmd4p4sn7aqsya7tuuc9dzhs4zp8pnwfz8msnyfvf5n6g0lqqg6uz0a
+                    am: "1000000000000000000"
+                    in: 40bb3aca8b4fda5afa8bc1558843ff81727d9ccc84953050d3359c0e5733dc69
+                    is: 2f3639d487bc502961a80240f9ab4adbc671eb93ba08286383a615a4cfa95826b57b4b339502eae3de5a6b7bfd080cd0d68ffa2c042453a308ca9afc5e8c100b
+                    va: trac1hyg3mv57fph35qev4xsa74n7rey2lkg9puq9yzq6aq84r023ldcqyk889z
+                    vn: b68a83b508ffa35b1984c1835905b2ba8ab230a202cf62f3d58e109f77f97804
+                    vs: ab3b4049a552b0b1a1a455e4b1f33c367a86f0312ba5c08050fdac1446a927236b43d79f4d16c260b5dbe96b4b1355dddc9c16174b9c2ed813368e33acf8600f
+                confirmed_length: 82
+                fee: "30000000000000000"
+        "400":
+          description: Invalid transaction hash or invalid `confirmed` parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                missingHash:
+                  value:
+                    error: Transaction hash is required
+                invalidHash:
+                  value:
+                    error: Invalid transaction hash format
+                invalidConfirmed:
+                  value:
+                    error: Parameter "confirmed" must be exactly "true" or "false"
+        "404":
+          description: Transaction not found.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "No payload found for tx hash: {transactionHash}"
+        "500":
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: An error occurred processing the request.
+
+components:
+  parameters:
+    AddressParam:
+      name: address
+      in: path
+      required: true
+      description: Wallet/account address.
+      schema:
+        type: string
+        minLength: 1
+
+    TransactionHashParamLoose:
+      name: transactionHash
+      in: path
+      required: true
+      description: Transaction hash.
+      schema:
+        type: string
+        minLength: 1
+
+    TransactionHashParamStrict:
+      name: transactionHash
+      in: path
+      required: true
+      description: Transaction hash (64-char hex string).
+      schema:
+        type: string
+        pattern: "^[A-Fa-f0-9]{64}$"
+
+    ConfirmedQueryParamLenient:
+      name: confirmed
+      in: query
+      required: false
+      description: |
+        Balance endpoint behavior:
+        - `true` for confirmed view
+        - `false` for unconfirmed view
+        - omitted => confirmed view
+        - any other value => treated as unconfirmed view
+      schema:
+        type: string
+        default: "true"
+
+    ConfirmedQueryParamStrict:
+      name: confirmed
+      in: query
+      required: false
+      description: Must be exactly `true` or `false`.
+      schema:
+        type: string
+        enum: ["true", "false"]
+        default: "true"
+
+    StartConfirmedLengthParam:
+      name: start_confirmed_length
+      in: path
+      required: true
+      description: Start of confirmed-length range (inclusive).
+      schema:
+        type: integer
+        minimum: 0
+
+    EndConfirmedLengthParam:
+      name: end_confirmed_length
+      in: path
+      required: true
+      description: End of confirmed-length range (inclusive).
+      schema:
+        type: integer
+        minimum: 0
+
+  responses:
+    InternalServerError:
+      description: Internal server error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: An error occurred processing the request.
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Error message describing the failure.
+
+    HealthResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+          description: Status indicator of the RPC node connectivity.
+          enum: [true]
+          example: true
+              
+    BalanceResponse:
+      type: object
+      required: [address, balance]
+      properties:
+        address:
+          type: string
+        balance:
+          type: string
+
+    AccountDetailsResponse:
+      type: object
+      required:
+        - address
+        - writingKey
+        - isWhitelisted
+        - isValidator
+        - isIndexer
+        - license
+        - balance
+        - stakedBalance
+      properties:
+        address:
+          type: string
+        writingKey:
+          description: |
+            64-character hex writing key.
+            Can be all zeros when no writer key is assigned.
+          type: string
+          pattern: "^[A-Fa-f0-9]{64}$"
+          example: "0000000000000000000000000000000000000000000000000000000000000000"
+        isWhitelisted:
+          type: boolean
+        isValidator:
+          type: boolean
+        isIndexer:
+          type: boolean
+        license:
+          type: string
+          nullable: true
+        balance:
+          type: string
+        stakedBalance:
+          type: string
+
+    TxvResponse:
+      type: object
+      required: [txv]
+      properties:
+        txv:
+          type: string
+
+    FeeResponse:
+      type: object
+      required: [fee]
+      properties:
+        fee:
+          type: string
+
+    ConfirmedLengthResponse:
+      type: object
+      required: [confirmed_length]
+      properties:
+        confirmed_length:
+          type: integer
+
+    UnconfirmedLengthResponse:
+      type: object
+      required: [unconfirmed_length]
+      properties:
+        unconfirmed_length:
+          type: integer
+
+    BroadcastTransactionRequest:
+      type: object
+      required: [payload]
+      properties:
+        payload:
+          type: string
+          description: Base64-encoded signed transaction.
+
+    BroadcastResult:
+      type: object
+      required: [message, signedLength, unsignedLength, tx]
+      properties:
+        message:
+          type: string
+        signedLength:
+          type: integer
+        unsignedLength:
+          type: integer
+        tx:
+          type: string
+
+    BroadcastTransactionResponse:
+      type: object
+      required: [result]
+      properties:
+        result:
+          $ref: "#/components/schemas/BroadcastResult"
+
+    TxHashItem:
+      type: object
+      required: [hash, confirmed_length]
+      properties:
+        hash:
+          type: string
+        confirmed_length:
+          type: integer
+
+    TxHashesResponse:
+      type: object
+      required: [hashes]
+      properties:
+        hashes:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxHashItem"
+
+    TxOperationPayload:
+      type: object
+      description: |
+        Normalized operation object (`tro` for transfer or `txo` for subnet tx).
+        Fields depend on operation type; unknown keys may also appear.
+      properties:
+        tx:
+          type: string
+          description: Transaction hash.
+        txv:
+          type: string
+          description: Transaction validity hash.
+        to:
+          type: string
+          description: Recipient address (transfer).
+        am:
+          type: string
+          description: Amount in base units.
+        in:
+          type: string
+          description: Nonce.
+        is:
+          type: string
+          description: Signature.
+        va:
+          type: string
+          description: Validator address or encoded validator field.
+        vn:
+          type: string
+          description: Validator nonce or validator-related field.
+        vs:
+          type: string
+          description: Validator signature or validator-related field.
+        iw:
+          type: string
+          description: Writer/indexer related field.
+        bs:
+          type: string
+          description: Bootstrap/subnetwork identifier (for subnet tx).
+      additionalProperties: true
+
+    TxDetailsPayload:
+      type: object
+      description: Normalized transaction payload.
+      required: [type, address]
+      properties:
+        type:
+          type: integer
+        address:
+          type: string
+        tro:
+          $ref: "#/components/schemas/TxOperationPayload"
+        txo:
+          $ref: "#/components/schemas/TxOperationPayload"
+      oneOf:
+        - required: [tro]
+        - required: [txo]
+      additionalProperties: false
+      example:
+        type: 13
+        address: trac1xljl28ugeskpcswxdxlsx7f9n7jtt5pxusf6qmq08na0j30f6n9smus3rh
+        tro:
+          tx: 0b4d1c1dac48af13212f616601d7399457476a0b644850875b7f4b79df6ff89c
+          txv: 54f57c8d3c4fb3e653201aa9a040e3f673e80c939a95f0a477b18fe51dbfd186
+          to: trac1fxmkmd4p4sn7aqsya7tuuc9dzhs4zp8pnwfz8msnyfvf5n6g0lqqg6uz0a
+          am: "1000000000000000000"
+          in: 40bb3aca8b4fda5afa8bc1558843ff81727d9ccc84953050d3359c0e5733dc69
+          is: 2f3639d487bc502961a80240f9ab4adbc671eb93ba08286383a615a4cfa95826b57b4b339502eae3de5a6b7bfd080cd0d68ffa2c042453a308ca9afc5e8c100b
+          va: trac1hyg3mv57fph35qev4xsa74n7rey2lkg9puq9yzq6aq84r023ldcqyk889z
+          vn: b68a83b508ffa35b1984c1835905b2ba8ab230a202cf62f3d58e109f77f97804
+          vs: ab3b4049a552b0b1a1a455e4b1f33c367a86f0312ba5c08050fdac1446a927236b43d79f4d16c260b5dbe96b4b1355dddc9c16174b9c2ed813368e33acf8600f
+
+    TxDetailsResponse:
+      type: object
+      required: [txDetails]
+      properties:
+        txDetails:
+          $ref: "#/components/schemas/TxDetailsPayload"
+
+    TxDetailsNotFoundResponse:
+      type: object
+      required: [txDetails]
+      properties:
+        txDetails:
+          type: object
+          nullable: true
+
+    TxPayloadsBulkRequest:
+      type: object
+      required: [hashes]
+      properties:
+        hashes:
+          type: array
+          minItems: 1
+          maxItems: 1500
+          items:
+            type: string
+
+    TxPayloadBulkResultItem:
+      type: object
+      required: [hash, payload]
+      properties:
+        hash:
+          type: string
+        payload:
+          $ref: "#/components/schemas/TxDetailsPayload"
+
+    TxPayloadsBulkResponse:
+      type: object
+      required: [results, missing]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/TxPayloadBulkResultItem"
+        missing:
+          type: array
+          items:
+            type: string
+
+    TxDetailsWithMetaResponse:
+      type: object
+      required: [txDetails, confirmed_length, fee]
+      properties:
+        txDetails:
+          $ref: "#/components/schemas/TxDetailsPayload"
+        confirmed_length:
+          type: integer
+          description: Confirmed ledger length (0 when transaction is not yet confirmed).
+        fee:
+          type: string

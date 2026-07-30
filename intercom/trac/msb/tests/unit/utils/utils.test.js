@@ -3,17 +3,19 @@
 import { default as test } from 'brittle';
 
 async function runTests() {
-	test.pause();
+    test.pause();
 
-	await import('./check/check.test.js');
-	await import('./protobuf/operationHelpers.test.js');
-	await import('./helpers/helpers.test.js');
-	await import('./fileUtils/readAddressesFromWhitelistFile.test.js');
-	await import('./fileUtils/readBalanceMigrationFile.test.js');
-	await import('./migrationUtils/validateAddressFromIncomingFile.test.js');
-	await import('./buffer/buffer.test.js')
-	await import('./amountSerialization/amountSerialization.test.js');
-	test.resume();
+    await import('./check/check.test.js');
+    await import('./deepEqualApplyPayload/deepEqualApplyPayload.test.js');
+    await import('./protobuf/operationHelpers.test.js');
+    await import('./helpers/helpers.test.js');
+    await import('./fileUtils/readAddressesFromWhitelistFile.test.js');
+    await import('./fileUtils/readBalanceMigrationFile.test.js');
+    await import('./migrationUtils/validateAddressFromIncomingFile.test.js');
+    await import('./buffer/buffer.test.js')
+    await import('./type/type.test.js');
+    await import('./amountSerialization/amountSerialization.test.js');
+    test.resume();
 }
 
 await runTests();

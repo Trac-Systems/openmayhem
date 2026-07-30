@@ -1,0 +1,105 @@
+const commonGlobals = {
+    console: "readonly",
+    Buffer: "readonly",
+    process: "readonly",
+    global: "readonly",
+    setTimeout: "readonly",
+    clearTimeout: "readonly",
+    setInterval: "readonly",
+    clearInterval: "readonly",
+    setImmediate: "readonly",
+    structuredClone: "readonly",
+    URL: "readonly",
+    URLSearchParams: "readonly",
+};
+
+const jestGlobals = {
+    beforeAll: "readonly",
+    beforeEach: "readonly",
+    afterAll: "readonly",
+    afterEach: "readonly",
+    describe: "readonly",
+    expect: "readonly",
+    it: "readonly",
+    jest: "readonly",
+    test: "readonly",
+};
+
+export default [
+    {
+        ignores: [
+            "coverage/**",
+            "migration/**",
+            "node_modules/**",
+            "src/utils/protobuf/*.cjs",
+            "stores/**",
+            "stores1/**",
+            "stores_/**",
+            "whitelist/**",
+        ],
+    },
+    {
+        files: ["**/*.{js,mjs}"],
+        languageOptions: {
+            ecmaVersion: "latest",
+            sourceType: "module",
+            globals: commonGlobals,
+        },
+        linterOptions: {
+            reportUnusedDisableDirectives: "warn",
+        },
+        rules: {
+            indent: ["warn", 4, { SwitchCase: 1 }],
+            "no-const-assign": "error",
+            "no-constant-condition": ["error", { checkLoops: false }],
+            "no-debugger": "error",
+            "no-dupe-args": "error",
+            "no-dupe-class-members": "error",
+            "no-dupe-keys": "error",
+            "no-duplicate-case": "error",
+            "no-empty-pattern": "error",
+            "no-ex-assign": "error",
+            "no-func-assign": "error",
+            "no-import-assign": "error",
+            "no-irregular-whitespace": "error",
+            "no-loss-of-precision": "error",
+            "no-new-native-nonconstructor": "error",
+            "no-obj-calls": "error",
+            "no-prototype-builtins": "off",
+            "no-redeclare": "error",
+            "no-self-assign": "error",
+            "no-self-compare": "error",
+            "no-shadow-restricted-names": "error",
+            "no-sparse-arrays": "error",
+            "no-this-before-super": "error",
+            "no-undef": "warn",
+            "no-unreachable": "error",
+            "no-unsafe-finally": "error",
+            "no-unsafe-negation": "error",
+            "no-unused-private-class-members": "warn",
+            "no-unused-vars": ["warn", { argsIgnorePattern: "^_", caughtErrorsIgnorePattern: "^_" }],
+            "no-use-before-define": ["warn", { functions: false, classes: true, variables: true }],
+            "require-yield": "error",
+            "use-isnan": "error",
+            "valid-typeof": "error",
+        },
+    },
+    {
+        files: ["tests/**/*.{js,mjs}"],
+        languageOptions: {
+            globals: {
+                ...commonGlobals,
+                ...jestGlobals,
+            },
+        },
+    },
+    {
+        files: ["msb.mjs"],
+        languageOptions: {
+            globals: {
+                ...commonGlobals,
+                Pear: "readonly",
+            },
+        },
+    },
+];

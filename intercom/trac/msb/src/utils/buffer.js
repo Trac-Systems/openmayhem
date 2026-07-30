@@ -15,7 +15,7 @@ export const safeWriteUInt32BE = (value, offset) => {
         const buf = b4a.alloc(4);
         buf.writeUInt32BE(value, offset);
         return buf;
-    } catch (error) {
+    } catch {
         return b4a.alloc(4);
     }
 }

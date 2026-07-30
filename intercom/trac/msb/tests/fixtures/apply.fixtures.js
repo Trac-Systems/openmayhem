@@ -23,9 +23,9 @@ export const testKeyPair4 = {
 }
 
 export const testKeyPair5 = {
-  publicKey: "6822a868e5a30c2c571e548f0807f3bd9760d04c4d6a32fe27d30c23c0eaa04b",
-  secretKey: "a573ec441c4f45a451ca615c5b31f4171e567c0c19e906cfe9af308826e6d37d6822a868e5a30c2c571e548f0807f3bd9760d04c4d6a32fe27d30c23c0eaa04b",
-  mnemonic: "walnut disagree toward verify shaft decade stage cactus very asset gasp recycle occur steel gorilla diamond slice sunset train train pill embrace senior clutch"
+    publicKey: "6822a868e5a30c2c571e548f0807f3bd9760d04c4d6a32fe27d30c23c0eaa04b",
+    secretKey: "a573ec441c4f45a451ca615c5b31f4171e567c0c19e906cfe9af308826e6d37d6822a868e5a30c2c571e548f0807f3bd9760d04c4d6a32fe27d30c23c0eaa04b",
+    mnemonic: "walnut disagree toward verify shaft decade stage cactus very asset gasp recycle occur steel gorilla diamond slice sunset train train pill embrace senior clutch"
 }
 
 export const testKeyPair6 = {

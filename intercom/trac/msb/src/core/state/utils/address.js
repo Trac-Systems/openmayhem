@@ -1,13 +1,6 @@
 import b4a from 'b4a';
 import { address as addressApi } from 'trac-crypto-api';
-
-const boolSafe = condition => {
-    try {
-        return condition()
-    } catch (_ignored) {
-        return false
-    }
-}
+import _ from 'lodash'
 
 /**
  * Checks if a given address is a valid TRAC bech32m address.
@@ -23,9 +16,11 @@ export function isAddressValid(address, hrp) {
         address = address.toString('ascii');
     }
 
-    return boolSafe(() => 
+    const res = _.attempt(() =>
         addressApi.size(hrp) === address.length && address.startsWith(`${hrp}1`) && addressApi.isValid(address)
     );
+
+    return !_.isError(res) && res
 }
 
 

@@ -4,33 +4,33 @@ import { applyWithRequesterEntryCorruption } from '../../addWriter/addWriterScen
 const passThroughPayload = (_t, payload) => payload;
 
 export default class IndexerNodeEntryDecodeFailureScenario extends OperationValidationScenarioBase {
-	constructor({
-		title,
-		setupScenario,
-		buildValidPayload,
-		assertStateUnchanged,
-		expectedLogs,
-		selectPeer,
-		mutatePayload = passThroughPayload
-	}) {
-		const peerSelector = typeof selectPeer === 'function' ? selectPeer : null;
+    constructor({
+        title,
+        setupScenario,
+        buildValidPayload,
+        assertStateUnchanged,
+        expectedLogs,
+        selectPeer,
+        mutatePayload = passThroughPayload
+    }) {
+        const peerSelector = typeof selectPeer === 'function' ? selectPeer : null;
 
-		super({
-			title,
-			setupScenario,
-			buildValidPayload,
-			mutatePayload,
-			applyInvalidPayload: (context, invalidPayload, t, validPayload) => {
-				const peer =
+        super({
+            title,
+            setupScenario,
+            buildValidPayload,
+            mutatePayload,
+            applyInvalidPayload: (context, invalidPayload, t, validPayload) => {
+                const peer =
 					peerSelector?.(context, {
-						invalidPayload,
-						validPayload,
-						t
+					    invalidPayload,
+					    validPayload,
+					    t
 					}) ?? null;
-				return applyWithRequesterEntryCorruption(context, invalidPayload, { peer });
-			},
-			assertStateUnchanged,
-			expectedLogs
-		});
-	}
+                return applyWithRequesterEntryCorruption(context, invalidPayload, { peer });
+            },
+            assertStateUnchanged,
+            expectedLogs
+        });
+    }
 }

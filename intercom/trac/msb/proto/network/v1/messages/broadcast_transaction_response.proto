@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package network.v1;
+
+import "network/v1/enums/result_code.proto";
+
+message BroadcastTransactionResponse {
+  bytes nonce = 1;
+  bytes signature = 2;
+  bytes proof = 3;
+  uint64 timestamp = 4;
+  ResultCode result = 5;
+}

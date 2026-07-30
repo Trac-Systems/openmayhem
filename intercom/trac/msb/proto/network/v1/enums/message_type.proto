@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package network.v1;
+
+// Warning: Do not change numeric values of existing enum fields.
+// They are part of the public API.
+// New values may be added, but existing values must never be renumbered or reused.
+// Use [deprecated = true] while phasing out a value that still remains in the schema.
+// If a value is removed, reserve its number (and preferably its name).
+enum MessageType {
+  MESSAGE_TYPE_UNSPECIFIED = 0;
+  MESSAGE_TYPE_LIVENESS_REQUEST = 1;
+  MESSAGE_TYPE_LIVENESS_RESPONSE = 2;
+  MESSAGE_TYPE_BROADCAST_TRANSACTION_REQUEST = 3;
+  MESSAGE_TYPE_BROADCAST_TRANSACTION_RESPONSE = 4;
+}

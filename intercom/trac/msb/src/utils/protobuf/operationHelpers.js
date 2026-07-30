@@ -1,6 +1,16 @@
 import applyOperations from './applyOperations.cjs';
-import networkV1Operations from './network.cjs';
+import networkV1Generated from './networkV1.generated.cjs';
 import b4a from 'b4a';
+
+const networkV1Operations = networkV1Generated.network.v1;
+const NETWORK_TO_OBJECT_OPTIONS = Object.freeze({
+    enums: Number,
+    longs: Number,
+    bytes: Buffer,
+    defaults: true,
+    arrays: true,
+    oneofs: false
+});
 
 /**
  * Safely encodes an operation using `applyOperations.Operation.encode`.
@@ -36,6 +46,14 @@ export const safeDecodeApplyOperation = (payload) => {
     return null;
 }
 
+export const unsafeDecodeApplyOperation= (payload) => {
+    return applyOperations.Operation.decode(payload);
+}
+
+export const unsafeEncodeApplyOperation = (payload) => {
+    return applyOperations.Operation.encode(payload);
+}
+
 export const normalizeIncomingMessage = (message) => {
     if (!message) return null;
     if (b4a.isBuffer(message)) {
@@ -51,10 +69,13 @@ export const normalizeIncomingMessage = (message) => {
 };
 
 export const encodeV1networkOperation = (payload) => {
-    return networkV1Operations.MessageHeader.encode(payload);
+    return b4a.from(networkV1Operations.MessageHeader.encode(payload).finish());
 }
 
 
 export const decodeV1networkOperation = (payload) => {
-    return networkV1Operations.MessageHeader.decode(payload);
+    return networkV1Operations.MessageHeader.toObject(
+        networkV1Operations.MessageHeader.decode(payload),
+        NETWORK_TO_OBJECT_OPTIONS
+    );
 }

@@ -1,8 +1,8 @@
-import PeerWallet from 'trac-wallet';
+import { WalletProvider } from 'trac-wallet';
+import { config } from './config.js';
 
 export async function createSignature(payloadBuffer) {
-    const wallet = new PeerWallet();
-    await wallet.generateKeyPair();
+    const wallet = await new WalletProvider(config).generate({ derivationPath: config.derivationPath })
     const signature = wallet.sign(payloadBuffer);
     return { signature, wallet };
 }

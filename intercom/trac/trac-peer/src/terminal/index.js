@@ -1,7 +1,15 @@
 /** @typedef {import('pear-interface')} */ /* global Pear */
+import process from 'process';
 import readline from 'readline';
-import tty from 'tty';
 import { TerminalHandlers } from './handlers.js';
+
+const createTerminalReadline = ({
+    readlineModule = readline,
+    runtimeProcess = process,
+} = {}) => readlineModule.createInterface({
+    input: runtimeProcess.stdin,
+    output: runtimeProcess.stdout,
+});
 
 class Terminal {
     #peer
@@ -44,31 +52,24 @@ class Terminal {
         console.log('- /get_keys | prints your public and private keys. Be careful and never share your private key!');
         console.log('- /exit | Exit the program');
         console.log('- /help | This help text');
-    
+
         this.#peer.protocol.instance.printOptions();
     }
 
     async start({ readlineInstance = null } = {}) {
         const peer = this.#peer;
         if (!peer) return;
-        if (global.Pear !== undefined && global.Pear.config?.options?.type === 'desktop') return;
-    
+        if (globalThis.Pear !== undefined && globalThis.Pear.config?.options?.type === 'desktop') return;
+
         let rl = readlineInstance;
         if (!rl) {
             try {
-                rl = readline.createInterface({
-                    input: new tty.ReadStream(0),
-                    output: new tty.WriteStream(1),
-                });
+                rl = createTerminalReadline();
             } catch (_e) {
-                try {
-                    rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-                } catch (_e2) {
-                    return;
-                }
+                return;
             }
         }
-    
+
         this.printHelp();
 
         const commandHandlers = [
@@ -112,12 +113,10 @@ class Terminal {
             }
             rl.prompt();
         });
-    
+
         rl.prompt();
         return rl;
     }
 }
 
-export { Terminal };
-
-
+export { Terminal, createTerminalReadline };

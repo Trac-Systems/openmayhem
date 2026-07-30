@@ -1,7 +1,8 @@
 import b4a from "b4a";
+import tracCryptoApi from "trac-crypto-api";
 import {bufferToAddress} from "../core/state/utils/address.js";
 import { EntryType } from "./constants.js";
-
+import { v7 as uuidv7 } from 'uuid';
 //TODO: change file name or split functions below into multiple files (Remember to update imports and tests accordingly)
 
 export function isHexString(string) {
@@ -55,7 +56,7 @@ export async function getFormattedIndexersWithAddresses(state, config) {
     }));
 
     const results = await Promise.all(
-        formatted.map(async (entry) => {            
+        formatted.map(async (entry) => {
             const address = bufferToAddress(
                 await state.getSigned(EntryType.WRITER_ADDRESS + entry.writingKey),
                 config.addressPrefix
@@ -94,4 +95,12 @@ export function isTransactionRecordPut(entry) {
     const isHex = isHexString(entry.key);
     const is64 = entry.key.length === 64;
     return isPut && isHex && is64;
+}
+
+export function generateUUID() {
+    return uuidv7();
+}
+
+export function publicKeyToAddress(publicKey, config) {
+    return tracCryptoApi.address.encode(config.addressPrefix, b4a.isBuffer(publicKey) ? publicKey : b4a.from(publicKey, typeof publicKey === 'string' ? 'hex' : undefined));
 }

@@ -42,14 +42,6 @@ class Scheduler {
         return this.#defaultInterval;
     }
 
-    get timer() {
-        return this.#timer;
-    }
-
-    get currentWorkerRun() {
-        return this.#currentWorkerRun;
-    }
-
     static #validateDelay(delayMs, scope = 'delayMs') {
         const ms = Number(delayMs);
         if (!Number.isFinite(ms) || ms < 0) {

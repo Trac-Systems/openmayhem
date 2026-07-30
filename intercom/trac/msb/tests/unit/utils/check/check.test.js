@@ -1,7 +1,7 @@
 import { default as test } from 'brittle';
 
 async function runCheckTests() {
-  test.pause();
+    test.pause();
 
     await import('./coreAdminOperation.test.js');
     await import('./adminControlOperation.test.js');
@@ -11,7 +11,7 @@ async function runCheckTests() {
     await import('./transferOperation.test.js')
     await import('./balanceInitializationOperation.test.js')
 
-  test.resume();
+    test.resume();
 }
 
 runCheckTests();

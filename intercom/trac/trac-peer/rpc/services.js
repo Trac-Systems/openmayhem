@@ -1,12 +1,5 @@
 import b4a from "b4a";
 import { fastestToJsonSchema } from "./utils/schemaToJson.js";
-import { createHash } from "../src/utils/types.js";
-
-const asHex32 = (value, field) => {
-  const hex = String(value ?? "").trim().toLowerCase();
-  if (!/^[0-9a-f]{64}$/.test(hex)) throw new Error(`Invalid ${field}. Expected 32-byte hex (64 chars).`);
-  return hex;
-};
 
 const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 
@@ -17,10 +10,10 @@ const requireApi = (peer) => {
 };
 
 export async function getStatus(peer) {
-  const subnetBootstrapHex = b4a.isBuffer(peer.bootstrap)
-    ? b4a.toString(peer.bootstrap, "hex")
-    : peer.bootstrap != null
-      ? String(peer.bootstrap)
+  const subnetBootstrapHex = b4a.isBuffer(peer.config.bootstrap)
+    ? b4a.toString(peer.config.bootstrap, "hex")
+    : peer.config.bootstrap != null
+      ? String(peer.config.bootstrap)
       : null;
 
   const peerMsbAddress = peer.msbClient.pubKeyHexToAddress(peer.wallet.publicKey);
@@ -120,22 +113,34 @@ export async function contractGenerateNonce(peer) {
   return api.generateNonce();
 }
 
-export async function contractPrepareTx(peer, { prepared_command, address, nonce } = {}) {
+export async function contractTxContext(peer) {
   const api = requireApi(peer);
-  if (!isObject(prepared_command)) throw new Error("prepared_command must be an object.");
-  const addr = asHex32(address, "address");
-  const n = asHex32(nonce, "nonce");
 
-  if (peer?.protocol.instance?.safeJsonStringify == null) {
-    throw new Error("safeJsonStringify is not available on protocol instance.");
-  }
+  const networkId = peer.msbClient.networkId;
+  const mbs = peer.msbClient.bootstrapHex;
+  const txv = await peer.msbClient.getTxvHex();
 
-  const json = peer.protocol.instance.safeJsonStringify(prepared_command);
-  if (json == null) throw new Error("Failed to stringify prepared_command.");
+  const bs =
+    b4a.isBuffer(peer.config.bootstrap)
+      ? b4a.toString(peer.config.bootstrap, "hex")
+      : peer.config.bootstrap != null
+        ? String(peer.config.bootstrap)
+        : null;
 
-  const command_hash = await createHash(json);
-  const tx = await api.generateTx(addr, command_hash, n);
-  return { tx, command_hash };
+  const iw = peer.writerLocalKey ?? api.getPeerWriterKey?.();
+  if (!iw || !/^[0-9a-f]{64}$/i.test(String(iw))) throw new Error("Peer writer key is not available.");
+  if (!bs || !/^[0-9a-f]{64}$/i.test(String(bs))) throw new Error("Peer subnet bootstrap is not available.");
+
+  return {
+    msb: {
+      networkId,
+      txv,
+      iw: String(iw).toLowerCase(),
+      bs: String(bs).toLowerCase(),
+      mbs: String(mbs).toLowerCase(),
+      operationType: 12,
+    },
+  };
 }
 
 export async function contractTx(peer, { tx, prepared_command, address, signature, nonce, sim = false } = {}) {

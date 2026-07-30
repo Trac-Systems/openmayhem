@@ -18,7 +18,7 @@ export const NodeRole = {
     INDEXER: 0x7, // Special writer that only participates in consensus.
 };
 
- /**
+/**
  * Calculates the node role bitmask from a node object.
  * **Note**: This function only sets the bits which represent each role. Some results might be invalid,
  * such as a node that is an indexer without being a writer or a writer which is not whitelisted.

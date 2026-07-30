@@ -1,6 +1,6 @@
 
 import { isAddressValid } from '../core/state/utils/address.js';
-import PeerWallet from 'trac-wallet';
+import tracCryptoApi from 'trac-crypto-api';
 import b4a from 'b4a';
 import { ZERO_LICENSE } from '../core/state/utils/nodeEntry.js';
 
@@ -9,7 +9,7 @@ export async function validateAddressFromIncomingFile(stateInstance, config, add
         throw new Error(`Invalid address format: '${address}'. Please ensure all addresses are valid.`);
     }
 
-    const publicKey = PeerWallet.decodeBech32m(address);
+    const publicKey = tracCryptoApi.address.decode(address);
 
     if (!publicKey || publicKey.length !== 32) {
         throw new Error(`Invalid public key: '${address}'. Please ensure all addresses are valid.`);

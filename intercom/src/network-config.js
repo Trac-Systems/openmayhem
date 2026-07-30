@@ -1,15 +1,15 @@
 import b4a from 'b4a';
 
-import { Config as MsbConfig } from '../trac/msb/src/config/config.js';
+import { Config as MsbConfig } from 'trac-msb/src/config/config.js';
 import {
   createConfig as createPinnedMsbConfig,
   ENV as PINNED_MSB_ENV,
-} from '../trac/msb/src/config/env.js';
-import { Config as PeerConfig } from '../trac/trac-peer/src/config/config.js';
+} from 'trac-msb/src/config/env.js';
+import { Config as PeerConfig } from 'trac-peer/src/config/config.js';
 import {
   createConfig as createPinnedPeerConfig,
   ENV as PINNED_PEER_ENV,
-} from '../trac/trac-peer/src/config/env.js';
+} from 'trac-peer/src/config/env.js';
 
 const PUBLIC_DHT_BOOTSTRAP = Object.freeze([
   '116.202.214.149:10001',

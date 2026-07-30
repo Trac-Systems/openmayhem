@@ -11,7 +11,7 @@ import {
   executeTransfer,
 } from '../src/msb-settlement-transfer-helper.js';
 import { runRootMsbTransferHelper } from '../src/msb-transfer-helper.js';
-import { bigIntTo16ByteBuffer } from '../trac/msb/src/utils/amountSerialization.js';
+import { bigIntTo16ByteBuffer } from 'trac-msb/src/utils/amountSerialization.js';
 
 test('root Intercom app resolves the bundled MSB transfer helper', async () => {
   await assert.rejects(

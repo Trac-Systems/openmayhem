@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package network.v1;
+
+import "network/v1/enums/message_type.proto";
+import "network/v1/messages/liveness_request.proto";
+import "network/v1/messages/liveness_response.proto";
+import "network/v1/messages/broadcast_transaction_request.proto";
+import "network/v1/messages/broadcast_transaction_response.proto";
+
+message MessageHeader {
+  MessageType type = 1;
+  string id = 2;
+  uint64 timestamp = 3;
+  oneof field {
+    LivenessRequest                       liveness_request = 4;
+    LivenessResponse                      liveness_response = 5;
+    BroadcastTransactionRequest           broadcast_transaction_request = 6;
+    BroadcastTransactionResponse          broadcast_transaction_response = 7;
+  }
+  repeated string capabilities = 8;
+}

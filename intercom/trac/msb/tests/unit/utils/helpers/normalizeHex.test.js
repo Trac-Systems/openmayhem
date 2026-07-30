@@ -20,7 +20,7 @@ test('normalizeHex should handle empty string', t => {
     try {
         normalizeHex('');
         t.fail('Should throw on empty string');
-    } catch (err) {
+    } catch {
         t.pass('Throws on empty string');
     }
 });
@@ -29,7 +29,7 @@ test('normalizeHex should handle invalid hex string', t => {
     try {
         normalizeHex('invalid hex');
         t.fail('Should throw on invalid hex string');
-    } catch (err) {
+    } catch {
         t.pass('Throws on invalid hex string');
     }
 });
@@ -75,7 +75,7 @@ test('normalizeHex should handle invalid data types', t => {
         try {
             normalizeHex(value);
             t.fail(`Should throw on ${desc} input`);
-        } catch (err) {
+        } catch {
             t.pass(`Correctly throws on ${desc} input`);
         }
     }

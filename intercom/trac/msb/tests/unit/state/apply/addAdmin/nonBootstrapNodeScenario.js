@@ -2,9 +2,9 @@ import { test } from 'brittle';
 import { eventFlush } from '../../../../helpers/autobaseTestHelpers.js';
 
 import {
-	setupAddAdminScenario,
-	buildAddAdminRequesterPayload,
-	assertAddAdminRequesterFailureStateLocal
+    setupAddAdminScenario,
+    buildAddAdminRequesterPayload,
+    assertAddAdminRequesterFailureStateLocal
 } from './addAdminScenarioHelpers.js';
 
 /**
@@ -16,53 +16,53 @@ import {
  * "Node is not a bootstrap node." guard, and the state must remain untouched.
  */
 export default function addAdminNonBootstrapNodeScenario() {
-	test('State.apply addAdmin rejects non-bootstrap requesters', async t => {
-		const networkContext = await setupAddAdminScenario(t);
-		const adminNode = networkContext.adminBootstrap;
-		const readerNode = networkContext.peers[1];
+    test('State.apply addAdmin rejects non-bootstrap requesters', async t => {
+        const networkContext = await setupAddAdminScenario(t);
+        const adminNode = networkContext.adminBootstrap;
+        const readerNode = networkContext.peers[1];
 
-		const originalApply = adminNode.base._handlers.apply;
-		let shouldMutateNextCall = true;
+        const originalApply = adminNode.base._handlers.apply;
+        let shouldMutateNextCall = true;
 
-		adminNode.base._handlers.apply = async (nodes, view, baseCtx) => {
-			if (!shouldMutateNextCall) {
-				return originalApply(nodes, view, baseCtx);
-			}
+        adminNode.base._handlers.apply = async (nodes, view, baseCtx) => {
+            if (!shouldMutateNextCall) {
+                return originalApply(nodes, view, baseCtx);
+            }
 
-			shouldMutateNextCall = false;
-			adminNode.base._handlers.apply = originalApply;
+            shouldMutateNextCall = false;
+            adminNode.base._handlers.apply = originalApply;
 
-			const readerKey = readerNode.base.local.key;
-			const mutatedNodes = nodes.map(node => {
-				if (!node?.from) return node;
-				return {
-					...node,
-				from: new Proxy(node.from, {
-						// We only need to fake node.from.key. A Proxy lets us override just that property
-						// while Reflect delegates every other access to the original object, so the node
-						// shape Autobase expects stays untouched.
-						get(target, prop, receiver) {
-							if (prop === 'key') {
-								return readerKey;
-							}
-							return Reflect.get(target, prop, receiver);
-						}
-					})
-				};
-			});
+            const readerKey = readerNode.base.local.key;
+            const mutatedNodes = nodes.map(node => {
+                if (!node?.from) return node;
+                return {
+                    ...node,
+                    from: new Proxy(node.from, {
+                        // We only need to fake node.from.key. A Proxy lets us override just that property
+                        // while Reflect delegates every other access to the original object, so the node
+                        // shape Autobase expects stays untouched.
+                        get(target, prop, receiver) {
+                            if (prop === 'key') {
+                                return readerKey;
+                            }
+                            return Reflect.get(target, prop, receiver);
+                        }
+                    })
+                };
+            });
 
-			return originalApply(mutatedNodes, view, baseCtx);
-		};
+            return originalApply(mutatedNodes, view, baseCtx);
+        };
 
-		t.teardown(() => {
-			adminNode.base._handlers.apply = originalApply;
-		});
+        t.teardown(() => {
+            adminNode.base._handlers.apply = originalApply;
+        });
 
-		const payload = await buildAddAdminRequesterPayload(networkContext);
-		await adminNode.base.append(payload);
-		await adminNode.base.update();
-		await eventFlush();
+        const payload = await buildAddAdminRequesterPayload(networkContext);
+        await adminNode.base.append(payload);
+        await adminNode.base.update();
+        await eventFlush();
 
-		await assertAddAdminRequesterFailureStateLocal(t, networkContext);
-	});
+        await assertAddAdminRequesterFailureStateLocal(t, networkContext);
+    });
 }

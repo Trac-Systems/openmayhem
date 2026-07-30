@@ -1,6 +1,5 @@
 import b4a from "b4a";
-import tracCrypto from "trac-crypto-api";
-import PeerWallet from "trac-wallet";
+import tracCryptoApi from "trac-crypto-api";
 import { $TNK } from "../../src/core/state/utils/balance.js";
 import { createMessage } from "../../src/utils/buffer.js";
 import { OperationType } from "../../src/utils/constants.js";
@@ -15,7 +14,7 @@ export const waitForConnection = async node => {
         if (count > 0) {
             break
         }
-        
+
         await sleep(300);
         attempts++;
     }
@@ -23,10 +22,10 @@ export const waitForConnection = async node => {
 
 /**
  * Build a base64-encoded transfer payload and matching tx hash
- * that are compatible with MSB's PartialTransfer validator.
+ * that are compatible with MSB's PartialTransferValidator validator.
  *
  * This helper mirrors the hashing/signing logic used by
- * PartialOperation.validateSignature, so that tests broadcast
+ * PartialOperationValidator.validateSignature, so that tests broadcast
  * transactions the node will accept without touching consensus code.
  *
  * @param {object} context - General context
@@ -38,7 +37,7 @@ export async function buildRpcSelfTransferPayload(context, state, amountTnk = 1n
     const txvBuffer = await state.getIndexerSequenceState();
     const txvHex = b4a.toString(txvBuffer, "hex");
 
-    const txData = await tracCrypto.transaction.preBuild(
+    const txData = await tracCryptoApi.transaction.preBuild(
         context.wallet.address,
         context.wallet.address,
         b4a.toString($TNK(amountTnk), "hex"),
@@ -63,7 +62,7 @@ export async function buildRpcSelfTransferPayload(context, state, amountTnk = 1n
         OperationType.TRANSFER
     );
 
-    const messageHash = await PeerWallet.blake3(message);
+    const messageHash = await tracCryptoApi.hash.blake3(message);
     const signature = context.wallet.sign(messageHash);
 
     const payloadObject = {
@@ -89,4 +88,3 @@ export async function buildRpcSelfTransferPayload(context, state, amountTnk = 1n
         txHashHex: b4a.toString(messageHash, "hex")
     };
 }
-

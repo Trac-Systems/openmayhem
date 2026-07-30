@@ -9,6 +9,7 @@ services:
       MSB_STORE: ${MSB_STORE:-rpc-node-store}
       MSB_HOST: ${MSB_HOST:-127.0.0.1}
       MSB_PORT: ${MSB_PORT:-5000}
+      NETWORK: ${NETWORK:-mainnet}
     volumes:
       - ./stores:/msb/stores
     ports:

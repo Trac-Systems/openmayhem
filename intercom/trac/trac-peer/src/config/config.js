@@ -1,11 +1,7 @@
 import b4a from "b4a";
 import path from "path";
 
-// MAYHEM PATCH: keep the vendored trac-peer Hyperbee/Corestore cache bounded
-// for long-running sparse peers.
 const DEFAULT_HYPERBEE_CACHE_MAX_ENTRIES = 65_536;
-// MAYHEM PATCH: prevent subnet tx apply from waiting on absurd future MSB
-// heights while still allowing old sparse readers to catch up legitimate history.
 const DEFAULT_MAX_MSB_SIGNED_LENGTH_FUTURE_DELTA = 1_000_000;
 
 export class Config {

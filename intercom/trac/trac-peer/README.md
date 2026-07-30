@@ -17,6 +17,10 @@ git clone -b trac-peer-r1 --single-branch git@github.com:Trac-Systems/trac-peer.
 Trac Peer must be used in combination the MSB and a Protocol/Contract pair in a unified setup.
 Please check our repos for sample setups.
 
+Docs:
+- `DOCS.md` — local MSB + peer setup, subnet workflow, RPC overview
+- `APP_DEV.md` — build apps (Protocol + Contract), wallet/dapp integration, RPC tx flow
+
 ### Local runner (interactive)
 
 If you already have an MSB network running (same `bootstrap` + `channel`), you can start a local MSB node (new store) that joins that network, and run `trac-peer` on top of it (this runner uses the `trac-msb` package, so it does not require a local `main_settlement_bus` repo checkout).
@@ -31,7 +35,13 @@ npm run peer:run -- --msb-bootstrap=<32-byte-hex> --msb-channel=<channel-string>
 
 ### Pear runner (interactive)
 
-Runs `trac-peer` using the Pear runtime (similar to `trac-msb`). You can control stores via flags (recommended); an optional first positional arg can be used as a “store label” fallback if `--peer-store-name` is omitted.
+Runs `trac-peer` through the Pear v2/v3 compatibility runner. With Pear v2 it delegates to the legacy
+`pear run` command; with Pear v3 (where `pear run` was removed), or when no Pear platform version can be
+detected, it starts the same entrypoint with the embedded `pear-runtime` module. The npm command and all
+application flags are identical in both modes.
+
+You can control stores via flags (recommended); an optional first positional arg can be used as a “store
+label” fallback if `--peer-store-name` is omitted.
 
 ```sh
 npm run peer:pear -- \
@@ -93,7 +103,7 @@ npm run peer:run -- \
 
 You can start an HTTP API alongside the interactive peer.
 
-This RPC is intended for **wallet/app connectivity** (URL + JSON), not for operating the peer node. Operator/admin actions remain CLI-only.
+This RPC is intended for **wallet/dApp connectivity** (URL + JSON), not for operating the peer node. Operator/admin actions remain CLI-only.
 
 ```sh
 npm run peer:run -- \

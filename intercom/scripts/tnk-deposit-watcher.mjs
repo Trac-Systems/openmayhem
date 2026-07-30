@@ -7,10 +7,6 @@ import { fileURLToPath } from 'node:url';
 import b4a from 'b4a';
 import PeerWallet from 'trac-wallet';
 import { MainSettlementBus } from 'trac-msb/src/index.js';
-import {
-  getTxDetailsCommand,
-  getTxHashesCommand,
-} from 'trac-msb/src/utils/cliCommands.js';
 
 import {
   boolArg,
@@ -422,9 +418,9 @@ async function scanMsbTransfers(msb, {
   const transfers = [];
   for (let start = fromSignedLength; start < safeEnd; start += chunkSize) {
     const end = Math.min(start + chunkSize, safeEnd);
-    const { hashes } = await getTxHashesCommand(msb.state, start, end);
+    const { hashes } = await msb.getTxHashes(start, end);
     for (const hashEntry of hashes) {
-      const details = await getTxDetailsCommand(msb.state, hashEntry.hash, msb.config);
+      const details = await msb.getTxDetails(hashEntry.hash);
       const transfer = transferFromTxDetails(hashEntry, details);
       if (transfer) transfers.push(transfer);
     }

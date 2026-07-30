@@ -23,5 +23,15 @@ export const registerTxPayloadsBulkTests = (context) => {
                 missing: []
             })
         })
+
+        it("returns 400 when hashes is not an array", async () => {
+            const res = await request(context.server)
+                .post("/v1/tx-payloads-bulk")
+                .set("Accept", "application/json")
+                .send(JSON.stringify({ hashes: null }))
+
+            expect(res.statusCode).toBe(400)
+            expect(res.body).toEqual({ error: "Missing hash list." })
+        })
     })
 }

@@ -10,33 +10,34 @@ import {
     OperationType, AMOUNT_BYTE_LENGTH
 } from '../../src/utils/constants.js';
 import { config } from '../helpers/config.js'
+import { asAddress } from '../helpers/address.js';
 
 export const TRO = {
     valid_partial_transfer: {
         type: OperationType.TRANSFER,
-        address: addressToBuffer('trac123z3gfpr2epjwww7ntm3m6ud2fhmq0tvts27p2f5mx3qkecsutlqfys769', config.addressPrefix),
+        address: addressToBuffer(asAddress('544514242356432739de9af71deb8d526fb03d6c5c15e0a934d9a20b6710e2fe'), config.addressPrefix),
         tro: {
             tx: b4a.from('c59f70942febb1de32fcb59febe84560416265d39f39b48fae676592910a98f4', 'hex'),
             txv: b4a.from('eb59a3e756d1c9597e46b33bcea91e262f8f73e94c238bdf70854aa2e8c42608', 'hex'),
             in: b4a.from('863fef21f5146553b0396b2ee1a93a8dbfce240411b71ccdcfc504504a6b9b50', 'hex'),
-            to: addressToBuffer('trac1mqktwme8fvklrds4hlhfy6lhmsu9qgfn3c3kuhz7c5zwjt8rc3dqj9tx7h', config.addressPrefix),
+            to: addressToBuffer(asAddress('d82cb76f274b2df1b615bfee926bf7dc385021338e236e5c5ec504e92ce3c45a'), config.addressPrefix),
             am: b4a.from('00000000000000015af1d78b58c40001', 'hex'),
             is: b4a.from('06acd7faecd5159221259ebb1d7e98eccd7c6e2884de9de45097e6d9d8c37192602901c74dde6bb2f48f6f665edc84140627f6e9c42f774a0e9f55ef3b348e06', 'hex')
         }
     },
     valid_complete_transfer: {
         type: OperationType.TRANSFER,
-        address: addressToBuffer('trac123z3gfpr2epjwww7ntm3m6ud2fhmq0tvts27p2f5mx3qkecsutlqfys769', config.addressPrefix),
+        address: addressToBuffer(asAddress('544514242356432739de9af71deb8d526fb03d6c5c15e0a934d9a20b6710e2fe'), config.addressPrefix),
         tro: {
             tx: b4a.from('c59f70942febb1de32fcb59febe84560416265d39f39b48fae676592910a98f4', 'hex'),
             txv: b4a.from('eb59a3e756d1c9597e46b33bcea91e262f8f73e94c238bdf70854aa2e8c42608', 'hex'),
             in: b4a.from('863fef21f5146553b0396b2ee1a93a8dbfce240411b71ccdcfc504504a6b9b50', 'hex'),
-            to: addressToBuffer('trac1mqktwme8fvklrds4hlhfy6lhmsu9qgfn3c3kuhz7c5zwjt8rc3dqj9tx7h', config.addressPrefix),
+            to: addressToBuffer(asAddress('d82cb76f274b2df1b615bfee926bf7dc385021338e236e5c5ec504e92ce3c45a'), config.addressPrefix),
             am: b4a.from('00000000000000015af1d78b58c40001', 'hex'),
             is: b4a.from('06acd7faecd5159221259ebb1d7e98eccd7c6e2884de9de45097e6d9d8c37192602901c74dde6bb2f48f6f665edc84140627f6e9c42f774a0e9f55ef3b348e06', 'hex'),
             vn: b4a.from('0ad7fe36a35a27ea4df932b800200823a97d4db31bca247f43ad7523b0493645', 'hex'),
             vs: b4a.from('5b534be7a374148962c271d194c26cf5b1ad705ab218a87709a33fe74f9d1b811772447c939b17b2f803e3da7648f49b666b929fbb20e458ced952f147162c08', 'hex'),
-            va: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
+            va: addressToBuffer(asAddress('3801ebd1f12462ad335b821807c9d87e4f20d57505222284b2634a7e8e5edac2'), config.addressPrefix),
         }
     },
     top_fields_transfer: ['type', 'address', 'tro'],
@@ -66,7 +67,7 @@ export const TRO = {
 export const BDO = {
     valid_partial_bootstrap_deployment: {
         type: OperationType.BOOTSTRAP_DEPLOYMENT,
-        address: addressToBuffer("trac1cep6jwcf02vmwekr4s0sttraqv736v8nf2gkaejz2203zhf7j7csnf44nm", config.addressPrefix),
+        address: addressToBuffer(asAddress('c643a93b097a99b766c3ac1f05ac7d033d1d30f34a916ee642529f115d3e97b1'), config.addressPrefix),
         bdo: {
             tx: b4a.from('1bd4f96adeffba9c04943a82993c5b19660c3a5f572620d82a67464f381640e2', 'hex'),
             txv: b4a.from('f24e61cf7941256b080be2133bccb520414c78021215edfcb781622da526c414', 'hex'),
@@ -79,7 +80,7 @@ export const BDO = {
 
     valid_complete_bootstrap_deployment: {
         type: OperationType.BOOTSTRAP_DEPLOYMENT,
-        address: addressToBuffer("trac1cep6jwcf02vmwekr4s0sttraqv736v8nf2gkaejz2203zhf7j7csnf44nm", config.addressPrefix),
+        address: addressToBuffer(asAddress('c643a93b097a99b766c3ac1f05ac7d033d1d30f34a916ee642529f115d3e97b1'), config.addressPrefix),
         bdo: {
             tx: b4a.from('1bd4f96adeffba9c04943a82993c5b19660c3a5f572620d82a67464f381640e2', 'hex'),
             txv: b4a.from('f24e61cf7941256b080be2133bccb520414c78021215edfcb781622da526c414', 'hex'),
@@ -87,7 +88,7 @@ export const BDO = {
             ic: b4a.from('f24e61cf7941256b080be2133bccb520414c78021215edfcb781622da526c414', 'hex'),
             in: b4a.from('0ad7fe36a35a27ea4df932b800200823a97d4db31bca247f43ad7523b0493645', 'hex'),
             is: b4a.from('5b534be7a374148962c271d194c26cf5b1ad705ab218a87709a33fe74f9d1b811772447c939b17b2f803e3da7648f49b666b929fbb20e458ced952f147162c08', 'hex'),
-            va: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
+            va: addressToBuffer(asAddress('3801ebd1f12462ad335b821807c9d87e4f20d57505222284b2634a7e8e5edac2'), config.addressPrefix),
             vn: b4a.from('0ad7fe36a35a27ea4df932b800200823a97d4db31bca247f43ad7523b0493645', 'hex'),
             vs: b4a.from('5b534be7a374148962c271d194c26cf5b1ad705ab218a87709a33fe74f9d1b811772447c939b17b2f803e3da7648f49b666b929fbb20e458ced952f147162c08', 'hex'),
         }
@@ -118,7 +119,7 @@ export const BDO = {
 export const TXO = {
     valid_complete_transaction_operation: {
         type: OperationType.TX,
-        address: addressToBuffer('trac1c232xtkvyg08zyeurn7l0wrarc4y36fzq5vhcdsgkxe6hdpzuslsm63dw8', config.addressPrefix),
+        address: addressToBuffer(asAddress('c2a2a32ecc221e71133c1cfdf7b87d1e2a48e92205197c3608b1b3abb422e43f'), config.addressPrefix),
         txo: {
             tx: b4a.from('6fb7f6e7f6970477977080f2b46cc837d48605e67691d30bf7511a1417d17ed7', 'hex'),
             txv: b4a.from('6fb7f6e7f6970477977080f2b46cc837d48605e67691d30bf7511a1417d17ed7', 'hex'),
@@ -130,12 +131,12 @@ export const TXO = {
             mbs: b4a.from('5f3b9a6a516066de365e5e75a7ac0feb55ab7cd4a29facbb028a047fc3f3956e', 'hex'),
             vn: b4a.from('0ad7fe36a35a27ea4df932b800200823a97d4db31bca247f43ad7523b0493645', 'hex'),
             vs: b4a.from('5b534be7a374148962c271d194c26cf5b1ad705ab218a87709a33fe74f9d1b811772447c939b17b2f803e3da7648f49b666b929fbb20e458ced952f147162c08', 'hex'),
-            va: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
+            va: addressToBuffer(asAddress('3801ebd1f12462ad335b821807c9d87e4f20d57505222284b2634a7e8e5edac2'), config.addressPrefix),
         }
     },
     valid_partial_transaction_operation: {
         type: OperationType.TX,
-        address: addressToBuffer('trac1c232xtkvyg08zyeurn7l0wrarc4y36fzq5vhcdsgkxe6hdpzuslsm63dw8', config.addressPrefix),
+        address: addressToBuffer(asAddress('c2a2a32ecc221e71133c1cfdf7b87d1e2a48e92205197c3608b1b3abb422e43f'), config.addressPrefix),
         txo: {
             tx: b4a.from('6fb7f6e7f6970477977080f2b46cc837d48605e67691d30bf7511a1417d17ed7', 'hex'),
             txv: b4a.from('6fb7f6e7f6970477977080f2b46cc837d48605e67691d30bf7511a1417d17ed7', 'hex'),
@@ -181,7 +182,7 @@ export const TXO = {
 export const CAO = {
     validAddAdminOperation: {
         type: OperationType.ADD_ADMIN,
-        address: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
+        address: addressToBuffer(asAddress('3801ebd1f12462ad335b821807c9d87e4f20d57505222284b2634a7e8e5edac2'), config.addressPrefix),
         cao: {
             tx: b4a.from('1bd4f96adeffba9c04943a82993c5b19660c3a5f572620d82a67464f381640e2', 'hex'),
             txv: b4a.from('f24e61cf7941256b080be2133bccb520414c78021215edfcb781622da526c414', 'hex'),
@@ -192,7 +193,7 @@ export const CAO = {
     },
     validDisableInitializationOperation: {
         type: OperationType.DISABLE_INITIALIZATION,
-        address: addressToBuffer('trac1sq3njyxzd27rsy8zcksgv2jmcsl9dlsmklwwqruhx92dufs3cemqgyrpf7', config.addressPrefix),
+        address: addressToBuffer(asAddress('80233910c26abc3810e2c5a0862a5bc43e56fe1bb7dce00f973154de2611c676'), config.addressPrefix),
         cao: {
             tx: b4a.from('0fc518b31505d163a696555df8dceae415032773f85e578a9a1810ad5c99cf0c', 'hex'),
             txv: b4a.from('dd6b3809673cbca08ee60c32971e9ed9d39fb962c53ab8ef49cd6b467d6977f3', 'hex'),
@@ -215,48 +216,48 @@ export const CAO = {
 export const ACO = {
     validAppendWhitelistOperation: {
         type: OperationType.APPEND_WHITELIST,
-        address: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
+        address: addressToBuffer(asAddress('3801ebd1f12462ad335b821807c9d87e4f20d57505222284b2634a7e8e5edac2'), config.addressPrefix),
         aco: {
             tx: b4a.from('1bd4f96adeffba9c04943a82993c5b19660c3a5f572620d82a67464f381640e2', 'hex'),
             txv: b4a.from('f24e61cf7941256b080be2133bccb520414c78021215edfcb781622da526c414', 'hex'),
             in: b4a.from('0ad7fe36a35a27ea4df932b800200823a97d4db31bca247f43ad7523b0493645', 'hex'),
-            ia: addressToBuffer('trac1xvqvlzx4w2q2pfqrmycew87kq4rv0q0cewxk68ddvddgk2xm09cqvpc4jc', config.addressPrefix),
+            ia: addressToBuffer(asAddress('3300cf88d57280a0a403d931971fd60546c781f8cb8d6d1dad635a8b28db7970'), config.addressPrefix),
             is: b4a.from('5b534be7a374148962c271d194c26cf5b1ad705ab218a87709a33fe74f9d1b811772447c939b17b2f803e3da7648f49b666b929fbb20e458ced952f147162c08', 'hex')
         }
     },
 
     validAddIndexerOperation: {
         type: OperationType.ADD_INDEXER,
-        address: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
+        address: addressToBuffer(asAddress('3801ebd1f12462ad335b821807c9d87e4f20d57505222284b2634a7e8e5edac2'), config.addressPrefix),
         aco: {
             tx: b4a.from('1bd4f96adeffba9c04943a82993c5b19660c3a5f572620d82a67464f381640e2', 'hex'),
             txv: b4a.from('f24e61cf7941256b080be2133bccb520414c78021215edfcb781622da526c414', 'hex'),
             in: b4a.from('0ad7fe36a35a27ea4df932b800200823a97d4db31bca247f43ad7523b0493645', 'hex'),
-            ia: addressToBuffer('trac1xvqvlzx4w2q2pfqrmycew87kq4rv0q0cewxk68ddvddgk2xm09cqvpc4jc', config.addressPrefix),
+            ia: addressToBuffer(asAddress('3300cf88d57280a0a403d931971fd60546c781f8cb8d6d1dad635a8b28db7970'), config.addressPrefix),
             is: b4a.from('5b534be7a374148962c271d194c26cf5b1ad705ab218a87709a33fe74f9d1b811772447c939b17b2f803e3da7648f49b666b929fbb20e458ced952f147162c08', 'hex')
         }
     },
 
     validRemoveIndexerOperation: {
         type: OperationType.REMOVE_INDEXER,
-        address: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
+        address: addressToBuffer(asAddress('3801ebd1f12462ad335b821807c9d87e4f20d57505222284b2634a7e8e5edac2'), config.addressPrefix),
         aco: {
             tx: b4a.from('1bd4f96adeffba9c04943a82993c5b19660c3a5f572620d82a67464f381640e2', 'hex'),
             txv: b4a.from('f24e61cf7941256b080be2133bccb520414c78021215edfcb781622da526c414', 'hex'),
             in: b4a.from('0ad7fe36a35a27ea4df932b800200823a97d4db31bca247f43ad7523b0493645', 'hex'),
-            ia: addressToBuffer('trac1xvqvlzx4w2q2pfqrmycew87kq4rv0q0cewxk68ddvddgk2xm09cqvpc4jc', config.addressPrefix),
+            ia: addressToBuffer(asAddress('3300cf88d57280a0a403d931971fd60546c781f8cb8d6d1dad635a8b28db7970'), config.addressPrefix),
             is: b4a.from('5b534be7a374148962c271d194c26cf5b1ad705ab218a87709a33fe74f9d1b811772447c939b17b2f803e3da7648f49b666b929fbb20e458ced952f147162c08', 'hex')
         }
     },
 
     validBanValidatorOperation: {
         type: OperationType.BAN_VALIDATOR,
-        address: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
+        address: addressToBuffer(asAddress('3801ebd1f12462ad335b821807c9d87e4f20d57505222284b2634a7e8e5edac2'), config.addressPrefix),
         aco: {
             tx: b4a.from('1bd4f96adeffba9c04943a82993c5b19660c3a5f572620d82a67464f381640e2', 'hex'),
             txv: b4a.from('f24e61cf7941256b080be2133bccb520414c78021215edfcb781622da526c414', 'hex'),
             in: b4a.from('0ad7fe36a35a27ea4df932b800200823a97d4db31bca247f43ad7523b0493645', 'hex'),
-            ia: addressToBuffer('trac1xvqvlzx4w2q2pfqrmycew87kq4rv0q0cewxk68ddvddgk2xm09cqvpc4jc', config.addressPrefix),
+            ia: addressToBuffer(asAddress('3300cf88d57280a0a403d931971fd60546c781f8cb8d6d1dad635a8b28db7970'), config.addressPrefix),
             is: b4a.from('5b534be7a374148962c271d194c26cf5b1ad705ab218a87709a33fe74f9d1b811772447c939b17b2f803e3da7648f49b666b929fbb20e458ced952f147162c08', 'hex')
         }
     },
@@ -275,21 +276,21 @@ export const ACO = {
 export const RAO = {
     valid_complete_add_writer: {
         type: OperationType.ADD_WRITER,
-        address: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
+        address: addressToBuffer(asAddress('3801ebd1f12462ad335b821807c9d87e4f20d57505222284b2634a7e8e5edac2'), config.addressPrefix),
         rao: {
             tx: b4a.from('1bd4f96adeffba9c04943a82993c5b19660c3a5f572620d82a67464f381640e2', 'hex'),
             txv: b4a.from('f24e61cf7941256b080be2133bccb520414c78021215edfcb781622da526c414', 'hex'),
             iw: b4a.from('71c53657a8738b48772f0940398d4f4b01dc56cb32cd2fd84c30359f0cbb08f1', 'hex'),
             in: b4a.from('0ad7fe36a35a27ea4df932b800200823a97d4db31bca247f43ad7523b0493645', 'hex'),
             is: b4a.from('5b534be7a374148962c271d194c26cf5b1ad705ab218a87709a33fe74f9d1b811772447c939b17b2f803e3da7648f49b666b929fbb20e458ced952f147162c08', 'hex'),
-            va: addressToBuffer('trac1xvqvlzx4w2q2pfqrmycew87kq4rv0q0cewxk68ddvddgk2xm09cqvpc4jc', config.addressPrefix),
+            va: addressToBuffer(asAddress('3300cf88d57280a0a403d931971fd60546c781f8cb8d6d1dad635a8b28db7970'), config.addressPrefix),
             vn: b4a.from('9027192c6de13b683bc0c0fbcfe09c4e55d47c12c46b122d988f06c282a4be5e', 'hex'),
             vs: b4a.from('8fb8a3ba30e00c347bca5a8554c47e167f63b248c87e1ea5532eebbad1bc036184fe8872ff65a9e63acfee68d2213a187466c13ff6687d3ab57e5209abd4fb01', 'hex')
         }
     },
     valid_partial_add_writer: {
         type: OperationType.ADD_WRITER,
-        address: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
+        address: addressToBuffer(asAddress('3801ebd1f12462ad335b821807c9d87e4f20d57505222284b2634a7e8e5edac2'), config.addressPrefix),
         rao: {
             tx: b4a.from('1bd4f96adeffba9c04943a82993c5b19660c3a5f572620d82a67464f381640e2', 'hex'),
             txv: b4a.from('f24e61cf7941256b080be2133bccb520414c78021215edfcb781622da526c414', 'hex'),
@@ -302,21 +303,21 @@ export const RAO = {
 
     valid_complete_remove_writer: {
         type: OperationType.REMOVE_WRITER,
-        address: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
+        address: addressToBuffer(asAddress('3801ebd1f12462ad335b821807c9d87e4f20d57505222284b2634a7e8e5edac2'), config.addressPrefix),
         rao: {
             tx: b4a.from('1bd4f96adeffba9c04943a82993c5b19660c3a5f572620d82a67464f381640e2', 'hex'),
             txv: b4a.from('f24e61cf7941256b080be2133bccb520414c78021215edfcb781622da526c414', 'hex'),
             iw: b4a.from('71c53657a8738b48772f0940398d4f4b01dc56cb32cd2fd84c30359f0cbb08f1', 'hex'),
             in: b4a.from('0ad7fe36a35a27ea4df932b800200823a97d4db31bca247f43ad7523b0493645', 'hex'),
             is: b4a.from('5b534be7a374148962c271d194c26cf5b1ad705ab218a87709a33fe74f9d1b811772447c939b17b2f803e3da7648f49b666b929fbb20e458ced952f147162c08', 'hex'),
-            va: addressToBuffer('trac1xvqvlzx4w2q2pfqrmycew87kq4rv0q0cewxk68ddvddgk2xm09cqvpc4jc', config.addressPrefix),
+            va: addressToBuffer(asAddress('3300cf88d57280a0a403d931971fd60546c781f8cb8d6d1dad635a8b28db7970'), config.addressPrefix),
             vn: b4a.from('9027192c6de13b683bc0c0fbcfe09c4e55d47c12c46b122d988f06c282a4be5e', 'hex'),
             vs: b4a.from('8fb8a3ba30e00c347bca5a8554c47e167f63b248c87e1ea5532eebbad1bc036184fe8872ff65a9e63acfee68d2213a187466c13ff6687d3ab57e5209abd4fb01', 'hex')
         }
     },
     valid_partial_remove_writer: {
         type: OperationType.REMOVE_WRITER,
-        address: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
+        address: addressToBuffer(asAddress('3801ebd1f12462ad335b821807c9d87e4f20d57505222284b2634a7e8e5edac2'), config.addressPrefix),
         rao: {
             tx: b4a.from('1bd4f96adeffba9c04943a82993c5b19660c3a5f572620d82a67464f381640e2', 'hex'),
             txv: b4a.from('f24e61cf7941256b080be2133bccb520414c78021215edfcb781622da526c414', 'hex'),
@@ -327,21 +328,21 @@ export const RAO = {
     },
     valid_complete_admin_recovery: {
         type: OperationType.ADMIN_RECOVERY,
-        address: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
+        address: addressToBuffer(asAddress('3801ebd1f12462ad335b821807c9d87e4f20d57505222284b2634a7e8e5edac2'), config.addressPrefix),
         rao: {
             tx: b4a.from('1bd4f96adeffba9c04943a82993c5b19660c3a5f572620d82a67464f381640e2', 'hex'),
             txv: b4a.from('f24e61cf7941256b080be2133bccb520414c78021215edfcb781622da526c414', 'hex'),
             iw: b4a.from('71c53657a8738b48772f0940398d4f4b01dc56cb32cd2fd84c30359f0cbb08f1', 'hex'),
             in: b4a.from('0ad7fe36a35a27ea4df932b800200823a97d4db31bca247f43ad7523b0493645', 'hex'),
             is: b4a.from('5b534be7a374148962c271d194c26cf5b1ad705ab218a87709a33fe74f9d1b811772447c939b17b2f803e3da7648f49b666b929fbb20e458ced952f147162c08', 'hex'),
-            va: addressToBuffer('trac1xvqvlzx4w2q2pfqrmycew87kq4rv0q0cewxk68ddvddgk2xm09cqvpc4jc', config.addressPrefix),
+            va: addressToBuffer(asAddress('3300cf88d57280a0a403d931971fd60546c781f8cb8d6d1dad635a8b28db7970'), config.addressPrefix),
             vn: b4a.from('9027192c6de13b683bc0c0fbcfe09c4e55d47c12c46b122d988f06c282a4be5e', 'hex'),
             vs: b4a.from('8fb8a3ba30e00c347bca5a8554c47e167f63b248c87e1ea5532eebbad1bc036184fe8872ff65a9e63acfee68d2213a187466c13ff6687d3ab57e5209abd4fb01', 'hex')
         }
     },
     valid_partial_admin_recovery: {
         type: OperationType.ADMIN_RECOVERY,
-        address: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
+        address: addressToBuffer(asAddress('3801ebd1f12462ad335b821807c9d87e4f20d57505222284b2634a7e8e5edac2'), config.addressPrefix),
         rao: {
             tx: b4a.from('1bd4f96adeffba9c04943a82993c5b19660c3a5f572620d82a67464f381640e2', 'hex'),
             txv: b4a.from('f24e61cf7941256b080be2133bccb520414c78021215edfcb781622da526c414', 'hex'),
@@ -378,12 +379,12 @@ export const RAO = {
 export const BIO = {
     valid_balance_initialization_operation: {
         type: OperationType.BALANCE_INITIALIZATION,
-        address: addressToBuffer('trac18qq7h503y3326v6msgvq0jwc0e8jp4t4q53z9p9jvd98arj7mtpqfac04p', config.addressPrefix),
+        address: addressToBuffer(asAddress('3801ebd1f12462ad335b821807c9d87e4f20d57505222284b2634a7e8e5edac2'), config.addressPrefix),
         bio: {
             tx: b4a.from('1bd4f96adeffba9c04943a82993c5b19660c3a5f572620d82a67464f381640e2', 'hex'),
             txv: b4a.from('f24e61cf7941256b080be2133bccb520414c78021215edfcb781622da526c414', 'hex'),
             in: b4a.from('0ad7fe36a35a27ea4df932b800200823a97d4db31bca247f43ad7523b0493645', 'hex'),
-            ia: addressToBuffer('trac1xvqvlzx4w2q2pfqrmycew87kq4rv0q0cewxk68ddvddgk2xm09cqvpc4jc', config.addressPrefix),
+            ia: addressToBuffer(asAddress('3300cf88d57280a0a403d931971fd60546c781f8cb8d6d1dad635a8b28db7970'), config.addressPrefix),
             am: b4a.from('00000000000000015af1d78b58c40001', 'hex'),
             is: b4a.from('5b534be7a374148962c271d194c26cf5b1ad705ab218a87709a33fe74f9d1b811772447c939b17b2f803e3da7648f49b666b929fbb20e458ced952f147162c08', 'hex')
         }

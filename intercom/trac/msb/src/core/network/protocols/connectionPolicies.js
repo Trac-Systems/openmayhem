@@ -1,0 +1,174 @@
+import { ResultCode } from '../../../utils/constants.js';
+
+// TODO: Consider how to behave with ResultCode.UNSPECIFIED
+
+/**
+ * Sender actions are consumed by the message orchestrator after a validator responds.
+ * They define whether the validator should be treated as successful, rotated out, or kept
+ * in the pool without rotation for the current result code.
+ */
+export const SENDER_ACTION = Object.freeze({
+    UNDEFINED: 'UNDEFINED',
+    SUCCESS: 'SUCCESS',
+    ROTATE: 'ROTATE',
+    NO_ROTATE: 'NO_ROTATE',
+});
+
+// Result codes that mean the validator completed the request successfully.
+const SUCCESS_CODES = new Set([
+    ResultCode.OK,
+]);
+
+// Result codes that should rotate the validator out of the sender pool after the response.
+// In practice these are transport, protocol, validation, or validator-side failures that make
+// the current peer unsuitable to keep as the next sender candidate.
+const ROTATE_CODES = new Set([
+    ResultCode.UNSPECIFIED,
+    ResultCode.INVALID_PAYLOAD,
+    ResultCode.RATE_LIMITED,
+    ResultCode.SIGNATURE_INVALID,
+    ResultCode.UNEXPECTED_ERROR,
+    ResultCode.TIMEOUT,
+    ResultCode.NODE_HAS_NO_WRITE_ACCESS,
+    ResultCode.TX_ACCEPTED_PROOF_UNAVAILABLE,
+    ResultCode.NODE_OVERLOADED,
+    ResultCode.OPERATION_TYPE_UNKNOWN,
+    ResultCode.SCHEMA_VALIDATION_FAILED,
+    ResultCode.REQUESTER_ADDRESS_INVALID,
+    ResultCode.REQUESTER_PUBLIC_KEY_INVALID,
+    ResultCode.TX_HASH_MISMATCH,
+    ResultCode.TX_SIGNATURE_INVALID,
+    ResultCode.TX_EXPIRED,
+    ResultCode.TX_ALREADY_EXISTS,
+    ResultCode.OPERATION_ALREADY_COMPLETED,
+    ResultCode.REQUESTER_NOT_FOUND,
+    ResultCode.INSUFFICIENT_FEE_BALANCE,
+    ResultCode.EXTERNAL_BOOTSTRAP_EQUALS_MSB_BOOTSTRAP,
+    ResultCode.SELF_VALIDATION_FORBIDDEN,
+    ResultCode.ROLE_NODE_ENTRY_NOT_FOUND,
+    ResultCode.ROLE_NODE_ALREADY_WRITER,
+    ResultCode.ROLE_NODE_NOT_WHITELISTED,
+    ResultCode.ROLE_NODE_NOT_WRITER,
+    ResultCode.ROLE_NODE_IS_INDEXER,
+    ResultCode.ROLE_ADMIN_ENTRY_MISSING,
+    ResultCode.ROLE_INVALID_RECOVERY_CASE,
+    ResultCode.ROLE_UNKNOWN_OPERATION,
+    ResultCode.ROLE_INVALID_WRITER_KEY,
+    ResultCode.ROLE_INSUFFICIENT_FEE_BALANCE,
+    ResultCode.MSB_BOOTSTRAP_MISMATCH,
+    ResultCode.EXTERNAL_BOOTSTRAP_NOT_DEPLOYED,
+    ResultCode.EXTERNAL_BOOTSTRAP_TX_MISSING,
+    ResultCode.EXTERNAL_BOOTSTRAP_MISMATCH,
+    ResultCode.BOOTSTRAP_ALREADY_EXISTS,
+    ResultCode.TRANSFER_RECIPIENT_ADDRESS_INVALID,
+    ResultCode.TRANSFER_RECIPIENT_PUBLIC_KEY_INVALID,
+    ResultCode.TRANSFER_AMOUNT_TOO_LARGE,
+    ResultCode.TRANSFER_SENDER_NOT_FOUND,
+    ResultCode.TRANSFER_INSUFFICIENT_BALANCE,
+    ResultCode.TRANSFER_RECIPIENT_BALANCE_OVERFLOW,
+    ResultCode.TX_HASH_INVALID_FORMAT,
+    ResultCode.INTERNAL_ENQUEUE_VALIDATION_FAILED,
+    ResultCode.TX_COMMITTED_RECEIPT_MISSING,
+    ResultCode.VALIDATOR_RESPONSE_TX_TYPE_INVALID,
+    ResultCode.VALIDATOR_RESPONSE_TX_TYPE_UNKNOWN,
+    ResultCode.VALIDATOR_RESPONSE_TX_TYPE_UNSUPPORTED,
+    ResultCode.VALIDATOR_RESPONSE_SCHEMA_INVALID,
+    ResultCode.PENDING_REQUEST_MISSING_TX_DATA,
+    ResultCode.PROOF_PAYLOAD_MISMATCH,
+    ResultCode.VALIDATOR_WRITER_KEY_NOT_REGISTERED,
+    ResultCode.VALIDATOR_ADDRESS_MISMATCH,
+    ResultCode.VALIDATOR_NODE_ENTRY_NOT_FOUND,
+    ResultCode.VALIDATOR_NODE_NOT_WRITER,
+    ResultCode.VALIDATOR_WRITER_KEY_MISMATCH,
+    ResultCode.VALIDATOR_TX_OBJECT_INVALID,
+    ResultCode.VALIDATOR_VA_MISSING,
+    ResultCode.TX_INVALID_PAYLOAD
+]);
+
+const NO_ROTATE_CODES = new Set([
+    ResultCode.TX_ALREADY_PENDING,
+]);
+
+export function resultToValidatorAction(resultCode) {
+    if (SUCCESS_CODES.has(resultCode)) return SENDER_ACTION.SUCCESS;
+    if (ROTATE_CODES.has(resultCode)) return SENDER_ACTION.ROTATE;
+    if (NO_ROTATE_CODES.has(resultCode)) return SENDER_ACTION.NO_ROTATE;
+    return SENDER_ACTION.UNDEFINED;
+}
+
+/**
+ * Keep connection result codes:
+ * - ResultCode.OK
+ * - ResultCode.TIMEOUT
+ * - ResultCode.TX_ACCEPTED_PROOF_UNAVAILABLE
+ * - ResultCode.TX_ALREADY_PENDING
+ * - ResultCode.TX_HASH_INVALID_FORMAT
+ * - ResultCode.INTERNAL_ENQUEUE_VALIDATION_FAILED
+ * - ResultCode.TX_COMMITTED_RECEIPT_MISSING
+ * - ResultCode.VALIDATOR_RESPONSE_TX_TYPE_INVALID
+ * - ResultCode.VALIDATOR_RESPONSE_TX_TYPE_UNKNOWN
+ * - ResultCode.VALIDATOR_RESPONSE_TX_TYPE_UNSUPPORTED
+ * - ResultCode.VALIDATOR_RESPONSE_SCHEMA_INVALID
+ * - ResultCode.PENDING_REQUEST_MISSING_TX_DATA
+ * - ResultCode.PROOF_PAYLOAD_MISMATCH
+ * - ResultCode.VALIDATOR_WRITER_KEY_NOT_REGISTERED
+ * - ResultCode.VALIDATOR_ADDRESS_MISMATCH
+ * - ResultCode.VALIDATOR_NODE_ENTRY_NOT_FOUND
+ * - ResultCode.VALIDATOR_NODE_NOT_WRITER
+ * - ResultCode.VALIDATOR_WRITER_KEY_MISMATCH
+ * - ResultCode.VALIDATOR_TX_OBJECT_INVALID
+ * - ResultCode.VALIDATOR_VA_MISSING
+ */
+const VALIDATOR_SIDE_END_CONNECTION_CODES = new Set([
+    // BASE_TRANSPORT_AND_VALIDATOR_STATUS
+    ResultCode.UNSPECIFIED,
+    ResultCode.INVALID_PAYLOAD,
+    ResultCode.RATE_LIMITED,
+    ResultCode.SIGNATURE_INVALID,
+    ResultCode.UNEXPECTED_ERROR,
+    ResultCode.NODE_HAS_NO_WRITE_ACCESS,
+    ResultCode.NODE_OVERLOADED,
+
+    // SHARED_VALIDATORS_REQUEST_PAYLOAD
+    ResultCode.OPERATION_TYPE_UNKNOWN,
+    ResultCode.SCHEMA_VALIDATION_FAILED,
+    ResultCode.REQUESTER_ADDRESS_INVALID,
+    ResultCode.REQUESTER_PUBLIC_KEY_INVALID,
+    ResultCode.TX_HASH_MISMATCH,
+    ResultCode.TX_SIGNATURE_INVALID,
+    ResultCode.TX_EXPIRED,
+    ResultCode.TX_ALREADY_EXISTS,
+    ResultCode.OPERATION_ALREADY_COMPLETED,
+    ResultCode.REQUESTER_NOT_FOUND,
+    ResultCode.INSUFFICIENT_FEE_BALANCE,
+    ResultCode.EXTERNAL_BOOTSTRAP_EQUALS_MSB_BOOTSTRAP,
+    ResultCode.SELF_VALIDATION_FORBIDDEN,
+    ResultCode.ROLE_NODE_ENTRY_NOT_FOUND,
+    ResultCode.ROLE_NODE_ALREADY_WRITER,
+    ResultCode.ROLE_NODE_NOT_WHITELISTED,
+    ResultCode.ROLE_NODE_NOT_WRITER,
+    ResultCode.ROLE_NODE_IS_INDEXER,
+    ResultCode.ROLE_ADMIN_ENTRY_MISSING,
+    ResultCode.ROLE_INVALID_RECOVERY_CASE,
+    ResultCode.ROLE_UNKNOWN_OPERATION,
+    ResultCode.ROLE_INVALID_WRITER_KEY,
+    ResultCode.ROLE_INSUFFICIENT_FEE_BALANCE,
+    ResultCode.MSB_BOOTSTRAP_MISMATCH,
+    ResultCode.EXTERNAL_BOOTSTRAP_NOT_DEPLOYED,
+    ResultCode.EXTERNAL_BOOTSTRAP_TX_MISSING,
+    ResultCode.EXTERNAL_BOOTSTRAP_MISMATCH,
+    ResultCode.BOOTSTRAP_ALREADY_EXISTS,
+    ResultCode.TRANSFER_RECIPIENT_ADDRESS_INVALID,
+    ResultCode.TRANSFER_RECIPIENT_PUBLIC_KEY_INVALID,
+    ResultCode.TRANSFER_AMOUNT_TOO_LARGE,
+    ResultCode.TRANSFER_SENDER_NOT_FOUND,
+    ResultCode.TRANSFER_INSUFFICIENT_BALANCE,
+    ResultCode.TRANSFER_RECIPIENT_BALANCE_OVERFLOW,
+
+    // VALIDATOR_RESPONSE_PROOF_AND_IDENTITY_VALIDATION
+    ResultCode.TX_INVALID_PAYLOAD,
+]);
+
+export function shouldEndConnection(resultCode) {
+    return VALIDATOR_SIDE_END_CONNECTION_CODES.has(resultCode);
+}

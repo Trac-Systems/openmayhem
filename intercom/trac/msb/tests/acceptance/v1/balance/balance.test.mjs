@@ -44,8 +44,7 @@ export const registerBalanceTests = (context) => {
             expect(BigInt(res.body.balance)).toBe(0n)
         })
 
-        //TODO: This test should return 400, but for backward compatibility reasons it currently returns 200 with zero balance. Please fix this.
-        it.skip("returns zero balance for an invalid address format", async () => {
+        it("returns 400 for an invalid address format", async () => {
             const invalidAddress = "not-a-valid-address"
             const res = await request(context.server).get(`/v1/balance/${invalidAddress}`)
             expect(res.statusCode).toBe(400)

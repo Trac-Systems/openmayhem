@@ -2,31 +2,6 @@ import b4a from 'b4a';
 import { v7 as uuidv7 } from 'uuid';
 import { NetworkOperationType, ResultCode as NetworkResultCode } from '../../src/utils/constants.js';
 
-const payloadValidatorConnectionRequest = {
-    type: NetworkOperationType.VALIDATOR_CONNECTION_REQUEST,
-    id: uuidv7(),
-    timestamp: 123,
-    validator_connection_request: {
-        issuer_address: 'trac1xm76l9qaujh7vqktk8302mw9sfrxau3l45w62hqfl4kasswt6yts0autkh',
-        nonce: b4a.from('00', 'hex'),
-        signature: b4a.from('01', 'hex')
-    },
-    capabilities: ['cap:a', 'cap:b']
-};
-
-const payloadValidatorConnectionResponse = {
-    type: NetworkOperationType.VALIDATOR_CONNECTION_RESPONSE,
-    id: uuidv7(),
-    timestamp: 456,
-    validator_connection_response: {
-        issuer_address: 'trac1xm76l9qaujh7vqktk8302mw9sfrxau3l45w62hqfl4kasswt6yts0autkh',
-        nonce: b4a.from('02', 'hex'),
-        signature: b4a.from('03', 'hex'),
-        result: NetworkResultCode.OK
-    },
-    capabilities: ['cap:a']
-};
-
 const payloadLivenessRequest = {
     type: NetworkOperationType.LIVENESS_REQUEST,
     id: uuidv7(),
@@ -69,14 +44,14 @@ const payloadBroadcastTransactionResponse = {
     broadcast_transaction_response: {
         nonce: b4a.from('0a', 'hex'),
         signature: b4a.from('0b', 'hex'),
+        proof: b4a.from('0c', 'hex'),
+        timestamp: 161719,
         result: NetworkResultCode.OK
     },
     capabilities: ['cap:b']
 };
 
 export default {
-    payloadValidatorConnectionRequest,
-    payloadValidatorConnectionResponse,
     payloadLivenessRequest,
     payloadLivenessResponse,
     payloadBroadcastTransactionRequest,

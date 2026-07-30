@@ -1,7 +1,5 @@
 import { test } from 'brittle';
-import b4a from 'b4a';
-import PeerWallet from 'trac-wallet';
-
+import { WalletProvider } from 'trac-wallet';
 import ApplyStateMessageBuilder from '../../../../src/messages/state/ApplyStateMessageBuilder.js';
 import { OperationType } from '../../../../src/utils/constants.js';
 import { isHexString } from '../../../../src/utils/helpers.js';
@@ -12,9 +10,7 @@ import { isAddressValid } from '../../../../src/core/state/utils/address.js';
 const hex = (value, bytes) => value.repeat(bytes);
 
 async function createWallet(mnemonic) {
-    const wallet = new PeerWallet({ mnemonic, networkPrefix: config.addressPrefix });
-    await wallet.ready;
-    return wallet;
+    return await new WalletProvider(config).fromMnemonic({ mnemonic, derivationPath: config.derivationPath })
 }
 
 function expectHexField(t, value, bytes, label) {

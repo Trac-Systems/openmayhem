@@ -167,26 +167,57 @@ class Protocol{
 
     async simulateTransaction(validator_pub_key, obj, surrogate = null){
         const storage = new SimStorage(this.peer);
-        let nonce = this.generateNonce();
         const content_hash = await createHash(this.safeJsonStringify(obj));
         const txvHex = await this.peer.msbClient.getTxvHex();
         const msbBootstrapHex = this.peer.msbClient.bootstrapHex;
         const subnetBootstrapHex = (b4a.isBuffer(this.peer.config.bootstrap) ? this.peer.config.bootstrap.toString('hex') : (''+this.peer.config.bootstrap)).toLowerCase();
-        const tx = await this.generateTx(
-            this.peer.msbClient.networkId,
-            txvHex,
-            this.peer.writerLocalKey,
-            content_hash,
-            subnetBootstrapHex,
-            msbBootstrapHex,
-            nonce
-        );
+
+        let nonceHex, txHex, signatureHex, pubKeyHex;
+        if(surrogate !== null) {
+            nonceHex = surrogate.nonce;
+            txHex = surrogate.tx;
+            signatureHex = surrogate.signature;
+            pubKeyHex = surrogate.address;
+        } else {
+            nonceHex = this.generateNonce();
+            txHex = await this.generateTx(
+                this.peer.msbClient.networkId,
+                txvHex,
+                this.peer.writerLocalKey,
+                content_hash,
+                subnetBootstrapHex,
+                msbBootstrapHex,
+                nonceHex
+            );
+            signatureHex = this.peer.wallet.sign(b4a.from(txHex, 'hex'));
+            pubKeyHex = this.peer.wallet.publicKey;
+        }
+
+        const address = this.peer.msbClient.pubKeyHexToAddress(pubKeyHex);
+        if(address === null) throw new Error('Failed to create MSB address from public key.');
+
+        const payload = {
+            type: MSB_OPERATION_TYPE.TX,
+            address: address,
+            txo: {
+                tx: txHex,
+                txv: txvHex,
+                iw: this.peer.writerLocalKey,
+                in: nonceHex,
+                ch: content_hash,
+                is: signatureHex,
+                bs: subnetBootstrapHex,
+                mbs: msbBootstrapHex
+            }
+        };
+        await this.peer.msbClient.validateTransaction(payload);
+
         const op = {
             type : 'tx',
-            key : tx,
+            key : txHex,
             value : {
                 dispatch : obj,
-                ipk : surrogate !== null ? surrogate.address : this.peer.wallet.publicKey,
+                ipk : pubKeyHex,
                 wp : validator_pub_key
             }
         }
@@ -250,6 +281,7 @@ class Protocol{
             }
         };
 
+        await this.peer.msbClient.validateTransaction(payload);
         await this.peer.msbClient.broadcastTransaction(payload);
         if(this.peer.txPool.isNotFull() && !this.peer.txPool.contains(txHex)){
             this.peer.txPool.add(txHex, { dispatch : obj, ipk : pubKeyHex, address : address });

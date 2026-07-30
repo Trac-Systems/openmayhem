@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package network.v1;
+
+import "network/v1/enums/result_code.proto";
+
+message LivenessResponse {
+  bytes nonce = 1;
+  bytes signature = 2;
+  ResultCode result = 3;
+}

@@ -1,12 +1,13 @@
-import { test, hook } from 'brittle';
+import { test } from 'brittle';
 import migrationUtils from '../../../../src/utils/migrationUtils.js';
 import { errorMessageIncludes } from "../../../helpers/regexHelper.js";
 import { ZERO_LICENSE } from '../../../../src/core/state/utils/nodeEntry.js';
 import b4a from 'b4a';
 import { config } from '../../../helpers/config.js';
+import { asAddress } from '../../../helpers/address.js';
 
-const VALID_ADDRESS = 'trac1dguwzsvcsehslh6dgj2mqlsxdn7s5t5vhem56yd0xlg47aq6exzqymhr6u';
-const ADMIN_ADDRESS = 'trac1yva2pduhz5yst8jgzmrc9ve0as5mx7tcw6le9srj6xcwqkx9hacqxxhsf9';
+const VALID_ADDRESS = asAddress('6a38e14198866f0fdf4d4495b07e066cfd0a2e8cbe774d11af37d15f741ac984');
+const ADMIN_ADDRESS = asAddress('233aa0b7971509059e4816c782b32fec29b3797876bf92c072d1b0e058c5bf70');
 const INVALID_ADDRESS = 'notanaddress';
 const LICENSE_NUMBER_ONE = b4a.alloc(4, 1);
 
