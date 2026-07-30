@@ -16,6 +16,7 @@ import {
   safeHeapSnapshotLabel,
   writeBareHeapSnapshot,
 } from '../features/sc-bridge/heap-snapshot.js';
+import { closeBridgeSocket } from '../features/sc-bridge/socket.js';
 import {
   canOwnSession,
   closeOwnedSessions,
@@ -66,6 +67,22 @@ test('failed async client request is contained and the bridge serves the next re
   );
 
   assert.deepEqual(events, ['error:injected session_open failure', 'pong']);
+});
+
+test('SC-Bridge closes rejected sockets without surfacing an uncaught error object', () => {
+  const calls = [];
+  const socket = {
+    end() {
+      calls.push(['end']);
+    },
+    destroy(...args) {
+      calls.push(['destroy', ...args]);
+    },
+  };
+
+  closeBridgeSocket(socket);
+
+  assert.deepEqual(calls, [['end'], ['destroy']]);
 });
 
 test('SC-Bridge heap snapshot helper writes a private sanitized artifact', async () => {

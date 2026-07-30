@@ -25,6 +25,7 @@ import {
   sessionSubscriptionMatches,
 } from './session-ownership.js';
 import { writeBareHeapSnapshot } from './heap-snapshot.js';
+import { closeBridgeSocket } from './socket.js';
 
 const DEFAULT_MAX_CLIENTS = 64;
 const DEFAULT_MAX_MESSAGE_BYTES = 2 * 1024 * 1024;
@@ -199,9 +200,7 @@ class ScBridge extends Feature {
       console.log(`[sc-bridge] client ${client.id} disconnected: ${reason}`);
     }
     if (destroySocket) {
-      try {
-        client.socket.destroy?.(new Error(reason));
-      } catch (_e) {}
+      closeBridgeSocket(client.socket);
     }
   }
 
@@ -1137,9 +1136,7 @@ class ScBridge extends Feature {
     this.started = true;
     this.server = new ws.Server({ host: this.host, port: this.port }, (socket) => {
       if (this.clients.size >= this.maxClients) {
-        try {
-          socket.destroy?.(new Error('SC-Bridge client limit reached.'));
-        } catch (_e) {}
+        closeBridgeSocket(socket);
         return;
       }
       const client = {
