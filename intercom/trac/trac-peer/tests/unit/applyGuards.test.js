@@ -164,6 +164,65 @@ test('apply: tx msbsl stall guard skips waiting', async (t) => {
     });
 });
 
+test('apply: tx msbsl relative future guard skips waiting', async (t) => {
+    await withTempDir(async ({ storesDirectory }) => {
+        const msbBootstrapBuf = b4a.alloc(32).fill(7);
+        const msb = makeMsbStub({
+            msbBootstrapBuf,
+            signedLength: 100,
+            async getEntry() {
+                return null;
+            },
+        });
+
+        msb.state.base.view.core.once = () => {
+            throw new Error('apply should not wait for a far-future msbsl');
+        };
+
+        const storeName = 'peer-relative-stall-guard';
+        const wallet = await prepareWallet(storesDirectory, storeName);
+        const config = createConfig(ENV.DEVELOPMENT, {
+            storesDirectory,
+            storeName,
+            maxMsbSignedLength: 1_000_000_000,
+            maxMsbSignedLengthFutureDelta: 10,
+        });
+        const peer = new Peer({
+            config,
+            msb,
+            protocol: TestProtocol,
+            contract: TestContract,
+            wallet,
+        });
+
+        try {
+            await peer.ready();
+
+            const txHashHex = makeHex32(1);
+            const op = {
+                type: 'tx',
+                key: txHashHex,
+                value: {
+                    dispatch: { type: 'ping', value: { msg: 'hi' } },
+                    msbsl: 111,
+                    ipk: makeHex32(2),
+                    wp: makeHex32(3),
+                },
+            };
+
+            const timeout = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error('append timed out (possible apply stall)')), 2000)
+            );
+            await Promise.race([peer.base.append(op), timeout]);
+
+            const txl = await peer.bee.get('txl');
+            t.is(txl, null, 'tx should not be indexed when msbsl exceeds the local future window');
+        } finally {
+            await closePeer(peer);
+        }
+    });
+});
+
 test('apply: tx MSB payload size guard blocks otherwise-valid tx', async (t) => {
     await withTempDir(async ({ storesDirectory }) => {
         const msbBootstrapBuf = b4a.alloc(32).fill(7);

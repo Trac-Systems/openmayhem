@@ -91,6 +91,8 @@ const stableValue = (value) => {
 
 const stableJson = (value) => JSON.stringify(stableValue(value));
 
+// MAYHEM PATCH: return a bounded relay error for over-large feature appends
+// instead of wedging the writer on Hypercore's block-size guard.
 const appendBlockSizeError = (error) =>
   error &&
   (error.code === 'BAD_ARGUMENT' || error.name === 'HypercoreError') &&
@@ -283,9 +285,13 @@ const participantFor = (value) => {
     return normalizeKey(value.intent?.provider);
   }
   if (value.op === 'spend_reserve_targeted') {
+    // MAYHEM PATCH: keep targeted reservation relay authority on the provider,
+    // matching the spend path without requiring writable local peers.
     return normalizeKey(value.provider);
   }
   if (value.op === 'record_usage_receipt') {
+    // MAYHEM PATCH: receipt relay is provider-authorized but must preserve the
+    // raw signed receipt envelope bytes through the feature path.
     const provider = normalizeKey(value.receipt?.body?.provider);
     return /^[0-9a-f]{64}$/.test(provider) ? provider : null;
   }
@@ -1630,6 +1636,8 @@ class MayhemFeature extends Feature {
   }
 
   async _submitRelayedFeature(key, value, requestId) {
+    // MAYHEM PATCH: relayed retries must not reuse a feature nonce after a
+    // contract-side rejection, otherwise the deterministic sh/fr slot is burned.
     // The sidechannel request id dedupes in-flight relay delivery. The writer
     // append itself needs a fresh nonce so a transient contract rejection does
     // not permanently burn the same fr/<hash> for later valid retries.

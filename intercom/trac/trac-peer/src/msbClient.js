@@ -93,11 +93,37 @@ export class MsbClient extends ReadyResource {
         return await this.#msb.network.tryConnect(pubKeyHex, role);
     }
 
-    async waitForSignedLengthAtLeast(targetSignedLength) {
+    async waitForSignedLengthAtLeast(targetSignedLength, { pollMs = 1_000 } = {}) {
         const core = this.#msb.state?.base?.view?.core ?? null;
         if (!core) throw new Error('MSB view core not available.');
+        if (!Number.isSafeInteger(targetSignedLength) || targetSignedLength < 0) {
+            throw new Error('Invalid MSB signed length target.');
+        }
+        if (!Number.isSafeInteger(pollMs) || pollMs < 1) {
+            throw new Error('Invalid MSB signed length wait poll interval.');
+        }
         while (core.signedLength < targetSignedLength) {
-            await new Promise((resolve) => core.once('append', resolve));
+            // MAYHEM PATCH: use a bounded append wait so a missed event cannot leave
+            // the waiter asleep forever; the outer loop still preserves sparse catch-up.
+            await new Promise((resolve) => {
+                const onAppend = () => {
+                    cleanup();
+                    resolve();
+                };
+                const cleanup = () => {
+                    clearTimeout(timer);
+                    if (typeof core.off === 'function') {
+                        core.off('append', onAppend);
+                    } else if (typeof core.removeListener === 'function') {
+                        core.removeListener('append', onAppend);
+                    }
+                };
+                const timer = setTimeout(() => {
+                    cleanup();
+                    resolve();
+                }, pollMs);
+                core.once('append', onAppend);
+            });
         }
     }
 

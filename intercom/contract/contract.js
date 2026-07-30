@@ -3601,6 +3601,8 @@ class MayhemContract extends Contract {
   }
 
   async targetedSpendAccountingState(user, rail) {
+    // MAYHEM PATCH: combine legacy aggregate holds with sharded reservation
+    // state so existing reservations survive the targeted-hold rollout.
     const hold = await this.normalizeTargetedSpendHoldRecord(
       (await this.get(this.targetedSpendHoldKey(user, rail))) ?? null,
       user,
@@ -3635,6 +3637,8 @@ class MayhemContract extends Contract {
   }
 
   async targetedSpendReservationState(user, rail, reservationId, sessionId) {
+    // MAYHEM PATCH: prefer sharded targeted reservation records and retain a
+    // legacy overlay path for reservations opened before the sharded layout.
     const sessionKey = this.targetedSpendSessionKey(user, rail, reservationId);
     const sessionRecord = await this.normalizeTargetedSpendSessionRecord(
       await this.get(sessionKey),
@@ -3849,6 +3853,8 @@ class MayhemContract extends Contract {
     at,
     reason,
   }) {
+    // MAYHEM PATCH: close or retain legacy targeted holds deterministically
+    // while payout epochs consume the new sharded reservation records.
     const closure = this.prepareTargetedReservationClosure({
       hold,
       session,
@@ -15970,6 +15976,8 @@ class MayhemContract extends Contract {
     return `payout/liability-index/${rail}`;
   }
 
+  // MAYHEM PATCH: canonical per-rail liability index avoids ledger-wide scans
+  // when targeted payout epochs collect provider earnings.
   normalizeProviderPayoutLiabilityIndex(value, rail) {
     const shapeError = this.validateExactObjectKeys(
       value,

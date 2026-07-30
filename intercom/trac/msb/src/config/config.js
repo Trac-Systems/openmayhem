@@ -1,5 +1,7 @@
 import b4a from 'b4a'
 
+// MAYHEM PATCH: keep the vendored trac-msb Hyperbee/Corestore cache bounded
+// for long-running mainnet peers.
 const DEFAULT_HYPERBEE_CACHE_MAX_ENTRIES = 65_536
 
 export class Config {

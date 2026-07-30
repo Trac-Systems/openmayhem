@@ -34,9 +34,15 @@ export class TxOperation {
         if(b4a.byteLength(jsonStringify(op)) > this.#protocolInstance.txMaxBytes()) return;
         // Schema validation (required fields / types)
         if(false === this.#validator.validate(op)) return;
-        // Stall guard: don't allow a writer to pin apply waiting on an absurd MSB height
+        // MAYHEM PATCH: absolute stall guard; don't allow a writer to pin apply
+        // waiting on an absurd MSB height.
         if (op.value.msbsl > this.#config.maxMsbSignedLength) return;
-        // Wait for local MSB view to reach the referenced signed length
+        const localMsbSignedLength = this.#msbClient.getSignedLength();
+        if (localMsbSignedLength > 0 &&
+            op.value.msbsl > localMsbSignedLength + this.#config.maxMsbSignedLengthFutureDelta) {
+            return;
+        }
+        // Wait for local MSB view to reach the referenced signed length.
         await this.#msbClient.waitForSignedLengthAtLeast(op.value.msbsl);
         // Fetch MSB apply-op at msbsl by tx key (op.key = tx hash)
         const msbTxEntry = await this.#msbClient.getSignedAtLength(op.key, op.value.msbsl);

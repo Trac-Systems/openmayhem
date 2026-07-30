@@ -25,6 +25,7 @@ const configData = {
         enableTxApplyLogs: false,
         enableValidatorObserver: true,
         enableWallet: true,
+        // MAYHEM PATCH: match the bounded trac-msb cache default explicitly in env config.
         hyperbeeCacheMaxEntries: 65_536,
         maxValidators: 50,
         maxRetries: 3,
@@ -49,6 +50,7 @@ const configData = {
         enableTxApplyLogs: true,
         enableValidatorObserver: true,
         enableWallet: true,
+        // MAYHEM PATCH: match the bounded trac-msb cache default explicitly in env config.
         hyperbeeCacheMaxEntries: 65_536,
         maxValidators: 6,
         maxRetries: 0,

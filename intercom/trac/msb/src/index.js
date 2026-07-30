@@ -62,6 +62,7 @@ export class MainSettlementBus extends ReadyResource {
         super();
         this.#config = config
         this.#store = new Corestore(this.#config.storesFullPath, {
+            // MAYHEM PATCH: bound the MSB Corestore cache to avoid unbounded RSS growth.
             globalCache: new Rache({ maxSize: this.#config.hyperbeeCacheMaxEntries })
         });
         this.#wallet = new PeerWallet({ networkPrefix: this.#config.addressPrefix });

@@ -32,6 +32,7 @@ export class Peer extends ReadyResource {
 
         this.keyPair = null;
         this.store = new Corestore(this.config.fullStoresDirectory, {
+            // MAYHEM PATCH: keep sparse peer Corestore memory bounded under relay load.
             globalCache: new Rache({ maxSize: this.config.hyperbeeCacheMaxEntries })
         });
         this.msbClient = new MsbClient(msb);
