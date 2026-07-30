@@ -280,6 +280,57 @@ async function submitReservation(ctx, options = {}) {
   return { key, value, result: result ?? ctx.contract._mayhemLastFeatureResult };
 }
 
+async function moveReservationsToLegacyHold(ctx, reservations, { txNo = 60 } = {}) {
+  const sessions = [];
+  for (const reservation of reservations) {
+    const voucher = reservation.value.voucher;
+    const sessionKey = ctx.contract.targetedSpendSessionKey(
+      ctx.user.publicKey,
+      voucher.rail,
+      voucher.reservation_id
+    );
+    const sessionRecord = await ctx.storage.get(sessionKey);
+    assert.notEqual(sessionRecord, null);
+    const { type: _type, updated_at: _updatedAt, ...session } = sessionRecord.value;
+    sessions.push(session);
+    await ctx.storage.del(sessionKey);
+    await ctx.storage.del(
+      ctx.contract.targetedSpendSessionIndexKey(
+        ctx.user.publicKey,
+        voucher.rail,
+        voucher.session_id
+      )
+    );
+    await ctx.storage.del(
+      ctx.contract.targetedSpendBillingAttemptKey(
+        ctx.user.publicKey,
+        voucher.rail,
+        voucher.billing_id,
+        voucher.billing_attempt
+      )
+    );
+  }
+  const rail = reservations[0].value.voucher.rail;
+  const legacyHoldKey = ctx.contract.targetedSpendHoldKey(ctx.user.publicKey, rail);
+  const legacyHold = {
+    type: 'targeted_spend_hold',
+    user: ctx.user.publicKey,
+    rail,
+    denom: 'au_usd',
+    reserved_au: sessions
+      .reduce((sum, session) => sum + BigInt(session.max_spend_au), 0n)
+      .toString(),
+    balance_au_at_last_reserve: '100000',
+    sessions: sessions.sort((left, right) =>
+      left.session_id.localeCompare(right.session_id)
+    ),
+    updated_at: makeTxKey(txNo),
+  };
+  await ctx.storage.put(legacyHoldKey, legacyHold);
+  await ctx.storage.del(ctx.contract.targetedSpendSummaryKey(ctx.user.publicKey, rail));
+  return { legacyHoldKey, legacyHold };
+}
+
 function receiptValue(ctx, reservation, {
   seq = 1,
   final = false,
@@ -552,11 +603,34 @@ test('closed no-receipt reservation can retry the same billing attempt without d
   assert.equal(head, null);
   const anchor = await ctx.storage.get(`receipt/billing/${billingId}`);
   assert.equal(anchor.value.latest_attempt, 0);
-  const hold = await ctx.storage.get(`hold/targeted-outstanding/tnk/${ctx.user.publicKey}`);
-  assert.deepEqual(
-    hold.value.sessions.map((session) => session.session_id),
-    ['76'.repeat(32)]
+  const legacyHold = await ctx.storage.get(
+    ctx.contract.targetedSpendHoldKey(ctx.user.publicKey, 'tnk')
   );
+  assert.equal(legacyHold, null);
+  const oldSession = await ctx.storage.get(
+    ctx.contract.targetedSpendSessionKey(
+      ctx.user.publicKey,
+      'tnk',
+      first.value.reservation_id
+    )
+  );
+  assert.equal(oldSession, null);
+  const retrySessionKey = ctx.contract.targetedSpendSessionKey(
+    ctx.user.publicKey,
+    'tnk',
+    retry.value.reservation_id
+  );
+  const retrySession = await ctx.storage.get(retrySessionKey);
+  assert.equal(retrySession.value.session_id, '76'.repeat(32));
+  const retryIndex = await ctx.storage.get(
+    ctx.contract.targetedSpendBillingAttemptKey(
+      ctx.user.publicKey,
+      'tnk',
+      billingId,
+      0
+    )
+  );
+  assert.equal(retryIndex.value.session_key, retrySessionKey);
 });
 
 async function submitTargetedApply(ctx, value) {
@@ -952,6 +1026,53 @@ test('receipt-bound targeted apply consumes a final head once and rejects later 
     (await submitReceipt(ctx, higher)).result.message,
     /consumed canonical receipt head cannot advance/i
   );
+});
+
+test('legacy targeted hold receipts release through overlays without rewriting the old hold', async () => {
+  const ctx = await setupContract();
+  const firstReservation = await submitReservation(ctx);
+  const secondReservation = await submitReservation(ctx, {
+    sessionId: '78'.repeat(32),
+    billingId: '79'.repeat(32),
+    reservationId: '7a'.repeat(32),
+  });
+  assert.equal(firstReservation.result.ok, true, firstReservation.result.message);
+  assert.equal(secondReservation.result.ok, true, secondReservation.result.message);
+  const { legacyHoldKey, legacyHold } = await moveReservationsToLegacyHold(
+    ctx,
+    [firstReservation, secondReservation]
+  );
+
+  const receipt = receiptValue(ctx, firstReservation, { final: true });
+  const recorded = await submitReceipt(ctx, receipt);
+  assert.equal(recorded.result.ok, true, recorded.result.message);
+  assert.deepEqual((await ctx.storage.get(legacyHoldKey)).value, legacyHold);
+  const releaseKey = ctx.contract.targetedSpendLegacyReleaseSummaryKey(
+    ctx.user.publicKey,
+    'tnk'
+  );
+  assert.equal((await ctx.storage.get(releaseKey)).value.released_au, '900');
+  const overlayKey = ctx.contract.targetedSpendLegacySessionKey(
+    ctx.user.publicKey,
+    'tnk',
+    firstReservation.value.reservation_id
+  );
+  const overlay = (await ctx.storage.get(overlayKey)).value;
+  assert.equal(overlay.max_spend_au, '100');
+  assert.equal(overlay.settlement_ready, true);
+
+  const head = (
+    await ctx.storage.get(`receipt/head/${receipt.receipt.body.billing_id}/0`)
+  ).value;
+  const commit = await commitEpoch(ctx, { count: 1, useAu: '100' });
+  const applied = await submitTargetedApply(ctx, await targetedApplyValue(ctx, {
+    heads: [head],
+    commitHash: commit.commit_hash,
+  }));
+  assert.equal(applied.result.ok, true, applied.result.message);
+  assert.deepEqual((await ctx.storage.get(legacyHoldKey)).value, legacyHold);
+  assert.equal((await ctx.storage.get(releaseKey)).value.released_au, '1000');
+  assert.equal(await ctx.storage.get(overlayKey), null);
 });
 
 test('targeted payout planning consumes a liability created by targeted epoch apply', async () => {

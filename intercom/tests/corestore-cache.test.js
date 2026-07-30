@@ -32,8 +32,8 @@ test('trac-peer bounds the shared Hyperbee/Corestore cache', async () => {
     contract: class {},
   });
 
-  assert.equal(defaultConfig.hyperbeeCacheMaxEntries, 128);
-  assert.equal(defaultPeer.store.globalCache.maxSize, 128);
+  assert.equal(defaultConfig.hyperbeeCacheMaxEntries, 65_536);
+  assert.equal(defaultPeer.store.globalCache.maxSize, 65_536);
   await defaultPeer.store.close();
 
   const overrideConfig = createPeerConfig(PEER_ENV.DEVELOPMENT, {
@@ -60,7 +60,7 @@ test('trac-msb bounds the shared Hyperbee/Corestore cache', () => {
     storeName: 'msb',
   });
 
-  assert.equal(defaultConfig.hyperbeeCacheMaxEntries, 128);
+  assert.equal(defaultConfig.hyperbeeCacheMaxEntries, 65_536);
 
   const overrideConfig = createMsbConfig(MSB_ENV.DEVELOPMENT, {
     storesDirectory: tempStore('mayhem-msb-cache-override-'),

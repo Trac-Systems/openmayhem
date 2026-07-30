@@ -446,17 +446,31 @@ async function seedCanonicalReceiptEpoch(
       `receipt/head/${head.billing_id}/${head.billing_attempt}`,
       head
     );
-    const holdKey = ctx.contract.targetedSpendHoldKey(head.user, head.rail);
-    const hold = (await ctx.storage.get(holdKey)).value;
-    await ctx.storage.put(holdKey, {
-      ...hold,
-      sessions: hold.sessions.map((session) => (
-        session.reservation_id === head.reservation_id
-          ? { ...session, settlement_ready: true }
-          : session
-      )),
-      updated_at: updatedAt,
-    });
+    const sessionKey = ctx.contract.targetedSpendSessionKey(
+      head.user,
+      head.rail,
+      head.reservation_id
+    );
+    const sessionRecord = await ctx.storage.get(sessionKey);
+    if (sessionRecord) {
+      await ctx.storage.put(sessionKey, {
+        ...sessionRecord.value,
+        settlement_ready: true,
+        updated_at: updatedAt,
+      });
+    } else {
+      const holdKey = ctx.contract.targetedSpendHoldKey(head.user, head.rail);
+      const hold = (await ctx.storage.get(holdKey)).value;
+      await ctx.storage.put(holdKey, {
+        ...hold,
+        sessions: hold.sessions.map((session) => (
+          session.reservation_id === head.reservation_id
+            ? { ...session, settlement_ready: true }
+            : session
+        )),
+        updated_at: updatedAt,
+      });
+    }
   }
   const useAu = heads
     .reduce((sum, head) => sum + BigInt(head.incremental_au), 0n)
@@ -1289,6 +1303,126 @@ test('Stripe readiness deactivates and reactivates fiat admission without changi
     true
   );
   assert.deepEqual((await ctx.storage.get(binding.key)).value, immutableBinding);
+});
+
+test('targeted reservations shard new sessions without expanding legacy outstanding hold', async () => {
+  const ctx = await setupBindingContract();
+  await seedTargetedServing(ctx);
+  const ready = await stripeVerificationValue(ctx, {
+    account_id: 'acct_sharded_targeted_hold',
+    request_nonce: '5'.repeat(64),
+  });
+  assert.equal((await executeStripeVerification(ctx, ready)).ok, true);
+  const binding = await payoutBindingValue({
+    contract: ctx.contract,
+    provider: ctx.provider,
+    targetOwner: ctx.provider,
+    admin: ctx.admin.publicKey,
+    rail: 'fiat',
+    contextRevision: ctx.contextRevision,
+    fiatTarget: ready.value.account_id,
+    nonce: '6'.repeat(64),
+  });
+  const bound = await executePayoutBinding(
+    ctx.contract,
+    ctx.storage,
+    binding,
+    ctx.admin.publicKey
+  );
+  assert.equal(bound.ok, true, bound.message);
+
+  const legacyReserve = targetedSpendReservation(ctx, {
+    payoutRevision: binding.revision,
+    epoch: 1,
+    sessionId: '1'.repeat(64),
+  });
+  assert.equal(
+    (await executeTargetedSpend(ctx, legacyReserve)).result.ok,
+    true
+  );
+  const legacySessionKey = ctx.contract.targetedSpendSessionKey(
+    ctx.user.publicKey,
+    'fiat',
+    legacyReserve.reservation_id
+  );
+  const legacySessionRecord = (await ctx.storage.get(legacySessionKey)).value;
+  const { type: _type, updated_at: _updatedAt, ...legacySession } = legacySessionRecord;
+  const legacyHoldKey = ctx.contract.targetedSpendHoldKey(ctx.user.publicKey, 'fiat');
+  const legacyHold = {
+    type: 'targeted_spend_hold',
+    user: ctx.user.publicKey,
+    rail: 'fiat',
+    denom: 'au_usd',
+    reserved_au: legacySession.max_spend_au,
+    balance_au_at_last_reserve: '5000000',
+    sessions: [legacySession],
+    updated_at: makeTxKey(60),
+  };
+  await ctx.storage.put(legacyHoldKey, legacyHold);
+  await ctx.storage.del(legacySessionKey);
+  await ctx.storage.del(
+    ctx.contract.targetedSpendSessionIndexKey(
+      ctx.user.publicKey,
+      'fiat',
+      legacyReserve.session_id
+    )
+  );
+  await ctx.storage.del(
+    ctx.contract.targetedSpendBillingAttemptKey(
+      ctx.user.publicKey,
+      'fiat',
+      legacyReserve.voucher.billing_id,
+      legacyReserve.voucher.billing_attempt
+    )
+  );
+  await ctx.storage.del(ctx.contract.targetedSpendSummaryKey(ctx.user.publicKey, 'fiat'));
+
+  const beforeLegacyHold = structuredClone((await ctx.storage.get(legacyHoldKey)).value);
+  const freshReserve = targetedSpendReservation(ctx, {
+    payoutRevision: binding.revision,
+    epoch: 1,
+    sessionId: '2'.repeat(64),
+  });
+  const reserved = await executeTargetedSpend(ctx, freshReserve);
+  assert.equal(reserved.result.ok, true, reserved.result.message);
+  assert.equal(reserved.result.reserved_au, '2000000');
+  assert.deepEqual((await ctx.storage.get(legacyHoldKey)).value, beforeLegacyHold);
+
+  const summary = (
+    await ctx.storage.get(ctx.contract.targetedSpendSummaryKey(ctx.user.publicKey, 'fiat'))
+  ).value;
+  assert.equal(summary.reserved_au, '1000000');
+  assert.equal(
+    (await ctx.storage.get(
+      ctx.contract.targetedSpendSessionKey(
+        ctx.user.publicKey,
+        'fiat',
+        freshReserve.reservation_id
+      )
+    )).value.max_spend_au,
+    '1000000'
+  );
+  assert.notEqual(
+    await ctx.storage.get(
+      ctx.contract.targetedSpendSessionIndexKey(
+        ctx.user.publicKey,
+        'fiat',
+        freshReserve.session_id
+      )
+    ),
+    null
+  );
+  assert.notEqual(
+    await ctx.storage.get(
+      ctx.contract.targetedSpendBillingAttemptKey(
+        ctx.user.publicKey,
+        'fiat',
+        freshReserve.voucher.billing_id,
+        freshReserve.voucher.billing_attempt
+      )
+    ),
+    null
+  );
 });
 
 test('Stripe payout rotation freezes reserved and earned liabilities by revision across restart', async () => {

@@ -2861,14 +2861,61 @@ class MayhemContract extends Contract {
     const balanceError = this.guardianValidateBalanceRecord(balance, normalized.user, normalized.rail);
     if (balanceError) return balanceError;
 
-    const holdKey = this.targetedSpendHoldKey(normalized.user, normalized.rail);
-    const hold = await this.normalizeTargetedSpendHoldRecord(
-      (await this.get(holdKey)) ?? null,
+    const accounting = await this.targetedSpendAccountingState(
       normalized.user,
       normalized.rail
     );
-    if (hold instanceof Error) return hold;
-    const existing = hold.sessions.find((session) => session.session_id === normalized.session_id);
+    if (accounting instanceof Error) return accounting;
+    const reservationState = await this.targetedSpendReservationState(
+      normalized.user,
+      normalized.rail,
+      normalized.reservation_id,
+      normalized.session_id
+    );
+    if (reservationState instanceof Error) return reservationState;
+    const legacySessionById = accounting.hold.sessions.find(
+      (session) => session.session_id === normalized.session_id
+    );
+    const sessionIndexKey = this.targetedSpendSessionIndexKey(
+      normalized.user,
+      normalized.rail,
+      normalized.session_id
+    );
+    const sessionIndex = this.normalizeTargetedSpendReservationIndexRecord(
+      await this.get(sessionIndexKey),
+      {
+        user: normalized.user,
+        rail: normalized.rail,
+        sessionId: normalized.session_id,
+      }
+    );
+    if (sessionIndex instanceof Error) return sessionIndex;
+    const billingAttemptKey = this.targetedSpendBillingAttemptKey(
+      normalized.user,
+      normalized.rail,
+      normalized.voucher_body.billing_id,
+      normalized.voucher_body.billing_attempt
+    );
+    const billingAttemptIndex = this.normalizeTargetedSpendReservationIndexRecord(
+      await this.get(billingAttemptKey),
+      {
+        user: normalized.user,
+        rail: normalized.rail,
+        billingId: normalized.voucher_body.billing_id,
+        billingAttempt: normalized.voucher_body.billing_attempt,
+      }
+    );
+    if (billingAttemptIndex instanceof Error) return billingAttemptIndex;
+    if (sessionIndex !== null && sessionIndex.reservation_id !== normalized.reservation_id) {
+      return new Error('Targeted spend reservation session already exists with different terms.');
+    }
+    if (billingAttemptIndex !== null &&
+        billingAttemptIndex.reservation_id !== normalized.reservation_id) {
+      return new Error('Billing attempt already has an active reservation.');
+    }
+    const existing = reservationState.kind !== 'missing'
+      ? reservationState.session
+      : legacySessionById ?? null;
     if (existing) {
       if (
         existing.billing_id !== normalized.voucher_body.billing_id ||
@@ -2908,9 +2955,9 @@ class MayhemContract extends Contract {
       }
       const billingError = await this.validateExistingBillingReservation(normalized);
       if (billingError) return billingError;
-      const availableAu = this.compareAu(hold.reserved_au, balance.au) >= 0
+      const availableAu = this.compareAu(accounting.total_reserved_au, balance.au) >= 0
         ? ZERO_AU
-        : this.safeSubAu(balance.au, hold.reserved_au);
+        : this.safeSubAu(balance.au, accounting.total_reserved_au);
       if (availableAu instanceof Error) return availableAu;
       return {
         ok: true,
@@ -2921,7 +2968,7 @@ class MayhemContract extends Contract {
         user: normalized.user,
         provider: normalized.provider,
         payout_revision: value.payout_revision,
-        reserved_au: hold.reserved_au,
+        reserved_au: accounting.total_reserved_au,
         available_au: availableAu,
         idempotent: true,
       };
@@ -2929,9 +2976,17 @@ class MayhemContract extends Contract {
 
     const billingReservation = await this.prepareBillingReservation(normalized, key);
     if (billingReservation instanceof Error) return billingReservation;
-    const nextReservedAu = this.safeAddAu(hold.reserved_au, normalized.max_spend_au);
-    if (nextReservedAu instanceof Error) return nextReservedAu;
-    if (this.compareAu(nextReservedAu, balance.au) > 0) {
+    const nextSummaryReservedAu = this.safeAddAu(
+      accounting.summary.reserved_au,
+      normalized.max_spend_au
+    );
+    if (nextSummaryReservedAu instanceof Error) return nextSummaryReservedAu;
+    const nextTotalReservedAu = this.safeAddAu(
+      accounting.legacy_reserved_au,
+      nextSummaryReservedAu
+    );
+    if (nextTotalReservedAu instanceof Error) return nextTotalReservedAu;
+    if (this.compareAu(nextTotalReservedAu, balance.au) > 0) {
       return new Error('Insufficient unreserved credit balance.');
     }
     const session = {
@@ -2967,17 +3022,32 @@ class MayhemContract extends Contract {
       reserved_at: normalized.at,
       recorded_at: this.tx,
     };
-    const nextHold = {
-      ...hold,
+    const sessionKey = this.targetedSpendSessionKey(
+      normalized.user,
+      normalized.rail,
+      normalized.reservation_id
+    );
+    const nextSummary = {
+      ...accounting.summary,
       balance_au_at_last_reserve: balance.au,
-      reserved_au: nextReservedAu,
-      sessions: [...hold.sessions, session].sort((a, b) => compareCodepoint(a.session_id, b.session_id)),
+      reserved_au: nextSummaryReservedAu,
       updated_at: this.tx,
     };
-    await this.put(holdKey, nextHold);
+    const indexRecord = this.targetedSpendReservationIndexRecord(
+      session,
+      sessionKey,
+      this.tx
+    );
+    await this.put(
+      this.targetedSpendSummaryKey(normalized.user, normalized.rail),
+      nextSummary
+    );
+    await this.put(sessionKey, this.targetedSpendSessionRecord(session, this.tx));
+    await this.put(sessionIndexKey, indexRecord);
+    await this.put(billingAttemptKey, indexRecord);
     await this.put(billingReservation.anchor_key, billingReservation.anchor);
     await this.put(billingReservation.reservation_key, billingReservation.reservation);
-    const availableAu = this.safeSubAu(balance.au, nextHold.reserved_au);
+    const availableAu = this.safeSubAu(balance.au, nextTotalReservedAu);
     if (availableAu instanceof Error) return availableAu;
     return {
       ok: true,
@@ -2988,7 +3058,7 @@ class MayhemContract extends Contract {
       user: normalized.user,
       provider: normalized.provider,
       payout_revision: value.payout_revision,
-      reserved_au: nextHold.reserved_au,
+      reserved_au: nextTotalReservedAu,
       available_au: availableAu,
       idempotent: false,
     };
@@ -3338,6 +3408,307 @@ class MayhemContract extends Contract {
     return base + 1;
   }
 
+  async normalizeTargetedSpendSummaryRecord(record, user, rail) {
+    if (!record) {
+      return {
+        type: 'targeted_spend_summary',
+        user,
+        rail,
+        denom: PRICE_DENOMINATION,
+        reserved_au: ZERO_AU,
+        balance_au_at_last_reserve: null,
+        updated_at: null,
+      };
+    }
+    if (!record || typeof record !== 'object' || Array.isArray(record) ||
+        record.type !== 'targeted_spend_summary' ||
+        record.user !== user ||
+        record.rail !== rail ||
+        record.denom !== PRICE_DENOMINATION) {
+      return new Error('Targeted spend summary key mismatch.');
+    }
+    const reservedAu = this.normalizeAu(record.reserved_au, 'targeted spend summary reserved amount');
+    if (reservedAu instanceof Error) {
+      return new Error('Invalid targeted spend summary reserved amount.');
+    }
+    let balanceAu = null;
+    if (record.balance_au_at_last_reserve !== null) {
+      balanceAu = this.normalizeAu(
+        record.balance_au_at_last_reserve,
+        'targeted spend summary balance amount'
+      );
+      if (balanceAu instanceof Error) {
+        return new Error('Invalid targeted spend summary balance amount.');
+      }
+    }
+    if (record.updated_at !== null &&
+        (typeof record.updated_at !== 'string' || record.updated_at.length === 0)) {
+      return new Error('Invalid targeted spend summary update pointer.');
+    }
+    return {
+      type: 'targeted_spend_summary',
+      user,
+      rail,
+      denom: PRICE_DENOMINATION,
+      reserved_au: reservedAu,
+      balance_au_at_last_reserve: balanceAu,
+      updated_at: record.updated_at,
+    };
+  }
+
+  async normalizeTargetedSpendLegacyReleaseSummaryRecord(record, user, rail) {
+    if (!record) {
+      return {
+        type: 'targeted_spend_legacy_release_summary',
+        user,
+        rail,
+        denom: PRICE_DENOMINATION,
+        released_au: ZERO_AU,
+        updated_at: null,
+      };
+    }
+    if (!record || typeof record !== 'object' || Array.isArray(record) ||
+        record.type !== 'targeted_spend_legacy_release_summary' ||
+        record.user !== user ||
+        record.rail !== rail ||
+        record.denom !== PRICE_DENOMINATION) {
+      return new Error('Targeted spend legacy release summary key mismatch.');
+    }
+    const releasedAu = this.normalizeAu(
+      record.released_au,
+      'targeted spend legacy release amount'
+    );
+    if (releasedAu instanceof Error) {
+      return new Error('Invalid targeted spend legacy release amount.');
+    }
+    if (record.updated_at !== null &&
+        record.updated_at !== undefined &&
+        (typeof record.updated_at !== 'string' || record.updated_at.length === 0)) {
+      return new Error('Invalid targeted spend legacy release update pointer.');
+    }
+    return {
+      type: 'targeted_spend_legacy_release_summary',
+      user,
+      rail,
+      denom: PRICE_DENOMINATION,
+      released_au: releasedAu,
+      updated_at: record.updated_at ?? null,
+    };
+  }
+
+  async normalizeTargetedSpendSessionRecord(record, user, rail, reservationId = null) {
+    if (!record) return null;
+    if (!record || typeof record !== 'object' || Array.isArray(record) ||
+        record.type !== 'targeted_spend_session') {
+      return new Error('Targeted spend session record must be a session object.');
+    }
+    const session = { ...record };
+    delete session.type;
+    delete session.updated_at;
+    const hold = await this.normalizeTargetedSpendHoldRecord({
+      type: 'targeted_spend_hold',
+      user,
+      rail,
+      denom: PRICE_DENOMINATION,
+      reserved_au: session.max_spend_au,
+      balance_au_at_last_reserve: null,
+      sessions: [session],
+      updated_at: record.updated_at ?? null,
+    }, user, rail);
+    if (hold instanceof Error) return hold;
+    const normalized = hold.sessions[0];
+    if (normalized.user !== user ||
+        normalized.rail !== rail ||
+        (reservationId !== null && normalized.reservation_id !== reservationId)) {
+      return new Error('Targeted spend session key mismatch.');
+    }
+    if (record.updated_at !== null &&
+        record.updated_at !== undefined &&
+        (typeof record.updated_at !== 'string' || record.updated_at.length === 0)) {
+      return new Error('Invalid targeted spend session update pointer.');
+    }
+    return {
+      type: 'targeted_spend_session',
+      ...normalized,
+      updated_at: record.updated_at ?? null,
+    };
+  }
+
+  targetedSpendSessionRecord(session, updatedAt) {
+    return {
+      type: 'targeted_spend_session',
+      ...session,
+      updated_at: updatedAt,
+    };
+  }
+
+  normalizeTargetedSpendReservationIndexRecord(
+    record,
+    {
+      user,
+      rail,
+      sessionId = null,
+      billingId = null,
+      billingAttempt = null,
+    }
+  ) {
+    if (!record) return null;
+    if (!record || typeof record !== 'object' || Array.isArray(record) ||
+        record.type !== 'targeted_spend_reservation_index' ||
+        record.user !== user ||
+        record.rail !== rail ||
+        (sessionId !== null && record.session_id !== sessionId) ||
+        (billingId !== null && record.billing_id !== billingId) ||
+        (billingAttempt !== null && record.billing_attempt !== billingAttempt) ||
+        !this.isHexBytes(record.session_id, 32) ||
+        !this.isHexBytes(record.billing_id, 32) ||
+        !Number.isSafeInteger(record.billing_attempt) ||
+        record.billing_attempt < 0 ||
+        !this.isHexBytes(record.reservation_id, 32) ||
+        typeof record.session_key !== 'string' ||
+        record.session_key !==
+          this.targetedSpendSessionKey(user, rail, record.reservation_id) ||
+        (record.updated_at !== null &&
+          record.updated_at !== undefined &&
+          (typeof record.updated_at !== 'string' || record.updated_at.length === 0))) {
+      return new Error('Targeted spend reservation index is invalid.');
+    }
+    return {
+      type: 'targeted_spend_reservation_index',
+      user,
+      rail,
+      session_id: record.session_id,
+      billing_id: record.billing_id,
+      billing_attempt: record.billing_attempt,
+      reservation_id: record.reservation_id,
+      session_key: record.session_key,
+      updated_at: record.updated_at,
+    };
+  }
+
+  targetedSpendReservationIndexRecord(session, sessionKey, updatedAt) {
+    return {
+      type: 'targeted_spend_reservation_index',
+      user: session.user,
+      rail: session.rail,
+      session_id: session.session_id,
+      billing_id: session.billing_id,
+      billing_attempt: session.billing_attempt,
+      reservation_id: session.reservation_id,
+      session_key: sessionKey,
+      updated_at: updatedAt,
+    };
+  }
+
+  async targetedSpendAccountingState(user, rail) {
+    const hold = await this.normalizeTargetedSpendHoldRecord(
+      (await this.get(this.targetedSpendHoldKey(user, rail))) ?? null,
+      user,
+      rail
+    );
+    if (hold instanceof Error) return hold;
+    const summary = await this.normalizeTargetedSpendSummaryRecord(
+      await this.get(this.targetedSpendSummaryKey(user, rail)),
+      user,
+      rail
+    );
+    if (summary instanceof Error) return summary;
+    const legacyRelease = await this.normalizeTargetedSpendLegacyReleaseSummaryRecord(
+      await this.get(this.targetedSpendLegacyReleaseSummaryKey(user, rail)),
+      user,
+      rail
+    );
+    if (legacyRelease instanceof Error) return legacyRelease;
+    const legacyReservedAu = this.safeSubAu(hold.reserved_au, legacyRelease.released_au);
+    if (legacyReservedAu instanceof Error) {
+      return new Error('Targeted spend legacy release exceeds outstanding holds.');
+    }
+    const totalReservedAu = this.safeAddAu(legacyReservedAu, summary.reserved_au);
+    if (totalReservedAu instanceof Error) return totalReservedAu;
+    return {
+      hold,
+      summary,
+      legacy_release: legacyRelease,
+      legacy_reserved_au: legacyReservedAu,
+      total_reserved_au: totalReservedAu,
+    };
+  }
+
+  async targetedSpendReservationState(user, rail, reservationId, sessionId) {
+    const sessionKey = this.targetedSpendSessionKey(user, rail, reservationId);
+    const sessionRecord = await this.normalizeTargetedSpendSessionRecord(
+      await this.get(sessionKey),
+      user,
+      rail,
+      reservationId
+    );
+    if (sessionRecord instanceof Error) return sessionRecord;
+    if (sessionRecord !== null) {
+      if (sessionRecord.session_id !== sessionId) {
+        return new Error('Targeted spend session id does not match reservation key.');
+      }
+      const summary = await this.normalizeTargetedSpendSummaryRecord(
+        await this.get(this.targetedSpendSummaryKey(user, rail)),
+        user,
+        rail
+      );
+      if (summary instanceof Error) return summary;
+      return {
+        kind: 'sharded',
+        sessionKey,
+        sessionIndexKey: this.targetedSpendSessionIndexKey(user, rail, sessionId),
+        billingAttemptKey: this.targetedSpendBillingAttemptKey(
+          user,
+          rail,
+          sessionRecord.billing_id,
+          sessionRecord.billing_attempt
+        ),
+        summary,
+        session: sessionRecord,
+      };
+    }
+    const holdKey = this.targetedSpendHoldKey(user, rail);
+    const hold = await this.normalizeTargetedSpendHoldRecord(
+      (await this.get(holdKey)) ?? null,
+      user,
+      rail
+    );
+    if (hold instanceof Error) return hold;
+    const session = hold.sessions.find((entry) =>
+      entry.session_id === sessionId &&
+      entry.reservation_id === reservationId
+    );
+    if (!session) return { kind: 'missing', hold };
+    const legacySessionKey = this.targetedSpendLegacySessionKey(user, rail, reservationId);
+    const legacySessionRecord = await this.normalizeTargetedSpendSessionRecord(
+      await this.get(legacySessionKey),
+      user,
+      rail,
+      reservationId
+    );
+    if (legacySessionRecord instanceof Error) return legacySessionRecord;
+    const legacyRelease = await this.normalizeTargetedSpendLegacyReleaseSummaryRecord(
+      await this.get(this.targetedSpendLegacyReleaseSummaryKey(user, rail)),
+      user,
+      rail
+    );
+    if (legacyRelease instanceof Error) return legacyRelease;
+    if (legacySessionRecord !== null) {
+      if (legacySessionRecord.session_id !== sessionId) {
+        return new Error('Targeted spend legacy session id does not match reservation key.');
+      }
+      return {
+        kind: 'legacy_overlay',
+        holdKey,
+        hold,
+        legacySessionKey,
+        legacyRelease,
+        session: legacySessionRecord,
+      };
+    }
+    return { kind: 'legacy', holdKey, hold, legacySessionKey, legacyRelease, session };
+  }
+
   prepareTargetedReservationClosure({
     hold,
     session,
@@ -3415,6 +3786,111 @@ class MayhemContract extends Contract {
     };
   }
 
+  prepareShardedTargetedReservationClosure({
+    summary,
+    session,
+    reservation,
+    head,
+    closeRecordKey,
+    closedBy,
+    closedByRole,
+    at,
+    reason,
+  }) {
+    const closure = this.prepareTargetedReservationClosure({
+      hold: {
+        type: 'targeted_spend_hold',
+        user: session.user,
+        rail: session.rail,
+        denom: PRICE_DENOMINATION,
+        reserved_au: session.max_spend_au,
+        balance_au_at_last_reserve: summary.balance_au_at_last_reserve,
+        sessions: [session],
+        updated_at: summary.updated_at,
+      },
+      session,
+      reservation,
+      head,
+      closeRecordKey,
+      closedBy,
+      closedByRole,
+      at,
+      reason,
+    });
+    if (closure instanceof Error) return closure;
+    const nextReservedAu = this.safeSubAu(
+      summary.reserved_au,
+      closure.close_record.released_au
+    );
+    if (nextReservedAu instanceof Error) {
+      return new Error('Targeted reservation close exceeds outstanding sharded holds.');
+    }
+    return {
+      summary: {
+        ...summary,
+        reserved_au: nextReservedAu,
+        updated_at: closeRecordKey,
+      },
+      session: head ? this.targetedSpendSessionRecord(closure.hold.sessions[0], closeRecordKey) : null,
+      reservation: closure.reservation,
+      close_record: closure.close_record,
+    };
+  }
+
+  prepareLegacyTargetedReservationClosure({
+    legacyRelease,
+    hold,
+    session,
+    reservation,
+    head,
+    closeRecordKey,
+    closedBy,
+    closedByRole,
+    at,
+    reason,
+  }) {
+    const closure = this.prepareTargetedReservationClosure({
+      hold,
+      session,
+      reservation,
+      head,
+      closeRecordKey,
+      closedBy,
+      closedByRole,
+      at,
+      reason,
+    });
+    if (closure instanceof Error) return closure;
+    const nextReleasedAu = this.safeAddAu(
+      legacyRelease.released_au,
+      closure.close_record.released_au
+    );
+    if (nextReleasedAu instanceof Error ||
+        this.compareAu(nextReleasedAu, hold.reserved_au) > 0) {
+      return new Error('Targeted reservation close exceeds legacy outstanding holds.');
+    }
+    const overlaySession = head
+      ? closure.hold.sessions.find(
+          (entry) => entry.reservation_id === session.reservation_id
+        )
+      : null;
+    if (head && !overlaySession) {
+      return new Error('Targeted reservation close lost its retained legacy session.');
+    }
+    return {
+      legacy_release: {
+        ...legacyRelease,
+        released_au: nextReleasedAu,
+        updated_at: closeRecordKey,
+      },
+      session: overlaySession
+        ? this.targetedSpendSessionRecord(overlaySession, closeRecordKey)
+        : null,
+      reservation: closure.reservation,
+      close_record: closure.close_record,
+    };
+  }
+
   async applyRecordUsageReceiptFeature(key, value) {
     const normalized = await this.normalizeRecordUsageReceiptValue(value);
     if (normalized instanceof Error) return normalized;
@@ -3477,18 +3953,17 @@ class MayhemContract extends Contract {
       }
     }
 
-    const holdKey = this.targetedSpendHoldKey(body.user, body.rail);
-    const hold = await this.normalizeTargetedSpendHoldRecord(
-      (await this.get(holdKey)) ?? null,
+    const reservationState = await this.targetedSpendReservationState(
       body.user,
-      body.rail
+      body.rail,
+      body.reservation_id,
+      body.session_id
     );
-    if (hold instanceof Error) return hold;
-    const session = hold.sessions.find((entry) =>
-      entry.session_id === body.session_id &&
-      entry.reservation_id === body.reservation_id
-    );
-    if (!session) return new Error('Receipt does not match an exact targeted spend hold session.');
+    if (reservationState instanceof Error) return reservationState;
+    if (reservationState.kind === 'missing') {
+      return new Error('Receipt does not match an exact targeted spend hold session.');
+    }
+    const session = reservationState.session;
     const sessionTermsMatch =
       session.billing_id === body.billing_id &&
       session.billing_attempt === body.billing_attempt &&
@@ -3613,17 +4088,30 @@ class MayhemContract extends Contract {
       if ((await this.get(closeRecordKey)) !== null) {
         return new Error('Targeted reservation close record already exists.');
       }
-      closure = this.prepareTargetedReservationClosure({
-        hold,
-        session,
-        reservation,
-        head,
-        closeRecordKey,
-        closedBy: body.provider,
-        closedByRole: 'provider',
-        at: body.ts,
-        reason: 'final_receipt',
-      });
+      closure = reservationState.kind === 'legacy'
+        ? this.prepareLegacyTargetedReservationClosure({
+            legacyRelease: reservationState.legacyRelease,
+            hold: reservationState.hold,
+            session,
+            reservation,
+            head,
+            closeRecordKey,
+            closedBy: body.provider,
+            closedByRole: 'provider',
+            at: body.ts,
+            reason: 'final_receipt',
+          })
+        : this.prepareShardedTargetedReservationClosure({
+            summary: reservationState.summary,
+            session,
+            reservation,
+            head,
+            closeRecordKey,
+            closedBy: body.provider,
+            closedByRole: 'provider',
+            at: body.ts,
+            reason: 'final_receipt',
+          });
       if (closure instanceof Error) return closure;
       if (epochIndex.index.revision >= Number.MAX_SAFE_INTEGER) {
         return new Error('Canonical receipt epoch revision overflow.');
@@ -3638,7 +4126,19 @@ class MayhemContract extends Contract {
     if (isFinal) {
       await this.put(epochIndex.page_key, epochIndex.page);
       await this.put(epochIndex.index_key, nextMetadata);
-      await this.put(holdKey, closure.hold);
+      if (reservationState.kind === 'legacy') {
+        await this.put(
+          this.targetedSpendLegacyReleaseSummaryKey(body.user, body.rail),
+          closure.legacy_release
+        );
+        await this.put(reservationState.legacySessionKey, closure.session);
+      } else {
+        await this.put(
+          this.targetedSpendSummaryKey(body.user, body.rail),
+          closure.summary
+        );
+        await this.put(reservationState.sessionKey, closure.session);
+      }
       await this.put(reservationKey, closure.reservation);
       await this.put(this.receiptReservationCloseKey(body.reservation_id), closure.close_record);
     }
@@ -3712,18 +4212,16 @@ class MayhemContract extends Contract {
         reservation.payout_revision !== normalized.payout_revision) {
       return new Error('Close usage reservation does not match an active reservation.');
     }
-    const holdKey = this.targetedSpendHoldKey(normalized.user, normalized.rail);
-    const hold = await this.normalizeTargetedSpendHoldRecord(
-      (await this.get(holdKey)) ?? null,
+    const reservationState = await this.targetedSpendReservationState(
       normalized.user,
-      normalized.rail
+      normalized.rail,
+      normalized.reservation_id,
+      normalized.session_id
     );
-    if (hold instanceof Error) return hold;
-    const session = hold.sessions.find(
-      (entry) =>
-        entry.session_id === normalized.session_id &&
-        entry.reservation_id === normalized.reservation_id
-    );
+    if (reservationState instanceof Error) return reservationState;
+    const session = reservationState.kind === 'missing'
+      ? null
+      : reservationState.session;
     if (!session ||
         session.billing_id !== normalized.billing_id ||
         session.billing_attempt !== normalized.billing_attempt ||
@@ -3815,17 +4313,30 @@ class MayhemContract extends Contract {
         updated_at: key,
       };
     }
-    const closure = this.prepareTargetedReservationClosure({
-      hold,
-      session,
-      reservation,
-      head,
-      closeRecordKey,
-      closedBy: normalized.actor,
-      closedByRole: normalized.actor_role,
-      at: normalized.at,
-      reason: normalized.reason,
-    });
+    const closure = reservationState.kind === 'legacy'
+      ? this.prepareLegacyTargetedReservationClosure({
+          legacyRelease: reservationState.legacyRelease,
+          hold: reservationState.hold,
+          session,
+          reservation,
+          head,
+          closeRecordKey,
+          closedBy: normalized.actor,
+          closedByRole: normalized.actor_role,
+          at: normalized.at,
+          reason: normalized.reason,
+        })
+      : this.prepareShardedTargetedReservationClosure({
+          summary: reservationState.summary,
+          session,
+          reservation,
+          head,
+          closeRecordKey,
+          closedBy: normalized.actor,
+          closedByRole: normalized.actor_role,
+          at: normalized.at,
+          reason: normalized.reason,
+        });
     if (closure instanceof Error) return closure;
     const closeRecord = {
       ...closure.close_record,
@@ -3840,7 +4351,29 @@ class MayhemContract extends Contract {
       await this.put(epochIndex.page_key, epochIndex.page);
       await this.put(epochIndex.index_key, nextMetadata);
     }
-    await this.put(holdKey, closure.hold);
+    if (reservationState.kind === 'legacy') {
+      await this.put(
+        this.targetedSpendLegacyReleaseSummaryKey(normalized.user, normalized.rail),
+        closure.legacy_release
+      );
+      if (closure.session) {
+        await this.put(reservationState.legacySessionKey, closure.session);
+      } else {
+        await this.del(reservationState.legacySessionKey);
+      }
+    } else {
+      await this.put(
+        this.targetedSpendSummaryKey(normalized.user, normalized.rail),
+        closure.summary
+      );
+      if (closure.session) {
+        await this.put(reservationState.sessionKey, closure.session);
+      } else {
+        await this.del(reservationState.sessionKey);
+        await this.del(reservationState.sessionIndexKey);
+        await this.del(reservationState.billingAttemptKey);
+      }
+    }
     await this.put(reservationKey, closure.reservation);
     await this.put(closeRecordKey, closeRecord);
     return {
@@ -4113,6 +4646,15 @@ class MayhemContract extends Contract {
     }
     for (const update of reservationBindings.hold_updates) {
       await this.put(update.key, update.value);
+    }
+    for (const update of reservationBindings.summary_updates) {
+      await this.put(update.key, update.value);
+    }
+    for (const update of reservationBindings.legacy_release_updates) {
+      await this.put(update.key, update.value);
+    }
+    for (const deleteKey of reservationBindings.session_deletes) {
+      await this.del(deleteKey);
     }
     for (const update of allocationUpdates) {
       await this.put(update.key, update.value);
@@ -6882,6 +7424,30 @@ class MayhemContract extends Contract {
 
   targetedSpendHoldKey(user, rail) {
     return `hold/targeted-outstanding/${rail}/${user}`;
+  }
+
+  targetedSpendSummaryKey(user, rail) {
+    return `hold/targeted-summary/${rail}/${user}`;
+  }
+
+  targetedSpendLegacyReleaseSummaryKey(user, rail) {
+    return `hold/targeted-legacy-release/${rail}/${user}`;
+  }
+
+  targetedSpendSessionKey(user, rail, reservationId) {
+    return `hold/targeted-session/${rail}/${user}/${reservationId}`;
+  }
+
+  targetedSpendLegacySessionKey(user, rail, reservationId) {
+    return `hold/targeted-legacy-session/${rail}/${user}/${reservationId}`;
+  }
+
+  targetedSpendSessionIndexKey(user, rail, sessionId) {
+    return `hold/targeted-session-index/${rail}/${user}/${sessionId}`;
+  }
+
+  targetedSpendBillingAttemptKey(user, rail, billingId, billingAttempt) {
+    return `hold/targeted-billing/${rail}/${user}/${billingId}/${billingAttempt}`;
   }
 
   receiptBillingKey(billingId) {
@@ -15661,6 +16227,9 @@ class MayhemContract extends Contract {
     const allocatedDebits = new Map();
     const allocatedEarnings = new Map();
     const holds = new Map();
+    const summaries = new Map();
+    const legacyReleases = new Map();
+    const sessionDeletes = [];
     const sessions = new Set();
     const billingAttempts = new Set();
     for (const allocation of value.allocations) {
@@ -15709,23 +16278,20 @@ class MayhemContract extends Contract {
         return new Error('Canonical receipt billing attempt is already consumed.');
       }
       if (existingConsumption === null) {
-        const holdIdentity = stableJson([allocation.rail, allocation.user]);
-        let hold = holds.get(holdIdentity);
-        if (!hold) {
-          hold = await this.normalizeTargetedSpendHoldRecord(
-            (
-              await this.get(
-                this.targetedSpendHoldKey(allocation.user, allocation.rail)
-              )
-            ) ?? null,
-            allocation.user,
-            allocation.rail
-          );
-          if (hold instanceof Error) return hold;
-        }
-        const session = hold.sessions.find(
-          (entry) => entry.session_id === allocation.session_id
+        const reservationState = await this.targetedSpendReservationState(
+          allocation.user,
+          allocation.rail,
+          head.reservation_id,
+          allocation.session_id
         );
+        if (reservationState instanceof Error) return reservationState;
+        if (reservationState.kind === 'missing') {
+          return new Error('Targeted epoch allocation does not match its reserved session.');
+        }
+        const holdIdentity = stableJson([allocation.rail, allocation.user]);
+        const isLegacy = reservationState.kind === 'legacy' ||
+          reservationState.kind === 'legacy_overlay';
+        const session = isLegacy ? reservationState.session : reservationState.session;
         if (!session ||
             session.billing_id !== allocation.billing_id ||
             session.billing_attempt !== allocation.billing_attempt ||
@@ -15742,18 +16308,41 @@ class MayhemContract extends Contract {
             this.compareAu(allocation.au, head.incremental_au) !== 0) {
           return new Error('Targeted epoch allocation does not exactly consume its reserved receipt.');
         }
-        const nextReservedAu = this.safeSubAu(hold.reserved_au, allocation.au);
-        if (nextReservedAu instanceof Error) {
-          return new Error('Targeted epoch allocation exceeds outstanding holds.');
+        if (isLegacy) {
+          let legacyRelease = legacyReleases.get(holdIdentity) ??
+            reservationState.legacyRelease;
+          const nextReleasedAu = this.safeAddAu(legacyRelease.released_au, allocation.au);
+          if (nextReleasedAu instanceof Error ||
+              this.compareAu(nextReleasedAu, reservationState.hold.reserved_au) > 0) {
+            return new Error('Targeted epoch allocation exceeds outstanding legacy holds.');
+          }
+          legacyRelease = {
+            ...legacyRelease,
+            released_au: nextReleasedAu,
+            updated_at: featureKey,
+          };
+          legacyReleases.set(holdIdentity, legacyRelease);
+          if (reservationState.kind === 'legacy_overlay') {
+            sessionDeletes.push(reservationState.legacySessionKey);
+          }
+        } else {
+          let summary = summaries.get(holdIdentity) ?? reservationState.summary;
+          const nextReservedAu = this.safeSubAu(summary.reserved_au, allocation.au);
+          if (nextReservedAu instanceof Error) {
+            return new Error('Targeted epoch allocation exceeds outstanding sharded holds.');
+          }
+          summary = {
+            ...summary,
+            reserved_au: nextReservedAu,
+            updated_at: featureKey,
+          };
+          summaries.set(holdIdentity, summary);
+          sessionDeletes.push(
+            reservationState.sessionKey,
+            reservationState.sessionIndexKey,
+            reservationState.billingAttemptKey
+          );
         }
-        holds.set(holdIdentity, {
-          ...hold,
-          reserved_au: nextReservedAu,
-          sessions: hold.sessions.filter(
-            (entry) => entry.reservation_id !== session.reservation_id
-          ),
-          updated_at: featureKey,
-        });
       }
       const debitKey = stableJson([allocation.rail, allocation.user]);
       const nextDebit = this.safeAddAu(
@@ -15795,6 +16384,15 @@ class MayhemContract extends Contract {
         key: this.targetedSpendHoldKey(hold.user, hold.rail),
         value: hold,
       })),
+      summary_updates: Array.from(summaries.values()).map((summary) => ({
+        key: this.targetedSpendSummaryKey(summary.user, summary.rail),
+        value: summary,
+      })),
+      legacy_release_updates: Array.from(legacyReleases.values()).map((summary) => ({
+        key: this.targetedSpendLegacyReleaseSummaryKey(summary.user, summary.rail),
+        value: summary,
+      })),
+      session_deletes: [...new Set(sessionDeletes)],
     };
   }
 
@@ -18031,10 +18629,38 @@ class MayhemContract extends Contract {
           identity.rail
         );
         if (hold instanceof Error) return hold;
-        if (hold.sessions.some((session) =>
-          session.billing_id === identity.billing_id &&
-          session.billing_attempt === identity.billing_attempt
-        )) {
+        const billingAttemptIndex = this.normalizeTargetedSpendReservationIndexRecord(
+          await this.get(
+            this.targetedSpendBillingAttemptKey(
+              identity.user,
+              identity.rail,
+              identity.billing_id,
+              identity.billing_attempt
+            )
+          ),
+          {
+            user: identity.user,
+            rail: identity.rail,
+            billingId: identity.billing_id,
+            billingAttempt: identity.billing_attempt,
+          }
+        );
+        if (billingAttemptIndex instanceof Error) return billingAttemptIndex;
+        let activeLegacyReservation = false;
+        for (const session of hold.sessions) {
+          if (session.billing_id !== identity.billing_id ||
+              session.billing_attempt !== identity.billing_attempt) {
+            continue;
+          }
+          const reservation = await this.get(this.receiptReservationKey(session.reservation_id));
+          if (!reservation ||
+              reservation.type !== 'receipt_reservation_identity' ||
+              reservation.status === 'active') {
+            activeLegacyReservation = true;
+            break;
+          }
+        }
+        if (activeLegacyReservation || billingAttemptIndex !== null) {
           return new Error('Billing attempt already has an active reservation.');
         }
         nextAnchor = {

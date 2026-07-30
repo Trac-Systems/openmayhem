@@ -1,6 +1,6 @@
 import b4a from 'b4a'
 
-const DEFAULT_HYPERBEE_CACHE_MAX_ENTRIES = 128
+const DEFAULT_HYPERBEE_CACHE_MAX_ENTRIES = 65_536
 
 export class Config {
     #options

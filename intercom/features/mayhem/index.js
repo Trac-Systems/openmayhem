@@ -91,6 +91,11 @@ const stableValue = (value) => {
 
 const stableJson = (value) => JSON.stringify(stableValue(value));
 
+const appendBlockSizeError = (error) =>
+  error &&
+  (error.code === 'BAD_ARGUMENT' || error.name === 'HypercoreError') &&
+  /Appended block exceeds the maximum suggested block size/i.test(String(error.message ?? ''));
+
 const exactKeys = (value, keys) => (
   value &&
   typeof value === 'object' &&
@@ -466,8 +471,28 @@ class MayhemFeature extends Feature {
           `${featureMaxBytes}; increase MAYHEM_FEATURE_MAX_BYTES consistently on the canonical network.`,
       };
     }
-    await this.peer.base.append(operation);
-    await this.peer.base.append(null);
+    try {
+      await this.peer.base.append(operation);
+      await this.peer.base.append(null);
+    } catch (error) {
+      if (appendBlockSizeError(error)) {
+        return {
+          ok: false,
+          accepted: false,
+          status: 'rejected',
+          feature: this.key,
+          key,
+          hash,
+          message:
+            `Feature operation could not be appended because the encoded Autobase block ` +
+            `exceeded Hypercore's maximum suggested block size ` +
+            `(json_bytes=${operationBytes}, feature_limit=${featureMaxBytes ?? 'unknown'}). ` +
+            `Retry after the canonical writer drains or reduce the feature payload.`,
+          result_key: resultKey,
+        };
+      }
+      throw error;
+    }
     const featureResult = await this._waitForResult(
       resultKey,
       this.resultTimeoutMs,

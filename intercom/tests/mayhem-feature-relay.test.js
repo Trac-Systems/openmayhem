@@ -547,6 +547,30 @@ test('admin writer rejects an oversized feature before append instead of stallin
   assert.equal(writer.flushes.length, 0);
 });
 
+test('admin writer returns a bounded rejection when Autobase append exceeds Hypercore block size', async () => {
+  const writer = peerFor(adminKey, { writable: true });
+  writer.peer.protocol.instance.featMaxBytes = () => 64_000;
+  writer.peer.base.append = async () => {
+    const error = new Error('Appended block exceeds the maximum suggested block size');
+    error.name = 'HypercoreError';
+    error.code = 'BAD_ARGUMENT';
+    throw error;
+  };
+  const writerFeature = new MayhemFeature(writer.peer, {});
+  writerFeature.key = 'mayhem';
+
+  const result = await writerFeature.submit(
+    `receipt/submit/1/${'11'.repeat(32)}/0/1/${'22'.repeat(32)}`,
+    { op: 'record_usage_receipt', receipt: { body: { provider: providerKey } } }
+  );
+
+  assert.equal(result.ok, false);
+  assert.equal(result.accepted, false);
+  assert.equal(result.status, 'rejected');
+  assert.match(result.message, /encoded Autobase block/);
+  assert.match(result.message, /json_bytes=/);
+});
+
 test('Mayhem feature limit admits a canonical payload above the Intercom core default', async () => {
   const writer = peerFor(adminKey, { writable: true });
   writer.peer.protocol.instance.featMaxBytes = () => 64_000;
