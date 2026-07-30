@@ -36,6 +36,15 @@ function fail(message) {
   throw new Error(message);
 }
 
+async function createWalletBackedMsb(config, options = {}) {
+  if (options.msb) return options.msb;
+  const wallet = new PeerWallet({ networkPrefix: config.addressPrefix });
+  await wallet.ready;
+  const password = String(options.walletPassword ?? '');
+  await wallet.importFromFile(config.keyPairPath, b4a.from(password, 'utf8'));
+  return new MainSettlementBus(config, wallet);
+}
+
 function takeOption(args, name) {
   const index = args.indexOf(name);
   if (index === -1) return null;
@@ -43,6 +52,23 @@ function takeOption(args, name) {
   if (value === undefined || value.startsWith('--')) fail(`Missing value for ${name}.`);
   args.splice(index, 2);
   return value;
+}
+
+function readWalletPasswordFile(file) {
+  if (file === null) return null;
+  let stat;
+  try {
+    stat = fs.statSync(file);
+  } catch (error) {
+    fail(`wallet password file cannot be read: ${error?.message ?? error}`);
+  }
+  if (!stat.isFile()) fail('wallet password file must be a regular file.');
+  if (stat.size > 4096) fail('wallet password file is too large.');
+  const isWindows = typeof process !== 'undefined' && process.platform === 'win32';
+  if (!isWindows && (stat.mode & 0o077) !== 0) {
+    fail('wallet password file must be owner-only (0600).');
+  }
+  return fs.readFileSync(file, 'utf8');
 }
 
 function normalizeNetwork(value) {
@@ -568,6 +594,7 @@ export async function runSettlementTransferHelper(rawArgs, options = {}) {
   const timeoutSeconds = Number.parseInt(takeOption(args, '--timeout-seconds') ?? '180', 10);
   const maxRetries = Number.parseInt(takeOption(args, '--max-retries') ?? '3', 10);
   const expectedBalanceBefore = takeOption(args, '--expected-balance-before');
+  const walletPassword = readWalletPasswordFile(takeOption(args, '--wallet-password-file'));
   const directPeers = parseCanonicalMsbDirectPeers(
     takeOption(args, '--direct-peer')
   );
@@ -597,7 +624,7 @@ export async function runSettlementTransferHelper(rawArgs, options = {}) {
   console.log = redirect;
   console.info = redirect;
 
-  const msb = options.msb ?? new MainSettlementBus(config);
+  const msb = await createWalletBackedMsb(config, { ...options, walletPassword });
   let opened = Boolean(options.ready);
   try {
     if (!options.ready) {
@@ -647,6 +674,7 @@ export async function runPreparedSettlementTransferHelper(command, rawArgs, opti
   const expectedBalanceBefore = takeOption(args, '--expected-balance-before');
   const payloadJson = takeOption(args, '--payload-json');
   const txHash = takeOption(args, '--tx-hash');
+  const walletPassword = readWalletPasswordFile(takeOption(args, '--wallet-password-file'));
   const directPeers = parseCanonicalMsbDirectPeers(
     takeOption(args, '--direct-peer')
   );
@@ -688,7 +716,7 @@ export async function runPreparedSettlementTransferHelper(command, rawArgs, opti
   console.log = redirect;
   console.info = redirect;
 
-  const msb = options.msb ?? new MainSettlementBus(config);
+  const msb = await createWalletBackedMsb(config, { ...options, walletPassword });
   let opened = Boolean(options.ready);
   try {
     if (!options.ready) {
@@ -836,6 +864,7 @@ export async function runTransferHelper(rawArgs, options = {}) {
   const timeoutSeconds = Number.parseInt(takeOption(args, '--timeout-seconds') ?? '180', 10);
   const maxRetries = Number.parseInt(takeOption(args, '--max-retries') ?? '3', 10);
   const expectedBalanceBefore = takeOption(args, '--expected-balance-before');
+  const walletPassword = readWalletPasswordFile(takeOption(args, '--wallet-password-file'));
   const directPeers = parseCanonicalMsbDirectPeers(
     takeOption(args, '--direct-peer')
   );
@@ -864,7 +893,7 @@ export async function runTransferHelper(rawArgs, options = {}) {
   console.log = redirect;
   console.info = redirect;
 
-  const msb = options.msb ?? new MainSettlementBus(config);
+  const msb = await createWalletBackedMsb(config, { ...options, walletPassword });
   let opened = Boolean(options.ready);
   try {
     if (!options.ready) {

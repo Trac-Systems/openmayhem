@@ -21,6 +21,7 @@ test('Config: valid overrideable startup fields remain usable after validation',
         bootstrap: 'ab'.repeat(32),
         channel: 'custom-channel',
         storesDirectory: 'custom-stores/',
+        storeName: 'custom-store',
         host: '0.0.0.0',
         port: 5050,
         dhtBootstrap: ['node1.example.test:1234', 'node2.example.test:5678']
@@ -31,6 +32,8 @@ test('Config: valid overrideable startup fields remain usable after validation',
     t.ok(b4a.isBuffer(config.channel));
     t.is(config.channel.length, 32);
     t.is(config.storesDirectory, 'custom-stores');
+    t.is(config.storeName, 'custom-store');
+    t.is(config.storesFullPath, 'custom-stores/custom-store');
     t.is(config.host, '0.0.0.0');
     t.is(config.port, 5050);
     t.alike(config.dhtBootstrap, ['node1.example.test:1234', 'node2.example.test:5678']);

@@ -27872,6 +27872,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
                     (index == 0)
                         .then(|| args.expected_treasury_balance_before.as_deref())
                         .flatten(),
+                    Some(&treasury_password),
                 )
                 .await
                 .with_context(|| {
@@ -27959,6 +27960,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
                 &prepared_payload,
                 args.msb_transfer_timeout_seconds,
                 args.msb_transfer_max_retries,
+                Some(&treasury_password),
             )
             .await
             .with_context(|| {
@@ -32452,6 +32454,7 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
             args.msb_transfer_timeout_seconds,
             3,
             None,
+            Some(wallet_password),
         )
         .await?;
         verify_tnk_transfer_result(
@@ -48571,6 +48574,7 @@ async fn submit_journaled_msb_settlement_transfer(
     timeout_seconds: u64,
     max_retries: u64,
     expected_balance_before: Option<&str>,
+    wallet_password: Option<&str>,
 ) -> Result<MsbTransferOutput> {
     let mut args = vec![
         "settlement-transfer".to_owned(),
@@ -48599,7 +48603,7 @@ async fn submit_journaled_msb_settlement_transfer(
             balance.trim().to_owned(),
         ]);
     }
-    run_msb_transfer_helper(args).await
+    run_msb_transfer_helper(args, wallet_password).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -48612,6 +48616,7 @@ async fn prepare_msb_settlement_transfer(
     timeout_seconds: u64,
     max_retries: u64,
     expected_balance_before: Option<&str>,
+    wallet_password: Option<&str>,
 ) -> Result<PreparedMsbSettlementTransfer> {
     let mut args = vec![
         "--network".to_owned(),
@@ -48636,7 +48641,8 @@ async fn prepare_msb_settlement_transfer(
         ]);
     }
     let prepared: PreparedMsbSettlementTransfer =
-        run_msb_transfer_helper_with_command("settlement-transfer-prepare", args).await?;
+        run_msb_transfer_helper_with_command("settlement-transfer-prepare", args, wallet_password)
+            .await?;
     ensure!(
         prepared.schema_version == 1
             && prepared.network == network
@@ -48661,6 +48667,7 @@ async fn execute_prepared_msb_settlement_transfer(
     payload: &Value,
     timeout_seconds: u64,
     max_retries: u64,
+    wallet_password: Option<&str>,
 ) -> Result<ExecutedMsbSettlementTransfer> {
     ensure!(
         is_hex_len(tx_hash, 64)
@@ -48694,7 +48701,8 @@ async fn execute_prepared_msb_settlement_transfer(
         max_retries.to_string(),
     ];
     let executed: ExecutedMsbSettlementTransfer =
-        run_msb_transfer_helper_with_command("settlement-transfer-execute", args).await?;
+        run_msb_transfer_helper_with_command("settlement-transfer-execute", args, wallet_password)
+            .await?;
     ensure!(
         executed.ok
             && executed.network == network
@@ -48717,6 +48725,7 @@ async fn submit_msb_transfer(
     timeout_seconds: u64,
     max_retries: u64,
     expected_balance_before: Option<&str>,
+    wallet_password: Option<&str>,
 ) -> Result<MsbTransferOutput> {
     let mut args = vec![
         "transfer".to_owned(),
@@ -48741,26 +48750,37 @@ async fn submit_msb_transfer(
             balance.trim().to_owned(),
         ]);
     }
-    run_msb_transfer_helper(args).await
+    run_msb_transfer_helper(args, wallet_password).await
 }
 
-async fn run_msb_transfer_helper<T>(args: Vec<String>) -> Result<T>
+async fn run_msb_transfer_helper<T>(args: Vec<String>, wallet_password: Option<&str>) -> Result<T>
 where
     T: DeserializeOwned,
 {
     let (command, helper_args) = args
         .split_first()
         .context("MSB transfer helper command is required")?;
-    run_msb_transfer_helper_with_command(command, helper_args.to_vec()).await
+    run_msb_transfer_helper_with_command(command, helper_args.to_vec(), wallet_password).await
 }
 
 async fn run_msb_transfer_helper_with_command<T>(
     command: &str,
     mut helper_args: Vec<String>,
+    wallet_password: Option<&str>,
 ) -> Result<T>
 where
     T: DeserializeOwned,
 {
+    let wallet_password_file = wallet_password
+        .filter(|password| !password.is_empty())
+        .map(write_msb_helper_wallet_password_file)
+        .transpose()?;
+    if let Some(secret_file) = wallet_password_file.as_ref() {
+        helper_args.extend([
+            "--wallet-password-file".to_owned(),
+            secret_file.path.display().to_string(),
+        ]);
+    }
     add_canonical_msb_direct_peers(&mut helper_args)?;
     validate_external_helper_option_pairs(&helper_args)?;
     let helper_timeout = msb_transfer_helper_process_timeout(command, &helper_args)?;
@@ -48799,6 +48819,47 @@ where
         );
     }
     parse_msb_transfer_helper_json(&output.stdout, &output.stderr)
+}
+
+struct MsbHelperWalletPasswordFile {
+    path: PathBuf,
+}
+
+impl Drop for MsbHelperWalletPasswordFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn write_msb_helper_wallet_password_file(password: &str) -> Result<MsbHelperWalletPasswordFile> {
+    let mut random = [0_u8; 16];
+    getrandom::fill(&mut random).context("generating MSB helper wallet password temp name")?;
+    let path = env::temp_dir().join(format!(
+        "mayhem-msb-wallet-password-{}-{}.secret",
+        std::process::id(),
+        hex_encode(&random)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    file.write_all(password.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("securing {}", path.display()))?;
+    }
+    Ok(MsbHelperWalletPasswordFile { path })
 }
 
 fn add_canonical_msb_direct_peers(args: &mut Vec<String>) -> Result<()> {
