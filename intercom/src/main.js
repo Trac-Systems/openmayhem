@@ -1290,6 +1290,14 @@ const ensureKeypairFile = async (keyPairPath) => {
   wallet.exportToFile(keyPairPath, b4a.alloc(0));
 };
 
+const loadPeerWallet = async (config) => {
+  if (!config.enableWallet) return undefined;
+  const wallet = new PeerWallet({ networkPrefix: config.addressPrefix });
+  await wallet.ready;
+  await wallet.importFromFile(config.keyPairPath, b4a.alloc(0));
+  return wallet;
+};
+
 const subnetBootstrapFile = path.join(peerStoresDirectory, peerStoreName, 'subnet-bootstrap.hex');
 let subnetBootstrap = subnetBootstrapHex ? subnetBootstrapHex.trim().toLowerCase() : null;
 if (subnetBootstrap) {
@@ -1334,7 +1342,8 @@ if (msbWalletEnabled) {
 await ensureKeypairFile(peerConfig.keyPairPath);
 
 console.log('=============== STARTING MSB ===============');
-const msb = new MainSettlementBus(msbConfig);
+const msbWallet = await loadPeerWallet(msbConfig);
+const msb = new MainSettlementBus(msbConfig, msbWallet);
 await msb.ready();
 
 const localMsbPeer = msb.wallet?.publicKey;
