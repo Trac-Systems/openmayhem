@@ -17,7 +17,7 @@ use endpoint_calibration::{
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::future::Future;
@@ -81492,13 +81492,10 @@ where
     secrets.apply_environment_fallbacks();
     let intercom_app = repo_path("intercom")?;
     let pear_runtime = resolve_pear_runtime_path()?;
+    let process_args = wallet_helper_runtime_args(command, &intercom_app, &helper_args);
     let mut process = Command::new(&pear_runtime);
     process
-        .arg("run")
-        .arg(".")
-        .arg(format!("--wallet-helper={command}"))
-        .args(&helper_args)
-        .current_dir(&intercom_app)
+        .args(&process_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -81542,6 +81539,20 @@ where
 
     parse_msb_transfer_helper_json(&output.stdout, &output.stderr)
         .context("parsing Pear wallet helper JSON output")
+}
+
+fn wallet_helper_runtime_args(
+    command: &str,
+    intercom_app: &Path,
+    helper_args: &[String],
+) -> Vec<OsString> {
+    let mut args = vec![
+        OsString::from("run"),
+        intercom_app.as_os_str().to_os_string(),
+        OsString::from(format!("--wallet-helper={command}")),
+    ];
+    args.extend(helper_args.iter().map(OsString::from));
+    args
 }
 
 fn validate_wallet_helper_public_args(args: &[String]) -> Result<()> {
@@ -82790,6 +82801,31 @@ mod tests {
         let serialized = serde_json::to_string(&secrets).unwrap();
         assert!(serialized.contains("old-password"));
         assert!(serialized.contains("ethereum mnemonic"));
+    }
+
+    #[test]
+    fn wallet_helper_uses_absolute_pear_app_path() {
+        let app = PathBuf::from("/opt/mayhem/source/intercom");
+        let args = wallet_helper_runtime_args(
+            "inspect",
+            &app,
+            &["--keypair".to_owned(), "wallet.json".to_owned()],
+        );
+        let rendered = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rendered,
+            [
+                "run",
+                "/opt/mayhem/source/intercom",
+                "--wallet-helper=inspect",
+                "--keypair",
+                "wallet.json",
+            ]
+        );
+        assert!(!rendered.iter().any(|arg| arg == "."));
     }
 
     #[test]
