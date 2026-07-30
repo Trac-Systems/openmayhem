@@ -256,7 +256,11 @@ impl GatewayJobStore {
     }
 
     fn make_room_for_job(&mut self) -> Result<(), String> {
-        while self.records.len().saturating_add(self.active.len()) >= self.max_jobs {
+        while self
+            .records_counted_for_job_limit()
+            .saturating_add(self.active.len())
+            >= self.max_jobs
+        {
             let Some(evict) = self
                 .records
                 .values()
@@ -265,11 +269,10 @@ impl GatewayJobStore {
                 .map(|job| job.id.clone())
             else {
                 return Err(format!(
-                    "gateway job vault has {} active job(s) or reconciliation-pending job(s), at its configured limit of {}",
-                    self.active.len().saturating_add(
-                        self.reconciling.len()
-                    ),
-                    self.max_jobs
+                    "gateway job vault has {} active job(s) at its configured live-job limit of {}; {} receipt reconciliation job(s) are retained separately",
+                    self.active.len(),
+                    self.max_jobs,
+                    self.reconciling.len()
                 ));
             };
             self.records.remove(&evict);
@@ -615,7 +618,9 @@ impl GatewayJobStore {
     }
 
     fn enforce_bounds(&mut self, preserve: Option<&str>) -> Result<(), String> {
-        while self.records.len() > self.max_jobs || self.total_bytes > self.max_bytes {
+        while self.records_counted_for_job_limit() > self.max_jobs
+            || self.total_bytes > self.max_bytes
+        {
             let Some(evict) = self
                 .records
                 .values()
@@ -630,6 +635,13 @@ impl GatewayJobStore {
             self.remove_sealed_record(&evict)?;
         }
         Ok(())
+    }
+
+    fn records_counted_for_job_limit(&self) -> usize {
+        self.records
+            .values()
+            .filter(|job| !self.reconciling.contains(&job.id))
+            .count()
     }
 
     fn make_room_for_bytes(
@@ -1118,20 +1130,41 @@ mod tests {
         assert_eq!(pending.result, Some(result.clone()));
         assert_eq!(pending.artifacts, vec![artifact.clone()]);
         assert_eq!(pending.receipt, Some(receipt.clone()));
-        let pressure_error = reopened
-            .begin(
-                "job_restart_pressure".to_owned(),
-                "video".to_owned(),
-                "model".to_owned(),
-                Some("buyer".to_owned()),
-                "request-pressure".to_owned(),
+        assert_eq!(
+            reopened
+                .begin(
+                    "job_restart_pressure".to_owned(),
+                    "video".to_owned(),
+                    "model".to_owned(),
+                    Some("buyer".to_owned()),
+                    "request-pressure".to_owned(),
+                    12,
+                )
+                .unwrap(),
+            BeginGatewayJob::Started
+        );
+        reopened
+            .complete(
+                "job_restart_pressure",
+                GatewayJobStatus::Completed,
+                Some(serde_json::json!({"kind": "video_generation"})),
+                Vec::new(),
+                None,
+                None,
                 12,
             )
-            .expect_err("restarted pending reconciliation must remain protected");
-        assert!(pressure_error.contains("reconciliation-pending"));
+            .unwrap();
         assert_eq!(
             reopened.get(&id, 12).unwrap().unwrap().artifacts,
             vec![artifact.clone()]
+        );
+        assert_eq!(
+            reopened
+                .get("job_restart_pressure", 12)
+                .unwrap()
+                .unwrap()
+                .status,
+            GatewayJobStatus::Completed
         );
         let completed = reopened
             .finish_reconciliation(&id, GatewayJobStatus::Completed, None, 13)
@@ -1206,7 +1239,7 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_pending_job_is_not_evicted_for_new_work() {
+    fn reconciliation_pending_job_is_not_evicted_or_counted_as_live_work() {
         let mut store = GatewayJobStore::in_memory([14_u8; 32], 1, 1024 * 1024, 60);
         store
             .begin(
@@ -1230,25 +1263,6 @@ mod tests {
             )
             .unwrap();
 
-        let error = store
-            .begin(
-                "job_new".to_owned(),
-                "image".to_owned(),
-                "model".to_owned(),
-                None,
-                "request-new".to_owned(),
-                3,
-            )
-            .expect_err("pending reconciliation must not be evicted");
-        assert!(error.contains("reconciliation-pending"));
-        assert_eq!(
-            store.get("job_pending", 3).unwrap().unwrap().status,
-            GatewayJobStatus::ReconciliationPending
-        );
-
-        store
-            .finish_reconciliation("job_pending", GatewayJobStatus::Completed, None, 4)
-            .unwrap();
         assert_eq!(
             store
                 .begin(
@@ -1257,12 +1271,54 @@ mod tests {
                     "model".to_owned(),
                     None,
                     "request-new".to_owned(),
-                    5,
+                    3,
                 )
                 .unwrap(),
             BeginGatewayJob::Started
         );
-        assert!(store.get("job_pending", 5).unwrap().is_none());
+        let error = store
+            .begin(
+                "job_blocked_by_active".to_owned(),
+                "image".to_owned(),
+                "model".to_owned(),
+                None,
+                "request-blocked".to_owned(),
+                4,
+            )
+            .expect_err("active live work remains bounded");
+        assert!(error.contains("live-job limit"));
+        store
+            .complete(
+                "job_new",
+                GatewayJobStatus::Completed,
+                Some(serde_json::json!({"kind": "image_generation"})),
+                Vec::new(),
+                None,
+                None,
+                4,
+            )
+            .unwrap();
+        assert_eq!(
+            store.get("job_pending", 4).unwrap().unwrap().status,
+            GatewayJobStatus::ReconciliationPending
+        );
+        assert_eq!(
+            store.get("job_new", 4).unwrap().unwrap().status,
+            GatewayJobStatus::Completed
+        );
+        assert_eq!(
+            store.get("job_pending", 5).unwrap().unwrap().status,
+            GatewayJobStatus::ReconciliationPending
+        );
+
+        store
+            .finish_reconciliation("job_pending", GatewayJobStatus::Completed, None, 6)
+            .unwrap();
+        assert_eq!(
+            store.get("job_pending", 6).unwrap().unwrap().status,
+            GatewayJobStatus::Completed
+        );
+        assert!(store.get("job_new", 6).unwrap().is_none());
     }
 
     #[test]
