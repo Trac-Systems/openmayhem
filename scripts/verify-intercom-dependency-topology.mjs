@@ -2,7 +2,6 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 
 const fail = (message) => {
@@ -38,8 +37,8 @@ if (!/^\s*install-links\s*=\s*true\s*(?:[#;].*)?$/m.test(npmrc)) {
 if (manifest.dependencies?.['trac-wallet'] !== '1.0.1') {
   fail('root dependencies must pin trac-wallet to 1.0.1');
 }
-if (manifest.overrides?.['trac-wallet'] !== '1.0.1') {
-  fail('root overrides must pin trac-wallet to 1.0.1');
+if (Object.prototype.hasOwnProperty.call(manifest.overrides ?? {}, 'trac-wallet')) {
+  fail('root overrides must not collapse trac-wallet across pinned MSB/peer dependencies');
 }
 if (lock.lockfileVersion !== 3 || typeof lock.packages !== 'object') {
   fail('root package-lock.json must use lockfileVersion 3');
@@ -89,11 +88,18 @@ const walletLockPaths = Object.keys(lock.packages).filter(
   (entry) => entry === 'node_modules/trac-wallet' ||
     entry.endsWith('/node_modules/trac-wallet'),
 );
-if (walletLockPaths.length !== 1 || walletLockPaths[0] !== 'node_modules/trac-wallet') {
-  fail(`root lock must contain exactly one top-level trac-wallet, found: ${walletLockPaths.join(', ')}`);
+const expectedWalletLocks = new Map([
+  ['node_modules/trac-wallet', '1.0.1'],
+  ['node_modules/trac-msb/node_modules/trac-wallet', '2.1.0'],
+  ['node_modules/trac-peer/node_modules/trac-wallet', '1.0.4'],
+]);
+if (walletLockPaths.length !== expectedWalletLocks.size) {
+  fail(`root lock must contain the three pinned trac-wallet installs, found: ${walletLockPaths.join(', ')}`);
 }
-if (lock.packages['node_modules/trac-wallet']?.version !== '1.0.1') {
-  fail('root lock must install trac-wallet 1.0.1');
+for (const [walletPath, expectedVersion] of expectedWalletLocks) {
+  if (lock.packages[walletPath]?.version !== expectedVersion) {
+    fail(`${walletPath} must install trac-wallet ${expectedVersion}`);
+  }
 }
 
 const installedPackages = [];
@@ -136,12 +142,22 @@ const visitNodeModules = (directory) => {
 visitNodeModules(path.join(root, 'node_modules'));
 
 const walletRoot = path.join(root, 'node_modules', 'trac-wallet');
-if (walletDirectories.length !== 1 || walletDirectories[0] !== walletRoot) {
-  fail(`runtime must contain exactly one top-level trac-wallet, found: ${walletDirectories.join(', ')}`);
+const walletRoots = new Map([
+  [walletRoot, '1.0.1'],
+  [path.join(root, 'node_modules', 'trac-msb', 'node_modules', 'trac-wallet'), '2.1.0'],
+  [path.join(root, 'node_modules', 'trac-peer', 'node_modules', 'trac-wallet'), '1.0.4'],
+]);
+if (walletDirectories.length !== walletRoots.size) {
+  fail(`runtime must contain the three pinned trac-wallet installs, found: ${walletDirectories.join(', ')}`);
 }
-const walletManifest = readJson(path.join(walletRoot, 'package.json'));
-if (walletManifest.name !== 'trac-wallet' || walletManifest.version !== '1.0.1') {
-  fail('installed top-level wallet must be trac-wallet 1.0.1');
+for (const [walletPath, expectedVersion] of walletRoots) {
+  if (!walletDirectories.includes(walletPath)) {
+    fail(`runtime missing pinned trac-wallet at ${walletPath}`);
+  }
+  const manifest = readJson(path.join(walletPath, 'package.json'));
+  if (manifest.name !== 'trac-wallet' || manifest.version !== expectedVersion) {
+    fail(`${walletPath} must be trac-wallet ${expectedVersion}`);
+  }
 }
 const walletModule = await import(pathToFileURL(path.join(walletRoot, 'index.js')).href);
 if (typeof walletModule.default?.encodeBech32mSafe !== 'function') {
@@ -167,7 +183,7 @@ const resolutionContexts = new Map([
 ]);
 if (declaresWallet(manifest)) resolutionContexts.set(root, 'root wallet declarer');
 for (const installed of installedPackages) {
-  if (declaresWallet(installed.manifest)) {
+  if (installed.manifest.name !== 'trac-wallet' && declaresWallet(installed.manifest)) {
     resolutionContexts.set(
       installed.root,
       `${installed.manifest.name ?? installed.root} wallet declarer`,
@@ -175,11 +191,30 @@ for (const installed of installedPackages) {
   }
 }
 
+const resolveInstalledWalletRoot = (contextRoot) => {
+  let current = contextRoot;
+  while (current.startsWith(root)) {
+    const candidate = path.join(current, 'node_modules', 'trac-wallet');
+    if (fs.existsSync(path.join(candidate, 'package.json'))) {
+      return fs.realpathSync(candidate);
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  fail(`cannot resolve trac-wallet from ${contextRoot}`);
+};
+
 for (const [contextRoot, label] of resolutionContexts) {
-  const resolved = createRequire(path.join(contextRoot, 'package.json')).resolve('trac-wallet');
-  const resolvedPath = fs.realpathSync(resolved);
-  if (resolvedPath !== walletRoot && !resolvedPath.startsWith(`${walletRoot}${path.sep}`)) {
-    fail(`${label} resolves trac-wallet outside the root 1.0.1 package: ${resolvedPath}`);
+  const resolvedPath = resolveInstalledWalletRoot(contextRoot);
+  let expectedWalletRoot = walletRoot;
+  if (contextRoot === path.join(root, 'node_modules', 'trac-msb')) {
+    expectedWalletRoot = path.join(root, 'node_modules', 'trac-msb', 'node_modules', 'trac-wallet');
+  } else if (contextRoot === path.join(root, 'node_modules', 'trac-peer')) {
+    expectedWalletRoot = path.join(root, 'node_modules', 'trac-peer', 'node_modules', 'trac-wallet');
+  }
+  if (resolvedPath !== expectedWalletRoot) {
+    fail(`${label} resolves trac-wallet outside its pinned package: ${resolvedPath}`);
   }
 }
 

@@ -166,8 +166,8 @@ if (!/^\s*install-links\s*=\s*true\s*$/m.test(npmrc)) {
   throw new Error('Intercom root npm config does not enable install-links');
 }
 if (manifest.dependencies?.['trac-wallet'] !== '1.0.1' ||
-    manifest.overrides?.['trac-wallet'] !== '1.0.1') {
-  throw new Error('Intercom root does not pin and override trac-wallet 1.0.1');
+    Object.prototype.hasOwnProperty.call(manifest.overrides ?? {}, 'trac-wallet')) {
+  throw new Error('Intercom root must pin trac-wallet 1.0.1 without overriding pinned MSB/peer wallets');
 }
 for (const [name, source] of [
   ['trac-msb', 'trac/msb'],
@@ -189,10 +189,14 @@ for (const [name, source] of [
 const wallets = Object.entries(lock.packages)
   .filter(([entry]) => entry === 'node_modules/trac-wallet' ||
     entry.endsWith('/node_modules/trac-wallet'));
-if (wallets.length !== 1 ||
-    wallets[0][0] !== 'node_modules/trac-wallet' ||
-    wallets[0][1].version !== '1.0.1') {
-  throw new Error('root lock does not contain exactly one top-level trac-wallet 1.0.1');
+const expectedWallets = new Map([
+  ['node_modules/trac-wallet', '1.0.1'],
+  ['node_modules/trac-msb/node_modules/trac-wallet', '2.1.0'],
+  ['node_modules/trac-peer/node_modules/trac-wallet', '1.0.4'],
+]);
+if (wallets.length !== expectedWallets.size ||
+    wallets.some(([entry, locked]) => locked.version !== expectedWallets.get(entry))) {
+  throw new Error('root lock does not contain the three pinned trac-wallet installs');
 }
 NODE
 
@@ -242,9 +246,6 @@ cat >"$topology/package.json" <<'JSON'
     "trac-msb": "file:trac/msb",
     "trac-peer": "file:trac/trac-peer",
     "trac-wallet": "1.0.1"
-  },
-  "overrides": {
-    "trac-wallet": "1.0.1"
   }
 }
 JSON
@@ -263,10 +264,18 @@ cat >"$topology/package-lock.json" <<'JSON'
       "version": "0.2.9",
       "resolved": "file:trac/msb"
     },
+    "node_modules/trac-msb/node_modules/trac-wallet": {
+      "name": "trac-wallet",
+      "version": "2.1.0"
+    },
     "node_modules/trac-peer": {
       "name": "trac-peer",
       "version": "0.4.0",
       "resolved": "file:trac/trac-peer"
+    },
+    "node_modules/trac-peer/node_modules/trac-wallet": {
+      "name": "trac-wallet",
+      "version": "1.0.4"
     },
     "node_modules/trac-wallet": {
       "name": "trac-wallet",
@@ -280,13 +289,16 @@ cat >"$topology/package-lock.json" <<'JSON'
 }
 JSON
 cat >"$topology/trac/msb/package.json" <<'JSON'
-{"name":"trac-msb","version":"0.2.9","dependencies":{"trac-wallet":"1.0.1"}}
+{"name":"trac-msb","version":"0.2.9","dependencies":{"trac-wallet":"2.1.0"}}
 JSON
 cat >"$topology/trac/trac-peer/package.json" <<'JSON'
-{"name":"trac-peer","version":"0.4.0","dependencies":{"trac-wallet":"^0.0.43"}}
+{"name":"trac-peer","version":"0.4.0","dependencies":{"trac-wallet":"1.0.4"}}
 JSON
 cp "$topology/trac/msb/package.json" "$topology/node_modules/trac-msb/package.json"
 cp "$topology/trac/trac-peer/package.json" "$topology/node_modules/trac-peer/package.json"
+mkdir -p \
+  "$topology/node_modules/trac-msb/node_modules/trac-wallet" \
+  "$topology/node_modules/trac-peer/node_modules/trac-wallet"
 for relative in migration proto rpc src whitelist; do
   mkdir -p \
     "$topology/trac/msb/$relative" \
@@ -314,6 +326,14 @@ cat >"$topology/node_modules/trac-wallet/package.json" <<'JSON'
 {"name":"trac-wallet","version":"1.0.1","main":"index.js"}
 JSON
 printf 'module.exports = class PeerWallet { static encodeBech32mSafe() {} };\n' >"$topology/node_modules/trac-wallet/index.js"
+cat >"$topology/node_modules/trac-msb/node_modules/trac-wallet/package.json" <<'JSON'
+{"name":"trac-wallet","version":"2.1.0","main":"index.js"}
+JSON
+printf 'module.exports = class PeerWallet {};\n' >"$topology/node_modules/trac-msb/node_modules/trac-wallet/index.js"
+cat >"$topology/node_modules/trac-peer/node_modules/trac-wallet/package.json" <<'JSON'
+{"name":"trac-wallet","version":"1.0.4","main":"index.js"}
+JSON
+printf 'module.exports = class PeerWallet {};\n' >"$topology/node_modules/trac-peer/node_modules/trac-wallet/index.js"
 cat >"$topology/node_modules/wallet-consumer/package.json" <<'JSON'
 {"name":"wallet-consumer","version":"1.0.0","optionalDependencies":{"trac-wallet":"*"}}
 JSON
@@ -342,13 +362,16 @@ expect_failure "topology verifier accepted source-owned dependencies" \
   node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$topology"
 rmdir "$topology/trac/msb/node_modules"
 
-mkdir -p "$topology/node_modules/trac-peer/node_modules"
-cp -R \
-  "$topology/node_modules/trac-wallet" \
-  "$topology/node_modules/trac-peer/node_modules/trac-wallet"
-expect_failure "topology verifier accepted a nested trac-wallet" \
+rm -rf "$topology/node_modules/trac-peer/node_modules/trac-wallet"
+cp -R "$topology/node_modules/trac-wallet" "$topology/node_modules/trac-peer/node_modules/trac-wallet"
+expect_failure "topology verifier accepted the wrong nested trac-wallet" \
   node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$topology"
 rm -rf "$topology/node_modules/trac-peer/node_modules"
+mkdir -p "$topology/node_modules/trac-peer/node_modules/trac-wallet"
+cat >"$topology/node_modules/trac-peer/node_modules/trac-wallet/package.json" <<'JSON'
+{"name":"trac-wallet","version":"1.0.4","main":"index.js"}
+JSON
+printf 'module.exports = class PeerWallet {};\n' >"$topology/node_modules/trac-peer/node_modules/trac-wallet/index.js"
 
 mv "$topology/node_modules/trac-peer" "$topology/trac-peer-installed"
 if ln -s ../trac-peer-installed "$topology/node_modules/trac-peer" 2>/dev/null; then
