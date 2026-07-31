@@ -3288,11 +3288,21 @@ async fn reconcile_and_persist_completed_invocation_job(
 type GatewayReceiptAckRecoveryFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Value, GatewaySessionError>> + Send + 'a>>;
 
+const GATEWAY_RECEIPT_ACK_RECOVERY_MAX_JOBS_PER_PASS: usize = 8;
+
 trait GatewayReceiptAckRecoveryTransport: Send + Sync + fmt::Debug {
     fn deliver<'a>(
         &'a self,
         recovery: &'a GatewayJobSettledReceipt,
     ) -> GatewayReceiptAckRecoveryFuture<'a>;
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GatewayReceiptAckRecoveryPass {
+    pending: usize,
+    attempted: usize,
+    completed: usize,
+    failed: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -3559,6 +3569,36 @@ async fn reconcile_pending_gateway_job_once(
     Ok(())
 }
 
+async fn reconcile_pending_gateway_jobs_pass(
+    state: &GatewayState,
+    transport: &dyn GatewayReceiptAckRecoveryTransport,
+    max_jobs: usize,
+) -> Result<GatewayReceiptAckRecoveryPass, String> {
+    let pending = state
+        .jobs
+        .lock_recover("gateway job vault")
+        .pending_reconciliations(now_secs())?;
+    let mut pass = GatewayReceiptAckRecoveryPass {
+        pending: pending.len(),
+        ..GatewayReceiptAckRecoveryPass::default()
+    };
+    for job in pending.into_iter().take(max_jobs.max(1)) {
+        pass.attempted += 1;
+        match reconcile_pending_gateway_job_once(state, &job.id, transport).await {
+            Ok(()) => pass.completed += 1,
+            Err(err) => {
+                pass.failed += 1;
+                eprintln!(
+                    "Gateway receipt acknowledgement recovery for {} is pending: {}",
+                    job.id, err.message
+                );
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok(pass)
+}
+
 fn spawn_pending_gateway_job_reconciliation(state: &GatewayState) -> Result<(), String> {
     let pending = state
         .jobs
@@ -3584,27 +3624,49 @@ fn spawn_pending_gateway_job_reconciliation(state: &GatewayState) -> Result<(), 
     }
     let transport: Arc<dyn GatewayReceiptAckRecoveryTransport> =
         Arc::new(ScBridgeReceiptAckRecoveryTransport { config });
-    for job in pending {
-        let state = state.clone();
-        let transport = transport.clone();
-        tokio::spawn(async move {
-            let mut retry = Duration::from_secs(1);
-            loop {
-                match reconcile_pending_gateway_job_once(&state, &job.id, transport.as_ref()).await
-                {
-                    Ok(()) => return,
-                    Err(err) => {
-                        eprintln!(
-                            "Gateway receipt acknowledgement recovery for {} is pending: {}",
-                            job.id, err.message
-                        );
-                    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut retry = Duration::from_secs(1);
+        loop {
+            let pass = match reconcile_pending_gateway_jobs_pass(
+                &state,
+                transport.as_ref(),
+                GATEWAY_RECEIPT_ACK_RECOVERY_MAX_JOBS_PER_PASS,
+            )
+            .await
+            {
+                Ok(pass) => pass,
+                Err(err) => {
+                    eprintln!("Gateway receipt acknowledgement recovery scan is pending: {err}");
+                    tokio::time::sleep(retry).await;
+                    retry = retry.saturating_mul(2).min(Duration::from_secs(30));
+                    continue;
                 }
-                tokio::time::sleep(retry).await;
-                retry = retry.saturating_mul(2).min(Duration::from_secs(30));
+            };
+            if pass.pending == 0 {
+                return;
             }
-        });
-    }
+
+            // Durable receipt recovery uses SC-Bridge too; pace it so old jobs
+            // cannot starve live provider sessions on a busy gateway.
+            if pass.pending > pass.attempted {
+                eprintln!(
+                    "Gateway receipt acknowledgement recovery deferred {} of {} pending jobs to preserve live session capacity",
+                    pass.pending - pass.attempted,
+                    pass.pending
+                );
+            }
+            let delay = if pass.failed == 0 {
+                retry = Duration::from_secs(1);
+                Duration::from_secs(1)
+            } else {
+                let delay = retry;
+                retry = retry.saturating_mul(2).min(Duration::from_secs(30));
+                delay
+            };
+            tokio::time::sleep(delay).await;
+        }
+    });
     Ok(())
 }
 
@@ -15056,7 +15118,7 @@ fn terminal_balance_refusal(err: &GatewaySessionError) -> Option<ApiError> {
             .message
             .to_ascii_lowercase()
             .contains("insufficient unreserved credit balance"))
-        .then(|| ApiError::payment_required(err.message.clone(), Some("model")))
+    .then(|| ApiError::payment_required(err.message.clone(), Some("model")))
 }
 
 fn verify_provider_receipt_signature(
@@ -33987,6 +34049,28 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct RecordingAnyReceiptAckRecoveryTransport {
+        deliveries: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl GatewayReceiptAckRecoveryTransport for RecordingAnyReceiptAckRecoveryTransport {
+        fn deliver<'a>(
+            &'a self,
+            recovery: &'a GatewayJobSettledReceipt,
+        ) -> GatewayReceiptAckRecoveryFuture<'a> {
+            Box::pin(async move {
+                self.deliveries
+                    .lock_recover("test receipt ACK deliveries")
+                    .push(recovery.body.session_id.clone());
+                Ok(test_receipt_settlement_feature(
+                    &recovery.provider_receipt(),
+                    &recovery.receipt_ack,
+                ))
+            })
+        }
+    }
+
     fn test_receipt_settlement_feature(
         provider_receipt: &ProviderSignedReceipt,
         receipt_ack: &ReceiptAck,
@@ -42082,6 +42166,119 @@ mod tests {
             1
         );
         assert_eq!(restarted.ledger_balance_au(), balance_before);
+    }
+
+    #[tokio::test]
+    async fn restart_receipt_ack_recovery_is_bounded_per_pass() {
+        let root = tempfile::tempdir().unwrap();
+        let jobs_dir = root.path().join("jobs");
+        let seed = test_user_seed();
+        let state = GatewayState::fixture()
+            .with_receipt_user_seed(seed)
+            .with_job_store_dir(jobs_dir.clone())
+            .unwrap();
+        let model = test_model();
+        for index in 0..3 {
+            let job = match prepare_gateway_job(
+                &state,
+                &HeaderMap::new(),
+                mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+                &model.id,
+                &json!({"model": model.id, "prompt": format!("bounded recovery {index}")}),
+                &None,
+            )
+            .await
+            .unwrap()
+            {
+                PreparedGatewayJob::Started(job) => job,
+                _ => panic!("fresh request must start a job"),
+            };
+            let mut invocation = test_invocation();
+            invocation.session_id = format!("{:064x}", index + 1);
+            invocation.transport_peer = Some("ab".repeat(32));
+            invocation.job = Some(job);
+            let request = test_chat_request(&model.id);
+            let output = test_chat_output();
+            let provider_receipt = test_provider_receipt(&model, &request, &output, &invocation);
+            let receipt_ack =
+                receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body)
+                    .unwrap();
+            stage_completed_invocation_job(
+                &invocation,
+                chat_job_result(&output),
+                &output.artifacts,
+                &provider_receipt,
+                &receipt_ack,
+            )
+            .await
+            .unwrap();
+        }
+        drop(state);
+
+        let publisher = Arc::new(RecordingReceiptSettlementPublisher::default());
+        let restarted = GatewayState::fixture()
+            .with_receipt_user_seed(seed)
+            .with_job_store_dir(jobs_dir)
+            .unwrap()
+            .with_receipt_settlement_publisher(publisher.clone());
+        let transport = RecordingAnyReceiptAckRecoveryTransport::default();
+
+        let first = reconcile_pending_gateway_jobs_pass(&restarted, &transport, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            GatewayReceiptAckRecoveryPass {
+                pending: 3,
+                attempted: 1,
+                completed: 1,
+                failed: 0,
+            }
+        );
+        assert_eq!(
+            restarted
+                .jobs
+                .lock_recover("gateway job vault")
+                .pending_reconciliations(now_secs())
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            transport
+                .deliveries
+                .lock_recover("test receipt ACK deliveries")
+                .len(),
+            1
+        );
+        assert_eq!(
+            publisher
+                .features
+                .lock_recover("test settlement features")
+                .len(),
+            1
+        );
+
+        let second = reconcile_pending_gateway_jobs_pass(&restarted, &transport, 8)
+            .await
+            .unwrap();
+        assert_eq!(second.pending, 2);
+        assert_eq!(second.attempted, 2);
+        assert_eq!(second.completed, 2);
+        assert_eq!(second.failed, 0);
+        assert!(restarted
+            .jobs
+            .lock_recover("gateway job vault")
+            .pending_reconciliations(now_secs())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            transport
+                .deliveries
+                .lock_recover("test receipt ACK deliveries")
+                .len(),
+            3
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
