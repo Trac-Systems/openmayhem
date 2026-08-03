@@ -186,7 +186,7 @@ class State extends ReadyResource {
 
         return !!(localWritable && !localIndexer) && (unsignedIsWriter && !unsignedIsIndexer)
     }
-
+    
     async isAdmin() {
         const adminEntry = await this.getAdminEntry();
         return !!adminEntry && this.#wallet?.address === adminEntry?.address && b4a.equals(adminEntry?.wk, this.writingKey)
@@ -898,7 +898,7 @@ class State extends ReadyResource {
         const { length, incrementedLength } = await this.#updateWritersIndex(batch);
 
         if (length !== null && incrementedLength !== null) {
-            // Update the writers index and length entries
+            // Update the writers index and length entries  
             await batch.put(EntryType.WRITERS_INDEX + length, adminAddressBuffer);
             await batch.put(EntryType.WRITERS_LENGTH, incrementedLength);
         } else {
@@ -1356,7 +1356,7 @@ class State extends ReadyResource {
                 in the network if you possess a valid wk. As an indirect user, this characteristic doesn't affect you.
 
             */
-            // If node does not exist, then create a new licence.
+            // If node does not exist, then create a new licence. 
             const { newLicenseLength, decodedNewLicenseLength } = await this.#applyAssignNewLicense(batch);
             if (newLicenseLength !== null && decodedNewLicenseLength) {
                 await batch.put(EntryType.LICENSE_COUNT, newLicenseLength)
@@ -1390,10 +1390,10 @@ class State extends ReadyResource {
                 return Status.FAILURE;
             }
 
-            // Edge case: if the user license is not ZERO_LICENSE, then we do not assign a new license.
-            // This means the admin has decided to unban the node.
-            // This is important because if the admin mistakenly whitelists a node that already has a license,
-            // the previous license could be overwritten and lost permanently.
+            // Edge case: if the user license is not ZERO_LICENSE, then we do not assign a new license. 
+            // This means the admin has decided to unban the node. 
+            // This is important because if the admin mistakenly whitelists a node that already has a license, 
+            // the previous license could be overwritten and lost permanently. 
             // Therefore, in this case we do not overwrite the license — we only change the role.
             if (!b4a.equals(decodedNodeEntry.license, nodeEntryUtils.ZERO_LICENSE)) {
                 await batch.put(nodeAddressString, editedNodeEntry);
@@ -1587,23 +1587,23 @@ class State extends ReadyResource {
 
         /*
             Writer Key Validation Cases:
-
+          
             Case 1: New Writing Key (writerKeyHasBeenRegistered === null)
             - If the key has never been registered before
             - System will register this new key and link it to the requester's address
             - Always allowed as long as other conditions are met (whitelisting, balance, etc.)
-
+          
             Case 2: Previously Used Key (writerKeyHasBeenRegistered !== null)
             Two conditions must be met:
             a) Key Match (isCurrentWk):
                 - The key must be the same as currently assigned in node's entry
                 - Prevents using different keys than what's assigned
-
+            
             b) Ownership (isOwner):
                 - The requester must be the original owner of this key
                 - Enables re-staking after being downgraded to reader
                 - Prevents key usage by non-owners
-
+          
             This validation ensures:
             1. Only legitimate new keys are registered
             2. Downgraded nodes can re-stake using their original keys
@@ -1940,7 +1940,7 @@ class State extends ReadyResource {
             return null;
         };
 
-        // Validator reward logic
+        // Validator reward logic 
         const decodedValidatorEntry = nodeEntryUtils.decode(validatorEntryBuffer);
         if (decodedValidatorEntry === null) {
             this.#safeLogApply(OperationType.REMOVE_WRITER, "Failed to decode validator node entry.", node.from.key)
@@ -2040,7 +2040,7 @@ class State extends ReadyResource {
             return Status.FAILURE;
         };
 
-        // Extract admin public key
+        // Extract admin public key 
         const adminPublicKey = tracCryptoApi.address.decodeSafe(decodedAdminEntry.address);
         if (b4a.equals(adminPublicKey, NULL_BUFFER)) {
             this.#safeLogApply(OperationType.ADD_INDEXER, "Failed to decode admin public key.", node.from.key)
@@ -2400,7 +2400,7 @@ class State extends ReadyResource {
         const { length, incrementedLength } = await this.#updateWritersIndex(batch);
 
         if (length !== null && incrementedLength !== null) {
-            // Update the writers index and length entries
+            // Update the writers index and length entries 
             await batch.put(EntryType.WRITERS_INDEX + length, toRemoveAddressBuffer);
             await batch.put(EntryType.WRITERS_LENGTH, incrementedLength);
         } else {

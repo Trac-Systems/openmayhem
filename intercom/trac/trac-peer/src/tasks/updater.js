@@ -1,14 +1,24 @@
 import Scheduler from '../utils/scheduler.js';
 
 const PROCESS_INTERVAL_MS = 10_000
+const ACK_OPERATION_TYPE = '_trac_peer_ack_v1'
+
+// MAYHEM PATCH: ACKs must be ordinary signed operations. append(null) can crash
+// under the Pear/Bare hypercore-storage encoder.
+const createAckOperation = () => ({
+    type: ACK_OPERATION_TYPE,
+    value: { version: 1 }
+})
 
 class Updater {
     #base
     #scheduler
     #isInterrupted
+    #processIntervalMs
 
-    constructor({ base }) {
+    constructor({ base }, config = {}) {
         this.#base = base
+        this.#processIntervalMs = Number(config?.updaterIntervalMs ?? PROCESS_INTERVAL_MS)
     }
 
     async start() {
@@ -25,18 +35,18 @@ class Updater {
 
     async #worker(next) {
         await this.#update();
-        next(PROCESS_INTERVAL_MS);
+        next(this.#processIntervalMs);
     }
 
     async #update() {
         if (!this.#shouldRun()) return
 
         if (this.#base.view.core.length > this.#base.view.core.signedLength)
-            await this.#base.append(null)
+            await this.#base.append(createAckOperation())
     }
 
     #createScheduler() {
-        return new Scheduler((next) => this.#worker(next), PROCESS_INTERVAL_MS);
+        return new Scheduler((next) => this.#worker(next), this.#processIntervalMs);
     }
 
     #sleep(ms) {
@@ -54,4 +64,4 @@ class Updater {
     }
 }
 
-export { Updater }
+export { Updater, ACK_OPERATION_TYPE, createAckOperation }

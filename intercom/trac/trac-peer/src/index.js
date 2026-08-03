@@ -45,11 +45,11 @@ export class Peer extends ReadyResource {
         this.updaterTask = null;
         this.writerLocalKey = null;
 
-        this.wallet = wallet
+        this.wallet = wallet        
         this.protocol = { Class: protocol, instance: null }
         this.contract = { Class: contract, instance: null }
         this.features = features || [];
-
+        
         // In bare runtime, Buffer#fill(undefined) throws; default to 0 when channel not provided.
         this.bee = null;
         this.readlineInstance = readlineInstance || null;
@@ -79,7 +79,9 @@ export class Peer extends ReadyResource {
 
     async _boot() {
         this.base = new Autobase(this.store, this.config.bootstrap, {
-            ackInterval : 1000,
+            // MAYHEM PATCH: disable Autobase's implicit null ACK; updater appends
+            // a signed no-op instead so Pear/Bare never encodes a null head.
+            ackInterval : 0,
             valueEncoding: 'json',
             open: store => {
                 this.bee = new Hyperbee(store.get('view'), {

@@ -260,7 +260,7 @@ export class MainSettlementBus extends ReadyResource {
         return { payload, decoded }
     }
 
-    handleGetFee() {
+    handleGetFee() {        
         const fee = this.#state.getFee();
         return bufferToBigInt(fee);
     }
@@ -300,7 +300,7 @@ export class MainSettlementBus extends ReadyResource {
             let dagSystem = await this.#state.base.system.core.treeHash();
             let lengthdagSystem = this.#state.base.system.core.length;
             const wl = await this.#state.getWriterLength();
-
+            
             console.log("---------- node & network stats ----------");
             console.log("wallet.publicKey:", this.#wallet?.publicKey?.toString("hex") ?? "unset");
             console.log("wallet.address:", this.#wallet?.address ?? "unset");

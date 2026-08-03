@@ -1,6 +1,6 @@
 import b4a from "b4a"
 import { operationToPayload } from "../../src/utils/applyOperations.js"
-import { isHexString } from "../../src/utils/helpers.js";
+import { isHexString } from "../../src/utils/helpers.js"; 
 import { ValidationError } from "../../src/utils/errors.js";
 
 export function decodeBase64Payload(base64) {

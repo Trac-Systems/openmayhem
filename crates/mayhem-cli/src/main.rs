@@ -52860,6 +52860,21 @@ fn provider_engine_component_failure(
         .then_some(reason)
 }
 
+fn provider_engine_component_failure_after_cancel(
+    responder: &mut dyn ProviderSessionResponder,
+    error: &anyhow::Error,
+) -> Option<String> {
+    let reason = format!("{error:#}");
+    if reason.contains(PROVIDER_ENGINE_REQUEST_CANCELLED)
+        && !reason.contains("provider engine panicked")
+        && responder.component_healthy()
+    {
+        return None;
+    }
+    (reason.contains("provider engine panicked") || !responder.component_healthy())
+        .then_some(reason)
+}
+
 fn reload_provider_session_responder(
     responder: &mut Box<dyn ProviderSessionResponder>,
     reason: String,
@@ -70643,7 +70658,9 @@ async fn handle_provider_session_frame(
                     if cancellation.is_cancelled()
                         && !err_text.contains(PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT)
                     {
-                        if let Some(reason) = provider_engine_component_failure(responder, &err) {
+                        if let Some(reason) =
+                            provider_engine_component_failure_after_cancel(responder, &err)
+                        {
                             heartbeat_load.set_accepting_new(false);
                             provider_session_debug(format!(
                                 "provider engine component stopped while cancelling session {session_id}; scheduling isolated reload: {reason}"
@@ -71185,6 +71202,7 @@ fn trim_provider_reasoning_boundary(text: &str) -> &str {
 
 const PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT: &str =
     "provider live stream cancelled after client disconnect";
+const PROVIDER_ENGINE_REQUEST_CANCELLED: &str = "engine request cancelled";
 
 impl<'a> ProviderSessionLiveStream<'a> {
     fn new(
@@ -99705,6 +99723,54 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
         let next = contain_provider_request(|| Ok::<_, anyhow::Error>("healthy response"));
         assert_eq!(next.unwrap(), "healthy response");
+    }
+
+    #[test]
+    fn cancelled_engine_request_keeps_healthy_component_loaded() {
+        struct HealthResponder {
+            healthy: bool,
+        }
+
+        impl ProviderSessionResponder for HealthResponder {
+            fn mode(&self) -> &'static str {
+                "health-test"
+            }
+
+            fn component_healthy(&mut self) -> bool {
+                self.healthy
+            }
+
+            fn respond(
+                &mut self,
+                _terms: &ProviderSessionTerms,
+                _body: &Value,
+                _cancellation: &CancellationToken,
+            ) -> Result<ProviderSessionOutput> {
+                bail!("unused test responder")
+            }
+        }
+
+        let mut healthy = HealthResponder { healthy: true };
+        assert!(provider_engine_component_failure_after_cancel(
+            &mut healthy,
+            &anyhow!("generating provider session video artifact with mayhem-engine: engine request cancelled"),
+        )
+        .is_none());
+
+        let mut dead = HealthResponder { healthy: false };
+        assert!(provider_engine_component_failure_after_cancel(
+            &mut dead,
+            &anyhow!("generating provider session video artifact with mayhem-engine: engine request cancelled"),
+        )
+        .is_some());
+
+        let mut panicked = HealthResponder { healthy: true };
+        let reason = provider_engine_component_failure_after_cancel(
+            &mut panicked,
+            &anyhow!("provider engine panicked while cancelling: engine request cancelled"),
+        )
+        .expect("panic still requires recovery");
+        assert!(reason.contains("provider engine panicked"));
     }
 
     #[cfg(unix)]

@@ -1,9 +1,9 @@
-import {
-    decodeBase64Payload,
-    isBase64,
-    isValidTxHash,
-    sanitizeBulkPayloadsRequestBody,
-    sanitizeTransferPayload,
+import { 
+    decodeBase64Payload, 
+    isBase64, 
+    isValidTxHash, 
+    sanitizeBulkPayloadsRequestBody, 
+    sanitizeTransferPayload, 
     validatePayloadStructure,
     hasSpacesInUrl
 } from "./utils/helpers.js"
@@ -114,7 +114,7 @@ export async function handleBroadcastTransaction({ msbInstance, respond, req }) 
             if (error instanceof ValidationError || error instanceof SyntaxError) {
                 code = 400;
                 errorMsg = error.message;
-            }
+            } 
             else if (error instanceof BroadcastError) {
                 code = 429;
                 errorMsg = error.message;

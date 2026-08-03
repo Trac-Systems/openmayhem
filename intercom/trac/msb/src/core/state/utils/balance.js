@@ -9,7 +9,7 @@ const DOUBLE_LENGTH = BALANCE_BYTE_LENGTH * 2
 const PERCENTAGE_TERM = bigIntToBuffer(10_000n, DOUBLE_LENGTH)
 
 /**
- * Converts a decimal to a buffer that can be used along with Balance#percentage.
+ * Converts a decimal to a buffer that can be used along with Balance#percentage. 
  * Should be used to define readable constants.
  * @param {number} value - The % with two decimal digits
  * @returns {Buffer} - Fixed-length buffer representing the percentage to be applied
@@ -40,7 +40,7 @@ export const PERCENT_25 = percent(25)
  * @returns {Buffer} - Fixed-length buffer representing token amount
  */
 export const $TNK = bigint => bigIntToBuffer(
-    bigint * 10n ** TOKEN_DECIMALS,
+    bigint * 10n ** TOKEN_DECIMALS, 
     BALANCE_BYTE_LENGTH
 )
 
@@ -51,7 +51,7 @@ export const $TNK = bigint => bigIntToBuffer(
  * @returns {Buffer} - Fixed-length buffer representing token amount
  */
 export const toTerm = bigint => bigIntToBuffer(
-    bigint,
+    bigint, 
     BALANCE_BYTE_LENGTH
 )
 
@@ -135,11 +135,11 @@ const mulBuffers = (a, b) => {
     if (a.length !== BALANCE_BYTE_LENGTH || b.length !== BALANCE_BYTE_LENGTH) {
         return NULL_BUFFER
     }
-
+  
     const alen = a.length;
     const blen = b.length;
     const result = b4a.alloc(DOUBLE_LENGTH); // up to 32 bytes
-
+  
     for (let i = alen - 1; i >= 0; i--) {
         let carry = 0;
         for (let j = blen - 1; j >= 0; j--) {
@@ -158,7 +158,7 @@ const mulBuffers = (a, b) => {
     if (!b4a.equals(result.slice(0, BALANCE_BYTE_LENGTH), ZERO_BALANCE)) {
         return NULL_BUFFER
     }
-
+  
     // Truncate
     return truncate(result)
 }
@@ -179,7 +179,7 @@ class Balance {
     get value() {
         return this.#value
     }
-
+    
     /**
      * Creates a Balance instance.
      * @param {Buffer} value - Buffer representing the balance
@@ -191,7 +191,7 @@ class Balance {
 
     /**
      * Adds another balance to this one.
-     * @param {Balance} b
+     * @param {Balance} b 
      * @returns {Balance} - New Balance instance
      */
     add(b) {
@@ -200,7 +200,7 @@ class Balance {
 
     /**
      * Subtracts another balance from this one.
-     * @param {Balance} b
+     * @param {Balance} b 
      * @returns {Balance} - New Balance instance
      */
     sub(b) {
@@ -242,7 +242,7 @@ class Balance {
 
     /**
      * Updates a node entry with this balance.
-     * @param {Object} nodeEntry
+     * @param {Object} nodeEntry 
      */
     update(nodeEntry) {
         return setBalance(nodeEntry, this.#value)

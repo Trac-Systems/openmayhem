@@ -318,7 +318,7 @@ class Network extends ReadyResource {
                 return CONNECTION_STATUS.CONNECTED;
             }
         }
-
+        
         return CONNECTION_STATUS.PENDING;
     }
 

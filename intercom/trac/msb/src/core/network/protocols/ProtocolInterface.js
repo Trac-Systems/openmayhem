@@ -4,7 +4,7 @@
  */
 
 class ProtocolInterface {
-
+    
     // TODO: Refactor this so we don't need to pass a reference for the whole network instance
     constructor(_router, _connection, _pendingRequestService, _config) {
         if (new.target === ProtocolInterface) {

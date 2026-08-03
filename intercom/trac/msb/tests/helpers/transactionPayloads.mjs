@@ -14,7 +14,7 @@ export const waitForConnection = async node => {
         if (count > 0) {
             break
         }
-
+        
         await sleep(300);
         attempts++;
     }

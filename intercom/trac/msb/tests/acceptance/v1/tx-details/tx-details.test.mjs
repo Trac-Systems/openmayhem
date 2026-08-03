@@ -230,10 +230,10 @@ export const registerTxDetailsTests = (context) => {
         });
 
         it("returns 400 for trailing space hash", async () => {
-            const hash = "a".repeat(64) + " ";
+            const hash = "a".repeat(64) + " "; 
             const res = await request(context.server)
                 .get(`/v1/tx/details/${encodeURIComponent(hash)}`);
-
+            
             expect(res.statusCode).toBe(400);
             expect(res.body).toEqual({ error: "Invalid transaction hash format" });
         });

@@ -11,4 +11,5 @@ await import('./msbTxValidation.test.js');
 await import('./walletNetworkConfig.test.js');
 await import('./pearCompat.test.js');
 await import('./terminalRuntime.test.js');
+await import('./updater.test.js');
 test.resume();

@@ -72,10 +72,10 @@ class ProtocolSession {
     }
 
     /**
-    * Probes the peer to determine which protocol version they support/prefer.
+    * Probes the peer to determine which protocol version they support/prefer. 
     * This is needed to know if the connected peer supports the new v1 protocol
     * or if we should fall back to legacy for this connection.
-    *
+    * 
     * TODO: After legacy protocol is retired, we can remove the concept of "probing" and just use v1 directly.
     * For now, this is needed to determine which protocol to use for health checks.
     * A good future improvement would be to implement a more robust negotiation mechanism that doesn't rely on timeouts

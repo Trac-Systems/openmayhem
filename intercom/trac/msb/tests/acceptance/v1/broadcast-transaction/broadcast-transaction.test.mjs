@@ -81,7 +81,7 @@ export const registerBroadcastTransactionTests = (context) => {
         })
 
         it("returns 413 when payload exceeds size limit", async () => {
-            const largeString = "a".repeat(2_100_000);
+            const largeString = "a".repeat(2_100_000); 
             const payload = toBase64({ type: 1, address: context.wallet.address, txo: { large: largeString } });
 
             await waitForConnection(context.rpcMsb);
@@ -97,7 +97,7 @@ export const registerBroadcastTransactionTests = (context) => {
         it("returns 429 on repeated broadcast failures", async () => {
             const { payload } = await buildRpcSelfTransferPayload(context, context.rpcMsb.state, 1n);
             const originalMethod = context.rpcMsb.broadcastPartialTransaction;
-            context.rpcMsb.broadcastPartialTransaction = async () => false;
+            context.rpcMsb.broadcastPartialTransaction = async () => false; 
 
             try {
                 await waitForConnection(context.rpcMsb);

@@ -36,7 +36,7 @@ class TransactionRateLimiterService {
             peerData.lastCounterReset = currentTime;
             this.#connectionsStatistics.set(peer, peerData);
         }
-
+        
         return peerData.transactionCount >= this.#config.rateLimitMaxTransactionsPerSecond;
     }
 
@@ -126,7 +126,7 @@ class TransactionRateLimiterService {
             });
         }
     }
-
+    
     /*
         When external peer sends a transaction, this method updates the connection info.
         It updates the last activity time and increments the transaction count.

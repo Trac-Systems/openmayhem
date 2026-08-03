@@ -39,7 +39,7 @@ class ConnectionManager {
      * @param {ReadyResource} healthCheckService
      */
     // TODO: We should consider moving this to ValidatorObserver instead.
-    // Keep here only if we forsee having health checks for non-validator connections in the future.
+    // Keep here only if we forsee having health checks for non-validator connections in the future. 
     // For now, it seems that it would be better to keep this logic here.
     subscribeToHealthChecks(healthCheckService) {
         this.#logger.debug('subscribeToHealthChecks: subscribing to health check events');

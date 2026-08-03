@@ -18,7 +18,7 @@ w*/
 # Coverage reports
 coverage/
 
-# Whitelist directory
+# Whitelist directory 
 whitelist/*
 !whitelist/.gitkeep
 .vscode/

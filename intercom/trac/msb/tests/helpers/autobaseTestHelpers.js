@@ -135,7 +135,7 @@ export function createBase(store, key, t, opts = {}) {
         fastForward: false,
         ...rest
     });
-
+	
     base.on('error', err => {
         if (err?.code === 'SESSION_CLOSED') return;
         console.error('autobase error', err);

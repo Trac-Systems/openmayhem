@@ -111,18 +111,18 @@ export const registerTxTests = (context) => {
 
         it("accepts uppercase hex", async () => {
             const { payload, txHashHex } = await buildRpcSelfTransferPayload(context, context.rpcMsb.state, 1n);
-
+            
             // Send the transaction
             await request(context.server)
                 .post("/v1/broadcast-transaction")
                 .send(JSON.stringify({ payload }));
 
             // Waits for the node indexer to process
-            await new Promise(resolve => setTimeout(resolve, 500));
+            await new Promise(resolve => setTimeout(resolve, 500)); 
 
             const uppercaseHash = txHashHex.toUpperCase();
             const res = await request(context.server).get(`/v1/tx/${uppercaseHash}`);
-
+            
             expect(res.statusCode).toBe(200);
         });
 

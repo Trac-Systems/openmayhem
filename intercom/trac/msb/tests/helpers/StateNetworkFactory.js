@@ -27,7 +27,7 @@ import { testKeyPair1 } from '../fixtures/apply.fixtures.js';
 import { overrideConfig } from './config.js';
 
 export class StateNetworkFactory {
-
+	
     static async create(options = {}) {
         const factory = new StateNetworkFactory(options);
         await factory.#initialize();

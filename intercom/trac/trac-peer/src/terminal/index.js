@@ -52,7 +52,7 @@ class Terminal {
         console.log('- /get_keys | prints your public and private keys. Be careful and never share your private key!');
         console.log('- /exit | Exit the program');
         console.log('- /help | This help text');
-
+    
         this.#peer.protocol.instance.printOptions();
     }
 
@@ -60,7 +60,7 @@ class Terminal {
         const peer = this.#peer;
         if (!peer) return;
         if (globalThis.Pear !== undefined && globalThis.Pear.config?.options?.type === 'desktop') return;
-
+    
         let rl = readlineInstance;
         if (!rl) {
             try {
@@ -69,7 +69,7 @@ class Terminal {
                 return;
             }
         }
-
+    
         this.printHelp();
 
         const commandHandlers = [
@@ -113,7 +113,7 @@ class Terminal {
             }
             rl.prompt();
         });
-
+    
         rl.prompt();
         return rl;
     }

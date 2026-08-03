@@ -90,8 +90,8 @@ class MessageOrchestrator {
 
         /* NOTE: Since the retry logic for Legacy is handled here, and is very unique to the protocol,
         * it was decided to not change MessageOrchestrator send method in the refactor to make protocols transparent.
-        * As the Legacy protocol is going to be deprecated soon, it was decided to keep the retry logic
-        * here instead of abstracting it in the protocol implementation.
+        * As the Legacy protocol is going to be deprecated soon, it was decided to keep the retry logic 
+        * here instead of abstracting it in the protocol implementation. 
         * If we were to abstract it, we would need to add protocol-specific logic in the ProtocolSession
         * or ProtocolInterface, which would make them less clean and more coupled with the specifics of the protocols.
         * The parts to be refactored in the future are marked with TODO comments.
@@ -116,7 +116,7 @@ class MessageOrchestrator {
         } else if (preferredProtocol === validatorConnection.protocolSession.supportedProtocols.V1) {
             // TODO: This is probably better placed inside the V1 protocol definition.
             // Both protocols should receive a 'canonical' message and solve the encodings internally
-            // Refactor
+            // Refactor 
             const normalizedMessage = normalizeMessageByOperationType(message, this.#config)
             const encodedTransaction = unsafeEncodeApplyOperation(normalizedMessage)
             const v1Message = await networkMessageFactory(this.#wallet, this.#config)

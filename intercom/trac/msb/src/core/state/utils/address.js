@@ -16,7 +16,7 @@ export function isAddressValid(address, hrp) {
         address = address.toString('ascii');
     }
 
-    const res = _.attempt(() =>
+    const res = _.attempt(() => 
         addressApi.size(hrp) === address.length && address.startsWith(`${hrp}1`) && addressApi.isValid(address)
     );
 

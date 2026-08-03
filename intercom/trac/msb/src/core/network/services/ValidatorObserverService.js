@@ -50,7 +50,7 @@ class ValidatorObserverService {
     #getPollInterval() {
         return this.#config.pollInterval;
     }
-
+    
     /**
      * Selects a subset of valid validator candidates to connect to.
      *
@@ -67,17 +67,17 @@ class ValidatorObserverService {
     #selectCandidates(writers, adminEntry) {
         const manager = this.#network.validatorConnectionManager;
         const adminThreshold = this.#config.maxWritersForAdminIndexerConnection;
-
+        
         // Evaluates the admin blockage policy based on fully connected/alive writers
         const aliveWritersCount = this.#countAliveWriters(writers, adminEntry);
         const adminBlocked = adminEntry && aliveWritersCount >= adminThreshold;
-
-        // Target calculation: ensures the observer deducts its own slot from the network size
+        
+        // Target calculation: ensures the observer deducts its own slot from the network size 
         // only if it belongs to the valid writers list.
         const isSelfInWriters = writers.some(w => w.address === this.#address);
         const networkSize = isSelfInWriters ? writers.length - 1 : writers.length;
         const target = Math.min(networkSize, this.#config.maxValidators);
-
+        
         const isSelfAdmin = this.#address === adminEntry?.address;
         const totalConnected = manager.connectedValidators().length;
 
@@ -85,13 +85,13 @@ class ValidatorObserverService {
             if (w.address === this.#address) return false;
 
             const isConnected = manager.connected(w.publicKey);
-
+            
             // Checks if we are ALREADY trying to connect to this specific node
             const isPending = this.#network.isConnectionPending(w.publicKeyHex);
 
             // Skips nodes we are already interacting with
             if (isConnected || isPending) return false;
-
+            
             // The admin is actively filtered out from the pool if the threshold policy is triggered
             if (adminBlocked && !isSelfAdmin && w.address === adminEntry?.address) return false;
 
@@ -110,13 +110,13 @@ class ValidatorObserverService {
         // Ignoring pending/non-active nodes to avoid blocking the queue.
         const slots = Math.max(0, target - totalConnected);
         const limit = Math.min(slots, VALIDATOR_CANDIDATES_PER_CYCLE, result.length);
-
+        
         return {
             candidates: result.slice(0, limit),
             slots: slots,
         }
     }
-
+   
     /**
      * Enforces admin-specific connection rules.
      *
@@ -133,7 +133,7 @@ class ValidatorObserverService {
     #enforceAdminPolicy(writers, adminEntry) {
         // Evaluates against alive network peers rather than dormant database entries
         const aliveWritersCount = this.#countAliveWriters(writers, adminEntry);
-
+        
         if (aliveWritersCount < this.#config.maxWritersForAdminIndexerConnection) return;
 
         this.#logger.debug("Validator threshold reached → enforcing admin policy");
@@ -160,7 +160,7 @@ class ValidatorObserverService {
             this.#logger.debug(`Removed stale validator connection: ${b4a.toString(publicKey, "hex")}`);
         }
     }
-
+    
     /**
      * Determines whether the observer should run.
      * Controlled by a config flag + runtime interruption.
@@ -169,12 +169,12 @@ class ValidatorObserverService {
     #shouldRun() {
         return this.#config.enableValidatorObserver && !this.#isInterrupted;
     }
-
+    
     /**
      * Counts the number of physically active and connected writers in the network.
-     * This method bridges the gap between the Autobase state (which may include
-     * offline/dormant writers due to its append-only/soft-delete nature) and the
-     * actual physical network layer. It ensures the admin threshold policy is
+     * This method bridges the gap between the Autobase state (which may include 
+     * offline/dormant writers due to its append-only/soft-delete nature) and the 
+     * actual physical network layer. It ensures the admin threshold policy is 
      * evaluated against truly active nodes rather than historical state.
      *
      * @param {Array<Object>} writers - The deduplicated list of writers from the Autobase.
@@ -213,7 +213,7 @@ class ValidatorObserverService {
             this.#logger.info('ValidatorObserverService can not start. Disabled by configuration.');
             return;
         }
-
+        
         if (this.#scheduler && this.#scheduler.isRunning) {
             this.#logger.info('ValidatorObserverService is already started');
             return;
@@ -261,15 +261,15 @@ class ValidatorObserverService {
         try {
             const adminEntry = await this.#getAdminEntryCached();
             const writers = await this.#getWritersCached(adminEntry);
-
+            
             if (writers.length === 0) return next(interval);
 
             this.#enforceAdminPolicy(writers, adminEntry);
 
             const manager = this.#network.validatorConnectionManager;
             // CEILING: do not exceed the max connections limit
-            if (manager.maxConnectionsReached()) return next(interval);
-
+            if (manager.maxConnectionsReached()) return next(interval); 
+            
             const { candidates, slots} = this.#selectCandidates(writers, adminEntry);
             if (candidates.length > 0) {
                 await this.#processCandidates(candidates, slots);
@@ -322,13 +322,13 @@ class ValidatorObserverService {
             this.#hasBootstrapped = true;
             this.#logger.debug("Bootstrap complete (timeout)");
         }
-
+        
         const short = this.#config.writersShortCacheTTL;
         const long = this.#config.writersLongCacheTTL;
-
+        
         const dynamicTTL = this.#hasBootstrapped ? long : short;
         if (cachedList.length > 0 && now - lastUpdated < dynamicTTL) return cachedList;
-
+            
         const list = await this.#scanAutobaseWriters(adminEntry);
         this.#writersCache = { list, lastUpdated: now };
 

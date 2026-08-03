@@ -178,7 +178,6 @@ export class Config {
     }
 
     get storeName() {
-        if (this.#isOverriden('storeName')) return this.#options.storeName
         return this.#config.storeName
     }
 
@@ -212,7 +211,7 @@ export class Config {
         if (this.#isOverriden('rateLimitMaxTransactionsPerSecond')) return this.#options.rateLimitMaxTransactionsPerSecond
         return this.#config.rateLimitMaxTransactionsPerSecond
     }
-
+    
     get pendingRequestTimeout() {
         return this.#config.pendingRequestTimeout
     }
@@ -241,7 +240,7 @@ export class Config {
     get derivationPath() {
         return this.#config.derivationPath
     }
-
+    
     get pollInterval() {
         if (this.#isOverriden('pollInterval')) return this.#options.pollInterval
         return this.#config.pollInterval
@@ -251,7 +250,7 @@ export class Config {
         if (this.#isOverriden('adminCacheTTL')) return this.#options.adminCacheTTL
         return this.#config.adminCacheTTL
     }
-
+    
     get bootstrapTimeout() {
         if (this.#isOverriden('bootstrapTimeout')) return this.#options.bootstrapTimeout
         return this.#config.bootstrapTimeout
@@ -266,7 +265,7 @@ export class Config {
         if (this.#isOverriden('writersLongCacheTTL')) return this.#options.writersLongCacheTTL
         return this.#config.writersLongCacheTTL
     }
-
+    
     get validatorConnectionAttemptDelay() {
         if (this.#isOverriden('validatorConnectionAttemptDelay')) return this.#options.validatorConnectionAttemptDelay
         return this.#config.validatorConnectionAttemptDelay
@@ -362,10 +361,6 @@ export class Config {
 
         if (isDefined(options.storesDirectory)) {
             this.#validateStringOverride('storesDirectory', options.storesDirectory);
-        }
-
-        if (isDefined(options.storeName)) {
-            this.#validateStringOverride('storeName', options.storeName);
         }
 
         if (isDefined(options.host)) {

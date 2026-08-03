@@ -10,8 +10,8 @@ class BaseResponse {
     #state;
 
     /**
-     *
-     * @param {State} state
+     * 
+     * @param {State} state 
      * @param {IWallet} wallet
      * @param {Config} config
      */
