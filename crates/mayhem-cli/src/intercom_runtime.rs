@@ -193,9 +193,9 @@ fn validate_wallet_package(
         expected_version
     );
 
-    let wallet_entry = wallet_root.join("index.js");
-    ensure_regular_file(&wallet_entry)?;
     if require_safe_bech32 {
+        let wallet_entry = wallet_root.join("index.js");
+        ensure_regular_file(&wallet_entry)?;
         let wallet_source = fs::read_to_string(&wallet_entry)
             .with_context(|| format!("reading {}", wallet_entry.display()))?;
         ensure!(
