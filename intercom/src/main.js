@@ -15,7 +15,7 @@ import { installFatalRuntimeErrorPolicy } from './runtime-errors.js';
 import { verifyStartupReleaseIdentity } from './release-identity.js';
 import { MainSettlementBus } from 'trac-msb/src/index.js';
 import { ensureTextCodecs } from 'trac-peer/src/textCodec.js';
-import { getPearRuntime, ensureTrailingSlash } from 'trac-peer/src/runnerArgs.js';
+import { getPearRuntime, ensureTrailingSlash, toArgMap } from 'trac-peer/src/runnerArgs.js';
 import { Terminal } from 'trac-peer/src/terminal/index.js';
 import {
   createMayhemMsbConfig,
@@ -33,7 +33,20 @@ const fatalRuntimeError = installFatalRuntimeErrorPolicy(
   typeof Bare !== 'undefined' ? Bare : null
 );
 
-const { argv, env, storeLabel, flags } = getPearRuntime();
+const getIntercomRuntime = () => {
+  const runtime = getPearRuntime();
+  const bareArgv = Array.isArray(globalThis.Bare?.argv) ? globalThis.Bare.argv.slice(2) : null;
+  if (!bareArgv || bareArgv.length === 0 || (runtime.argv && runtime.argv.length > 0)) return runtime;
+  const storeLabel = bareArgv[0] && !String(bareArgv[0]).startsWith('--') ? String(bareArgv[0]) : null;
+  return {
+    ...runtime,
+    argv: bareArgv,
+    storeLabel,
+    flags: toArgMap(bareArgv.slice(storeLabel ? 1 : 0)),
+  };
+};
+
+const { argv, env, storeLabel, flags } = getIntercomRuntime();
 
 const releaseIdentity = verifyStartupReleaseIdentity();
 const [

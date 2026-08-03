@@ -16,3 +16,11 @@ test('main peer opens MainSettlementBus with the configured wallet', () => {
   assert.match(source, /const\s+msbWallet\s*=\s*await\s+loadPeerWallet\s*\(\s*msbConfig\s*\)/);
   assert.match(source, /new\s+MainSettlementBus\s*\(\s*msbConfig\s*,\s*msbWallet\s*\)/);
 });
+
+test('main peer reads Pear v3 worker args from Bare argv', () => {
+  const source = fs.readFileSync(mainPath, 'utf8');
+
+  assert.match(source, /globalThis\.Bare\?\.argv/);
+  assert.match(source, /toArgMap\(bareArgv\.slice/);
+  assert.match(source, /const\s+\{\s*argv,\s*env,\s*storeLabel,\s*flags\s*\}\s*=\s*getIntercomRuntime\(\)/);
+});
