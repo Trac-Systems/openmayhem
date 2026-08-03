@@ -8,6 +8,8 @@ use serde_json::Value;
 use tokio::process::Command;
 
 const WALLET_VERSION: &str = "1.0.1";
+const MSB_WALLET_VERSION: &str = "2.1.0";
+const PEER_WALLET_VERSION: &str = "1.0.4";
 const SOURCE_OWNED_DEPENDENCY_DIRS: &[&str] =
     &["trac/msb/node_modules", "trac/trac-peer/node_modules"];
 
@@ -150,6 +152,32 @@ fn validate_runtime_topology(intercom_dir: &Path) -> Result<()> {
     }
 
     let wallet_root = node_modules.join("trac-wallet");
+    validate_wallet_package(&wallet_root, WALLET_VERSION, true)?;
+    validate_wallet_package(
+        &node_modules
+            .join("trac-msb")
+            .join("node_modules")
+            .join("trac-wallet"),
+        MSB_WALLET_VERSION,
+        false,
+    )?;
+    validate_wallet_package(
+        &node_modules
+            .join("trac-peer")
+            .join("node_modules")
+            .join("trac-wallet"),
+        PEER_WALLET_VERSION,
+        false,
+    )?;
+    Ok(())
+}
+
+fn validate_wallet_package(
+    wallet_root: &Path,
+    expected_version: &str,
+    require_safe_bech32: bool,
+) -> Result<()> {
+    canonical_directory(wallet_root, "Intercom trac-wallet package")?;
     let wallet_manifest_path = wallet_root.join("package.json");
     ensure_regular_file(&wallet_manifest_path)?;
     let wallet_manifest: Value = serde_json::from_slice(
@@ -158,27 +186,23 @@ fn validate_runtime_topology(intercom_dir: &Path) -> Result<()> {
     )
     .with_context(|| format!("parsing {}", wallet_manifest_path.display()))?;
     ensure!(
-        wallet_manifest.get("version").and_then(Value::as_str) == Some(WALLET_VERSION),
-        "Intercom root trac-wallet must be exact version {WALLET_VERSION}"
+        wallet_manifest.get("name").and_then(Value::as_str) == Some("trac-wallet")
+            && wallet_manifest.get("version").and_then(Value::as_str) == Some(expected_version),
+        "{} must be trac-wallet exact version {}",
+        wallet_root.display(),
+        expected_version
     );
 
     let wallet_entry = wallet_root.join("index.js");
     ensure_regular_file(&wallet_entry)?;
-    let wallet_source = fs::read_to_string(&wallet_entry)
-        .with_context(|| format!("reading {}", wallet_entry.display()))?;
-    ensure!(
-        wallet_source.contains("encodeBech32mSafe"),
-        "Intercom root trac-wallet {WALLET_VERSION} does not expose encodeBech32mSafe"
-    );
-
-    let peer_wallet_shadow = node_modules
-        .join("trac-peer")
-        .join("node_modules")
-        .join("trac-wallet");
-    ensure!(
-        fs::symlink_metadata(&peer_wallet_shadow).is_err(),
-        "Intercom trac-peer contains a nested trac-wallet that shadows the root-authoritative runtime"
-    );
+    if require_safe_bech32 {
+        let wallet_source = fs::read_to_string(&wallet_entry)
+            .with_context(|| format!("reading {}", wallet_entry.display()))?;
+        ensure!(
+            wallet_source.contains("encodeBech32mSafe"),
+            "Intercom root trac-wallet {WALLET_VERSION} does not expose encodeBech32mSafe"
+        );
+    }
     Ok(())
 }
 
@@ -333,11 +357,30 @@ mod tests {
         for package in ["trac-msb", "trac-peer", "trac-wallet"] {
             fs::create_dir_all(intercom.join("node_modules").join(package)).unwrap();
         }
-        fs::write(
-            intercom.join("node_modules/trac-wallet/package.json"),
-            r#"{"name":"trac-wallet","version":"1.0.1"}"#,
-        )
-        .unwrap();
+        for (relative, version) in [
+            ("node_modules/trac-wallet", WALLET_VERSION),
+            (
+                "node_modules/trac-msb/node_modules/trac-wallet",
+                MSB_WALLET_VERSION,
+            ),
+            (
+                "node_modules/trac-peer/node_modules/trac-wallet",
+                PEER_WALLET_VERSION,
+            ),
+        ] {
+            let root = intercom.join(relative);
+            fs::create_dir_all(&root).unwrap();
+            fs::write(
+                root.join("package.json"),
+                format!(r#"{{"name":"trac-wallet","version":"{version}"}}"#),
+            )
+            .unwrap();
+            fs::write(
+                root.join("index.js"),
+                "export default class PeerWallet {}\n",
+            )
+            .unwrap();
+        }
         fs::write(
             intercom.join("node_modules/trac-wallet/index.js"),
             "export default class PeerWallet { static encodeBech32mSafe() {} }\n",
@@ -347,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_one_root_authoritative_wallet() {
+    fn accepts_pinned_wallet_runtime_topology() {
         let intercom = fixture();
         validate_runtime_topology(&intercom).unwrap();
         fs::remove_dir_all(intercom.parent().unwrap()).unwrap();

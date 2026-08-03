@@ -32763,7 +32763,7 @@ struct UpPlan {
     mayhemd_path: PathBuf,
     mayhem_path: PathBuf,
     paygate_path: PathBuf,
-    pear_runtime: PathBuf,
+    node_path: PathBuf,
     intercom_dir: PathBuf,
     paygate_internal_auth_secret_path: PathBuf,
     role: Role,
@@ -33709,7 +33709,7 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
     let mayhem_path = env::current_exe().context("resolving current mayhem binary")?;
     let mayhemd_path = sibling_binary_path(&mayhem_path, "mayhemd");
     let paygate_path = sibling_binary_path(&mayhem_path, "mayhem-paygate");
-    let pear_runtime = resolve_pear_runtime_path()?;
+    let node_path = resolve_node_path()?;
     let supervisor_config_path = home.join("mayhemd-up.toml");
     let provider_hardware_quote_command = match (
         args.provider_hardware_quote_kind.as_ref(),
@@ -33736,7 +33736,7 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
         mayhemd_path,
         mayhem_path,
         paygate_path,
-        pear_runtime,
+        node_path,
         intercom_dir,
         paygate_internal_auth_secret_path,
         role,
@@ -34145,8 +34145,11 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
     let paygate_auth_secret_path = plan.paygate_internal_auth_secret_path.display().to_string();
     let mayhem_home = plan.home.display().to_string();
     let mut peer_args = vec![
-        "run".to_owned(),
-        ".".to_owned(),
+        plan.intercom_dir
+            .join("scripts")
+            .join("pear-runner.mjs")
+            .display()
+            .to_string(),
         "--network".to_owned(),
         plan.network.clone(),
         "--peer-stores-directory".to_owned(),
@@ -34235,7 +34238,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
     write_supervisor_child(
         &mut out,
         "peer",
-        &plan.pear_runtime,
+        &plan.node_path,
         &peer_args,
         Some(&plan.intercom_dir),
         &[(
@@ -35040,6 +35043,17 @@ fn resolve_pear_runtime_path() -> Result<PathBuf> {
     command_from_path("pear-runtime").context(
         "pear-runtime was not found; install Pear or set MAYHEM_PEAR_RUNTIME to the pear-runtime binary",
     )
+}
+
+fn resolve_node_path() -> Result<PathBuf> {
+    if let Ok(path) = env::var("MAYHEM_NODE_BIN") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
+        }
+    }
+    command_from_path("node")
+        .context("node was not found; install Node.js or set MAYHEM_NODE_BIN to the node binary")
 }
 
 fn windows_pear_runtime_path(app_data: &Path, aarch64: bool) -> PathBuf {
@@ -110988,7 +111002,7 @@ State initialization...
             mayhemd_path: PathBuf::from("/tmp/mayhemd"),
             mayhem_path: PathBuf::from("/tmp/mayhem"),
             paygate_path: PathBuf::from("/tmp/mayhem-paygate"),
-            pear_runtime: PathBuf::from("/tmp/pear-runtime"),
+            node_path: PathBuf::from("/tmp/node"),
             intercom_dir: PathBuf::from("/tmp/intercom"),
             paygate_internal_auth_secret_path: paygate_internal_auth_secret_path(&home),
             role: Role::Both,

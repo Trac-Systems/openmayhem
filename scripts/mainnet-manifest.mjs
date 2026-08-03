@@ -480,9 +480,9 @@ export function buildCommands(manifest) {
       'set -a',
       '. ./.mayhem-local/secrets/mayhem-live.env',
       'set +a',
-      'pear_runtime="${MAYHEM_PEAR_RUNTIME:-$HOME/Library/Application Support/pear/current/by-arch/darwin-arm64/bin/pear-runtime}"',
+      'node_bin="${MAYHEM_NODE_BIN:-node}"',
       'cd intercom',
-      `"$pear_runtime" run . --network mainnet --peer-store-name ${sh(startup.peer_store_name)} --msb-store-name ${sh(startup.msb_store_name)} --msb-bootstrap ${sh(msb.bootstrap)} --msb-channel ${sh(msb.channel)} --subnet-channel ${sh(subnet.channel)} --subnet-bootstrap ${sh(subnet.bootstrap)} --sc-bridge 1 --sc-bridge-host 127.0.0.1 --sc-bridge-port 49222 --sc-bridge-token-file "$MAYHEM_SC_BRIDGE_TOKEN_FILE" --paygate-internal-auth-secret-file "$MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE" --stripe-worker-url http://127.0.0.1:11436 --rpc 1 --rpc-host 127.0.0.1 --rpc-port 49223${peerDht ? ` --peer-dht-bootstrap ${sh(peerDht)}` : ''}${msbDht ? ` --msb-dht-bootstrap ${sh(msbDht)}` : ''}${inferenceRelays ? ` --inference-relay-peers ${sh(inferenceRelays)}` : ''}`,
+      `"$node_bin" scripts/pear-runner.mjs --network mainnet --peer-store-name ${sh(startup.peer_store_name)} --msb-store-name ${sh(startup.msb_store_name)} --msb-bootstrap ${sh(msb.bootstrap)} --msb-channel ${sh(msb.channel)} --subnet-channel ${sh(subnet.channel)} --subnet-bootstrap ${sh(subnet.bootstrap)} --sc-bridge 1 --sc-bridge-host 127.0.0.1 --sc-bridge-port 49222 --sc-bridge-token-file "$MAYHEM_SC_BRIDGE_TOKEN_FILE" --paygate-internal-auth-secret-file "$MAYHEM_PAYGATE_INTERNAL_AUTH_SECRET_FILE" --stripe-worker-url http://127.0.0.1:11436 --rpc 1 --rpc-host 127.0.0.1 --rpc-port 49223${peerDht ? ` --peer-dht-bootstrap ${sh(peerDht)}` : ''}${msbDht ? ` --msb-dht-bootstrap ${sh(msbDht)}` : ''}${inferenceRelays ? ` --inference-relay-peers ${sh(inferenceRelays)}` : ''}`,
     ],
     read_state: [
       'curl -sf http://127.0.0.1:49223/v1/health',
@@ -490,9 +490,9 @@ export function buildCommands(manifest) {
       "curl -sf 'http://127.0.0.1:49223/v1/state?prefix=catalog/&confirmed=false&limit=20'",
     ],
     select_testnet: [
-      'pear_runtime="${MAYHEM_PEAR_RUNTIME:-$HOME/Library/Application Support/pear/current/by-arch/darwin-arm64/bin/pear-runtime}"',
+      'node_bin="${MAYHEM_NODE_BIN:-node}"',
       'cd intercom',
-      '"$pear_runtime" run . --network testnet1 --msb-bootstrap <testnet-msb-bootstrap-64-hex> --msb-channel <testnet-msb-channel> --subnet-channel <testnet-subnet-channel> --subnet-bootstrap <testnet-subnet-bootstrap-64-hex>',
+      '"$node_bin" scripts/pear-runner.mjs --network testnet1 --msb-bootstrap <testnet-msb-bootstrap-64-hex> --msb-channel <testnet-msb-channel> --subnet-channel <testnet-subnet-channel> --subnet-bootstrap <testnet-subnet-bootstrap-64-hex>',
     ],
   };
 }
