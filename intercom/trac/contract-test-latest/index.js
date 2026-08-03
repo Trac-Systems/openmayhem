@@ -7,7 +7,7 @@ import { Peer, Wallet, createConfig as createPeerConfig, ENV as PEER_ENV } from 
 import { MainSettlementBus } from 'trac-msb/src/index.js';
 import { createConfig as createMsbConfig, ENV as MSB_ENV } from 'trac-msb/src/config/env.js';
 import { ensureTextCodecs } from 'trac-peer/src/textCodec.js';
-import { getPearRuntime, ensureTrailingSlash } from 'trac-peer/src/runnerArgs.js';
+import { getPearRuntime, ensureTrailingSlash, toArgMap } from 'trac-peer/src/runnerArgs.js';
 import { Terminal } from 'trac-peer/src/terminal/index.js';
 import SampleProtocol from './contract/protocol.js';
 import SampleContract from './contract/contract.js';
@@ -15,7 +15,20 @@ import { Timer } from './features/timer/index.js';
 import Sidechannel from './features/sidechannel/index.js';
 import ScBridge from './features/sc-bridge/index.js';
 
-const { env, storeLabel, flags } = getPearRuntime();
+const getIntercomRuntime = () => {
+  const runtime = getPearRuntime();
+  const bareArgv = Array.isArray(globalThis.Bare?.argv) ? globalThis.Bare.argv.slice(2) : null;
+  if (!bareArgv || bareArgv.length === 0 || (runtime.argv && runtime.argv.length > 0)) return runtime;
+  const storeLabel = bareArgv[0] && !String(bareArgv[0]).startsWith('--') ? String(bareArgv[0]) : null;
+  return {
+    ...runtime,
+    argv: bareArgv,
+    storeLabel,
+    flags: toArgMap(bareArgv.slice(storeLabel ? 1 : 0)),
+  };
+};
+
+const { env, storeLabel, flags } = getIntercomRuntime();
 
 const peerStoreNameRaw =
   (flags['peer-store-name'] && String(flags['peer-store-name'])) ||
@@ -325,6 +338,11 @@ const scBridgeDebugRaw =
   env.SC_BRIDGE_DEBUG ||
   '';
 const scBridgeDebug = parseBool(scBridgeDebugRaw, false);
+const timerEnabledRaw =
+  (flags['timer'] && String(flags['timer'])) ||
+  env.INTERCOM_TIMER ||
+  '';
+const timerEnabled = parseBool(timerEnabledRaw, false);
 
 // Optional: override DHT bootstrap nodes (host:port list) for faster local tests.
 // Note: this affects all Hyperswarm joins (subnet replication + sidechannels).
@@ -394,30 +412,45 @@ const peerConfig = createPeerConfig(PEER_ENV.MAINNET, {
   ...(peerDhtBootstrap ? { dhtBootstrap: peerDhtBootstrap } : {}),
 });
 
-const ensureKeypairFile = async (keyPairPath) => {
-  if (fs.existsSync(keyPairPath)) return;
+const loadOrCreateWallet = async (keyPairPath, walletOptions) => {
   fs.mkdirSync(path.dirname(keyPairPath), { recursive: true });
   await ensureTextCodecs();
-  const wallet = new PeerWallet();
+  const wallet = new PeerWallet(walletOptions);
   await wallet.ready;
+  if (fs.existsSync(keyPairPath)) {
+    wallet.importFromFile(keyPairPath, b4a.alloc(0));
+    return wallet;
+  }
   if (!wallet.secretKey) {
-    await wallet.generateKeyPair();
+    await wallet.generateKeyPair(null, walletOptions?.derivationPath ?? null);
+    await wallet.ready;
   }
   wallet.exportToFile(keyPairPath, b4a.alloc(0));
+  return wallet;
 };
 
-await ensureKeypairFile(msbConfig.keyPairPath);
-await ensureKeypairFile(peerConfig.keyPairPath);
+const ensureKeypairFile = async (keyPairPath, walletOptions) => {
+  if (fs.existsSync(keyPairPath)) return;
+  await loadOrCreateWallet(keyPairPath, walletOptions);
+};
+
+const walletOptions = {
+  networkPrefix: msbConfig.addressPrefix,
+  derivationPath: msbConfig.derivationPath,
+};
+
+const msbWallet = await loadOrCreateWallet(msbConfig.keyPairPath, walletOptions);
+await ensureKeypairFile(peerConfig.keyPairPath, walletOptions);
 
 console.log('=============== STARTING MSB ===============');
-const msb = new MainSettlementBus(msbConfig);
+const msb = new MainSettlementBus(msbConfig, msbWallet);
 await msb.ready();
 
 console.log('=============== STARTING PEER ===============');
 const peer = new Peer({
   config: peerConfig,
   msb,
-  wallet: new Wallet(),
+  wallet: new Wallet(walletOptions),
   protocol: SampleProtocol,
   contract: SampleContract,
 });
@@ -467,7 +500,7 @@ console.log('================================================================');
 console.log('');
 
 const admin = await peer.base.view.get('admin');
-if (admin && admin.value === peer.wallet.publicKey && peer.base.writable) {
+if (timerEnabled && admin && admin.value === peer.wallet.publicKey && peer.base.writable) {
   const timer = new Timer(peer, { update_interval: 60_000 });
   await peer.protocol.instance.addFeature('timer', timer);
   timer.start().catch((err) => console.error('Timer feature stopped:', err?.message ?? err));
@@ -534,24 +567,64 @@ const sidechannel = new Sidechannel(peer, {
 });
 peer.sidechannel = sidechannel;
 
+let terminalReadline = null;
+let shutdownStarted = false;
+let resolveLifetime = null;
+const lifetime = new Promise((resolve) => {
+  resolveLifetime = resolve;
+});
+const shutdown = async () => {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  try {
+    terminalReadline?.close?.();
+  } catch (_e) {}
+  try {
+    scBridge?.stop?.();
+  } catch (_e) {}
+  try {
+    await sidechannel.stop?.();
+  } catch (_e) {}
+  try {
+    await peer.close?.();
+  } catch (_e) {}
+  try {
+    await msb.close?.();
+  } catch (_e) {}
+  resolveLifetime?.();
+  if (typeof Bare !== 'undefined' && Bare.exit) Bare.exit(0);
+};
+
+if (typeof Pear !== 'undefined' && Pear.teardown) Pear.teardown(shutdown);
+if (typeof process !== 'undefined' && process.once) {
+  for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) {
+    process.once(signal, () => {
+      void shutdown();
+    });
+  }
+}
+
 if (scBridge) {
   scBridge.attachSidechannel(sidechannel);
   try {
     scBridge.start();
   } catch (err) {
     console.error('SC-Bridge failed to start:', err?.message ?? err);
+    await shutdown();
+    throw err;
   }
   peer.scBridge = scBridge;
 }
 
-sidechannel
-  .start()
-  .then(() => {
-    console.log('Sidechannel: ready');
-  })
-  .catch((err) => {
-    console.error('Sidechannel failed to start:', err?.message ?? err);
-  });
+try {
+  await sidechannel.start();
+  console.log('Sidechannel: ready');
+} catch (err) {
+  console.error('Sidechannel failed to start:', err?.message ?? err);
+  await shutdown();
+  throw err;
+}
 
 const terminal = new Terminal(peer);
-await terminal.start();
+terminalReadline = await terminal.start();
+await lifetime;
