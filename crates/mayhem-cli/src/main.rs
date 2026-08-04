@@ -4183,9 +4183,21 @@ struct AdminPartsOnboardArgs {
     #[arg(long = "row-index", default_value_t = 1)]
     row_index: usize,
 
-    /// Downloaded payload file to hash and seal into the finalized record.
+    /// Existing payload file to hash and seal into the finalized record.
     #[arg(long, value_name = "PATH")]
-    payload: PathBuf,
+    payload: Option<PathBuf>,
+
+    /// Directory for downloading the draft's source when --payload is not passed.
+    #[arg(long = "download-dir", value_name = "PATH")]
+    download_dir: Option<PathBuf>,
+
+    /// Bearer token file for authenticated source downloads.
+    #[arg(long = "source-token-file", value_name = "PATH")]
+    source_token_file: Option<PathBuf>,
+
+    /// Minimum free-space reserve to keep after source download.
+    #[arg(long = "disk-reserve")]
+    disk_reserve: Option<String>,
 
     /// Output finalized Comfy part record JSON.
     #[arg(long, value_name = "PATH")]
@@ -24888,6 +24900,8 @@ struct AdminPartsOnboardReport {
     input: String,
     row_index: u64,
     payload: String,
+    payload_source: String,
+    download_source_url: Option<String>,
     output: String,
     output_reused_existing: bool,
     part_id: String,
@@ -25040,13 +25054,18 @@ fn read_comfy_part_yaml_rows(path: &Path) -> Result<Vec<Value>> {
 
 fn admin_parts_onboard(args: &AdminPartsOnboardArgs) -> Result<()> {
     let input = absolutize(args.input.clone())?;
-    let payload = absolutize(args.payload.clone())?;
+    let payload = args.payload.clone().map(absolutize).transpose()?;
+    let download_dir = args.download_dir.clone().map(absolutize).transpose()?;
+    let source_token_file = args.source_token_file.clone().map(absolutize).transpose()?;
     let output = absolutize(args.output.clone())?;
     let license_doc = args.license_doc.clone().map(absolutize).transpose()?;
     let report = admin_parts_onboard_report(AdminPartsOnboardInput {
         input,
         row_index: args.row_index,
         payload,
+        download_dir,
+        source_token_file,
+        disk_reserve: args.disk_reserve.clone(),
         output,
         min_runtime: args.min_runtime.clone(),
         license_doc,
@@ -25066,6 +25085,7 @@ fn admin_parts_onboard(args: &AdminPartsOnboardArgs) -> Result<()> {
         println!("Comfy part record finalized.");
         println!("Part: {}", report.part_id);
         println!("Record hash: {}", report.record_hash);
+        println!("Payload source: {}", report.payload_source);
         println!("Payload SHA-256: {}", report.sha256);
         println!("Payload BLAKE3 root: {}", report.blake3_root);
         println!("Output: {}", report.output);
@@ -25079,7 +25099,10 @@ fn admin_parts_onboard(args: &AdminPartsOnboardArgs) -> Result<()> {
 struct AdminPartsOnboardInput {
     input: PathBuf,
     row_index: usize,
-    payload: PathBuf,
+    payload: Option<PathBuf>,
+    download_dir: Option<PathBuf>,
+    source_token_file: Option<PathBuf>,
+    disk_reserve: Option<String>,
     output: PathBuf,
     min_runtime: String,
     license_doc: Option<PathBuf>,
@@ -25119,12 +25142,14 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
     );
 
     let (draft, row_index) = read_comfy_part_draft_input(&input.input, input.row_index)?;
-    let payload_metadata = fs::metadata(&input.payload)
-        .with_context(|| format!("inspecting payload {}", input.payload.display()))?;
+    let (payload_path, payload_source, download_source_url) =
+        admin_parts_resolve_payload(&input, &draft)?;
+    let payload_metadata = fs::metadata(&payload_path)
+        .with_context(|| format!("inspecting payload {}", payload_path.display()))?;
     ensure!(
         payload_metadata.is_file(),
         "--payload must be a regular file: {}",
-        input.payload.display()
+        payload_path.display()
     );
     ensure!(
         payload_metadata.len() == draft.size_bytes,
@@ -25133,7 +25158,7 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
         draft.size_bytes,
         payload_metadata.len()
     );
-    let sha256 = file_sha256_hex(&input.payload)?;
+    let sha256 = file_sha256_hex(&payload_path)?;
     ensure!(
         sha256.eq_ignore_ascii_case(&draft.sha256),
         "payload SHA-256 mismatch for {}: draft expects {}, payload hashes to {}",
@@ -25141,7 +25166,7 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
         draft.sha256,
         sha256
     );
-    let merkle = build_merkle_manifest(&input.payload, input.chunk_size)?;
+    let merkle = build_merkle_manifest(&payload_path, input.chunk_size)?;
     let license_doc_hash = comfy_part_license_doc_hash(
         input.license_doc.as_deref(),
         input.license_doc_hash.as_deref(),
@@ -25176,7 +25201,9 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
         ok: true,
         input: input.input.display().to_string(),
         row_index: row_index as u64,
-        payload: input.payload.display().to_string(),
+        payload: payload_path.display().to_string(),
+        payload_source,
+        download_source_url,
         output: input.output.display().to_string(),
         output_reused_existing,
         part_id: record.part_id,
@@ -25193,6 +25220,302 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
             max_distance_bps: input.canary_max_distance_bps,
         },
     })
+}
+
+fn admin_parts_resolve_payload(
+    input: &AdminPartsOnboardInput,
+    draft: &mayhem_proto::ComfyPartDraft,
+) -> Result<(PathBuf, String, Option<String>)> {
+    match (&input.payload, &input.download_dir) {
+        (Some(_), Some(_)) => bail!("pass only one of --payload or --download-dir"),
+        (Some(path), None) => Ok((path.clone(), "provided".to_owned(), None)),
+        (None, Some(download_dir)) => {
+            let (path, source_url) = admin_parts_download_payload_from_sources(
+                draft,
+                download_dir,
+                input.source_token_file.as_deref(),
+                input.disk_reserve.as_deref(),
+            )?;
+            Ok((path, "download".to_owned(), Some(source_url)))
+        }
+        (None, None) => bail!("pass --payload or --download-dir"),
+    }
+}
+
+fn admin_parts_download_payload_from_sources(
+    draft: &mayhem_proto::ComfyPartDraft,
+    download_dir: &Path,
+    source_token_file: Option<&Path>,
+    disk_reserve: Option<&str>,
+) -> Result<(PathBuf, String)> {
+    fs::create_dir_all(download_dir)
+        .with_context(|| format!("creating {}", download_dir.display()))?;
+    let mut attempted = false;
+    let mut failures = Vec::new();
+    for source in draft
+        .sources
+        .mirrors
+        .iter()
+        .chain(draft.sources.origins.iter())
+    {
+        attempted = true;
+        let destination = admin_comfy_part_download_path(download_dir, draft, source);
+        match admin_comfy_part_download_source(
+            source,
+            draft.sources.require_auth,
+            &destination,
+            draft,
+            source_token_file,
+            disk_reserve,
+        ) {
+            Ok(()) => return Ok((destination, source.url.clone())),
+            Err(error) => failures.push(format!("{}: {error:#}", source.url)),
+        }
+    }
+    if attempted {
+        bail!(
+            "all Comfy part sources failed for {}: {}",
+            draft.name,
+            failures.join("; ")
+        );
+    }
+    bail!("Comfy part draft {} has no source URLs", draft.name)
+}
+
+fn admin_comfy_part_download_path(
+    download_dir: &Path,
+    draft: &mayhem_proto::ComfyPartDraft,
+    source: &mayhem_proto::ComfyPartSource,
+) -> PathBuf {
+    download_dir.join(admin_comfy_part_source_filename(draft, source))
+}
+
+fn admin_comfy_part_source_filename(
+    draft: &mayhem_proto::ComfyPartDraft,
+    source: &mayhem_proto::ComfyPartSource,
+) -> String {
+    if let Some(path) = source.path.as_deref() {
+        if let Some(name) = Path::new(path).file_name().and_then(|name| name.to_str()) {
+            let name = safe_path_component(name);
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    if let Ok(url) = reqwest::Url::parse(&source.url) {
+        if let Some(name) = url
+            .path_segments()
+            .and_then(|segments| segments.rev().find(|segment| !segment.is_empty()))
+        {
+            let name = safe_path_component(name);
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    let part_id = mayhem_proto::derive_comfy_part_id(&draft.part_type, &draft.name, &draft.sha256);
+    format!(
+        "{}-sha-{}.{}",
+        safe_path_component(&part_id),
+        safe_path_component(&draft.sha256[..16]),
+        safe_path_component(&draft.file_format)
+    )
+}
+
+fn admin_comfy_part_download_source(
+    source: &mayhem_proto::ComfyPartSource,
+    require_auth: bool,
+    destination: &Path,
+    draft: &mayhem_proto::ComfyPartDraft,
+    source_token_file: Option<&Path>,
+    disk_reserve: Option<&str>,
+) -> Result<()> {
+    let parsed = reqwest::Url::parse(&source.url)
+        .with_context(|| format!("parsing Comfy part source URL {}", source.url))?;
+    ensure!(
+        parsed.scheme() == "https",
+        "Comfy part source URLs must be HTTPS"
+    );
+    if admin_comfy_part_payload_matches(destination, draft)? {
+        return Ok(());
+    }
+    if destination.exists() {
+        bail!(
+            "existing download destination {} does not match the draft SHA/size; remove it or choose another --download-dir",
+            destination.display()
+        );
+    }
+    let token = admin_comfy_part_source_token(source, require_auth, source_token_file)?;
+    provider_comfy_part_disk_preflight(destination, draft.size_bytes, disk_reserve)?;
+    let parent = destination
+        .parent()
+        .context("Comfy part download destination has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let part_path = provider_download_partial_path(destination);
+    let mut partial_bytes = fs::metadata(&part_path)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if partial_bytes > draft.size_bytes {
+        fs::remove_file(&part_path)
+            .with_context(|| format!("removing oversized partial {}", part_path.display()))?;
+        partial_bytes = 0;
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(format!("openmayhem/{}", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .context("building Comfy part download client")?;
+    let mut append = partial_bytes > 0;
+    let mut request = client.get(parsed);
+    if append {
+        request = request.header(reqwest::header::RANGE, format!("bytes={partial_bytes}-"));
+    }
+    if let Some(token) = token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+
+    let mut response = request
+        .send()
+        .with_context(|| format!("downloading Comfy part source {}", source.url))?;
+    match response.status() {
+        reqwest::StatusCode::PARTIAL_CONTENT if append => {}
+        reqwest::StatusCode::OK => {
+            if append {
+                fs::remove_file(&part_path).with_context(|| {
+                    format!(
+                        "removing partial {} after source ignored range request",
+                        part_path.display()
+                    )
+                })?;
+                partial_bytes = 0;
+                append = false;
+            }
+        }
+        reqwest::StatusCode::RANGE_NOT_SATISFIABLE if append => {
+            fs::remove_file(&part_path).with_context(|| {
+                format!("removing rejected partial download {}", part_path.display())
+            })?;
+            bail!("source rejected the resume range; partial was reset, retry onboarding");
+        }
+        status => bail!("source returned HTTP status {status}"),
+    }
+    if let Some(content_length) = response.content_length() {
+        let expected_remaining = draft.size_bytes.saturating_sub(partial_bytes);
+        ensure!(
+            content_length <= expected_remaining,
+            "source response is too large for {}: got at least {}, expected at most {} remaining bytes",
+            draft.name,
+            content_length,
+            expected_remaining
+        );
+    }
+
+    let mut output = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(&part_path)
+        .with_context(|| format!("opening partial download {}", part_path.display()))?;
+    let mut written = partial_bytes;
+    let mut buffer = [0u8; 1024 * 128];
+    loop {
+        let read = response
+            .read(&mut buffer)
+            .with_context(|| format!("reading Comfy part source {}", source.url))?;
+        if read == 0 {
+            break;
+        }
+        written = written
+            .checked_add(u64::try_from(read).context("download chunk length overflowed")?)
+            .context("download size overflowed")?;
+        if written > draft.size_bytes {
+            let _ = fs::remove_file(&part_path);
+            bail!(
+                "downloaded Comfy part {} exceeded expected size {}",
+                draft.name,
+                draft.size_bytes
+            );
+        }
+        output
+            .write_all(&buffer[..read])
+            .with_context(|| format!("writing {}", part_path.display()))?;
+    }
+    output
+        .sync_all()
+        .with_context(|| format!("syncing {}", part_path.display()))?;
+    ensure!(
+        written == draft.size_bytes,
+        "downloaded Comfy part {} is incomplete: got {}, expected {} bytes",
+        draft.name,
+        written,
+        draft.size_bytes
+    );
+    if !admin_comfy_part_payload_matches(&part_path, draft)? {
+        let _ = fs::remove_file(&part_path);
+        bail!(
+            "downloaded Comfy part {} failed SHA-256 verification",
+            draft.name
+        );
+    }
+    fs::rename(&part_path, destination).with_context(|| {
+        format!(
+            "installing verified Comfy part payload at {}",
+            destination.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn admin_comfy_part_payload_matches(
+    path: &Path,
+    draft: &mayhem_proto::ComfyPartDraft,
+) -> Result<bool> {
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(false);
+    };
+    if !metadata.is_file() || metadata.len() != draft.size_bytes {
+        return Ok(false);
+    }
+    Ok(file_sha256_hex(path)?.eq_ignore_ascii_case(&draft.sha256))
+}
+
+fn admin_comfy_part_source_token(
+    source: &mayhem_proto::ComfyPartSource,
+    require_auth: bool,
+    source_token_file: Option<&Path>,
+) -> Result<Option<String>> {
+    if source.kind.eq_ignore_ascii_case("huggingface") {
+        let token = read_optional_token(source_token_file)?;
+        if require_auth && token.is_none() {
+            bail!(
+                "Comfy part source {} requires Hugging Face auth; pass --source-token-file or set HF_TOKEN",
+                source.url
+            );
+        }
+        return Ok(token);
+    }
+    let token = if let Some(path) = source_token_file {
+        Some(
+            fs::read_to_string(path)
+                .with_context(|| format!("reading source token file {}", path.display()))?
+                .trim()
+                .to_owned(),
+        )
+        .filter(|value| !value.is_empty())
+    } else {
+        None
+    };
+    if require_auth && token.is_none() {
+        bail!(
+            "Comfy part source {} requires auth; pass --source-token-file",
+            source.url
+        );
+    }
+    Ok(token)
 }
 
 fn read_comfy_part_draft_input(
@@ -87278,7 +87601,10 @@ mod tests {
         };
         assert_eq!(args.input, PathBuf::from("row.yaml"));
         assert_eq!(args.row_index, 2);
-        assert_eq!(args.payload, PathBuf::from("payload.bin"));
+        assert_eq!(args.payload, Some(PathBuf::from("payload.bin")));
+        assert_eq!(args.download_dir, None);
+        assert_eq!(args.source_token_file, None);
+        assert_eq!(args.disk_reserve, None);
         assert_eq!(args.output, PathBuf::from("record.json"));
         assert_eq!(args.min_runtime, "comfyui-v0.30.1");
         assert_eq!(args.license_doc_hash, Some("11".repeat(32)));
@@ -87426,7 +87752,10 @@ mod tests {
         let report = admin_parts_onboard_report(AdminPartsOnboardInput {
             input: input_path.clone(),
             row_index: 2,
-            payload: payload_path.clone(),
+            payload: Some(payload_path.clone()),
+            download_dir: None,
+            source_token_file: None,
+            disk_reserve: None,
             output: output_path.clone(),
             min_runtime: "comfyui-v0.30.1".to_owned(),
             license_doc: Some(license_path.clone()),
@@ -87447,6 +87776,8 @@ mod tests {
         assert_eq!(report.row_index, 2);
         assert_eq!(report.sha256, sha256);
         assert_eq!(report.size_bytes, size_bytes);
+        assert_eq!(report.payload_source, "provided");
+        assert_eq!(report.download_source_url, None);
         assert_eq!(
             report.license_doc_hash,
             file_sha256_hex(&license_path).unwrap()
@@ -87464,7 +87795,10 @@ mod tests {
         let idempotent = admin_parts_onboard_report(AdminPartsOnboardInput {
             input: input_path,
             row_index: 2,
-            payload: payload_path,
+            payload: Some(payload_path),
+            download_dir: None,
+            source_token_file: None,
+            disk_reserve: None,
             output: output_path,
             min_runtime: "comfyui-v0.30.1".to_owned(),
             license_doc: Some(license_path),
@@ -87480,6 +87814,124 @@ mod tests {
         })
         .unwrap();
         assert!(idempotent.output_reused_existing);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn admin_parts_onboard_reuses_verified_download_dir_payload() {
+        let temp = test_temp_dir("mayhem-admin-parts-onboard-download-dir");
+        let download_dir = temp.join("downloads");
+        fs::create_dir_all(&download_dir).unwrap();
+        let payload_path = download_dir.join("downloaded.bin");
+        fs::write(&payload_path, b"download-dir payload").unwrap();
+        let sha256 = file_sha256_hex(&payload_path).unwrap();
+        let size_bytes = fs::metadata(&payload_path).unwrap().len();
+        let input_path = temp.join("part.yaml");
+        fs::write(
+            &input_path,
+            format!(
+                r#"
+name: "downloaded payload"
+type: upscaler
+lane: all
+license: MIT
+file_format: bin
+sha256: "{sha256}"
+size_bytes: {size_bytes}
+download_url: "https://huggingface.co/TracNetwork/openmayhem-parts/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/downloaded.bin"
+status: linked
+"#
+            ),
+        )
+        .unwrap();
+
+        let report = admin_parts_onboard_report(AdminPartsOnboardInput {
+            input: input_path,
+            row_index: 1,
+            payload: None,
+            download_dir: Some(download_dir),
+            source_token_file: None,
+            disk_reserve: None,
+            output: temp.join("record.json"),
+            min_runtime: "comfyui-v0.30.1".to_owned(),
+            license_doc: None,
+            license_doc_hash: Some("33".repeat(32)),
+            license_ref: "license:test".to_owned(),
+            license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
+            canary_graph_hash: "44".repeat(32),
+            canary_output_ref: "canaries/test.png".to_owned(),
+            canary_tolerance_method: "phash".to_owned(),
+            canary_max_distance_bps: 10,
+            chunk_size: 8,
+            force: false,
+        })
+        .unwrap();
+
+        assert!(report.ok);
+        assert_eq!(report.payload_source, "download");
+        assert_eq!(
+            report.download_source_url.as_deref(),
+            Some("https://huggingface.co/TracNetwork/openmayhem-parts/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/downloaded.bin")
+        );
+        assert_eq!(report.payload, payload_path.display().to_string());
+        assert_eq!(report.sha256, sha256);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn admin_parts_onboard_rejects_payload_and_download_dir_together() {
+        let temp = test_temp_dir("mayhem-admin-parts-onboard-source-conflict");
+        fs::create_dir_all(&temp).unwrap();
+        let payload_path = temp.join("payload.bin");
+        fs::write(&payload_path, b"payload").unwrap();
+        let sha256 = file_sha256_hex(&payload_path).unwrap();
+        let size_bytes = fs::metadata(&payload_path).unwrap().len();
+        let input_path = temp.join("part.yaml");
+        fs::write(
+            &input_path,
+            format!(
+                r#"
+name: "source conflict"
+type: upscaler
+lane: all
+license: MIT
+file_format: bin
+sha256: "{sha256}"
+size_bytes: {size_bytes}
+download_url: "https://huggingface.co/TracNetwork/openmayhem-parts/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/payload.bin"
+status: linked
+"#
+            ),
+        )
+        .unwrap();
+
+        let err = admin_parts_onboard_report(AdminPartsOnboardInput {
+            input: input_path,
+            row_index: 1,
+            payload: Some(payload_path),
+            download_dir: Some(temp.join("downloads")),
+            source_token_file: None,
+            disk_reserve: None,
+            output: temp.join("record.json"),
+            min_runtime: "comfyui-v0.30.1".to_owned(),
+            license_doc: None,
+            license_doc_hash: Some("33".repeat(32)),
+            license_ref: "license:test".to_owned(),
+            license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
+            canary_graph_hash: "44".repeat(32),
+            canary_output_ref: "canaries/test.png".to_owned(),
+            canary_tolerance_method: "phash".to_owned(),
+            canary_max_distance_bps: 10,
+            chunk_size: 8,
+            force: false,
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("pass only one of --payload or --download-dir"),
+            "{err:#}"
+        );
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -87513,7 +87965,10 @@ status: linked
         let err = admin_parts_onboard_report(AdminPartsOnboardInput {
             input: input_path,
             row_index: 1,
-            payload: payload_path,
+            payload: Some(payload_path),
+            download_dir: None,
+            source_token_file: None,
+            disk_reserve: None,
             output: temp.join("record.json"),
             min_runtime: "comfyui-v0.30.1".to_owned(),
             license_doc: None,
@@ -87566,7 +88021,10 @@ status: linked
         let report = admin_parts_onboard_report(AdminPartsOnboardInput {
             input: input_path,
             row_index: 1,
-            payload: payload_path,
+            payload: Some(payload_path),
+            download_dir: None,
+            source_token_file: None,
+            disk_reserve: None,
             output: temp.join("record.json"),
             min_runtime: "comfyui-v0.30.1".to_owned(),
             license_doc: None,
