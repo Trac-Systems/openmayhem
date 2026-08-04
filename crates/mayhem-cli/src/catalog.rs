@@ -146,6 +146,8 @@ pub(crate) struct CatalogModel {
     pub(crate) speciality_assessment: CatalogSpecialityAssessment,
     #[serde(default)]
     pub(crate) sampling: CatalogSamplingProfile,
+    #[serde(default)]
+    pub(crate) workflow: Option<mayhem_proto::ComfyWorkflowCatalogPolicy>,
     pub(crate) canary: CanaryRef,
     pub(crate) price_ref_au: PriceRef,
 }
@@ -948,6 +950,7 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
     validate_model_caps_modalities(model, errors);
     validate_model_modality_assessment(model, errors);
     validate_model_adapter(model, errors);
+    validate_comfy_workflow_policy(model, errors);
     validate_chatterbox_endpoint_surface(model, errors);
     validate_stable_diffusion_endpoint_ranges(model, errors);
     validate_model_specialities(model, errors);
@@ -1013,6 +1016,59 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
         ));
     }
     validate_price_ref(model, errors);
+}
+
+fn validate_comfy_workflow_policy(model: &CatalogModel, errors: &mut Vec<String>) {
+    let has_comfy_endpoint = model
+        .adapter
+        .endpoint_families
+        .iter()
+        .any(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS);
+    match (&model.workflow, has_comfy_endpoint) {
+        (Some(policy), true) => {
+            if let Err(err) = policy.derivation_policy() {
+                errors.push(format!(
+                    "{} workflow policy is invalid: {err}",
+                    model.model_id
+                ));
+            }
+            if let Some(runtime_id) = policy.runtime_id.as_deref() {
+                if runtime_id.trim().is_empty() {
+                    errors.push(format!(
+                        "{} workflow.runtime_id must not be empty",
+                        model.model_id
+                    ));
+                }
+            }
+            if let Some(outcome_class) = policy.outcome_class.as_deref() {
+                if outcome_class.trim().is_empty() {
+                    errors.push(format!(
+                        "{} workflow.outcome_class must not be empty",
+                        model.model_id
+                    ));
+                }
+            }
+            if let Some(inventory_root) = policy.inventory_root.as_deref() {
+                if !is_hex_len(inventory_root, 64) {
+                    errors.push(format!(
+                        "{} workflow.inventory_root must be a 32-byte hex digest",
+                        model.model_id
+                    ));
+                }
+            }
+        }
+        (None, true) => errors.push(format!(
+            "{} endpoint family {} requires signed workflow policy",
+            model.model_id,
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
+        )),
+        (Some(_), false) => errors.push(format!(
+            "{} declares workflow policy without endpoint family {}",
+            model.model_id,
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
+        )),
+        (None, false) => {}
+    }
 }
 
 fn model_targets_newer_app(model: &CatalogModel) -> bool {
@@ -3452,6 +3508,7 @@ fn valid_endpoint_family(family: &str) -> bool {
             | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
             | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
             | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+            | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
     )
 }
 
@@ -3550,10 +3607,13 @@ fn endpoint_family_allowed_for_model(model: &CatalogModel, family: &str) -> bool
             family,
             mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS
                 | mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE
+                | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
         ),
         MODEL_CLASS_VIDEO_GENERATION => matches!(
             family,
-            mayhem_proto::ENDPOINT_OPENAI_VIDEOS | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS
+                | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+                | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
         ),
         MODEL_CLASS_TTS => matches!(
             family,
@@ -3568,12 +3628,14 @@ fn endpoint_family_allowed_for_model(model: &CatalogModel, family: &str) -> bool
             family,
             mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
                 | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+                | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
         ),
         MODEL_CLASS_MUSIC_GENERATION => matches!(
             family,
             mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
                 | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
                 | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+                | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
         ),
         _ => false,
     }
@@ -6283,6 +6345,7 @@ mod tests {
                 ..CatalogSpecialityAssessment::default()
             },
             sampling: CatalogSamplingProfile::default(),
+            workflow: None,
             canary: CanaryRef {
                 set_id: "canary-launch-v1".to_owned(),
                 match_min: 0.9,
@@ -7537,6 +7600,7 @@ mod tests {
                 ..CatalogSpecialityAssessment::default()
             },
             sampling: CatalogSamplingProfile::default(),
+            workflow: None,
             canary,
             price_ref_au: PriceRef {
                 denom: "au_usd".to_owned(),

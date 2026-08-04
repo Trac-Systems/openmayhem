@@ -31,6 +31,105 @@ pub struct ComfyWorkflowPartRef {
     pub sha256: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComfyWorkflowCatalogPolicy {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub whitelisted_nodes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parts: Vec<ComfyWorkflowPartRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_nodes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_width: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_height: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_frames: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_artifacts: Option<u64>,
+}
+
+impl ComfyWorkflowCatalogPolicy {
+    pub fn derivation_policy(
+        &self,
+    ) -> Result<ComfyWorkflowDerivationPolicy, ComfyWorkflowDerivationError> {
+        if self.whitelisted_nodes.is_empty() {
+            return Err(ComfyWorkflowDerivationError::InvalidPolicy(
+                "node whitelist is empty".to_owned(),
+            ));
+        }
+        let mut whitelisted_nodes = BTreeSet::new();
+        for node in &self.whitelisted_nodes {
+            let node = node.trim();
+            if node.is_empty() {
+                return Err(ComfyWorkflowDerivationError::InvalidPolicy(
+                    "node whitelist contains an empty class".to_owned(),
+                ));
+            }
+            if !whitelisted_nodes.insert(node.to_owned()) {
+                return Err(ComfyWorkflowDerivationError::InvalidPolicy(format!(
+                    "duplicate whitelisted node {node}"
+                )));
+            }
+        }
+        let mut parts_by_name = BTreeMap::new();
+        for part in &self.parts {
+            if part.name.trim().is_empty() {
+                return Err(ComfyWorkflowDerivationError::InvalidPolicy(
+                    "part name is empty".to_owned(),
+                ));
+            }
+            if parts_by_name
+                .insert(part.name.clone(), part.clone())
+                .is_some()
+            {
+                return Err(ComfyWorkflowDerivationError::InvalidPolicy(format!(
+                    "duplicate part name {}",
+                    part.name
+                )));
+            }
+        }
+        let defaults = ComfyWorkflowDerivationPolicy::default();
+        Ok(ComfyWorkflowDerivationPolicy {
+            whitelisted_nodes,
+            parts_by_name,
+            max_nodes: self.max_nodes.unwrap_or(defaults.max_nodes).max(1),
+            max_width: self.max_width.unwrap_or(defaults.max_width).max(1),
+            max_height: self.max_height.unwrap_or(defaults.max_height).max(1),
+            max_frames: self.max_frames.unwrap_or(defaults.max_frames).max(1),
+            max_duration_seconds: self
+                .max_duration_seconds
+                .unwrap_or(defaults.max_duration_seconds)
+                .max(1),
+            max_steps: self.max_steps.unwrap_or(defaults.max_steps).max(1),
+            max_artifacts: self.max_artifacts.unwrap_or(defaults.max_artifacts).max(1),
+        })
+    }
+
+    pub fn runtime_id(&self) -> &str {
+        self.runtime_id
+            .as_deref()
+            .unwrap_or(DEFAULT_COMFY_WORKFLOW_RUNTIME_ID)
+    }
+
+    pub fn outcome_class_for(&self, output_modality: &str) -> String {
+        self.outcome_class
+            .clone()
+            .unwrap_or_else(|| format!("{output_modality}.workflow"))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComfyWorkflowDerivationPolicy {
     pub whitelisted_nodes: BTreeSet<String>,
@@ -89,6 +188,7 @@ pub struct ComfyWorkflowDerivation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ComfyWorkflowDerivationError {
+    InvalidPolicy(String),
     InvalidGraph(String),
     NonWhitelistedNode(String),
     MissingPart(String),
@@ -99,6 +199,7 @@ pub enum ComfyWorkflowDerivationError {
 impl fmt::Display for ComfyWorkflowDerivationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidPolicy(reason) => write!(f, "invalid Comfy workflow policy: {reason}"),
             Self::InvalidGraph(reason) => write!(f, "invalid Comfy workflow graph: {reason}"),
             Self::NonWhitelistedNode(node) => {
                 write!(f, "Comfy workflow node class {node} is not whitelisted")
@@ -567,6 +668,42 @@ mod tests {
         assert_eq!(
             err,
             ComfyWorkflowDerivationError::NonWhitelistedNode("ShellExec".to_owned())
+        );
+    }
+
+    #[test]
+    fn catalog_policy_builds_bounded_derivation_policy() {
+        let policy = ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec![
+                "CheckpointLoaderSimple".to_owned(),
+                "KSampler".to_owned(),
+                "EmptyLatentImage".to_owned(),
+                "VAEDecode".to_owned(),
+                "SaveImage".to_owned(),
+            ],
+            parts: vec![ComfyWorkflowPartRef {
+                part_id: "11".repeat(32),
+                name: "sdxl.safetensors".to_owned(),
+                part_type: "checkpoint".to_owned(),
+                sha256: "22".repeat(32),
+            }],
+            runtime_id: Some("comfyui-v0.31.0".to_owned()),
+            outcome_class: Some("image.light.512".to_owned()),
+            inventory_root: Some("33".repeat(32)),
+            max_width: Some(512),
+            ..ComfyWorkflowCatalogPolicy::default()
+        };
+
+        let derived_policy = policy.derivation_policy().unwrap();
+        let mut graph = image_graph();
+        graph["5"]["inputs"]["width"] = json!(768);
+        let err = derive_comfy_workflow(&graph, &derived_policy).unwrap_err();
+
+        assert_eq!(policy.runtime_id(), "comfyui-v0.31.0");
+        assert_eq!(policy.outcome_class_for("image"), "image.light.512");
+        assert_eq!(
+            err,
+            ComfyWorkflowDerivationError::OutcomeOverflow("width exceeds 512".to_owned())
         );
     }
 

@@ -739,6 +739,8 @@ pub struct MayhemModelInfo {
     pub sampling: SamplingProfile,
     #[serde(default, skip_serializing_if = "GatewayFailoverPolicyConfig::is_empty")]
     pub failover: GatewayFailoverPolicyConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<mayhem_proto::ComfyWorkflowCatalogPolicy>,
     pub source: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kyb_identities: Vec<ProviderKybInfo>,
@@ -4163,6 +4165,7 @@ impl GatewayState {
                 speciality_calibrations: BTreeMap::new(),
                 sampling: SamplingProfile::default(),
                 failover: GatewayFailoverPolicyConfig::default(),
+                workflow: None,
                 source: "local-fixture".to_owned(),
                 kyb_identities: Vec::new(),
                 markets: Vec::new(),
@@ -8950,11 +8953,13 @@ async fn execute_artifact_generation_endpoint(
         &raw_request,
     )?;
     let normalized = prepared.normalized;
-    let request = artifact_generation_request(
+    let model = require_model(state, &model_id)?;
+    let request = artifact_generation_request_with_workflow_policy(
         &model_id,
         endpoint_family,
         normalized.clone(),
         prepared.video,
+        model.mayhem.workflow.as_ref(),
     )?;
     let mut options = state.request_options_from_headers(headers)?;
     options.access_token = access_token;
@@ -10039,6 +10044,22 @@ fn artifact_generation_request(
     raw_request: Value,
     video: VideoRequestPreparation,
 ) -> Result<ArtifactGenerationRequest, ApiError> {
+    artifact_generation_request_with_workflow_policy(
+        model_id,
+        endpoint_family,
+        raw_request,
+        video,
+        None,
+    )
+}
+
+fn artifact_generation_request_with_workflow_policy(
+    model_id: &str,
+    endpoint_family: &str,
+    raw_request: Value,
+    video: VideoRequestPreparation,
+    workflow_policy: Option<&mayhem_proto::ComfyWorkflowCatalogPolicy>,
+) -> Result<ArtifactGenerationRequest, ApiError> {
     let inline_audio = artifact_generation_inline_audio_load(&raw_request).map_err(|error| {
         ApiError::bad_request(
             format!("invalid inline artifact-generation audio: {error}"),
@@ -10191,11 +10212,10 @@ fn artifact_generation_request(
             let workflow_graph = raw_request.get("workflow").ok_or_else(|| {
                 ApiError::bad_request("workflow request is missing workflow", Some("workflow"))
             })?;
-            let derivation = mayhem_proto::derive_comfy_workflow(
-                workflow_graph,
-                &gateway_comfy_workflow_derivation_policy(),
-            )
-            .map_err(|err| ApiError::bad_request(err.to_string(), Some("workflow")))?;
+            let policy = gateway_comfy_workflow_derivation_policy(workflow_policy)
+                .map_err(|err| ApiError::bad_request(err.to_string(), Some("workflow")))?;
+            let derivation = mayhem_proto::derive_comfy_workflow(workflow_graph, &policy)
+                .map_err(|err| ApiError::bad_request(err.to_string(), Some("workflow")))?;
             let output_modality = if derivation
                 .outcome_spec
                 .output_modalities
@@ -10216,13 +10236,21 @@ fn artifact_generation_request(
             let runtime_id = raw_request
                 .get("runtime_id")
                 .and_then(Value::as_str)
-                .unwrap_or(mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID)
+                .unwrap_or_else(|| {
+                    workflow_policy
+                        .map(|policy| policy.runtime_id())
+                        .unwrap_or(mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID)
+                })
                 .to_owned();
             let outcome_class = raw_request
                 .get("outcome_class")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
-                .unwrap_or_else(|| format!("{output_modality}.workflow"));
+                .unwrap_or_else(|| {
+                    workflow_policy
+                        .map(|policy| policy.outcome_class_for(output_modality))
+                        .unwrap_or_else(|| format!("{output_modality}.workflow"))
+                });
             let binding = WorkflowBinding {
                 endpoint_family: mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS.to_owned(),
                 graph_hash: derivation.graph_hash,
@@ -10313,8 +10341,14 @@ fn artifact_generation_request(
     })
 }
 
-fn gateway_comfy_workflow_derivation_policy() -> mayhem_proto::ComfyWorkflowDerivationPolicy {
-    mayhem_proto::ComfyWorkflowDerivationPolicy {
+fn gateway_comfy_workflow_derivation_policy(
+    workflow_policy: Option<&mayhem_proto::ComfyWorkflowCatalogPolicy>,
+) -> Result<mayhem_proto::ComfyWorkflowDerivationPolicy, mayhem_proto::ComfyWorkflowDerivationError>
+{
+    if let Some(policy) = workflow_policy {
+        return policy.derivation_policy();
+    }
+    Ok(mayhem_proto::ComfyWorkflowDerivationPolicy {
         whitelisted_nodes: [
             "EmptyImage",
             "EmptyLatentImage",
@@ -10327,7 +10361,7 @@ fn gateway_comfy_workflow_derivation_policy() -> mayhem_proto::ComfyWorkflowDeri
         .map(str::to_owned)
         .collect::<BTreeSet<_>>(),
         ..mayhem_proto::ComfyWorkflowDerivationPolicy::default()
-    }
+    })
 }
 
 fn artifact_generation_request_value<'a>(
@@ -25721,7 +25755,11 @@ fn request_requirements_for_artifact_generation(
             .map(|workflow| WorkflowRouteRequirements {
                 runtime_id: workflow.runtime_id.clone(),
                 outcome_class: workflow.outcome_class.clone(),
-                inventory_root: None,
+                inventory_root: model
+                    .mayhem
+                    .workflow
+                    .as_ref()
+                    .and_then(|policy| policy.inventory_root.clone()),
             }),
         modality_load,
         // Artifact endpoints bound prompt size through their calibrated endpoint
@@ -32722,12 +32760,23 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
             speciality_calibrations: speciality_calibrations_from_catalog_value(model),
             sampling: sampling_profile_from_catalog_value(model),
             failover: failover_policy_from_catalog_value(model),
+            workflow: comfy_workflow_policy_from_catalog_value(model),
             source: "catalog".to_owned(),
             kyb_identities: Vec::new(),
             markets: Vec::new(),
             route_candidates: Vec::new(),
         },
     })
+}
+
+fn comfy_workflow_policy_from_catalog_value(
+    model: &Value,
+) -> Option<mayhem_proto::ComfyWorkflowCatalogPolicy> {
+    model
+        .get("workflow")
+        .or_else(|| model.get("comfy_workflow"))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
 }
 
 fn sampling_profile_from_catalog_value(model: &Value) -> SamplingProfile {
@@ -37935,6 +37984,7 @@ mod tests {
                 speciality_calibrations: BTreeMap::new(),
                 sampling: SamplingProfile::default(),
                 failover: GatewayFailoverPolicyConfig::default(),
+                workflow: None,
                 source: "test".to_owned(),
                 kyb_identities: Vec::new(),
                 markets: Vec::new(),
@@ -43513,6 +43563,97 @@ mod tests {
         let image_load = requirements.modality_load.get("image").unwrap();
         assert_eq!(image_load.item_count, 2);
         assert_eq!(image_load.max_item_units, 512 * 512);
+    }
+
+    #[test]
+    fn comfy_workflow_request_uses_catalog_policy_defaults_and_parts() {
+        let graph = json!({
+            "1": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": { "ckpt_name": "tiny.safetensors" }
+            },
+            "2": {
+                "class_type": "EmptyLatentImage",
+                "inputs": { "width": 384, "height": 384, "batch_size": 1 }
+            },
+            "3": {
+                "class_type": "SaveImage",
+                "inputs": { "images": ["2", 0] }
+            }
+        });
+        let policy = mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec![
+                "CheckpointLoaderSimple".to_owned(),
+                "EmptyLatentImage".to_owned(),
+                "SaveImage".to_owned(),
+            ],
+            parts: vec![mayhem_proto::ComfyWorkflowPartRef {
+                part_id: "11".repeat(32),
+                name: "tiny.safetensors".to_owned(),
+                part_type: "checkpoint".to_owned(),
+                sha256: "22".repeat(32),
+            }],
+            runtime_id: Some("comfyui-v0.31.0".to_owned()),
+            outcome_class: Some("image.custom.384".to_owned()),
+            inventory_root: Some("33".repeat(32)),
+            max_width: Some(512),
+            max_height: Some(512),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        };
+        let request = artifact_generation_request_with_workflow_policy(
+            "mayhem/comfy-test",
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            json!({
+                "model": "mayhem/comfy-test",
+                "workflow": graph,
+                "response_format": "artifact"
+            }),
+            VideoRequestPreparation::default(),
+            Some(&policy),
+        )
+        .unwrap();
+
+        let workflow = request.workflow.as_ref().expect("workflow binding");
+        assert_eq!(workflow.runtime_id, "comfyui-v0.31.0");
+        assert_eq!(workflow.outcome_class, "image.custom.384");
+        let mut model = test_model();
+        model.mayhem.workflow = Some(policy.clone());
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let requirements =
+            request_requirements_for_artifact_generation(&state, &model, &request, 1, None, None);
+        assert_eq!(
+            requirements.workflow,
+            Some(WorkflowRouteRequirements {
+                runtime_id: "comfyui-v0.31.0".to_owned(),
+                outcome_class: "image.custom.384".to_owned(),
+                inventory_root: Some("33".repeat(32)),
+            })
+        );
+
+        let missing_part = artifact_generation_request_with_workflow_policy(
+            "mayhem/comfy-test",
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            json!({
+                "model": "mayhem/comfy-test",
+                "workflow": {
+                    "1": {
+                        "class_type": "CheckpointLoaderSimple",
+                        "inputs": { "ckpt_name": "missing.safetensors" }
+                    },
+                    "2": {
+                        "class_type": "SaveImage",
+                        "inputs": { "images": ["1", 0] }
+                    }
+                },
+                "response_format": "artifact"
+            }),
+            VideoRequestPreparation::default(),
+            Some(&policy),
+        )
+        .unwrap_err();
+        assert!(missing_part
+            .message
+            .contains("requires unknown part missing.safetensors"));
     }
 
     #[test]

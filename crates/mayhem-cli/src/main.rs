@@ -17278,6 +17278,7 @@ fn catalog_endpoint_calibration_execute(
                     Some(&model.model_id),
                     &model.adapter,
                     &model.sampling,
+                    model.workflow.as_ref(),
                     &sealed,
                     None,
                     Some(ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS),
@@ -17307,6 +17308,7 @@ fn catalog_endpoint_calibration_execute(
                 Some(&model.model_id),
                 &model.adapter,
                 &model.sampling,
+                model.workflow.as_ref(),
                 &sealed,
                 None,
                 Some(ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS),
@@ -55969,6 +55971,7 @@ struct ProviderSessionTerms {
     model_id: String,
     adapter: catalog::CatalogAdapter,
     sampling: catalog::CatalogSamplingProfile,
+    workflow_policy: Option<mayhem_proto::ComfyWorkflowCatalogPolicy>,
     output_modalities: Vec<String>,
     served_modalities: Vec<String>,
     served_specialities: BTreeMap<String, Vec<String>>,
@@ -56104,6 +56107,7 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
             Some(&terms.model_id),
             &terms.adapter,
             &terms.sampling,
+            terms.workflow_policy.as_ref(),
             body,
             None,
             cancellation,
@@ -56122,6 +56126,7 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
             Some(&terms.model_id),
             &terms.adapter,
             &terms.sampling,
+            terms.workflow_policy.as_ref(),
             body,
             stream,
             cancellation,
@@ -65664,6 +65669,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                 speciality_calibrations: BTreeMap::new(),
                 sampling: SamplingProfile::default(),
                 failover: mayhem_gateway::openai::GatewayFailoverPolicyConfig::default(),
+                workflow: None,
                 source: "contract".to_owned(),
                 kyb_identities,
                 markets,
@@ -72876,8 +72882,10 @@ fn validate_provider_session_request_modalities(
         )));
     }
     if let Some(expected_workflow) = active.workflow.as_ref() {
-        let actual_workflow =
-            provider_session_request_result(provider_comfy_workflow_binding(verified.request))?;
+        let actual_workflow = provider_session_request_result(provider_comfy_workflow_binding(
+            verified.request,
+            terms.workflow_policy.as_ref(),
+        ))?;
         if &actual_workflow != expected_workflow {
             return Err(provider_session_request_error(
                 "workflow graph derivation does not match signed voucher binding",
@@ -72889,6 +72897,7 @@ fn validate_provider_session_request_modalities(
         verified.family,
         verified.request,
         body,
+        terms.workflow_policy.as_ref(),
         &terms.output_modalities,
     )?;
     let actual = provider_session_request_modalities(
@@ -72987,6 +72996,7 @@ fn provider_session_modality_load(
     family: &str,
     body: &Value,
     transport_body: &Value,
+    workflow_policy: Option<&mayhem_proto::ComfyWorkflowCatalogPolicy>,
     output_modalities: &[String],
 ) -> Result<BTreeMap<String, ModalityRequestLoad>> {
     match provider_endpoint_transport_kind(family)? {
@@ -73179,8 +73189,9 @@ fn provider_session_modality_load(
             )]))
         }
         "workflow_generation" => {
-            let workflow_output =
-                provider_session_request_result(provider_session_workflow_output(transport_body))?;
+            let workflow_output = provider_session_request_result(
+                provider_session_workflow_output(transport_body, workflow_policy),
+            )?;
             let artifact_count = workflow_output
                 .metrics
                 .get("artifact_count")
@@ -76316,7 +76327,10 @@ fn provider_session_receipt_for_usage_attribution(
         "provider receipt exceeds the signed incremental spend maximum"
     );
     let workflow_output = if active.workflow.is_some() {
-        Some(provider_session_workflow_output(body)?)
+        Some(provider_session_workflow_output(
+            body,
+            terms.workflow_policy.as_ref(),
+        )?)
     } else {
         None
     };
@@ -76398,7 +76412,10 @@ fn provider_session_au_owed(
     )
 }
 
-fn provider_session_workflow_output(body: &Value) -> Result<WorkflowOutputBinding> {
+fn provider_session_workflow_output(
+    body: &Value,
+    workflow_policy: Option<&mayhem_proto::ComfyWorkflowCatalogPolicy>,
+) -> Result<WorkflowOutputBinding> {
     if let Some(value) = body
         .get("mayhem_contract")
         .and_then(|contract| contract.get("workflow_output"))
@@ -76412,7 +76429,7 @@ fn provider_session_workflow_output(body: &Value) -> Result<WorkflowOutputBindin
         .context("workflow session missing workflow output binding and workflow graph")?;
     let derivation = mayhem_proto::derive_comfy_workflow(
         workflow_graph,
-        &provider_comfy_workflow_derivation_policy(),
+        &provider_comfy_workflow_derivation_policy(workflow_policy)?,
     )
     .map_err(anyhow::Error::msg)?;
     Ok(derivation.workflow_output)
@@ -79285,6 +79302,7 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         model_id: ctx.selected.enclave.model_id.clone(),
         adapter: ctx.selected.model.adapter.clone(),
         sampling: ctx.selected.model.sampling.clone(),
+        workflow_policy: ctx.selected.model.workflow.clone(),
         output_modalities: if ctx.selected.model.caps.output_modalities.is_empty() {
             ctx.selected
                 .model
@@ -80878,8 +80896,13 @@ fn provider_local_endpoint_family(kind: &str) -> &'static str {
     }
 }
 
-fn provider_comfy_workflow_derivation_policy() -> mayhem_proto::ComfyWorkflowDerivationPolicy {
-    mayhem_proto::ComfyWorkflowDerivationPolicy {
+fn provider_comfy_workflow_derivation_policy(
+    workflow_policy: Option<&mayhem_proto::ComfyWorkflowCatalogPolicy>,
+) -> Result<mayhem_proto::ComfyWorkflowDerivationPolicy> {
+    if let Some(policy) = workflow_policy {
+        return policy.derivation_policy().map_err(anyhow::Error::msg);
+    }
+    Ok(mayhem_proto::ComfyWorkflowDerivationPolicy {
         whitelisted_nodes: [
             "EmptyImage",
             "EmptyLatentImage",
@@ -80892,16 +80915,19 @@ fn provider_comfy_workflow_derivation_policy() -> mayhem_proto::ComfyWorkflowDer
         .map(str::to_owned)
         .collect::<BTreeSet<_>>(),
         ..mayhem_proto::ComfyWorkflowDerivationPolicy::default()
-    }
+    })
 }
 
-fn provider_comfy_workflow_binding(body: &Value) -> Result<WorkflowBinding> {
+fn provider_comfy_workflow_binding(
+    body: &Value,
+    workflow_policy: Option<&mayhem_proto::ComfyWorkflowCatalogPolicy>,
+) -> Result<WorkflowBinding> {
     let workflow_graph = body
         .get("workflow")
         .context("workflow request is missing workflow")?;
     let derivation = mayhem_proto::derive_comfy_workflow(
         workflow_graph,
-        &provider_comfy_workflow_derivation_policy(),
+        &provider_comfy_workflow_derivation_policy(workflow_policy)?,
     )
     .map_err(anyhow::Error::msg)?;
     let output_modality = derivation
@@ -80924,13 +80950,21 @@ fn provider_comfy_workflow_binding(body: &Value) -> Result<WorkflowBinding> {
         runtime_id: body
             .get("runtime_id")
             .and_then(Value::as_str)
-            .unwrap_or("comfyui-v0.30.1")
+            .unwrap_or_else(|| {
+                workflow_policy
+                    .map(|policy| policy.runtime_id())
+                    .unwrap_or(mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID)
+            })
             .to_owned(),
         outcome_class: body
             .get("outcome_class")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .unwrap_or_else(|| format!("{output_modality}.workflow")),
+            .unwrap_or_else(|| {
+                workflow_policy
+                    .map(|policy| policy.outcome_class_for(output_modality))
+                    .unwrap_or_else(|| format!("{output_modality}.workflow"))
+            }),
         quoted_usage: derivation.quoted_usage,
     })
 }
@@ -81102,6 +81136,7 @@ fn provider_engine_session_response(
         None,
         &adapter,
         &catalog::CatalogSamplingProfile::default(),
+        None,
         &sealed,
         live_stream,
         &CancellationToken::new(),
@@ -81113,6 +81148,7 @@ fn provider_engine_session_response_with_sampling(
     expected_model_id: Option<&str>,
     adapter: &catalog::CatalogAdapter,
     sampling: &catalog::CatalogSamplingProfile,
+    workflow_policy: Option<&mayhem_proto::ComfyWorkflowCatalogPolicy>,
     body: &Value,
     live_stream: Option<&mut ProviderSessionLiveStream<'_>>,
     cancellation: &CancellationToken,
@@ -81122,6 +81158,7 @@ fn provider_engine_session_response_with_sampling(
         expected_model_id,
         adapter,
         sampling,
+        workflow_policy,
         body,
         live_stream,
         None,
@@ -81172,6 +81209,7 @@ fn provider_engine_session_response_with_sampling_bounded(
     expected_model_id: Option<&str>,
     adapter: &catalog::CatalogAdapter,
     sampling: &catalog::CatalogSamplingProfile,
+    workflow_policy: Option<&mayhem_proto::ComfyWorkflowCatalogPolicy>,
     body: &Value,
     mut live_stream: Option<&mut ProviderSessionLiveStream<'_>>,
     output_token_cap: Option<u32>,
@@ -81390,10 +81428,14 @@ fn provider_engine_session_response_with_sampling_bounded(
             .get("workflow")
             .cloned()
             .context("workflow request is missing workflow")?;
-        let workflow =
-            provider_session_request_result(provider_comfy_workflow_binding(request_body))?;
-        let workflow_output =
-            provider_session_request_result(provider_session_workflow_output(body))?;
+        let workflow = provider_session_request_result(provider_comfy_workflow_binding(
+            request_body,
+            workflow_policy,
+        ))?;
+        let workflow_output = provider_session_request_result(provider_session_workflow_output(
+            body,
+            workflow_policy,
+        ))?;
         let expected_artifacts = workflow_output
             .metrics
             .get("artifact_count")
@@ -100853,6 +100895,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             Some("test/model"),
             &adapter,
             &catalog::CatalogSamplingProfile::default(),
+            None,
             &sealed,
             None,
             &CancellationToken::new(),
@@ -100866,6 +100909,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             Some("test/model"),
             &adapter,
             &catalog::CatalogSamplingProfile::default(),
+            None,
             &sealed,
             None,
             Some(ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS),
@@ -100915,6 +100959,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 Some(&model.model_id),
                 &model.adapter,
                 &model.sampling,
+                model.workflow.as_ref(),
                 &sealed,
                 None,
                 &CancellationToken::new(),
@@ -102007,7 +102052,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let terms = test_provider_comfy_session_terms();
         let sealed = provider_test_seal_contract_request(&body, &terms.adapter).unwrap();
         let mut active = test_active_provider_session(&terms, vec!["image".to_owned()]);
-        active.workflow = Some(provider_comfy_workflow_binding(&body).unwrap());
+        active.workflow = Some(provider_comfy_workflow_binding(&body, None).unwrap());
 
         let measured =
             validate_provider_session_request_modalities(&active, &terms, &sealed).unwrap();
@@ -102022,6 +102067,55 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .to_string()
             .contains("workflow graph derivation does not match signed voucher binding"));
         assert_eq!(provider_response_error_code(&error), "request_invalid");
+    }
+
+    #[test]
+    fn provider_workflow_validator_uses_catalog_policy() {
+        let mut terms = test_provider_comfy_session_terms();
+        terms.workflow_policy = Some(test_provider_comfy_workflow_policy());
+        let body = json!({
+            "endpoint_family": mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            "model": "test/model@4bit",
+            "workflow": {
+                "1": {
+                    "class_type": "CheckpointLoaderSimple",
+                    "inputs": { "ckpt_name": "tiny.safetensors" }
+                },
+                "2": {
+                    "class_type": "EmptyLatentImage",
+                    "inputs": { "width": 384, "height": 384, "batch_size": 1 }
+                },
+                "3": {
+                    "class_type": "SaveImage",
+                    "inputs": { "images": ["2", 0] }
+                }
+            },
+            "response_format": "artifact"
+        });
+        let sealed = provider_test_seal_contract_request(&body, &terms.adapter).unwrap();
+        let mut active = test_active_provider_session(&terms, vec!["image".to_owned()]);
+        active.workflow =
+            Some(provider_comfy_workflow_binding(&body, terms.workflow_policy.as_ref()).unwrap());
+
+        let measured =
+            validate_provider_session_request_modalities(&active, &terms, &sealed).unwrap();
+
+        assert_eq!(measured, BTreeMap::from([("image".to_owned(), 1)]));
+        assert_eq!(
+            active.workflow.as_ref().unwrap().runtime_id,
+            "comfyui-v0.31.0"
+        );
+        assert_eq!(
+            active.workflow.as_ref().unwrap().outcome_class,
+            "image.custom.384"
+        );
+
+        let mut hostile = body.clone();
+        hostile["workflow"]["666"] = json!({"class_type": "ShellExec", "inputs": {}});
+        let sealed_hostile = provider_test_seal_contract_request(&hostile, &terms.adapter).unwrap();
+        let error = validate_provider_session_request_modalities(&active, &terms, &sealed_hostile)
+            .expect_err("provider must reject nodes outside the signed workflow policy");
+        assert!(error.to_string().contains("ShellExec"));
     }
 
     #[test]
@@ -102343,6 +102437,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             Some(&model.model_id),
             adapter,
             &model.sampling,
+            model.workflow.as_ref(),
             &sealed,
             None,
             &CancellationToken::new(),
@@ -103057,6 +103152,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
             &body,
             &json!({"kind": "video_generation"}),
+            None,
             &["video".to_owned(), "audio".to_owned()],
         )
         .expect("video admission load");
@@ -103278,6 +103374,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
             &body,
             &json!({"kind": "music_generation"}),
+            None,
             &[],
         )
         .unwrap();
@@ -103341,6 +103438,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
             &body,
             &json!({"kind": "music_generation"}),
+            None,
             &[],
         )
         .unwrap();
@@ -114975,6 +115073,7 @@ State initialization...
             model_id: "test/model@4bit".to_owned(),
             adapter: catalog::CatalogAdapter::default(),
             sampling: catalog::CatalogSamplingProfile::default(),
+            workflow_policy: None,
             output_modalities: vec!["text".to_owned()],
             served_modalities: vec!["text".to_owned()],
             served_specialities: BTreeMap::new(),
@@ -115061,6 +115160,28 @@ State initialization...
             granularity: 1,
         }];
         terms
+    }
+
+    fn test_provider_comfy_workflow_policy() -> mayhem_proto::ComfyWorkflowCatalogPolicy {
+        mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec![
+                "CheckpointLoaderSimple".to_owned(),
+                "EmptyLatentImage".to_owned(),
+                "SaveImage".to_owned(),
+            ],
+            parts: vec![mayhem_proto::ComfyWorkflowPartRef {
+                part_id: "11".repeat(32),
+                name: "tiny.safetensors".to_owned(),
+                part_type: "checkpoint".to_owned(),
+                sha256: "22".repeat(32),
+            }],
+            runtime_id: Some("comfyui-v0.31.0".to_owned()),
+            outcome_class: Some("image.custom.384".to_owned()),
+            inventory_root: Some("33".repeat(32)),
+            max_width: Some(512),
+            max_height: Some(512),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        }
     }
 
     fn test_provider_comfy_workflow_request(width: u64) -> Value {
@@ -117317,6 +117438,7 @@ State initialization...
                     ..catalog::CatalogSpecialityAssessment::default()
                 },
                 sampling: catalog::CatalogSamplingProfile::default(),
+                workflow: None,
                 canary: catalog::CanaryRef {
                     set_id: "test-canary".to_owned(),
                     match_min: 0.9,

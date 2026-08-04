@@ -7028,6 +7028,7 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
             speciality_calibrations: BTreeMap::new(),
             sampling: SamplingProfile::default(),
             failover: mayhem_gateway::openai::GatewayFailoverPolicyConfig::default(),
+            workflow: None,
             source: "contract".to_owned(),
             kyb_identities: Vec::new(),
             markets: Vec::new(),
