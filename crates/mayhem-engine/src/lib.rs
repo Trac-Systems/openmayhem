@@ -9890,6 +9890,115 @@ mod tests {
         let _ = std::fs::remove_dir_all(cache);
     }
 
+    #[cfg(feature = "comfyui")]
+    #[test]
+    #[ignore = "requires MAYHEM_COMFYUI_REAL_RUNTIME, MAYHEM_COMFYUI_PYTHON, and MAYHEM_COMFYUI_REAL_UPSCALER"]
+    fn comfyui_real_runtime_upscale_workflow_stable() {
+        let runtime = std::env::var_os("MAYHEM_COMFYUI_REAL_RUNTIME")
+            .map(PathBuf::from)
+            .expect("MAYHEM_COMFYUI_REAL_RUNTIME must point at a ComfyUI checkout");
+        let upscaler = std::env::var_os("MAYHEM_COMFYUI_REAL_UPSCALER")
+            .map(PathBuf::from)
+            .expect("MAYHEM_COMFYUI_REAL_UPSCALER must point at a verified upscaler file");
+        let upscaler_name = upscaler
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("upscaler path must have a UTF-8 file name")
+            .to_owned();
+        let cache = std::env::temp_dir().join(format!(
+            "mayhem-engine-test-{}-{}",
+            std::process::id(),
+            "comfyui-upscale"
+        ));
+        let model_dir = cache.join("base").join("models").join("upscale_models");
+        std::fs::create_dir_all(&model_dir).expect("create ComfyUI upscaler model dir");
+        std::fs::copy(&upscaler, model_dir.join(&upscaler_name))
+            .expect("copy verified upscaler into isolated ComfyUI base dir");
+
+        let mut config = LoadConfig::comfyui_runtime(runtime);
+        config.backend_cache_dir = Some(cache.clone());
+        let mut backend = ComfyUiBackend::new();
+        backend.load(config).expect("load sandboxed ComfyUI");
+        assert!(backend.component_healthy());
+
+        let workflow = json!({
+            "1": {
+                "class_type": "EmptyImage",
+                "inputs": {"width": 16, "height": 16, "batch_size": 1, "color": 4482645}
+            },
+            "2": {
+                "class_type": "UpscaleModelLoader",
+                "inputs": {"model_name": upscaler_name}
+            },
+            "3": {
+                "class_type": "ImageUpscaleWithModel",
+                "inputs": {"upscale_model": ["2", 0], "image": ["1", 0]}
+            },
+            "4": {
+                "class_type": "SaveImage",
+                "inputs": {"images": ["3", 0], "filename_prefix": "mayhem-comfyui-upscale"}
+            }
+        });
+
+        let first = run_real_comfy_workflow_collect(&mut backend, workflow.clone()).0;
+        let second = run_real_comfy_workflow_collect(&mut backend, workflow).0;
+        assert_eq!(png_dimensions(&first), Some((64, 64)));
+        assert_eq!(png_dimensions(&second), Some((64, 64)));
+        assert_eq!(
+            Sha256::digest(&first)[..],
+            Sha256::digest(&second)[..],
+            "ComfyUI upscale output must be hash-stable per box"
+        );
+
+        if let Some(output_dir) = std::env::var_os("MAYHEM_COMFYUI_REAL_OUTPUT_DIR") {
+            let output_dir = PathBuf::from(output_dir);
+            std::fs::create_dir_all(&output_dir).expect("create ComfyUI test output dir");
+            let label =
+                std::env::var("MAYHEM_COMFYUI_REAL_LABEL").unwrap_or_else(|_| "local".to_owned());
+            std::fs::write(
+                output_dir.join(format!("comfy-upscale-{label}.png")),
+                &first,
+            )
+            .expect("write ComfyUI upscale proof output");
+        }
+
+        drop(backend);
+        let _ = std::fs::remove_dir_all(cache);
+    }
+
+    #[cfg(feature = "comfyui")]
+    fn run_real_comfy_workflow_collect(
+        backend: &mut ComfyUiBackend,
+        workflow: Value,
+    ) -> (Vec<u8>, WorkflowGenerationOutput) {
+        let mut chunks = Vec::new();
+        let output = backend
+            .run_workflow(
+                WorkflowGenerationRequest::new(workflow),
+                &mut |chunk: ArtifactChunk| {
+                    chunks.extend_from_slice(&chunk.bytes);
+                    Ok(())
+                },
+                &CancellationToken::new(),
+            )
+            .expect("run workflow");
+        assert_eq!(output.artifact_count, 1);
+        assert!(chunks.starts_with(b"\x89PNG\r\n\x1a\n"));
+        (chunks, output)
+    }
+
+    #[cfg(feature = "comfyui")]
+    fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+        if bytes.len() < 24 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") || &bytes[12..16] != b"IHDR"
+        {
+            return None;
+        }
+        Some((
+            u32::from_be_bytes(bytes[16..20].try_into().ok()?),
+            u32::from_be_bytes(bytes[20..24].try_into().ok()?),
+        ))
+    }
+
     #[test]
     fn speciality_reasoning_detection_ignores_history_preservation_controls() {
         for (name, worker) in [
