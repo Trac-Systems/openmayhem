@@ -779,6 +779,8 @@ enum AdminPartsCommands {
     ValidateYaml(AdminPartsValidateYamlArgs),
     /// Finalize one Comfy part draft into a verified record JSON.
     Onboard(AdminPartsOnboardArgs),
+    /// Add a verified mirror source to a finalized Comfy part record.
+    AddMirror(AdminPartsAddMirrorArgs),
     /// Build a machine-pullable Comfy parts index from finalized part records.
     BuildIndex(AdminPartsBuildIndexArgs),
     /// Verify a built parts-index layout and print Hugging Face upload commands.
@@ -4340,6 +4342,49 @@ struct AdminPartsUploadPlanArgs {
     hf_token_file: Option<PathBuf>,
 
     /// Print a machine-readable upload plan.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct AdminPartsAddMirrorArgs {
+    /// Existing finalized Comfy part record JSON.
+    #[arg(long = "record", value_name = "PATH")]
+    record: PathBuf,
+
+    /// Already-downloaded payload bytes for this record. Rechecked before the mirror is added.
+    #[arg(long = "payload", value_name = "PATH")]
+    payload: PathBuf,
+
+    /// Output record path. May be the same as --record when --force is passed.
+    #[arg(long = "output", value_name = "PATH")]
+    output: PathBuf,
+
+    /// Mirror URL to add to sources.mirrors.
+    #[arg(long = "mirror-url")]
+    mirror_url: String,
+
+    /// Mirror source kind.
+    #[arg(long = "mirror-kind", default_value = "huggingface")]
+    mirror_kind: String,
+
+    /// Optional Hugging Face repository identifier for this mirror.
+    #[arg(long = "mirror-repository")]
+    mirror_repository: Option<String>,
+
+    /// Optional path inside the mirror repository.
+    #[arg(long = "mirror-path")]
+    mirror_path: Option<String>,
+
+    /// Optional immutable mirror revision.
+    #[arg(long = "mirror-revision")]
+    mirror_revision: Option<String>,
+
+    /// Overwrite an existing different output record.
+    #[arg(long)]
+    force: bool,
+
+    /// Print a machine-readable report.
     #[arg(long)]
     json: bool,
 }
@@ -24982,6 +25027,21 @@ struct AdminPartsOnboardBatchReport {
 }
 
 #[derive(Debug, Serialize)]
+struct AdminPartsAddMirrorReport {
+    ok: bool,
+    input: String,
+    payload: String,
+    output: String,
+    output_reused_existing: bool,
+    part_id: String,
+    record_hash: String,
+    sha256: String,
+    size_bytes: u64,
+    mirror: mayhem_proto::ComfyPartSource,
+    mirror_count: u64,
+}
+
+#[derive(Debug, Serialize)]
 struct AdminPartsUploadPlanReport {
     ok: bool,
     layout_dir: String,
@@ -25012,6 +25072,7 @@ async fn admin_parts(command: &AdminPartsCommands) -> Result<()> {
     match command {
         AdminPartsCommands::ValidateYaml(args) => admin_parts_validate_yaml(args),
         AdminPartsCommands::Onboard(args) => admin_parts_onboard(args),
+        AdminPartsCommands::AddMirror(args) => admin_parts_add_mirror(args),
         AdminPartsCommands::BuildIndex(args) => admin_parts_build_index(args),
         AdminPartsCommands::UploadPlan(args) => admin_parts_upload_plan(args),
     }
@@ -25586,6 +25647,117 @@ fn write_admin_parts_onboard_receipt(
     let path = receipt_dir.join(format!("{}.receipt.json", report.part_id));
     write_json_file(&path, report)
         .with_context(|| format!("writing Comfy part onboarding receipt {}", path.display()))
+}
+
+fn admin_parts_add_mirror(args: &AdminPartsAddMirrorArgs) -> Result<()> {
+    let record_path = absolutize(args.record.clone())?;
+    let payload = absolutize(args.payload.clone())?;
+    let output = absolutize(args.output.clone())?;
+    let mirror = mayhem_proto::ComfyPartSource {
+        kind: args.mirror_kind.clone(),
+        url: args.mirror_url.clone(),
+        repository: args.mirror_repository.clone(),
+        path: args.mirror_path.clone(),
+        revision: args.mirror_revision.clone(),
+    };
+    let report = admin_parts_add_mirror_report(record_path, payload, output, mirror, args.force)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Added mirror for Comfy part {} into {}.",
+            report.part_id, report.output
+        );
+    }
+    Ok(())
+}
+
+fn admin_parts_add_mirror_report(
+    record_path: PathBuf,
+    payload: PathBuf,
+    output: PathBuf,
+    mirror: mayhem_proto::ComfyPartSource,
+    force: bool,
+) -> Result<AdminPartsAddMirrorReport> {
+    let mut record: mayhem_proto::ComfyPartRecord =
+        serde_json::from_value(read_json_file(&record_path)?)
+            .with_context(|| format!("parsing Comfy part record {}", record_path.display()))?;
+    record
+        .validate()
+        .with_context(|| format!("validating Comfy part record {}", record_path.display()))?;
+    ensure_comfy_record_payload_matches(&record, &payload)?;
+    record.sources.mirrors.iter().try_for_each(|existing| {
+        if existing.url == mirror.url && existing != &mirror {
+            bail!(
+                "mirror URL {} already exists with different metadata",
+                mirror.url
+            );
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+    if !record
+        .sources
+        .mirrors
+        .iter()
+        .any(|existing| existing == &mirror)
+    {
+        record.sources.mirrors.push(mirror.clone());
+        record
+            .sources
+            .mirrors
+            .sort_by(|left, right| left.url.cmp(&right.url));
+    }
+    record
+        .validate()
+        .context("validating Comfy part record after adding mirror")?;
+    let record_hash = mayhem_proto::comfy_part_record_hash(&record)
+        .context("hashing Comfy part record after adding mirror")?;
+    let output_reused_existing = write_comfy_part_record_idempotent(&output, &record, force)?;
+    Ok(AdminPartsAddMirrorReport {
+        ok: true,
+        input: record_path.display().to_string(),
+        payload: payload.display().to_string(),
+        output: output.display().to_string(),
+        output_reused_existing,
+        part_id: record.part_id,
+        record_hash,
+        sha256: record.sha256,
+        size_bytes: record.size_bytes,
+        mirror,
+        mirror_count: record.sources.mirrors.len() as u64,
+    })
+}
+
+fn ensure_comfy_record_payload_matches(
+    record: &mayhem_proto::ComfyPartRecord,
+    payload: &Path,
+) -> Result<()> {
+    let metadata = fs::metadata(payload)
+        .with_context(|| format!("reading payload metadata {}", payload.display()))?;
+    ensure!(
+        metadata.is_file(),
+        "payload {} must be a regular file",
+        payload.display()
+    );
+    ensure!(
+        metadata.len() == record.size_bytes,
+        "payload {} size mismatch for {}: got {}, expected {}",
+        payload.display(),
+        record.part_id,
+        metadata.len(),
+        record.size_bytes
+    );
+    let actual = file_sha256_hex(payload)
+        .with_context(|| format!("hashing payload {}", payload.display()))?;
+    ensure!(
+        actual.eq_ignore_ascii_case(&record.sha256),
+        "payload {} SHA-256 mismatch for {}: got {}, expected {}",
+        payload.display(),
+        record.part_id,
+        actual,
+        record.sha256
+    );
+    Ok(())
 }
 
 fn admin_parts_onboard_step(step: &str, fields: &[(&str, String)]) -> AdminPartsOnboardStepReport {
@@ -88736,6 +88908,56 @@ mod tests {
     }
 
     #[test]
+    fn admin_parts_add_mirror_cli_parses_without_tx_flags() {
+        let parsed = Cli::try_parse_from([
+            "mayhem",
+            "admin",
+            "parts",
+            "add-mirror",
+            "--record",
+            "record.json",
+            "--payload",
+            "payload.safetensors",
+            "--output",
+            "record.mirrored.json",
+            "--mirror-url",
+            "https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/abc/parts/model.safetensors",
+            "--mirror-kind",
+            "huggingface",
+            "--mirror-repository",
+            "TracNetwork/openmayhem-parts-index",
+            "--mirror-path",
+            "parts/model.safetensors",
+            "--mirror-revision",
+            "abc",
+            "--force",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Admin { command } = parsed.command else {
+            panic!("expected admin command");
+        };
+        let AdminCommands::Parts { command } = *command else {
+            panic!("expected admin parts command");
+        };
+        let AdminPartsCommands::AddMirror(args) = command else {
+            panic!("expected admin parts add-mirror command");
+        };
+        assert_eq!(args.record, PathBuf::from("record.json"));
+        assert_eq!(args.payload, PathBuf::from("payload.safetensors"));
+        assert_eq!(args.output, PathBuf::from("record.mirrored.json"));
+        assert_eq!(args.mirror_kind, "huggingface");
+        assert_eq!(
+            args.mirror_repository.as_deref(),
+            Some("TracNetwork/openmayhem-parts-index")
+        );
+        assert_eq!(args.mirror_path.as_deref(), Some("parts/model.safetensors"));
+        assert_eq!(args.mirror_revision.as_deref(), Some("abc"));
+        assert!(args.force);
+        assert!(args.json);
+    }
+
+    #[test]
     fn admin_parts_yaml_import_reports_importable_and_skipped_rows() {
         let rows = yaml_serde::from_str::<Value>(
             r#"
@@ -89561,6 +89783,80 @@ status: linked
         let cache_path = provider_comfy_part_cache_path(&cache_dir, &record);
         assert!(cache_path.exists());
         assert!(provider_comfy_part_payload_matches(&cache_path, &record, 8).unwrap());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn admin_parts_add_mirror_updates_record_after_payload_verification() {
+        let temp = test_temp_dir("mayhem-admin-parts-add-mirror");
+        fs::create_dir_all(&temp).unwrap();
+        let payload_path = temp.join("payload.bin");
+        fs::write(&payload_path, b"openmayhem mirrored part payload").unwrap();
+        let record = test_comfy_part_record_for_payload("mirrored part", &payload_path, 8);
+        let record_path = temp.join("record.json");
+        let output_path = temp.join("record-mirrored.json");
+        write_json_file(&record_path, &record).unwrap();
+        let mirror = mayhem_proto::ComfyPartSource {
+            kind: "huggingface".to_owned(),
+            url: "https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/parts/mirrored.bin".to_owned(),
+            repository: Some("TracNetwork/openmayhem-parts-index".to_owned()),
+            path: Some("parts/mirrored.bin".to_owned()),
+            revision: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+        };
+
+        let report = admin_parts_add_mirror_report(
+            record_path,
+            payload_path,
+            output_path.clone(),
+            mirror.clone(),
+            false,
+        )
+        .unwrap();
+
+        assert!(report.ok);
+        assert_eq!(report.part_id, record.part_id);
+        assert_eq!(report.mirror, mirror);
+        assert_eq!(report.mirror_count, record.sources.mirrors.len() as u64 + 1);
+        let updated: mayhem_proto::ComfyPartRecord =
+            serde_json::from_value(read_json_file(&output_path).unwrap()).unwrap();
+        assert!(updated
+            .sources
+            .mirrors
+            .iter()
+            .any(|source| source == &mirror));
+        updated.validate().unwrap();
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn admin_parts_add_mirror_rejects_payload_mismatch() {
+        let temp = test_temp_dir("mayhem-admin-parts-add-mirror-mismatch");
+        fs::create_dir_all(&temp).unwrap();
+        let payload_path = temp.join("payload.bin");
+        let bad_payload_path = temp.join("bad-payload.bin");
+        fs::write(&payload_path, b"openmayhem mirrored part payload").unwrap();
+        fs::write(&bad_payload_path, b"wrong").unwrap();
+        let record = test_comfy_part_record_for_payload("mirrored mismatch", &payload_path, 8);
+        let record_path = temp.join("record.json");
+        write_json_file(&record_path, &record).unwrap();
+        let mirror = mayhem_proto::ComfyPartSource {
+            kind: "huggingface".to_owned(),
+            url: "https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/parts/mismatch.bin".to_owned(),
+            repository: Some("TracNetwork/openmayhem-parts-index".to_owned()),
+            path: Some("parts/mismatch.bin".to_owned()),
+            revision: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+        };
+
+        let err = admin_parts_add_mirror_report(
+            record_path,
+            bad_payload_path,
+            temp.join("record-mirrored.json"),
+            mirror,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("size mismatch"), "{err:#}");
         let _ = fs::remove_dir_all(temp);
     }
 
