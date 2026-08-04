@@ -12,6 +12,7 @@ path = "src/lib.rs"
 default = ["llama-cpp"]
 ace-step = ["dep:flate2", "dep:mayhem-enclave", "dep:tar"]
 chatterbox = ["dep:mayhem-enclave"]
+comfyui = ["dep:mayhem-enclave"]
 sulphur = ["dep:mayhem-enclave", "llama-cpp"]
 llama-cpp = ["dep:encoding_rs", "dep:llama-cpp-2", "dep:wait-timeout", "llama-cpp-2/llguidance", "llama-cpp-2/mtmd"]
 llama-cpp-cuda = ["llama-cpp", "llama-cpp-2/cuda"]

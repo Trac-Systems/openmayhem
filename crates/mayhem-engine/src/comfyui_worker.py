@@ -1,0 +1,279 @@
+import asyncio
+import base64
+import contextlib
+import json
+import os
+import sys
+import time
+import traceback
+import uuid
+from pathlib import Path
+
+MAX_RESPONSE_ARTIFACT_BYTES = 128 * 1024 * 1024
+POLL_SECONDS = 0.05
+
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+prompt_server = None
+runner = None
+session = None
+base_dir = None
+control_mode = None
+
+
+def reply(message_id, ok, result=None, error=None):
+    response = {"id": message_id, "ok": ok}
+    if result is not None:
+        response["result"] = result
+    if error is not None:
+        response["error"] = str(error)
+    sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def content_type(path):
+    suffix = path.suffix.lower()
+    if suffix == ".png":
+        return "image/png"
+    if suffix in (".jpg", ".jpeg"):
+        return "image/jpeg"
+    if suffix == ".webp":
+        return "image/webp"
+    if suffix == ".mp4":
+        return "video/mp4"
+    if suffix == ".wav":
+        return "audio/wav"
+    if suffix == ".mp3":
+        return "audio/mpeg"
+    return "application/octet-stream"
+
+
+def resolve_output_file(item):
+    filename = item.get("filename")
+    if not isinstance(filename, str) or not filename:
+        return None
+    subfolder = item.get("subfolder")
+    if not isinstance(subfolder, str):
+        subfolder = ""
+    kind = item.get("type")
+    root = {
+        "input": base_dir / "input",
+        "temp": base_dir / "temp",
+    }.get(kind, base_dir / "output")
+    candidate = (root / subfolder / filename).resolve()
+    if not str(candidate).startswith(str(root.resolve())):
+        raise RuntimeError("ComfyUI output path escaped its output root")
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def collect_artifacts(prompt_id, history):
+    artifacts = []
+    total_bytes = 0
+    for node_id, node_output in (history.get("outputs") or {}).items():
+        for key in ("images", "gifs", "audio", "videos"):
+            for item in node_output.get(key) or []:
+                path = resolve_output_file(item)
+                if path is None:
+                    continue
+                data = path.read_bytes()
+                total_bytes += len(data)
+                if total_bytes > MAX_RESPONSE_ARTIFACT_BYTES:
+                    raise RuntimeError("ComfyUI workflow artifacts exceed response bound")
+                artifacts.append({
+                    "artifact_id": f"{prompt_id}:{node_id}:{len(artifacts)}",
+                    "content_type": content_type(path),
+                    "data_base64": base64.b64encode(data).decode("ascii"),
+                })
+    return artifacts
+
+
+def load(payload):
+    global prompt_server, base_dir, control_mode
+    runtime_root = Path(payload["runtime_root"]).resolve()
+    base_dir = Path(payload["base_dir"]).resolve()
+    socket_path = Path(payload["socket_path"]).resolve()
+    device = payload.get("device", "cpu")
+    for path in (base_dir / "input", base_dir / "output", base_dir / "temp", base_dir / "user"):
+        path.mkdir(parents=True, exist_ok=True)
+    socket_path.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(FileNotFoundError):
+        socket_path.unlink()
+
+    sys.path.insert(0, str(runtime_root))
+    argv = [
+        "main.py",
+        "--disable-auto-launch",
+        "--disable-all-custom-nodes",
+        "--disable-api-nodes",
+        "--dont-print-server",
+        "--base-directory",
+        str(base_dir),
+    ]
+    if device == "cpu":
+        argv.append("--cpu")
+    sys.argv = argv
+    os.chdir(runtime_root)
+
+    import main
+
+    _, prompt_server, _ = main.start_comfyui(loop)
+    try:
+        result = loop.run_until_complete(load_socket_async(socket_path))
+        control_mode = "unix_socket"
+        return result
+    except PermissionError:
+        control_mode = "internal_queue"
+        import nodes
+        return {
+            "object_info_classes": len(nodes.NODE_CLASS_MAPPINGS),
+            "node_classes": sorted(nodes.NODE_CLASS_MAPPINGS.keys()),
+            "socket_path": None,
+            "control_mode": "internal_queue",
+        }
+
+
+async def load_socket_async(socket_path):
+    global runner, session
+    import aiohttp
+    from aiohttp import web
+
+    await prompt_server.setup()
+    runner = web.AppRunner(prompt_server.app, access_log=None)
+    await runner.setup()
+    await web.UnixSite(runner, str(socket_path)).start()
+    session = aiohttp.ClientSession(connector=aiohttp.UnixConnector(path=str(socket_path)))
+    async with session.get("http://mayhem/object_info") as response:
+        object_info = await response.json()
+    return {
+        "object_info_classes": len(object_info),
+        "node_classes": sorted(object_info.keys()),
+        "socket_path": str(socket_path),
+        "control_mode": "unix_socket",
+    }
+
+
+async def run_workflow(payload):
+    if control_mode == "internal_queue":
+        return await run_workflow_internal(payload)
+    workflow = payload["workflow"]
+    if not isinstance(workflow, dict):
+        raise ValueError("workflow must be an object")
+    client_id = payload.get("client_id") or "mayhem-comfyui"
+    timeout_ms = int(payload.get("timeout_ms") or 300000)
+    async with session.post(
+        "http://mayhem/prompt",
+        json={"prompt": workflow, "client_id": client_id},
+    ) as response:
+        submitted = await response.json()
+    prompt_id = submitted["prompt_id"]
+    deadline = asyncio.get_event_loop().time() + timeout_ms / 1000.0
+    progress = []
+    history = None
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(POLL_SECONDS)
+        async with session.get(f"http://mayhem/history/{prompt_id}") as response:
+            history_map = await response.json()
+        if prompt_id in history_map:
+            history = history_map[prompt_id]
+            break
+        progress.append({"kind": "poll", "node": None, "value": {"prompt_id": prompt_id}})
+    if history is None:
+        raise TimeoutError("ComfyUI workflow did not complete before timeout")
+    status = history.get("status", {})
+    if status.get("status_str") != "success":
+        raise RuntimeError(f"ComfyUI workflow failed: {status}")
+    artifacts = collect_artifacts(prompt_id, history)
+    return {
+        "prompt_id": prompt_id,
+        "artifacts": artifacts,
+        "progress_events": progress,
+    }
+
+
+async def run_workflow_internal(payload):
+    import execution
+
+    workflow = payload["workflow"]
+    if not isinstance(workflow, dict):
+        raise ValueError("workflow must be an object")
+    client_id = payload.get("client_id") or "mayhem-comfyui"
+    timeout_ms = int(payload.get("timeout_ms") or 300000)
+    prompt_id = str(uuid.uuid4())
+    number = prompt_server.number
+    prompt_server.number += 1
+    prompt = prompt_server.trigger_on_prompt({"prompt": workflow, "client_id": client_id})["prompt"]
+    prompt_server.node_replace_manager.apply_replacements(prompt)
+    valid = await execution.validate_prompt(prompt_id, prompt, None)
+    if not valid[0]:
+        raise RuntimeError(f"ComfyUI workflow failed validation: {valid[1]}")
+    extra_data = {"client_id": client_id, "create_time": int(time.time() * 1000)}
+    outputs_to_execute = valid[2]
+    sensitive = {}
+    for sensitive_val in execution.SENSITIVE_EXTRA_DATA_KEYS:
+        if sensitive_val in extra_data:
+            sensitive[sensitive_val] = extra_data.pop(sensitive_val)
+    prompt_server.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive))
+    deadline = loop.time() + timeout_ms / 1000.0
+    progress = []
+    history = None
+    while loop.time() < deadline:
+        await asyncio.sleep(POLL_SECONDS)
+        history_map = prompt_server.prompt_queue.get_history(prompt_id=prompt_id)
+        if prompt_id in history_map:
+            history = history_map[prompt_id]
+            break
+        progress.append({"kind": "poll", "node": None, "value": {"prompt_id": prompt_id}})
+    if history is None:
+        raise TimeoutError("ComfyUI workflow did not complete before timeout")
+    status = history.get("status", {})
+    if status.get("status_str") != "success":
+        raise RuntimeError(f"ComfyUI workflow failed: {status}")
+    artifacts = collect_artifacts(prompt_id, history)
+    return {
+        "prompt_id": prompt_id,
+        "artifacts": artifacts,
+        "progress_events": progress,
+    }
+
+
+async def shutdown():
+    global runner, session
+    if session is not None:
+        await session.close()
+    if runner is not None:
+        await runner.cleanup()
+
+
+def dispatch(message):
+    op = message.get("op")
+    payload = message.get("payload")
+    if op == "load":
+        return load(payload)
+    if op == "run_workflow":
+        return loop.run_until_complete(run_workflow(payload))
+    if op == "shutdown":
+        loop.run_until_complete(shutdown())
+        return {"shutdown": True}
+    raise ValueError(f"unknown operation {op!r}")
+
+
+def main_loop():
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            break
+        message = json.loads(line)
+        message_id = message["id"]
+        try:
+            result = dispatch(message)
+            reply(message_id, True, result=result)
+            if message.get("op") == "shutdown":
+                break
+        except Exception as error:
+            reply(message_id, False, error="".join(traceback.format_exception(error)))
+
+
+main_loop()
+loop.close()

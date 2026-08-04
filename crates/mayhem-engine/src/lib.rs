@@ -24,6 +24,7 @@ pub const MTMD_MEDIA_MARKER: &str = "<__media__>";
 #[cfg(any(
     feature = "ace-step",
     feature = "chatterbox",
+    feature = "comfyui",
     feature = "needle",
     feature = "sulphur",
     feature = "mlx",
@@ -75,6 +76,8 @@ pub enum EngineError {
     AceStep(String),
     #[error("Chatterbox backend error: {0}")]
     Chatterbox(String),
+    #[error("ComfyUI backend error: {0}")]
+    ComfyUi(String),
     #[error("Needle backend error: {0}")]
     Needle(String),
     #[error("Sulphur backend error: {0}")]
@@ -220,6 +223,7 @@ pub enum ArtifactFormat {
     TransformersSafetensors,
     AceStepSafetensors,
     ChatterboxSafetensors,
+    ComfyUiRuntime,
     StableDiffusionCheckpoint,
     WhisperGgml,
     PiperVoice,
@@ -236,6 +240,7 @@ impl ArtifactFormat {
             Self::TransformersSafetensors => b"",
             Self::AceStepSafetensors => b"",
             Self::ChatterboxSafetensors => b"",
+            Self::ComfyUiRuntime => b"",
             Self::StableDiffusionCheckpoint => b"",
             Self::WhisperGgml => b"",
             Self::PiperVoice => b"",
@@ -252,6 +257,7 @@ impl ArtifactFormat {
             Self::TransformersSafetensors => "Transformers safetensors",
             Self::AceStepSafetensors => "ACE-Step safetensors",
             Self::ChatterboxSafetensors => "Chatterbox safetensors",
+            Self::ComfyUiRuntime => "ComfyUI runtime",
             Self::StableDiffusionCheckpoint => "stable-diffusion checkpoint",
             Self::WhisperGgml => "whisper.cpp ggml model",
             Self::PiperVoice => "Piper voice",
@@ -373,6 +379,15 @@ impl ModelArtifact {
         Self {
             path: path.into(),
             format: ArtifactFormat::ChatterboxSafetensors,
+            sha256: None,
+            sha256_path: None,
+        }
+    }
+
+    pub fn comfyui_runtime(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            format: ArtifactFormat::ComfyUiRuntime,
             sha256: None,
             sha256_path: None,
         }
@@ -538,6 +553,13 @@ impl LoadConfig {
     pub fn chatterbox_safetensors(path: impl Into<PathBuf>) -> Self {
         Self {
             artifact: ModelArtifact::chatterbox_safetensors(path),
+            ..Self::default()
+        }
+    }
+
+    pub fn comfyui_runtime(path: impl Into<PathBuf>) -> Self {
+        Self {
+            artifact: ModelArtifact::comfyui_runtime(path),
             ..Self::default()
         }
     }
@@ -1020,6 +1042,54 @@ pub struct ImageGenerationOutput {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowGenerationRequest {
+    pub workflow: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(default = "default_workflow_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl WorkflowGenerationRequest {
+    #[must_use]
+    pub fn new(workflow: Value) -> Self {
+        Self {
+            workflow,
+            client_id: None,
+            timeout_ms: default_workflow_timeout_ms(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if !self.workflow.is_object() {
+            return Err(EngineError::InvalidRequest(
+                "workflow request must contain a ComfyUI graph object".to_owned(),
+            ));
+        }
+        if self.timeout_ms == 0 {
+            return Err(EngineError::InvalidRequest(
+                "workflow timeout_ms must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowProgressEvent {
+    pub kind: String,
+    pub node: Option<String>,
+    pub value: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowGenerationOutput {
+    pub prompt_id: String,
+    pub artifact_count: u32,
+    pub progress_events: Vec<WorkflowProgressEvent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AudioTranscriptionRequest {
     pub audio: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1365,6 +1435,17 @@ pub trait EngineBackend {
             self.backend_id()
         )))
     }
+    fn run_workflow(
+        &mut self,
+        _request: WorkflowGenerationRequest,
+        _artifact_sink: &mut dyn ArtifactSink,
+        _cancellation: &CancellationToken,
+    ) -> Result<WorkflowGenerationOutput> {
+        Err(EngineError::InvalidConfig(format!(
+            "{} backend does not support workflow generation",
+            self.backend_id()
+        )))
+    }
     fn transcribe(
         &mut self,
         _request: AudioTranscriptionRequest,
@@ -1700,6 +1781,16 @@ pub fn verify_artifact(artifact: &ModelArtifact) -> Result<()> {
             let payload = chatterbox_safetensors_payload_path(&artifact.path)?;
             verify_safetensors_header_as(&payload, artifact.format.label())?;
             payload
+        }
+        ArtifactFormat::ComfyUiRuntime => {
+            let main = artifact.path.join("main.py");
+            if !main.is_file() {
+                return Err(EngineError::InvalidConfig(format!(
+                    "ComfyUI runtime {} must contain main.py",
+                    artifact.path.display()
+                )));
+            }
+            main
         }
         ArtifactFormat::StableDiffusionCheckpoint => {
             let payload = stable_diffusion_payload_path(&artifact.path)?;
@@ -2306,6 +2397,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_workflow_timeout_ms() -> u64 {
+    300_000
+}
+
 fn default_tool_parameters() -> Value {
     json!({
         "type": "object",
@@ -2346,6 +2441,12 @@ pub use chatterbox_backend::{
     ChatterboxSpeechRequest, CHATTERBOX_MODEL_REVISION, CHATTERBOX_PERTH_COMMIT,
     CHATTERBOX_SOURCE_COMMIT,
 };
+
+#[cfg(feature = "comfyui")]
+mod comfyui_backend;
+
+#[cfg(feature = "comfyui")]
+pub use comfyui_backend::ComfyUiBackend;
 
 #[cfg(feature = "needle")]
 mod needle_backend;
@@ -9710,6 +9811,83 @@ mod tests {
             windows_worker_working_set_bounds((WINDOWS_MINIMUM_WORKING_SET_BYTES - 1) as u64)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn workflow_request_requires_graph_object_and_timeout() {
+        WorkflowGenerationRequest::new(json!({"1": {"class_type": "EmptyImage"}}))
+            .validate()
+            .expect("object workflow is valid");
+
+        let non_object = WorkflowGenerationRequest::new(json!(["not", "a", "graph"]));
+        assert!(non_object.validate().is_err());
+
+        let mut zero_timeout = WorkflowGenerationRequest::new(json!({}));
+        zero_timeout.timeout_ms = 0;
+        assert!(zero_timeout.validate().is_err());
+    }
+
+    #[test]
+    fn verifies_comfyui_runtime_artifact() {
+        let dir = std::env::temp_dir().join(format!(
+            "mayhem-engine-test-{}-{}",
+            std::process::id(),
+            "comfyui-runtime"
+        ));
+        std::fs::create_dir_all(&dir).expect("temp comfy dir");
+        std::fs::write(dir.join("main.py"), b"print('comfy')\n").expect("write main.py");
+
+        let artifact = ModelArtifact::comfyui_runtime(&dir);
+        verify_artifact(&artifact).expect("valid ComfyUI runtime");
+
+        std::fs::remove_file(dir.join("main.py")).expect("remove main.py");
+        assert!(verify_artifact(&artifact).is_err());
+        std::fs::remove_dir_all(dir).expect("remove temp comfy dir");
+    }
+
+    #[cfg(feature = "comfyui")]
+    #[test]
+    #[ignore = "requires MAYHEM_COMFYUI_REAL_RUNTIME and MAYHEM_COMFYUI_PYTHON"]
+    fn comfyui_real_runtime_workflow_smoke() {
+        let runtime = std::env::var_os("MAYHEM_COMFYUI_REAL_RUNTIME")
+            .map(PathBuf::from)
+            .expect("MAYHEM_COMFYUI_REAL_RUNTIME must point at a ComfyUI checkout");
+        let cache = std::env::temp_dir().join(format!(
+            "mayhem-engine-test-{}-{}",
+            std::process::id(),
+            "comfyui-real"
+        ));
+        let mut config = LoadConfig::comfyui_runtime(runtime);
+        config.backend_cache_dir = Some(cache.clone());
+        let mut backend = ComfyUiBackend::new();
+        backend.load(config).expect("load sandboxed ComfyUI");
+        assert!(backend.component_healthy());
+
+        let workflow = json!({
+            "1": {
+                "class_type": "EmptyImage",
+                "inputs": {"width": 64, "height": 64, "batch_size": 1, "color": 3368703}
+            },
+            "2": {
+                "class_type": "SaveImage",
+                "inputs": {"images": ["1", 0], "filename_prefix": "mayhem-comfyui-real"}
+            }
+        });
+        let mut chunks = Vec::new();
+        let output = backend
+            .run_workflow(
+                WorkflowGenerationRequest::new(workflow),
+                &mut |chunk: ArtifactChunk| {
+                    chunks.extend_from_slice(&chunk.bytes);
+                    Ok(())
+                },
+                &CancellationToken::new(),
+            )
+            .expect("run workflow");
+        assert_eq!(output.artifact_count, 1);
+        assert!(chunks.starts_with(b"\x89PNG\r\n\x1a\n"));
+        drop(backend);
+        let _ = std::fs::remove_dir_all(cache);
     }
 
     #[test]
