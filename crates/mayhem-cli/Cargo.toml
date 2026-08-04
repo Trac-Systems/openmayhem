@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [features]
 default = []
+comfyui = ["mayhem-engine/comfyui"]
 llama-cpp-cuda = ["mayhem-engine/llama-cpp-cuda"]
 llama-cpp-metal = ["mayhem-engine/llama-cpp-metal"]
 llama-cpp-openmp = ["mayhem-engine/llama-cpp-openmp"]

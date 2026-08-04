@@ -71,6 +71,8 @@ use mayhem_engine::{
     LoadConfig, MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
     SpeechReferenceAudio, SpeechRequest, TokenChunk, ToolSpec, MTMD_MEDIA_MARKER,
 };
+#[cfg(feature = "comfyui")]
+use mayhem_engine::{ComfyUiBackend, WorkflowGenerationRequest};
 use mayhem_gateway::{
     audio_fingerprint, cancellation_settlement_usage, embedding_vector_fingerprint,
     heartbeat_signing_payload, image_average_hash_hex, logical_cumulative_priced_usage_au,
@@ -4250,6 +4252,22 @@ struct AdminPartsOnboardArgs {
     /// Local canary output artifact to fingerprint into the onboarding receipt.
     #[arg(long = "canary-output", value_name = "PATH")]
     canary_output: Option<PathBuf>,
+
+    /// ComfyUI runtime checkout used to generate the canary output from --canary-graph.
+    #[arg(long = "canary-run-runtime", value_name = "PATH")]
+    canary_run_runtime: Option<PathBuf>,
+
+    /// Isolated ComfyUI cache root for --canary-run-runtime.
+    #[arg(long = "canary-run-cache-dir", value_name = "PATH")]
+    canary_run_cache_dir: Option<PathBuf>,
+
+    /// Directory where generated canary outputs are written.
+    #[arg(long = "canary-run-output-dir", value_name = "PATH")]
+    canary_run_output_dir: Option<PathBuf>,
+
+    /// Timeout for the ComfyUI canary graph run.
+    #[arg(long = "canary-run-timeout-ms", default_value_t = 120_000)]
+    canary_run_timeout_ms: u64,
 
     /// Canary tolerance method.
     #[arg(long = "canary-tolerance-method", default_value = "phash")]
@@ -25104,6 +25122,21 @@ fn admin_parts_onboard(args: &AdminPartsOnboardArgs) -> Result<()> {
     let license_doc = args.license_doc.clone().map(absolutize).transpose()?;
     let canary_graph = args.canary_graph.clone().map(absolutize).transpose()?;
     let canary_output = args.canary_output.clone().map(absolutize).transpose()?;
+    let canary_run_runtime = args
+        .canary_run_runtime
+        .clone()
+        .map(absolutize)
+        .transpose()?;
+    let canary_run_cache_dir = args
+        .canary_run_cache_dir
+        .clone()
+        .map(absolutize)
+        .transpose()?;
+    let canary_run_output_dir = args
+        .canary_run_output_dir
+        .clone()
+        .map(absolutize)
+        .transpose()?;
     if args.all {
         ensure!(args.row_index == 1, "--row-index cannot be used with --all");
         let report = admin_parts_onboard_batch_report(AdminPartsOnboardBatchInput {
@@ -25124,6 +25157,10 @@ fn admin_parts_onboard(args: &AdminPartsOnboardArgs) -> Result<()> {
             canary_graph_hash: args.canary_graph_hash.clone(),
             canary_output_ref: args.canary_output_ref.clone(),
             canary_output,
+            canary_run_runtime,
+            canary_run_cache_dir,
+            canary_run_output_dir,
+            canary_run_timeout_ms: args.canary_run_timeout_ms,
             canary_tolerance_method: args.canary_tolerance_method.clone(),
             canary_max_distance_bps: args.canary_max_distance_bps,
             chunk_size: args.chunk_size,
@@ -25165,6 +25202,10 @@ fn admin_parts_onboard(args: &AdminPartsOnboardArgs) -> Result<()> {
         canary_graph_hash: args.canary_graph_hash.clone(),
         canary_output_ref: args.canary_output_ref.clone(),
         canary_output,
+        canary_run_runtime,
+        canary_run_cache_dir,
+        canary_run_output_dir,
+        canary_run_timeout_ms: args.canary_run_timeout_ms,
         canary_tolerance_method: args.canary_tolerance_method.clone(),
         canary_max_distance_bps: args.canary_max_distance_bps,
         chunk_size: args.chunk_size,
@@ -25205,6 +25246,10 @@ struct AdminPartsOnboardInput {
     canary_graph_hash: Option<String>,
     canary_output_ref: String,
     canary_output: Option<PathBuf>,
+    canary_run_runtime: Option<PathBuf>,
+    canary_run_cache_dir: Option<PathBuf>,
+    canary_run_output_dir: Option<PathBuf>,
+    canary_run_timeout_ms: u64,
     canary_tolerance_method: String,
     canary_max_distance_bps: u32,
     chunk_size: usize,
@@ -25229,6 +25274,10 @@ struct AdminPartsOnboardBatchInput {
     canary_graph_hash: Option<String>,
     canary_output_ref: String,
     canary_output: Option<PathBuf>,
+    canary_run_runtime: Option<PathBuf>,
+    canary_run_cache_dir: Option<PathBuf>,
+    canary_run_output_dir: Option<PathBuf>,
+    canary_run_timeout_ms: u64,
     canary_tolerance_method: String,
     canary_max_distance_bps: u32,
     chunk_size: usize,
@@ -25338,10 +25387,41 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
         input.canary_graph.as_deref(),
         input.canary_graph_hash.as_deref(),
     )?;
-    let canary_output_evidence = comfy_part_canary_output_evidence(
+    let generated_canary_output = comfy_part_generate_canary_output(
+        &draft,
+        &payload_path,
+        input.canary_graph.as_deref(),
+        input.canary_graph_hash.as_deref(),
         input.canary_output.as_deref(),
-        &input.canary_tolerance_method,
+        input.canary_run_runtime.as_deref(),
+        input.canary_run_cache_dir.as_deref(),
+        input.canary_run_output_dir.as_deref(),
+        input.canary_run_timeout_ms,
+        input.force,
     )?;
+    if let Some(generated) = &generated_canary_output {
+        steps.push(admin_parts_onboard_step(
+            "canary_generated",
+            &[
+                ("runtime", generated.runtime.clone()),
+                ("cache_dir", generated.cache_dir.clone()),
+                ("output", generated.path.display().to_string()),
+                ("content_type", generated.content_type.clone()),
+                ("sha256", generated.sha256.clone()),
+                (
+                    "progress_events",
+                    generated.progress_event_count.to_string(),
+                ),
+                ("reused_existing", generated.reused_existing.to_string()),
+            ],
+        ));
+    }
+    let canary_output_path = generated_canary_output
+        .as_ref()
+        .map(|generated| generated.path.as_path())
+        .or(input.canary_output.as_deref());
+    let canary_output_evidence =
+        comfy_part_canary_output_evidence(canary_output_path, &input.canary_tolerance_method)?;
     let mut canary_fields = vec![
         ("probe_graph_hash", canary_graph_hash.clone()),
         ("reference_output_ref", input.canary_output_ref.clone()),
@@ -25469,6 +25549,10 @@ fn admin_parts_onboard_batch_report(
             canary_graph_hash: input.canary_graph_hash.clone(),
             canary_output_ref: input.canary_output_ref.clone(),
             canary_output: input.canary_output.clone(),
+            canary_run_runtime: input.canary_run_runtime.clone(),
+            canary_run_cache_dir: input.canary_run_cache_dir.clone(),
+            canary_run_output_dir: input.canary_run_output_dir.clone(),
+            canary_run_timeout_ms: input.canary_run_timeout_ms,
             canary_tolerance_method: input.canary_tolerance_method.clone(),
             canary_max_distance_bps: input.canary_max_distance_bps,
             chunk_size: input.chunk_size,
@@ -25521,6 +25605,16 @@ struct AdminPartsCanaryOutputEvidence {
     fingerprint: String,
 }
 
+struct AdminPartsGeneratedCanaryOutput {
+    path: PathBuf,
+    content_type: String,
+    sha256: String,
+    runtime: String,
+    cache_dir: String,
+    progress_event_count: usize,
+    reused_existing: bool,
+}
+
 fn comfy_part_canary_graph_hash(graph: Option<&Path>, hash: Option<&str>) -> Result<String> {
     match (graph, hash) {
         (Some(_), Some(_)) => bail!("pass only one of --canary-graph or --canary-graph-hash"),
@@ -25536,6 +25630,380 @@ fn comfy_part_canary_graph_hash(graph: Option<&Path>, hash: Option<&str>) -> Res
         }
         (None, None) => bail!("pass --canary-graph or --canary-graph-hash"),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn comfy_part_generate_canary_output(
+    draft: &mayhem_proto::ComfyPartDraft,
+    payload_path: &Path,
+    canary_graph: Option<&Path>,
+    canary_graph_hash: Option<&str>,
+    canary_output: Option<&Path>,
+    canary_run_runtime: Option<&Path>,
+    canary_run_cache_dir: Option<&Path>,
+    canary_run_output_dir: Option<&Path>,
+    canary_run_timeout_ms: u64,
+    force: bool,
+) -> Result<Option<AdminPartsGeneratedCanaryOutput>> {
+    let Some(runtime) = canary_run_runtime else {
+        ensure!(
+            canary_run_cache_dir.is_none(),
+            "--canary-run-cache-dir requires --canary-run-runtime"
+        );
+        ensure!(
+            canary_run_output_dir.is_none(),
+            "--canary-run-output-dir requires --canary-run-runtime"
+        );
+        ensure!(
+            canary_run_timeout_ms == 120_000,
+            "--canary-run-timeout-ms requires --canary-run-runtime"
+        );
+        return Ok(None);
+    };
+    ensure!(
+        canary_graph.is_some(),
+        "--canary-run-runtime requires --canary-graph"
+    );
+    ensure!(
+        canary_graph_hash.is_none(),
+        "--canary-run-runtime needs graph bytes; pass --canary-graph instead of --canary-graph-hash"
+    );
+    ensure!(
+        canary_output.is_none(),
+        "pass only one of --canary-output or --canary-run-runtime"
+    );
+    let output_dir = canary_run_output_dir.context("--canary-run-output-dir is required")?;
+    ensure!(
+        canary_run_timeout_ms > 0,
+        "--canary-run-timeout-ms must be positive"
+    );
+    comfy_part_generate_canary_output_with_runtime(
+        draft,
+        payload_path,
+        canary_graph.expect("checked"),
+        runtime,
+        canary_run_cache_dir,
+        output_dir,
+        canary_run_timeout_ms,
+        force,
+    )
+    .map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn comfy_part_generate_canary_output_with_runtime(
+    draft: &mayhem_proto::ComfyPartDraft,
+    payload_path: &Path,
+    canary_graph: &Path,
+    runtime: &Path,
+    canary_run_cache_dir: Option<&Path>,
+    output_dir: &Path,
+    canary_run_timeout_ms: u64,
+    force: bool,
+) -> Result<AdminPartsGeneratedCanaryOutput> {
+    #[cfg(feature = "comfyui")]
+    {
+        comfy_part_generate_canary_output_with_runtime_inner(
+            draft,
+            payload_path,
+            canary_graph,
+            runtime,
+            canary_run_cache_dir,
+            output_dir,
+            canary_run_timeout_ms,
+            force,
+        )
+    }
+    #[cfg(not(feature = "comfyui"))]
+    {
+        let _ = (
+            draft,
+            payload_path,
+            canary_graph,
+            runtime,
+            canary_run_cache_dir,
+            output_dir,
+            canary_run_timeout_ms,
+            force,
+        );
+        bail!("Comfy canary execution requires rebuilding mayhem-cli with --features comfyui")
+    }
+}
+
+#[cfg(feature = "comfyui")]
+#[allow(clippy::too_many_arguments)]
+fn comfy_part_generate_canary_output_with_runtime_inner(
+    draft: &mayhem_proto::ComfyPartDraft,
+    payload_path: &Path,
+    canary_graph: &Path,
+    runtime: &Path,
+    canary_run_cache_dir: Option<&Path>,
+    output_dir: &Path,
+    canary_run_timeout_ms: u64,
+    force: bool,
+) -> Result<AdminPartsGeneratedCanaryOutput> {
+    let part_id = mayhem_proto::derive_comfy_part_id(&draft.part_type, &draft.name, &draft.sha256);
+    let cache_root = canary_run_cache_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| output_dir.join(".runtime-cache"))
+        .join(&part_id);
+    let model_subdir = comfy_part_model_subdir(draft)?;
+    let model_dir = cache_root.join("base").join("models").join(model_subdir);
+    fs::create_dir_all(&model_dir).with_context(|| {
+        format!(
+            "creating Comfy canary model directory {}",
+            model_dir.display()
+        )
+    })?;
+    let payload_name = payload_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(safe_path_component)
+        .filter(|name| !name.is_empty())
+        .context("Comfy canary payload path must have a usable file name")?;
+    let installed_payload = model_dir.join(payload_name);
+    fs::copy(payload_path, &installed_payload).with_context(|| {
+        format!(
+            "copying verified Comfy part payload into {}",
+            installed_payload.display()
+        )
+    })?;
+
+    let workflow: Value = serde_json::from_value(read_json_file(canary_graph)?)
+        .with_context(|| format!("parsing canary graph {}", canary_graph.display()))?;
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("creating canary output dir {}", output_dir.display()))?;
+
+    let mut config = LoadConfig::comfyui_runtime(runtime);
+    config.backend_cache_dir = Some(cache_root.clone());
+    let mut backend = ComfyUiBackend::new();
+    backend
+        .load(config)
+        .context("loading ComfyUI runtime for parts canary")?;
+    let mut request = WorkflowGenerationRequest::new(workflow);
+    request.timeout_ms = canary_run_timeout_ms;
+    let mut collector = AdminPartsCanaryArtifactCollector::default();
+    let output = backend
+        .run_workflow(
+            request,
+            &mut |chunk: ArtifactChunk| collector.push(chunk),
+            &CancellationToken::new(),
+        )
+        .context("running ComfyUI parts canary graph")?;
+    ensure!(
+        output.artifact_count == 1,
+        "ComfyUI parts canary must emit exactly one artifact, got {}",
+        output.artifact_count
+    );
+    let artifact = collector.finish()?;
+    let ext = comfy_canary_content_extension(&artifact.content_type);
+    let output_path = output_dir.join(format!("{part_id}-canary.{ext}"));
+    let sha256 = sha256_bytes_hex(&artifact.bytes);
+    let reused_existing =
+        write_comfy_canary_artifact_idempotent(&output_path, &artifact.bytes, force)?;
+    Ok(AdminPartsGeneratedCanaryOutput {
+        path: output_path,
+        content_type: artifact.content_type,
+        sha256,
+        runtime: runtime.display().to_string(),
+        cache_dir: cache_root.display().to_string(),
+        progress_event_count: output.progress_events.len(),
+        reused_existing,
+    })
+}
+
+#[cfg(feature = "comfyui")]
+#[derive(Default)]
+struct AdminPartsCanaryArtifactCollector {
+    artifact_id: Option<String>,
+    content_type: Option<String>,
+    bytes: Vec<u8>,
+    next_index: u32,
+    final_seen: bool,
+}
+
+#[cfg(feature = "comfyui")]
+struct AdminPartsCanaryArtifact {
+    content_type: String,
+    bytes: Vec<u8>,
+}
+
+#[cfg(feature = "comfyui")]
+impl AdminPartsCanaryArtifactCollector {
+    fn push(&mut self, chunk: ArtifactChunk) -> mayhem_engine::Result<()> {
+        const MAX_CANARY_ARTIFACT_BYTES: usize = 128 * 1024 * 1024;
+        if self.final_seen {
+            return Err(EngineError::InvalidOutput(
+                "ComfyUI parts canary emitted bytes after final chunk".to_owned(),
+            ));
+        }
+        let artifact_id = chunk.artifact_id.trim();
+        if artifact_id.is_empty() {
+            return Err(EngineError::InvalidOutput(
+                "ComfyUI parts canary emitted artifact with empty id".to_owned(),
+            ));
+        }
+        if chunk.content_type.trim().is_empty() {
+            return Err(EngineError::InvalidOutput(format!(
+                "ComfyUI parts canary artifact {artifact_id} has empty content type"
+            )));
+        }
+        if self
+            .artifact_id
+            .as_deref()
+            .is_some_and(|existing| existing != artifact_id)
+        {
+            return Err(EngineError::InvalidOutput(
+                "ComfyUI parts canary emitted more than one artifact id".to_owned(),
+            ));
+        }
+        if self
+            .content_type
+            .as_deref()
+            .is_some_and(|existing| existing != chunk.content_type.as_str())
+        {
+            return Err(EngineError::InvalidOutput(format!(
+                "ComfyUI parts canary artifact {artifact_id} changed content type"
+            )));
+        }
+        if chunk.index != self.next_index {
+            return Err(EngineError::InvalidOutput(format!(
+                "ComfyUI parts canary artifact {artifact_id} chunk index gap: expected {}, got {}",
+                self.next_index, chunk.index
+            )));
+        }
+        let next_len = self
+            .bytes
+            .len()
+            .checked_add(chunk.bytes.len())
+            .ok_or_else(|| {
+                EngineError::InvalidOutput("ComfyUI parts canary byte count overflow".to_owned())
+            })?;
+        if next_len > MAX_CANARY_ARTIFACT_BYTES {
+            return Err(EngineError::InvalidOutput(format!(
+                "ComfyUI parts canary artifact exceeds {MAX_CANARY_ARTIFACT_BYTES} bytes"
+            )));
+        }
+        self.artifact_id = Some(artifact_id.to_owned());
+        self.content_type = Some(chunk.content_type);
+        self.bytes.extend_from_slice(&chunk.bytes);
+        self.next_index = self.next_index.checked_add(1).ok_or_else(|| {
+            EngineError::InvalidOutput("ComfyUI parts canary chunk index overflow".to_owned())
+        })?;
+        self.final_seen = chunk.final_chunk;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<AdminPartsCanaryArtifact> {
+        ensure!(
+            self.final_seen,
+            "ComfyUI parts canary artifact missing final chunk"
+        );
+        let content_type = self
+            .content_type
+            .context("ComfyUI parts canary emitted no artifact")?;
+        ensure!(
+            !self.bytes.is_empty(),
+            "ComfyUI parts canary emitted an empty artifact"
+        );
+        Ok(AdminPartsCanaryArtifact {
+            content_type,
+            bytes: self.bytes,
+        })
+    }
+}
+
+#[cfg(feature = "comfyui")]
+fn comfy_part_model_subdir(draft: &mayhem_proto::ComfyPartDraft) -> Result<PathBuf> {
+    if let Some(path) = draft
+        .adapter
+        .get("comfy_model_subdir")
+        .and_then(Value::as_str)
+    {
+        return safe_relative_comfy_model_subdir(path);
+    }
+    let subdir = match draft.part_type.as_str() {
+        "audio-model" => "audio",
+        "checkpoint" => "checkpoints",
+        "clip-vision" => "clip_vision",
+        "controlnet" => "controlnet",
+        "lipsync" => "liveportrait",
+        "lora" => "loras",
+        "text-encoder" => "text_encoders",
+        "tts" => "tts",
+        "upscaler" => "upscale_models",
+        "vae" => "vae",
+        "video-model" => "diffusion_models",
+        other => bail!("unsupported Comfy part type for canary model install: {other}"),
+    };
+    safe_relative_comfy_model_subdir(subdir)
+}
+
+#[cfg(feature = "comfyui")]
+fn safe_relative_comfy_model_subdir(path: &str) -> Result<PathBuf> {
+    let path = Path::new(path);
+    ensure!(
+        !path.is_absolute(),
+        "comfy_model_subdir must be relative under ComfyUI models/"
+    );
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => {
+                let Some(value) = value.to_str() else {
+                    bail!("comfy_model_subdir must be UTF-8");
+                };
+                let safe = safe_path_component(value);
+                ensure!(
+                    !safe.is_empty() && safe == value,
+                    "comfy_model_subdir contains an unsafe component"
+                );
+                out.push(value);
+            }
+            Component::CurDir => {}
+            _ => bail!("comfy_model_subdir cannot contain parent or prefix components"),
+        }
+    }
+    ensure!(
+        !out.as_os_str().is_empty(),
+        "comfy_model_subdir cannot be empty"
+    );
+    Ok(out)
+}
+
+#[cfg(feature = "comfyui")]
+fn comfy_canary_content_extension(content_type: &str) -> &'static str {
+    match content_type.trim().to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "video/mp4" => "mp4",
+        _ => "bin",
+    }
+}
+
+#[cfg(feature = "comfyui")]
+fn write_comfy_canary_artifact_idempotent(
+    output: &Path,
+    bytes: &[u8],
+    force: bool,
+) -> Result<bool> {
+    if output.exists() && !force {
+        let existing = fs::read(output).with_context(|| format!("reading {}", output.display()))?;
+        if existing == bytes {
+            return Ok(true);
+        }
+        bail!(
+            "{} already exists with different Comfy canary output; pass --force to overwrite",
+            output.display()
+        );
+    }
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    fs::write(output, bytes).with_context(|| format!("writing {}", output.display()))?;
+    Ok(false)
 }
 
 fn comfy_part_canary_output_evidence(
@@ -88065,10 +88533,73 @@ mod tests {
         assert_eq!(args.canary_graph_hash, Some("22".repeat(32)));
         assert_eq!(args.canary_graph, None);
         assert_eq!(args.canary_output, None);
+        assert_eq!(args.canary_run_runtime, None);
+        assert_eq!(args.canary_run_cache_dir, None);
+        assert_eq!(args.canary_run_output_dir, None);
+        assert_eq!(args.canary_run_timeout_ms, 120_000);
         assert_eq!(args.canary_max_distance_bps, 12);
         assert_eq!(args.chunk_size, 8);
         assert!(args.force);
         assert!(args.json);
+    }
+
+    #[test]
+    fn admin_parts_onboard_cli_parses_comfy_canary_runner_flags() {
+        let parsed = Cli::try_parse_from([
+            "mayhem",
+            "admin",
+            "parts",
+            "onboard",
+            "--input",
+            "row.yaml",
+            "--payload",
+            "payload.bin",
+            "--output",
+            "record.json",
+            "--min-runtime",
+            "comfyui-v0.30.1",
+            "--license-doc-hash",
+            &"11".repeat(32),
+            "--license-ref",
+            "license:test",
+            "--license-captured-at",
+            "2026-08-04T00:00:00Z",
+            "--canary-graph",
+            "graph.json",
+            "--canary-output-ref",
+            "canaries/generated.png",
+            "--canary-run-runtime",
+            "ComfyUI",
+            "--canary-run-cache-dir",
+            "canary-cache",
+            "--canary-run-output-dir",
+            "canary-outputs",
+            "--canary-run-timeout-ms",
+            "45000",
+        ])
+        .unwrap();
+        let Commands::Admin { command } = parsed.command else {
+            panic!("expected admin command");
+        };
+        let AdminCommands::Parts { command } = *command else {
+            panic!("expected admin parts command");
+        };
+        let AdminPartsCommands::Onboard(args) = command else {
+            panic!("expected admin parts onboard command");
+        };
+        assert_eq!(args.canary_graph, Some(PathBuf::from("graph.json")));
+        assert_eq!(args.canary_graph_hash, None);
+        assert_eq!(args.canary_output, None);
+        assert_eq!(args.canary_run_runtime, Some(PathBuf::from("ComfyUI")));
+        assert_eq!(
+            args.canary_run_cache_dir,
+            Some(PathBuf::from("canary-cache"))
+        );
+        assert_eq!(
+            args.canary_run_output_dir,
+            Some(PathBuf::from("canary-outputs"))
+        );
+        assert_eq!(args.canary_run_timeout_ms, 45_000);
     }
 
     #[test]
@@ -88282,6 +88813,10 @@ mod tests {
             canary_graph_hash: Some("44".repeat(32)),
             canary_output_ref: "canaries/test.png".to_owned(),
             canary_output: None,
+            canary_run_runtime: None,
+            canary_run_cache_dir: None,
+            canary_run_output_dir: None,
+            canary_run_timeout_ms: 120_000,
             canary_tolerance_method: "phash".to_owned(),
             canary_max_distance_bps: 10,
             chunk_size: 8,
@@ -88344,6 +88879,10 @@ mod tests {
             canary_graph_hash: Some("44".repeat(32)),
             canary_output_ref: "canaries/test.png".to_owned(),
             canary_output: None,
+            canary_run_runtime: None,
+            canary_run_cache_dir: None,
+            canary_run_output_dir: None,
+            canary_run_timeout_ms: 120_000,
             canary_tolerance_method: "phash".to_owned(),
             canary_max_distance_bps: 10,
             chunk_size: 8,
@@ -88400,6 +88939,10 @@ status: linked
             canary_graph_hash: Some("44".repeat(32)),
             canary_output_ref: "canaries/test.png".to_owned(),
             canary_output: None,
+            canary_run_runtime: None,
+            canary_run_cache_dir: None,
+            canary_run_output_dir: None,
+            canary_run_timeout_ms: 120_000,
             canary_tolerance_method: "phash".to_owned(),
             canary_max_distance_bps: 10,
             chunk_size: 8,
@@ -88468,6 +89011,10 @@ status: linked
             canary_graph_hash: None,
             canary_output_ref: "canaries/reference.png".to_owned(),
             canary_output: Some(output_path.clone()),
+            canary_run_runtime: None,
+            canary_run_cache_dir: None,
+            canary_run_output_dir: None,
+            canary_run_timeout_ms: 120_000,
             canary_tolerance_method: "phash".to_owned(),
             canary_max_distance_bps: 10,
             chunk_size: 8,
@@ -88565,6 +89112,10 @@ status: linked
             canary_graph_hash: Some("44".repeat(32)),
             canary_output_ref: "canaries/batch.png".to_owned(),
             canary_output: None,
+            canary_run_runtime: None,
+            canary_run_cache_dir: None,
+            canary_run_output_dir: None,
+            canary_run_timeout_ms: 120_000,
             canary_tolerance_method: "phash".to_owned(),
             canary_max_distance_bps: 10,
             chunk_size: 8,
@@ -88631,6 +89182,10 @@ status: linked
             canary_graph_hash: Some("44".repeat(32)),
             canary_output_ref: "canaries/test.png".to_owned(),
             canary_output: None,
+            canary_run_runtime: None,
+            canary_run_cache_dir: None,
+            canary_run_output_dir: None,
+            canary_run_timeout_ms: 120_000,
             canary_tolerance_method: "phash".to_owned(),
             canary_max_distance_bps: 10,
             chunk_size: 8,
@@ -88691,6 +89246,10 @@ status: linked
             canary_graph_hash: Some("44".repeat(32)),
             canary_output_ref: "canaries/test.png".to_owned(),
             canary_output: None,
+            canary_run_runtime: None,
+            canary_run_cache_dir: None,
+            canary_run_output_dir: None,
+            canary_run_timeout_ms: 120_000,
             canary_tolerance_method: "phash".to_owned(),
             canary_max_distance_bps: 10,
             chunk_size: 8,
@@ -88750,6 +89309,10 @@ status: linked
             canary_graph_hash: Some("44".repeat(32)),
             canary_output_ref: "canaries/controlnet.png".to_owned(),
             canary_output: None,
+            canary_run_runtime: None,
+            canary_run_cache_dir: None,
+            canary_run_output_dir: None,
+            canary_run_timeout_ms: 120_000,
             canary_tolerance_method: "phash".to_owned(),
             canary_max_distance_bps: 10,
             chunk_size: 8,
