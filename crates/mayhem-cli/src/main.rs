@@ -25369,7 +25369,7 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
         "--canary-tolerance-method must be non-empty"
     );
 
-    let (draft, row_index) = read_comfy_part_draft_input(&input.input, input.row_index)?;
+    let (mut draft, row_index) = read_comfy_part_draft_input(&input.input, input.row_index)?;
     let draft_part_id =
         mayhem_proto::derive_comfy_part_id(&draft.part_type, &draft.name, &draft.sha256);
     let mut steps = vec![admin_parts_onboard_step(
@@ -25402,13 +25402,23 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
         "--payload must be a regular file: {}",
         payload_path.display()
     );
-    ensure!(
-        payload_metadata.len() == draft.size_bytes,
-        "payload size mismatch for {}: draft expects {}, payload has {} bytes",
-        draft.name,
-        draft.size_bytes,
-        payload_metadata.len()
-    );
+    if draft.size_bytes_exact {
+        ensure!(
+            payload_metadata.len() == draft.size_bytes,
+            "payload size mismatch for {}: draft expects {}, payload has {} bytes",
+            draft.name,
+            draft.size_bytes,
+            payload_metadata.len()
+        );
+    } else {
+        ensure!(
+            payload_metadata.len() <= draft.size_bytes,
+            "payload size exceeds approximate cap for {}: draft cap {}, payload has {} bytes",
+            draft.name,
+            draft.size_bytes,
+            payload_metadata.len()
+        );
+    }
     let sha256 = file_sha256_hex(&payload_path)?;
     ensure!(
         sha256.eq_ignore_ascii_case(&draft.sha256),
@@ -25417,11 +25427,16 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
         draft.sha256,
         sha256
     );
+    if !draft.size_bytes_exact {
+        draft.size_bytes = payload_metadata.len();
+        draft.size_bytes_exact = true;
+    }
     steps.push(admin_parts_onboard_step(
         "payload_verified",
         &[
             ("sha256", sha256.clone()),
             ("size_bytes", payload_metadata.len().to_string()),
+            ("size_bytes_exact", draft.size_bytes_exact.to_string()),
         ],
     ));
     let merkle = build_merkle_manifest(&payload_path, input.chunk_size)?;
@@ -26463,13 +26478,22 @@ fn admin_comfy_part_download_source_blocking(
     output
         .sync_all()
         .with_context(|| format!("syncing {}", part_path.display()))?;
-    ensure!(
-        written == draft.size_bytes,
-        "downloaded Comfy part {} is incomplete: got {}, expected {} bytes",
-        draft.name,
-        written,
-        draft.size_bytes
-    );
+    if draft.size_bytes_exact {
+        ensure!(
+            written == draft.size_bytes,
+            "downloaded Comfy part {} is incomplete: got {}, expected {} bytes",
+            draft.name,
+            written,
+            draft.size_bytes
+        );
+    } else {
+        ensure!(
+            written <= draft.size_bytes,
+            "downloaded Comfy part {} exceeded approximate size cap {}",
+            draft.name,
+            draft.size_bytes
+        );
+    }
     if !admin_comfy_part_payload_matches(&part_path, draft)? {
         let _ = fs::remove_file(&part_path);
         bail!(
@@ -26493,7 +26517,14 @@ fn admin_comfy_part_payload_matches(
     let Ok(metadata) = fs::metadata(path) else {
         return Ok(false);
     };
-    if !metadata.is_file() || metadata.len() != draft.size_bytes {
+    if !metadata.is_file() {
+        return Ok(false);
+    }
+    if draft.size_bytes_exact {
+        if metadata.len() != draft.size_bytes {
+            return Ok(false);
+        }
+    } else if metadata.len() > draft.size_bytes {
         return Ok(false);
     }
     Ok(file_sha256_hex(path)?.eq_ignore_ascii_case(&draft.sha256))
@@ -89116,6 +89147,70 @@ mod tests {
     }
 
     #[test]
+    fn admin_parts_onboard_finalizes_approximate_yaml_size_to_verified_payload_size() {
+        let temp = test_temp_dir("mayhem-admin-parts-onboard-approx-size");
+        fs::create_dir_all(&temp).unwrap();
+        let payload_path = temp.join("payload.bin");
+        fs::write(&payload_path, b"smaller than the yaml gb cap").unwrap();
+        let sha256 = file_sha256_hex(&payload_path).unwrap();
+        let size_bytes = fs::metadata(&payload_path).unwrap().len();
+        let input_path = temp.join("part.yaml");
+        fs::write(
+            &input_path,
+            format!(
+                r#"
+name: "approx sized payload"
+type: checkpoint
+lane: sdxl
+license: MIT
+file_format: bin
+sha256: "{sha256}"
+size_gb: 0.001
+download_url: "https://huggingface.co/TracNetwork/openmayhem-parts/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/payload.bin"
+status: linked
+"#
+            ),
+        )
+        .unwrap();
+        let output_path = temp.join("record.json");
+
+        let report = admin_parts_onboard_report(AdminPartsOnboardInput {
+            input: input_path,
+            row_index: 1,
+            payload: Some(payload_path),
+            download_dir: None,
+            source_token_file: None,
+            disk_reserve: None,
+            output: output_path.clone(),
+            receipt_dir: None,
+            min_runtime: "comfyui-v0.30.1".to_owned(),
+            license_doc: None,
+            license_doc_hash: Some("33".repeat(32)),
+            license_ref: "license:test".to_owned(),
+            license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
+            canary_graph: None,
+            canary_graph_hash: Some("44".repeat(32)),
+            canary_output_ref: "canaries/test.png".to_owned(),
+            canary_output: None,
+            canary_run_runtime: None,
+            canary_run_cache_dir: None,
+            canary_run_output_dir: None,
+            canary_run_timeout_ms: 120_000,
+            canary_tolerance_method: "phash".to_owned(),
+            canary_max_distance_bps: 10,
+            chunk_size: 8,
+            force: false,
+        })
+        .unwrap();
+
+        assert_eq!(report.size_bytes, size_bytes);
+        let record: mayhem_proto::ComfyPartRecord =
+            serde_json::from_value(read_json_file(&output_path).unwrap()).unwrap();
+        assert_eq!(record.size_bytes, size_bytes);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn admin_parts_onboard_reuses_verified_download_dir_payload() {
         let temp = test_temp_dir("mayhem-admin-parts-onboard-download-dir");
         let download_dir = temp.join("downloads");
@@ -89946,6 +90041,7 @@ status: linked
             lane: "all".to_owned(),
             sha256: "00".repeat(32),
             size_bytes: 1,
+            size_bytes_exact: true,
             file_format: "bin".to_owned(),
             license: "MIT".to_owned(),
             permissions: Vec::new(),
@@ -90030,6 +90126,7 @@ status: linked
             lane: "all".to_owned(),
             sha256: hex_byte.repeat(32),
             size_bytes: 64,
+            size_bytes_exact: true,
             file_format: "safetensors".to_owned(),
             license: "MIT".to_owned(),
             permissions: Vec::new(),
@@ -90089,6 +90186,7 @@ status: linked
             lane: "all".to_owned(),
             sha256,
             size_bytes,
+            size_bytes_exact: true,
             file_format: "bin".to_owned(),
             license: "MIT".to_owned(),
             permissions: Vec::new(),

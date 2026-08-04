@@ -201,6 +201,8 @@ pub struct ComfyPartDraft {
     pub lane: String,
     pub sha256: String,
     pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub size_bytes_exact: bool,
     pub file_format: String,
     pub license: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -226,7 +228,10 @@ impl ComfyPartDraft {
             .or_else(|_| yaml_string(object, "lane_fit"))
             .unwrap_or_else(|_| "all".to_owned());
         let sha256 = normalize_hex(&yaml_string(object, "sha256")?)?;
-        let size_bytes = yaml_u64(object, "size_bytes").or_else(|_| yaml_size_gb(object))?;
+        let (size_bytes, size_bytes_exact) = match yaml_u64(object, "size_bytes") {
+            Ok(size_bytes) => (size_bytes, true),
+            Err(_) => (yaml_size_gb(object)?, false),
+        };
         let file_format =
             yaml_string(object, "file_format").unwrap_or_else(|_| infer_file_format(object));
         let license = yaml_string(object, "license")?;
@@ -259,6 +264,7 @@ impl ComfyPartDraft {
             lane,
             sha256,
             size_bytes,
+            size_bytes_exact,
             file_format,
             license,
             permissions,
@@ -990,6 +996,7 @@ mod tests {
             lane: "all lanes".to_owned(),
             sha256: sha256.to_owned(),
             size_bytes: 64,
+            size_bytes_exact: true,
             file_format: "safetensors".to_owned(),
             license: "MIT".to_owned(),
             permissions: vec!["Rent".to_owned()],
@@ -1112,11 +1119,14 @@ mod tests {
             drafts[0].sha256,
             "3e15ba00387db678ab4a099f75771c4f5ac67fda9e7100a01d263eaf30145aa9"
         );
+        assert!(!drafts[0].size_bytes_exact);
+        assert_eq!(drafts[0].size_bytes, 6_979_321_856);
         assert_eq!(
             drafts[0].permissions,
             vec!["Rent".to_owned(), "RentCivit".to_owned()]
         );
         assert_eq!(drafts[1].part_type, "controlnet");
+        assert!(drafts[1].size_bytes_exact);
         assert_eq!(drafts[2].part_type, "upscaler");
 
         let finalized = drafts[2]
