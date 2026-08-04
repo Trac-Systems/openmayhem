@@ -777,6 +777,8 @@ enum AdminPartsCommands {
     ValidateYaml(AdminPartsValidateYamlArgs),
     /// Build a machine-pullable Comfy parts index from finalized part records.
     BuildIndex(AdminPartsBuildIndexArgs),
+    /// Verify a built parts-index layout and print Hugging Face upload commands.
+    UploadPlan(AdminPartsUploadPlanArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -4194,6 +4196,33 @@ struct AdminPartsBuildIndexArgs {
     /// Outcome-class grid version included in the anchor.
     #[arg(long, default_value_t = 1)]
     outcome_classes_ver: u32,
+}
+
+#[derive(Debug, Parser)]
+struct AdminPartsUploadPlanArgs {
+    /// Directory containing a built parts index layout.
+    #[arg(long = "layout-dir", value_name = "PATH")]
+    layout_dir: PathBuf,
+
+    /// Hugging Face repository that will hold the parts-index layout.
+    #[arg(long, default_value = "TracNetwork/openmayhem-parts-index")]
+    repo: String,
+
+    /// Hugging Face repository type for the upload command.
+    #[arg(long = "repo-type", default_value = "model")]
+    repo_type: String,
+
+    /// Commit message for the Hugging Face upload command.
+    #[arg(long, default_value = "Mayhem Comfy parts index")]
+    commit_message: String,
+
+    /// Hugging Face token file for printed upload/revision commands.
+    #[arg(long, value_name = "PATH")]
+    hf_token_file: Option<PathBuf>,
+
+    /// Print a machine-readable upload plan.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -24784,10 +24813,38 @@ struct AdminPartsBuildIndexRecordSummary {
     status: String,
 }
 
+#[derive(Debug, Serialize)]
+struct AdminPartsUploadPlanReport {
+    ok: bool,
+    layout_dir: String,
+    repo: String,
+    repo_type: String,
+    index_ver: u32,
+    index_root: String,
+    anchor_hash: String,
+    record_count: u64,
+    layout_file_count: u64,
+    layout_total_bytes: u64,
+    preflight_command: CatalogCanaryPlanCommand,
+    upload_command: CatalogCanaryPlanCommand,
+    revision_command: CatalogCanaryPlanCommand,
+    uploaded_index_url_template: String,
+    uploaded_anchor_url_template: String,
+    errors: Vec<String>,
+}
+
+struct VerifiedComfyPartsLayout {
+    index: mayhem_proto::ComfyPartsIndex,
+    anchor_hash: String,
+    file_count: u64,
+    total_bytes: u64,
+}
+
 async fn admin_parts(command: &AdminPartsCommands) -> Result<()> {
     match command {
         AdminPartsCommands::ValidateYaml(args) => admin_parts_validate_yaml(args),
         AdminPartsCommands::BuildIndex(args) => admin_parts_build_index(args),
+        AdminPartsCommands::UploadPlan(args) => admin_parts_upload_plan(args),
     }
 }
 
@@ -24990,6 +25047,290 @@ fn admin_parts_build_index(args: &AdminPartsBuildIndexArgs) -> Result<()> {
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn admin_parts_upload_plan(args: &AdminPartsUploadPlanArgs) -> Result<()> {
+    let layout_dir = absolutize(args.layout_dir.clone())?;
+    let hf_token_file = args.hf_token_file.clone().map(absolutize).transpose()?;
+    let report = admin_parts_upload_plan_report(AdminPartsUploadPlanInput {
+        layout_dir,
+        repo: args.repo.clone(),
+        repo_type: args.repo_type.clone(),
+        commit_message: args.commit_message.clone(),
+        hf_token_file,
+    })?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Comfy parts index upload command plan.");
+        println!("Layout: {}", report.layout_dir);
+        println!("Repository: {} ({})", report.repo, report.repo_type);
+        println!(
+            "Anchor: index_ver={}, root={}, hash={}",
+            report.index_ver, report.index_root, report.anchor_hash
+        );
+        println!(
+            "Coverage: {} records, {} files, {} bytes",
+            report.record_count, report.layout_file_count, report.layout_total_bytes
+        );
+        println!("Preflight: {}", report.preflight_command.shell);
+        println!("Upload: {}", report.upload_command.shell);
+        println!("Revision: {}", report.revision_command.shell);
+        println!("Index URL template: {}", report.uploaded_index_url_template);
+        println!(
+            "Anchor URL template: {}",
+            report.uploaded_anchor_url_template
+        );
+    }
+    Ok(())
+}
+
+struct AdminPartsUploadPlanInput {
+    layout_dir: PathBuf,
+    repo: String,
+    repo_type: String,
+    commit_message: String,
+    hf_token_file: Option<PathBuf>,
+}
+
+fn admin_parts_upload_plan_report(
+    input: AdminPartsUploadPlanInput,
+) -> Result<AdminPartsUploadPlanReport> {
+    validate_huggingface_repo_id(&input.repo)?;
+    validate_huggingface_repo_type(&input.repo_type)?;
+    ensure!(
+        !input.commit_message.trim().is_empty(),
+        "--commit-message must be non-empty"
+    );
+    let verified = verify_comfy_parts_layout(&input.layout_dir)?;
+    let preflight_command =
+        catalog_artifact_publish_preflight_command(input.hf_token_file.as_deref());
+    let mut upload_command = catalog_canary_plan_command(vec![
+        "hf".to_owned(),
+        "upload".to_owned(),
+        "--repo-type".to_owned(),
+        input.repo_type.clone(),
+        "--commit-message".to_owned(),
+        input.commit_message,
+        input.repo.clone(),
+        input.layout_dir.display().to_string(),
+        ".".to_owned(),
+    ]);
+    upload_command.shell =
+        with_hf_shell_prefix(upload_command.shell, input.hf_token_file.as_deref(), true);
+    let repo_literal = serde_json::to_string(&input.repo).expect("repo string serializes");
+    let repo_type_literal =
+        serde_json::to_string(&input.repo_type).expect("repo type string serializes");
+    let revision_script = format!(
+        "from huggingface_hub import HfApi; import os; print(HfApi(token=os.environ.get('HF_TOKEN')).repo_info(repo_id={repo_literal}, repo_type={repo_type_literal}).sha)"
+    );
+    let mut revision_command =
+        catalog_canary_plan_command(vec!["python3".to_owned(), "-c".to_owned(), revision_script]);
+    revision_command.shell = with_hf_shell_prefix(
+        revision_command.shell,
+        input.hf_token_file.as_deref(),
+        false,
+    );
+    let index_url = huggingface_resolve_url_template(&input.repo_type, &input.repo, "index.json")?;
+    let anchor_url =
+        huggingface_resolve_url_template(&input.repo_type, &input.repo, "anchor.json")?;
+
+    Ok(AdminPartsUploadPlanReport {
+        ok: true,
+        layout_dir: input.layout_dir.display().to_string(),
+        repo: input.repo,
+        repo_type: input.repo_type,
+        index_ver: verified.index.index_ver,
+        index_root: verified.index.root,
+        anchor_hash: verified.anchor_hash,
+        record_count: verified.index.parts.len() as u64,
+        layout_file_count: verified.file_count,
+        layout_total_bytes: verified.total_bytes,
+        preflight_command,
+        upload_command,
+        revision_command,
+        uploaded_index_url_template: index_url,
+        uploaded_anchor_url_template: anchor_url,
+        errors: Vec::new(),
+    })
+}
+
+fn verify_comfy_parts_layout(layout_dir: &Path) -> Result<VerifiedComfyPartsLayout> {
+    let index_path = layout_dir.join("index.json");
+    let anchor_path = layout_dir.join("anchor.json");
+    let index: mayhem_proto::ComfyPartsIndex = serde_json::from_value(read_json_file(&index_path)?)
+        .with_context(|| format!("parsing {}", index_path.display()))?;
+    ensure!(
+        index.schema_version == mayhem_proto::COMFY_PARTS_INDEX_SCHEMA_VERSION,
+        "Comfy parts index schema version mismatch: expected {}, got {}",
+        mayhem_proto::COMFY_PARTS_INDEX_SCHEMA_VERSION,
+        index.schema_version
+    );
+    let anchor: mayhem_proto::ComfyPartsAnchor =
+        serde_json::from_value(read_json_file(&anchor_path)?)
+            .with_context(|| format!("parsing {}", anchor_path.display()))?;
+    anchor
+        .validate()
+        .with_context(|| format!("validating {}", anchor_path.display()))?;
+    ensure!(
+        anchor.parts_index_root == index.root,
+        "Comfy parts anchor root {} does not match index root {}",
+        anchor.parts_index_root,
+        index.root
+    );
+    ensure!(
+        anchor.index_ver == index.index_ver,
+        "Comfy parts anchor index_ver {} does not match index index_ver {}",
+        anchor.index_ver,
+        index.index_ver
+    );
+    let anchor_hash = mayhem_proto::comfy_parts_anchor_hash(&anchor)?;
+    let anchor_hash_path = layout_dir.join("anchor-hash.txt");
+    if anchor_hash_path.exists() {
+        let expected = fs::read_to_string(&anchor_hash_path)
+            .with_context(|| format!("reading {}", anchor_hash_path.display()))?;
+        ensure!(
+            expected.trim() == anchor_hash,
+            "{} does not match anchor.json hash",
+            anchor_hash_path.display()
+        );
+    }
+
+    let mut seen = BTreeSet::new();
+    for entry in &index.parts {
+        ensure!(
+            seen.insert(entry.part_id.clone()),
+            "duplicate part_id {} in index.json",
+            entry.part_id
+        );
+        let record_path = layout_dir
+            .join("records")
+            .join(format!("{}.json", entry.part_id));
+        let proof_path = layout_dir
+            .join("proofs")
+            .join(format!("{}.proof.json", entry.part_id));
+        let record: mayhem_proto::ComfyPartRecord =
+            serde_json::from_value(read_json_file(&record_path)?)
+                .with_context(|| format!("parsing {}", record_path.display()))?;
+        record
+            .validate()
+            .with_context(|| format!("validating {}", record_path.display()))?;
+        ensure!(
+            record.part_id == entry.part_id,
+            "record {} contains part_id {}, expected {}",
+            record_path.display(),
+            record.part_id,
+            entry.part_id
+        );
+        let record_hash = mayhem_proto::comfy_part_record_hash(&record)?;
+        ensure!(
+            record_hash == entry.record_hash,
+            "record hash mismatch for {}: index has {}, record hashes to {}",
+            entry.part_id,
+            entry.record_hash,
+            record_hash
+        );
+        ensure!(
+            record.part_type == entry.part_type
+                && record.lane == entry.lane
+                && record.status == entry.status,
+            "index metadata for {} does not match its record",
+            entry.part_id
+        );
+        let proof: mayhem_proto::ComfyPartMerkleProof =
+            serde_json::from_value(read_json_file(&proof_path)?)
+                .with_context(|| format!("parsing {}", proof_path.display()))?;
+        mayhem_proto::verify_comfy_part_proof(&record, &proof, &index.root)
+            .with_context(|| format!("verifying proof {}", proof_path.display()))?;
+    }
+    let (file_count, total_bytes) = comfy_parts_layout_file_stats(layout_dir)?;
+    Ok(VerifiedComfyPartsLayout {
+        index,
+        anchor_hash,
+        file_count,
+        total_bytes,
+    })
+}
+
+fn comfy_parts_layout_file_stats(layout_dir: &Path) -> Result<(u64, u64)> {
+    let metadata = fs::symlink_metadata(layout_dir)
+        .with_context(|| format!("inspecting {}", layout_dir.display()))?;
+    ensure!(
+        !metadata.file_type().is_symlink() && metadata.is_dir(),
+        "parts layout must be a real directory: {}",
+        layout_dir.display()
+    );
+    let mut stack = vec![layout_dir.to_path_buf()];
+    let mut file_count = 0_u64;
+    let mut total_bytes = 0_u64;
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("inspecting {}", path.display()))?;
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "parts layout upload refuses symlink {}",
+                path.display()
+            );
+            if metadata.is_dir() {
+                stack.push(path);
+            } else if metadata.is_file() {
+                file_count = file_count.saturating_add(1);
+                total_bytes = total_bytes.saturating_add(metadata.len());
+            } else {
+                bail!(
+                    "parts layout contains unsupported file type {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok((file_count, total_bytes))
+}
+
+fn validate_huggingface_repo_id(repo: &str) -> Result<()> {
+    let Some((namespace, name)) = repo.split_once('/') else {
+        bail!("Hugging Face repo must be namespace/name");
+    };
+    ensure!(
+        !namespace.contains('/') && !name.contains('/'),
+        "Hugging Face repo must be namespace/name"
+    );
+    for component in [namespace, name] {
+        ensure!(
+            !component.is_empty()
+                && component.len() <= 96
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+                && !component.starts_with('.')
+                && !component.ends_with('.'),
+            "Hugging Face repo contains an unsafe component"
+        );
+    }
+    Ok(())
+}
+
+fn validate_huggingface_repo_type(repo_type: &str) -> Result<()> {
+    ensure!(
+        matches!(repo_type, "model" | "dataset"),
+        "--repo-type must be model or dataset"
+    );
+    Ok(())
+}
+
+fn huggingface_resolve_url_template(repo_type: &str, repo: &str, path: &str) -> Result<String> {
+    validate_huggingface_repo_type(repo_type)?;
+    validate_huggingface_repo_id(repo)?;
+    validate_catalog_artifact_relative_path(path)?;
+    let prefix = if repo_type == "dataset" {
+        "https://huggingface.co/datasets"
+    } else {
+        "https://huggingface.co"
+    };
+    Ok(format!("{prefix}/{repo}/resolve/<revision>/{path}"))
 }
 
 #[derive(Debug, Serialize)]
@@ -86600,6 +86941,43 @@ mod tests {
     }
 
     #[test]
+    fn admin_parts_upload_plan_cli_parses_without_tx_flags() {
+        let parsed = Cli::try_parse_from([
+            "mayhem",
+            "admin",
+            "parts",
+            "upload-plan",
+            "--layout-dir",
+            "parts-index",
+            "--repo",
+            "TracNetwork/openmayhem-parts-index",
+            "--repo-type",
+            "dataset",
+            "--commit-message",
+            "Comfy parts test",
+            "--hf-token-file",
+            "hf.token",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Admin { command } = parsed.command else {
+            panic!("expected admin command");
+        };
+        let AdminCommands::Parts { command } = *command else {
+            panic!("expected admin parts command");
+        };
+        let AdminPartsCommands::UploadPlan(args) = command else {
+            panic!("expected admin parts upload-plan command");
+        };
+        assert_eq!(args.layout_dir, PathBuf::from("parts-index"));
+        assert_eq!(args.repo, "TracNetwork/openmayhem-parts-index");
+        assert_eq!(args.repo_type, "dataset");
+        assert_eq!(args.commit_message, "Comfy parts test");
+        assert_eq!(args.hf_token_file, Some(PathBuf::from("hf.token")));
+        assert!(args.json);
+    }
+
+    #[test]
     fn admin_parts_yaml_import_reports_importable_and_skipped_rows() {
         let rows = yaml_serde::from_str::<Value>(
             r#"
@@ -86691,6 +87069,87 @@ mod tests {
             assert_eq!(stored_record, record);
             mayhem_proto::verify_comfy_part_proof(&stored_record, &proof, &index.root).unwrap();
         }
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn admin_parts_upload_plan_verifies_layout_and_prints_hf_commands() {
+        let temp = test_temp_dir("mayhem-admin-parts-upload-plan");
+        let source_dir = temp.join("source");
+        let layout_dir = temp.join("layout");
+        fs::create_dir_all(&source_dir).unwrap();
+        let record = test_comfy_part_record("4x upload test", "77");
+        let record_path = source_dir.join("record.json");
+        write_json_file(&record_path, &record).unwrap();
+        admin_parts_build_index(&AdminPartsBuildIndexArgs {
+            records: vec![record_path],
+            output_dir: layout_dir.clone(),
+            index_ver: 12,
+            blessed_runtimes: vec!["comfyui-v0.30.1".to_owned()],
+            whitelist_ver: 4,
+            outcome_classes_ver: 5,
+        })
+        .unwrap();
+
+        let report = admin_parts_upload_plan_report(AdminPartsUploadPlanInput {
+            layout_dir: layout_dir.clone(),
+            repo: "TracNetwork/openmayhem-parts-index".to_owned(),
+            repo_type: "model".to_owned(),
+            commit_message: "Mayhem Comfy parts test".to_owned(),
+            hf_token_file: Some(PathBuf::from("hf-token.txt")),
+        })
+        .unwrap();
+
+        assert!(report.ok);
+        assert_eq!(report.index_ver, 12);
+        assert_eq!(report.record_count, 1);
+        assert!(report.layout_file_count >= 5);
+        assert!(report.upload_command.argv.contains(&"upload".to_owned()));
+        assert!(report
+            .upload_command
+            .shell
+            .contains("HF_XET_HIGH_PERFORMANCE=1"));
+        assert!(report.upload_command.shell.contains("hf-token.txt"));
+        assert_eq!(
+            report.uploaded_index_url_template,
+            "https://huggingface.co/TracNetwork/openmayhem-parts-index/resolve/<revision>/index.json"
+        );
+        assert!(report.revision_command.shell.contains("repo_info"));
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admin_parts_upload_plan_rejects_symlinked_layout_content() {
+        let temp = test_temp_dir("mayhem-admin-parts-upload-plan-symlink");
+        let source_dir = temp.join("source");
+        let layout_dir = temp.join("layout");
+        fs::create_dir_all(&source_dir).unwrap();
+        let record = test_comfy_part_record("4x symlink test", "88");
+        let record_path = source_dir.join("record.json");
+        write_json_file(&record_path, &record).unwrap();
+        admin_parts_build_index(&AdminPartsBuildIndexArgs {
+            records: vec![record_path],
+            output_dir: layout_dir.clone(),
+            index_ver: 13,
+            blessed_runtimes: vec!["comfyui-v0.30.1".to_owned()],
+            whitelist_ver: 4,
+            outcome_classes_ver: 5,
+        })
+        .unwrap();
+        std::os::unix::fs::symlink(layout_dir.join("index.json"), layout_dir.join("leak.json"))
+            .unwrap();
+
+        let err = admin_parts_upload_plan_report(AdminPartsUploadPlanInput {
+            layout_dir,
+            repo: "TracNetwork/openmayhem-parts-index".to_owned(),
+            repo_type: "model".to_owned(),
+            commit_message: "Mayhem Comfy parts test".to_owned(),
+            hf_token_file: None,
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("refuses symlink"), "{err:#}");
         let _ = fs::remove_dir_all(temp);
     }
 
