@@ -4235,13 +4235,21 @@ struct AdminPartsOnboardArgs {
     #[arg(long = "license-captured-at")]
     license_captured_at: String,
 
-    /// Hash of the canary probe graph for this part.
+    /// Canary probe graph JSON to hash for this part.
+    #[arg(long = "canary-graph", value_name = "PATH")]
+    canary_graph: Option<PathBuf>,
+
+    /// Precomputed hash of the canary probe graph for this part.
     #[arg(long = "canary-graph-hash")]
-    canary_graph_hash: String,
+    canary_graph_hash: Option<String>,
 
     /// Reference to the canary output artifact.
     #[arg(long = "canary-output-ref")]
     canary_output_ref: String,
+
+    /// Local canary output artifact to fingerprint into the onboarding receipt.
+    #[arg(long = "canary-output", value_name = "PATH")]
+    canary_output: Option<PathBuf>,
 
     /// Canary tolerance method.
     #[arg(long = "canary-tolerance-method", default_value = "phash")]
@@ -24931,6 +24939,8 @@ struct AdminPartsOnboardReport {
 struct AdminPartsOnboardCanaryReport {
     probe_graph_hash: String,
     reference_output_ref: String,
+    reference_output_sha256: Option<String>,
+    reference_output_fingerprint: Option<String>,
     tolerance_method: String,
     max_distance_bps: u32,
 }
@@ -25092,6 +25102,8 @@ fn admin_parts_onboard(args: &AdminPartsOnboardArgs) -> Result<()> {
     let output_dir = args.output_dir.clone().map(absolutize).transpose()?;
     let receipt_dir = args.receipt_dir.clone().map(absolutize).transpose()?;
     let license_doc = args.license_doc.clone().map(absolutize).transpose()?;
+    let canary_graph = args.canary_graph.clone().map(absolutize).transpose()?;
+    let canary_output = args.canary_output.clone().map(absolutize).transpose()?;
     if args.all {
         ensure!(args.row_index == 1, "--row-index cannot be used with --all");
         let report = admin_parts_onboard_batch_report(AdminPartsOnboardBatchInput {
@@ -25108,8 +25120,10 @@ fn admin_parts_onboard(args: &AdminPartsOnboardArgs) -> Result<()> {
             license_doc_hash: args.license_doc_hash.clone(),
             license_ref: args.license_ref.clone(),
             license_captured_at: args.license_captured_at.clone(),
+            canary_graph,
             canary_graph_hash: args.canary_graph_hash.clone(),
             canary_output_ref: args.canary_output_ref.clone(),
+            canary_output,
             canary_tolerance_method: args.canary_tolerance_method.clone(),
             canary_max_distance_bps: args.canary_max_distance_bps,
             chunk_size: args.chunk_size,
@@ -25147,8 +25161,10 @@ fn admin_parts_onboard(args: &AdminPartsOnboardArgs) -> Result<()> {
         license_doc_hash: args.license_doc_hash.clone(),
         license_ref: args.license_ref.clone(),
         license_captured_at: args.license_captured_at.clone(),
+        canary_graph,
         canary_graph_hash: args.canary_graph_hash.clone(),
         canary_output_ref: args.canary_output_ref.clone(),
+        canary_output,
         canary_tolerance_method: args.canary_tolerance_method.clone(),
         canary_max_distance_bps: args.canary_max_distance_bps,
         chunk_size: args.chunk_size,
@@ -25185,8 +25201,10 @@ struct AdminPartsOnboardInput {
     license_doc_hash: Option<String>,
     license_ref: String,
     license_captured_at: String,
-    canary_graph_hash: String,
+    canary_graph: Option<PathBuf>,
+    canary_graph_hash: Option<String>,
     canary_output_ref: String,
+    canary_output: Option<PathBuf>,
     canary_tolerance_method: String,
     canary_max_distance_bps: u32,
     chunk_size: usize,
@@ -25207,8 +25225,10 @@ struct AdminPartsOnboardBatchInput {
     license_doc_hash: Option<String>,
     license_ref: String,
     license_captured_at: String,
-    canary_graph_hash: String,
+    canary_graph: Option<PathBuf>,
+    canary_graph_hash: Option<String>,
     canary_output_ref: String,
+    canary_output: Option<PathBuf>,
     canary_tolerance_method: String,
     canary_max_distance_bps: u32,
     chunk_size: usize,
@@ -25314,23 +25334,29 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
             ("license_captured_at", input.license_captured_at.clone()),
         ],
     ));
-    let canary_graph_hash = input.canary_graph_hash.to_ascii_lowercase();
-    ensure!(
-        is_hex_len(&canary_graph_hash, 64),
-        "--canary-graph-hash must be 32-byte hex"
-    );
-    steps.push(admin_parts_onboard_step(
-        "canary_bound",
-        &[
-            ("probe_graph_hash", canary_graph_hash.clone()),
-            ("reference_output_ref", input.canary_output_ref.clone()),
-            ("tolerance_method", input.canary_tolerance_method.clone()),
-            (
-                "max_distance_bps",
-                input.canary_max_distance_bps.to_string(),
-            ),
-        ],
-    ));
+    let canary_graph_hash = comfy_part_canary_graph_hash(
+        input.canary_graph.as_deref(),
+        input.canary_graph_hash.as_deref(),
+    )?;
+    let canary_output_evidence = comfy_part_canary_output_evidence(
+        input.canary_output.as_deref(),
+        &input.canary_tolerance_method,
+    )?;
+    let mut canary_fields = vec![
+        ("probe_graph_hash", canary_graph_hash.clone()),
+        ("reference_output_ref", input.canary_output_ref.clone()),
+        ("tolerance_method", input.canary_tolerance_method.clone()),
+        (
+            "max_distance_bps",
+            input.canary_max_distance_bps.to_string(),
+        ),
+    ];
+    if let Some(evidence) = &canary_output_evidence {
+        canary_fields.push(("reference_output_sha256", evidence.sha256.clone()));
+        canary_fields.push(("reference_output_fingerprint", evidence.fingerprint.clone()));
+        canary_fields.push(("reference_output_path", evidence.path.clone()));
+    }
+    steps.push(admin_parts_onboard_step("canary_bound", &canary_fields));
     let record = draft.finalize(
         merkle.root.clone(),
         input.min_runtime.clone(),
@@ -25379,6 +25405,12 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
         canary: AdminPartsOnboardCanaryReport {
             probe_graph_hash: canary_graph_hash,
             reference_output_ref: input.canary_output_ref,
+            reference_output_sha256: canary_output_evidence
+                .as_ref()
+                .map(|evidence| evidence.sha256.clone()),
+            reference_output_fingerprint: canary_output_evidence
+                .as_ref()
+                .map(|evidence| evidence.fingerprint.clone()),
             tolerance_method: input.canary_tolerance_method,
             max_distance_bps: input.canary_max_distance_bps,
         },
@@ -25433,8 +25465,10 @@ fn admin_parts_onboard_batch_report(
             license_doc_hash: input.license_doc_hash.clone(),
             license_ref: input.license_ref.clone(),
             license_captured_at: input.license_captured_at.clone(),
+            canary_graph: input.canary_graph.clone(),
             canary_graph_hash: input.canary_graph_hash.clone(),
             canary_output_ref: input.canary_output_ref.clone(),
+            canary_output: input.canary_output.clone(),
             canary_tolerance_method: input.canary_tolerance_method.clone(),
             canary_max_distance_bps: input.canary_max_distance_bps,
             chunk_size: input.chunk_size,
@@ -25479,6 +25513,60 @@ fn admin_parts_onboard_step(step: &str, fields: &[(&str, String)]) -> AdminParts
             .map(|(key, value)| ((*key).to_owned(), value.clone()))
             .collect(),
     }
+}
+
+struct AdminPartsCanaryOutputEvidence {
+    path: String,
+    sha256: String,
+    fingerprint: String,
+}
+
+fn comfy_part_canary_graph_hash(graph: Option<&Path>, hash: Option<&str>) -> Result<String> {
+    match (graph, hash) {
+        (Some(_), Some(_)) => bail!("pass only one of --canary-graph or --canary-graph-hash"),
+        (Some(path), None) => file_sha256_hex(path)
+            .with_context(|| format!("hashing canary graph {}", path.display())),
+        (None, Some(hash)) => {
+            let normalized = hash.to_ascii_lowercase();
+            ensure!(
+                is_hex_len(&normalized, 64),
+                "--canary-graph-hash must be 32-byte hex"
+            );
+            Ok(normalized)
+        }
+        (None, None) => bail!("pass --canary-graph or --canary-graph-hash"),
+    }
+}
+
+fn comfy_part_canary_output_evidence(
+    output: Option<&Path>,
+    tolerance_method: &str,
+) -> Result<Option<AdminPartsCanaryOutputEvidence>> {
+    let Some(path) = output else {
+        return Ok(None);
+    };
+    let bytes =
+        fs::read(path).with_context(|| format!("reading canary output {}", path.display()))?;
+    let sha256 = sha256_bytes_hex(&bytes);
+    let method = tolerance_method.trim().to_ascii_lowercase();
+    let fingerprint = match method.as_str() {
+        "phash" | "average_hash" | "image_average_hash" => {
+            image_average_hash_hex(&bytes).map_err(anyhow::Error::msg)?
+        }
+        "audio_fingerprint" => audio_fingerprint(&bytes),
+        CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT => {
+            video_av_fingerprint(&bytes).map_err(anyhow::Error::msg)?
+        }
+        "sha256" | "exact_sha256" => sha256.clone(),
+        other => bail!(
+            "--canary-output cannot fingerprint tolerance method {other}; pass a supported method or omit --canary-output"
+        ),
+    };
+    Ok(Some(AdminPartsCanaryOutputEvidence {
+        path: path.display().to_string(),
+        sha256,
+        fingerprint,
+    }))
 }
 
 fn admin_parts_resolve_payload(
@@ -87896,6 +87984,9 @@ mod tests {
         assert_eq!(args.receipt_dir, None);
         assert_eq!(args.min_runtime, "comfyui-v0.30.1");
         assert_eq!(args.license_doc_hash, Some("11".repeat(32)));
+        assert_eq!(args.canary_graph_hash, Some("22".repeat(32)));
+        assert_eq!(args.canary_graph, None);
+        assert_eq!(args.canary_output, None);
         assert_eq!(args.canary_max_distance_bps, 12);
         assert_eq!(args.chunk_size, 8);
         assert!(args.force);
@@ -87954,6 +88045,9 @@ mod tests {
         assert_eq!(args.output, None);
         assert_eq!(args.output_dir, Some(PathBuf::from("records")));
         assert_eq!(args.receipt_dir, Some(PathBuf::from("receipts")));
+        assert_eq!(args.canary_graph_hash, Some("22".repeat(32)));
+        assert_eq!(args.canary_graph, None);
+        assert_eq!(args.canary_output, None);
         assert!(args.json);
     }
 
@@ -88106,8 +88200,10 @@ mod tests {
             license_doc_hash: None,
             license_ref: "license:test".to_owned(),
             license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
-            canary_graph_hash: "44".repeat(32),
+            canary_graph: None,
+            canary_graph_hash: Some("44".repeat(32)),
             canary_output_ref: "canaries/test.png".to_owned(),
+            canary_output: None,
             canary_tolerance_method: "phash".to_owned(),
             canary_max_distance_bps: 10,
             chunk_size: 8,
@@ -88166,8 +88262,10 @@ mod tests {
             license_doc_hash: None,
             license_ref: "license:test".to_owned(),
             license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
-            canary_graph_hash: "44".repeat(32),
+            canary_graph: None,
+            canary_graph_hash: Some("44".repeat(32)),
             canary_output_ref: "canaries/test.png".to_owned(),
+            canary_output: None,
             canary_tolerance_method: "phash".to_owned(),
             canary_max_distance_bps: 10,
             chunk_size: 8,
@@ -88220,8 +88318,10 @@ status: linked
             license_doc_hash: Some("33".repeat(32)),
             license_ref: "license:test".to_owned(),
             license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
-            canary_graph_hash: "44".repeat(32),
+            canary_graph: None,
+            canary_graph_hash: Some("44".repeat(32)),
             canary_output_ref: "canaries/test.png".to_owned(),
+            canary_output: None,
             canary_tolerance_method: "phash".to_owned(),
             canary_max_distance_bps: 10,
             chunk_size: 8,
@@ -88237,6 +88337,92 @@ status: linked
         );
         assert_eq!(report.payload, payload_path.display().to_string());
         assert_eq!(report.sha256, sha256);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn admin_parts_onboard_computes_canary_graph_and_output_evidence() {
+        let temp = test_temp_dir("mayhem-admin-parts-onboard-canary-files");
+        fs::create_dir_all(&temp).unwrap();
+        let payload_path = temp.join("payload.bin");
+        fs::write(&payload_path, b"canary evidence payload").unwrap();
+        let graph_path = temp.join("graph.json");
+        fs::write(&graph_path, br#"{"nodes":[{"class_type":"SaveImage"}]}"#).unwrap();
+        let output_path = temp.join("reference.png");
+        let image = image::RgbaImage::from_pixel(8, 8, image::Rgba([128, 64, 32, 255]));
+        image.save(&output_path).unwrap();
+        let sha256 = file_sha256_hex(&payload_path).unwrap();
+        let size_bytes = fs::metadata(&payload_path).unwrap().len();
+        let input_path = temp.join("part.yaml");
+        fs::write(
+            &input_path,
+            format!(
+                r#"
+name: "canary evidence"
+type: upscaler
+lane: all
+license: MIT
+file_format: bin
+sha256: "{sha256}"
+size_bytes: {size_bytes}
+download_url: "https://huggingface.co/TracNetwork/openmayhem-parts/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/payload.bin"
+status: linked
+"#
+            ),
+        )
+        .unwrap();
+
+        let report = admin_parts_onboard_report(AdminPartsOnboardInput {
+            input: input_path,
+            row_index: 1,
+            payload: Some(payload_path),
+            download_dir: None,
+            source_token_file: None,
+            disk_reserve: None,
+            output: temp.join("record.json"),
+            receipt_dir: None,
+            min_runtime: "comfyui-v0.30.1".to_owned(),
+            license_doc: None,
+            license_doc_hash: Some("33".repeat(32)),
+            license_ref: "license:test".to_owned(),
+            license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
+            canary_graph: Some(graph_path.clone()),
+            canary_graph_hash: None,
+            canary_output_ref: "canaries/reference.png".to_owned(),
+            canary_output: Some(output_path.clone()),
+            canary_tolerance_method: "phash".to_owned(),
+            canary_max_distance_bps: 10,
+            chunk_size: 8,
+            force: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            report.canary.probe_graph_hash,
+            file_sha256_hex(&graph_path).unwrap()
+        );
+        assert_eq!(
+            report.canary.reference_output_sha256.as_deref(),
+            Some(file_sha256_hex(&output_path).unwrap().as_str())
+        );
+        let fingerprint = report
+            .canary
+            .reference_output_fingerprint
+            .as_deref()
+            .unwrap();
+        assert_eq!(fingerprint.len(), 16, "{fingerprint}");
+        assert!(
+            fingerprint.chars().all(|ch| ch.is_ascii_hexdigit()),
+            "{fingerprint}"
+        );
+        let canary_step = report
+            .steps
+            .iter()
+            .find(|step| step.step == "canary_bound")
+            .unwrap();
+        assert!(canary_step
+            .fields
+            .contains_key("reference_output_fingerprint"));
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -88297,8 +88483,10 @@ status: linked
             license_doc_hash: Some("33".repeat(32)),
             license_ref: "license:batch-test".to_owned(),
             license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
-            canary_graph_hash: "44".repeat(32),
+            canary_graph: None,
+            canary_graph_hash: Some("44".repeat(32)),
             canary_output_ref: "canaries/batch.png".to_owned(),
+            canary_output: None,
             canary_tolerance_method: "phash".to_owned(),
             canary_max_distance_bps: 10,
             chunk_size: 8,
@@ -88361,8 +88549,10 @@ status: linked
             license_doc_hash: Some("33".repeat(32)),
             license_ref: "license:test".to_owned(),
             license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
-            canary_graph_hash: "44".repeat(32),
+            canary_graph: None,
+            canary_graph_hash: Some("44".repeat(32)),
             canary_output_ref: "canaries/test.png".to_owned(),
+            canary_output: None,
             canary_tolerance_method: "phash".to_owned(),
             canary_max_distance_bps: 10,
             chunk_size: 8,
@@ -88419,8 +88609,10 @@ status: linked
             license_doc_hash: Some("33".repeat(32)),
             license_ref: "license:test".to_owned(),
             license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
-            canary_graph_hash: "44".repeat(32),
+            canary_graph: None,
+            canary_graph_hash: Some("44".repeat(32)),
             canary_output_ref: "canaries/test.png".to_owned(),
+            canary_output: None,
             canary_tolerance_method: "phash".to_owned(),
             canary_max_distance_bps: 10,
             chunk_size: 8,
@@ -88476,8 +88668,10 @@ status: linked
             license_doc_hash: Some("33".repeat(32)),
             license_ref: "license:controlnet-test".to_owned(),
             license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
-            canary_graph_hash: "44".repeat(32),
+            canary_graph: None,
+            canary_graph_hash: Some("44".repeat(32)),
             canary_output_ref: "canaries/controlnet.png".to_owned(),
+            canary_output: None,
             canary_tolerance_method: "phash".to_owned(),
             canary_max_distance_bps: 10,
             chunk_size: 8,
