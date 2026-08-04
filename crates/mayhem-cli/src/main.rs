@@ -25431,12 +25431,18 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
         draft.size_bytes = payload_metadata.len();
         draft.size_bytes_exact = true;
     }
+    if draft.file_format == "unknown" {
+        if let Some(file_format) = comfy_part_file_format_from_payload_path(&payload_path) {
+            draft.file_format = file_format;
+        }
+    }
     steps.push(admin_parts_onboard_step(
         "payload_verified",
         &[
             ("sha256", sha256.clone()),
             ("size_bytes", payload_metadata.len().to_string()),
             ("size_bytes_exact", draft.size_bytes_exact.to_string()),
+            ("file_format", draft.file_format.clone()),
         ],
     ));
     let merkle = build_merkle_manifest(&payload_path, input.chunk_size)?;
@@ -26191,6 +26197,17 @@ fn write_comfy_canary_artifact_idempotent(
     }
     fs::write(output, bytes).with_context(|| format!("writing {}", output.display()))?;
     Ok(false)
+}
+
+fn comfy_part_file_format_from_payload_path(path: &Path) -> Option<String> {
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    match extension.as_str() {
+        "safetensors" => Some("safetensors".to_owned()),
+        "pth" => Some("pickle(.pth)".to_owned()),
+        "pt" => Some("pickle(.pt)".to_owned()),
+        "bin" => Some("pickle(.bin)".to_owned()),
+        _ => None,
+    }
 }
 
 fn comfy_part_canary_output_evidence(
@@ -89150,7 +89167,7 @@ mod tests {
     fn admin_parts_onboard_finalizes_approximate_yaml_size_to_verified_payload_size() {
         let temp = test_temp_dir("mayhem-admin-parts-onboard-approx-size");
         fs::create_dir_all(&temp).unwrap();
-        let payload_path = temp.join("payload.bin");
+        let payload_path = temp.join("payload.safetensors");
         fs::write(&payload_path, b"smaller than the yaml gb cap").unwrap();
         let sha256 = file_sha256_hex(&payload_path).unwrap();
         let size_bytes = fs::metadata(&payload_path).unwrap().len();
@@ -89163,10 +89180,9 @@ name: "approx sized payload"
 type: checkpoint
 lane: sdxl
 license: MIT
-file_format: bin
 sha256: "{sha256}"
 size_gb: 0.001
-download_url: "https://huggingface.co/TracNetwork/openmayhem-parts/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/payload.bin"
+source: "https://civitai.com/models/123"
 status: linked
 "#
             ),
@@ -89207,6 +89223,7 @@ status: linked
         let record: mayhem_proto::ComfyPartRecord =
             serde_json::from_value(read_json_file(&output_path).unwrap()).unwrap();
         assert_eq!(record.size_bytes, size_bytes);
+        assert_eq!(record.file_format, "safetensors");
         let _ = fs::remove_dir_all(temp);
     }
 
