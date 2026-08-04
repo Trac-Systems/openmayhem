@@ -24,7 +24,7 @@ async function receiptHead(ordinal, {
   billingEpoch = settlementEpoch,
 } = {}) {
   const body = {
-    schema_version: 10,
+    schema_version: 11,
     session_id: hex(1_000 + ordinal),
     billing_id: hex(ordinal),
     billing_attempt: 0,

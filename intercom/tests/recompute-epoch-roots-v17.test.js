@@ -25,7 +25,7 @@ async function canonicalBundle(count, {
   for (const ordinal of order) {
     const billingId = hex(ordinal);
     const body = {
-      schema_version: 10,
+      schema_version: 11,
       session_id: hex(10_000 + ordinal),
       billing_id: billingId,
       billing_attempt: 0,
@@ -192,7 +192,7 @@ test('v17 recompute rejects v9, epoch, reservation, and payout drift', async () 
     recomputeEpoch(await canonicalBundle(1, {
       mutateBody: (body) => { body.schema_version = 9; },
     })),
-    /schema_version must be 10/,
+    /schema_version must be 11/,
   );
   await assert.rejects(
     recomputeEpoch(await canonicalBundle(1, {

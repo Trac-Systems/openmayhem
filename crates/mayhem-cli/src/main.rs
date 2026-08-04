@@ -4160,6 +4160,42 @@ struct AdminPublishCatalogArgs {
     /// Source label for the release URLs.
     #[arg(long, default_value = "huggingface")]
     source_kind: String,
+
+    /// Directory containing a verified Comfy parts-index layout to anchor with this catalog.
+    #[arg(long = "parts-layout-dir", value_name = "PATH")]
+    parts_layout_dir: Option<PathBuf>,
+
+    /// Immutable HTTPS URL for the published Comfy parts index.json.
+    #[arg(long = "parts-index-url")]
+    parts_index_url: Option<String>,
+
+    /// Immutable HTTPS URL for the published Comfy parts anchor.json.
+    #[arg(long = "parts-anchor-url")]
+    parts_anchor_url: Option<String>,
+
+    /// Source label for the parts index URLs.
+    #[arg(long = "parts-source-kind", default_value = "huggingface")]
+    parts_source_kind: String,
+
+    /// Immutable source revision for the parts index layout.
+    #[arg(long = "parts-repo-revision")]
+    parts_repo_revision: Option<String>,
+
+    /// JSON array of blessed Comfy runtime records.
+    #[arg(long = "blessed-runtimes-json")]
+    blessed_runtimes_json: Option<String>,
+
+    /// Path to a JSON array of blessed Comfy runtime records.
+    #[arg(long = "blessed-runtimes-file", value_name = "PATH")]
+    blessed_runtimes_file: Option<PathBuf>,
+
+    /// JSON array of workflow outcome-class references.
+    #[arg(long = "outcome-classes-json")]
+    outcome_classes_json: Option<String>,
+
+    /// Path to a JSON array of workflow outcome-class references.
+    #[arg(long = "outcome-classes-file", value_name = "PATH")]
+    outcome_classes_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -25063,6 +25099,7 @@ struct AdminPartsUploadPlanReport {
 
 struct VerifiedComfyPartsLayout {
     index: mayhem_proto::ComfyPartsIndex,
+    anchor: mayhem_proto::ComfyPartsAnchor,
     anchor_hash: String,
     file_count: u64,
     total_bytes: u64,
@@ -26987,6 +27024,7 @@ fn verify_comfy_parts_layout(layout_dir: &Path) -> Result<VerifiedComfyPartsLayo
     let (file_count, total_bytes) = comfy_parts_layout_file_stats(layout_dir)?;
     Ok(VerifiedComfyPartsLayout {
         index,
+        anchor,
         anchor_hash,
         file_count,
         total_bytes,
@@ -29833,7 +29871,7 @@ fn admin_publish_catalog_payload(args: &AdminPublishCatalogArgs) -> Result<Value
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(json!({
+    let mut payload = json!({
         "op": "publish_catalog",
         "catalog_id": catalog_doc.catalog_id,
         "source_kind": args.source_kind,
@@ -29846,7 +29884,96 @@ fn admin_publish_catalog_payload(args: &AdminPublishCatalogArgs) -> Result<Value
         "model_count": report.model_count,
         "artifact_count": report.artifact_count,
         "canaries": canaries,
-    }))
+    });
+    if let Some(parts_anchor) = admin_publish_catalog_parts_anchor_payload(args)? {
+        payload["parts_anchor"] = parts_anchor;
+    }
+    if let Some(blessed_runtimes) = optional_json_arg_or_file(
+        args.blessed_runtimes_json.as_deref(),
+        args.blessed_runtimes_file.as_ref(),
+        "blessed runtimes",
+    )? {
+        ensure!(
+            blessed_runtimes.is_array(),
+            "blessed runtimes must be a JSON array"
+        );
+        payload["blessed_runtimes"] = blessed_runtimes;
+    }
+    if let Some(outcome_classes) = optional_json_arg_or_file(
+        args.outcome_classes_json.as_deref(),
+        args.outcome_classes_file.as_ref(),
+        "outcome classes",
+    )? {
+        ensure!(
+            outcome_classes.is_array(),
+            "outcome classes must be a JSON array"
+        );
+        payload["outcome_classes"] = outcome_classes;
+    }
+    Ok(payload)
+}
+
+fn admin_publish_catalog_parts_anchor_payload(
+    args: &AdminPublishCatalogArgs,
+) -> Result<Option<Value>> {
+    let any_parts_anchor_flag = args.parts_layout_dir.is_some()
+        || args.parts_index_url.is_some()
+        || args.parts_anchor_url.is_some()
+        || args.parts_repo_revision.is_some()
+        || args.parts_source_kind != "huggingface";
+    if !any_parts_anchor_flag {
+        return Ok(None);
+    }
+    let layout_dir = args
+        .parts_layout_dir
+        .as_ref()
+        .context("--parts-layout-dir is required when anchoring Comfy parts")?;
+    let index_url = args
+        .parts_index_url
+        .as_ref()
+        .context("--parts-index-url is required when anchoring Comfy parts")?;
+    let anchor_url = args
+        .parts_anchor_url
+        .as_ref()
+        .context("--parts-anchor-url is required when anchoring Comfy parts")?;
+    let repo_revision = args
+        .parts_repo_revision
+        .as_ref()
+        .context("--parts-repo-revision is required when anchoring Comfy parts")?;
+    validate_catalog_source_url(&args.parts_source_kind, index_url, "--parts-index-url")?;
+    validate_catalog_source_url(&args.parts_source_kind, anchor_url, "--parts-anchor-url")?;
+    if args.parts_source_kind == "huggingface" {
+        ensure!(
+            is_hex_len(repo_revision, 40),
+            "--parts-repo-revision must be a 40-hex Hugging Face commit revision"
+        );
+        ensure!(
+            pinned_huggingface_resolve_revision(index_url, "--parts-index-url")?
+                == repo_revision.as_str(),
+            "--parts-index-url revision must match --parts-repo-revision"
+        );
+        ensure!(
+            pinned_huggingface_resolve_revision(anchor_url, "--parts-anchor-url")?
+                == repo_revision.as_str(),
+            "--parts-anchor-url revision must match --parts-repo-revision"
+        );
+    } else {
+        ensure!(
+            is_safe_key_part(repo_revision),
+            "--parts-repo-revision must be a safe immutable revision id"
+        );
+    }
+    let verified = verify_comfy_parts_layout(&absolutize(layout_dir.clone())?)?;
+    Ok(Some(json!({
+        "index_ver": verified.anchor.index_ver,
+        "source_kind": args.parts_source_kind,
+        "index_url": index_url,
+        "anchor_url": anchor_url,
+        "anchor_hash": verified.anchor_hash,
+        "index_root": verified.anchor.parts_index_root,
+        "record_count": verified.index.parts.len() as u64,
+        "repo_revision": repo_revision,
+    })))
 }
 
 fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Value> {
@@ -52897,6 +53024,11 @@ fn validate_catalog_source_url(source_kind: &str, value: &str, label: &str) -> R
 }
 
 fn validate_pinned_huggingface_resolve_url(value: &str, label: &str) -> Result<()> {
+    let _ = pinned_huggingface_resolve_revision(value, label)?;
+    Ok(())
+}
+
+fn pinned_huggingface_resolve_revision(value: &str, label: &str) -> Result<String> {
     let parsed = reqwest::Url::parse(value).with_context(|| format!("{label} is not a URL"))?;
     if parsed.host_str() != Some("huggingface.co") {
         bail!("{label} must use huggingface.co for source_kind=huggingface");
@@ -52917,7 +53049,7 @@ fn validate_pinned_huggingface_resolve_url(value: &str, label: &str) -> Result<(
     if segments.get(resolve_index + 2).is_none() {
         bail!("{label} must include a file path after the Hugging Face revision");
     }
-    Ok(())
+    Ok((*revision).to_owned())
 }
 
 fn catalog_release_url_join(base: &str, path: &str) -> Result<String> {
@@ -88614,6 +88746,15 @@ mod tests {
             signature_url: "https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json.sig".to_owned(),
             canaries_base_url: "https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries".to_owned(),
             source_kind: "huggingface".to_owned(),
+            parts_layout_dir: None,
+            parts_index_url: None,
+            parts_anchor_url: None,
+            parts_source_kind: "huggingface".to_owned(),
+            parts_repo_revision: None,
+            blessed_runtimes_json: None,
+            blessed_runtimes_file: None,
+            outcome_classes_json: None,
+            outcome_classes_file: None,
         };
 
         let payload = admin_publish_catalog_payload(&args).unwrap();
@@ -88643,6 +88784,106 @@ mod tests {
     }
 
     #[test]
+    fn admin_publish_catalog_payload_anchors_verified_comfy_parts_layout() {
+        let temp = test_temp_dir("mayhem-admin-publish-catalog-parts");
+        let catalog_path = temp.join("models.json");
+        write_semantically_valid_test_catalog(&catalog_path);
+        let seed_file = temp.join("catalog-seed.hex");
+        fs::write(&seed_file, "08".repeat(32)).unwrap();
+        let signature_path = temp.join("models.json.sig");
+        let keys_dir = temp.join("keys");
+        catalog_sign_report(CatalogSignRequest {
+            catalog_path: catalog_path.clone(),
+            signature_output: signature_path.clone(),
+            keys_dir: keys_dir.clone(),
+            key_id: "test-catalog-key".to_owned(),
+            seed_file,
+            write_key: true,
+            created_at: Some("2026-07-04T00:00:00Z".to_owned()),
+        })
+        .unwrap();
+        let parts_source_dir = temp.join("parts-source");
+        let parts_layout_dir = temp.join("parts-layout");
+        fs::create_dir_all(&parts_source_dir).unwrap();
+        let part = test_comfy_part_record("catalog anchor part", "44");
+        let part_path = parts_source_dir.join("part.json");
+        write_json_file(&part_path, &part).unwrap();
+        admin_parts_build_index(&AdminPartsBuildIndexArgs {
+            records: vec![part_path],
+            output_dir: parts_layout_dir.clone(),
+            index_ver: 7,
+            blessed_runtimes: vec!["comfyui-v0.30.1".to_owned()],
+            whitelist_ver: 3,
+            outcome_classes_ver: 4,
+        })
+        .unwrap();
+        let revision = "b".repeat(40);
+        let args = AdminPublishCatalogArgs {
+            tx: test_admin_tx_args(),
+            catalog_path: Some(catalog_path),
+            signature_path: Some(signature_path),
+            keys_dir: Some(keys_dir),
+            canaries_dir: Some(repo_path("catalog/canaries").unwrap()),
+            catalog_url: "https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json".to_owned(),
+            signature_url: "https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json.sig".to_owned(),
+            canaries_base_url: "https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries".to_owned(),
+            source_kind: "huggingface".to_owned(),
+            parts_layout_dir: Some(parts_layout_dir.clone()),
+            parts_index_url: Some(format!(
+                "https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/{revision}/index.json"
+            )),
+            parts_anchor_url: Some(format!(
+                "https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/{revision}/anchor.json"
+            )),
+            parts_source_kind: "huggingface".to_owned(),
+            parts_repo_revision: Some(revision.clone()),
+            blessed_runtimes_json: Some(
+                json!([{
+                    "runtime_id": "comfyui-v0.30.1",
+                    "comfy_release_hash": "1".repeat(64),
+                    "env_lock_hash": "2".repeat(64),
+                    "whitelist_ver": 3,
+                    "status": "blessed",
+                    "min_grace_epochs": 2,
+                }])
+                .to_string(),
+            ),
+            blessed_runtimes_file: None,
+            outcome_classes_json: Some(
+                json!([{
+                    "class_id": "image.light.512",
+                    "enclave_id": "3".repeat(64),
+                    "definition_hash": "4".repeat(64),
+                    "status": "active",
+                }])
+                .to_string(),
+            ),
+            outcome_classes_file: None,
+        };
+
+        let payload = admin_publish_catalog_payload(&args).unwrap();
+        let anchor: mayhem_proto::ComfyPartsAnchor =
+            serde_json::from_value(read_json_file(&parts_layout_dir.join("anchor.json")).unwrap())
+                .unwrap();
+        let anchor_hash = mayhem_proto::comfy_parts_anchor_hash(&anchor).unwrap();
+
+        assert_eq!(payload["parts_anchor"]["index_ver"], 7);
+        assert_eq!(
+            payload["parts_anchor"]["index_root"],
+            anchor.parts_index_root
+        );
+        assert_eq!(payload["parts_anchor"]["anchor_hash"], anchor_hash);
+        assert_eq!(payload["parts_anchor"]["record_count"], 1);
+        assert_eq!(payload["parts_anchor"]["repo_revision"], revision);
+        assert_eq!(
+            payload["blessed_runtimes"][0]["runtime_id"],
+            "comfyui-v0.30.1"
+        );
+        assert_eq!(payload["outcome_classes"][0]["class_id"], "image.light.512");
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn admin_publish_catalog_payload_rejects_mutable_huggingface_release_urls() {
         let args = AdminPublishCatalogArgs {
             tx: test_admin_tx_args(),
@@ -88654,6 +88895,15 @@ mod tests {
             signature_url: "https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/models.json.sig".to_owned(),
             canaries_base_url: "https://huggingface.co/TracNetwork/mayhem-catalog/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/canaries".to_owned(),
             source_kind: "huggingface".to_owned(),
+            parts_layout_dir: None,
+            parts_index_url: None,
+            parts_anchor_url: None,
+            parts_source_kind: "huggingface".to_owned(),
+            parts_repo_revision: None,
+            blessed_runtimes_json: None,
+            blessed_runtimes_file: None,
+            outcome_classes_json: None,
+            outcome_classes_file: None,
         };
 
         let err = admin_publish_catalog_payload(&args).unwrap_err();
@@ -92028,9 +92278,9 @@ status: linked
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 19);
+        assert_eq!(CONTRACT_VERSION, 20);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
-        assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 10);
+        assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 11);
     }
 
     #[test]

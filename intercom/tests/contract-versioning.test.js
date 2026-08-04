@@ -29,9 +29,9 @@ const versioningLockedRateMap = [
 const versioningBillingId = 'bb'.repeat(32);
 
 test('launch version gates cover A16/A17/D6/D7/M5/M6/M8 deterministic changes', () => {
-  assert.equal(CONTRACT_VERSION, 19);
+  assert.equal(CONTRACT_VERSION, 20);
   assert.deepEqual(signingMessageVersions(), [2]);
-  assert.equal(SESSION_RECEIPT_SCHEMA_VERSION, 10);
+  assert.equal(SESSION_RECEIPT_SCHEMA_VERSION, 11);
 });
 
 test('contract reports the exported contract version', async () => {
@@ -218,7 +218,7 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
     { unit: 'output_token', per_unit_au: '2500000000000000', granularity: 1000 },
   ];
   const voucher = {
-    schema_version: 10,
+    schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
     session_id: 'sess-au-roundtrip',
     billing_id: '44'.repeat(32),
     billing_attempt: 0,
@@ -248,7 +248,7 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
   };
   const expectedVoucher = [
     '{"domain":"mayhem-spend-voucher","signing_version":2,"body":{',
-    '"schema_version":10,"session_id":"sess-au-roundtrip","billing_id":"',
+    '"schema_version":11,"session_id":"sess-au-roundtrip","billing_id":"',
     '44'.repeat(32),
     '","billing_attempt":0,"billing_prior_usage":{},"billing_prior_au_owed_cum":"0",',
     '"billing_epoch":7,"reservation_id":"',
@@ -308,7 +308,7 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
   };
   const expectedReceipt = [
     '{"domain":"mayhem-session-receipt","signing_version":2,"body":{',
-    '"schema_version":10,"session_id":"sess-au-roundtrip","billing_id":"',
+    '"schema_version":11,"session_id":"sess-au-roundtrip","billing_id":"',
     '44'.repeat(32),
     '","billing_attempt":0,"billing_prior_usage":{},"billing_prior_au_owed_cum":"0",',
     '"billing_epoch":7,"reservation_id":"',

@@ -651,6 +651,90 @@ test('MayhemContract requires Hugging Face catalog anchors to use pinned revisio
   assert.equal(await storage.get('catalog/current'), null);
 });
 
+test('MayhemContract anchors optional Comfy parts index metadata', async () => {
+  const admin = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(admin.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+  const revision = 'c'.repeat(40);
+  const release = {
+    ...catalogRelease,
+    parts_anchor: {
+      index_ver: 7,
+      source_kind: 'huggingface',
+      index_url: `https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/${revision}/index.json`,
+      anchor_url: `https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/${revision}/anchor.json`,
+      anchor_hash: 'd'.repeat(64),
+      index_root: 'e'.repeat(64),
+      record_count: 2,
+      repo_revision: revision,
+    },
+    blessed_runtimes: [{
+      runtime_id: 'comfyui-v0.30.1',
+      comfy_release_hash: '1'.repeat(64),
+      env_lock_hash: '2'.repeat(64),
+      whitelist_ver: 3,
+      status: 'blessed',
+      min_grace_epochs: 2,
+    }],
+    outcome_classes: [{
+      class_id: 'image.light.512',
+      enclave_id: '3'.repeat(64),
+      definition_hash: '4'.repeat(64),
+      status: 'active',
+    }],
+  };
+
+  const result = await execute(
+    contract,
+    storage,
+    'publishCatalog',
+    release,
+    admin.publicKey,
+    1
+  );
+
+  assert.equal(result.ok, true, result.message);
+  const current = await storage.get('catalog/current');
+  assert.deepEqual(current.value.parts_anchor, release.parts_anchor);
+  assert.deepEqual(current.value.blessed_runtimes, release.blessed_runtimes);
+  assert.deepEqual(current.value.outcome_classes, release.outcome_classes);
+});
+
+test('MayhemContract rejects mutable Comfy parts index anchors', async () => {
+  const admin = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(admin.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+  const revision = 'c'.repeat(40);
+  const release = {
+    ...catalogRelease,
+    parts_anchor: {
+      index_ver: 7,
+      source_kind: 'huggingface',
+      index_url: 'https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/main/index.json',
+      anchor_url: `https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/${revision}/anchor.json`,
+      anchor_hash: 'd'.repeat(64),
+      index_root: 'e'.repeat(64),
+      record_count: 2,
+      repo_revision: revision,
+    },
+  };
+
+  const result = await execute(
+    contract,
+    storage,
+    'publishCatalog',
+    release,
+    admin.publicKey,
+    1
+  );
+
+  assert.ok(result instanceof Error);
+  assert.match(result.message, /parts index URL/i);
+  assert.equal(await storage.get('catalog/current'), null);
+});
+
 test('MayhemContract requires a current admin price before provider serving rows', async () => {
   const admin = await makeIdentity();
   const provider = await makeIdentity();

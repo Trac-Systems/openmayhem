@@ -5,7 +5,7 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 19;
+export const CONTRACT_VERSION = 20;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -27,6 +27,8 @@ const REQUIRED_FIAT_PAYOUT_CURRENCIES = Object.freeze(['eur', 'gbp', 'usd']);
 const PRICE_DENOMINATION = 'au_usd';
 const RATE_SOURCES = new Set(['gate-spot', 'mexc-spot']);
 const CATALOG_SOURCE_KINDS = new Set(['https', 'huggingface']);
+const CATALOG_RUNTIME_STATUSES = new Set(['blessed', 'deprecated', 'revoked']);
+const CATALOG_OUTCOME_CLASS_STATUSES = new Set(['active', 'deprecated', 'revoked']);
 const PROVIDER_LIFECYCLE_OPS = new Set([
   'register_provider',
   'join_enclave',
@@ -69,7 +71,7 @@ const TAP_OPERATOR_BPS = 1_500;
 const TAP_BURN_BPS = 1_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
-export const SESSION_RECEIPT_SCHEMA_VERSION = 10;
+export const SESSION_RECEIPT_SCHEMA_VERSION = 11;
 export const SPEND_VOUCHER_SCHEMA_VERSION = 10;
 const RECEIPT_EPOCH_INDEX_PAGE_SIZE = 128;
 const CTX_BRACKET_TABLE_VERSION = 1;
@@ -1069,6 +1071,9 @@ class MayhemContract extends Contract {
         model_count: { type: 'number', integer: true, min: 1 },
         artifact_count: { type: 'number', integer: true, min: 1 },
         canaries: { type: 'array', max: 64, items: { type: 'any' } },
+        parts_anchor: { type: 'any', optional: true },
+        blessed_runtimes: { type: 'array', max: 32, optional: true, items: { type: 'any' } },
+        outcome_classes: { type: 'array', max: 64, optional: true, items: { type: 'any' } },
       },
     });
 
@@ -7966,6 +7971,15 @@ class MayhemContract extends Contract {
       published_by: this.address,
       published_by_role: 'admin',
     };
+    if (hasOwn(this.value, 'parts_anchor')) {
+      record.parts_anchor = cloneValue(this.value.parts_anchor);
+    }
+    if (hasOwn(this.value, 'blessed_runtimes')) {
+      record.blessed_runtimes = cloneValue(this.value.blessed_runtimes);
+    }
+    if (hasOwn(this.value, 'outcome_classes')) {
+      record.outcome_classes = cloneValue(this.value.outcome_classes);
+    }
     await this.put(`catalog/release/${record.catalog_hash}`, record);
     await this.put('catalog/current', record);
     console.log('mayhem publishCatalog', record);
@@ -16629,22 +16643,26 @@ class MayhemContract extends Contract {
   }
 
   validateCatalogRelease(value) {
+    const releaseKeys = [
+      'op',
+      'catalog_id',
+      'source_kind',
+      'catalog_url',
+      'signature_url',
+      'catalog_hash',
+      'signature_hash',
+      'key_id',
+      'public_key',
+      'model_count',
+      'artifact_count',
+      'canaries',
+    ];
+    for (const optionalKey of ['parts_anchor', 'blessed_runtimes', 'outcome_classes']) {
+      if (hasOwn(value, optionalKey)) releaseKeys.push(optionalKey);
+    }
     const shapeError = this.validateExactObjectKeys(
       value,
-      [
-        'op',
-        'catalog_id',
-        'source_kind',
-        'catalog_url',
-        'signature_url',
-        'catalog_hash',
-        'signature_hash',
-        'key_id',
-        'public_key',
-        'model_count',
-        'artifact_count',
-        'canaries',
-      ],
+      releaseKeys,
       'catalog release'
     );
     if (shapeError) return shapeError;
@@ -16683,6 +16701,135 @@ class MayhemContract extends Contract {
       }
       if (seen.has(entry.set_id)) return new Error('Duplicate catalog canary set.');
       seen.add(entry.set_id);
+    }
+    if (hasOwn(value, 'parts_anchor')) {
+      const partsAnchorError = this.validateCatalogPartsAnchor(value.parts_anchor);
+      if (partsAnchorError) return partsAnchorError;
+    }
+    if (hasOwn(value, 'blessed_runtimes')) {
+      if (!Array.isArray(value.blessed_runtimes)) {
+        return new Error('Catalog blessed_runtimes must be an array.');
+      }
+      const runtimeIds = new Set();
+      for (const entry of value.blessed_runtimes) {
+        const runtimeError = this.validateCatalogBlessedRuntime(entry);
+        if (runtimeError) return runtimeError;
+        if (runtimeIds.has(entry.runtime_id)) return new Error('Duplicate catalog blessed runtime id.');
+        runtimeIds.add(entry.runtime_id);
+      }
+    }
+    if (hasOwn(value, 'outcome_classes')) {
+      if (!Array.isArray(value.outcome_classes)) {
+        return new Error('Catalog outcome_classes must be an array.');
+      }
+      const classIds = new Set();
+      for (const entry of value.outcome_classes) {
+        const classError = this.validateCatalogOutcomeClassRef(entry);
+        if (classError) return classError;
+        if (classIds.has(entry.class_id)) return new Error('Duplicate catalog outcome class id.');
+        classIds.add(entry.class_id);
+      }
+    }
+    return null;
+  }
+
+  validateCatalogPartsAnchor(anchor) {
+    const shapeError = this.validateExactObjectKeys(
+      anchor,
+      [
+        'index_ver',
+        'source_kind',
+        'index_url',
+        'anchor_url',
+        'anchor_hash',
+        'index_root',
+        'record_count',
+        'repo_revision',
+      ],
+      'catalog parts anchor'
+    );
+    if (shapeError) return shapeError;
+    if (!Number.isSafeInteger(anchor.index_ver) || anchor.index_ver <= 0) {
+      return new Error('Catalog parts anchor index_ver must be a positive integer.');
+    }
+    if (!CATALOG_SOURCE_KINDS.has(anchor.source_kind)) {
+      return new Error('Unsupported catalog parts anchor source kind.');
+    }
+    if (!this.isHttpsUrl(anchor.index_url) || !this.isHttpsUrl(anchor.anchor_url)) {
+      return new Error('Catalog parts anchor URLs must be HTTPS.');
+    }
+    if (anchor.source_kind === 'huggingface') {
+      const indexRevision = this.pinnedHuggingFaceResolveRevision(anchor.index_url);
+      const anchorRevision = this.pinnedHuggingFaceResolveRevision(anchor.anchor_url);
+      if (indexRevision === null) {
+        return new Error('Hugging Face parts index URL must use huggingface.co/resolve/<40-hex-revision>/.');
+      }
+      if (anchorRevision === null) {
+        return new Error('Hugging Face parts anchor URL must use huggingface.co/resolve/<40-hex-revision>/.');
+      }
+      if (indexRevision !== anchor.repo_revision || anchorRevision !== anchor.repo_revision) {
+        return new Error('Hugging Face parts anchor URLs must match repo_revision.');
+      }
+    } else if (!this.isSafeExternalRef(anchor.repo_revision)) {
+      return new Error('Invalid catalog parts repo revision.');
+    }
+    if (!this.isHexBytes(anchor.anchor_hash, 32)) {
+      return new Error('Catalog parts anchor hash must be a 32-byte hex hash.');
+    }
+    if (!this.isHexBytes(anchor.index_root, 32)) {
+      return new Error('Catalog parts index root must be a 32-byte hex hash.');
+    }
+    if (!Number.isSafeInteger(anchor.record_count) || anchor.record_count < 1) {
+      return new Error('Catalog parts anchor record_count must be a positive integer.');
+    }
+    return null;
+  }
+
+  validateCatalogBlessedRuntime(entry) {
+    const shapeError = this.validateExactObjectKeys(
+      entry,
+      [
+        'runtime_id',
+        'comfy_release_hash',
+        'env_lock_hash',
+        'whitelist_ver',
+        'status',
+        'min_grace_epochs',
+      ],
+      'catalog blessed runtime'
+    );
+    if (shapeError) return shapeError;
+    if (!this.isSafeExternalRef(entry.runtime_id)) return new Error('Invalid catalog runtime id.');
+    if (!this.isHexBytes(entry.comfy_release_hash, 32)) {
+      return new Error('Catalog runtime comfy_release_hash must be a 32-byte hex hash.');
+    }
+    if (!this.isHexBytes(entry.env_lock_hash, 32)) {
+      return new Error('Catalog runtime env_lock_hash must be a 32-byte hex hash.');
+    }
+    if (!Number.isSafeInteger(entry.whitelist_ver) || entry.whitelist_ver <= 0) {
+      return new Error('Catalog runtime whitelist_ver must be a positive integer.');
+    }
+    if (!CATALOG_RUNTIME_STATUSES.has(entry.status)) return new Error('Invalid catalog runtime status.');
+    if (!Number.isSafeInteger(entry.min_grace_epochs) || entry.min_grace_epochs < 0) {
+      return new Error('Catalog runtime min_grace_epochs must be a non-negative integer.');
+    }
+    return null;
+  }
+
+  validateCatalogOutcomeClassRef(entry) {
+    const shapeError = this.validateExactObjectKeys(
+      entry,
+      ['class_id', 'enclave_id', 'definition_hash', 'status'],
+      'catalog outcome class'
+    );
+    if (shapeError) return shapeError;
+    if (!this.isSafeExternalRef(entry.class_id)) return new Error('Invalid catalog outcome class id.');
+    if (!this.isHexBytes(entry.enclave_id, 32)) return new Error('Invalid catalog outcome class enclave id.');
+    if (!this.isHexBytes(entry.definition_hash, 32)) {
+      return new Error('Catalog outcome class definition_hash must be a 32-byte hex hash.');
+    }
+    if (!CATALOG_OUTCOME_CLASS_STATUSES.has(entry.status)) {
+      return new Error('Invalid catalog outcome class status.');
     }
     return null;
   }
@@ -22951,13 +23098,17 @@ class MayhemContract extends Contract {
   }
 
   isPinnedHuggingFaceResolveUrl(value) {
-    if (!this.isHttpsUrl(value)) return false;
+    return this.pinnedHuggingFaceResolveRevision(value) !== null;
+  }
+
+  pinnedHuggingFaceResolveRevision(value) {
+    if (!this.isHttpsUrl(value)) return null;
     const parsed = new URL(value);
-    if (parsed.hostname !== 'huggingface.co') return false;
+    if (parsed.hostname !== 'huggingface.co') return null;
     const parts = parsed.pathname.split('/').filter(Boolean);
     const resolveIndex = parts.indexOf('resolve');
-    if (resolveIndex < 0 || resolveIndex + 2 >= parts.length) return false;
-    return this.isHexBytes(parts[resolveIndex + 1], 20);
+    if (resolveIndex < 0 || resolveIndex + 2 >= parts.length) return null;
+    return this.isHexBytes(parts[resolveIndex + 1], 20) ? parts[resolveIndex + 1] : null;
   }
 
   isSafeExternalRef(value) {

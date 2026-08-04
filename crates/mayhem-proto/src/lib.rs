@@ -37,7 +37,7 @@ pub use validated_audio::{
 };
 
 pub const CRATE_NAME: &str = "mayhem-proto";
-pub const CONTRACT_VERSION: u32 = 19;
+pub const CONTRACT_VERSION: u32 = 20;
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 2;
 pub const ATTESTATION_ALG: &str = "ed25519";
 pub const ATTESTATION_POLICY_SCHEMA_VERSION: u32 = 1;
@@ -48,7 +48,7 @@ pub const TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE: &str = "tpm.activate.cha
 pub const TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE: &str = "tpm.activate.response";
 pub const TPM_PCR_POLICY_SCHEMA_VERSION: u32 = 2;
 pub const TPM_QUOTE_EVIDENCE_SCHEMA_VERSION: u32 = 1;
-pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 10;
+pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 11;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
 pub const CTX_BRACKET_TABLE_VERSION: u32 = 1;
 pub const CTX_BRACKETS: &[(u32, &str)] = &[

@@ -9,7 +9,7 @@ const LEDGER_RAILS = new Set(['fiat', 'tap', 'tnk']);
 const LEDGER_RAIL_ORDER = ['fiat', 'tap', 'tnk'];
 const MAX_OPERATOR_FEE_BPS = 1_500;
 const TAP_BURN_BPS = 1_000;
-const SESSION_RECEIPT_SCHEMA_VERSION = 10;
+const SESSION_RECEIPT_SCHEMA_VERSION = 11;
 const CANONICAL_RECEIPT_SNAPSHOT_SCHEMA_VERSION = 1;
 
 export const stableValue = (value) => {

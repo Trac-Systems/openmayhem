@@ -596,8 +596,8 @@ for identity in identities:
     canonical_au(head.get("incremental_au"), "canonical receipt head incremental_au", allow_zero=False)
     receipt = head.get("receipt")
     body = receipt.get("body") if isinstance(receipt, dict) else None
-    if not isinstance(body, dict) or body.get("schema_version") != 10:
-        raise SystemExit("canonical receipt head must contain a schema v10 signed receipt")
+    if not isinstance(body, dict) or body.get("schema_version") != 11:
+        raise SystemExit("canonical receipt head must contain a schema v11 signed receipt")
     if (
         body.get("billing_id") != identity["billing_id"]
         or body.get("billing_attempt") != identity["billing_attempt"]
