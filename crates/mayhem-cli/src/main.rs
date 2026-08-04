@@ -2791,7 +2791,7 @@ struct DoctorArgs {
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
 
-    /// Also preflight one provider backend: auto, llama.cpp, mlx, vllm, trt-llm, stable-diffusion.cpp, ace-step, chatterbox, needle-cpu, needle-gpu, sulphur, transformers-asr, whisper.cpp, or piper.
+    /// Also preflight one provider backend: auto, llama.cpp, mlx, vllm, trt-llm, stable-diffusion.cpp, comfyui, ace-step, chatterbox, needle-cpu, needle-gpu, sulphur, transformers-asr, whisper.cpp, or piper.
     #[arg(long, value_name = "BACKEND")]
     provider_backend: Option<String>,
 
@@ -6044,7 +6044,7 @@ struct ProviderServePlanArgs {
     #[arg(long, value_name = "PATH")]
     canaries_dir: Option<PathBuf>,
 
-    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, ace-step, chatterbox, needle-cpu, needle-gpu, sulphur, transformers-asr, whisper.cpp, or piper.
+    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, comfyui, ace-step, chatterbox, needle-cpu, needle-gpu, sulphur, transformers-asr, whisper.cpp, or piper.
     #[arg(long, default_value = "auto")]
     engine_backend: String,
 
@@ -6264,7 +6264,7 @@ struct ProviderStartArgs {
     #[arg(long, value_name = "PATH")]
     hf_token_file: Option<PathBuf>,
 
-    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, ace-step, chatterbox, needle-cpu, needle-gpu, sulphur, transformers-asr, whisper.cpp, or piper.
+    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, comfyui, ace-step, chatterbox, needle-cpu, needle-gpu, sulphur, transformers-asr, whisper.cpp, or piper.
     #[arg(long, default_value = "auto")]
     engine_backend: String,
 
@@ -7544,6 +7544,7 @@ fn resolve_doctor_provider_backend(requested: &str, report: &HardwareReport) -> 
                 | "vllm"
                 | "trt-llm"
                 | "stable-diffusion.cpp"
+                | "comfyui"
                 | "ace-step"
                 | "chatterbox"
                 | "needle-cpu"
@@ -8567,6 +8568,9 @@ fn backend_requirement_hint(backend: &str) -> &'static str {
         "llama.cpp" => "llama.cpp requires enough RAM and a compatible CPU/GPU runtime",
         "stable-diffusion.cpp" => {
             "stable-diffusion.cpp requires enough local RAM and preferably a local accelerator"
+        }
+        "comfyui" => {
+            "ComfyUI requires a verified ComfyUI runtime checkout, its pinned workflow parts, and MAYHEM_COMFYUI_PYTHON when python3 is not the right interpreter"
         }
         "ace-step" => {
             "ACE-Step requires its pinned local Python runtime and enough RAM or accelerator memory for the signed artifact"
@@ -21781,6 +21785,7 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
                 "llama.cpp"
                 | "mlx"
                 | "stable-diffusion.cpp"
+                | "comfyui"
                 | "ace-step"
                 | "chatterbox"
                 | "needle-cpu"
@@ -22978,6 +22983,7 @@ fn catalog_calibration_backend(
         "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
         "vllm" => LoadConfig::vllm_safetensors(artifact_path),
         "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
+        "comfyui" => LoadConfig::comfyui_runtime(artifact_path),
         "ace-step" => LoadConfig::ace_step_safetensors(artifact_path),
         "chatterbox" => LoadConfig::chatterbox_safetensors(artifact_path),
         "needle-cpu" | "needle-gpu" => LoadConfig::transformers_safetensors(artifact_path),
@@ -23127,6 +23133,22 @@ fn catalog_calibration_backend(
                 .load(config)
                 .context("loading stable-diffusion.cpp canary calibration artifact")?;
             Ok(Box::new(backend))
+        }
+        "comfyui" => {
+            #[cfg(feature = "comfyui")]
+            {
+                let mut backend = ComfyUiBackend::new();
+                backend
+                    .load(config)
+                    .context("loading ComfyUI canary calibration runtime")?;
+                Ok(Box::new(backend))
+            }
+            #[cfg(not(feature = "comfyui"))]
+            {
+                bail!(
+                    "Comfy canary calibration requires rebuilding mayhem-cli with --features comfyui"
+                );
+            }
         }
         "ace-step" => {
             let python = &managed_runtime
@@ -30247,7 +30269,7 @@ fn enforce_backend_caps(backend: &str, caps: &mut Value) -> Result<()> {
 fn backend_supports_tool_calls(backend: &str) -> bool {
     !matches!(
         backend,
-        "mlx" | "ace-step" | "chatterbox" | "sulphur" | "transformers-asr" | "trt-llm"
+        "mlx" | "comfyui" | "ace-step" | "chatterbox" | "sulphur" | "transformers-asr" | "trt-llm"
     )
 }
 
@@ -57159,6 +57181,12 @@ fn provider_backend_runtime_child_env(
                 );
             }
         }
+        "comfyui" => {
+            insert_path("MAYHEM_COMFYUI_PYTHON", runtime.python.as_deref());
+            if let Ok(device) = env::var("MAYHEM_COMFYUI_DEVICE") {
+                child_env.insert("MAYHEM_COMFYUI_DEVICE".to_owned(), device);
+            }
+        }
         "whisper.cpp" => insert_path("MAYHEM_WHISPER_CPP_BIN", runtime.external_binary.as_deref()),
         "piper" => insert_path("MAYHEM_PIPER_BIN", runtime.external_binary.as_deref()),
         _ => {}
@@ -57507,6 +57535,40 @@ fn provider_backend_runtime_preflight_for_backend(
                 "sd-cli",
             )?);
             runtime.stable_diffusion_backend = stable_diffusion_accelerator(hardware)?;
+        }
+        "comfyui" => {
+            #[cfg(feature = "comfyui")]
+            {
+                let python = if let Some(explicit) = env::var_os("MAYHEM_COMFYUI_PYTHON") {
+                    let path = PathBuf::from(explicit);
+                    resolve_executable(&path)
+                        .context("MAYHEM_COMFYUI_PYTHON does not point to an executable Python")?
+                } else {
+                    resolve_executable(Path::new("python3")).context(
+                        "comfyui requires `python3` on PATH or an explicit MAYHEM_COMFYUI_PYTHON",
+                    )?
+                };
+                let cache_dir = home.join("cache").join("comfyui");
+                fs::create_dir_all(&cache_dir).with_context(|| {
+                    format!("creating managed comfyui cache {}", cache_dir.display())
+                })?;
+                runtime.python = Some(python);
+                runtime.python_source = Some(
+                    if env::var_os("MAYHEM_COMFYUI_PYTHON").is_some() {
+                        "explicit MAYHEM_COMFYUI_PYTHON"
+                    } else {
+                        "PATH python3"
+                    }
+                    .to_owned(),
+                );
+                runtime.cache_dir = Some(cache_dir);
+            }
+            #[cfg(not(feature = "comfyui"))]
+            {
+                bail!(
+                    "comfyui provider backend requires rebuilding mayhem-cli with --features comfyui"
+                );
+            }
         }
         "whisper.cpp" => {
             runtime.external_binary = Some(resolve_backend_binary(
@@ -69364,6 +69426,7 @@ fn backend_rank(backend: &str) -> u8 {
         "vllm" => 4,
         "trt-llm" => 3,
         "mlx" => 2,
+        "comfyui" => 2,
         "ace-step" => 2,
         "chatterbox" => 2,
         "needle-cpu" => 1,
@@ -76782,6 +76845,26 @@ fn provider_session_responder(
                 backend: Box::new(backend),
             }))
         }
+        "comfyui" => {
+            #[cfg(feature = "comfyui")]
+            {
+                let mut backend = ComfyUiBackend::new();
+                with_provider_progress_spinner(ctx.args, "ComfyUI engine load", || {
+                    backend
+                        .load(load_config)
+                        .context("loading ComfyUI provider session engine")
+                })?;
+                Ok(Box::new(EngineProviderSessionResponder {
+                    backend: Box::new(backend),
+                }))
+            }
+            #[cfg(not(feature = "comfyui"))]
+            {
+                bail!(
+                    "comfyui provider backend requires rebuilding mayhem-cli with --features comfyui"
+                );
+            }
+        }
         "ace-step" => {
             let python = ctx
                 .backend_runtime
@@ -77826,6 +77909,7 @@ fn provider_engine_load_config(
         "trt-llm" => ModelArtifact::trt_llm_checkpoint(artifact_path),
         "vllm" => ModelArtifact::vllm_safetensors(artifact_path),
         "stable-diffusion.cpp" => ModelArtifact::stable_diffusion_checkpoint(artifact_path),
+        "comfyui" => ModelArtifact::comfyui_runtime(artifact_path),
         "ace-step" => ModelArtifact::ace_step_safetensors(artifact_path),
         "chatterbox" => ModelArtifact::chatterbox_safetensors(artifact_path),
         "needle-cpu" | "needle-gpu" => ModelArtifact::transformers_safetensors(artifact_path),
@@ -77849,6 +77933,7 @@ fn provider_engine_load_config(
         "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
         "vllm" => LoadConfig::vllm_safetensors(artifact_path),
         "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
+        "comfyui" => LoadConfig::comfyui_runtime(artifact_path),
         "ace-step" => LoadConfig::ace_step_safetensors(artifact_path),
         "chatterbox" => LoadConfig::chatterbox_safetensors(artifact_path),
         "needle-cpu" | "needle-gpu" => LoadConfig::transformers_safetensors(artifact_path),
@@ -104830,6 +104915,77 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn provider_engine_load_config_wires_comfy_runtime_artifact() {
+        let root = "aa".repeat(32);
+        let source_sha = "ef".repeat(32);
+        let mut model = test_catalog(&root).models.remove(0);
+        model.model_id = "test/workflow@comfy".to_owned();
+        model.model_class = "workflow-image".to_owned();
+        model.requirements.backends = vec!["comfyui".to_owned()];
+        let mut artifact = model.artifacts.remove("gguf-q4_k_m").unwrap();
+        artifact.engine = "comfyui".to_owned();
+        artifact.path = "ComfyUI-v0.30.1".to_owned();
+        artifact.source_sha256 = Some(source_sha.clone());
+        let mut enclave = test_contract(&root).enclaves.remove(0);
+        enclave.model_id = model.model_id.clone();
+        enclave.model_class = model.model_class.clone();
+        enclave.backend = "comfyui".to_owned();
+        enclave.artifact_source.path = artifact.path.clone();
+        enclave.quant = "runtime-v0.30.1".to_owned();
+        enclave.source_sha256 = artifact.source_sha256.clone();
+        let selected = ProviderCandidate {
+            enclave,
+            model,
+            artifact_name: "comfy-runtime".to_owned(),
+            artifact,
+            verdict: BackendVerdict {
+                backend: "comfyui".to_owned(),
+                status: VerdictStatus::CpuOnly,
+                reason: None,
+                est_tok_s: None,
+                n_layers_gpu: Some(0),
+                max_sessions: 1,
+                kv_cache_bytes_budget: 0,
+            },
+            price: None,
+            served_ctx: 1,
+            served_modalities: vec!["image".to_owned()],
+            served_specialities: BTreeMap::new(),
+            modality_capacities: test_modality_capacities("image"),
+            feasibility: ProviderCtxFeasibility::not_applicable(1, 0),
+            ctx_bracket_schedule: default_ctx_bracket_schedule(),
+        };
+        let artifact_paths = ProviderArtifactPaths {
+            primary: PathBuf::from("/tmp/admin-approved-comfy-runtime"),
+            sidecars: BTreeMap::new(),
+        };
+        let cache_dir = PathBuf::from("/tmp/mayhem-comfy-cache");
+        let runtime = ProviderBackendRuntime {
+            cache_dir: Some(cache_dir.clone()),
+            ..ProviderBackendRuntime::default()
+        };
+
+        let config = provider_engine_load_config(
+            &test_provider_start_args(),
+            &selected,
+            &artifact_paths,
+            &runtime,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.artifact.format,
+            mayhem_engine::ArtifactFormat::ComfyUiRuntime
+        );
+        assert_eq!(
+            config.artifact.path,
+            PathBuf::from("/tmp/admin-approved-comfy-runtime")
+        );
+        assert_eq!(config.artifact.sha256.as_deref(), Some(source_sha.as_str()));
+        assert_eq!(config.backend_cache_dir, Some(cache_dir));
+    }
+
+    #[test]
     fn seal_provider_artifact_reuses_cached_sealed_store_without_plaintext() {
         let temp = test_temp_dir("mayhem-seal-cache");
         let artifact = temp.join("model.bin");
@@ -117034,6 +117190,10 @@ State initialization...
         assert_eq!(
             resolve_doctor_provider_backend("trt-llm", &linux).unwrap(),
             "trt-llm"
+        );
+        assert_eq!(
+            resolve_doctor_provider_backend("comfyui", &linux).unwrap(),
+            "comfyui"
         );
         assert!(resolve_doctor_provider_backend("trt_llm", &linux).is_err());
     }

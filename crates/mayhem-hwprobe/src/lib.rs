@@ -22,6 +22,7 @@ const CHATTERBOX_RAM_FLOOR: u64 = 8 * GIB;
 const CHATTERBOX_ACCELERATOR_MEMORY_FLOOR: u64 = 6 * GIB;
 const NEEDLE_RAM_FLOOR: u64 = GIB;
 const NEEDLE_GPU_MEMORY_FLOOR: u64 = 512 * MIB;
+const COMFYUI_RAM_FLOOR: u64 = 4 * GIB;
 const TRANSFORMERS_ASR_RAM_FLOOR: u64 = 8 * GIB;
 const TRANSFORMERS_ASR_CUDA_MEMORY_FLOOR: u64 = 4 * GIB;
 const SULPHUR_NVIDIA_PARTIAL_OFFLOAD_FLOOR: u64 = 16 * GIB;
@@ -340,6 +341,7 @@ fn compute_backend_verdicts(profile: &HardwareProfile) -> Vec<BackendVerdict> {
         mlx_verdict(profile),
         llama_cpp_verdict(profile),
         stable_diffusion_cpp_verdict(profile),
+        comfyui_verdict(profile),
         ace_step_verdict(profile),
         chatterbox_verdict(profile),
         transformers_asr_verdict(profile),
@@ -1057,6 +1059,56 @@ fn stable_diffusion_cpp_verdict(profile: &HardwareProfile) -> BackendVerdict {
                 .unwrap_or(profile.memory.total_bytes)
                 / 5,
         }
+    }
+}
+
+fn comfyui_verdict(profile: &HardwareProfile) -> BackendVerdict {
+    let host_supported = match profile.host.os.as_str() {
+        "linux" | "macos" => matches!(profile.host.arch.as_str(), "x86_64" | "aarch64" | "arm64"),
+        "windows" => profile.host.arch == "x86_64",
+        _ => false,
+    };
+    if !host_supported {
+        return insufficient(
+            "comfyui",
+            &format!(
+                "ComfyUI runtime has no supported launch path for {}/{}",
+                profile.host.os, profile.host.arch
+            ),
+        );
+    }
+    if profile.memory.total_bytes < COMFYUI_RAM_FLOOR {
+        return insufficient(
+            "comfyui",
+            "less than 4 GiB RAM available for ComfyUI runtime serving",
+        );
+    }
+    let has_accel = profile.gpus.iter().any(|gpu| {
+        matches!(
+            gpu.backend,
+            GpuBackend::Metal | GpuBackend::Nvml | GpuBackend::Rocm | GpuBackend::Vulkan
+        )
+    });
+    BackendVerdict {
+        backend: "comfyui".to_owned(),
+        status: if has_accel {
+            VerdictStatus::PartialOffload
+        } else {
+            VerdictStatus::CpuOnly
+        },
+        reason: Some(if has_accel {
+            "local accelerator available for ComfyUI workflows".to_owned()
+        } else {
+            cpu_reason(&profile.cpu)
+        }),
+        est_tok_s: None,
+        n_layers_gpu: None,
+        max_sessions: 1,
+        kv_cache_bytes_budget: profile
+            .memory
+            .available_bytes
+            .unwrap_or(profile.memory.total_bytes)
+            / 5,
     }
 }
 
@@ -2944,6 +2996,27 @@ mod tests {
                     .map(|verdict| verdict.backend.as_str()),
                 Some("sulphur")
             );
+        }
+    }
+
+    #[test]
+    fn comfyui_verdict_is_available_without_changing_backend_precedence() {
+        for (fixture, selected) in [
+            (FixtureProfile::AppleSilicon, "mlx"),
+            (FixtureProfile::LinuxNvidia, "vllm"),
+            (FixtureProfile::LinuxNvidiaArm64, "vllm"),
+            (FixtureProfile::WindowsNvidia, "llama.cpp"),
+            (FixtureProfile::CpuOnly, "llama.cpp"),
+        ] {
+            let report = fixture_report(fixture);
+            assert_eq!(report.selected_backend.as_deref(), Some(selected));
+            let verdict = report
+                .backend_verdicts
+                .iter()
+                .find(|verdict| verdict.backend == "comfyui")
+                .expect("comfyui verdict");
+            assert_ne!(verdict.status, VerdictStatus::Insufficient);
+            assert_eq!(verdict.max_sessions, 1);
         }
     }
 

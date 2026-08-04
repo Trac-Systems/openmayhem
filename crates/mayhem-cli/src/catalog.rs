@@ -3679,6 +3679,7 @@ fn validate_artifact_with_engine_policy(
                 | "trt-llm"
                 | "vllm"
                 | "stable-diffusion.cpp"
+                | "comfyui"
                 | "ace-step"
                 | "chatterbox"
                 | "needle-cpu"
