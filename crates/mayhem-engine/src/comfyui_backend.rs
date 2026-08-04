@@ -34,6 +34,7 @@ const WORKER_STDERR_TAIL_BYTES: usize = 64 * 1024;
 const MAX_WORKER_REQUEST_LINE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WORKER_RESPONSE_LINE_BYTES: usize = 192 * 1024 * 1024;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(60);
+const SANDBOX_HELPER_ENV: &str = "MAYHEM_ENCLAVE_SANDBOX_HELPER";
 
 #[derive(Default)]
 pub struct ComfyUiBackend {
@@ -298,6 +299,9 @@ impl ComfyUiWorker {
             vec![cache_root.to_path_buf(), socket_dir.to_path_buf()],
         );
         let mut command = SandboxedCommand::new(&python);
+        if let Some(helper) = env::var_os(SANDBOX_HELPER_ENV) {
+            command.sandbox_helper(PathBuf::from(helper));
+        }
         if let Some(memory_limit_bytes) = memory_limit_bytes {
             command.memory_limit_bytes(memory_limit_bytes);
         }
