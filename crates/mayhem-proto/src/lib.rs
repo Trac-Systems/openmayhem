@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 mod endpoint_contract;
+mod parts_catalog;
 mod validated_audio;
 
 pub use endpoint_contract::{
@@ -20,6 +21,15 @@ pub use endpoint_contract::{
     validate_endpoint_request, validate_endpoint_response, ArtifactGenerationInlineAudioLoad,
     EndpointCalibrationCase, EndpointCalibrationMutation, EndpointCalibrationValue,
     EndpointContractViolation,
+};
+pub use parts_catalog::{
+    build_comfy_parts_index, comfy_part_record_hash, comfy_parts_anchor_hash, derive_comfy_part_id,
+    prove_comfy_part, verify_comfy_part_proof, ComfyPartCanary, ComfyPartCanaryTolerance,
+    ComfyPartDraft, ComfyPartLicenseEvidence, ComfyPartMerkleProof, ComfyPartMerkleSibling,
+    ComfyPartMerkleSide, ComfyPartRecord, ComfyPartSource, ComfyPartSources, ComfyPartsAnchor,
+    ComfyPartsCatalogError, ComfyPartsIndex, ComfyPartsIndexEntry,
+    COMFY_PARTS_ANCHOR_SCHEMA_VERSION, COMFY_PARTS_INDEX_SCHEMA_VERSION,
+    COMFY_PART_RECORD_SCHEMA_VERSION,
 };
 pub use validated_audio::{
     validated_audio_metadata, validated_flac_audio_metadata, validated_wav_audio_metadata,
