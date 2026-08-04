@@ -223,12 +223,26 @@ pub struct ProviderHeartbeat {
     pub transport_peer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_anchor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workflow_classes: BTreeMap<String, HeartbeatWorkflowClass>,
     pub accepting_new: bool,
     pub caps: HeartbeatCaps,
     pub att: HeartbeatAttestation,
     pub ts: u64,
     pub nonce: String,
     pub sig: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HeartbeatWorkflowClass {
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    pub min_ask_au: MoneyAu,
+    pub max_concurrent: u32,
+    pub active: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2732,6 +2746,43 @@ fn validate_heartbeat_fields(heartbeat: &ProviderHeartbeat) -> Result<()> {
     if let Some(identity_anchor) = heartbeat.identity_anchor.as_deref() {
         validate_identity_anchor(identity_anchor)?;
     }
+    if let Some(inventory_root) = heartbeat.inventory_root.as_deref() {
+        validate_hex_field("inventory_root", inventory_root, 32)?;
+    }
+    if let Some(runtime_id) = heartbeat.runtime_id.as_deref() {
+        if !valid_heartbeat_safe_ref(runtime_id) {
+            return Err(GatewayError::BadHeartbeatField {
+                field: "runtime_id",
+                reason: "must be a safe bounded runtime id".to_owned(),
+            });
+        }
+    }
+    if heartbeat.workflow_classes.len() > 32 {
+        return Err(GatewayError::BadHeartbeatField {
+            field: "workflow_classes",
+            reason: "must contain at most 32 classes".to_owned(),
+        });
+    }
+    for (class, summary) in &heartbeat.workflow_classes {
+        if !valid_heartbeat_safe_ref(class) {
+            return Err(GatewayError::BadHeartbeatField {
+                field: "workflow_classes",
+                reason: format!("{class} must be a safe bounded class id"),
+            });
+        }
+        if summary.min_ask_au == 0 || summary.max_concurrent == 0 {
+            return Err(GatewayError::BadHeartbeatField {
+                field: "workflow_classes",
+                reason: format!("{class} must have a positive ask and capacity"),
+            });
+        }
+        if summary.active > summary.max_concurrent {
+            return Err(GatewayError::BadHeartbeatField {
+                field: "workflow_classes",
+                reason: format!("{class} active count exceeds capacity"),
+            });
+        }
+    }
     validate_hex_field("att.head", &heartbeat.att.head, 32)?;
     validate_hex_field("nonce", &heartbeat.nonce, 32)?;
     validate_hex_field("sig", &heartbeat.sig, 64)?;
@@ -2888,6 +2939,14 @@ fn valid_heartbeat_capability_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn valid_heartbeat_safe_ref(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
 }
 
 fn validate_heartbeat_time(
@@ -3233,6 +3292,48 @@ mod tests {
             max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
         })
         .expect_err("tampered heartbeat must fail");
+        assert!(matches!(err, GatewayError::BadHeartbeatSignature { .. }));
+    }
+
+    #[test]
+    fn heartbeat_accepts_signed_workflow_inventory_summary() {
+        let signing_key = SigningKey::from_bytes(&[8_u8; 32]);
+        let provider = hex::encode(signing_key.verifying_key().to_bytes());
+        let now = 1_800_000_000_000;
+        let mut heartbeat = signed_heartbeat(&signing_key, &provider, now, "a9");
+        heartbeat["inventory_root"] = json!("66".repeat(32));
+        heartbeat["runtime_id"] = json!("comfyui.cuda124");
+        heartbeat["workflow_classes"] = json!({
+            "image.batch": {
+                "min_ask_au": "110",
+                "max_concurrent": 2,
+                "active": 1
+            }
+        });
+        resign_heartbeat(&signing_key, &mut heartbeat);
+
+        let accepted = validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+            raw: &heartbeat,
+            now_millis: now,
+            replay_cache: &mut HeartbeatReplayCache::default(),
+            max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+            max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        })
+        .expect("valid workflow inventory heartbeat");
+        assert_eq!(accepted.inventory_root, Some("66".repeat(32)));
+        assert_eq!(accepted.runtime_id.as_deref(), Some("comfyui.cuda124"));
+        assert_eq!(accepted.workflow_classes["image.batch"].max_concurrent, 2);
+
+        let mut bad = heartbeat;
+        bad["inventory_root"] = json!("67".repeat(32));
+        let err = validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+            raw: &bad,
+            now_millis: now,
+            replay_cache: &mut HeartbeatReplayCache::default(),
+            max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+            max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        })
+        .expect_err("tampered workflow inventory root must fail");
         assert!(matches!(err, GatewayError::BadHeartbeatSignature { .. }));
     }
 

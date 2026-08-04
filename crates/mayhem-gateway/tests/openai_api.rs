@@ -6186,6 +6186,8 @@ fn signed_image_provider_receipt(
         ctx_bracket: invocation.ctx_bracket.clone(),
         ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
         rules_ver: invocation.rules_ver,
+        workflow: None,
+        workflow_output: None,
         usage: usage.clone(),
         usage_attribution: BTreeMap::new(),
         au_owed_cum: priced_usage_au(
@@ -6279,6 +6281,8 @@ fn signed_provider_receipt_for_test(
         ctx_bracket: invocation.ctx_bracket.clone(),
         ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
         rules_ver: invocation.rules_ver,
+        workflow: None,
+        workflow_output: None,
         usage: usage.clone(),
         usage_attribution: BTreeMap::new(),
         au_owed_cum: priced_usage_au(
@@ -7219,6 +7223,9 @@ fn test_provider_heartbeat(
         min_ask_au: 0,
         transport_peer: Some(candidate.provider.clone()),
         identity_anchor: None,
+        inventory_root: None,
+        runtime_id: None,
+        workflow_classes: BTreeMap::new(),
         accepting_new: true,
         caps: HeartbeatCaps {
             tools: candidate

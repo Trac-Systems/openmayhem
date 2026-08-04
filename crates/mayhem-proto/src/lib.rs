@@ -1018,6 +1018,21 @@ pub struct RateMapEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowBinding {
+    pub endpoint_family: String,
+    pub graph_hash: String,
+    pub runtime_id: String,
+    pub outcome_class: String,
+    pub quoted_usage: ReceiptUsage,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowOutputBinding {
+    pub output_modalities: Vec<String>,
+    pub metrics: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SpendVoucherBody {
     pub schema_version: u32,
     pub session_id: String,
@@ -1047,6 +1062,8 @@ pub struct SpendVoucherBody {
     pub required_modalities: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub required_specialities: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowBinding>,
     #[serde(default)]
     pub ctx_bracket: Option<String>,
     #[serde(default)]
@@ -1284,6 +1301,10 @@ pub struct ReceiptBody {
     #[serde(default)]
     pub ctx_bracket_table_ver: Option<u32>,
     pub rules_ver: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_output: Option<WorkflowOutputBinding>,
     pub usage: ReceiptUsage,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub usage_attribution: BTreeMap<String, u64>,
@@ -3276,6 +3297,7 @@ mod tests {
             served_ctx: 8192,
             required_modalities: vec!["text".to_owned()],
             required_specialities: BTreeMap::new(),
+            workflow: None,
             ctx_bracket: Some("le8k".to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             max_spend_au: 5000,
@@ -3294,6 +3316,25 @@ mod tests {
         changed.required_modalities = vec!["image".to_owned(), "text".to_owned()];
         assert_ne!(
             spend_voucher_signing_bytes(&voucher).unwrap(),
+            spend_voucher_signing_bytes(&changed).unwrap()
+        );
+        let workflow = WorkflowBinding {
+            endpoint_family: "comfy_workflow".to_owned(),
+            graph_hash: "66".repeat(32),
+            runtime_id: "comfyui.cuda124".to_owned(),
+            outcome_class: "image.batch".to_owned(),
+            quoted_usage: ReceiptUsage::from_units([(USAGE_IMAGE, 1), (USAGE_STEP, 20)]),
+        };
+        let mut workflow_voucher = voucher.clone();
+        workflow_voucher.workflow = Some(workflow.clone());
+        assert_ne!(
+            spend_voucher_signing_bytes(&voucher).unwrap(),
+            spend_voucher_signing_bytes(&workflow_voucher).unwrap()
+        );
+        let mut changed = workflow_voucher.clone();
+        changed.workflow.as_mut().unwrap().graph_hash = "77".repeat(32);
+        assert_ne!(
+            spend_voucher_signing_bytes(&workflow_voucher).unwrap(),
             spend_voucher_signing_bytes(&changed).unwrap()
         );
 
@@ -3324,6 +3365,8 @@ mod tests {
             ctx_bracket: voucher.ctx_bracket.clone(),
             ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
             rules_ver: 1,
+            workflow: None,
+            workflow_output: None,
             usage: ReceiptUsage::text(3, 5),
             usage_attribution: BTreeMap::new(),
             au_owed_cum: 1,
@@ -3364,6 +3407,31 @@ mod tests {
         changed.reservation_receipt_grace_epochs += 1;
         assert_ne!(
             receipt_signing_bytes(&receipt).unwrap(),
+            receipt_signing_bytes(&changed).unwrap()
+        );
+        let mut workflow_receipt = receipt.clone();
+        workflow_receipt.workflow = Some(workflow);
+        workflow_receipt.workflow_output = Some(WorkflowOutputBinding {
+            output_modalities: vec!["image".to_owned()],
+            metrics: BTreeMap::from([
+                ("bytes".to_owned(), 512_000),
+                ("height".to_owned(), 1024),
+                ("width".to_owned(), 1024),
+            ]),
+        });
+        assert_ne!(
+            receipt_signing_bytes(&receipt).unwrap(),
+            receipt_signing_bytes(&workflow_receipt).unwrap()
+        );
+        let mut changed = workflow_receipt.clone();
+        changed
+            .workflow_output
+            .as_mut()
+            .unwrap()
+            .metrics
+            .insert("bytes".to_owned(), 513_000);
+        assert_ne!(
+            receipt_signing_bytes(&workflow_receipt).unwrap(),
             receipt_signing_bytes(&changed).unwrap()
         );
     }
@@ -3430,6 +3498,7 @@ mod tests {
             served_ctx: 8192,
             required_modalities: vec!["text".to_owned()],
             required_specialities: BTreeMap::new(),
+            workflow: None,
             ctx_bracket: Some("le8k".to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             max_spend_au: 5000,
@@ -3470,6 +3539,8 @@ mod tests {
             ctx_bracket: voucher.ctx_bracket.clone(),
             ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
             rules_ver: 1,
+            workflow: None,
+            workflow_output: None,
             usage: ReceiptUsage::text(3, 5),
             usage_attribution: BTreeMap::new(),
             au_owed_cum: 1,
@@ -3521,6 +3592,7 @@ mod tests {
             served_ctx: 131_072,
             required_modalities: vec!["text".to_owned()],
             required_specialities: BTreeMap::new(),
+            workflow: None,
             ctx_bracket: Some("le128k".to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             max_spend_au: 2_000_000_000_000_000_000_000_001,
@@ -3531,7 +3603,7 @@ mod tests {
         };
         let expected_voucher = concat!(
             "{\"domain\":\"mayhem-spend-voucher\",\"signing_version\":2,\"body\":{",
-            "\"schema_version\":10,\"session_id\":\"sess-au-roundtrip\",",
+            "\"schema_version\":11,\"session_id\":\"sess-au-roundtrip\",",
             "\"billing_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
             "\"billing_attempt\":0,\"billing_prior_usage\":{},\"billing_prior_au_owed_cum\":\"0\",",
             "\"billing_epoch\":12,",
@@ -3584,6 +3656,8 @@ mod tests {
             ctx_bracket: voucher.ctx_bracket,
             ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
             rules_ver: 7,
+            workflow: None,
+            workflow_output: None,
             usage: ReceiptUsage::text(3, 5),
             usage_attribution: BTreeMap::new(),
             au_owed_cum: voucher.max_spend_au,
@@ -3592,7 +3666,7 @@ mod tests {
         };
         let expected_receipt = concat!(
             "{\"domain\":\"mayhem-session-receipt\",\"signing_version\":2,\"body\":{",
-            "\"schema_version\":10,\"session_id\":\"sess-au-roundtrip\",",
+            "\"schema_version\":11,\"session_id\":\"sess-au-roundtrip\",",
             "\"billing_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
             "\"billing_attempt\":0,\"billing_prior_usage\":{},\"billing_prior_au_owed_cum\":\"0\",",
             "\"billing_epoch\":12,",

@@ -118,14 +118,15 @@ use mayhem_proto::{
     PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
     TpmActivateCredentialChallengeFrame, TpmActivateCredentialResponseFrame, TranscriptionResult,
     TranscriptionResultLimits, TranscriptionTimestamp, ValidatedAudioFormat, VisibleToolCall,
-    CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
-    DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
-    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
-    MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN, SESSION_RECEIPT_SCHEMA_VERSION,
-    TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
-    TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN,
-    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
-    USAGE_STEP, USAGE_VIDEO_SECOND, VISIBLE_OUTPUT_BYTES_PER_UNIT,
+    WorkflowBinding, WorkflowOutputBinding, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
+    DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
+    SESSION_RECEIPT_SCHEMA_VERSION, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
+    TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION, TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE,
+    USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
+    USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
+    VISIBLE_OUTPUT_BYTES_PER_UNIT,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -55860,6 +55861,7 @@ struct ActiveProviderSession {
     served_ctx: u32,
     required_modalities: Vec<String>,
     required_specialities: BTreeMap<String, String>,
+    workflow: Option<WorkflowBinding>,
     ctx_bracket: Option<String>,
     ctx_bracket_table_ver: Option<u32>,
     checkpoint_every: CheckpointPolicy,
@@ -73585,6 +73587,7 @@ async fn handle_provider_session_frame(
                         served_ctx: spend_voucher.body.served_ctx,
                         required_modalities: spend_voucher.body.required_modalities.clone(),
                         required_specialities: spend_voucher.body.required_specialities.clone(),
+                        workflow: spend_voucher.body.workflow.clone(),
                         ctx_bracket: spend_voucher.body.ctx_bracket.clone(),
                         ctx_bracket_table_ver: spend_voucher.body.ctx_bracket_table_ver,
                         checkpoint_every,
@@ -76198,6 +76201,11 @@ fn provider_session_receipt_for_usage_attribution(
         incremental_au <= active.max_spend_au,
         "provider receipt exceeds the signed incremental spend maximum"
     );
+    let workflow_output = if active.workflow.is_some() {
+        Some(provider_session_workflow_output(body)?)
+    } else {
+        None
+    };
     let receipt_body = ReceiptBody {
         schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
         session_id: active.session_id.clone(),
@@ -76225,6 +76233,8 @@ fn provider_session_receipt_for_usage_attribution(
         ctx_bracket: active.ctx_bracket.clone(),
         ctx_bracket_table_ver: active.ctx_bracket_table_ver,
         rules_ver: terms.rules_ver,
+        workflow: active.workflow.clone(),
+        workflow_output,
         usage: usage.clone(),
         usage_attribution,
         au_owed_cum,
@@ -76272,6 +76282,15 @@ fn provider_session_au_owed(
         active.billing_prior_au_owed_cum,
         usage,
     )
+}
+
+fn provider_session_workflow_output(body: &Value) -> Result<WorkflowOutputBinding> {
+    let value = body
+        .get("mayhem_contract")
+        .and_then(|contract| contract.get("workflow_output"))
+        .cloned()
+        .context("workflow session missing workflow output binding")?;
+    serde_json::from_value(value).context("workflow session output binding is invalid")
 }
 
 fn provider_session_prompt_hash(body: &Value) -> String {
@@ -79630,7 +79649,7 @@ fn provider_session_spend_reservation_value(
         is_hex_len(enclave_pubkey, 64) && enclave_pubkey == enclave_pubkey.to_ascii_lowercase(),
         "runtime enclave public key must be 32-byte lower-case hexadecimal"
     );
-    Ok(json!({
+    let mut value = json!({
         "op": "spend_reserve_targeted",
         "payout_revision": payout_revision,
         "reservation_id": spend_voucher.body.reservation_id,
@@ -79656,7 +79675,12 @@ fn provider_session_spend_reservation_value(
         "max_spend_au": money_au_json(spend_voucher.body.max_spend_au),
         "voucher": voucher,
         "provider_sig": "",
-    }))
+    });
+    if let Some(workflow) = &spend_voucher.body.workflow {
+        value["workflow"] = serde_json::to_value(workflow)
+            .context("serializing spend reservation workflow binding")?;
+    }
+    Ok(value)
 }
 
 fn spend_reservation_evidence(value: &Value) -> Value {
@@ -79700,6 +79724,9 @@ fn spend_reservation_evidence(value: &Value) -> Value {
     {
         evidence["required_specialities"] =
             stable_json_value(value.get("required_specialities").unwrap());
+    }
+    if value.get("workflow").and_then(Value::as_object).is_some() {
+        evidence["workflow"] = stable_json_value(value.get("workflow").unwrap());
     }
     evidence
 }

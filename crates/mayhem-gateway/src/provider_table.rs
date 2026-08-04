@@ -1529,6 +1529,9 @@ mod tests {
             min_ask_au: 0,
             transport_peer: None,
             identity_anchor: None,
+            inventory_root: None,
+            runtime_id: None,
+            workflow_classes: BTreeMap::new(),
             accepting_new: true,
             caps: caps(),
             att: HeartbeatAttestation {
@@ -1570,6 +1573,9 @@ mod tests {
             min_ask_au: 0,
             transport_peer: None,
             identity_anchor: None,
+            inventory_root: None,
+            runtime_id: None,
+            workflow_classes: BTreeMap::new(),
             accepting_new: true,
             caps: caps(),
             att: HeartbeatAttestation {

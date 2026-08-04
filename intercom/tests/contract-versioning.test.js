@@ -4,6 +4,7 @@ import b4a from 'b4a';
 import MayhemContract, {
   CONTRACT_VERSION,
   SESSION_RECEIPT_SCHEMA_VERSION,
+  SPEND_VOUCHER_SCHEMA_VERSION,
   consentMessage,
   providerLifecycleIntentMessage,
   receiptMessage,
@@ -32,6 +33,7 @@ test('launch version gates cover A16/A17/D6/D7/M5/M6/M8 deterministic changes', 
   assert.equal(CONTRACT_VERSION, 20);
   assert.deepEqual(signingMessageVersions(), [2]);
   assert.equal(SESSION_RECEIPT_SCHEMA_VERSION, 11);
+  assert.equal(SPEND_VOUCHER_SCHEMA_VERSION, 11);
 });
 
 test('contract reports the exported contract version', async () => {
@@ -333,6 +335,138 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
     '","ts":1783517300}}',
   ].join('');
   assert.equal(receiptMessage(receipt), expectedReceipt);
+});
+
+test('workflow voucher and receipt terms are canonical signed evidence', async () => {
+  const user = await makeIdentity();
+  const provider = await makeIdentity();
+  const enclave = await makeIdentity();
+  const contract = new MayhemContract({ peer: { wallet: makeVerifier(enclave.wallet) } }, {});
+  const lockedRateMap = [
+    { unit: 'image', per_unit_au: '100', granularity: 1 },
+    { unit: 'step', per_unit_au: '2', granularity: 1 },
+  ];
+  const workflow = {
+    endpoint_family: 'comfy_workflow',
+    graph_hash: '66'.repeat(32),
+    runtime_id: 'comfyui.cuda124',
+    outcome_class: 'image.batch',
+    quoted_usage: { image: 1, step: 5 },
+  };
+  const voucher = {
+    schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
+    session_id: 'sess-workflow',
+    billing_id: '47'.repeat(32),
+    billing_attempt: 0,
+    billing_prior_usage: {},
+    billing_prior_au_owed_cum: '0',
+    billing_epoch: 3,
+    reservation_id: '48'.repeat(32),
+    reservation_expires_after_epoch: 31,
+    reservation_receipt_grace_epochs: 6,
+    user: user.publicKey,
+    provider: provider.publicKey,
+    payout_revision: '49'.repeat(32),
+    rail: 'tap',
+    enclave_id: 'enclave-workflow',
+    model_id: 'model/workflow',
+    price_ver: 4,
+    locked_rate_map: lockedRateMap,
+    locked_per_req_au: '0',
+    locked_min_session_au: '0',
+    served_ctx: 0,
+    required_modalities: ['image'],
+    workflow,
+    ctx_bracket: null,
+    ctx_bracket_table_ver: null,
+    rules_ver: 9,
+    max_spend_au: '110',
+    checkpoint_every: { tokens: 4096, ms: 30000 },
+  };
+
+  assert.match(spendVoucherMessage(voucher), /"workflow":\{"endpoint_family":"comfy_workflow"/);
+  assert.notEqual(
+    spendVoucherMessage(voucher),
+    spendVoucherMessage({
+      ...voucher,
+      workflow: { ...workflow, graph_hash: '67'.repeat(32) },
+    })
+  );
+
+  const body = {
+    schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+    session_id: voucher.session_id,
+    billing_id: voucher.billing_id,
+    billing_attempt: voucher.billing_attempt,
+    billing_prior_usage: voucher.billing_prior_usage,
+    billing_prior_au_owed_cum: voucher.billing_prior_au_owed_cum,
+    billing_epoch: voucher.billing_epoch,
+    reservation_id: voucher.reservation_id,
+    reservation_expires_after_epoch: voucher.reservation_expires_after_epoch,
+    reservation_receipt_grace_epochs: voucher.reservation_receipt_grace_epochs,
+    payout_revision: voucher.payout_revision,
+    seq: 1,
+    final: true,
+    rail: voucher.rail,
+    user: user.publicKey,
+    provider: provider.publicKey,
+    enclave_id: voucher.enclave_id,
+    model_id: voucher.model_id,
+    price_ver: voucher.price_ver,
+    locked_rate_map: lockedRateMap,
+    locked_per_req_au: '0',
+    locked_min_session_au: '0',
+    served_ctx: 0,
+    ctx_bracket: null,
+    ctx_bracket_table_ver: null,
+    rules_ver: voucher.rules_ver,
+    workflow,
+    workflow_output: {
+      output_modalities: ['image'],
+      metrics: { bytes: 512000, height: 1024, width: 1024 },
+    },
+    usage: { image: 1, step: 5 },
+    au_owed_cum: '110',
+    prompt_hash: '68'.repeat(32),
+    ts: 1_783_517_400,
+  };
+  contract.storage = new MemoryStorage({
+    [`enclave/${body.enclave_id}`]: {
+      enclave_id: body.enclave_id,
+      model_id: body.model_id,
+      model_class: 'image-generation',
+      caps: { chat: false, ctx: 0, modality_set: ['image'], speciality_levels: {} },
+    },
+  });
+  const message = b4a.from(receiptMessage(body));
+  const envelope = {
+    body,
+    enclave_pubkey: enclave.publicKey,
+    enclave_sig: b4a.toString(enclave.wallet.sign(message), 'hex'),
+    user_sig: b4a.toString(user.wallet.sign(message), 'hex'),
+  };
+  const normalized = await contract.normalizeReceiptEnvelope(envelope);
+  assert.equal(normalized instanceof Error, false, normalized.message);
+  assert.equal(contract.verifyReceiptEnvelope(normalized), true);
+  assert.notEqual(
+    receiptMessage(body),
+    receiptMessage({
+      ...body,
+      workflow_output: {
+        ...body.workflow_output,
+        metrics: { ...body.workflow_output.metrics, bytes: 513000 },
+      },
+    })
+  );
+
+  const bodyWithoutOutput = { ...body };
+  delete bodyWithoutOutput.workflow_output;
+  const missingOutput = await contract.normalizeReceiptEnvelope({
+    ...envelope,
+    body: bodyWithoutOutput,
+  });
+  assert.equal(missingOutput instanceof Error, true);
+  assert.match(missingOutput.message, /workflow requires workflow_output/);
 });
 
 test('receipt normalization rejects old schemas and non-canonical usage', async () => {

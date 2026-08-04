@@ -188,6 +188,7 @@ function reservationValue(ctx, {
   reservationExpiresAfterEpoch = epoch + 24,
   reservationReceiptGraceEpochs = 6,
   maxSpendAu = '1000',
+  workflow = null,
 } = {}) {
   const voucherBody = {
     schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
@@ -217,6 +218,7 @@ function reservationValue(ctx, {
     rules_ver: 1,
     max_spend_au: maxSpendAu,
     checkpoint_every: { tokens: 128, ms: 1000 },
+    ...(workflow ? { workflow } : {}),
   };
   const unsigned = {
     op: 'spend_reserve_targeted',
@@ -245,6 +247,7 @@ function reservationValue(ctx, {
       ...voucherBody,
       user_sig: signHex(ctx.user.wallet, spendVoucherMessage(voucherBody)),
     },
+    ...(workflow ? { workflow } : {}),
     provider_sig: '',
   };
   return {
@@ -336,6 +339,7 @@ function receiptValue(ctx, reservation, {
   final = false,
   usage = { input_token: 10 },
   auOwedCum = '100',
+  workflowOutput = null,
   bodyOverrides = {},
   receiptOverrides = {},
   outerOverrides = {},
@@ -372,6 +376,13 @@ function receiptValue(ctx, reservation, {
     au_owed_cum: auOwedCum,
     prompt_hash: '81'.repeat(32),
     ts: 3600 + seq,
+    ...(voucher.workflow ? {
+      workflow: voucher.workflow,
+      workflow_output: workflowOutput ?? {
+        output_modalities: ['image'],
+        metrics: { image: 1 },
+      },
+    } : {}),
     ...bodyOverrides,
   };
   const message = receiptMessage(body);
@@ -1026,6 +1037,70 @@ test('receipt-bound targeted apply consumes a final head once and rejects later 
     (await submitReceipt(ctx, higher)).result.message,
     /consumed canonical receipt head cannot advance/i
   );
+});
+
+test('workflow targeted reservations bind voucher, delivered output, and settlement', async () => {
+  const ctx = await setupContract();
+  const workflow = {
+    endpoint_family: 'openai_image_generations',
+    graph_hash: 'a1'.repeat(32),
+    runtime_id: 'comfyui-portable-0.3.43',
+    outcome_class: 'image',
+    quoted_usage: { input_token: 10 },
+  };
+  const reservation = await submitReservation(ctx, {
+    sessionId: 'a2'.repeat(32),
+    billingId: 'a3'.repeat(32),
+    reservationId: 'a4'.repeat(32),
+    workflow,
+  });
+  assert.equal(reservation.result.ok, true, reservation.result.message);
+  assert.deepEqual(reservation.value.voucher.workflow, workflow);
+  const session = (
+    await ctx.storage.get(
+      ctx.contract.targetedSpendSessionKey(ctx.user.publicKey, 'tnk', 'a4'.repeat(32))
+    )
+  ).value;
+  assert.deepEqual(session.workflow, workflow);
+
+  const missingOutput = receiptValue(ctx, reservation, {
+    bodyOverrides: { workflow_output: undefined },
+  });
+  delete missingOutput.receipt.body.workflow_output;
+  const unsigned = { ...missingOutput, provider_sig: '' };
+  missingOutput.provider_sig = signHex(
+    ctx.provider.wallet,
+    recordUsageReceiptMessage(unsigned)
+  );
+  assert.match(
+    (await submitReceipt(ctx, missingOutput)).result.message,
+    /workflow requires workflow_output/i
+  );
+
+  const receipt = receiptValue(ctx, reservation, {
+    final: true,
+    workflowOutput: {
+      output_modalities: ['image'],
+      metrics: { image: 1 },
+    },
+  });
+  const recorded = await submitReceipt(ctx, receipt);
+  assert.equal(recorded.result.ok, true, recorded.result.message);
+  const head = (
+    await ctx.storage.get(`receipt/head/${receipt.receipt.body.billing_id}/0`)
+  ).value;
+  assert.deepEqual(head.receipt.body.workflow, workflow);
+  assert.deepEqual(head.receipt.body.workflow_output, {
+    output_modalities: ['image'],
+    metrics: { image: 1 },
+  });
+  const commit = await commitEpoch(ctx, { count: 1, useAu: '100' });
+  const applyValue = await targetedApplyValue(ctx, {
+    heads: [head],
+    commitHash: commit.commit_hash,
+  });
+  const applied = await submitTargetedApply(ctx, applyValue);
+  assert.equal(applied.result.ok, true, applied.result.message);
 });
 
 test('legacy targeted hold receipts release through overlays without rewriting the old hold', async () => {

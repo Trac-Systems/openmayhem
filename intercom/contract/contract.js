@@ -72,7 +72,7 @@ const TAP_BURN_BPS = 1_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
 export const SESSION_RECEIPT_SCHEMA_VERSION = 11;
-export const SPEND_VOUCHER_SCHEMA_VERSION = 10;
+export const SPEND_VOUCHER_SCHEMA_VERSION = 11;
 const RECEIPT_EPOCH_INDEX_PAGE_SIZE = 128;
 const CTX_BRACKET_TABLE_VERSION = 1;
 const CTX_BRACKETS = Object.freeze([
@@ -471,6 +471,7 @@ const canonicalSpendVoucherBody = (body) => {
       !Array.isArray(body.required_specialities) && Object.keys(body.required_specialities).length > 0) {
     canonical.required_specialities = body.required_specialities;
   }
+  if (hasOwn(body, 'workflow')) canonical.workflow = canonicalWorkflowBinding(body.workflow);
   if (hasOwn(body, 'ctx_bracket')) canonical.ctx_bracket = body.ctx_bracket;
   if (hasOwn(body, 'ctx_bracket_table_ver')) canonical.ctx_bracket_table_ver = body.ctx_bracket_table_ver;
   canonical.rules_ver = body.rules_ver;
@@ -508,6 +509,8 @@ const canonicalReceiptBody = (body) => {
   if (hasOwn(body, 'ctx_bracket')) canonical.ctx_bracket = body.ctx_bracket;
   if (hasOwn(body, 'ctx_bracket_table_ver')) canonical.ctx_bracket_table_ver = body.ctx_bracket_table_ver;
   canonical.rules_ver = body.rules_ver;
+  if (hasOwn(body, 'workflow')) canonical.workflow = canonicalWorkflowBinding(body.workflow);
+  if (hasOwn(body, 'workflow_output')) canonical.workflow_output = canonicalWorkflowOutput(body.workflow_output);
   canonical.usage = body.usage;
   if (body.usage_attribution && typeof body.usage_attribution === 'object' &&
       !Array.isArray(body.usage_attribution) && Object.keys(body.usage_attribution).length > 0) {
@@ -517,6 +520,23 @@ const canonicalReceiptBody = (body) => {
   canonical.prompt_hash = body.prompt_hash;
   canonical.ts = body.ts;
   return canonical;
+};
+const canonicalWorkflowBinding = (workflow) => {
+  if (!workflow || typeof workflow !== 'object' || Array.isArray(workflow)) return workflow;
+  return {
+    endpoint_family: workflow.endpoint_family,
+    graph_hash: workflow.graph_hash,
+    runtime_id: workflow.runtime_id,
+    outcome_class: workflow.outcome_class,
+    quoted_usage: stableValue(workflow.quoted_usage),
+  };
+};
+const canonicalWorkflowOutput = (output) => {
+  if (!output || typeof output !== 'object' || Array.isArray(output)) return output;
+  return {
+    output_modalities: output.output_modalities,
+    metrics: stableValue(output.metrics),
+  };
 };
 export const receiptMessage = (body, signingVersion = SIGNING_MESSAGE_VERSION) => {
   if (signingVersion !== SIGNING_MESSAGE_VERSION) {
@@ -570,6 +590,9 @@ export const spendReservationEvidence = (value) => {
   if (value.required_specialities && typeof value.required_specialities === 'object' &&
       !Array.isArray(value.required_specialities) && Object.keys(value.required_specialities).length > 0) {
     evidence.required_specialities = value.required_specialities;
+  }
+  if (value.workflow && typeof value.workflow === 'object' && !Array.isArray(value.workflow)) {
+    evidence.workflow = canonicalWorkflowBinding(value.workflow);
   }
   return evidence;
 };
@@ -2692,6 +2715,7 @@ class MayhemContract extends Contract {
         existing.served_ctx !== normalized.served_ctx ||
         stableJson(existing.required_modalities) !== stableJson(normalized.required_modalities) ||
         stableJson(existing.required_specialities) !== stableJson(normalized.required_specialities) ||
+        stableJson(existing.workflow ?? null) !== stableJson(normalized.workflow ?? null) ||
         existing.ctx_bracket !== normalized.ctx_bracket ||
         existing.ctx_bracket_table_ver !== normalized.ctx_bracket_table_ver ||
         this.compareAu(existing.max_spend_au, normalized.max_spend_au) !== 0 ||
@@ -2733,6 +2757,7 @@ class MayhemContract extends Contract {
       served_ctx: normalized.served_ctx,
       required_modalities: normalized.required_modalities.slice(),
       required_specialities: cloneValue(normalized.required_specialities),
+      ...(normalized.workflow ? { workflow: cloneValue(normalized.workflow) } : {}),
       ctx_bracket: normalized.ctx_bracket,
       ctx_bracket_table_ver: normalized.ctx_bracket_table_ver,
       rules_ver: normalized.rules_ver,
@@ -2949,6 +2974,7 @@ class MayhemContract extends Contract {
         existing.served_ctx !== normalized.served_ctx ||
         stableJson(existing.required_modalities) !== stableJson(normalized.required_modalities) ||
         stableJson(existing.required_specialities) !== stableJson(normalized.required_specialities) ||
+        stableJson(existing.workflow ?? null) !== stableJson(normalized.workflow ?? null) ||
         existing.ctx_bracket !== normalized.ctx_bracket ||
         existing.ctx_bracket_table_ver !== normalized.ctx_bracket_table_ver ||
         existing.rules_ver !== normalized.rules_ver ||
@@ -3018,6 +3044,7 @@ class MayhemContract extends Contract {
       served_ctx: normalized.served_ctx,
       required_modalities: normalized.required_modalities.slice(),
       required_specialities: cloneValue(normalized.required_specialities),
+      ...(normalized.workflow ? { workflow: cloneValue(normalized.workflow) } : {}),
       ctx_bracket: normalized.ctx_bracket,
       ctx_bracket_table_ver: normalized.ctx_bracket_table_ver,
       rules_ver: normalized.rules_ver,
@@ -3095,6 +3122,7 @@ class MayhemContract extends Contract {
       ctx_bracket: body.ctx_bracket,
       ctx_bracket_table_ver: body.ctx_bracket_table_ver,
       rules_ver: body.rules_ver,
+      workflow: body.workflow ?? null,
       prompt_hash: body.prompt_hash,
     };
   }
@@ -4001,7 +4029,8 @@ class MayhemContract extends Contract {
       session.served_ctx === body.served_ctx &&
       session.ctx_bracket === body.ctx_bracket &&
       session.ctx_bracket_table_ver === body.ctx_bracket_table_ver &&
-      session.rules_ver === body.rules_ver;
+      session.rules_ver === body.rules_ver &&
+      stableJson(session.workflow ?? null) === stableJson(body.workflow ?? null);
     if (!sessionTermsMatch) {
       return new Error('Receipt terms do not match the targeted spend hold session.');
     }
@@ -18149,6 +18178,7 @@ class MayhemContract extends Contract {
       'user_sig',
     ];
     if (hasOwn(voucher, 'required_specialities')) voucherFields.push('required_specialities');
+    if (hasOwn(voucher, 'workflow')) voucherFields.push('workflow');
     const shapeError = this.validateExactObjectKeys(
       voucher,
       voucherFields,
@@ -18248,6 +18278,18 @@ class MayhemContract extends Contract {
     const normalizedSpecialities = Object.fromEntries(
       Object.entries(requiredSpecialities).sort(([left], [right]) => compareCodepoint(left, right))
     );
+    let workflow = null;
+    if (hasOwn(voucher, 'workflow')) {
+      workflow = this.normalizeWorkflowBinding(
+        voucher.workflow,
+        'spend voucher workflow',
+        lockedRateMap
+      );
+      if (workflow instanceof Error) return workflow;
+      if (stableJson(workflow) !== stableJson(canonicalWorkflowBinding(voucher.workflow))) {
+        return new Error('Spend voucher workflow must be canonical.');
+      }
+    }
     const table = voucher.ctx_bracket_table_ver === null || voucher.ctx_bracket_table_ver === undefined
       ? null
       : await this.ctxBracketTableByVersion(voucher.ctx_bracket_table_ver);
@@ -18296,6 +18338,7 @@ class MayhemContract extends Contract {
       served_ctx: voucher.served_ctx,
       required_modalities: voucher.required_modalities.slice(),
       required_specialities: normalizedSpecialities,
+      ...(workflow ? { workflow } : {}),
       ctx_bracket: ctxMeta.ctx_bracket,
       ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
       rules_ver: voucher.rules_ver,
@@ -18340,6 +18383,7 @@ class MayhemContract extends Contract {
       'provider_sig',
     ];
     if (hasOwn(value, 'required_specialities')) reserveFields.push('required_specialities');
+    if (hasOwn(value, 'workflow')) reserveFields.push('workflow');
     const shapeError = this.validateExactObjectKeys(
       value,
       reserveFields,
@@ -18467,6 +18511,21 @@ class MayhemContract extends Contract {
     if (stableJson(voucher.body.required_specialities) !== stableJson(normalizedSpecialities)) {
       return new Error('Spend reservation voucher required specialities mismatch.');
     }
+    let workflow = null;
+    if (hasOwn(value, 'workflow')) {
+      workflow = this.normalizeWorkflowBinding(
+        value.workflow,
+        'spend reservation workflow',
+        voucher.body.locked_rate_map
+      );
+      if (workflow instanceof Error) return workflow;
+      if (stableJson(workflow) !== stableJson(value.workflow)) {
+        return new Error('Spend reservation workflow must be canonical.');
+      }
+    }
+    if (stableJson(voucher.body.workflow ?? null) !== stableJson(workflow)) {
+      return new Error('Spend reservation voucher workflow mismatch.');
+    }
     if (voucher.body.ctx_bracket !== value.ctx_bracket) {
       return new Error('Spend reservation voucher context bracket mismatch.');
     }
@@ -18515,6 +18574,7 @@ class MayhemContract extends Contract {
       served_ctx: value.served_ctx,
       required_modalities: value.required_modalities.slice(),
       required_specialities: normalizedSpecialities,
+      ...(workflow ? { workflow } : {}),
       ctx_bracket: ctxMeta.ctx_bracket,
       ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
       rules_ver: value.rules_ver,
@@ -18635,6 +18695,21 @@ class MayhemContract extends Contract {
     if (stableJson(voucher.body.required_specialities) !== stableJson(normalizedSpecialities)) {
       return new Error('Spend reservation voucher required specialities mismatch.');
     }
+    let workflow = null;
+    if (hasOwn(value, 'workflow')) {
+      workflow = this.normalizeWorkflowBinding(
+        value.workflow,
+        'spend reservation workflow',
+        voucher.body.locked_rate_map
+      );
+      if (workflow instanceof Error) return workflow;
+      if (stableJson(workflow) !== stableJson(value.workflow)) {
+        return new Error('Spend reservation workflow must be canonical.');
+      }
+    }
+    if (stableJson(voucher.body.workflow ?? null) !== stableJson(workflow)) {
+      return new Error('Spend reservation voucher workflow mismatch.');
+    }
     if (voucher.body.ctx_bracket !== value.ctx_bracket) {
       return new Error('Spend reservation voucher context bracket mismatch.');
     }
@@ -18661,6 +18736,7 @@ class MayhemContract extends Contract {
       served_ctx: value.served_ctx,
       required_modalities: value.required_modalities.slice(),
       required_specialities: normalizedSpecialities,
+      ...(workflow ? { workflow } : {}),
       ctx_bracket: ctxMeta.ctx_bracket,
       ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
       rules_ver: value.rules_ver,
@@ -18680,6 +18756,7 @@ class MayhemContract extends Contract {
         served_ctx: voucher.body.served_ctx,
         required_modalities: voucher.body.required_modalities,
         required_specialities: voucher.body.required_specialities,
+        ...(voucher.body.workflow ? { workflow: voucher.body.workflow } : {}),
         ctx_bracket: voucher.body.ctx_bracket,
         ctx_bracket_table_ver: voucher.body.ctx_bracket_table_ver,
         max_spend_au: voucher.body.max_spend_au,
@@ -18987,6 +19064,17 @@ class MayhemContract extends Contract {
         'spend hold required_specialities'
       );
       if (specialitiesError) return specialitiesError;
+      if (hasOwn(session, 'workflow')) {
+        const workflow = this.normalizeWorkflowBinding(
+          session.workflow,
+          'spend hold workflow',
+          lockedRateMap
+        );
+        if (workflow instanceof Error) return workflow;
+        if (stableJson(workflow) !== stableJson(session.workflow)) {
+          return new Error('Spend hold workflow must be canonical.');
+        }
+      }
       const table = session.ctx_bracket_table_ver === null || session.ctx_bracket_table_ver === undefined
         ? null
         : await this.ctxBracketTableByVersion(session.ctx_bracket_table_ver);
@@ -19027,6 +19115,13 @@ class MayhemContract extends Contract {
         locked_min_session_au: this.normalizeAu(session.locked_min_session_au, 'spend hold locked minimum session price'),
         required_modalities: session.required_modalities.slice(),
         required_specialities: cloneValue(session.required_specialities ?? {}),
+        ...(hasOwn(session, 'workflow') ? {
+          workflow: this.normalizeWorkflowBinding(
+            session.workflow,
+            'spend hold workflow',
+            this.normalizeLockedRateMap(session.locked_rate_map, 'spend hold locked_rate_map')
+          ),
+        } : {}),
         max_spend_au: this.normalizeAu(session.max_spend_au, 'spend hold max spend', { allowZero: false }),
       })),
     };
@@ -20961,6 +21056,74 @@ class MayhemContract extends Contract {
     return Object.fromEntries(Object.entries(usage).sort(([left], [right]) => compareCodepoint(left, right)));
   }
 
+  normalizeWorkflowBinding(source, label, rateMap = null) {
+    const shapeError = this.validateExactObjectKeys(
+      source,
+      ['endpoint_family', 'graph_hash', 'runtime_id', 'outcome_class', 'quoted_usage'],
+      label
+    );
+    if (shapeError) return shapeError;
+    if (!this.isSafeKeyPart(source.endpoint_family)) {
+      return new Error(`${label} endpoint_family is invalid.`);
+    }
+    if (!this.isHexBytes(source.graph_hash, 32)) {
+      return new Error(`${label} graph_hash is invalid.`);
+    }
+    if (!this.isSafeKeyPart(source.runtime_id)) {
+      return new Error(`${label} runtime_id is invalid.`);
+    }
+    if (!this.isSafeKeyPart(source.outcome_class)) {
+      return new Error(`${label} outcome_class is invalid.`);
+    }
+    const quotedUsage = this.normalizeReceiptUsage(source.quoted_usage);
+    if (quotedUsage instanceof Error || Object.keys(quotedUsage).length === 0) {
+      return new Error(`${label} quoted_usage is invalid.`);
+    }
+    if (rateMap !== null) {
+      const quotedAu = this.usageAuForRateMap(rateMap, quotedUsage);
+      if (quotedAu instanceof Error) return new Error(`${label} quoted_usage is not priced by the locked rate_map.`);
+    }
+    return {
+      endpoint_family: source.endpoint_family,
+      graph_hash: source.graph_hash.toLowerCase(),
+      runtime_id: source.runtime_id,
+      outcome_class: source.outcome_class,
+      quoted_usage: quotedUsage,
+    };
+  }
+
+  normalizeWorkflowOutputBinding(source, label) {
+    const shapeError = this.validateExactObjectKeys(
+      source,
+      ['output_modalities', 'metrics'],
+      label
+    );
+    if (shapeError) return shapeError;
+    const modalityError = this.validateModalitySet(source.output_modalities, `${label} output_modalities`);
+    if (modalityError) return modalityError;
+    if (!source.metrics || typeof source.metrics !== 'object' || Array.isArray(source.metrics)) {
+      return new Error(`${label} metrics must be an object.`);
+    }
+    const metricEntries = Object.entries(source.metrics);
+    if (metricEntries.length === 0 || metricEntries.length > 32) {
+      return new Error(`${label} metrics must contain between 1 and 32 entries.`);
+    }
+    const metrics = {};
+    for (const [key, count] of metricEntries) {
+      if (!this.isSafeKeyPart(key)) return new Error(`${label} metric key is invalid.`);
+      if (!Number.isSafeInteger(count) || count <= 0) {
+        return new Error(`${label} metric count is invalid.`);
+      }
+      metrics[key] = count;
+    }
+    return {
+      output_modalities: source.output_modalities.slice(),
+      metrics: Object.fromEntries(
+        Object.entries(metrics).sort(([left], [right]) => compareCodepoint(left, right))
+      ),
+    };
+  }
+
   normalizeReceiptUsageAttribution(source) {
     if (source === undefined || source === null) return {};
     if (!source || typeof source !== 'object' || Array.isArray(source)) {
@@ -21033,6 +21196,12 @@ class MayhemContract extends Contract {
     if (hasOwn(bodySource, 'ctx_bracket')) body.ctx_bracket = bodySource.ctx_bracket;
     if (hasOwn(bodySource, 'ctx_bracket_table_ver')) {
       body.ctx_bracket_table_ver = bodySource.ctx_bracket_table_ver;
+    }
+    if (hasOwn(bodySource, 'workflow')) {
+      body.workflow = cloneValue(bodySource.workflow);
+    }
+    if (hasOwn(bodySource, 'workflow_output')) {
+      body.workflow_output = cloneValue(bodySource.workflow_output);
     }
 
     if (body.schema_version !== targetSchemaVersion) {
@@ -21147,6 +21316,27 @@ class MayhemContract extends Contract {
     if (ctxMeta instanceof Error) return ctxMeta;
     if (!Number.isSafeInteger(body.rules_ver) || body.rules_ver < 1) {
       return new Error('Invalid receipt rules version.');
+    }
+    let workflow = null;
+    if (hasOwn(body, 'workflow')) {
+      workflow = this.normalizeWorkflowBinding(body.workflow, 'receipt workflow', lockedRateMap);
+      if (workflow instanceof Error) return workflow;
+      if (stableJson(workflow) !== stableJson(body.workflow)) {
+        return new Error('Receipt workflow must be canonical.');
+      }
+    }
+    if (hasOwn(body, 'workflow_output')) {
+      if (!workflow) return new Error('Receipt workflow_output requires workflow.');
+      const workflowOutput = this.normalizeWorkflowOutputBinding(
+        body.workflow_output,
+        'receipt workflow_output'
+      );
+      if (workflowOutput instanceof Error) return workflowOutput;
+      if (stableJson(workflowOutput) !== stableJson(body.workflow_output)) {
+        return new Error('Receipt workflow_output must be canonical.');
+      }
+    } else if (workflow) {
+      return new Error('Receipt workflow requires workflow_output.');
     }
     const usage = this.normalizeReceiptUsage(body.usage);
     if (usage instanceof Error) return usage;
