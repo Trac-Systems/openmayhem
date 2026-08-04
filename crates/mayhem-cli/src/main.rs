@@ -4183,6 +4183,10 @@ struct AdminPartsOnboardArgs {
     #[arg(long = "row-index", default_value_t = 1)]
     row_index: usize,
 
+    /// Onboard every importable row in --input. Requires --download-dir and --output-dir.
+    #[arg(long = "all")]
+    all: bool,
+
     /// Existing payload file to hash and seal into the finalized record.
     #[arg(long, value_name = "PATH")]
     payload: Option<PathBuf>,
@@ -4199,9 +4203,17 @@ struct AdminPartsOnboardArgs {
     #[arg(long = "disk-reserve")]
     disk_reserve: Option<String>,
 
-    /// Output finalized Comfy part record JSON.
+    /// Output finalized Comfy part record JSON for single-row onboarding.
     #[arg(long, value_name = "PATH")]
-    output: PathBuf,
+    output: Option<PathBuf>,
+
+    /// Output directory for --all batch onboarding records.
+    #[arg(long = "output-dir", value_name = "PATH")]
+    output_dir: Option<PathBuf>,
+
+    /// Optional directory for per-part onboarding receipt JSON reports.
+    #[arg(long = "receipt-dir", value_name = "PATH")]
+    receipt_dir: Option<PathBuf>,
 
     /// Blessed Comfy runtime id required for this part.
     #[arg(long = "min-runtime")]
@@ -24912,6 +24924,7 @@ struct AdminPartsOnboardReport {
     min_runtime: String,
     license_doc_hash: String,
     canary: AdminPartsOnboardCanaryReport,
+    steps: Vec<AdminPartsOnboardStepReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -24920,6 +24933,24 @@ struct AdminPartsOnboardCanaryReport {
     reference_output_ref: String,
     tolerance_method: String,
     max_distance_bps: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AdminPartsOnboardStepReport {
+    step: String,
+    ok: bool,
+    fields: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminPartsOnboardBatchReport {
+    ok: bool,
+    input: String,
+    row_count: u64,
+    record_count: u64,
+    output_dir: String,
+    receipt_dir: Option<String>,
+    parts: Vec<AdminPartsOnboardReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -25057,8 +25088,51 @@ fn admin_parts_onboard(args: &AdminPartsOnboardArgs) -> Result<()> {
     let payload = args.payload.clone().map(absolutize).transpose()?;
     let download_dir = args.download_dir.clone().map(absolutize).transpose()?;
     let source_token_file = args.source_token_file.clone().map(absolutize).transpose()?;
-    let output = absolutize(args.output.clone())?;
+    let output = args.output.clone().map(absolutize).transpose()?;
+    let output_dir = args.output_dir.clone().map(absolutize).transpose()?;
+    let receipt_dir = args.receipt_dir.clone().map(absolutize).transpose()?;
     let license_doc = args.license_doc.clone().map(absolutize).transpose()?;
+    if args.all {
+        ensure!(args.row_index == 1, "--row-index cannot be used with --all");
+        let report = admin_parts_onboard_batch_report(AdminPartsOnboardBatchInput {
+            input,
+            payload,
+            download_dir,
+            source_token_file,
+            disk_reserve: args.disk_reserve.clone(),
+            output,
+            output_dir,
+            receipt_dir,
+            min_runtime: args.min_runtime.clone(),
+            license_doc,
+            license_doc_hash: args.license_doc_hash.clone(),
+            license_ref: args.license_ref.clone(),
+            license_captured_at: args.license_captured_at.clone(),
+            canary_graph_hash: args.canary_graph_hash.clone(),
+            canary_output_ref: args.canary_output_ref.clone(),
+            canary_tolerance_method: args.canary_tolerance_method.clone(),
+            canary_max_distance_bps: args.canary_max_distance_bps,
+            chunk_size: args.chunk_size,
+            force: args.force,
+        })?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!(
+                "Finalized {} Comfy part record(s) into {}.",
+                report.record_count, report.output_dir
+            );
+            if let Some(receipt_dir) = &report.receipt_dir {
+                println!("Receipts: {receipt_dir}");
+            }
+        }
+        return Ok(());
+    }
+    let output = output.context("--output is required unless --all is passed")?;
+    ensure!(
+        output_dir.is_none(),
+        "--output-dir requires --all; use --output for single-row onboarding"
+    );
     let report = admin_parts_onboard_report(AdminPartsOnboardInput {
         input,
         row_index: args.row_index,
@@ -25067,6 +25141,7 @@ fn admin_parts_onboard(args: &AdminPartsOnboardArgs) -> Result<()> {
         source_token_file,
         disk_reserve: args.disk_reserve.clone(),
         output,
+        receipt_dir,
         min_runtime: args.min_runtime.clone(),
         license_doc,
         license_doc_hash: args.license_doc_hash.clone(),
@@ -25104,6 +25179,29 @@ struct AdminPartsOnboardInput {
     source_token_file: Option<PathBuf>,
     disk_reserve: Option<String>,
     output: PathBuf,
+    receipt_dir: Option<PathBuf>,
+    min_runtime: String,
+    license_doc: Option<PathBuf>,
+    license_doc_hash: Option<String>,
+    license_ref: String,
+    license_captured_at: String,
+    canary_graph_hash: String,
+    canary_output_ref: String,
+    canary_tolerance_method: String,
+    canary_max_distance_bps: u32,
+    chunk_size: usize,
+    force: bool,
+}
+
+struct AdminPartsOnboardBatchInput {
+    input: PathBuf,
+    payload: Option<PathBuf>,
+    download_dir: Option<PathBuf>,
+    source_token_file: Option<PathBuf>,
+    disk_reserve: Option<String>,
+    output: Option<PathBuf>,
+    output_dir: Option<PathBuf>,
+    receipt_dir: Option<PathBuf>,
     min_runtime: String,
     license_doc: Option<PathBuf>,
     license_doc_hash: Option<String>,
@@ -25142,8 +25240,31 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
     );
 
     let (draft, row_index) = read_comfy_part_draft_input(&input.input, input.row_index)?;
+    let draft_part_id =
+        mayhem_proto::derive_comfy_part_id(&draft.part_type, &draft.name, &draft.sha256);
+    let mut steps = vec![admin_parts_onboard_step(
+        "draft_imported",
+        &[
+            ("row_index", row_index.to_string()),
+            ("part_id", draft_part_id),
+            ("name", draft.name.clone()),
+            ("type", draft.part_type.clone()),
+            ("lane", draft.lane.clone()),
+        ],
+    )];
     let (payload_path, payload_source, download_source_url) =
         admin_parts_resolve_payload(&input, &draft)?;
+    let mut payload_fields = vec![
+        ("source", payload_source.clone()),
+        ("path", payload_path.display().to_string()),
+    ];
+    if let Some(url) = &download_source_url {
+        payload_fields.push(("source_url", url.clone()));
+    }
+    steps.push(admin_parts_onboard_step(
+        "payload_resolved",
+        &payload_fields,
+    ));
     let payload_metadata = fs::metadata(&payload_path)
         .with_context(|| format!("inspecting payload {}", payload_path.display()))?;
     ensure!(
@@ -25166,16 +25287,50 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
         draft.sha256,
         sha256
     );
+    steps.push(admin_parts_onboard_step(
+        "payload_verified",
+        &[
+            ("sha256", sha256.clone()),
+            ("size_bytes", payload_metadata.len().to_string()),
+        ],
+    ));
     let merkle = build_merkle_manifest(&payload_path, input.chunk_size)?;
+    steps.push(admin_parts_onboard_step(
+        "merkle_built",
+        &[
+            ("blake3_root", merkle.root.clone()),
+            ("chunk_size", input.chunk_size.to_string()),
+        ],
+    ));
     let license_doc_hash = comfy_part_license_doc_hash(
         input.license_doc.as_deref(),
         input.license_doc_hash.as_deref(),
     )?;
+    steps.push(admin_parts_onboard_step(
+        "license_bound",
+        &[
+            ("license_doc_hash", license_doc_hash.clone()),
+            ("license_ref", input.license_ref.clone()),
+            ("license_captured_at", input.license_captured_at.clone()),
+        ],
+    ));
     let canary_graph_hash = input.canary_graph_hash.to_ascii_lowercase();
     ensure!(
         is_hex_len(&canary_graph_hash, 64),
         "--canary-graph-hash must be 32-byte hex"
     );
+    steps.push(admin_parts_onboard_step(
+        "canary_bound",
+        &[
+            ("probe_graph_hash", canary_graph_hash.clone()),
+            ("reference_output_ref", input.canary_output_ref.clone()),
+            ("tolerance_method", input.canary_tolerance_method.clone()),
+            (
+                "max_distance_bps",
+                input.canary_max_distance_bps.to_string(),
+            ),
+        ],
+    ));
     let record = draft.finalize(
         merkle.root.clone(),
         input.min_runtime.clone(),
@@ -25196,8 +25351,16 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
     let record_hash = mayhem_proto::comfy_part_record_hash(&record)?;
     let output_reused_existing =
         write_comfy_part_record_idempotent(&input.output, &record, input.force)?;
+    steps.push(admin_parts_onboard_step(
+        "record_written",
+        &[
+            ("output", input.output.display().to_string()),
+            ("reused_existing", output_reused_existing.to_string()),
+            ("record_hash", record_hash.clone()),
+        ],
+    ));
 
-    Ok(AdminPartsOnboardReport {
+    let report = AdminPartsOnboardReport {
         ok: true,
         input: input.input.display().to_string(),
         row_index: row_index as u64,
@@ -25219,7 +25382,103 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
             tolerance_method: input.canary_tolerance_method,
             max_distance_bps: input.canary_max_distance_bps,
         },
+        steps,
+    };
+    write_admin_parts_onboard_receipt(input.receipt_dir.as_deref(), &report)?;
+    Ok(report)
+}
+
+fn admin_parts_onboard_batch_report(
+    input: AdminPartsOnboardBatchInput,
+) -> Result<AdminPartsOnboardBatchReport> {
+    ensure!(
+        input.payload.is_none(),
+        "--payload cannot be used with --all"
+    );
+    ensure!(
+        input.output.is_none(),
+        "--output cannot be used with --all; pass --output-dir"
+    );
+    let output_dir = input
+        .output_dir
+        .clone()
+        .context("--output-dir is required with --all")?;
+    let download_dir = input
+        .download_dir
+        .clone()
+        .context("--download-dir is required with --all")?;
+    fs::create_dir_all(&output_dir)
+        .with_context(|| format!("creating {}", output_dir.display()))?;
+    if let Some(receipt_dir) = &input.receipt_dir {
+        fs::create_dir_all(receipt_dir)
+            .with_context(|| format!("creating {}", receipt_dir.display()))?;
+    }
+    let rows = read_all_comfy_part_draft_inputs(&input.input)?;
+    let mut parts = Vec::with_capacity(rows.len());
+    for (draft, row_index) in rows {
+        let part_id =
+            mayhem_proto::derive_comfy_part_id(&draft.part_type, &draft.name, &draft.sha256);
+        let output = output_dir.join(format!("{part_id}.json"));
+        let report = admin_parts_onboard_report(AdminPartsOnboardInput {
+            input: input.input.clone(),
+            row_index,
+            payload: None,
+            download_dir: Some(download_dir.clone()),
+            source_token_file: input.source_token_file.clone(),
+            disk_reserve: input.disk_reserve.clone(),
+            output,
+            receipt_dir: input.receipt_dir.clone(),
+            min_runtime: input.min_runtime.clone(),
+            license_doc: input.license_doc.clone(),
+            license_doc_hash: input.license_doc_hash.clone(),
+            license_ref: input.license_ref.clone(),
+            license_captured_at: input.license_captured_at.clone(),
+            canary_graph_hash: input.canary_graph_hash.clone(),
+            canary_output_ref: input.canary_output_ref.clone(),
+            canary_tolerance_method: input.canary_tolerance_method.clone(),
+            canary_max_distance_bps: input.canary_max_distance_bps,
+            chunk_size: input.chunk_size,
+            force: input.force,
+        })?;
+        parts.push(report);
+    }
+    Ok(AdminPartsOnboardBatchReport {
+        ok: true,
+        input: input.input.display().to_string(),
+        row_count: parts.len() as u64,
+        record_count: parts.len() as u64,
+        output_dir: output_dir.display().to_string(),
+        receipt_dir: input
+            .receipt_dir
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        parts,
     })
+}
+
+fn write_admin_parts_onboard_receipt(
+    receipt_dir: Option<&Path>,
+    report: &AdminPartsOnboardReport,
+) -> Result<()> {
+    let Some(receipt_dir) = receipt_dir else {
+        return Ok(());
+    };
+    fs::create_dir_all(receipt_dir)
+        .with_context(|| format!("creating {}", receipt_dir.display()))?;
+    let path = receipt_dir.join(format!("{}.receipt.json", report.part_id));
+    write_json_file(&path, report)
+        .with_context(|| format!("writing Comfy part onboarding receipt {}", path.display()))
+}
+
+fn admin_parts_onboard_step(step: &str, fields: &[(&str, String)]) -> AdminPartsOnboardStepReport {
+    AdminPartsOnboardStepReport {
+        step: step.to_owned(),
+        ok: true,
+        fields: fields
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), value.clone()))
+            .collect(),
+    }
 }
 
 fn admin_parts_resolve_payload(
@@ -25549,6 +25808,32 @@ fn read_comfy_part_draft_input(
     let draft = mayhem_proto::ComfyPartDraft::from_yaml_value(&row)
         .with_context(|| format!("importing {} row {}", path.display(), resolved_index))?;
     Ok((draft, resolved_index))
+}
+
+fn read_all_comfy_part_draft_inputs(
+    path: &Path,
+) -> Result<Vec<(mayhem_proto::ComfyPartDraft, usize)>> {
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let value = serde_json::from_str::<Value>(&text)
+        .or_else(|_| yaml_serde::from_str::<Value>(&text))
+        .with_context(|| format!("parsing Comfy part draft input {}", path.display()))?;
+    let rows = value.as_array().cloned().unwrap_or_else(|| vec![value]);
+    let mut drafts = Vec::with_capacity(rows.len());
+    for (index, row) in rows.into_iter().enumerate() {
+        let row_index = index + 1;
+        if let Some(reason) = comfy_part_yaml_skip_reason(&row) {
+            bail!(
+                "{} row {} is not directly onboardable: {}",
+                path.display(),
+                row_index,
+                reason
+            );
+        }
+        let draft = mayhem_proto::ComfyPartDraft::from_yaml_value(&row)
+            .with_context(|| format!("importing {} row {}", path.display(), row_index))?;
+        drafts.push((draft, row_index));
+    }
+    Ok(drafts)
 }
 
 fn comfy_part_license_doc_hash(
@@ -87605,12 +87890,70 @@ mod tests {
         assert_eq!(args.download_dir, None);
         assert_eq!(args.source_token_file, None);
         assert_eq!(args.disk_reserve, None);
-        assert_eq!(args.output, PathBuf::from("record.json"));
+        assert!(!args.all);
+        assert_eq!(args.output, Some(PathBuf::from("record.json")));
+        assert_eq!(args.output_dir, None);
+        assert_eq!(args.receipt_dir, None);
         assert_eq!(args.min_runtime, "comfyui-v0.30.1");
         assert_eq!(args.license_doc_hash, Some("11".repeat(32)));
         assert_eq!(args.canary_max_distance_bps, 12);
         assert_eq!(args.chunk_size, 8);
         assert!(args.force);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn admin_parts_onboard_batch_cli_parses_without_tx_flags() {
+        let parsed = Cli::try_parse_from([
+            "mayhem",
+            "admin",
+            "parts",
+            "onboard",
+            "--input",
+            "rows.yaml",
+            "--all",
+            "--download-dir",
+            "payloads",
+            "--source-token-file",
+            "source.token",
+            "--disk-reserve",
+            "10GB",
+            "--output-dir",
+            "records",
+            "--receipt-dir",
+            "receipts",
+            "--min-runtime",
+            "comfyui-v0.30.1",
+            "--license-doc-hash",
+            &"11".repeat(32),
+            "--license-ref",
+            "license:test",
+            "--license-captured-at",
+            "2026-08-04T00:00:00Z",
+            "--canary-graph-hash",
+            &"22".repeat(32),
+            "--canary-output-ref",
+            "canaries/test.png",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Admin { command } = parsed.command else {
+            panic!("expected admin command");
+        };
+        let AdminCommands::Parts { command } = *command else {
+            panic!("expected admin parts command");
+        };
+        let AdminPartsCommands::Onboard(args) = command else {
+            panic!("expected admin parts onboard command");
+        };
+        assert!(args.all);
+        assert_eq!(args.payload, None);
+        assert_eq!(args.download_dir, Some(PathBuf::from("payloads")));
+        assert_eq!(args.source_token_file, Some(PathBuf::from("source.token")));
+        assert_eq!(args.disk_reserve, Some("10GB".to_owned()));
+        assert_eq!(args.output, None);
+        assert_eq!(args.output_dir, Some(PathBuf::from("records")));
+        assert_eq!(args.receipt_dir, Some(PathBuf::from("receipts")));
         assert!(args.json);
     }
 
@@ -87757,6 +88100,7 @@ mod tests {
             source_token_file: None,
             disk_reserve: None,
             output: output_path.clone(),
+            receipt_dir: None,
             min_runtime: "comfyui-v0.30.1".to_owned(),
             license_doc: Some(license_path.clone()),
             license_doc_hash: None,
@@ -87779,6 +88123,22 @@ mod tests {
         assert_eq!(report.payload_source, "provided");
         assert_eq!(report.download_source_url, None);
         assert_eq!(
+            report
+                .steps
+                .iter()
+                .map(|step| step.step.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "draft_imported",
+                "payload_resolved",
+                "payload_verified",
+                "merkle_built",
+                "license_bound",
+                "canary_bound",
+                "record_written"
+            ]
+        );
+        assert_eq!(
             report.license_doc_hash,
             file_sha256_hex(&license_path).unwrap()
         );
@@ -87800,6 +88160,7 @@ mod tests {
             source_token_file: None,
             disk_reserve: None,
             output: output_path,
+            receipt_dir: None,
             min_runtime: "comfyui-v0.30.1".to_owned(),
             license_doc: Some(license_path),
             license_doc_hash: None,
@@ -87853,6 +88214,7 @@ status: linked
             source_token_file: None,
             disk_reserve: None,
             output: temp.join("record.json"),
+            receipt_dir: None,
             min_runtime: "comfyui-v0.30.1".to_owned(),
             license_doc: None,
             license_doc_hash: Some("33".repeat(32)),
@@ -87875,6 +88237,86 @@ status: linked
         );
         assert_eq!(report.payload, payload_path.display().to_string());
         assert_eq!(report.sha256, sha256);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn admin_parts_onboard_batch_writes_records_and_receipts() {
+        let temp = test_temp_dir("mayhem-admin-parts-onboard-batch");
+        let download_dir = temp.join("downloads");
+        let output_dir = temp.join("records");
+        let receipt_dir = temp.join("receipts");
+        fs::create_dir_all(&download_dir).unwrap();
+        let first_payload = download_dir.join("first.bin");
+        let second_payload = download_dir.join("second.bin");
+        fs::write(&first_payload, b"first batch payload").unwrap();
+        fs::write(&second_payload, b"second batch payload").unwrap();
+        let first_sha = file_sha256_hex(&first_payload).unwrap();
+        let second_sha = file_sha256_hex(&second_payload).unwrap();
+        let first_size = fs::metadata(&first_payload).unwrap().len();
+        let second_size = fs::metadata(&second_payload).unwrap().len();
+        let input_path = temp.join("parts.yaml");
+        fs::write(
+            &input_path,
+            format!(
+                r#"
+- name: "Batch first"
+  type: upscaler
+  lane: all
+  license: MIT
+  file_format: bin
+  sha256: "{first_sha}"
+  size_bytes: {first_size}
+  download_url: "https://huggingface.co/TracNetwork/openmayhem-parts/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/first.bin"
+  status: linked
+- name: "Batch second"
+  type: controlnet
+  lane: image
+  license: Apache-2.0
+  file_format: bin
+  sha256: "{second_sha}"
+  size_bytes: {second_size}
+  download_url: "https://huggingface.co/TracNetwork/openmayhem-parts/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/second.bin"
+  status: linked
+"#
+            ),
+        )
+        .unwrap();
+
+        let report = admin_parts_onboard_batch_report(AdminPartsOnboardBatchInput {
+            input: input_path,
+            payload: None,
+            download_dir: Some(download_dir),
+            source_token_file: None,
+            disk_reserve: None,
+            output: None,
+            output_dir: Some(output_dir.clone()),
+            receipt_dir: Some(receipt_dir.clone()),
+            min_runtime: "comfyui-v0.30.1".to_owned(),
+            license_doc: None,
+            license_doc_hash: Some("33".repeat(32)),
+            license_ref: "license:batch-test".to_owned(),
+            license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
+            canary_graph_hash: "44".repeat(32),
+            canary_output_ref: "canaries/batch.png".to_owned(),
+            canary_tolerance_method: "phash".to_owned(),
+            canary_max_distance_bps: 10,
+            chunk_size: 8,
+            force: false,
+        })
+        .unwrap();
+
+        assert!(report.ok);
+        assert_eq!(report.record_count, 2);
+        assert_eq!(report.parts.len(), 2);
+        for part in &report.parts {
+            let record_path = output_dir.join(format!("{}.json", part.part_id));
+            let receipt_path = receipt_dir.join(format!("{}.receipt.json", part.part_id));
+            assert!(record_path.is_file(), "missing {}", record_path.display());
+            assert!(receipt_path.is_file(), "missing {}", receipt_path.display());
+            assert_eq!(part.payload_source, "download");
+            assert!(part.steps.iter().any(|step| step.step == "record_written"));
+        }
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -87913,6 +88355,7 @@ status: linked
             source_token_file: None,
             disk_reserve: None,
             output: temp.join("record.json"),
+            receipt_dir: None,
             min_runtime: "comfyui-v0.30.1".to_owned(),
             license_doc: None,
             license_doc_hash: Some("33".repeat(32)),
@@ -87970,6 +88413,7 @@ status: linked
             source_token_file: None,
             disk_reserve: None,
             output: temp.join("record.json"),
+            receipt_dir: None,
             min_runtime: "comfyui-v0.30.1".to_owned(),
             license_doc: None,
             license_doc_hash: Some("33".repeat(32)),
@@ -88026,6 +88470,7 @@ status: linked
             source_token_file: None,
             disk_reserve: None,
             output: temp.join("record.json"),
+            receipt_dir: None,
             min_runtime: "comfyui-v0.30.1".to_owned(),
             license_doc: None,
             license_doc_hash: Some("33".repeat(32)),
