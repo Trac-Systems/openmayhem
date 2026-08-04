@@ -42,6 +42,7 @@ indicatif = "0.17"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+yaml_serde = "0.10.4"
 semver = "1"
 sha2 = "0.10"
 tar = "0.4"

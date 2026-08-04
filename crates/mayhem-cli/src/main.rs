@@ -661,6 +661,11 @@ enum AdminCommands {
     SetModelRef(AdminSetModelRefArgs),
     /// Publish the latest signed catalog release anchor for network discovery.
     PublishCatalog(AdminPublishCatalogArgs),
+    /// Local Comfy parts catalog preparation helpers.
+    Parts {
+        #[command(subcommand)]
+        command: AdminPartsCommands,
+    },
     /// Register an admin-created and attested canonical enclave.
     RegisterEnclave(AdminRegisterEnclaveArgs),
     /// Update admin-owned metadata for a canonical enclave.
@@ -753,6 +758,12 @@ enum AdminCommands {
 enum AdminPriceCommands {
     /// Seed the admin-owned initial market price P0 for an enclave.
     Seed(AdminPriceSeedArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminPartsCommands {
+    /// Parse Comfy inventory YAML and report importable pinned part drafts.
+    ValidateYaml(AdminPartsValidateYamlArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -4128,6 +4139,21 @@ struct AdminPublishCatalogArgs {
     /// Source label for the release URLs.
     #[arg(long, default_value = "huggingface")]
     source_kind: String,
+}
+
+#[derive(Debug, Parser)]
+struct AdminPartsValidateYamlArgs {
+    /// YAML inventory file to parse. Pass once per catalog source file.
+    #[arg(long = "input", required = true, value_name = "PATH")]
+    inputs: Vec<PathBuf>,
+
+    /// Include importable draft records in the JSON output.
+    #[arg(long)]
+    include_drafts: bool,
+
+    /// Fail if any YAML row is not directly importable as a single pinned part draft.
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -24498,6 +24524,7 @@ async fn admin(command: AdminCommands) -> Result<()> {
         AdminCommands::Disputes { command } => return admin_disputes(command).await,
         AdminCommands::Ban { command } => return admin_ban(command).await,
         AdminCommands::Tier3 { command } => return admin_tier3(command).await,
+        AdminCommands::Parts { command } => return admin_parts(command).await,
         AdminCommands::EpochApply(args) => return run_admin_epoch_apply_feature(args).await,
         AdminCommands::PublishPayoutContext(args) => {
             return run_admin_publish_payout_context_feature(args).await;
@@ -24578,6 +24605,177 @@ async fn admin(command: AdminCommands) -> Result<()> {
     };
     ensure_admin_command_signatures(tx_args, &mut value).await?;
     run_admin_command(tx_args, tx_type, value, schedule_meta).await
+}
+
+#[derive(Debug, Serialize)]
+struct AdminPartsValidateYamlReport {
+    ok: bool,
+    all_rows_importable: bool,
+    schema_version: u32,
+    inputs: Vec<AdminPartsValidateYamlInputReport>,
+    rows_total: u64,
+    imported_count: u64,
+    skipped_count: u64,
+    by_status: BTreeMap<String, u64>,
+    by_type: BTreeMap<String, u64>,
+    skipped: Vec<AdminPartsSkippedRow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drafts: Option<Vec<AdminPartsDraftSummary>>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminPartsValidateYamlInputReport {
+    path: String,
+    rows: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminPartsSkippedRow {
+    path: String,
+    row_index: u64,
+    name: Option<String>,
+    status: Option<String>,
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminPartsDraftSummary {
+    path: String,
+    row_index: u64,
+    part_id: String,
+    name: String,
+    #[serde(rename = "type")]
+    part_type: String,
+    lane: String,
+    sha256: String,
+    size_bytes: u64,
+    status: String,
+    require_auth: bool,
+}
+
+async fn admin_parts(command: &AdminPartsCommands) -> Result<()> {
+    match command {
+        AdminPartsCommands::ValidateYaml(args) => admin_parts_validate_yaml(args),
+    }
+}
+
+fn admin_parts_validate_yaml(args: &AdminPartsValidateYamlArgs) -> Result<()> {
+    let mut inputs = Vec::new();
+    let mut drafts = Vec::new();
+    let mut skipped = Vec::new();
+    let mut by_status = BTreeMap::new();
+    let mut by_type = BTreeMap::new();
+    let mut rows_total = 0_u64;
+
+    for input in &args.inputs {
+        let path = absolutize(input.clone())?;
+        let rows = read_comfy_part_yaml_rows(&path)?;
+        inputs.push(AdminPartsValidateYamlInputReport {
+            path: path.display().to_string(),
+            rows: rows.len() as u64,
+        });
+        for (index, row) in rows.into_iter().enumerate() {
+            rows_total += 1;
+            let row_index = (index + 1) as u64;
+            if let Some(reason) = comfy_part_yaml_skip_reason(&row) {
+                skipped.push(AdminPartsSkippedRow {
+                    path: path.display().to_string(),
+                    row_index,
+                    name: comfy_part_yaml_string(&row, "name"),
+                    status: comfy_part_yaml_string(&row, "status"),
+                    reason,
+                });
+                continue;
+            }
+            match mayhem_proto::ComfyPartDraft::from_yaml_value(&row) {
+                Ok(draft) => {
+                    *by_status.entry(draft.status.clone()).or_insert(0) += 1;
+                    *by_type.entry(draft.part_type.clone()).or_insert(0) += 1;
+                    drafts.push(AdminPartsDraftSummary {
+                        path: path.display().to_string(),
+                        row_index,
+                        part_id: mayhem_proto::derive_comfy_part_id(
+                            &draft.part_type,
+                            &draft.name,
+                            &draft.sha256,
+                        ),
+                        name: draft.name,
+                        part_type: draft.part_type,
+                        lane: draft.lane,
+                        sha256: draft.sha256,
+                        size_bytes: draft.size_bytes,
+                        status: draft.status,
+                        require_auth: draft.sources.require_auth,
+                    });
+                }
+                Err(error) => skipped.push(AdminPartsSkippedRow {
+                    path: path.display().to_string(),
+                    row_index,
+                    name: comfy_part_yaml_string(&row, "name"),
+                    status: comfy_part_yaml_string(&row, "status"),
+                    reason: error.to_string(),
+                }),
+            }
+        }
+    }
+
+    if args.strict && !skipped.is_empty() {
+        bail!(
+            "Comfy parts YAML validation skipped {} row(s); rerun without --strict for the JSON report",
+            skipped.len()
+        );
+    }
+
+    let report = AdminPartsValidateYamlReport {
+        ok: true,
+        all_rows_importable: skipped.is_empty(),
+        schema_version: mayhem_proto::COMFY_PART_RECORD_SCHEMA_VERSION,
+        inputs,
+        rows_total,
+        imported_count: drafts.len() as u64,
+        skipped_count: skipped.len() as u64,
+        by_status,
+        by_type,
+        skipped,
+        drafts: args.include_drafts.then_some(drafts),
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn read_comfy_part_yaml_rows(path: &Path) -> Result<Vec<Value>> {
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let value: Value =
+        yaml_serde::from_str(&text).with_context(|| format!("parsing YAML {}", path.display()))?;
+    value
+        .as_array()
+        .cloned()
+        .with_context(|| format!("{} must be a top-level YAML sequence", path.display()))
+}
+
+fn comfy_part_yaml_skip_reason(row: &Value) -> Option<String> {
+    let object = row.as_object()?;
+    if object.get("files").is_some() {
+        return Some("composite row uses files[]; split into single file rows".to_owned());
+    }
+    if object.keys().any(|key| key.starts_with("sha256_")) {
+        return Some("multi-file row uses sha256_* fields; split into single file rows".to_owned());
+    }
+    match object.get("sha256").and_then(Value::as_str) {
+        Some(value) if value.eq_ignore_ascii_case("gated") => {
+            Some("sha256 is GATED; terms must be accepted and the file pinned first".to_owned())
+        }
+        Some(_) => None,
+        None => Some("missing sha256; row is not a pinned downloadable part".to_owned()),
+    }
+}
+
+fn comfy_part_yaml_string(row: &Value, key: &str) -> Option<String> {
+    row.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 async fn admin_disputes(command: &AdminDisputeCommands) -> Result<()> {
@@ -26210,6 +26408,9 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::PublishPayoutContext(args) => &args.tx,
         AdminCommands::SetModelRef(args) => &args.tx,
         AdminCommands::PublishCatalog(args) => &args.tx,
+        AdminCommands::Parts { .. } => {
+            unreachable!("admin parts commands are handled before admin_tx_args")
+        }
         AdminCommands::RegisterEnclave(args) => &args.tx,
         AdminCommands::UpdateEnclave(args) => &args.tx,
         AdminCommands::SetEnclaveMinTier(args) => &args.tx,
@@ -26273,6 +26474,9 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         AdminCommands::SetModelRef(args) => Ok(("setModelRef", admin_set_model_ref_payload(args)?)),
         AdminCommands::PublishCatalog(args) => {
             Ok(("publishCatalog", admin_publish_catalog_payload(args)?))
+        }
+        AdminCommands::Parts { .. } => {
+            bail!("admin parts commands are handled outside generic paid admin commands")
         }
         AdminCommands::RegisterEnclave(args) => {
             Ok(("registerEnclave", admin_register_enclave_payload(args)?))
@@ -85468,6 +85672,61 @@ mod tests {
         assert!(err
             .to_string()
             .contains("--catalog-url must use a 40-hex Hugging Face commit revision"));
+    }
+
+    #[test]
+    fn admin_parts_validate_yaml_cli_parses_without_tx_flags() {
+        let parsed = Cli::try_parse_from([
+            "mayhem",
+            "admin",
+            "parts",
+            "validate-yaml",
+            "--input",
+            "docs/comfy/UpscalersOpenmayhem.yaml",
+            "--include-drafts",
+        ])
+        .unwrap();
+        let Commands::Admin { command } = parsed.command else {
+            panic!("expected admin command");
+        };
+        let AdminCommands::Parts { command } = *command else {
+            panic!("expected admin parts command");
+        };
+        let AdminPartsCommands::ValidateYaml(args) = command;
+        assert_eq!(
+            args.inputs,
+            vec![PathBuf::from("docs/comfy/UpscalersOpenmayhem.yaml")]
+        );
+        assert!(args.include_drafts);
+        assert!(!args.strict);
+    }
+
+    #[test]
+    fn admin_parts_yaml_import_reports_importable_and_skipped_rows() {
+        let rows = yaml_serde::from_str::<Value>(
+            r#"
+- name: "4x test"
+  role: "upscale"
+  lane_fit: "all lanes"
+  license: "MIT"
+  file_format: "safetensors"
+  sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  size_bytes: 64
+  download_url: "https://example.test/model.safetensors"
+  status: linked
+- name: "not pinned yet"
+  status: in-catalog
+"#,
+        )
+        .unwrap();
+        let rows = rows.as_array().unwrap();
+
+        let draft = mayhem_proto::ComfyPartDraft::from_yaml_value(&rows[0]).unwrap();
+        assert_eq!(draft.part_type, "upscaler");
+        assert_eq!(draft.status, "linked");
+        assert!(comfy_part_yaml_skip_reason(&rows[1])
+            .unwrap()
+            .contains("missing sha256"));
     }
 
     #[test]
