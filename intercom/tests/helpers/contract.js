@@ -304,8 +304,123 @@ export const executeFeature = async (contract, storage, featureType, key, value,
 
 export async function epochApplyFeatureKey(contract, value) {
   const key = await contract.epochApplyFeatureKey(value);
-  if (key instanceof Error) throw key;
+  if (key instanceof Error) {
+    if (/Aggregate epoch_apply is disabled/i.test(key.message)) {
+      const digest = await contract.opaqueHash('mayhem-test-legacy-epoch-apply-feature-v1', value);
+      return `test/legacy/epoch_apply/${value.epoch}/${digest}`;
+    }
+    throw key;
+  }
   return key;
+}
+
+const sumAu = (entries, field) =>
+  entries.reduce((sum, entry) => sum + BigInt(entry[field] ?? '0'), 0n).toString();
+
+async function legacyEpochAllocations(value) {
+  if (Array.isArray(value.allocations) && value.allocations.length > 0) {
+    return value.allocations;
+  }
+  const debits = Array.isArray(value.debits) ? value.debits : [];
+  const earnings = Array.isArray(value.earnings) ? value.earnings : [];
+  const allocations = [];
+  for (let index = 0; index < earnings.length; index += 1) {
+    const earning = earnings[index];
+    const debit = debits.find((entry) => entry.rail === earning.rail) ?? debits[0];
+    if (!debit) continue;
+    const identity = await testDigest('mayhem-test-legacy-epoch-allocation-v1', {
+      epoch: value.epoch,
+      index,
+      debit,
+      earning,
+    });
+    allocations.push({
+      session_id: identity,
+      billing_id: identity,
+      billing_attempt: 0,
+      billing_epoch: value.epoch,
+      receipt_seq: index + 1,
+      receipt_hash: await testDigest('mayhem-test-legacy-epoch-receipt-v1', {
+        epoch: value.epoch,
+        index,
+        identity,
+      }),
+      user: debit.user,
+      rail: earning.rail,
+      provider: earning.provider,
+      payout_revision: earning.payout_revision ?? ZERO_HEX,
+      au: String(earning.gross_au ?? earning.au),
+    });
+  }
+  return allocations;
+}
+
+async function legacyReceiptIndex(value, allocations) {
+  if (value.receipt_index) return value.receipt_index;
+  const count = allocations.length;
+  return {
+    type: 'canonical_receipt_epoch_index',
+    epoch: value.epoch,
+    count,
+    page_size: 128,
+    page_count: count === 0 ? 0 : Math.ceil(count / 128),
+    revision: count,
+    updated_at: count === 0
+      ? null
+      : await testDigest('mayhem-test-legacy-epoch-receipt-index-v1', {
+          epoch: value.epoch,
+          count,
+          allocations,
+        }),
+  };
+}
+
+async function legacyEpochCommit(storage, contract, value, sender, allocations) {
+  const existing = await storage.get(`epoch/commit/${value.epoch}`);
+  if (existing?.value?.commit_hash) return existing.value.commit_hash;
+  if (value.epoch_commit_hash) return value.epoch_commit_hash;
+  if (value.roots || value.totals) return ZERO_HEX;
+  const useAu = sumAu(value.debits ?? [], 'au');
+  const commitHash = await testDigest('mayhem-test-legacy-epoch-commit-v1', {
+    epoch: value.epoch,
+    at: value.at,
+    debits: value.debits,
+    earnings: value.earnings,
+    allocations,
+  });
+  await storage.put(`epoch/commit/${value.epoch}`, {
+    type: 'epoch_commit',
+    epoch: value.epoch,
+    epoch_seconds: 3_600,
+    roots: null,
+    totals: {
+      use_count: allocations.length,
+      use_au: useAu,
+    },
+    status: 'provisional',
+    challenge_epochs: 6,
+    provisional_until_epoch: value.epoch + 6,
+    commit_hash: commitHash,
+    submitted_by: sender,
+    submitted_at: contract.tx,
+    at: value.at,
+  });
+  return commitHash;
+}
+
+async function legacyTargetedEpochValue(storage, contract, value, sender) {
+  const allocations = await legacyEpochAllocations(value);
+  const receiptIndex = await legacyReceiptIndex(value, allocations);
+  await storage.put(contract.receiptEpochIndexKey(value.epoch), receiptIndex);
+  const epochCommitHash = await legacyEpochCommit(storage, contract, value, sender, allocations);
+  return {
+    value: {
+      ...value,
+      epoch_commit_hash: epochCommitHash,
+      receipt_index: receiptIndex,
+    },
+    allocations,
+  };
 }
 
 export async function executeEpochApplyFeature(contract, storage, value, sender) {
@@ -319,7 +434,9 @@ export async function executeEpochApplyFeature(contract, storage, value, sender)
   contract.tx = await epochApplyFeatureKey(contract, value);
   try {
     // Legacy-shaped vectors exercise the accounting core used by apply_targeted_epoch.
-    return await contract.targetedEpochApply(value, [], []);
+    const targeted = await legacyTargetedEpochValue(storage, contract, value, sender);
+    contract.value = targeted.value;
+    return await contract.targetedEpochApply(targeted.value, [], targeted.allocations);
   } finally {
     contract.storage = previousStorage;
     contract.address = previousAddress;

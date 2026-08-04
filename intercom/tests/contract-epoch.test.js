@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,7 +8,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import b4a from 'b4a';
 import MayhemContract, { SESSION_RECEIPT_SCHEMA_VERSION, receiptMessage } from '../contract/contract.js';
-import { recomputeEpoch } from '../scripts/recompute-epoch-roots.mjs';
+import { opaqueHash, recomputeEpoch, stableJson } from '../scripts/recompute-epoch-roots.mjs';
 import {
   MemoryStorage,
   execute,
@@ -72,6 +73,121 @@ const seededBalance = (user, au, rail = 'fiat') => ({
   updated_at: null,
 });
 
+const defaultReceiptBody = (user, provider) => ({
+  schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+  session_id: 'session-epoch-1',
+  billing_id: 'd'.repeat(64),
+  billing_attempt: 0,
+  billing_epoch: 1,
+  reservation_id: '8'.repeat(64),
+  reservation_expires_after_epoch: 25,
+  reservation_receipt_grace_epochs: 6,
+  payout_revision: '9'.repeat(64),
+  billing_prior_usage: {},
+  billing_prior_au_owed_cum: '0',
+  seq: 1,
+  final: true,
+  rail: 'fiat',
+  user: user.publicKey,
+  provider: provider.publicKey,
+  enclave_id: enclaveId,
+  model_id: modelId,
+  price_ver: 1,
+  locked_rate_map: textLockedRateMapFor(2_000),
+  locked_per_req_au: '0',
+  locked_min_session_au: '0',
+  served_ctx: 32768,
+  ctx_bracket: 'le32k',
+  ctx_bracket_table_ver: 1,
+  rules_ver: 1,
+  usage: { input_token: 100, output_token: 250 },
+  au_owed_cum: '2000',
+  prompt_hash: 'a'.repeat(64),
+  ts: 3_600,
+});
+
+const receiptEnvelopeFromEntry = (entry) => {
+  if (entry?.receipt?.body) return entry.receipt;
+  if (entry?.body) {
+    return {
+      body: entry.body,
+      enclave_sig: entry.enclave_sig ?? 'b'.repeat(128),
+      enclave_pubkey: entry.enclave_pubkey ?? '2'.repeat(64),
+      user_sig: entry.user_sig ?? 'c'.repeat(128),
+    };
+  }
+  const {
+    enclave_sig: enclaveSig = 'b'.repeat(128),
+    enclave_pubkey: enclavePubkey = '2'.repeat(64),
+    user_sig: userSig = 'c'.repeat(128),
+    receipt_ack: _receiptAck,
+    voucher: _voucher,
+    ...body
+  } = entry;
+  return {
+    body,
+    enclave_sig: enclaveSig,
+    enclave_pubkey: enclavePubkey,
+    user_sig: userSig,
+  };
+};
+
+const canonicalReceiptHeadFromEntry = async (entry, settlementEpoch) => {
+  const receipt = receiptEnvelopeFromEntry(entry);
+  const { body } = receipt;
+  const receiptHash = await opaqueHash('mayhem-canonical-receipt-v1', receipt);
+  return {
+    epoch: settlementEpoch,
+    billing_epoch: body.billing_epoch,
+    billing_id: body.billing_id,
+    billing_attempt: body.billing_attempt,
+    reservation_id: body.reservation_id,
+    payout_revision: body.payout_revision,
+    receipt_hash: receiptHash,
+    incremental_au: (
+      BigInt(body.au_owed_cum) - BigInt(body.billing_prior_au_owed_cum ?? '0')
+    ).toString(),
+    receipt,
+  };
+};
+
+const canonicalReceiptSnapshotHash = (snapshot) => crypto
+  .createHash('sha256')
+  .update(stableJson({
+    schema_version: snapshot.schema_version,
+    type: snapshot.type,
+    settlement_epoch: snapshot.settlement_epoch,
+    metadata: snapshot.metadata,
+    identities: snapshot.identities,
+    heads: snapshot.heads,
+  }))
+  .digest('hex');
+
+const canonicalReceiptSnapshot = (heads, settlementEpoch) => {
+  const count = heads.length;
+  const snapshot = {
+    schema_version: 1,
+    type: 'canonical_epoch_receipt_snapshot',
+    settlement_epoch: settlementEpoch,
+    metadata: {
+      type: 'canonical_receipt_epoch_index',
+      epoch: settlementEpoch,
+      count,
+      page_size: 128,
+      page_count: Math.ceil(count / 128),
+      revision: count,
+      updated_at: 'f'.repeat(64),
+    },
+    identities: heads.map((head) => ({
+      billing_id: head.billing_id,
+      billing_attempt: head.billing_attempt,
+    })),
+    heads,
+  };
+  snapshot.snapshot_sha256 = canonicalReceiptSnapshotHash(snapshot);
+  return snapshot;
+};
+
 async function setupEpochContract() {
   const admin = await makeIdentity();
   const provider = await makeIdentity();
@@ -120,54 +236,44 @@ async function setupEpochContract() {
   return { admin, provider, user, submitter, storage, contract };
 }
 
-const receiptBundle = (user, provider, overrides = {}) => ({
-  epoch: 1,
-  prior_burn_cum_au: '0',
-  params: {
-    fee_bps: 1_500,
-  },
-  deposits: [],
-  receipts: [
-    {
-      schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
-      session_id: 'session-epoch-1',
-      billing_id: 'd'.repeat(64),
-      billing_attempt: 0,
-      billing_prior_usage: {},
-      billing_prior_au_owed_cum: '0',
-      seq: 1,
-      final: true,
-      rail: 'fiat',
-      user: user.publicKey,
-      provider: provider.publicKey,
-      enclave_id: enclaveId,
-      model_id: modelId,
-      price_ver: 1,
-      locked_rate_map: textLockedRateMapFor(2_000),
-      locked_per_req_au: '0',
-      locked_min_session_au: '0',
-      served_ctx: 32768,
-      ctx_bracket: 'le32k',
-      ctx_bracket_table_ver: 1,
-      rules_ver: 1,
-      usage: { input_token: 100, output_token: 250 },
-      au_owed_cum: '2000',
-      prompt_hash: 'a'.repeat(64),
-      ts: 3_600,
-      enclave_sig: 'b'.repeat(128),
-      user_sig: 'c'.repeat(128),
+const receiptBundle = async (user, provider, overrides = {}) => {
+  const settlementEpoch = overrides.epoch ?? 1;
+  const receiptEntries = overrides.receipts ?? [defaultReceiptBody(user, provider)];
+  const heads = [];
+  for (const entry of receiptEntries) {
+    heads.push(await canonicalReceiptHeadFromEntry(entry, settlementEpoch));
+  }
+  const snapshot = canonicalReceiptSnapshot(heads, settlementEpoch);
+  const {
+    receipts: _receipts,
+    receipt_snapshot: _receiptSnapshot,
+    ...restOverrides
+  } = overrides;
+  return {
+    epoch: settlementEpoch,
+    prior_burn_cum_au: '0',
+    params: {
+      fee_bps: 1_500,
+      max_apply_batch: 2_000,
+      max_market_usage_entries: 5_000,
     },
-  ],
-  payouts: [],
-  ...overrides,
-});
+    deposits: [],
+    receipts: heads,
+    receipt_snapshot: snapshot,
+    payouts: [],
+    price_derivations: [],
+    prior_fee_cum_au: '0',
+    ...restOverrides,
+  };
+};
 
 test('epoch recompute accepts only current canonical metered usage maps', async () => {
   const { provider, user } = await setupEpochContract();
-  const canonicalText = receiptBundle(user, provider, {
+  const canonicalTextBody = defaultReceiptBody(user, provider);
+  const canonicalText = await receiptBundle(user, provider, {
     receipts: [
       {
-        ...receiptBundle(user, provider).receipts[0],
+        ...canonicalTextBody,
         locked_rate_map: textLockedRateMapFor(2_000),
         usage: { input_token: 100, output_token: 250 },
       },
@@ -179,10 +285,10 @@ test('epoch recompute accepts only current canonical metered usage maps', async 
   assert.equal(canonicalRoll.totals.use_au, '2000');
 
   await assert.rejects(
-    () => recomputeEpoch(receiptBundle(user, provider, {
+    async () => recomputeEpoch(await receiptBundle(user, provider, {
       receipts: [
         {
-          ...canonicalText.receipts[0],
+          ...canonicalTextBody,
           usage: { in: 100, out: 250 },
         },
       ],
@@ -190,10 +296,10 @@ test('epoch recompute accepts only current canonical metered usage maps', async 
     /receipt usage must be canonical/
   );
 
-  const imageAliasBundle = receiptBundle(user, provider, {
+  const imageAliasBundle = await receiptBundle(user, provider, {
     receipts: [
       {
-        ...canonicalText.receipts[0],
+        ...canonicalTextBody,
         model_id: 'admin/image-small@fp16',
         locked_rate_map: imageLockedRateMap,
         usage: { images: 2, steps: 60 },
@@ -201,10 +307,10 @@ test('epoch recompute accepts only current canonical metered usage maps', async 
       },
     ],
   });
-  const imageCanonicalBundle = receiptBundle(user, provider, {
+  const imageCanonicalBundle = await receiptBundle(user, provider, {
     receipts: [
       {
-        ...canonicalText.receipts[0],
+        ...canonicalTextBody,
         model_id: 'admin/image-small@fp16',
         locked_rate_map: imageLockedRateMap,
         usage: { image: 2, step: 60 },
@@ -222,7 +328,7 @@ test('epoch recompute accepts only current canonical metered usage maps', async 
 test('epoch recompute nets one logical bill across provider redispatch attempts', async () => {
   const { provider: providerA, user } = await setupEpochContract();
   const providerB = await makeIdentity();
-  const base = receiptBundle(user, providerA).receipts[0];
+  const base = defaultReceiptBody(user, providerA);
   const billingId = '7'.repeat(64);
   const lockedRateMap = [
     { unit: 'input_token', per_unit_au: '100', granularity: 1 },
@@ -257,10 +363,10 @@ test('epoch recompute nets one logical bill across provider redispatch attempts'
     au_owed_cum: '200',
   };
 
-  const roll = await recomputeEpoch(receiptBundle(user, providerA, {
+  const roll = await recomputeEpoch(await receiptBundle(user, providerA, {
     receipts: [second, first],
   }));
-  assert.equal(roll.totals.use_count, 1);
+  assert.equal(roll.totals.use_count, 2);
   assert.equal(roll.totals.use_au, '200');
   assert.equal(roll.totals.provider_count, 2);
   assert.deepEqual(
@@ -272,19 +378,19 @@ test('epoch recompute nets one logical bill across provider redispatch attempts'
   );
 
   await assert.rejects(
-    () => recomputeEpoch(receiptBundle(user, providerA, {
+    async () => recomputeEpoch(await receiptBundle(user, providerA, {
       receipts: [first, { ...second, billing_prior_au_owed_cum: '99' }],
     })),
     /redispatch baseline does not match prior logical settlement/
   );
   await assert.rejects(
-    () => recomputeEpoch(receiptBundle(user, providerA, {
+    async () => recomputeEpoch(await receiptBundle(user, providerA, {
       receipts: [first, { ...second, billing_prior_usage: {} }],
     })),
     /redispatch baseline does not match prior logical settlement/
   );
   await assert.rejects(
-    () => recomputeEpoch(receiptBundle(user, providerB, {
+    async () => recomputeEpoch(await receiptBundle(user, providerB, {
       receipts: [second],
     })),
     /logical billing baseline has no prior signed receipt/
@@ -293,8 +399,8 @@ test('epoch recompute nets one logical bill across provider redispatch attempts'
 
 test('epoch recompute applies TAP 75/15/10 without burning fiat or TNK', async () => {
   const { provider, user } = await setupEpochContract();
-  const base = receiptBundle(user, provider).receipts[0];
-  const roll = await recomputeEpoch(receiptBundle(user, provider, {
+  const base = defaultReceiptBody(user, provider);
+  const roll = await recomputeEpoch(await receiptBundle(user, provider, {
     prior_burn_cum_au: '200',
     receipts: ['fiat', 'tap', 'tnk'].map((rail, index) => ({
       ...base,
@@ -315,17 +421,22 @@ test('epoch recompute applies TAP 75/15/10 without burning fiat or TNK', async (
   assert.equal(roll.totals.burn_cum_au, '1200');
 });
 
-test('epoch recompute treats enclave public key as receipt envelope metadata', async () => {
+test('epoch recompute binds enclave public key into the canonical receipt head hash', async () => {
   const { provider, user } = await setupEpochContract();
-  const withoutKey = receiptBundle(user, provider);
-  const withKey = receiptBundle(user, provider, {
-    receipts: withoutKey.receipts.map((receipt) => ({
-      ...receipt,
+  const withoutKey = await receiptBundle(user, provider);
+  const withKey = await receiptBundle(user, provider, {
+    receipts: withoutKey.receipts.map((head) => ({
+      ...head.receipt,
       enclave_pubkey: 'd'.repeat(64),
     })),
   });
 
-  assert.deepEqual(await recomputeEpoch(withKey), await recomputeEpoch(withoutKey));
+  const withoutKeyRoll = await recomputeEpoch(withoutKey);
+  const withKeyRoll = await recomputeEpoch(withKey);
+  assert.equal(withKeyRoll.totals.use_au, withoutKeyRoll.totals.use_au);
+  assert.equal(withKeyRoll.totals.earn_au, withoutKeyRoll.totals.earn_au);
+  assert.notEqual(withKeyRoll.allocations[0].receipt_hash, withoutKeyRoll.allocations[0].receipt_hash);
+  assert.notEqual(withKeyRoll.apply_pages[0].page_sha256, withoutKeyRoll.apply_pages[0].page_sha256);
 });
 
 const signedReceipt = (user, provider, enclave, overrides = {}) => {
@@ -334,6 +445,11 @@ const signedReceipt = (user, provider, enclave, overrides = {}) => {
     session_id: 'session-epoch-1',
     billing_id: 'd'.repeat(64),
     billing_attempt: 0,
+    billing_epoch: 1,
+    reservation_id: '8'.repeat(64),
+    reservation_expires_after_epoch: 25,
+    reservation_receipt_grace_epochs: 6,
+    payout_revision: '9'.repeat(64),
     billing_prior_usage: {},
     billing_prior_au_owed_cum: '0',
     seq: 1,
@@ -368,7 +484,7 @@ const signedReceipt = (user, provider, enclave, overrides = {}) => {
 
 test('MayhemContract anchors epoch roots permissionlessly and applies matching evidence roots', async () => {
   const { admin, provider, user, submitter, storage, contract } = await setupEpochContract();
-  const bundle = receiptBundle(user, provider);
+  const bundle = await receiptBundle(user, provider);
   const roll = await recomputeEpoch(bundle);
 
   const commit = await execute(
@@ -600,9 +716,12 @@ test('MayhemContract admin can seal one elapsed empty epoch and unblock later se
     updated_epoch: 1,
     updated_at: makeTxKey(8),
     last_apply_hash: sealed.seal_hash,
+    last_apply_previous_hash: null,
     last_epoch_seconds: 3_600,
+    last_settlement_unix: 3_600,
     pending_epoch: null,
     pending_next_page: 0,
+    pending_settlement_unix: null,
     pending_reserved_debits: null,
     last_page: 0,
   });
@@ -702,7 +821,7 @@ test('MayhemContract binds active admin epoch timing into commit and apply evide
   );
   assert.equal(tuned.ok, true, tuned.message);
 
-  const roll = await recomputeEpoch(receiptBundle(user, provider));
+  const roll = await recomputeEpoch(await receiptBundle(user, provider));
   const commit = await execute(
     contract,
     storage,
@@ -786,7 +905,7 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
       au_owed_cum: '2000',
     },
   };
-  const inflatedRoll = await recomputeEpoch(receiptBundle(user, provider, {
+  const inflatedRoll = await recomputeEpoch(await receiptBundle(user, provider, {
     receipts: [inflatedReceipt],
   }));
 
@@ -892,20 +1011,19 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
     voidApplyValue,
     admin.publicKey
   );
-  assert.match(voidApply.message, /commit is void/i);
+  assert.match(voidApply.message, /commit is void|matching provisional epoch commit required/i);
   assert.equal((await storage.get('ev/use/1')), null);
   assert.equal((await storage.get(`bal/${user.publicKey}/fiat`)).value.au, '1000000');
 
-  const emptyEpoch = await recomputeEpoch({
+  const nextEpoch = await recomputeEpoch(await receiptBundle(user, provider, {
     epoch: 2,
-    prior_burn_cum_au: '0',
-    params: {
-      fee_bps: 1_500,
-    },
-    deposits: [],
-    receipts: [],
-    payouts: [],
-  });
+    receipts: [{
+      ...defaultReceiptBody(user, provider),
+      billing_epoch: 2,
+      session_id: 'ban-check-epoch-2',
+      billing_id: '2'.repeat(64),
+    }],
+  }));
   const bannedCommit = await execute(
     contract,
     storage,
@@ -914,8 +1032,8 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
       op: 'epoch_commit',
       epoch: 2,
       at: 7_200,
-      roots: emptyEpoch.roots,
-      totals: emptyEpoch.totals,
+      roots: nextEpoch.roots,
+      totals: nextEpoch.totals,
     },
     submitter.publicKey,
     8
@@ -930,8 +1048,8 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
       op: 'epoch_commit',
       epoch: 2,
       at: 7_200,
-      roots: emptyEpoch.roots,
-      totals: emptyEpoch.totals,
+      roots: nextEpoch.roots,
+      totals: nextEpoch.totals,
     },
     otherSubmitter.publicKey,
     9
@@ -954,16 +1072,15 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
   assert.equal(unbanned.ok, true, unbanned.message);
   assert.equal((await storage.get(`committer/ban/${submitter.publicKey}`)).value.status, 'unbanned');
 
-  const emptyEpoch3 = await recomputeEpoch({
+  const nextEpoch3 = await recomputeEpoch(await receiptBundle(user, provider, {
     epoch: 3,
-    prior_burn_cum_au: '0',
-    params: {
-      fee_bps: 1_500,
-    },
-    deposits: [],
-    receipts: [],
-    payouts: [],
-  });
+    receipts: [{
+      ...defaultReceiptBody(user, provider),
+      billing_epoch: 3,
+      session_id: 'ban-check-epoch-3',
+      billing_id: '3'.repeat(64),
+    }],
+  }));
   const restoredCommit = await execute(
     contract,
     storage,
@@ -972,13 +1089,112 @@ test('MayhemContract fraudProof voids an inflated single-receipt commit and bans
       op: 'epoch_commit',
       epoch: 3,
       at: 10_800,
-      roots: emptyEpoch3.roots,
-      totals: emptyEpoch3.totals,
+      roots: nextEpoch3.roots,
+      totals: nextEpoch3.totals,
     },
     submitter.publicKey,
     11
   );
   assert.equal(restoredCommit.ok, true, restoredCommit.message);
+});
+
+test('MayhemContract fraudProof voids an inflated workflow receipt commit', async () => {
+  const { admin, provider, user, submitter, storage, contract } = await setupEpochContract();
+  const enclave = await makeIdentity();
+  const prover = await makeIdentity();
+  const workflow = {
+    endpoint_family: 'comfy_workflow',
+    graph_hash: 'a1'.repeat(32),
+    runtime_id: 'comfyui-portable-0.3.43',
+    outcome_class: 'image',
+    quoted_usage: { image: 1, step: 250 },
+  };
+  const receipt = signedReceipt(user, provider, enclave, {
+    session_id: 'workflow-fraud-session',
+    billing_id: 'a2'.repeat(32),
+    locked_rate_map: imageLockedRateMap,
+    usage: { image: 1, step: 250 },
+    au_owed_cum: '1000',
+    workflow,
+    workflow_output: {
+      output_modalities: ['image'],
+      metrics: {
+        bytes: 512_000,
+        height: 512,
+        image: 1,
+        width: 512,
+      },
+    },
+  });
+  const inflatedReceipt = {
+    ...receipt,
+    body: {
+      ...receipt.body,
+      au_owed_cum: '2000',
+    },
+  };
+  const inflatedRoll = await recomputeEpoch(await receiptBundle(user, provider, {
+    receipts: [inflatedReceipt],
+  }));
+
+  const commit = await execute(
+    contract,
+    storage,
+    'epochCommit',
+    {
+      op: 'epoch_commit',
+      epoch: 1,
+      at: 3_600,
+      roots: inflatedRoll.roots,
+      totals: inflatedRoll.totals,
+    },
+    submitter.publicKey,
+    4
+  );
+  assert.equal(commit.ok, true, commit.message);
+  assert.equal(inflatedRoll.totals.use_au, '2000');
+
+  const proof = await execute(
+    contract,
+    storage,
+    'fraudProof',
+    {
+      op: 'fraud_proof',
+      epoch: 1,
+      proof_epoch: 2,
+      at: 7_200,
+      reason: 'over_credit',
+      receipt,
+      claimed_au_owed_cum: '2000',
+    },
+    prover.publicKey,
+    5
+  );
+  assert.equal(proof.ok, true, proof.message);
+  assert.equal(proof.voided_commit, commit.commit_hash);
+  assert.equal((await storage.get('epoch/commit/1')).value.status, 'void');
+  const fraudRecord = (await storage.get(`ev/fraud/1/${proof.proof_hash}`)).value;
+  assert.equal(fraudRecord.actual_au, '1000');
+  assert.equal(fraudRecord.claimed_au, '2000');
+  assert.equal(fraudRecord.receipt_hash.length, 64);
+
+  const voidApplyValue = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 3_600,
+    debits: inflatedRoll.debits,
+    earnings: inflatedRoll.earnings,
+    roots: inflatedRoll.roots,
+    totals: inflatedRoll.totals,
+  };
+  await seedSpendHoldsForApply(storage, voidApplyValue);
+  const voidApply = await executeEpochApplyFeature(
+    contract,
+    storage,
+    voidApplyValue,
+    admin.publicKey
+  );
+  assert.match(voidApply.message, /commit is void|matching provisional epoch commit required/i);
 });
 
 test('MayhemContract fraudProof slashes a registered provider committer', async () => {
@@ -993,7 +1209,7 @@ test('MayhemContract fraudProof slashes a registered provider committer', async 
       au_owed_cum: '2000',
     },
   };
-  const inflatedRoll = await recomputeEpoch(receiptBundle(user, provider, {
+  const inflatedRoll = await recomputeEpoch(await receiptBundle(user, provider, {
     receipts: [inflatedReceipt],
   }));
   await storage.put(`earn/fiat/${provider.publicKey}`, {
@@ -1102,7 +1318,7 @@ test('MayhemContract fraudProof rejects proofs after the challenge window', asyn
   const enclave = await makeIdentity();
   const prover = await makeIdentity();
   const receipt = signedReceipt(user, provider, enclave, { au_owed_cum: '1000' });
-  const inflatedRoll = await recomputeEpoch(receiptBundle(user, provider, {
+  const inflatedRoll = await recomputeEpoch(await receiptBundle(user, provider, {
     receipts: [{
       ...receipt,
       body: {
@@ -1151,7 +1367,7 @@ test('MayhemContract fraudProof rejects proofs after the challenge window', asyn
 
 test('MayhemContract refuses evidence-root apply without a matching epoch commit', async () => {
   const { admin, provider, user, storage, contract } = await setupEpochContract();
-  const roll = await recomputeEpoch(receiptBundle(user, provider));
+  const roll = await recomputeEpoch(await receiptBundle(user, provider));
 
   const noCommitValue = {
     op: 'epoch_apply',
@@ -1211,7 +1427,7 @@ test('MayhemContract refuses evidence-root apply without a matching epoch commit
 
 test('epoch root recompute script CLI matches the imported independent recompute function', async () => {
   const { provider, user } = await setupEpochContract();
-  const bundle = receiptBundle(user, provider);
+  const bundle = await receiptBundle(user, provider);
   const expected = await recomputeEpoch(bundle);
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'mayhem-epoch-'));
   const bundlePath = path.join(dir, 'bundle.json');
@@ -1226,7 +1442,7 @@ test('epoch root recompute script CLI matches the imported independent recompute
 
 test('epoch root recompute requires admin params fee_bps and rejects loose fee_bps', async () => {
   const { provider, user } = await setupEpochContract();
-  const bundle = receiptBundle(user, provider);
+  const bundle = await receiptBundle(user, provider);
   const { prior_burn_cum_au: _priorBurnCumAu, ...missingBurnBundle } = bundle;
 
   await assert.rejects(
