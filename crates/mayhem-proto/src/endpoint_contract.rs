@@ -8,10 +8,10 @@ use crate::{
     ValidatedAudioFormat, ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION, ENDPOINT_HF_FEATURE_EXTRACTION,
     ENDPOINT_HF_MULTIMODAL_CHAT, ENDPOINT_HF_TEXT_TO_AUDIO, ENDPOINT_HF_TEXT_TO_IMAGE,
     ENDPOINT_HF_TEXT_TO_SPEECH, ENDPOINT_HF_TEXT_TO_VIDEO, ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
-    ENDPOINT_MAYHEM_MUSIC_GENERATIONS, ENDPOINT_OPENAI_AUDIO_SPEECH,
-    ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS, ENDPOINT_OPENAI_CHAT_COMPLETIONS,
-    ENDPOINT_OPENAI_COMPLETIONS, ENDPOINT_OPENAI_EMBEDDINGS, ENDPOINT_OPENAI_IMAGE_GENERATIONS,
-    ENDPOINT_OPENAI_RESPONSES, ENDPOINT_OPENAI_VIDEOS,
+    ENDPOINT_MAYHEM_COMFY_WORKFLOWS, ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+    ENDPOINT_OPENAI_AUDIO_SPEECH, ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS,
+    ENDPOINT_OPENAI_CHAT_COMPLETIONS, ENDPOINT_OPENAI_COMPLETIONS, ENDPOINT_OPENAI_EMBEDDINGS,
+    ENDPOINT_OPENAI_IMAGE_GENERATIONS, ENDPOINT_OPENAI_RESPONSES, ENDPOINT_OPENAI_VIDEOS,
 };
 
 const MAX_MUSIC_CAPTION_CHARS: u64 = 512;
@@ -633,6 +633,28 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
             &["inputs"],
             &["audio", "sampling_rate", "content_type", "usage", "mayhem"],
         ),
+        ENDPOINT_MAYHEM_COMFY_WORKFLOWS => (
+            &[
+                "model",
+                "workflow",
+                "runtime_id",
+                "outcome_class",
+                "timeout_ms",
+                "response_format",
+                "user",
+            ],
+            &["model", "workflow"],
+            &[
+                "id",
+                "object",
+                "model",
+                "status",
+                "progress",
+                "artifacts",
+                "usage",
+                "mayhem",
+            ],
+        ),
         _ => return None,
     };
 
@@ -955,6 +977,28 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
             ]),
         ),
         "metadata" => object_spec_with_default(json!({})),
+        "workflow" if family == ENDPOINT_MAYHEM_COMFY_WORKFLOWS => object_spec(json!({
+            "1": {
+                "class_type": "EmptyLatentImage",
+                "inputs": {"width": 512, "height": 512, "batch_size": 1}
+            },
+            "2": {
+                "class_type": "SaveImage",
+                "inputs": {"images": ["1", 0]}
+            }
+        })),
+        "runtime_id" if family == ENDPOINT_MAYHEM_COMFY_WORKFLOWS => {
+            string_spec(1, 128, json!("comfyui-v0.30.1"))
+        }
+        "outcome_class" if family == ENDPOINT_MAYHEM_COMFY_WORKFLOWS => {
+            string_spec(1, 128, json!("image.light.512"))
+        }
+        "timeout_ms" if family == ENDPOINT_MAYHEM_COMFY_WORKFLOWS => {
+            with_default(integer_spec(1_000.0, 3_600_000.0, 120_000), json!(120_000))
+        }
+        "response_format" if family == ENDPOINT_MAYHEM_COMFY_WORKFLOWS => {
+            enum_spec(Some(json!("artifact")), &[json!("artifact"), json!("json")])
+        }
         "text" | "reasoning" | "response_format"
             if matches!(
                 family,
@@ -1701,9 +1745,8 @@ fn response_attribute_spec(path: &str) -> Option<EndpointAttributeSpec> {
         "created" | "created_at" | "completed_at" | "expires_at" | "progress" => {
             integer_spec(0.0, u64::MAX as f64, 1)
         }
-        "choices" | "data" | "output" | "embeddings" | "chunks" | "words" | "segments" => {
-            array_spec(0, 1_000_000, json!([]))
-        }
+        "choices" | "data" | "output" | "embeddings" | "chunks" | "words" | "segments"
+        | "artifacts" => array_spec(0, 1_000_000, json!([])),
         "usage" | "mayhem" => object_spec(json!({})),
         "error" => union_spec(
             &[EndpointValueType::Object, EndpointValueType::Null],
@@ -5233,6 +5276,7 @@ mod tests {
             ENDPOINT_HF_TEXT_TO_VIDEO,
             ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
             ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
             ENDPOINT_HF_TEXT_TO_AUDIO,
         ] {
             let contract = endpoint_family_contract_template(family)

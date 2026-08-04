@@ -8,10 +8,16 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod comfy_workflow;
 mod endpoint_contract;
 mod parts_catalog;
 mod validated_audio;
 
+pub use comfy_workflow::{
+    derive_comfy_workflow, ComfyWorkflowDerivation, ComfyWorkflowDerivationError,
+    ComfyWorkflowDerivationPolicy, ComfyWorkflowOutcomeSpec, ComfyWorkflowPartRef,
+    COMFY_WORKFLOW_DERIVATION_SCHEMA_VERSION,
+};
 pub use endpoint_contract::{
     artifact_generation_inline_audio_load, artifact_generation_input_characters,
     canonicalize_endpoint_request_aliases, endpoint_attribute_value_matches,
@@ -308,6 +314,7 @@ pub const ENDPOINT_OPENAI_VIDEOS: &str = "openai_videos";
 pub const ENDPOINT_HF_TEXT_TO_VIDEO: &str = "hf_text_to_video";
 pub const ENDPOINT_MAYHEM_AUDIO_GENERATIONS: &str = "mayhem_audio_generations";
 pub const ENDPOINT_MAYHEM_MUSIC_GENERATIONS: &str = "mayhem_music_generations";
+pub const ENDPOINT_MAYHEM_COMFY_WORKFLOWS: &str = "mayhem_comfy_workflows";
 pub const ENDPOINT_HF_TEXT_TO_AUDIO: &str = "hf_text_to_audio";
 pub const DEFAULT_SESSION_MAX_FRAME_BYTES: usize = 256 * 1024;
 pub const DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES: usize = 16 * 1024;

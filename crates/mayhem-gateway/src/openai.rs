@@ -103,9 +103,9 @@ use mayhem_proto::{
     PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
     SessionReceipt, SpendVoucher, SpendVoucherBody, TpmActivateCredentialChallengeFrame,
     TpmActivateCredentialHello, TpmActivateCredentialResponseFrame, TranscriptionResult,
-    TranscriptionResultLimits, ValidatedAudioFormat, VisibleToolCall, ATTESTATION_ALG,
-    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
-    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    TranscriptionResultLimits, ValidatedAudioFormat, VisibleToolCall, WorkflowBinding,
+    WorkflowOutputBinding, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
+    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
     MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
     SESSION_RECEIPT_SCHEMA_VERSION, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
@@ -2283,6 +2283,8 @@ pub struct ArtifactGenerationRequest {
     pub prompt: String,
     pub endpoint_family: String,
     pub contract_request: Value,
+    pub workflow: Option<WorkflowBinding>,
+    pub workflow_output: Option<WorkflowOutputBinding>,
     pub effective_specialities: BTreeMap<String, String>,
     pub output_modality: String,
     pub transport_kind: String,
@@ -5201,6 +5203,7 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/v1/audio/transcriptions", post(create_audio_transcription))
         .route("/v1/audio/generations", post(create_audio_generation))
         .route("/v1/music/generations", post(create_music_generation))
+        .route("/v1/workflows", post(create_comfy_workflow_generation))
         .route("/hf-inference/models/{*model}", post(create_hf_inference))
         .route("/mayhem/status", get(mayhem_status))
         .route("/mayhem/receipts", get(mayhem_receipts))
@@ -8885,6 +8888,41 @@ async fn create_music_generation(
     }
 }
 
+async fn create_comfy_workflow_generation(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(raw_request): Json<Value>,
+) -> Response {
+    let cancellation = GatewayRequestCancellation::new();
+    let request_state = state.clone();
+    match run_detached_nonstreaming_request(cancellation.clone(), async move {
+        execute_artifact_generation_endpoint(
+            &request_state,
+            &headers,
+            raw_request,
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            Some(cancellation),
+        )
+        .await
+    })
+    .await
+    {
+        Ok(ArtifactEndpointOutcome::Immediate(response)) => response,
+        Ok(ArtifactEndpointOutcome::Completed {
+            request,
+            run,
+            job,
+            stored: _,
+        }) => {
+            let mut response =
+                Json(artifact_generation_response_value(&request, &run)).into_response();
+            attach_gateway_job_headers(&mut response, &job.id);
+            response
+        }
+        Err(err) => err.into_response(),
+    }
+}
+
 enum ArtifactEndpointOutcome {
     Immediate(Response),
     Completed {
@@ -10045,6 +10083,8 @@ fn artifact_generation_request(
         frame_count,
         frame_rate,
         response_format,
+        workflow,
+        workflow_output,
     ) = match endpoint_family {
         mayhem_proto::ENDPOINT_OPENAI_VIDEOS => {
             let fps = frame_rate.unwrap_or(DEFAULT_VIDEO_GENERATION_FPS as f64);
@@ -10066,6 +10106,8 @@ fn artifact_generation_request(
                 frames,
                 fps,
                 "mp4",
+                None,
+                None,
             )
         }
         mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO => {
@@ -10089,6 +10131,8 @@ fn artifact_generation_request(
                 frames,
                 fps,
                 "mp4",
+                None,
+                None,
             )
         }
         mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS => (
@@ -10107,6 +10151,8 @@ fn artifact_generation_request(
             )
             .and_then(Value::as_str)
             .unwrap_or("wav"),
+            None,
+            None,
         ),
         mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS => (
             "audio",
@@ -10124,6 +10170,8 @@ fn artifact_generation_request(
             )
             .and_then(Value::as_str)
             .unwrap_or("wav"),
+            None,
+            None,
         ),
         mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => (
             "audio",
@@ -10135,7 +10183,70 @@ fn artifact_generation_request(
             0,
             0.0,
             "wav",
+            None,
+            None,
         ),
+        mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS => {
+            let workflow_graph = raw_request.get("workflow").ok_or_else(|| {
+                ApiError::bad_request("workflow request is missing workflow", Some("workflow"))
+            })?;
+            let derivation = mayhem_proto::derive_comfy_workflow(
+                workflow_graph,
+                &gateway_comfy_workflow_derivation_policy(),
+            )
+            .map_err(|err| ApiError::bad_request(err.to_string(), Some("workflow")))?;
+            let output_modality = if derivation
+                .outcome_spec
+                .output_modalities
+                .iter()
+                .any(|modality| modality == "video")
+            {
+                "video"
+            } else if derivation
+                .outcome_spec
+                .output_modalities
+                .iter()
+                .any(|modality| modality == "audio")
+            {
+                "audio"
+            } else {
+                "image"
+            };
+            let runtime_id = raw_request
+                .get("runtime_id")
+                .and_then(Value::as_str)
+                .unwrap_or("comfyui-v0.30.1")
+                .to_owned();
+            let outcome_class = raw_request
+                .get("outcome_class")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{output_modality}.workflow"));
+            let binding = WorkflowBinding {
+                endpoint_family: mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS.to_owned(),
+                graph_hash: derivation.graph_hash,
+                runtime_id,
+                outcome_class,
+                quoted_usage: derivation.quoted_usage,
+            };
+            (
+                output_modality,
+                "workflow_generation",
+                derivation.outcome_spec.duration_seconds.unwrap_or(1).max(1),
+                derivation.outcome_spec.frames.unwrap_or(0),
+                derivation.outcome_spec.frames.unwrap_or(0),
+                frame_rate.unwrap_or(DEFAULT_VIDEO_GENERATION_FPS as f64),
+                artifact_generation_request_value(
+                    &raw_request,
+                    endpoint_family,
+                    ARTIFACT_GENERATION_FORMAT_ALIASES,
+                )
+                .and_then(Value::as_str)
+                .unwrap_or("artifact"),
+                Some(binding),
+                Some(derivation.workflow_output),
+            )
+        }
         _ => {
             return Err(ApiError::bad_request(
                 format!("endpoint family {endpoint_family} is not an artifact generation API"),
@@ -10180,6 +10291,8 @@ fn artifact_generation_request(
         prompt,
         endpoint_family: endpoint_family.to_owned(),
         contract_request: raw_request,
+        workflow,
+        workflow_output,
         effective_specialities: BTreeMap::new(),
         output_modality: output_modality.to_owned(),
         transport_kind: transport_kind.to_owned(),
@@ -10197,6 +10310,23 @@ fn artifact_generation_request(
         input_audio_max_seconds: inline_audio.max_item_seconds,
         response_format,
     })
+}
+
+fn gateway_comfy_workflow_derivation_policy() -> mayhem_proto::ComfyWorkflowDerivationPolicy {
+    mayhem_proto::ComfyWorkflowDerivationPolicy {
+        whitelisted_nodes: [
+            "EmptyImage",
+            "EmptyLatentImage",
+            "PreviewImage",
+            "SaveImage",
+            "ImageScale",
+            "ImageScaleBy",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>(),
+        ..mayhem_proto::ComfyWorkflowDerivationPolicy::default()
+    }
 }
 
 fn artifact_generation_request_value<'a>(
@@ -10229,12 +10359,11 @@ fn artifact_generation_response_value(
     run: &CompletedArtifactGeneration,
 ) -> Value {
     let output = &run.output;
-    let artifact_field =
-        if request.endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
-            "music"
-        } else {
-            "audio"
-        };
+    let artifact_field = match request.endpoint_family.as_str() {
+        mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS => "music",
+        mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS => "artifact",
+        _ => "audio",
+    };
     let data = output
         .artifacts
         .iter()
@@ -10282,6 +10411,16 @@ fn artifact_generation_response_value(
             now_secs(),
             DEFAULT_GATEWAY_JOB_TTL_SECONDS,
         ),
+        mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS => json!({
+            "id": id,
+            "object": "workflow.generation",
+            "created": now_secs(),
+            "model": request.model,
+            "status": "completed",
+            "artifacts": data,
+            "usage": output.usage,
+            "mayhem": mayhem,
+        }),
         mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS => json!({
             "id": id,
             "object": "music.generation",
@@ -14876,11 +15015,12 @@ impl ScBridgeGatewaySessionBackend {
         )
         .await?;
 
-        let request_body = seal_direct_session_request_body(
+        let request_body = seal_direct_session_request_body_with_workflow_output(
             model,
             &request.endpoint_family,
             json!({"kind": request.transport_kind}),
             request.contract_request.clone(),
+            request.workflow_output.as_ref(),
         )?;
         let request_id = request_id_for_body(&invocation.session_id, &request_body);
         send_direct_session_request_frames(
@@ -15469,6 +15609,22 @@ fn seal_direct_session_request_body(
     transport_body: Value,
     contract_request: Value,
 ) -> Result<Value, GatewaySessionError> {
+    seal_direct_session_request_body_with_workflow_output(
+        model,
+        endpoint_family,
+        transport_body,
+        contract_request,
+        None,
+    )
+}
+
+fn seal_direct_session_request_body_with_workflow_output(
+    model: &GatewayModel,
+    endpoint_family: &str,
+    transport_body: Value,
+    contract_request: Value,
+    workflow_output: Option<&WorkflowOutputBinding>,
+) -> Result<Value, GatewaySessionError> {
     let contract = model
         .mayhem
         .adapter
@@ -15507,6 +15663,12 @@ fn seal_direct_session_request_body(
         "normalized_request_fingerprint": mayhem_proto::endpoint_request_fingerprint(&contract_request),
         "transport_request_fingerprint": transport_request_fingerprint,
     });
+    if let Some(workflow_output) = workflow_output {
+        sealed["mayhem_contract"]["workflow_output"] = serde_json::to_value(workflow_output)
+            .map_err(|err| {
+                GatewaySessionError::new(format!("workflow output binding failed: {err}"))
+            })?;
+    }
     Ok(sealed)
 }
 
@@ -18584,6 +18746,13 @@ fn direct_session_artifact_generation_receipt_ack(
         model, request, output, provider, invocation,
     )?;
     ensure_final_receipt_within_voucher(invocation, expected.au_owed_cum)?;
+    if request.workflow.is_some()
+        && provider_receipt.body.workflow_output != request.workflow_output
+    {
+        return Err(GatewaySessionError::new(
+            "provider receipt workflow output does not match the derived request outcome",
+        ));
+    }
     validate_provider_receipt(model, invocation, provider_receipt, expected)?;
     receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).map_err(|err| {
         GatewaySessionError::new(format!(
@@ -19423,6 +19592,18 @@ fn validate_provider_receipt(
             body.rules_ver == invocation.rules_ver
                 && body.rules_ver == invocation.spend_voucher.body.rules_ver,
             "provider receipt rules_ver mismatch",
+        ),
+        (
+            body.workflow == invocation.spend_voucher.body.workflow,
+            "provider receipt workflow binding mismatch",
+        ),
+        (
+            if invocation.spend_voucher.body.workflow.is_some() {
+                body.workflow_output.is_some()
+            } else {
+                body.workflow_output.is_none()
+            },
+            "provider receipt workflow output binding mismatch",
         ),
         (
             body.usage == expected.usage,
@@ -25422,7 +25603,15 @@ fn request_requirements_for_artifact_generation(
     min_throughput: Option<f64>,
 ) -> RequestRequirements {
     let input_tokens = rough_tokens(&request.prompt);
-    let output_item_units = if request.output_modality == "video" {
+    let output_item_units = if let Some(workflow_output) = request.workflow_output.as_ref() {
+        workflow_output
+            .metrics
+            .get("frame")
+            .or_else(|| workflow_output.metrics.get("duration_second"))
+            .copied()
+            .unwrap_or(1)
+            .max(1)
+    } else if request.output_modality == "video" {
         request.frame_count.max(1)
     } else {
         request.duration_seconds.max(1)
@@ -25431,34 +25620,89 @@ fn request_requirements_for_artifact_generation(
     let required_modalities = artifact_generation_required_modalities(model, request);
     let mut modality_load = BTreeMap::new();
     for modality in &required_modalities {
-        let load = match modality.as_str() {
-            "video" => ModalityRequestLoad {
-                item_count: output_item_count,
-                max_item_bytes: 1,
-                max_item_units: request.frame_count.max(1),
-            },
-            "audio" if request.output_modality == "audio" => ModalityRequestLoad {
-                item_count: output_item_count.max(request.input_audio_count),
-                max_item_bytes: request.input_audio_max_bytes.max(1),
-                max_item_units: output_item_units
-                    .max(request.input_audio_max_seconds)
-                    .max(1),
-            },
-            "audio" => ModalityRequestLoad {
-                item_count: output_item_count,
-                max_item_bytes: 1,
-                max_item_units: request.duration_seconds.max(1),
-            },
-            "image" => ModalityRequestLoad {
-                item_count: request.input_image_count,
-                max_item_bytes: request.input_image_max_bytes,
-                max_item_units: request.input_image_max_pixels,
-            },
-            _ => ModalityRequestLoad {
-                item_count: output_item_count,
-                max_item_bytes: 1,
-                max_item_units: output_item_units,
-            },
+        let load = if let Some(workflow_output) = request.workflow_output.as_ref() {
+            let artifact_count = workflow_output
+                .metrics
+                .get("artifact_count")
+                .copied()
+                .unwrap_or(u64::from(output_item_count))
+                .max(1);
+            let item_count = u32::try_from(artifact_count).unwrap_or(u32::MAX);
+            match modality.as_str() {
+                "video" => ModalityRequestLoad {
+                    item_count,
+                    max_item_bytes: 1,
+                    max_item_units: workflow_output
+                        .metrics
+                        .get("frame")
+                        .copied()
+                        .unwrap_or(output_item_units)
+                        .max(1),
+                },
+                "audio" => ModalityRequestLoad {
+                    item_count,
+                    max_item_bytes: 1,
+                    max_item_units: workflow_output
+                        .metrics
+                        .get("duration_second")
+                        .copied()
+                        .unwrap_or(output_item_units)
+                        .max(1),
+                },
+                "image" => ModalityRequestLoad {
+                    item_count,
+                    max_item_bytes: 1,
+                    max_item_units: workflow_output
+                        .metrics
+                        .get("width")
+                        .copied()
+                        .unwrap_or(1)
+                        .max(1)
+                        .saturating_mul(
+                            workflow_output
+                                .metrics
+                                .get("height")
+                                .copied()
+                                .unwrap_or(1)
+                                .max(1),
+                        ),
+                },
+                _ => ModalityRequestLoad {
+                    item_count,
+                    max_item_bytes: 1,
+                    max_item_units: output_item_units,
+                },
+            }
+        } else {
+            match modality.as_str() {
+                "video" => ModalityRequestLoad {
+                    item_count: output_item_count,
+                    max_item_bytes: 1,
+                    max_item_units: request.frame_count.max(1),
+                },
+                "audio" if request.output_modality == "audio" => ModalityRequestLoad {
+                    item_count: output_item_count.max(request.input_audio_count),
+                    max_item_bytes: request.input_audio_max_bytes.max(1),
+                    max_item_units: output_item_units
+                        .max(request.input_audio_max_seconds)
+                        .max(1),
+                },
+                "audio" => ModalityRequestLoad {
+                    item_count: output_item_count,
+                    max_item_bytes: 1,
+                    max_item_units: request.duration_seconds.max(1),
+                },
+                "image" => ModalityRequestLoad {
+                    item_count: request.input_image_count,
+                    max_item_bytes: request.input_image_max_bytes,
+                    max_item_units: request.input_image_max_pixels,
+                },
+                _ => ModalityRequestLoad {
+                    item_count: output_item_count,
+                    max_item_bytes: 1,
+                    max_item_units: output_item_units,
+                },
+            }
         };
         modality_load.insert(modality.clone(), load);
     }
@@ -25490,6 +25734,9 @@ fn artifact_generation_required_modalities(
     model: &GatewayModel,
     request: &ArtifactGenerationRequest,
 ) -> Vec<String> {
+    if let Some(workflow_output) = request.workflow_output.as_ref() {
+        return workflow_output.output_modalities.clone();
+    }
     if request.output_modality == "video" {
         mayhem_proto::video_generation_required_modalities(
             &model.mayhem.caps.output_modalities,
@@ -30183,7 +30430,7 @@ impl GatewayState {
             served_ctx,
             required_modalities: artifact_generation_required_modalities(model, request),
             required_specialities: request.effective_specialities.clone(),
-            workflow: None,
+            workflow: request.workflow.clone(),
             ctx_bracket: ctx_bracket.clone(),
             ctx_bracket_table_ver,
             max_spend_au,
@@ -30668,6 +30915,14 @@ impl GatewayState {
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
         let prompt_hash = artifact_generation_prompt_hash(request);
         let receipt = if let Some(provider_receipt) = provider_receipt {
+            if request.workflow.is_some()
+                && provider_receipt.body.workflow_output != request.workflow_output
+            {
+                return Err(ApiError::bad_gateway(
+                    "provider receipt workflow output does not match the derived request outcome",
+                    Some("model"),
+                ));
+            }
             self.cosign_provider_receipt(
                 model,
                 invocation,
@@ -30715,8 +30970,8 @@ impl GatewayState {
                 ctx_bracket: invocation.ctx_bracket.clone(),
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
-                workflow: None,
-                workflow_output: None,
+                workflow: request.workflow.clone(),
+                workflow_output: request.workflow_output.clone(),
                 usage,
                 usage_attribution: BTreeMap::new(),
                 au_owed_cum,
@@ -33527,6 +33782,9 @@ fn audio_transcription_failover_work_units(request: &AudioTranscriptionRequest) 
 }
 
 fn artifact_generation_usage_for_request(request: &ArtifactGenerationRequest) -> ReceiptUsage {
+    if let Some(workflow) = request.workflow.as_ref() {
+        return workflow.quoted_usage.clone();
+    }
     if request.output_modality == "video" {
         ReceiptUsage::from_units([
             (
@@ -33563,6 +33821,9 @@ fn artifact_generation_usage_for_observed(
     request: &ArtifactGenerationRequest,
     artifacts: &[GatewayArtifactOutput],
 ) -> Result<ReceiptUsage, GatewaySessionError> {
+    if let Some(workflow) = request.workflow.as_ref() {
+        return Ok(workflow.quoted_usage.clone());
+    }
     if request.output_modality != "audio" {
         return Ok(artifact_generation_usage_for_request(request));
     }
@@ -33639,6 +33900,9 @@ fn artifact_audio_content_type_matches_format(
 }
 
 fn artifact_generation_max_usage_for_request(request: &ArtifactGenerationRequest) -> ReceiptUsage {
+    if let Some(workflow) = request.workflow.as_ref() {
+        return workflow.quoted_usage.clone();
+    }
     if request.output_modality != "audio" {
         return artifact_generation_usage_for_request(request);
     }
@@ -43177,6 +43441,64 @@ mod tests {
     }
 
     #[test]
+    fn comfy_workflow_request_binds_graph_output_and_route_load() {
+        let graph = json!({
+            "1": {
+                "class_type": "EmptyLatentImage",
+                "inputs": { "width": 512, "height": 512, "batch_size": 2 }
+            },
+            "2": {
+                "class_type": "SaveImage",
+                "inputs": { "images": ["1", 0] }
+            }
+        });
+        let request = artifact_generation_request(
+            "mayhem/comfy-test",
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            json!({
+                "model": "mayhem/comfy-test",
+                "workflow": graph,
+                "runtime_id": "comfyui-v0.30.1",
+                "outcome_class": "image.light.512",
+                "response_format": "artifact"
+            }),
+            VideoRequestPreparation::default(),
+        )
+        .unwrap();
+
+        let workflow = request.workflow.as_ref().expect("workflow binding");
+        assert_eq!(
+            workflow.endpoint_family,
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
+        );
+        assert_eq!(workflow.runtime_id, "comfyui-v0.30.1");
+        assert_eq!(workflow.outcome_class, "image.light.512");
+        assert_eq!(
+            workflow.quoted_usage,
+            ReceiptUsage::from_units([(USAGE_IMAGE, 2)])
+        );
+        assert_eq!(
+            artifact_generation_usage_for_request(&request),
+            workflow.quoted_usage
+        );
+
+        let output = request.workflow_output.as_ref().expect("workflow output");
+        assert_eq!(output.output_modalities, vec!["image".to_owned()]);
+        assert_eq!(output.metrics.get("artifact_count"), Some(&2));
+        assert_eq!(output.metrics.get("width"), Some(&512));
+        assert_eq!(output.metrics.get("height"), Some(&512));
+
+        let model = test_model();
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let requirements =
+            request_requirements_for_artifact_generation(&state, &model, &request, 1, None, None);
+        assert_eq!(requirements.required_modalities, vec!["image".to_owned()]);
+        let image_load = requirements.modality_load.get("image").unwrap();
+        assert_eq!(image_load.item_count, 2);
+        assert_eq!(image_load.max_item_units, 512 * 512);
+    }
+
+    #[test]
     fn music_inline_audio_drives_gateway_route_load_and_auto_duration() {
         let source = test_wav_b64_with_samples(16_000);
         let reference = test_wav_b64_with_samples(8_000);
@@ -43702,6 +44024,8 @@ mod tests {
                     }
                     .to_owned(),
                     contract_request: json!({}),
+                    workflow: None,
+                    workflow_output: None,
                     effective_specialities: BTreeMap::new(),
                     output_modality: if is_video { "video" } else { "audio" }.to_owned(),
                     transport_kind: if is_video {

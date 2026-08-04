@@ -64,15 +64,16 @@ use mayhem_enclave::{
     SealOptions, Tier1AttestationReport, Tier1ExternalProviderAttestationOptions,
     DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
 };
+#[cfg(feature = "comfyui")]
+use mayhem_engine::ComfyUiBackend;
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, CancellationToken,
     EngineBackend, EngineError, GenerateRequest, GenerateSpecialityParameter,
     GenerateSpecialityTarget, GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest,
     LoadConfig, MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
-    SpeechReferenceAudio, SpeechRequest, TokenChunk, ToolSpec, MTMD_MEDIA_MARKER,
+    SpeechReferenceAudio, SpeechRequest, TokenChunk, ToolSpec, WorkflowGenerationRequest,
+    MTMD_MEDIA_MARKER,
 };
-#[cfg(feature = "comfyui")]
-use mayhem_engine::{ComfyUiBackend, WorkflowGenerationRequest};
 use mayhem_gateway::{
     audio_fingerprint, cancellation_settlement_usage, embedding_vector_fingerprint,
     heartbeat_signing_payload, image_average_hash_hex, logical_cumulative_priced_usage_au,
@@ -72517,6 +72518,7 @@ fn provider_session_request_modalities(
             output_modalities,
             modality_load.contains_key("image"),
         ),
+        "workflow_generation" => modality_load.keys().cloned().collect::<Vec<_>>(),
         "chat" => vec!["text".to_owned()],
         other => bail!("unsupported provider request kind {other}"),
     };
@@ -72822,6 +72824,15 @@ fn validate_provider_session_request_modalities(
             actual_specialities, active.required_specialities
         )));
     }
+    if let Some(expected_workflow) = active.workflow.as_ref() {
+        let actual_workflow =
+            provider_session_request_result(provider_comfy_workflow_binding(verified.request))?;
+        if &actual_workflow != expected_workflow {
+            return Err(provider_session_request_error(
+                "workflow graph derivation does not match signed voucher binding",
+            ));
+        }
+    }
     let load = provider_session_modality_load(
         verified.contract,
         verified.family,
@@ -73115,6 +73126,58 @@ fn provider_session_modality_load(
                     max_item_units,
                 },
             )]))
+        }
+        "workflow_generation" => {
+            let workflow_output =
+                provider_session_request_result(provider_session_workflow_output(transport_body))?;
+            let artifact_count = workflow_output
+                .metrics
+                .get("artifact_count")
+                .copied()
+                .unwrap_or(1)
+                .max(1);
+            let item_count = u32::try_from(artifact_count).unwrap_or(u32::MAX).max(1);
+            let mut load = BTreeMap::new();
+            for modality in &workflow_output.output_modalities {
+                let max_item_units = match modality.as_str() {
+                    "video" => workflow_output
+                        .metrics
+                        .get("frame")
+                        .copied()
+                        .unwrap_or(1)
+                        .max(1),
+                    "audio" => workflow_output
+                        .metrics
+                        .get("duration_second")
+                        .copied()
+                        .unwrap_or(1)
+                        .max(1),
+                    "image" => workflow_output
+                        .metrics
+                        .get("width")
+                        .copied()
+                        .unwrap_or(1)
+                        .max(1)
+                        .saturating_mul(
+                            workflow_output
+                                .metrics
+                                .get("height")
+                                .copied()
+                                .unwrap_or(1)
+                                .max(1),
+                        ),
+                    _ => 1,
+                };
+                load.insert(
+                    modality.clone(),
+                    ModalityRequestLoad {
+                        item_count,
+                        max_item_bytes: 1,
+                        max_item_units,
+                    },
+                );
+            }
+            Ok(load)
         }
         other => bail!("unsupported provider request kind {other}"),
     }
@@ -76285,12 +76348,23 @@ fn provider_session_au_owed(
 }
 
 fn provider_session_workflow_output(body: &Value) -> Result<WorkflowOutputBinding> {
-    let value = body
+    if let Some(value) = body
         .get("mayhem_contract")
         .and_then(|contract| contract.get("workflow_output"))
         .cloned()
-        .context("workflow session missing workflow output binding")?;
-    serde_json::from_value(value).context("workflow session output binding is invalid")
+    {
+        return serde_json::from_value(value).context("workflow session output binding is invalid");
+    }
+    let request = body.get("contract_request").unwrap_or(body);
+    let workflow_graph = request
+        .get("workflow")
+        .context("workflow session missing workflow output binding and workflow graph")?;
+    let derivation = mayhem_proto::derive_comfy_workflow(
+        workflow_graph,
+        &provider_comfy_workflow_derivation_policy(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    Ok(derivation.workflow_output)
 }
 
 fn provider_session_prompt_hash(body: &Value) -> String {
@@ -76321,6 +76395,7 @@ fn provider_receipt_binds_contract_request(endpoint_family: &str) -> bool {
             | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
             | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
             | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+            | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
             | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
     )
 }
@@ -76357,6 +76432,7 @@ fn provider_session_prompt_text(body: &Value) -> String {
                 | mayhem_proto::ENDPOINT_HF_TEXT_TO_SPEECH
                 | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
                 | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+                | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
                 | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
         )
     ) {
@@ -80636,6 +80712,7 @@ fn provider_endpoint_transport_kind(family: &str) -> Result<&'static str> {
         mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
         | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => Ok("audio_generation"),
         mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS => Ok("music_generation"),
+        mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS => Ok("workflow_generation"),
         _ => bail!("unsupported provider endpoint family {family}"),
     }
 }
@@ -80745,8 +80822,66 @@ fn provider_local_endpoint_family(kind: &str) -> &'static str {
         "video_generation" => mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
         "audio_generation" => mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
         "music_generation" => mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+        "workflow_generation" => mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
         _ => mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
     }
+}
+
+fn provider_comfy_workflow_derivation_policy() -> mayhem_proto::ComfyWorkflowDerivationPolicy {
+    mayhem_proto::ComfyWorkflowDerivationPolicy {
+        whitelisted_nodes: [
+            "EmptyImage",
+            "EmptyLatentImage",
+            "PreviewImage",
+            "SaveImage",
+            "ImageScale",
+            "ImageScaleBy",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>(),
+        ..mayhem_proto::ComfyWorkflowDerivationPolicy::default()
+    }
+}
+
+fn provider_comfy_workflow_binding(body: &Value) -> Result<WorkflowBinding> {
+    let workflow_graph = body
+        .get("workflow")
+        .context("workflow request is missing workflow")?;
+    let derivation = mayhem_proto::derive_comfy_workflow(
+        workflow_graph,
+        &provider_comfy_workflow_derivation_policy(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let output_modality = derivation
+        .outcome_spec
+        .output_modalities
+        .iter()
+        .find(|modality| modality.as_str() == "video")
+        .or_else(|| {
+            derivation
+                .outcome_spec
+                .output_modalities
+                .iter()
+                .find(|modality| modality.as_str() == "audio")
+        })
+        .map(String::as_str)
+        .unwrap_or("image");
+    Ok(WorkflowBinding {
+        endpoint_family: mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS.to_owned(),
+        graph_hash: derivation.graph_hash,
+        runtime_id: body
+            .get("runtime_id")
+            .and_then(Value::as_str)
+            .unwrap_or("comfyui-v0.30.1")
+            .to_owned(),
+        outcome_class: body
+            .get("outcome_class")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{output_modality}.workflow")),
+        quoted_usage: derivation.quoted_usage,
+    })
 }
 
 fn provider_reasoning_output_mode(
@@ -81195,6 +81330,60 @@ fn provider_engine_session_response_with_sampling_bounded(
             completion_tokens: 0,
             token_ids: Vec::new(),
             usage: provider_video_generation_usage(output.duration_seconds, output.frame_count),
+            usage_attribution: BTreeMap::new(),
+        });
+    }
+
+    if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS {
+        let workflow_graph = request_body
+            .get("workflow")
+            .cloned()
+            .context("workflow request is missing workflow")?;
+        let workflow =
+            provider_session_request_result(provider_comfy_workflow_binding(request_body))?;
+        let workflow_output =
+            provider_session_request_result(provider_session_workflow_output(body))?;
+        let expected_artifacts = workflow_output
+            .metrics
+            .get("artifact_count")
+            .copied()
+            .unwrap_or(1)
+            .max(1);
+        let mut request = WorkflowGenerationRequest::new(workflow_graph);
+        if let Some(timeout_ms) = request_body.get("timeout_ms").and_then(Value::as_u64) {
+            request.timeout_ms = timeout_ms;
+        }
+        let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
+        let output = backend
+            .run_workflow(
+                request,
+                &mut |chunk: ArtifactChunk| artifact_chunks.push(chunk),
+                cancellation,
+            )
+            .context("running provider Comfy workflow with mayhem-engine")?;
+        let artifacts = artifact_chunks.finish()?;
+        ensure!(
+            !artifacts.is_empty(),
+            "provider workflow engine produced no artifacts"
+        );
+        ensure!(
+            u64::from(output.artifact_count) == expected_artifacts
+                && u64::try_from(artifacts.len()).unwrap_or(u64::MAX) == expected_artifacts,
+            "provider workflow engine produced {} artifact(s), expected {expected_artifacts}",
+            artifacts.len()
+        );
+        return Ok(ProviderSessionOutput {
+            content: String::new(),
+            reasoning_evidence: String::new(),
+            tools: Vec::new(),
+            embeddings: None,
+            transcription: None,
+            artifacts,
+            finish_reason: "stop".to_owned(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            token_ids: Vec::new(),
+            usage: workflow.quoted_usage,
             usage_attribution: BTreeMap::new(),
         });
     }
@@ -98449,6 +98638,8 @@ esac
             ctx_bracket: Some("le32k".to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             rules_ver: 1,
+            workflow: None,
+            workflow_output: None,
             usage: ReceiptUsage::text(1, output_tokens),
             usage_attribution: BTreeMap::new(),
             au_owed_cum: MoneyAu::from(output_tokens),
@@ -99193,6 +99384,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             served_ctx: u32::try_from(terms.ctx).unwrap(),
             required_modalities: vec!["text".to_owned()],
             required_specialities: BTreeMap::new(),
+            workflow: None,
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -99285,6 +99477,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             served_ctx: u32::try_from(terms.ctx).unwrap(),
             required_modalities: vec!["text".to_owned()],
             required_specialities: BTreeMap::new(),
+            workflow: None,
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -99462,6 +99655,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             served_ctx: u32::try_from(terms.ctx).unwrap(),
             required_modalities: vec!["text".to_owned()],
             required_specialities: BTreeMap::new(),
+            workflow: None,
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
@@ -99593,6 +99787,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             served_ctx: 8192,
             required_modalities: vec!["text".to_owned()],
             required_specialities: BTreeMap::new(),
+            workflow: None,
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
@@ -99642,6 +99837,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             served_ctx: u32::try_from(terms.ctx).unwrap(),
             required_modalities: vec!["text".to_owned()],
             required_specialities: BTreeMap::new(),
+            workflow: None,
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -101752,6 +101948,29 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .expect_err("a voucher must not add an unadvertised output modality");
             assert!(error.to_string().contains("do not match signed voucher"));
         }
+    }
+
+    #[test]
+    fn provider_workflow_validator_binds_graph_and_derived_output() {
+        let body = test_provider_comfy_workflow_request(512);
+        let terms = test_provider_comfy_session_terms();
+        let sealed = provider_test_seal_contract_request(&body, &terms.adapter).unwrap();
+        let mut active = test_active_provider_session(&terms, vec!["image".to_owned()]);
+        active.workflow = Some(provider_comfy_workflow_binding(&body).unwrap());
+
+        let measured =
+            validate_provider_session_request_modalities(&active, &terms, &sealed).unwrap();
+        assert_eq!(measured, BTreeMap::from([("image".to_owned(), 2)]));
+
+        let tampered = test_provider_comfy_workflow_request(768);
+        let sealed_tampered =
+            provider_test_seal_contract_request(&tampered, &terms.adapter).unwrap();
+        let error = validate_provider_session_request_modalities(&active, &terms, &sealed_tampered)
+            .expect_err("provider must rederive the workflow graph before engine dispatch");
+        assert!(error
+            .to_string()
+            .contains("workflow graph derivation does not match signed voucher binding"));
+        assert_eq!(provider_response_error_code(&error), "request_invalid");
     }
 
     #[test]
@@ -104553,6 +104772,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     served_ctx: 8192,
                     required_modalities: vec!["text".to_owned()],
                     required_specialities: BTreeMap::new(),
+                    workflow: None,
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -104614,6 +104834,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     served_ctx: 8192,
                     required_modalities: vec!["text".to_owned()],
                     required_specialities: BTreeMap::new(),
+                    workflow: None,
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -104674,6 +104895,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     served_ctx: 8192,
                     required_modalities: vec!["text".to_owned()],
                     required_specialities: BTreeMap::new(),
+                    workflow: None,
                     ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
                     ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -114725,6 +114947,45 @@ State initialization...
         }
     }
 
+    fn test_provider_comfy_session_terms() -> ProviderSessionTerms {
+        let mut terms = test_provider_session_terms();
+        terms.adapter.endpoint_families = vec![mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+        )
+        .unwrap()];
+        terms.output_modalities = vec!["image".to_owned()];
+        terms.served_modalities = vec!["image".to_owned()];
+        let mut image_capacity = test_heartbeat_modality_capacity("image");
+        image_capacity.max_items_per_request = 2;
+        terms.modality_capacities = BTreeMap::from([("image".to_owned(), image_capacity)]);
+        terms.rate_map = vec![RateMapEntry {
+            unit: USAGE_IMAGE.to_owned(),
+            per_unit_au: 10,
+            granularity: 1,
+        }];
+        terms
+    }
+
+    fn test_provider_comfy_workflow_request(width: u64) -> Value {
+        json!({
+            "endpoint_family": mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            "model": "test/model@4bit",
+            "workflow": {
+                "1": {
+                    "class_type": "EmptyLatentImage",
+                    "inputs": { "width": width, "height": 512, "batch_size": 2 }
+                },
+                "2": {
+                    "class_type": "SaveImage",
+                    "inputs": { "images": ["1", 0] }
+                }
+            },
+            "runtime_id": "comfyui-v0.30.1",
+            "outcome_class": "image.light.512",
+            "response_format": "artifact"
+        })
+    }
+
     fn test_active_provider_session(
         terms: &ProviderSessionTerms,
         required_modalities: Vec<String>,
@@ -114751,6 +115012,7 @@ State initialization...
             served_ctx: u32::try_from(terms.ctx).unwrap(),
             required_modalities,
             required_specialities: BTreeMap::new(),
+            workflow: None,
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
@@ -114788,6 +115050,7 @@ State initialization...
             served_ctx: u32::try_from(terms.ctx).unwrap(),
             required_modalities: vec!["text".to_owned()],
             required_specialities: BTreeMap::new(),
+            workflow: None,
             ctx_bracket: terms.ctx_bracket.clone(),
             ctx_bracket_table_ver: terms.ctx_bracket_table_ver,
             max_spend_au: 1000,
