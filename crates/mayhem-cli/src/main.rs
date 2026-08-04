@@ -764,6 +764,8 @@ enum AdminPriceCommands {
 enum AdminPartsCommands {
     /// Parse Comfy inventory YAML and report importable pinned part drafts.
     ValidateYaml(AdminPartsValidateYamlArgs),
+    /// Build a machine-pullable Comfy parts index from finalized part records.
+    BuildIndex(AdminPartsBuildIndexArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -4154,6 +4156,33 @@ struct AdminPartsValidateYamlArgs {
     /// Fail if any YAML row is not directly importable as a single pinned part draft.
     #[arg(long)]
     strict: bool,
+}
+
+#[derive(Debug, Parser)]
+struct AdminPartsBuildIndexArgs {
+    /// Finalized Comfy part record JSON. Pass once per record.
+    #[arg(long = "record", required = true, value_name = "PATH")]
+    records: Vec<PathBuf>,
+
+    /// Output directory for index.json, anchor.json, records/, and proofs/.
+    #[arg(long = "output-dir", value_name = "PATH")]
+    output_dir: PathBuf,
+
+    /// Monotonic index version to place in index.json and anchor.json.
+    #[arg(long, default_value_t = 1)]
+    index_ver: u32,
+
+    /// Blessed Comfy runtime id included in the anchor. Repeat for blue/green windows.
+    #[arg(long = "blessed-runtime", required = true)]
+    blessed_runtimes: Vec<String>,
+
+    /// Node whitelist version included in the anchor.
+    #[arg(long, default_value_t = 1)]
+    whitelist_ver: u32,
+
+    /// Outcome-class grid version included in the anchor.
+    #[arg(long, default_value_t = 1)]
+    outcome_classes_ver: u32,
 }
 
 #[derive(Debug, Parser)]
@@ -24653,9 +24682,47 @@ struct AdminPartsDraftSummary {
     require_auth: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct AdminPartsBuildIndexReport {
+    ok: bool,
+    schema_version: u32,
+    index_ver: u32,
+    output_dir: String,
+    record_count: u64,
+    index_root: String,
+    anchor_hash: String,
+    by_status: BTreeMap<String, u64>,
+    by_type: BTreeMap<String, u64>,
+    outputs: AdminPartsBuildIndexOutputs,
+    records: Vec<AdminPartsBuildIndexRecordSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminPartsBuildIndexOutputs {
+    index: String,
+    anchor: String,
+    anchor_hash: String,
+    records_dir: String,
+    proofs_dir: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminPartsBuildIndexRecordSummary {
+    source: String,
+    part_id: String,
+    record_hash: String,
+    record_path: String,
+    proof_path: String,
+    #[serde(rename = "type")]
+    part_type: String,
+    lane: String,
+    status: String,
+}
+
 async fn admin_parts(command: &AdminPartsCommands) -> Result<()> {
     match command {
         AdminPartsCommands::ValidateYaml(args) => admin_parts_validate_yaml(args),
+        AdminPartsCommands::BuildIndex(args) => admin_parts_build_index(args),
     }
 }
 
@@ -24751,6 +24818,113 @@ fn read_comfy_part_yaml_rows(path: &Path) -> Result<Vec<Value>> {
         .as_array()
         .cloned()
         .with_context(|| format!("{} must be a top-level YAML sequence", path.display()))
+}
+
+fn admin_parts_build_index(args: &AdminPartsBuildIndexArgs) -> Result<()> {
+    ensure!(
+        !args.records.is_empty(),
+        "at least one --record path is required"
+    );
+    ensure!(
+        !args.blessed_runtimes.is_empty(),
+        "at least one --blessed-runtime is required"
+    );
+    for runtime in &args.blessed_runtimes {
+        ensure!(
+            !runtime.trim().is_empty(),
+            "--blessed-runtime values must be non-empty"
+        );
+    }
+
+    let output_dir = absolutize(args.output_dir.clone())?;
+    let records_dir = output_dir.join("records");
+    let proofs_dir = output_dir.join("proofs");
+    fs::create_dir_all(&records_dir)
+        .with_context(|| format!("creating {}", records_dir.display()))?;
+    fs::create_dir_all(&proofs_dir)
+        .with_context(|| format!("creating {}", proofs_dir.display()))?;
+
+    let mut records_with_source = Vec::new();
+    for input in &args.records {
+        let path = absolutize(input.clone())?;
+        let value = read_json_file(&path)?;
+        let record: mayhem_proto::ComfyPartRecord = serde_json::from_value(value)
+            .with_context(|| format!("parsing Comfy part record {}", path.display()))?;
+        record
+            .validate()
+            .with_context(|| format!("validating Comfy part record {}", path.display()))?;
+        records_with_source.push((path, record));
+    }
+    records_with_source.sort_by(|left, right| left.1.part_id.cmp(&right.1.part_id));
+    let records = records_with_source
+        .iter()
+        .map(|(_, record)| record.clone())
+        .collect::<Vec<_>>();
+    let index = mayhem_proto::build_comfy_parts_index(&records, args.index_ver)?;
+    let anchor = mayhem_proto::ComfyPartsAnchor {
+        schema_version: mayhem_proto::COMFY_PARTS_ANCHOR_SCHEMA_VERSION,
+        parts_index_root: index.root.clone(),
+        index_ver: args.index_ver,
+        blessed_runtimes: args.blessed_runtimes.clone(),
+        whitelist_ver: args.whitelist_ver,
+        outcome_classes_ver: args.outcome_classes_ver,
+    };
+    let anchor_hash = mayhem_proto::comfy_parts_anchor_hash(&anchor)?;
+
+    let mut by_status = BTreeMap::new();
+    let mut by_type = BTreeMap::new();
+    let mut summaries = Vec::new();
+    for (source, record) in &records_with_source {
+        let record_hash = mayhem_proto::comfy_part_record_hash(record)?;
+        let proof = mayhem_proto::prove_comfy_part(&records, &record.part_id)?;
+        mayhem_proto::verify_comfy_part_proof(record, &proof, &index.root)?;
+        let record_path = records_dir.join(format!("{}.json", record.part_id));
+        let proof_path = proofs_dir.join(format!("{}.proof.json", record.part_id));
+        write_json_file(&record_path, record)?;
+        write_json_file(&proof_path, &proof)?;
+        *by_status.entry(record.status.clone()).or_insert(0) += 1;
+        *by_type.entry(record.part_type.clone()).or_insert(0) += 1;
+        summaries.push(AdminPartsBuildIndexRecordSummary {
+            source: source.display().to_string(),
+            part_id: record.part_id.clone(),
+            record_hash,
+            record_path: record_path.display().to_string(),
+            proof_path: proof_path.display().to_string(),
+            part_type: record.part_type.clone(),
+            lane: record.lane.clone(),
+            status: record.status.clone(),
+        });
+    }
+
+    let index_path = output_dir.join("index.json");
+    let anchor_path = output_dir.join("anchor.json");
+    let anchor_hash_path = output_dir.join("anchor-hash.txt");
+    write_json_file(&index_path, &index)?;
+    write_json_file(&anchor_path, &anchor)?;
+    fs::write(&anchor_hash_path, format!("{anchor_hash}\n"))
+        .with_context(|| format!("writing {}", anchor_hash_path.display()))?;
+
+    let report = AdminPartsBuildIndexReport {
+        ok: true,
+        schema_version: mayhem_proto::COMFY_PARTS_INDEX_SCHEMA_VERSION,
+        index_ver: args.index_ver,
+        output_dir: output_dir.display().to_string(),
+        record_count: summaries.len() as u64,
+        index_root: index.root,
+        anchor_hash,
+        by_status,
+        by_type,
+        outputs: AdminPartsBuildIndexOutputs {
+            index: index_path.display().to_string(),
+            anchor: anchor_path.display().to_string(),
+            anchor_hash: anchor_hash_path.display().to_string(),
+            records_dir: records_dir.display().to_string(),
+            proofs_dir: proofs_dir.display().to_string(),
+        },
+        records: summaries,
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 fn comfy_part_yaml_skip_reason(row: &Value) -> Option<String> {
@@ -85692,13 +85866,53 @@ mod tests {
         let AdminCommands::Parts { command } = *command else {
             panic!("expected admin parts command");
         };
-        let AdminPartsCommands::ValidateYaml(args) = command;
+        let AdminPartsCommands::ValidateYaml(args) = command else {
+            panic!("expected admin parts validate-yaml command");
+        };
         assert_eq!(
             args.inputs,
             vec![PathBuf::from("docs/comfy/UpscalersOpenmayhem.yaml")]
         );
         assert!(args.include_drafts);
         assert!(!args.strict);
+    }
+
+    #[test]
+    fn admin_parts_build_index_cli_parses_without_tx_flags() {
+        let parsed = Cli::try_parse_from([
+            "mayhem",
+            "admin",
+            "parts",
+            "build-index",
+            "--record",
+            "part-a.json",
+            "--output-dir",
+            "parts-index",
+            "--index-ver",
+            "7",
+            "--blessed-runtime",
+            "comfyui-v0.30.1",
+            "--whitelist-ver",
+            "3",
+            "--outcome-classes-ver",
+            "2",
+        ])
+        .unwrap();
+        let Commands::Admin { command } = parsed.command else {
+            panic!("expected admin command");
+        };
+        let AdminCommands::Parts { command } = *command else {
+            panic!("expected admin parts command");
+        };
+        let AdminPartsCommands::BuildIndex(args) = command else {
+            panic!("expected admin parts build-index command");
+        };
+        assert_eq!(args.records, vec![PathBuf::from("part-a.json")]);
+        assert_eq!(args.output_dir, PathBuf::from("parts-index"));
+        assert_eq!(args.index_ver, 7);
+        assert_eq!(args.blessed_runtimes, vec!["comfyui-v0.30.1"]);
+        assert_eq!(args.whitelist_ver, 3);
+        assert_eq!(args.outcome_classes_ver, 2);
     }
 
     #[test]
@@ -85727,6 +85941,118 @@ mod tests {
         assert!(comfy_part_yaml_skip_reason(&rows[1])
             .unwrap()
             .contains("missing sha256"));
+    }
+
+    #[test]
+    fn admin_parts_build_index_writes_verifiable_layout() {
+        let temp = test_temp_dir("mayhem-admin-parts-build-index");
+        let source_dir = temp.join("source");
+        let output_dir = temp.join("out");
+        fs::create_dir_all(&source_dir).unwrap();
+        let first = test_comfy_part_record("4x test", "11");
+        let second = test_comfy_part_record("control test", "22");
+        let first_path = source_dir.join("first.json");
+        let second_path = source_dir.join("second.json");
+        write_json_file(&first_path, &first).unwrap();
+        write_json_file(&second_path, &second).unwrap();
+
+        admin_parts_build_index(&AdminPartsBuildIndexArgs {
+            records: vec![second_path, first_path],
+            output_dir: output_dir.clone(),
+            index_ver: 9,
+            blessed_runtimes: vec!["comfyui-v0.30.1".to_owned()],
+            whitelist_ver: 4,
+            outcome_classes_ver: 5,
+        })
+        .unwrap();
+
+        let index: mayhem_proto::ComfyPartsIndex =
+            serde_json::from_value(read_json_file(&output_dir.join("index.json")).unwrap())
+                .unwrap();
+        let anchor: mayhem_proto::ComfyPartsAnchor =
+            serde_json::from_value(read_json_file(&output_dir.join("anchor.json")).unwrap())
+                .unwrap();
+        assert_eq!(index.index_ver, 9);
+        assert_eq!(index.parts.len(), 2);
+        assert_eq!(anchor.parts_index_root, index.root);
+        assert_eq!(anchor.blessed_runtimes, vec!["comfyui-v0.30.1"]);
+        assert_eq!(anchor.whitelist_ver, 4);
+        assert_eq!(anchor.outcome_classes_ver, 5);
+        assert_eq!(
+            fs::read_to_string(output_dir.join("anchor-hash.txt"))
+                .unwrap()
+                .trim(),
+            mayhem_proto::comfy_parts_anchor_hash(&anchor).unwrap()
+        );
+
+        for record in [first, second] {
+            let stored_record: mayhem_proto::ComfyPartRecord = serde_json::from_value(
+                read_json_file(
+                    &output_dir
+                        .join("records")
+                        .join(format!("{}.json", record.part_id)),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let proof: mayhem_proto::ComfyPartMerkleProof = serde_json::from_value(
+                read_json_file(
+                    &output_dir
+                        .join("proofs")
+                        .join(format!("{}.proof.json", record.part_id)),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(stored_record, record);
+            mayhem_proto::verify_comfy_part_proof(&stored_record, &proof, &index.root).unwrap();
+        }
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    fn test_comfy_part_record(name: &str, hex_byte: &str) -> mayhem_proto::ComfyPartRecord {
+        mayhem_proto::ComfyPartDraft {
+            name: name.to_owned(),
+            part_type: "upscaler".to_owned(),
+            lane: "all".to_owned(),
+            sha256: hex_byte.repeat(32),
+            size_bytes: 64,
+            file_format: "safetensors".to_owned(),
+            license: "MIT".to_owned(),
+            permissions: Vec::new(),
+            policy_flags: Vec::new(),
+            adapter: BTreeMap::new(),
+            sources: mayhem_proto::ComfyPartSources {
+                mirrors: vec![mayhem_proto::ComfyPartSource {
+                    kind: "huggingface".to_owned(),
+                    url: format!("https://huggingface.co/TracNetwork/openmayhem-parts/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/{name}.safetensors"),
+                    repository: Some("TracNetwork/openmayhem-parts".to_owned()),
+                    path: Some(format!("{name}.safetensors")),
+                    revision: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+                }],
+                origins: Vec::new(),
+                require_auth: false,
+            },
+            status: "linked".to_owned(),
+        }
+        .finalize(
+            hex_byte.repeat(32),
+            "comfyui-v0.30.1".to_owned(),
+            mayhem_proto::ComfyPartLicenseEvidence {
+                doc_hash: "33".repeat(32),
+                archived_ref: "license-evidence:test".to_owned(),
+                captured_at: "2026-08-04T00:00:00Z".to_owned(),
+            },
+            mayhem_proto::ComfyPartCanary {
+                probe_graph_hash: "44".repeat(32),
+                reference_output_ref: "canaries/test.png".to_owned(),
+                tolerance: mayhem_proto::ComfyPartCanaryTolerance {
+                    method: "phash".to_owned(),
+                    max_distance_bps: 10,
+                },
+            },
+        )
+        .unwrap()
     }
 
     #[test]
