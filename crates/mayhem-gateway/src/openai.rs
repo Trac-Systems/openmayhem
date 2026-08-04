@@ -5371,6 +5371,52 @@ impl GatewayMarketRouteSummary {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ModelsQuery {
+    #[serde(default)]
+    endpoint_family: Option<String>,
+    #[serde(default, alias = "workflow_media")]
+    media: Option<String>,
+    #[serde(default, alias = "workflow_max_width")]
+    max_width: Option<u64>,
+    #[serde(default, alias = "workflow_max_height")]
+    max_height: Option<u64>,
+    #[serde(default, alias = "workflow_runtime_id")]
+    runtime_id: Option<String>,
+    #[serde(default, alias = "workflow_outcome_class")]
+    outcome_class: Option<String>,
+    #[serde(default, alias = "workflow_inventory_root")]
+    inventory_root: Option<String>,
+    #[serde(default)]
+    max_price_au: Option<MoneyAu>,
+    #[serde(default, alias = "attestation_tier")]
+    tier: Option<String>,
+    #[serde(default)]
+    nsfw_policy: Option<String>,
+    #[serde(default)]
+    live: Option<bool>,
+}
+
+impl ModelsQuery {
+    fn is_empty(&self) -> bool {
+        self.endpoint_family.is_none()
+            && self.media.is_none()
+            && self.max_width.is_none()
+            && self.max_height.is_none()
+            && self.runtime_id.is_none()
+            && self.outcome_class.is_none()
+            && self.inventory_root.is_none()
+            && self.max_price_au.is_none()
+            && self.tier.is_none()
+            && self.nsfw_policy.is_none()
+            && self.live.is_none()
+    }
+
+    fn live_required(&self) -> bool {
+        self.live.unwrap_or(false)
+    }
+}
+
 fn gateway_live_route_keys(
     state: &GatewayState,
     models: &[GatewayModel],
@@ -5381,6 +5427,240 @@ fn gateway_live_route_keys(
         .iter()
         .flat_map(|model| gateway_model_live_route_keys(state, model, entries, now_millis))
         .collect()
+}
+
+fn gateway_model_matches_models_query(
+    model: &GatewayModel,
+    live_routes: &[GatewayLiveRoute<'_>],
+    query: &ModelsQuery,
+) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    if query.live_required() && live_routes.is_empty() {
+        return false;
+    }
+    if let Some(family) = query
+        .endpoint_family
+        .as_deref()
+        .filter(|family| !family.is_empty())
+    {
+        if !model
+            .mayhem
+            .adapter
+            .endpoint_families
+            .iter()
+            .any(|contract| contract.family == family)
+        {
+            return false;
+        }
+    }
+    if let Some(max_price_au) = query.max_price_au {
+        if gateway_model_max_listed_price_au(model) > max_price_au {
+            return false;
+        }
+    }
+    if let Some(tier) = query.tier.as_deref().and_then(normalize_models_query_tier) {
+        if query.live_required() {
+            if !live_routes
+                .iter()
+                .any(|route| format!("T{}", route.candidate.att_tier) == tier)
+            {
+                return false;
+            }
+        } else if !model.mayhem.attestation_tiers.contains_key(&tier) {
+            return false;
+        }
+    } else if query.tier.as_deref().is_some_and(|tier| !tier.is_empty()) {
+        return false;
+    }
+    if let Some(media) = query.media.as_deref().filter(|media| !media.is_empty()) {
+        if query.live_required() {
+            if !live_routes.iter().any(|route| {
+                gateway_live_route_modalities(*route)
+                    .iter()
+                    .any(|modality| modality.eq_ignore_ascii_case(media))
+            }) {
+                return false;
+            }
+        } else if !gateway_model_registered_modalities(model)
+            .iter()
+            .any(|modality| modality.eq_ignore_ascii_case(media))
+        {
+            return false;
+        }
+    }
+    if !gateway_model_matches_workflow_query(model, live_routes, query) {
+        return false;
+    }
+    if query
+        .nsfw_policy
+        .as_deref()
+        .is_some_and(|policy| !policy.is_empty())
+    {
+        return false;
+    }
+    true
+}
+
+fn normalize_models_query_tier(tier: &str) -> Option<String> {
+    let value = tier.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let digits = value
+        .strip_prefix('T')
+        .or_else(|| value.strip_prefix('t'))
+        .or_else(|| value.strip_prefix("tier"))
+        .or_else(|| value.strip_prefix("Tier"))
+        .unwrap_or(value);
+    let parsed = digits.parse::<u8>().ok()?;
+    (1..=3).contains(&parsed).then(|| format!("T{parsed}"))
+}
+
+fn gateway_model_registered_modalities(model: &GatewayModel) -> BTreeSet<String> {
+    let mut modalities = model
+        .mayhem
+        .adapter
+        .modality_set
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    modalities.extend(model.mayhem.caps.output_modalities.iter().cloned());
+    if let Some(output_modality) = model.mayhem.caps.output_modality.as_ref() {
+        modalities.insert(output_modality.clone());
+    }
+    for candidate in &model.mayhem.route_candidates {
+        modalities.extend(candidate.served_modalities.iter().cloned());
+    }
+    modalities
+}
+
+fn gateway_model_max_listed_price_au(model: &GatewayModel) -> MoneyAu {
+    let mut max_price = model
+        .mayhem
+        .price_ref_au
+        .per_req_au
+        .max(model.mayhem.price_ref_au.min_session_au);
+    for entry in &model.mayhem.price_ref_au.rate_map {
+        max_price = max_price.max(entry.per_unit_au);
+    }
+    for candidate in &model.mayhem.route_candidates {
+        max_price = max_price.max(candidate.min_ask_au);
+        let price = route_price_ref_au(model, Some(candidate));
+        max_price = max_price.max(price.per_req_au).max(price.min_session_au);
+        for entry in &price.rate_map {
+            max_price = max_price.max(entry.per_unit_au);
+        }
+    }
+    max_price
+}
+
+fn gateway_model_matches_workflow_query(
+    model: &GatewayModel,
+    live_routes: &[GatewayLiveRoute<'_>],
+    query: &ModelsQuery,
+) -> bool {
+    let workflow_filter_present = query.max_width.is_some()
+        || query.max_height.is_some()
+        || query
+            .runtime_id
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || query
+            .outcome_class
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        || query
+            .inventory_root
+            .as_deref()
+            .is_some_and(|value| !value.is_empty());
+    if !workflow_filter_present {
+        return true;
+    }
+    let Some(policy) = model.mayhem.workflow.as_ref() else {
+        return false;
+    };
+    if let Some(max_width) = query.max_width {
+        let Some(policy_max_width) = policy.max_width else {
+            return false;
+        };
+        if policy_max_width < max_width {
+            return false;
+        }
+    }
+    if let Some(max_height) = query.max_height {
+        let Some(policy_max_height) = policy.max_height else {
+            return false;
+        };
+        if policy_max_height < max_height {
+            return false;
+        }
+    }
+    if let Some(runtime_id) = query
+        .runtime_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        if policy.runtime_id() != runtime_id {
+            return false;
+        }
+    }
+    if let Some(outcome_class) = query
+        .outcome_class
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        let outputs = if model.mayhem.caps.output_modalities.is_empty() {
+            vec![model
+                .mayhem
+                .caps
+                .output_modality
+                .as_deref()
+                .unwrap_or("image")
+                .to_owned()]
+        } else {
+            model.mayhem.caps.output_modalities.clone()
+        };
+        if !outputs
+            .iter()
+            .any(|modality| policy.outcome_class_for(modality) == outcome_class)
+        {
+            return false;
+        }
+    }
+    if let Some(inventory_root) = query
+        .inventory_root
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        if policy.inventory_root.as_deref() != Some(inventory_root) {
+            return false;
+        }
+    }
+    if query.live_required() {
+        let runtime_id = policy.runtime_id();
+        let inventory_root = policy.inventory_root.as_deref();
+        if !live_routes.iter().any(|route| {
+            let Some(heartbeat) = route.entry.heartbeat.as_ref() else {
+                return false;
+            };
+            heartbeat.runtime_id.as_deref() == Some(runtime_id)
+                && inventory_root
+                    .map(|root| heartbeat.inventory_root.as_deref() == Some(root))
+                    .unwrap_or(true)
+                && gateway_live_route_modalities(*route)
+                    .iter()
+                    .any(|modality| {
+                        heartbeat
+                            .workflow_classes
+                            .contains_key(&policy.outcome_class_for(modality))
+                    })
+        }) {
+            return false;
+        }
+    }
+    true
 }
 
 fn gateway_model_live_route_keys(
@@ -5480,6 +5760,7 @@ fn gateway_reporting_requirements_for_route(
             RequestRequirements {
                 current_rules_ver: state.receipt_config.rules_ver,
                 requires_transport_peer: !state.dev_session_shim,
+                workflow: gateway_reporting_workflow_requirements(model, &modalities),
                 required_modalities: modalities,
                 modality_load,
                 min_ctx: if is_text_generation {
@@ -5537,6 +5818,15 @@ fn gateway_reporting_modality_shapes(
     let mut recognized_endpoint = false;
     let mut shapes = BTreeSet::new();
     for contract in &model.mayhem.adapter.endpoint_families {
+        if contract.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS {
+            recognized_endpoint = true;
+            shapes.extend(
+                gateway_comfy_workflow_reporting_modalities(model, candidate)
+                    .into_iter()
+                    .map(|modality| vec![modality]),
+            );
+            continue;
+        }
         let modalities = match contract.family.as_str() {
             mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
             | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
@@ -5578,6 +5868,63 @@ fn gateway_reporting_modality_shapes(
         );
     }
     shapes
+}
+
+fn gateway_comfy_workflow_reporting_modalities(
+    model: &GatewayModel,
+    candidate: &GatewayRouteCandidate,
+) -> BTreeSet<String> {
+    let model_outputs = if model.mayhem.caps.output_modalities.is_empty() {
+        model
+            .mayhem
+            .caps
+            .output_modality
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        model.mayhem.caps.output_modalities.clone()
+    };
+    let mut modalities = model_outputs
+        .into_iter()
+        .filter(|modality| matches!(modality.as_str(), "image" | "video" | "audio"))
+        .filter(|modality| candidate.served_modalities.contains(modality))
+        .collect::<BTreeSet<_>>();
+    if modalities.is_empty() {
+        modalities.extend(
+            candidate
+                .served_modalities
+                .iter()
+                .filter(|modality| matches!(modality.as_str(), "image" | "video" | "audio"))
+                .cloned(),
+        );
+    }
+    modalities
+}
+
+fn gateway_reporting_workflow_requirements(
+    model: &GatewayModel,
+    modalities: &[String],
+) -> Option<WorkflowRouteRequirements> {
+    if !model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .any(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS)
+    {
+        return None;
+    }
+    let policy = model.mayhem.workflow.as_ref()?;
+    let output_modality = modalities
+        .iter()
+        .find(|modality| matches!(modality.as_str(), "image" | "video" | "audio"))
+        .or_else(|| modalities.first())?;
+    Some(WorkflowRouteRequirements {
+        runtime_id: policy.runtime_id().to_owned(),
+        outcome_class: policy.outcome_class_for(output_modality),
+        inventory_root: policy.inventory_root.clone(),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -6220,7 +6567,11 @@ fn gateway_model_info_value(
     mayhem
 }
 
-async fn list_models(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+async fn list_models(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(query): Query<ModelsQuery>,
+) -> Response {
     if let Err(err) = state.authorize_gateway_request(&headers, None) {
         return err.into_response();
     }
@@ -6232,18 +6583,22 @@ async fn list_models(State(state): State<SharedState>, headers: HeaderMap) -> Re
     let models = state.models_snapshot();
     let data = models
         .iter()
-        .map(|model| {
+        .filter_map(|model| {
             let live_route_keys =
                 gateway_model_live_route_keys(&state, model, &entries, now_millis);
+            let live_routes = gateway_model_live_routes(model, &entries, &live_route_keys);
+            if !gateway_model_matches_models_query(model, &live_routes, &query) {
+                return None;
+            }
             let mayhem =
                 gateway_model_info_value(&state, model, &entries, &live_route_keys, now_millis);
-            json!({
+            Some(json!({
                 "id": model.id,
                 "object": "model",
                 "created": model.created,
                 "owned_by": model.owned_by,
                 "mayhem": mayhem,
-            })
+            }))
         })
         .collect::<Vec<_>>();
     Json(json!({ "object": "list", "data": data })).into_response()
@@ -43654,6 +44009,158 @@ mod tests {
         assert!(missing_part
             .message
             .contains("requires unknown part missing.safetensors"));
+    }
+
+    #[tokio::test]
+    async fn models_query_filters_comfy_policy_and_live_workflow_capabilities() {
+        use tower::ServiceExt;
+
+        let mut model = test_routed_model(1);
+        model.id = "mayhem/comfy-query-test".to_owned();
+        model.mayhem.model_class = "image-generation".to_owned();
+        model.mayhem.caps = ModelCaps {
+            tools: false,
+            json: false,
+            ctx: 1,
+            vision: false,
+            image: true,
+            video: false,
+            audio: false,
+            max_image_width: Some(512),
+            max_image_height: Some(512),
+            max_image_steps: Some(32),
+            output_modality: Some("image".to_owned()),
+            output_modalities: vec!["image".to_owned()],
+        };
+        model.mayhem.adapter.modality_set = vec!["image".to_owned()];
+        model.mayhem.adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            )
+            .unwrap()];
+        let policy = mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["EmptyLatentImage".to_owned(), "SaveImage".to_owned()],
+            parts: Vec::new(),
+            runtime_id: Some("comfyui-v0.31.0".to_owned()),
+            outcome_class: Some("image.custom.512".to_owned()),
+            inventory_root: Some("33".repeat(32)),
+            max_width: Some(512),
+            max_height: Some(512),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        };
+        model.mayhem.workflow = Some(policy);
+        model.mayhem.route_candidates[0].served_modalities = vec!["image".to_owned()];
+        model.mayhem.route_candidates[0].caps = json!({
+            "modality_capacity": {
+                "image": {
+                    "unit": "pixel",
+                    "max_inflight_items": 2,
+                    "active_items": 0,
+                    "max_items_per_request": 1,
+                    "max_item_bytes": 1,
+                    "max_item_units": 1,
+                    "working_set_bytes_per_item": 1
+                }
+            }
+        });
+        let now = now_millis_u64();
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let mut heartbeat = heartbeat_for_route(&model, &model.mayhem.route_candidates[0], now);
+        heartbeat.caps.served_modalities = vec!["image".to_owned()];
+        heartbeat.caps.modality_capacity = BTreeMap::from([(
+            "image".to_owned(),
+            HeartbeatModalityCapacity {
+                unit: "pixel".to_owned(),
+                max_inflight_items: 2,
+                active_items: 0,
+                max_items_per_request: 1,
+                max_item_bytes: 1,
+                max_item_units: 1,
+                working_set_bytes_per_item: 1,
+            },
+        )]);
+        heartbeat.runtime_id = Some("comfyui-v0.31.0".to_owned());
+        heartbeat.inventory_root = Some("33".repeat(32));
+        heartbeat.workflow_classes.insert(
+            "image.custom.512".to_owned(),
+            crate::HeartbeatWorkflowClass {
+                min_ask_au: 7,
+                max_concurrent: 2,
+                active: 0,
+            },
+        );
+        state.ingest_provider_heartbeat(heartbeat, now);
+        let entries = state
+            .provider_table
+            .lock_recover("provider table")
+            .entries(now);
+        let live_route_keys = gateway_model_live_route_keys(&state, &model, &entries, now);
+        let live_routes = gateway_model_live_routes(&model, &entries, &live_route_keys);
+
+        let query = ModelsQuery {
+            endpoint_family: Some(mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS.to_owned()),
+            media: Some("image".to_owned()),
+            max_width: Some(512),
+            max_height: Some(512),
+            runtime_id: Some("comfyui-v0.31.0".to_owned()),
+            outcome_class: Some("image.custom.512".to_owned()),
+            inventory_root: Some("33".repeat(32)),
+            tier: Some("T1".to_owned()),
+            live: Some(true),
+            ..ModelsQuery::default()
+        };
+        assert!(gateway_model_matches_models_query(
+            &model,
+            &live_routes,
+            &query
+        ));
+
+        let mut too_large = query.clone();
+        too_large.max_width = Some(1024);
+        assert!(!gateway_model_matches_models_query(
+            &model,
+            &live_routes,
+            &too_large
+        ));
+
+        let mut wrong_runtime = query.clone();
+        wrong_runtime.runtime_id = Some("comfyui-v0.30.1".to_owned());
+        assert!(!gateway_model_matches_models_query(
+            &model,
+            &live_routes,
+            &wrong_runtime
+        ));
+
+        let mut no_metadata_for_nsfw = query;
+        no_metadata_for_nsfw.nsfw_policy = Some("allow".to_owned());
+        assert!(!gateway_model_matches_models_query(
+            &model,
+            &live_routes,
+            &no_metadata_for_nsfw
+        ));
+
+        let query_path = format!(
+            "/v1/models?endpoint_family={}&workflow_media=image&workflow_max_width=512&workflow_max_height=512&workflow_runtime_id=comfyui-v0.31.0&workflow_outcome_class=image.custom.512&workflow_inventory_root={}&attestation_tier=T1&live=true",
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            "33".repeat(32)
+        );
+        let response = openai_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri(query_path)
+                    .body(Body::empty())
+                    .expect("models query request"),
+            )
+            .await
+            .expect("models query response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("models query body");
+        let body: Value = serde_json::from_slice(&bytes).expect("models query json");
+        assert_eq!(body["data"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["data"][0]["id"], model.id);
     }
 
     #[test]

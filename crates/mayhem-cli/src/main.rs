@@ -71072,7 +71072,12 @@ async fn send_provider_heartbeat_round(
         if let Some(workflow_classes) =
             provider_heartbeat_workflow_classes(selected, min_ask_au, max_sessions, &load)
         {
-            heartbeat["runtime_id"] = json!(mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID);
+            heartbeat["runtime_id"] = json!(selected
+                .model
+                .workflow
+                .as_ref()
+                .map(mayhem_proto::ComfyWorkflowCatalogPolicy::runtime_id)
+                .unwrap_or(mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID));
             heartbeat["workflow_classes"] = workflow_classes;
         }
         project_provider_heartbeat_attestation(&mut heartbeat, attestation, tpm_activation_hello)?;
@@ -71449,9 +71454,15 @@ fn provider_heartbeat_workflow_classes(
     } else {
         "image"
     };
+    let outcome_class = selected
+        .model
+        .workflow
+        .as_ref()
+        .map(|policy| policy.outcome_class_for(modality))
+        .unwrap_or_else(|| format!("{modality}.workflow"));
     let active = u32::try_from(load.active_slots).unwrap_or(u32::MAX);
     Some(json!({
-        format!("{modality}.workflow"): {
+        outcome_class: {
             "min_ask_au": money_au_json(min_ask_au),
             "max_concurrent": max_sessions.max(1),
             "active": active.min(max_sessions.max(1)),
@@ -104937,6 +104948,19 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(classes["image.workflow"]["min_ask_au"], json!("7"));
         assert_eq!(classes["image.workflow"]["max_concurrent"], json!(2));
         assert_eq!(classes["image.workflow"]["active"], json!(0));
+
+        selected.model.workflow = Some(mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["EmptyLatentImage".to_owned(), "SaveImage".to_owned()],
+            parts: Vec::new(),
+            runtime_id: Some("comfyui-v0.31.0".to_owned()),
+            outcome_class: Some("image.custom.512".to_owned()),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        });
+        let classes = provider_heartbeat_workflow_classes(&selected, 9, 3, &load)
+            .expect("Comfy endpoint should advertise signed workflow class");
+        assert_eq!(classes["image.custom.512"]["min_ask_au"], json!("9"));
+        assert_eq!(classes["image.custom.512"]["max_concurrent"], json!(3));
+        assert!(classes.get("image.workflow").is_none());
     }
 
     #[test]
