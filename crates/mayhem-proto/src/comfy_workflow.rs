@@ -418,7 +418,7 @@ fn scan_workflow_value(
     match value {
         Value::Object(map) => {
             for (key, value) in map {
-                if let Some(part_name) = comfy_part_name_for_key(key, value) {
+                if let Some(part_name) = comfy_part_name_for_key(key, value)? {
                     let part = policy
                         .parts_by_name
                         .get(part_name)
@@ -442,10 +442,13 @@ fn scan_workflow_value(
     Ok(())
 }
 
-fn comfy_part_name_for_key<'a>(key: &str, value: &'a Value) -> Option<&'a str> {
-    let key = key.to_ascii_lowercase();
+fn comfy_part_name_for_key<'a>(
+    key: &str,
+    value: &'a Value,
+) -> Result<Option<&'a str>, ComfyWorkflowDerivationError> {
+    let normalized = key.to_ascii_lowercase();
     let looks_like_part = matches!(
-        key.as_str(),
+        normalized.as_str(),
         "ckpt_name"
             | "checkpoint"
             | "checkpoint_name"
@@ -463,14 +466,30 @@ fn comfy_part_name_for_key<'a>(key: &str, value: &'a Value) -> Option<&'a str> {
             | "audio_model_name"
             | "video_model"
             | "video_model_name"
-    );
+    ) || normalized
+        .strip_prefix("clip_name")
+        .is_some_and(|suffix| suffix.is_empty() || suffix.chars().all(|ch| ch.is_ascii_digit()))
+        || normalized
+            .strip_prefix("text_encoder_name")
+            .is_some_and(|suffix| {
+                suffix.is_empty() || suffix.chars().all(|ch| ch.is_ascii_digit())
+            });
     if !looks_like_part {
-        return None;
+        return Ok(None);
     }
-    value
+    let Some(value) = value
         .as_str()
         .map(str::trim)
-        .filter(|value| !value.is_empty() && value.len() <= MAX_COMFY_WORKFLOW_PART_NAME_BYTES)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if value.len() > MAX_COMFY_WORKFLOW_PART_NAME_BYTES {
+        return Err(ComfyWorkflowDerivationError::InvalidGraph(format!(
+            "part name for key {key} exceeds {MAX_COMFY_WORKFLOW_PART_NAME_BYTES} bytes"
+        )));
+    }
+    Ok(Some(value))
 }
 
 fn update_metric_from_key(key: &str, value: &Value, metrics: &mut OutcomeMetrics) {
@@ -619,6 +638,85 @@ mod tests {
         })
     }
 
+    fn part(name: &str, part_type: &str, byte: &str) -> ComfyWorkflowPartRef {
+        ComfyWorkflowPartRef {
+            part_id: byte.repeat(32),
+            name: name.to_owned(),
+            part_type: part_type.to_owned(),
+            sha256: byte.repeat(32),
+        }
+    }
+
+    fn av_policy() -> ComfyWorkflowDerivationPolicy {
+        ComfyWorkflowDerivationPolicy {
+            whitelisted_nodes: [
+                "UNETLoader",
+                "CLIPLoader",
+                "VAELoader",
+                "LoraLoader",
+                "ControlNetLoader",
+                "AudioModelLoader",
+                "KSamplerAdvanced",
+                "VHS_VideoCombine",
+                "SaveAudio",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            parts_by_name: BTreeMap::from([
+                (
+                    "wan.safetensors".to_owned(),
+                    part("wan.safetensors", "video-model", "31"),
+                ),
+                (
+                    "t5xxl_fp16.safetensors".to_owned(),
+                    part("t5xxl_fp16.safetensors", "text-encoder", "32"),
+                ),
+                (
+                    "clip_l.safetensors".to_owned(),
+                    part("clip_l.safetensors", "text-encoder", "33"),
+                ),
+                (
+                    "wan.vae.safetensors".to_owned(),
+                    part("wan.vae.safetensors", "vae", "34"),
+                ),
+                (
+                    "style.safetensors".to_owned(),
+                    part("style.safetensors", "lora", "35"),
+                ),
+                (
+                    "control.safetensors".to_owned(),
+                    part("control.safetensors", "controlnet", "36"),
+                ),
+                (
+                    "stable-audio.safetensors".to_owned(),
+                    part("stable-audio.safetensors", "audio-model", "37"),
+                ),
+            ]),
+            max_width: 1_024,
+            max_height: 1_024,
+            max_frames: 128,
+            max_duration_seconds: 30,
+            max_steps: 64,
+            max_artifacts: 2,
+            ..ComfyWorkflowDerivationPolicy::default()
+        }
+    }
+
+    fn av_graph() -> Value {
+        json!({
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan.safetensors"}},
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name1": "t5xxl_fp16.safetensors", "clip_name2": "clip_l.safetensors"}},
+            "3": {"class_type": "VAELoader", "inputs": {"vae_name": "wan.vae.safetensors"}},
+            "4": {"class_type": "LoraLoader", "inputs": {"lora_name": "style.safetensors", "model": ["1", 0], "clip": ["2", 0]}},
+            "5": {"class_type": "ControlNetLoader", "inputs": {"control_net_name": "control.safetensors"}},
+            "6": {"class_type": "AudioModelLoader", "inputs": {"audio_model_name": "stable-audio.safetensors"}},
+            "7": {"class_type": "KSamplerAdvanced", "inputs": {"steps": 32, "model": ["4", 0], "positive": ["2", 0], "negative": ["2", 1]}},
+            "8": {"class_type": "VHS_VideoCombine", "inputs": {"images": ["7", 0], "width": 768, "height": 512, "frame_rate": 24, "length": 96}},
+            "9": {"class_type": "SaveAudio", "inputs": {"audio": ["6", 0], "duration_seconds": 12}}
+        })
+    }
+
     #[test]
     fn derives_stable_hash_parts_nodes_and_usage() {
         let derivation = derive_comfy_workflow(&image_graph(), &policy()).unwrap();
@@ -668,6 +766,141 @@ mod tests {
         assert_eq!(
             err,
             ComfyWorkflowDerivationError::NonWhitelistedNode("ShellExec".to_owned())
+        );
+    }
+
+    #[test]
+    fn derives_realistic_av_graph_parts_modalities_and_usage() {
+        let derivation = derive_comfy_workflow(&av_graph(), &av_policy()).unwrap();
+        let names = derivation
+            .parts_required
+            .iter()
+            .map(|part| part.name.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                "clip_l.safetensors",
+                "control.safetensors",
+                "stable-audio.safetensors",
+                "style.safetensors",
+                "t5xxl_fp16.safetensors",
+                "wan.safetensors",
+                "wan.vae.safetensors"
+            ])
+        );
+        assert_eq!(
+            derivation.outcome_spec.output_modalities,
+            vec!["audio".to_owned(), "video".to_owned()]
+        );
+        assert_eq!(derivation.outcome_spec.width, Some(768));
+        assert_eq!(derivation.outcome_spec.height, Some(512));
+        assert_eq!(derivation.outcome_spec.frames, Some(96));
+        assert_eq!(derivation.outcome_spec.duration_seconds, Some(12));
+        assert_eq!(derivation.outcome_spec.steps, Some(32));
+        assert_eq!(derivation.quoted_usage.get(USAGE_AUDIO_SECOND), 12);
+        assert_eq!(derivation.quoted_usage.get(USAGE_VIDEO_SECOND), 12);
+        assert_eq!(derivation.quoted_usage.get(USAGE_FRAME), 96);
+        assert_eq!(derivation.quoted_usage.get(USAGE_STEP), 32);
+    }
+
+    #[test]
+    fn refuses_malformed_graph_records_and_empty_policy() {
+        let cases = [
+            (
+                json!([]),
+                policy(),
+                ComfyWorkflowDerivationError::InvalidGraph(
+                    "graph must be a JSON object".to_owned(),
+                ),
+            ),
+            (
+                json!({}),
+                policy(),
+                ComfyWorkflowDerivationError::InvalidGraph(
+                    "graph must contain at least one node".to_owned(),
+                ),
+            ),
+            (
+                json!({"1": null}),
+                policy(),
+                ComfyWorkflowDerivationError::InvalidGraph("node 1 must be an object".to_owned()),
+            ),
+            (
+                json!({"1": {"inputs": {}}}),
+                policy(),
+                ComfyWorkflowDerivationError::InvalidGraph(
+                    "node 1 is missing class_type".to_owned(),
+                ),
+            ),
+            (
+                json!({"1": {"class_type": " ", "inputs": {}}}),
+                policy(),
+                ComfyWorkflowDerivationError::InvalidGraph(
+                    "node 1 is missing class_type".to_owned(),
+                ),
+            ),
+            (
+                image_graph(),
+                ComfyWorkflowDerivationPolicy::default(),
+                ComfyWorkflowDerivationError::InvalidGraph("node whitelist is empty".to_owned()),
+            ),
+        ];
+        for (graph, policy, expected) in cases {
+            assert_eq!(derive_comfy_workflow(&graph, &policy), Err(expected));
+        }
+    }
+
+    #[test]
+    fn refuses_overlong_loader_part_name() {
+        let mut graph = image_graph();
+        graph["4"]["inputs"]["ckpt_name"] =
+            json!("x".repeat(MAX_COMFY_WORKFLOW_PART_NAME_BYTES + 1));
+        let err = derive_comfy_workflow(&graph, &policy()).unwrap_err();
+        assert_eq!(
+            err,
+            ComfyWorkflowDerivationError::InvalidGraph(format!(
+                "part name for key ckpt_name exceeds {MAX_COMFY_WORKFLOW_PART_NAME_BYTES} bytes"
+            ))
+        );
+    }
+
+    #[test]
+    fn refuses_av_outcome_caps() {
+        let mut too_many_frames = av_graph();
+        too_many_frames["8"]["inputs"]["length"] = json!(129);
+        assert_eq!(
+            derive_comfy_workflow(&too_many_frames, &av_policy()),
+            Err(ComfyWorkflowDerivationError::OutcomeOverflow(
+                "frames exceeds 128".to_owned()
+            ))
+        );
+
+        let mut too_long = av_graph();
+        too_long["9"]["inputs"]["duration_seconds"] = json!(31);
+        assert_eq!(
+            derive_comfy_workflow(&too_long, &av_policy()),
+            Err(ComfyWorkflowDerivationError::OutcomeOverflow(
+                "duration_seconds exceeds 30".to_owned()
+            ))
+        );
+
+        let mut too_many_steps = av_graph();
+        too_many_steps["7"]["inputs"]["steps"] = json!(65);
+        assert_eq!(
+            derive_comfy_workflow(&too_many_steps, &av_policy()),
+            Err(ComfyWorkflowDerivationError::OutcomeOverflow(
+                "steps exceeds 64".to_owned()
+            ))
+        );
+
+        let mut too_many_outputs = image_graph();
+        too_many_outputs["5"]["inputs"]["batch_size"] = json!(5);
+        assert_eq!(
+            derive_comfy_workflow(&too_many_outputs, &policy()),
+            Err(ComfyWorkflowDerivationError::OutcomeOverflow(
+                "artifact_count exceeds 4".to_owned()
+            ))
         );
     }
 
