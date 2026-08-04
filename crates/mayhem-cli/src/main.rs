@@ -775,6 +775,8 @@ enum AdminPriceCommands {
 enum AdminPartsCommands {
     /// Parse Comfy inventory YAML and report importable pinned part drafts.
     ValidateYaml(AdminPartsValidateYamlArgs),
+    /// Finalize one Comfy part draft into a verified record JSON.
+    Onboard(AdminPartsOnboardArgs),
     /// Build a machine-pullable Comfy parts index from finalized part records.
     BuildIndex(AdminPartsBuildIndexArgs),
     /// Verify a built parts-index layout and print Hugging Face upload commands.
@@ -4169,6 +4171,73 @@ struct AdminPartsValidateYamlArgs {
     /// Fail if any YAML row is not directly importable as a single pinned part draft.
     #[arg(long)]
     strict: bool,
+}
+
+#[derive(Debug, Parser)]
+struct AdminPartsOnboardArgs {
+    /// YAML/JSON object or top-level sequence containing the part draft row.
+    #[arg(long = "input", value_name = "PATH")]
+    input: PathBuf,
+
+    /// One-based row index when --input is a top-level sequence.
+    #[arg(long = "row-index", default_value_t = 1)]
+    row_index: usize,
+
+    /// Downloaded payload file to hash and seal into the finalized record.
+    #[arg(long, value_name = "PATH")]
+    payload: PathBuf,
+
+    /// Output finalized Comfy part record JSON.
+    #[arg(long, value_name = "PATH")]
+    output: PathBuf,
+
+    /// Blessed Comfy runtime id required for this part.
+    #[arg(long = "min-runtime")]
+    min_runtime: String,
+
+    /// License/evidence document to hash with SHA-256.
+    #[arg(long = "license-doc", value_name = "PATH")]
+    license_doc: Option<PathBuf>,
+
+    /// Precomputed SHA-256 of the license/evidence document.
+    #[arg(long = "license-doc-hash")]
+    license_doc_hash: Option<String>,
+
+    /// Immutable reference to the archived license/evidence material.
+    #[arg(long = "license-ref")]
+    license_ref: String,
+
+    /// Capture timestamp for the license/evidence material.
+    #[arg(long = "license-captured-at")]
+    license_captured_at: String,
+
+    /// Hash of the canary probe graph for this part.
+    #[arg(long = "canary-graph-hash")]
+    canary_graph_hash: String,
+
+    /// Reference to the canary output artifact.
+    #[arg(long = "canary-output-ref")]
+    canary_output_ref: String,
+
+    /// Canary tolerance method.
+    #[arg(long = "canary-tolerance-method", default_value = "phash")]
+    canary_tolerance_method: String,
+
+    /// Canary tolerance ceiling in basis points.
+    #[arg(long = "canary-max-distance-bps", default_value_t = 10)]
+    canary_max_distance_bps: u32,
+
+    /// BLAKE3 Merkle chunk size for the payload.
+    #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
+    chunk_size: usize,
+
+    /// Overwrite an existing different output record.
+    #[arg(long)]
+    force: bool,
+
+    /// Print machine-readable output.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -24814,6 +24883,32 @@ struct AdminPartsBuildIndexRecordSummary {
 }
 
 #[derive(Debug, Serialize)]
+struct AdminPartsOnboardReport {
+    ok: bool,
+    input: String,
+    row_index: u64,
+    payload: String,
+    output: String,
+    output_reused_existing: bool,
+    part_id: String,
+    record_hash: String,
+    sha256: String,
+    blake3_root: String,
+    size_bytes: u64,
+    min_runtime: String,
+    license_doc_hash: String,
+    canary: AdminPartsOnboardCanaryReport,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminPartsOnboardCanaryReport {
+    probe_graph_hash: String,
+    reference_output_ref: String,
+    tolerance_method: String,
+    max_distance_bps: u32,
+}
+
+#[derive(Debug, Serialize)]
 struct AdminPartsUploadPlanReport {
     ok: bool,
     layout_dir: String,
@@ -24843,6 +24938,7 @@ struct VerifiedComfyPartsLayout {
 async fn admin_parts(command: &AdminPartsCommands) -> Result<()> {
     match command {
         AdminPartsCommands::ValidateYaml(args) => admin_parts_validate_yaml(args),
+        AdminPartsCommands::Onboard(args) => admin_parts_onboard(args),
         AdminPartsCommands::BuildIndex(args) => admin_parts_build_index(args),
         AdminPartsCommands::UploadPlan(args) => admin_parts_upload_plan(args),
     }
@@ -24940,6 +25036,238 @@ fn read_comfy_part_yaml_rows(path: &Path) -> Result<Vec<Value>> {
         .as_array()
         .cloned()
         .with_context(|| format!("{} must be a top-level YAML sequence", path.display()))
+}
+
+fn admin_parts_onboard(args: &AdminPartsOnboardArgs) -> Result<()> {
+    let input = absolutize(args.input.clone())?;
+    let payload = absolutize(args.payload.clone())?;
+    let output = absolutize(args.output.clone())?;
+    let license_doc = args.license_doc.clone().map(absolutize).transpose()?;
+    let report = admin_parts_onboard_report(AdminPartsOnboardInput {
+        input,
+        row_index: args.row_index,
+        payload,
+        output,
+        min_runtime: args.min_runtime.clone(),
+        license_doc,
+        license_doc_hash: args.license_doc_hash.clone(),
+        license_ref: args.license_ref.clone(),
+        license_captured_at: args.license_captured_at.clone(),
+        canary_graph_hash: args.canary_graph_hash.clone(),
+        canary_output_ref: args.canary_output_ref.clone(),
+        canary_tolerance_method: args.canary_tolerance_method.clone(),
+        canary_max_distance_bps: args.canary_max_distance_bps,
+        chunk_size: args.chunk_size,
+        force: args.force,
+    })?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Comfy part record finalized.");
+        println!("Part: {}", report.part_id);
+        println!("Record hash: {}", report.record_hash);
+        println!("Payload SHA-256: {}", report.sha256);
+        println!("Payload BLAKE3 root: {}", report.blake3_root);
+        println!("Output: {}", report.output);
+        if report.output_reused_existing {
+            println!("Existing identical output was reused.");
+        }
+    }
+    Ok(())
+}
+
+struct AdminPartsOnboardInput {
+    input: PathBuf,
+    row_index: usize,
+    payload: PathBuf,
+    output: PathBuf,
+    min_runtime: String,
+    license_doc: Option<PathBuf>,
+    license_doc_hash: Option<String>,
+    license_ref: String,
+    license_captured_at: String,
+    canary_graph_hash: String,
+    canary_output_ref: String,
+    canary_tolerance_method: String,
+    canary_max_distance_bps: u32,
+    chunk_size: usize,
+    force: bool,
+}
+
+fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPartsOnboardReport> {
+    ensure!(input.row_index > 0, "--row-index is one-based");
+    ensure!(input.chunk_size > 0, "--chunk-size must be positive");
+    ensure!(
+        !input.min_runtime.trim().is_empty(),
+        "--min-runtime must be non-empty"
+    );
+    ensure!(
+        !input.license_ref.trim().is_empty(),
+        "--license-ref must be non-empty"
+    );
+    ensure!(
+        !input.license_captured_at.trim().is_empty(),
+        "--license-captured-at must be non-empty"
+    );
+    ensure!(
+        !input.canary_output_ref.trim().is_empty(),
+        "--canary-output-ref must be non-empty"
+    );
+    ensure!(
+        !input.canary_tolerance_method.trim().is_empty(),
+        "--canary-tolerance-method must be non-empty"
+    );
+
+    let (draft, row_index) = read_comfy_part_draft_input(&input.input, input.row_index)?;
+    let payload_metadata = fs::metadata(&input.payload)
+        .with_context(|| format!("inspecting payload {}", input.payload.display()))?;
+    ensure!(
+        payload_metadata.is_file(),
+        "--payload must be a regular file: {}",
+        input.payload.display()
+    );
+    ensure!(
+        payload_metadata.len() == draft.size_bytes,
+        "payload size mismatch for {}: draft expects {}, payload has {} bytes",
+        draft.name,
+        draft.size_bytes,
+        payload_metadata.len()
+    );
+    let sha256 = file_sha256_hex(&input.payload)?;
+    ensure!(
+        sha256.eq_ignore_ascii_case(&draft.sha256),
+        "payload SHA-256 mismatch for {}: draft expects {}, payload hashes to {}",
+        draft.name,
+        draft.sha256,
+        sha256
+    );
+    let merkle = build_merkle_manifest(&input.payload, input.chunk_size)?;
+    let license_doc_hash = comfy_part_license_doc_hash(
+        input.license_doc.as_deref(),
+        input.license_doc_hash.as_deref(),
+    )?;
+    let canary_graph_hash = input.canary_graph_hash.to_ascii_lowercase();
+    ensure!(
+        is_hex_len(&canary_graph_hash, 64),
+        "--canary-graph-hash must be 32-byte hex"
+    );
+    let record = draft.finalize(
+        merkle.root.clone(),
+        input.min_runtime.clone(),
+        mayhem_proto::ComfyPartLicenseEvidence {
+            doc_hash: license_doc_hash.clone(),
+            archived_ref: input.license_ref.clone(),
+            captured_at: input.license_captured_at.clone(),
+        },
+        mayhem_proto::ComfyPartCanary {
+            probe_graph_hash: canary_graph_hash.clone(),
+            reference_output_ref: input.canary_output_ref.clone(),
+            tolerance: mayhem_proto::ComfyPartCanaryTolerance {
+                method: input.canary_tolerance_method.clone(),
+                max_distance_bps: input.canary_max_distance_bps,
+            },
+        },
+    )?;
+    let record_hash = mayhem_proto::comfy_part_record_hash(&record)?;
+    let output_reused_existing =
+        write_comfy_part_record_idempotent(&input.output, &record, input.force)?;
+
+    Ok(AdminPartsOnboardReport {
+        ok: true,
+        input: input.input.display().to_string(),
+        row_index: row_index as u64,
+        payload: input.payload.display().to_string(),
+        output: input.output.display().to_string(),
+        output_reused_existing,
+        part_id: record.part_id,
+        record_hash,
+        sha256,
+        blake3_root: merkle.root,
+        size_bytes: payload_metadata.len(),
+        min_runtime: input.min_runtime,
+        license_doc_hash,
+        canary: AdminPartsOnboardCanaryReport {
+            probe_graph_hash: canary_graph_hash,
+            reference_output_ref: input.canary_output_ref,
+            tolerance_method: input.canary_tolerance_method,
+            max_distance_bps: input.canary_max_distance_bps,
+        },
+    })
+}
+
+fn read_comfy_part_draft_input(
+    path: &Path,
+    row_index: usize,
+) -> Result<(mayhem_proto::ComfyPartDraft, usize)> {
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let value = serde_json::from_str::<Value>(&text)
+        .or_else(|_| yaml_serde::from_str::<Value>(&text))
+        .with_context(|| format!("parsing Comfy part draft input {}", path.display()))?;
+    let (row, resolved_index) = if let Some(rows) = value.as_array() {
+        let row = rows
+            .get(row_index - 1)
+            .with_context(|| format!("{} has no row {}", path.display(), row_index))?;
+        (row.clone(), row_index)
+    } else {
+        ensure!(
+            row_index == 1,
+            "--row-index can only be greater than 1 for top-level sequences"
+        );
+        (value, 1)
+    };
+    if let Some(reason) = comfy_part_yaml_skip_reason(&row) {
+        bail!(
+            "{} row {} is not directly onboardable: {}",
+            path.display(),
+            resolved_index,
+            reason
+        );
+    }
+    let draft = mayhem_proto::ComfyPartDraft::from_yaml_value(&row)
+        .with_context(|| format!("importing {} row {}", path.display(), resolved_index))?;
+    Ok((draft, resolved_index))
+}
+
+fn comfy_part_license_doc_hash(
+    license_doc: Option<&Path>,
+    license_doc_hash: Option<&str>,
+) -> Result<String> {
+    match (license_doc, license_doc_hash) {
+        (Some(_), Some(_)) => {
+            bail!("pass only one of --license-doc or --license-doc-hash");
+        }
+        (Some(path), None) => file_sha256_hex(path),
+        (None, Some(hash)) => {
+            let normalized = hash.to_ascii_lowercase();
+            ensure!(
+                is_hex_len(&normalized, 64),
+                "--license-doc-hash must be 32-byte hex"
+            );
+            Ok(normalized)
+        }
+        (None, None) => bail!("pass --license-doc or --license-doc-hash"),
+    }
+}
+
+fn write_comfy_part_record_idempotent(
+    output: &Path,
+    record: &mayhem_proto::ComfyPartRecord,
+    force: bool,
+) -> Result<bool> {
+    if output.exists() && !force {
+        let existing: mayhem_proto::ComfyPartRecord =
+            serde_json::from_value(read_json_file(output)?)
+                .with_context(|| format!("parsing existing output {}", output.display()))?;
+        if existing == *record {
+            return Ok(true);
+        }
+        bail!(
+            "{} already exists with different Comfy part record content; pass --force to overwrite",
+            output.display()
+        );
+    }
+    write_json_file(output, record)?;
+    Ok(false)
 }
 
 fn admin_parts_build_index(args: &AdminPartsBuildIndexArgs) -> Result<()> {
@@ -86903,6 +87231,64 @@ mod tests {
     }
 
     #[test]
+    fn admin_parts_onboard_cli_parses_without_tx_flags() {
+        let parsed = Cli::try_parse_from([
+            "mayhem",
+            "admin",
+            "parts",
+            "onboard",
+            "--input",
+            "row.yaml",
+            "--row-index",
+            "2",
+            "--payload",
+            "payload.bin",
+            "--output",
+            "record.json",
+            "--min-runtime",
+            "comfyui-v0.30.1",
+            "--license-doc-hash",
+            &"11".repeat(32),
+            "--license-ref",
+            "license:test",
+            "--license-captured-at",
+            "2026-08-04T00:00:00Z",
+            "--canary-graph-hash",
+            &"22".repeat(32),
+            "--canary-output-ref",
+            "canaries/test.png",
+            "--canary-tolerance-method",
+            "phash",
+            "--canary-max-distance-bps",
+            "12",
+            "--chunk-size",
+            "8",
+            "--force",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Admin { command } = parsed.command else {
+            panic!("expected admin command");
+        };
+        let AdminCommands::Parts { command } = *command else {
+            panic!("expected admin parts command");
+        };
+        let AdminPartsCommands::Onboard(args) = command else {
+            panic!("expected admin parts onboard command");
+        };
+        assert_eq!(args.input, PathBuf::from("row.yaml"));
+        assert_eq!(args.row_index, 2);
+        assert_eq!(args.payload, PathBuf::from("payload.bin"));
+        assert_eq!(args.output, PathBuf::from("record.json"));
+        assert_eq!(args.min_runtime, "comfyui-v0.30.1");
+        assert_eq!(args.license_doc_hash, Some("11".repeat(32)));
+        assert_eq!(args.canary_max_distance_bps, 12);
+        assert_eq!(args.chunk_size, 8);
+        assert!(args.force);
+        assert!(args.json);
+    }
+
+    #[test]
     fn admin_parts_build_index_cli_parses_without_tx_flags() {
         let parsed = Cli::try_parse_from([
             "mayhem",
@@ -87003,6 +87389,205 @@ mod tests {
         assert!(comfy_part_yaml_skip_reason(&rows[1])
             .unwrap()
             .contains("missing sha256"));
+    }
+
+    #[test]
+    fn admin_parts_onboard_finalizes_payload_and_is_idempotent() {
+        let temp = test_temp_dir("mayhem-admin-parts-onboard");
+        fs::create_dir_all(&temp).unwrap();
+        let payload_path = temp.join("payload.bin");
+        fs::write(&payload_path, b"openmayhem onboard payload").unwrap();
+        let license_path = temp.join("license.txt");
+        fs::write(&license_path, b"license evidence").unwrap();
+        let sha256 = file_sha256_hex(&payload_path).unwrap();
+        let size_bytes = fs::metadata(&payload_path).unwrap().len();
+        let input_path = temp.join("parts.yaml");
+        fs::write(
+            &input_path,
+            format!(
+                r#"
+- name: "not this row"
+  status: linked
+- name: "4x onboard"
+  type: upscaler
+  lane: all
+  license: MIT
+  file_format: bin
+  sha256: "{sha256}"
+  size_bytes: {size_bytes}
+  download_url: "https://huggingface.co/TracNetwork/openmayhem-parts/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/payload.bin"
+  status: linked
+"#
+            ),
+        )
+        .unwrap();
+        let output_path = temp.join("record.json");
+
+        let report = admin_parts_onboard_report(AdminPartsOnboardInput {
+            input: input_path.clone(),
+            row_index: 2,
+            payload: payload_path.clone(),
+            output: output_path.clone(),
+            min_runtime: "comfyui-v0.30.1".to_owned(),
+            license_doc: Some(license_path.clone()),
+            license_doc_hash: None,
+            license_ref: "license:test".to_owned(),
+            license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
+            canary_graph_hash: "44".repeat(32),
+            canary_output_ref: "canaries/test.png".to_owned(),
+            canary_tolerance_method: "phash".to_owned(),
+            canary_max_distance_bps: 10,
+            chunk_size: 8,
+            force: false,
+        })
+        .unwrap();
+
+        assert!(report.ok);
+        assert!(!report.output_reused_existing);
+        assert_eq!(report.row_index, 2);
+        assert_eq!(report.sha256, sha256);
+        assert_eq!(report.size_bytes, size_bytes);
+        assert_eq!(
+            report.license_doc_hash,
+            file_sha256_hex(&license_path).unwrap()
+        );
+        let record: mayhem_proto::ComfyPartRecord =
+            serde_json::from_value(read_json_file(&output_path).unwrap()).unwrap();
+        assert_eq!(record.name, "4x onboard");
+        assert_eq!(record.blake3_root, report.blake3_root);
+        assert_eq!(record.canary.probe_graph_hash, "44".repeat(32));
+        assert_eq!(
+            mayhem_proto::comfy_part_record_hash(&record).unwrap(),
+            report.record_hash
+        );
+
+        let idempotent = admin_parts_onboard_report(AdminPartsOnboardInput {
+            input: input_path,
+            row_index: 2,
+            payload: payload_path,
+            output: output_path,
+            min_runtime: "comfyui-v0.30.1".to_owned(),
+            license_doc: Some(license_path),
+            license_doc_hash: None,
+            license_ref: "license:test".to_owned(),
+            license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
+            canary_graph_hash: "44".repeat(32),
+            canary_output_ref: "canaries/test.png".to_owned(),
+            canary_tolerance_method: "phash".to_owned(),
+            canary_max_distance_bps: 10,
+            chunk_size: 8,
+            force: false,
+        })
+        .unwrap();
+        assert!(idempotent.output_reused_existing);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn admin_parts_onboard_rejects_payload_hash_mismatch() {
+        let temp = test_temp_dir("mayhem-admin-parts-onboard-mismatch");
+        fs::create_dir_all(&temp).unwrap();
+        let payload_path = temp.join("payload.bin");
+        fs::write(&payload_path, b"actual payload").unwrap();
+        let size_bytes = fs::metadata(&payload_path).unwrap().len();
+        let input_path = temp.join("part.yaml");
+        fs::write(
+            &input_path,
+            format!(
+                r#"
+name: "bad payload"
+type: upscaler
+lane: all
+license: MIT
+file_format: bin
+sha256: "{}"
+size_bytes: {size_bytes}
+download_url: "https://huggingface.co/TracNetwork/openmayhem-parts/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/payload.bin"
+status: linked
+"#,
+                "55".repeat(32)
+            ),
+        )
+        .unwrap();
+
+        let err = admin_parts_onboard_report(AdminPartsOnboardInput {
+            input: input_path,
+            row_index: 1,
+            payload: payload_path,
+            output: temp.join("record.json"),
+            min_runtime: "comfyui-v0.30.1".to_owned(),
+            license_doc: None,
+            license_doc_hash: Some("33".repeat(32)),
+            license_ref: "license:test".to_owned(),
+            license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
+            canary_graph_hash: "44".repeat(32),
+            canary_output_ref: "canaries/test.png".to_owned(),
+            canary_tolerance_method: "phash".to_owned(),
+            canary_max_distance_bps: 10,
+            chunk_size: 8,
+            force: false,
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("payload SHA-256 mismatch"),
+            "{err:#}"
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn admin_parts_onboard_handles_non_upscaler_part_type() {
+        let temp = test_temp_dir("mayhem-admin-parts-onboard-controlnet");
+        fs::create_dir_all(&temp).unwrap();
+        let payload_path = temp.join("controlnet.safetensors");
+        fs::write(&payload_path, b"controlnet payload").unwrap();
+        let sha256 = file_sha256_hex(&payload_path).unwrap();
+        let size_bytes = fs::metadata(&payload_path).unwrap().len();
+        let input_path = temp.join("controlnet.yaml");
+        fs::write(
+            &input_path,
+            format!(
+                r#"
+name: "ControlNet onboard"
+type: controlnet
+lane: image
+license: Apache-2.0
+file_format: safetensors
+sha256: "{sha256}"
+size_bytes: {size_bytes}
+download_url: "https://huggingface.co/TracNetwork/openmayhem-parts/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/controlnet.safetensors"
+status: linked
+"#
+            ),
+        )
+        .unwrap();
+
+        let report = admin_parts_onboard_report(AdminPartsOnboardInput {
+            input: input_path,
+            row_index: 1,
+            payload: payload_path,
+            output: temp.join("record.json"),
+            min_runtime: "comfyui-v0.30.1".to_owned(),
+            license_doc: None,
+            license_doc_hash: Some("33".repeat(32)),
+            license_ref: "license:controlnet-test".to_owned(),
+            license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
+            canary_graph_hash: "44".repeat(32),
+            canary_output_ref: "canaries/controlnet.png".to_owned(),
+            canary_tolerance_method: "phash".to_owned(),
+            canary_max_distance_bps: 10,
+            chunk_size: 8,
+            force: false,
+        })
+        .unwrap();
+
+        let record: mayhem_proto::ComfyPartRecord =
+            serde_json::from_value(read_json_file(&temp.join("record.json")).unwrap()).unwrap();
+        assert_eq!(record.part_type, "controlnet");
+        assert_eq!(record.lane, "image");
+        assert_eq!(record.part_id, report.part_id);
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
