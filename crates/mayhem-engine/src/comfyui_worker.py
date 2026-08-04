@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 
 MAX_RESPONSE_ARTIFACT_BYTES = 128 * 1024 * 1024
+MAX_PROGRESS_EVENTS = 4096
 POLL_SECONDS = 0.05
 
 loop = asyncio.new_event_loop()
@@ -87,6 +88,61 @@ def collect_artifacts(prompt_id, history):
                     "data_base64": base64.b64encode(data).decode("ascii"),
                 })
     return artifacts
+
+
+def append_progress(progress, event):
+    if len(progress) < MAX_PROGRESS_EVENTS:
+        progress.append(event)
+    elif len(progress) == MAX_PROGRESS_EVENTS:
+        progress.append({"kind": "truncated", "node": None, "value": {"limit": MAX_PROGRESS_EVENTS}})
+
+
+def progress_node(data):
+    if not isinstance(data, dict):
+        return None
+    node = data.get("node") or data.get("node_id")
+    if node is None:
+        return None
+    return str(node)
+
+
+def progress_value(data):
+    try:
+        json.dumps(data, separators=(",", ":"))
+        return data
+    except TypeError:
+        return {"non_json": True}
+
+
+def progress_matches_prompt(data, prompt_id):
+    if not isinstance(data, dict):
+        return False
+    if data.get("prompt_id") == prompt_id:
+        return True
+    for value in data.values():
+        if isinstance(value, dict) and value.get("prompt_id") == prompt_id:
+            return True
+    return False
+
+
+@contextlib.contextmanager
+def capture_prompt_server_progress(prompt_id, progress):
+    original_send_sync = prompt_server.send_sync
+
+    def send_sync_with_capture(event, data, sid=None):
+        if isinstance(event, str) and progress_matches_prompt(data, prompt_id):
+            append_progress(progress, {
+                "kind": event,
+                "node": progress_node(data),
+                "value": progress_value(data),
+            })
+        return original_send_sync(event, data, sid)
+
+    prompt_server.send_sync = send_sync_with_capture
+    try:
+        yield
+    finally:
+        prompt_server.send_sync = original_send_sync
 
 
 def load(payload):
@@ -178,7 +234,7 @@ async def run_workflow(payload):
         if prompt_id in history_map:
             history = history_map[prompt_id]
             break
-        progress.append({"kind": "poll", "node": None, "value": {"prompt_id": prompt_id}})
+        append_progress(progress, {"kind": "poll", "node": None, "value": {"prompt_id": prompt_id}})
     if history is None:
         raise TimeoutError("ComfyUI workflow did not complete before timeout")
     status = history.get("status", {})
@@ -214,17 +270,18 @@ async def run_workflow_internal(payload):
     for sensitive_val in execution.SENSITIVE_EXTRA_DATA_KEYS:
         if sensitive_val in extra_data:
             sensitive[sensitive_val] = extra_data.pop(sensitive_val)
-    prompt_server.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive))
     deadline = loop.time() + timeout_ms / 1000.0
     progress = []
     history = None
-    while loop.time() < deadline:
-        await asyncio.sleep(POLL_SECONDS)
-        history_map = prompt_server.prompt_queue.get_history(prompt_id=prompt_id)
-        if prompt_id in history_map:
-            history = history_map[prompt_id]
-            break
-        progress.append({"kind": "poll", "node": None, "value": {"prompt_id": prompt_id}})
+    with capture_prompt_server_progress(prompt_id, progress):
+        prompt_server.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive))
+        while loop.time() < deadline:
+            await asyncio.sleep(POLL_SECONDS)
+            history_map = prompt_server.prompt_queue.get_history(prompt_id=prompt_id)
+            if prompt_id in history_map:
+                history = history_map[prompt_id]
+                break
+            append_progress(progress, {"kind": "poll", "node": None, "value": {"prompt_id": prompt_id}})
     if history is None:
         raise TimeoutError("ComfyUI workflow did not complete before timeout")
     status = history.get("status", {})

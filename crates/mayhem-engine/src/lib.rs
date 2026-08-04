@@ -9940,10 +9940,19 @@ mod tests {
             }
         });
 
-        let first = run_real_comfy_workflow_collect(&mut backend, workflow.clone()).0;
+        let (first, first_output) = run_real_comfy_workflow_collect(&mut backend, workflow.clone());
         let second = run_real_comfy_workflow_collect(&mut backend, workflow).0;
         assert_eq!(png_dimensions(&first), Some((64, 64)));
         assert_eq!(png_dimensions(&second), Some((64, 64)));
+        assert!(
+            first_output
+                .progress_events
+                .iter()
+                .any(|event| event.kind == "execution_start"
+                    || event.kind == "executing"
+                    || event.kind == "progress_state"),
+            "ComfyUI upscale proof must capture runtime progress events"
+        );
         assert_eq!(
             Sha256::digest(&first)[..],
             Sha256::digest(&second)[..],
