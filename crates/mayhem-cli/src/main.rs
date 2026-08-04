@@ -25677,6 +25677,35 @@ fn admin_comfy_part_download_source(
     source_token_file: Option<&Path>,
     disk_reserve: Option<&str>,
 ) -> Result<()> {
+    let source = source.clone();
+    let destination = destination.to_path_buf();
+    let draft = draft.clone();
+    let source_token_file = source_token_file.map(Path::to_path_buf);
+    let disk_reserve = disk_reserve.map(str::to_owned);
+    let handle = std::thread::Builder::new()
+        .name("mayhem-comfy-admin-download".to_owned())
+        .spawn(move || {
+            admin_comfy_part_download_source_blocking(
+                &source,
+                require_auth,
+                &destination,
+                &draft,
+                source_token_file.as_deref(),
+                disk_reserve.as_deref(),
+            )
+        })
+        .context("spawning Comfy admin part download worker")?;
+    join_comfy_download_worker(handle, "Comfy admin part download")
+}
+
+fn admin_comfy_part_download_source_blocking(
+    source: &mayhem_proto::ComfyPartSource,
+    require_auth: bool,
+    destination: &Path,
+    draft: &mayhem_proto::ComfyPartDraft,
+    source_token_file: Option<&Path>,
+    disk_reserve: Option<&str>,
+) -> Result<()> {
     let parsed = reqwest::Url::parse(&source.url)
         .with_context(|| format!("parsing Comfy part source URL {}", source.url))?;
     ensure!(
@@ -26752,6 +26781,37 @@ fn provider_comfy_part_download_source(
     hf_token_file: Option<&Path>,
     disk_reserve: Option<&str>,
 ) -> Result<()> {
+    let source = source.clone();
+    let cache_path = cache_path.to_path_buf();
+    let record = record.clone();
+    let hf_token_file = hf_token_file.map(Path::to_path_buf);
+    let disk_reserve = disk_reserve.map(str::to_owned);
+    let handle = std::thread::Builder::new()
+        .name("mayhem-comfy-provider-download".to_owned())
+        .spawn(move || {
+            provider_comfy_part_download_source_blocking(
+                &source,
+                require_auth,
+                &cache_path,
+                &record,
+                chunk_size,
+                hf_token_file.as_deref(),
+                disk_reserve.as_deref(),
+            )
+        })
+        .context("spawning Comfy provider part download worker")?;
+    join_comfy_download_worker(handle, "Comfy provider part download")
+}
+
+fn provider_comfy_part_download_source_blocking(
+    source: &mayhem_proto::ComfyPartSource,
+    require_auth: bool,
+    cache_path: &Path,
+    record: &mayhem_proto::ComfyPartRecord,
+    chunk_size: usize,
+    hf_token_file: Option<&Path>,
+    disk_reserve: Option<&str>,
+) -> Result<()> {
     let parsed = reqwest::Url::parse(&source.url)
         .with_context(|| format!("parsing Comfy part source URL {}", source.url))?;
     ensure!(
@@ -26887,6 +26947,24 @@ fn provider_comfy_part_download_source(
         )
     })?;
     Ok(())
+}
+
+fn join_comfy_download_worker(
+    handle: std::thread::JoinHandle<Result<()>>,
+    label: &str,
+) -> Result<()> {
+    match handle.join() {
+        Ok(result) => result,
+        Err(panic) => {
+            if let Some(message) = panic.downcast_ref::<&str>() {
+                bail!("{label} worker panicked: {message}");
+            }
+            if let Some(message) = panic.downcast_ref::<String>() {
+                bail!("{label} worker panicked: {message}");
+            }
+            bail!("{label} worker panicked");
+        }
+    }
 }
 
 fn provider_comfy_part_source_token(
@@ -88996,6 +89074,93 @@ status: linked
                 .contains("authenticated Comfy part source kind civitai is not supported"),
             "{err:#}"
         );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn comfy_parts_download_errors_do_not_panic_inside_tokio_runtime() {
+        let temp = test_temp_dir("mayhem-comfy-parts-download-runtime-boundary");
+        fs::create_dir_all(&temp).unwrap();
+        let mut draft = mayhem_proto::ComfyPartDraft {
+            name: "download runtime boundary".to_owned(),
+            part_type: "upscaler".to_owned(),
+            lane: "all".to_owned(),
+            sha256: "00".repeat(32),
+            size_bytes: 1,
+            file_format: "bin".to_owned(),
+            license: "MIT".to_owned(),
+            permissions: Vec::new(),
+            policy_flags: Vec::new(),
+            adapter: BTreeMap::new(),
+            sources: mayhem_proto::ComfyPartSources {
+                mirrors: vec![mayhem_proto::ComfyPartSource {
+                    kind: "huggingface".to_owned(),
+                    url: "https://127.0.0.1:1/missing.bin".to_owned(),
+                    repository: Some("TracNetwork/openmayhem-parts".to_owned()),
+                    path: Some("missing.bin".to_owned()),
+                    revision: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+                }],
+                origins: Vec::new(),
+                require_auth: false,
+            },
+            status: "linked".to_owned(),
+        };
+        let record = draft
+            .clone()
+            .finalize(
+                "11".repeat(32),
+                "comfyui-v0.30.1".to_owned(),
+                mayhem_proto::ComfyPartLicenseEvidence {
+                    doc_hash: "33".repeat(32),
+                    archived_ref: "license-evidence:test".to_owned(),
+                    captured_at: "2026-08-04T00:00:00Z".to_owned(),
+                },
+                mayhem_proto::ComfyPartCanary {
+                    probe_graph_hash: "44".repeat(32),
+                    reference_output_ref: "canaries/test.png".to_owned(),
+                    tolerance: mayhem_proto::ComfyPartCanaryTolerance {
+                        method: "phash".to_owned(),
+                        max_distance_bps: 10,
+                    },
+                },
+            )
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let admin_err = admin_comfy_part_download_source(
+                &draft.sources.mirrors[0],
+                false,
+                &temp.join("admin.bin"),
+                &draft,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{admin_err:#}").contains("downloading Comfy part source"),
+                "{admin_err:#}"
+            );
+
+            draft.sources.mirrors[0].url = "https://127.0.0.1:1/provider.bin".to_owned();
+            let provider_err = provider_comfy_part_download_source(
+                &draft.sources.mirrors[0],
+                false,
+                &temp.join("cache").join("provider.bin"),
+                &record,
+                8,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{provider_err:#}").contains("downloading Comfy part source"),
+                "{provider_err:#}"
+            );
+        });
         let _ = fs::remove_dir_all(temp);
     }
 
