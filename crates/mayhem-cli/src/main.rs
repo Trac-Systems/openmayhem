@@ -516,6 +516,11 @@ enum ProviderCommands {
         #[command(subcommand)]
         command: ProviderLimitsCommands,
     },
+    /// Pull and verify Comfy parts from a published parts-index layout.
+    Parts {
+        #[command(subcommand)]
+        command: ProviderPartsCommands,
+    },
     /// Gracefully stop accepting new sessions while finishing in-flight ones.
     Drain(ProviderDrainArgs),
     /// Show this provider's earnings, holdback, reputation, and claimable balances.
@@ -577,6 +582,12 @@ enum ProviderServeCommands {
     Remove(ProviderServeRemoveArgs),
     /// Replace one supervised worker, leaving durable registration only when changing enclaves.
     Switch(ProviderServeSwitchArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderPartsCommands {
+    /// Verify part records/proofs and install matching local payloads into the provider cache.
+    Pull(ProviderPartsPullArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -5577,6 +5588,45 @@ struct ProviderLimitsSetArgs {
 }
 
 #[derive(Debug, Parser)]
+struct ProviderPartsPullArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Directory containing index.json, anchor.json, records/, and proofs/.
+    #[arg(long = "layout-dir", value_name = "PATH")]
+    layout_dir: PathBuf,
+
+    /// Part id to verify and pull. Repeat, or pass --all.
+    #[arg(long = "part-id", value_name = "HEX")]
+    part_ids: Vec<String>,
+
+    /// Pull every part listed by index.json.
+    #[arg(long)]
+    all: bool,
+
+    /// Directory containing already-downloaded payload files for local install proof.
+    #[arg(long = "payload-dir", value_name = "PATH")]
+    payload_dir: Option<PathBuf>,
+
+    /// Destination cache directory. Defaults to <home>/comfy-parts.
+    #[arg(long = "cache-dir", value_name = "PATH")]
+    cache_dir: Option<PathBuf>,
+
+    /// Fail unless each requested part is installed into the cache.
+    #[arg(long)]
+    require_payload: bool,
+
+    /// Chunk size for BLAKE3 Merkle-root verification.
+    #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
+    chunk_size: usize,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
 struct ProviderDrainArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
@@ -6583,6 +6633,9 @@ async fn provider_command(command: ProviderCommands, verbose: bool) -> Result<()
         ProviderCommands::Limits { command } => match command {
             ProviderLimitsCommands::Get(args) => provider_limits_get(args),
             ProviderLimitsCommands::Set(args) => provider_limits_set(args),
+        },
+        ProviderCommands::Parts { command } => match command {
+            ProviderPartsCommands::Pull(args) => provider_parts_pull(args),
         },
         ProviderCommands::Drain(args) => provider_drain(args).await,
         ProviderCommands::Earnings(args) => provider_earnings(args).await,
@@ -24925,6 +24978,358 @@ fn admin_parts_build_index(args: &AdminPartsBuildIndexArgs) -> Result<()> {
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderPartsPullReport {
+    ok: bool,
+    layout_dir: String,
+    cache_dir: String,
+    index_ver: u32,
+    index_root: String,
+    anchor_hash: String,
+    requested_count: u64,
+    installed_count: u64,
+    parts: Vec<ProviderPartsPullItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderPartsPullItem {
+    part_id: String,
+    record_hash: String,
+    #[serde(rename = "type")]
+    part_type: String,
+    lane: String,
+    status: String,
+    proof_verified: bool,
+    cache_path: String,
+    cache_hit: bool,
+    installed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    install_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    install_error: Option<String>,
+}
+
+fn provider_parts_pull(args: ProviderPartsPullArgs) -> Result<()> {
+    ensure!(
+        args.chunk_size > 0,
+        "--chunk-size must be greater than zero"
+    );
+    ensure!(
+        args.all || !args.part_ids.is_empty(),
+        "pass at least one --part-id or --all"
+    );
+    ensure!(
+        !(args.all && !args.part_ids.is_empty()),
+        "pass either --all or explicit --part-id values, not both"
+    );
+
+    let home = absolutize(args.home.clone().map(Ok).unwrap_or_else(default_home)?)?;
+    let layout_dir = absolutize(args.layout_dir.clone())?;
+    let cache_dir = absolutize(
+        args.cache_dir
+            .clone()
+            .unwrap_or_else(|| home.join("comfy-parts")),
+    )?;
+    let payload_dir = args.payload_dir.clone().map(absolutize).transpose()?;
+    fs::create_dir_all(&cache_dir).with_context(|| format!("creating {}", cache_dir.display()))?;
+
+    let index_path = layout_dir.join("index.json");
+    let anchor_path = layout_dir.join("anchor.json");
+    let index: mayhem_proto::ComfyPartsIndex = serde_json::from_value(read_json_file(&index_path)?)
+        .with_context(|| format!("parsing {}", index_path.display()))?;
+    ensure!(
+        index.schema_version == mayhem_proto::COMFY_PARTS_INDEX_SCHEMA_VERSION,
+        "Comfy parts index schema version mismatch: expected {}, got {}",
+        mayhem_proto::COMFY_PARTS_INDEX_SCHEMA_VERSION,
+        index.schema_version
+    );
+    let anchor: mayhem_proto::ComfyPartsAnchor =
+        serde_json::from_value(read_json_file(&anchor_path)?)
+            .with_context(|| format!("parsing {}", anchor_path.display()))?;
+    anchor
+        .validate()
+        .with_context(|| format!("validating {}", anchor_path.display()))?;
+    ensure!(
+        anchor.parts_index_root == index.root,
+        "Comfy parts anchor root {} does not match index root {}",
+        anchor.parts_index_root,
+        index.root
+    );
+    ensure!(
+        anchor.index_ver == index.index_ver,
+        "Comfy parts anchor index_ver {} does not match index index_ver {}",
+        anchor.index_ver,
+        index.index_ver
+    );
+    let anchor_hash = mayhem_proto::comfy_parts_anchor_hash(&anchor)?;
+    let anchor_hash_path = layout_dir.join("anchor-hash.txt");
+    if anchor_hash_path.exists() {
+        let expected = fs::read_to_string(&anchor_hash_path)
+            .with_context(|| format!("reading {}", anchor_hash_path.display()))?;
+        ensure!(
+            expected.trim() == anchor_hash,
+            "{} does not match anchor.json hash",
+            anchor_hash_path.display()
+        );
+    }
+
+    let mut entries = BTreeMap::new();
+    for entry in &index.parts {
+        ensure!(
+            entries.insert(entry.part_id.clone(), entry).is_none(),
+            "duplicate part_id {} in index.json",
+            entry.part_id
+        );
+    }
+    let requested = if args.all {
+        index
+            .parts
+            .iter()
+            .map(|entry| entry.part_id.clone())
+            .collect::<Vec<_>>()
+    } else {
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        for part_id in args.part_ids {
+            let part_id = part_id.to_ascii_lowercase();
+            ensure!(is_hex_len(&part_id, 64), "--part-id must be 32-byte hex");
+            ensure!(
+                seen.insert(part_id.clone()),
+                "duplicate --part-id {part_id}"
+            );
+            out.push(part_id);
+        }
+        out
+    };
+
+    let mut parts = Vec::new();
+    for part_id in &requested {
+        let entry = entries
+            .get(part_id)
+            .with_context(|| format!("part_id {part_id} is not listed by index.json"))?;
+        let record_path = layout_dir.join("records").join(format!("{part_id}.json"));
+        let proof_path = layout_dir
+            .join("proofs")
+            .join(format!("{part_id}.proof.json"));
+        let record: mayhem_proto::ComfyPartRecord =
+            serde_json::from_value(read_json_file(&record_path)?)
+                .with_context(|| format!("parsing {}", record_path.display()))?;
+        record
+            .validate()
+            .with_context(|| format!("validating {}", record_path.display()))?;
+        ensure!(
+            &record.part_id == part_id,
+            "record {} contains part_id {}, expected {}",
+            record_path.display(),
+            record.part_id,
+            part_id
+        );
+        let record_hash = mayhem_proto::comfy_part_record_hash(&record)?;
+        ensure!(
+            record_hash == entry.record_hash,
+            "record hash mismatch for {part_id}: index has {}, record hashes to {}",
+            entry.record_hash,
+            record_hash
+        );
+        ensure!(
+            record.part_type == entry.part_type
+                && record.lane == entry.lane
+                && record.status == entry.status,
+            "index metadata for {part_id} does not match its record"
+        );
+        let proof: mayhem_proto::ComfyPartMerkleProof =
+            serde_json::from_value(read_json_file(&proof_path)?)
+                .with_context(|| format!("parsing {}", proof_path.display()))?;
+        mayhem_proto::verify_comfy_part_proof(&record, &proof, &index.root)
+            .with_context(|| format!("verifying proof {}", proof_path.display()))?;
+
+        let cache_path = provider_comfy_part_cache_path(&cache_dir, &record);
+        let mut cache_hit =
+            provider_comfy_part_payload_matches(&cache_path, &record, args.chunk_size)?;
+        let mut installed = cache_hit;
+        let mut install_source = None;
+        let mut install_error = None;
+        if !cache_hit {
+            if let Some(payload_dir) = payload_dir.as_deref() {
+                match provider_comfy_part_install_from_payload_dir(
+                    payload_dir,
+                    &cache_path,
+                    &record,
+                    args.chunk_size,
+                ) {
+                    Ok(Some(source)) => {
+                        cache_hit = false;
+                        installed = true;
+                        install_source = Some(source.display().to_string());
+                    }
+                    Ok(None) => {
+                        install_error = Some(format!(
+                            "no matching payload found under {}",
+                            payload_dir.display()
+                        ));
+                    }
+                    Err(error) => {
+                        install_error = Some(error.to_string());
+                    }
+                }
+            }
+        }
+        if args.require_payload && !installed {
+            bail!(
+                "part {part_id} was verified but not installed: {}",
+                install_error
+                    .as_deref()
+                    .unwrap_or("pass --payload-dir with a matching payload")
+            );
+        }
+        parts.push(ProviderPartsPullItem {
+            part_id: part_id.clone(),
+            record_hash,
+            part_type: record.part_type,
+            lane: record.lane,
+            status: record.status,
+            proof_verified: true,
+            cache_path: cache_path.display().to_string(),
+            cache_hit,
+            installed,
+            install_source,
+            install_error,
+        });
+    }
+
+    let installed_count = parts.iter().filter(|part| part.installed).count() as u64;
+    let report = ProviderPartsPullReport {
+        ok: true,
+        layout_dir: layout_dir.display().to_string(),
+        cache_dir: cache_dir.display().to_string(),
+        index_ver: index.index_ver,
+        index_root: index.root,
+        anchor_hash,
+        requested_count: requested.len() as u64,
+        installed_count,
+        parts,
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "Verified {} Comfy part(s); installed {} into {}",
+            report.requested_count, report.installed_count, report.cache_dir
+        );
+        for part in &report.parts {
+            println!(
+                "{} {} {} installed={}",
+                part.part_id, part.part_type, part.status, part.installed
+            );
+        }
+    }
+    Ok(())
+}
+
+fn provider_comfy_part_cache_path(
+    cache_dir: &Path,
+    record: &mayhem_proto::ComfyPartRecord,
+) -> PathBuf {
+    let ext = safe_path_component(&record.file_format);
+    cache_dir.join(&record.part_type).join(format!(
+        "{}-sha-{}.{}",
+        safe_path_component(&record.part_id),
+        safe_path_component(&record.sha256[..16]),
+        ext
+    ))
+}
+
+fn provider_comfy_part_payload_matches(
+    path: &Path,
+    record: &mayhem_proto::ComfyPartRecord,
+    chunk_size: usize,
+) -> Result<bool> {
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(false);
+    };
+    if !metadata.is_file() || metadata.len() != record.size_bytes {
+        return Ok(false);
+    }
+    if !file_sha256_hex(path)?.eq_ignore_ascii_case(&record.sha256) {
+        return Ok(false);
+    }
+    let merkle = build_merkle_manifest(path, chunk_size)?;
+    Ok(merkle.root == record.blake3_root)
+}
+
+fn provider_comfy_part_install_from_payload_dir(
+    payload_dir: &Path,
+    cache_path: &Path,
+    record: &mayhem_proto::ComfyPartRecord,
+    chunk_size: usize,
+) -> Result<Option<PathBuf>> {
+    for candidate in provider_comfy_part_payload_candidates(payload_dir, record) {
+        if !provider_comfy_part_payload_matches(&candidate, record, chunk_size)? {
+            continue;
+        }
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let part = provider_download_partial_path(cache_path);
+        if part.exists() {
+            fs::remove_file(&part)
+                .with_context(|| format!("removing stale partial {}", part.display()))?;
+        }
+        fs::copy(&candidate, &part).with_context(|| {
+            format!(
+                "copying verified Comfy part payload {} to {}",
+                candidate.display(),
+                part.display()
+            )
+        })?;
+        ensure!(
+            provider_comfy_part_payload_matches(&part, record, chunk_size)?,
+            "copied Comfy part payload {} failed post-copy verification",
+            part.display()
+        );
+        if cache_path.exists() {
+            fs::remove_file(cache_path)
+                .with_context(|| format!("removing stale cache file {}", cache_path.display()))?;
+        }
+        fs::rename(&part, cache_path).with_context(|| {
+            format!(
+                "installing verified Comfy part payload at {}",
+                cache_path.display()
+            )
+        })?;
+        return Ok(Some(candidate));
+    }
+    Ok(None)
+}
+
+fn provider_comfy_part_payload_candidates(
+    payload_dir: &Path,
+    record: &mayhem_proto::ComfyPartRecord,
+) -> Vec<PathBuf> {
+    let mut names = BTreeSet::new();
+    let ext = safe_path_component(&record.file_format);
+    names.insert(record.part_id.clone());
+    names.insert(record.sha256.clone());
+    names.insert(format!("{}.{}", record.part_id, ext));
+    names.insert(format!("{}.{}", record.sha256, ext));
+    for source in record
+        .sources
+        .mirrors
+        .iter()
+        .chain(record.sources.origins.iter())
+    {
+        if let Some(path) = source.path.as_deref() {
+            if let Some(name) = Path::new(path).file_name().and_then(|name| name.to_str()) {
+                names.insert(safe_path_component(name));
+            }
+        }
+    }
+    names
+        .into_iter()
+        .map(|name| payload_dir.join(name))
+        .collect()
 }
 
 fn comfy_part_yaml_skip_reason(row: &Value) -> Option<String> {
@@ -86010,6 +86415,83 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[test]
+    fn provider_parts_pull_cli_parses_without_wallet_flags() {
+        let parsed = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "parts",
+            "pull",
+            "--layout-dir",
+            "parts-index",
+            "--part-id",
+            &"aa".repeat(32),
+            "--payload-dir",
+            "payloads",
+            "--cache-dir",
+            "cache",
+            "--require-payload",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = parsed.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Parts { command } = *command else {
+            panic!("expected provider parts command");
+        };
+        let ProviderPartsCommands::Pull(args) = command;
+        assert_eq!(args.layout_dir, PathBuf::from("parts-index"));
+        assert_eq!(args.part_ids, vec!["aa".repeat(32)]);
+        assert_eq!(args.payload_dir, Some(PathBuf::from("payloads")));
+        assert_eq!(args.cache_dir, Some(PathBuf::from("cache")));
+        assert!(args.require_payload);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn provider_parts_pull_verifies_layout_and_installs_matching_payload() {
+        let temp = test_temp_dir("mayhem-provider-parts-pull");
+        let source_dir = temp.join("source");
+        let layout_dir = temp.join("layout");
+        let payload_dir = temp.join("payloads");
+        let cache_dir = temp.join("cache");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&payload_dir).unwrap();
+        let payload_path = payload_dir.join("payload.bin");
+        fs::write(&payload_path, b"openmayhem comfy part payload").unwrap();
+        let record = test_comfy_part_record_for_payload("payload part", &payload_path, 8);
+        let record_path = source_dir.join("record.json");
+        write_json_file(&record_path, &record).unwrap();
+        admin_parts_build_index(&AdminPartsBuildIndexArgs {
+            records: vec![record_path],
+            output_dir: layout_dir.clone(),
+            index_ver: 3,
+            blessed_runtimes: vec!["comfyui-v0.30.1".to_owned()],
+            whitelist_ver: 1,
+            outcome_classes_ver: 1,
+        })
+        .unwrap();
+
+        provider_parts_pull(ProviderPartsPullArgs {
+            home: Some(temp.join("home")),
+            layout_dir,
+            part_ids: vec![record.part_id.clone()],
+            all: false,
+            payload_dir: Some(payload_dir),
+            cache_dir: Some(cache_dir.clone()),
+            require_payload: true,
+            chunk_size: 8,
+            json: true,
+        })
+        .unwrap();
+
+        let cache_path = provider_comfy_part_cache_path(&cache_dir, &record);
+        assert!(cache_path.exists());
+        assert!(provider_comfy_part_payload_matches(&cache_path, &record, 8).unwrap());
+        let _ = fs::remove_dir_all(temp);
+    }
+
     fn test_comfy_part_record(name: &str, hex_byte: &str) -> mayhem_proto::ComfyPartRecord {
         mayhem_proto::ComfyPartDraft {
             name: name.to_owned(),
@@ -86037,6 +86519,67 @@ mod tests {
         }
         .finalize(
             hex_byte.repeat(32),
+            "comfyui-v0.30.1".to_owned(),
+            mayhem_proto::ComfyPartLicenseEvidence {
+                doc_hash: "33".repeat(32),
+                archived_ref: "license-evidence:test".to_owned(),
+                captured_at: "2026-08-04T00:00:00Z".to_owned(),
+            },
+            mayhem_proto::ComfyPartCanary {
+                probe_graph_hash: "44".repeat(32),
+                reference_output_ref: "canaries/test.png".to_owned(),
+                tolerance: mayhem_proto::ComfyPartCanaryTolerance {
+                    method: "phash".to_owned(),
+                    max_distance_bps: 10,
+                },
+            },
+        )
+        .unwrap()
+    }
+
+    fn test_comfy_part_record_for_payload(
+        name: &str,
+        payload_path: &Path,
+        chunk_size: usize,
+    ) -> mayhem_proto::ComfyPartRecord {
+        let payload_name = payload_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .to_owned();
+        let size_bytes = fs::metadata(payload_path).unwrap().len();
+        let sha256 = file_sha256_hex(payload_path).unwrap();
+        let blake3_root = build_merkle_manifest(payload_path, chunk_size)
+            .unwrap()
+            .root;
+        mayhem_proto::ComfyPartDraft {
+            name: name.to_owned(),
+            part_type: "upscaler".to_owned(),
+            lane: "all".to_owned(),
+            sha256,
+            size_bytes,
+            file_format: "bin".to_owned(),
+            license: "MIT".to_owned(),
+            permissions: Vec::new(),
+            policy_flags: Vec::new(),
+            adapter: BTreeMap::new(),
+            sources: mayhem_proto::ComfyPartSources {
+                mirrors: vec![mayhem_proto::ComfyPartSource {
+                    kind: "huggingface".to_owned(),
+                    url: format!(
+                        "https://huggingface.co/TracNetwork/openmayhem-parts/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/{payload_name}"
+                    ),
+                    repository: Some("TracNetwork/openmayhem-parts".to_owned()),
+                    path: Some(payload_name),
+                    revision: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()),
+                }],
+                origins: Vec::new(),
+                require_auth: false,
+            },
+            status: "linked".to_owned(),
+        }
+        .finalize(
+            blake3_root,
             "comfyui-v0.30.1".to_owned(),
             mayhem_proto::ComfyPartLicenseEvidence {
                 doc_hash: "33".repeat(32),
