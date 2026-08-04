@@ -10,6 +10,7 @@ use crate::{
 };
 
 pub const COMFY_WORKFLOW_DERIVATION_SCHEMA_VERSION: u32 = 1;
+pub const DEFAULT_COMFY_WORKFLOW_RUNTIME_ID: &str = "comfyui-v0.30.1";
 
 const GRAPH_HASH_DOMAIN: &[u8] = b"mayhem:comfy-workflow-graph:v1";
 const MAX_COMFY_WORKFLOW_PART_NAME_BYTES: usize = 512;

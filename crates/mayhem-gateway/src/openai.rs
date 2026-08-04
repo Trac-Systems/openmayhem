@@ -50,9 +50,10 @@ use crate::{
         ContractProviderSnapshot, LcgBalancerRng, ModalityRequestLoad,
         ProviderCapacityMismatchEvent, ProviderObservationSample, ProviderTable,
         ProviderTableEntry, ProviderUnderdeliveryEvent, RequestRequirements,
-        RouteAttestationPolicyReadiness, SelectionWeights, DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR,
-        DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S, DEFAULT_IMAGE_FLOOR_IMAGES_PER_S,
-        DEFAULT_LLM_GENERATION_FLOOR_TOK_S, DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
+        RouteAttestationPolicyReadiness, SelectionWeights, WorkflowRouteRequirements,
+        DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR, DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S,
+        DEFAULT_IMAGE_FLOOR_IMAGES_PER_S, DEFAULT_LLM_GENERATION_FLOOR_TOK_S,
+        DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
     },
     verify_tier1_attestation, AttestationPolicyVerificationContext, AttestationVerificationRequest,
     EnclaveContractRecord, HardwareQuoteVerifierCommand, HeartbeatAttestation, HeartbeatCaps,
@@ -10215,7 +10216,7 @@ fn artifact_generation_request(
             let runtime_id = raw_request
                 .get("runtime_id")
                 .and_then(Value::as_str)
-                .unwrap_or("comfyui-v0.30.1")
+                .unwrap_or(mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID)
                 .to_owned();
             let outcome_class = raw_request
                 .get("outcome_class")
@@ -25714,6 +25715,14 @@ fn request_requirements_for_artifact_generation(
         requires_vision: false,
         required_modalities,
         required_specialities: request.effective_specialities.clone(),
+        workflow: request
+            .workflow
+            .as_ref()
+            .map(|workflow| WorkflowRouteRequirements {
+                runtime_id: workflow.runtime_id.clone(),
+                outcome_class: workflow.outcome_class.clone(),
+                inventory_root: None,
+            }),
         modality_load,
         // Artifact endpoints bound prompt size through their calibrated endpoint
         // contract. Provider `ctx` is a text-generation capacity and is only a
@@ -43493,6 +43502,14 @@ mod tests {
         let requirements =
             request_requirements_for_artifact_generation(&state, &model, &request, 1, None, None);
         assert_eq!(requirements.required_modalities, vec!["image".to_owned()]);
+        assert_eq!(
+            requirements.workflow,
+            Some(WorkflowRouteRequirements {
+                runtime_id: "comfyui-v0.30.1".to_owned(),
+                outcome_class: "image.light.512".to_owned(),
+                inventory_root: None,
+            })
+        );
         let image_load = requirements.modality_load.get("image").unwrap();
         assert_eq!(image_load.item_count, 2);
         assert_eq!(image_load.max_item_units, 512 * 512);

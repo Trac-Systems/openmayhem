@@ -71063,6 +71063,12 @@ async fn send_provider_heartbeat_round(
             "ts": ts,
             "nonce": blake3::hash(format!("{}:{}:{}:{}", room.room_id, provider_pubkey, ts, seq).as_bytes()).to_hex().to_string(),
         });
+        if let Some(workflow_classes) =
+            provider_heartbeat_workflow_classes(selected, min_ask_au, max_sessions, &load)
+        {
+            heartbeat["runtime_id"] = json!(mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID);
+            heartbeat["workflow_classes"] = workflow_classes;
+        }
         project_provider_heartbeat_attestation(&mut heartbeat, attestation, tpm_activation_hello)?;
         if let Some(transport_peer) = transport_peer {
             heartbeat["transport_peer"] = json!(transport_peer);
@@ -71086,6 +71092,11 @@ async fn send_provider_heartbeat_round(
             "identity_anchor": identity_anchor,
             "served_modalities": &selected.served_modalities,
             "served_specialities": &selected.served_specialities,
+            "runtime_id": heartbeat.get("runtime_id").cloned().unwrap_or(Value::Null),
+            "workflow_classes": heartbeat
+                .get("workflow_classes")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
         }));
     }
     Ok(sent)
@@ -71400,6 +71411,46 @@ fn provider_heartbeat_caps(selected: &ProviderCandidate) -> ModelCaps {
         caps.vision = false;
     }
     caps
+}
+
+fn provider_heartbeat_workflow_classes(
+    selected: &ProviderCandidate,
+    min_ask_au: MoneyAu,
+    max_sessions: u32,
+    load: &ProviderLoadSnapshot,
+) -> Option<Value> {
+    if !selected
+        .model
+        .adapter
+        .endpoint_families
+        .iter()
+        .any(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS)
+    {
+        return None;
+    }
+    let modality = if selected
+        .served_modalities
+        .iter()
+        .any(|modality| modality == "video")
+    {
+        "video"
+    } else if selected
+        .served_modalities
+        .iter()
+        .any(|modality| modality == "audio")
+    {
+        "audio"
+    } else {
+        "image"
+    };
+    let active = u32::try_from(load.active_slots).unwrap_or(u32::MAX);
+    Some(json!({
+        format!("{modality}.workflow"): {
+            "min_ask_au": money_au_json(min_ask_au),
+            "max_concurrent": max_sessions.max(1),
+            "active": active.min(max_sessions.max(1)),
+        }
+    }))
 }
 
 async fn serve_provider_sessions(
@@ -104742,6 +104793,52 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
         selected.enclave.backend = "vllm".to_owned();
         assert!(provider_heartbeat_caps(&selected).tools);
+    }
+
+    #[test]
+    fn provider_heartbeat_advertises_workflow_classes_only_for_comfy_models() {
+        let root = "aa".repeat(32);
+        let catalog = test_catalog(&root);
+        let contract = test_contract(&root);
+        let artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        let mut selected = ProviderCandidate {
+            enclave: contract.enclaves[0].clone(),
+            model: catalog.models[0].clone(),
+            artifact_name: "gguf-q4_k_m".to_owned(),
+            artifact,
+            verdict: BackendVerdict {
+                backend: "comfyui".to_owned(),
+                status: VerdictStatus::FullOffload,
+                reason: None,
+                est_tok_s: None,
+                n_layers_gpu: None,
+                max_sessions: 2,
+                kv_cache_bytes_budget: 0,
+            },
+            price: contract.prices.first().cloned(),
+            served_ctx: 1,
+            served_modalities: vec!["image".to_owned()],
+            served_specialities: BTreeMap::new(),
+            modality_capacities: test_modality_capacities("image"),
+            feasibility: ProviderCtxFeasibility::not_applicable(1, 0),
+            ctx_bracket_schedule: default_ctx_bracket_schedule(),
+        };
+        let load = ProviderLoadSnapshot::idle(2);
+        assert!(
+            provider_heartbeat_workflow_classes(&selected, 7, 2, &load).is_none(),
+            "non-Comfy endpoint models must not gain workflow heartbeat fields"
+        );
+
+        selected.model.adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            )
+            .unwrap()];
+        let classes = provider_heartbeat_workflow_classes(&selected, 7, 2, &load)
+            .expect("Comfy endpoint should advertise workflow class");
+        assert_eq!(classes["image.workflow"]["min_ask_au"], json!("7"));
+        assert_eq!(classes["image.workflow"]["max_concurrent"], json!(2));
+        assert_eq!(classes["image.workflow"]["active"], json!(0));
     }
 
     #[test]

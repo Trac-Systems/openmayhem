@@ -209,6 +209,8 @@ pub struct RequestRequirements {
     pub required_modalities: Vec<String>,
     #[serde(default)]
     pub required_specialities: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowRouteRequirements>,
     pub modality_load: BTreeMap<String, ModalityRequestLoad>,
     pub min_ctx: u32,
     pub input_tokens: u64,
@@ -228,6 +230,14 @@ pub struct RequestRequirements {
     pub heartbeat_ttl_millis: u64,
     pub saturation_cutoff: f64,
     pub provider_user_active_sessions: BTreeMap<String, u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowRouteRequirements {
+    pub runtime_id: String,
+    pub outcome_class: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_root: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -258,6 +268,7 @@ pub enum IneligibilityReason {
     AttestationStale,
     CircuitOpen,
     ThroughputFloor,
+    Workflow,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -459,6 +470,7 @@ impl Default for RequestRequirements {
             requires_vision: false,
             required_modalities: Vec::new(),
             required_specialities: BTreeMap::new(),
+            workflow: None,
             modality_load: BTreeMap::new(),
             min_ctx: 0,
             input_tokens: 0,
@@ -913,6 +925,24 @@ pub fn evaluate_eligibility(
                 .is_some_and(|levels| levels.contains(level))
     }) {
         return Err(IneligibilityReason::Speciality);
+    }
+    if let Some(workflow) = &request.workflow {
+        if heartbeat.runtime_id.as_deref() != Some(workflow.runtime_id.as_str())
+            || workflow
+                .inventory_root
+                .as_ref()
+                .is_some_and(|inventory_root| {
+                    heartbeat.inventory_root.as_deref() != Some(inventory_root.as_str())
+                })
+        {
+            return Err(IneligibilityReason::Workflow);
+        }
+        let Some(class) = heartbeat.workflow_classes.get(&workflow.outcome_class) else {
+            return Err(IneligibilityReason::Workflow);
+        };
+        if class.active >= class.max_concurrent {
+            return Err(IneligibilityReason::Saturated);
+        }
     }
     for modality in request
         .required_modalities
@@ -1418,7 +1448,7 @@ mod tests {
     use crate::text_generation_rate_map;
     use crate::{
         HeartbeatAttestation, HeartbeatModalityCapacity, HeartbeatPerf, HeartbeatQueue,
-        HeartbeatSlots, ProbationCaps,
+        HeartbeatSlots, HeartbeatWorkflowClass, ProbationCaps,
     };
 
     fn key() -> ProviderKey {
@@ -1611,6 +1641,66 @@ mod tests {
         }
     }
 
+    fn workflow_request(now: u64) -> RequestRequirements {
+        RequestRequirements {
+            requires_tools: false,
+            requires_json: false,
+            required_modalities: vec!["image".to_owned()],
+            workflow: Some(WorkflowRouteRequirements {
+                runtime_id: "comfyui-v0.30.1".to_owned(),
+                outcome_class: "image.workflow".to_owned(),
+                inventory_root: None,
+            }),
+            modality_load: BTreeMap::from([(
+                "image".to_owned(),
+                ModalityRequestLoad {
+                    item_count: 1,
+                    max_item_bytes: 1,
+                    max_item_units: 512 * 512,
+                },
+            )]),
+            min_ctx: 1,
+            input_tokens: 1,
+            output_tokens: 0,
+            usage: ReceiptUsage::from_units([(mayhem_proto::USAGE_IMAGE, 1)]),
+            max_price_au: Some(1_000_000),
+            ..eligible_request(now)
+        }
+    }
+
+    fn make_workflow_route(entry: &mut ProviderTableEntry) {
+        entry.contract.caps.served_modalities = vec!["image".to_owned()];
+        entry.contract.rate_map = vec![RateMapEntry {
+            unit: mayhem_proto::USAGE_IMAGE.to_owned(),
+            per_unit_au: 100,
+            granularity: 1,
+        }];
+        entry.contract.ref_rate_map = entry.contract.rate_map.clone();
+        let heartbeat = entry.heartbeat.as_mut().unwrap();
+        heartbeat.caps.served_modalities = vec!["image".to_owned()];
+        heartbeat.caps.modality_capacity = BTreeMap::from([(
+            "image".to_owned(),
+            HeartbeatModalityCapacity {
+                unit: "pixel".to_owned(),
+                max_inflight_items: 2,
+                active_items: 0,
+                max_items_per_request: 1,
+                max_item_bytes: 1,
+                max_item_units: 1024 * 1024,
+                working_set_bytes_per_item: 1024,
+            },
+        )]);
+        heartbeat.runtime_id = Some("comfyui-v0.30.1".to_owned());
+        heartbeat.workflow_classes.insert(
+            "image.workflow".to_owned(),
+            HeartbeatWorkflowClass {
+                min_ask_au: 1,
+                max_concurrent: 2,
+                active: 0,
+            },
+        );
+    }
+
     fn active_probation() -> ProviderProbation {
         ProviderProbation {
             active: true,
@@ -1653,6 +1743,62 @@ mod tests {
         let candidates = eligible_candidates(&[entry], &request, &SelectionWeights::default());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].estimated_price_au, 1_500);
+    }
+
+    #[test]
+    fn workflow_routes_require_matching_runtime_and_class() {
+        let now = 1_000_000;
+        let mut entry = entry_for(1, now, 0.2, 100);
+        make_workflow_route(&mut entry);
+        let request = workflow_request(now + 1);
+        assert_eq!(evaluate_eligibility(&entry, &request), Ok(100));
+
+        let mut missing = entry.clone();
+        missing.heartbeat.as_mut().unwrap().workflow_classes.clear();
+        assert_eq!(
+            evaluate_eligibility(&missing, &request),
+            Err(IneligibilityReason::Workflow)
+        );
+
+        let mut runtime_mismatch = entry.clone();
+        runtime_mismatch.heartbeat.as_mut().unwrap().runtime_id =
+            Some("comfyui-v0.29.0".to_owned());
+        assert_eq!(
+            evaluate_eligibility(&runtime_mismatch, &request),
+            Err(IneligibilityReason::Workflow)
+        );
+    }
+
+    #[test]
+    fn workflow_routes_respect_inventory_and_class_capacity() {
+        let now = 1_000_000;
+        let mut entry = entry_for(1, now, 0.2, 100);
+        make_workflow_route(&mut entry);
+        entry.heartbeat.as_mut().unwrap().inventory_root = Some("66".repeat(32));
+        let mut request = workflow_request(now + 1);
+        request.workflow.as_mut().unwrap().inventory_root = Some("66".repeat(32));
+        assert_eq!(evaluate_eligibility(&entry, &request), Ok(100));
+
+        request.workflow.as_mut().unwrap().inventory_root = Some("67".repeat(32));
+        assert_eq!(
+            evaluate_eligibility(&entry, &request),
+            Err(IneligibilityReason::Workflow)
+        );
+
+        let mut saturated = entry;
+        saturated
+            .heartbeat
+            .as_mut()
+            .unwrap()
+            .workflow_classes
+            .get_mut("image.workflow")
+            .unwrap()
+            .active = 2;
+        request.workflow.as_mut().unwrap().inventory_root = Some("66".repeat(32));
+        assert_eq!(
+            evaluate_eligibility(&saturated, &request),
+            Err(IneligibilityReason::Saturated)
+        );
     }
 
     #[test]
