@@ -5609,9 +5609,21 @@ struct ProviderPartsPullArgs {
     #[arg(long = "payload-dir", value_name = "PATH")]
     payload_dir: Option<PathBuf>,
 
+    /// Hugging Face token file for authenticated Hugging Face part mirrors. Defaults to HF_TOKEN.
+    #[arg(long = "hf-token-file", value_name = "PATH")]
+    hf_token_file: Option<PathBuf>,
+
     /// Destination cache directory. Defaults to <home>/comfy-parts.
     #[arg(long = "cache-dir", value_name = "PATH")]
     cache_dir: Option<PathBuf>,
+
+    /// Reserved free disk space to keep after downloading parts, e.g. 20GB.
+    #[arg(long = "disk-reserve", value_name = "SIZE")]
+    disk_reserve: Option<String>,
+
+    /// Verify records/proofs/cache only; do not download missing payloads from sources.
+    #[arg(long)]
+    offline: bool,
 
     /// Fail unless each requested part is installed into the cache.
     #[arg(long)]
@@ -25176,6 +25188,29 @@ fn provider_parts_pull(args: ProviderPartsPullArgs) -> Result<()> {
                 }
             }
         }
+        if !installed && !args.offline {
+            match provider_comfy_part_install_from_sources(
+                &cache_path,
+                &record,
+                args.chunk_size,
+                args.hf_token_file.as_deref(),
+                args.disk_reserve.as_deref(),
+            ) {
+                Ok(Some(source)) => {
+                    installed = true;
+                    install_source = Some(source);
+                    install_error = None;
+                }
+                Ok(None) => {
+                    if install_error.is_none() {
+                        install_error = Some("part record has no source URLs".to_owned());
+                    }
+                }
+                Err(error) => {
+                    install_error = Some(error.to_string());
+                }
+            }
+        }
         if args.require_payload && !installed {
             bail!(
                 "part {part_id} was verified but not installed: {}",
@@ -25302,6 +25337,250 @@ fn provider_comfy_part_install_from_payload_dir(
         return Ok(Some(candidate));
     }
     Ok(None)
+}
+
+fn provider_comfy_part_install_from_sources(
+    cache_path: &Path,
+    record: &mayhem_proto::ComfyPartRecord,
+    chunk_size: usize,
+    hf_token_file: Option<&Path>,
+    disk_reserve: Option<&str>,
+) -> Result<Option<String>> {
+    let mut attempted = false;
+    let mut failures = Vec::new();
+    for source in record
+        .sources
+        .mirrors
+        .iter()
+        .chain(record.sources.origins.iter())
+    {
+        attempted = true;
+        match provider_comfy_part_download_source(
+            source,
+            record.sources.require_auth,
+            cache_path,
+            record,
+            chunk_size,
+            hf_token_file,
+            disk_reserve,
+        ) {
+            Ok(()) => return Ok(Some(source.url.clone())),
+            Err(error) => failures.push(format!("{}: {error:#}", source.url)),
+        }
+    }
+    if attempted {
+        bail!(
+            "all Comfy part sources failed for {}: {}",
+            record.part_id,
+            failures.join("; ")
+        );
+    }
+    Ok(None)
+}
+
+fn provider_comfy_part_download_source(
+    source: &mayhem_proto::ComfyPartSource,
+    require_auth: bool,
+    cache_path: &Path,
+    record: &mayhem_proto::ComfyPartRecord,
+    chunk_size: usize,
+    hf_token_file: Option<&Path>,
+    disk_reserve: Option<&str>,
+) -> Result<()> {
+    let parsed = reqwest::Url::parse(&source.url)
+        .with_context(|| format!("parsing Comfy part source URL {}", source.url))?;
+    ensure!(
+        parsed.scheme() == "https",
+        "Comfy part source URLs must be HTTPS"
+    );
+    let token = provider_comfy_part_source_token(source, require_auth, hf_token_file)?;
+    provider_comfy_part_disk_preflight(cache_path, record.size_bytes, disk_reserve)?;
+    let parent = cache_path
+        .parent()
+        .context("Comfy part cache destination has no parent directory")?;
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    let part_path = provider_download_partial_path(cache_path);
+    let mut partial_bytes = fs::metadata(&part_path)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if partial_bytes > record.size_bytes {
+        fs::remove_file(&part_path)
+            .with_context(|| format!("removing oversized partial {}", part_path.display()))?;
+        partial_bytes = 0;
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(format!("openmayhem/{}", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .context("building Comfy part download client")?;
+    let mut append = partial_bytes > 0;
+    let mut request = client.get(parsed);
+    if append {
+        request = request.header(reqwest::header::RANGE, format!("bytes={partial_bytes}-"));
+    }
+    if let Some(token) = token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+
+    let mut response = request
+        .send()
+        .with_context(|| format!("downloading Comfy part source {}", source.url))?;
+    match response.status() {
+        reqwest::StatusCode::PARTIAL_CONTENT if append => {}
+        reqwest::StatusCode::OK => {
+            if append {
+                fs::remove_file(&part_path).with_context(|| {
+                    format!(
+                        "removing partial {} after source ignored range request",
+                        part_path.display()
+                    )
+                })?;
+                partial_bytes = 0;
+                append = false;
+            }
+        }
+        reqwest::StatusCode::RANGE_NOT_SATISFIABLE if append => {
+            fs::remove_file(&part_path).with_context(|| {
+                format!("removing rejected partial download {}", part_path.display())
+            })?;
+            bail!("source rejected the resume range; partial was reset, retry the pull");
+        }
+        status => {
+            bail!("source returned HTTP status {status}");
+        }
+    }
+    if let Some(content_length) = response.content_length() {
+        let expected_remaining = record.size_bytes.saturating_sub(partial_bytes);
+        ensure!(
+            content_length <= expected_remaining,
+            "source response is too large for {}: got at least {}, expected at most {} remaining bytes",
+            record.part_id,
+            content_length,
+            expected_remaining
+        );
+    }
+
+    let mut output = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(&part_path)
+        .with_context(|| format!("opening partial download {}", part_path.display()))?;
+    let mut written = partial_bytes;
+    let mut buffer = [0u8; 1024 * 128];
+    loop {
+        let read = response
+            .read(&mut buffer)
+            .with_context(|| format!("reading Comfy part source {}", source.url))?;
+        if read == 0 {
+            break;
+        }
+        written = written
+            .checked_add(u64::try_from(read).context("download chunk length overflowed")?)
+            .context("download size overflowed")?;
+        if written > record.size_bytes {
+            let _ = fs::remove_file(&part_path);
+            bail!(
+                "downloaded Comfy part {} exceeded expected size {}",
+                record.part_id,
+                record.size_bytes
+            );
+        }
+        output
+            .write_all(&buffer[..read])
+            .with_context(|| format!("writing {}", part_path.display()))?;
+    }
+    output
+        .sync_all()
+        .with_context(|| format!("syncing {}", part_path.display()))?;
+    ensure!(
+        written == record.size_bytes,
+        "downloaded Comfy part {} is incomplete: got {}, expected {} bytes",
+        record.part_id,
+        written,
+        record.size_bytes
+    );
+    if !provider_comfy_part_payload_matches(&part_path, record, chunk_size)? {
+        let _ = fs::remove_file(&part_path);
+        bail!(
+            "downloaded Comfy part {} failed SHA-256/BLAKE3 verification",
+            record.part_id
+        );
+    }
+    if cache_path.exists() {
+        fs::remove_file(cache_path)
+            .with_context(|| format!("removing stale cache file {}", cache_path.display()))?;
+    }
+    fs::rename(&part_path, cache_path).with_context(|| {
+        format!(
+            "installing verified Comfy part payload at {}",
+            cache_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn provider_comfy_part_source_token(
+    source: &mayhem_proto::ComfyPartSource,
+    require_auth: bool,
+    hf_token_file: Option<&Path>,
+) -> Result<Option<String>> {
+    if source.kind == "huggingface" {
+        let token = read_optional_token(hf_token_file)?;
+        if require_auth && token.is_none() {
+            bail!(
+                "Comfy part source {} requires Hugging Face auth; pass --hf-token-file or set HF_TOKEN",
+                source.url
+            );
+        }
+        return Ok(token);
+    }
+    if require_auth {
+        bail!(
+            "authenticated Comfy part source kind {} is not supported by provider pull; mirror it to Hugging Face or use --payload-dir",
+            source.kind
+        );
+    }
+    Ok(None)
+}
+
+fn provider_comfy_part_disk_preflight(
+    destination: &Path,
+    expected_bytes: u64,
+    disk_reserve: Option<&str>,
+) -> Result<()> {
+    let part = provider_download_partial_path(destination);
+    let mut partial_bytes = fs::metadata(&part)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if partial_bytes > expected_bytes {
+        partial_bytes = 0;
+    }
+    let remaining_bytes = expected_bytes.saturating_sub(partial_bytes);
+    let (reserve_bytes, reserve_source) = provider_disk_reserve_bytes(disk_reserve)?;
+    let available_bytes = available_bytes_for_path(destination)?.with_context(|| {
+        format!(
+            "checking available disk space for {}",
+            destination.display()
+        )
+    })?;
+    let required_bytes = remaining_bytes.saturating_add(reserve_bytes);
+    if available_bytes < required_bytes {
+        bail!(
+            "Not enough disk space to download Comfy part: need {} remaining download bytes plus {} reserve ({reserve_source}), but only {} is free at {}. Free space, choose a different --cache-dir, or adjust --disk-reserve.",
+            human_bytes(remaining_bytes),
+            human_bytes(reserve_bytes),
+            human_bytes(available_bytes),
+            destination.display()
+        );
+    }
+    Ok(())
 }
 
 fn provider_comfy_part_payload_candidates(
@@ -86428,8 +86707,13 @@ mod tests {
             &"aa".repeat(32),
             "--payload-dir",
             "payloads",
+            "--hf-token-file",
+            "hf.token",
             "--cache-dir",
             "cache",
+            "--disk-reserve",
+            "1GB",
+            "--offline",
             "--require-payload",
             "--json",
         ])
@@ -86444,7 +86728,10 @@ mod tests {
         assert_eq!(args.layout_dir, PathBuf::from("parts-index"));
         assert_eq!(args.part_ids, vec!["aa".repeat(32)]);
         assert_eq!(args.payload_dir, Some(PathBuf::from("payloads")));
+        assert_eq!(args.hf_token_file, Some(PathBuf::from("hf.token")));
         assert_eq!(args.cache_dir, Some(PathBuf::from("cache")));
+        assert_eq!(args.disk_reserve, Some("1GB".to_owned()));
+        assert!(args.offline);
         assert!(args.require_payload);
         assert!(args.json);
     }
@@ -86479,7 +86766,10 @@ mod tests {
             part_ids: vec![record.part_id.clone()],
             all: false,
             payload_dir: Some(payload_dir),
+            hf_token_file: None,
             cache_dir: Some(cache_dir.clone()),
+            disk_reserve: None,
+            offline: false,
             require_payload: true,
             chunk_size: 8,
             json: true,
@@ -86489,6 +86779,82 @@ mod tests {
         let cache_path = provider_comfy_part_cache_path(&cache_dir, &record);
         assert!(cache_path.exists());
         assert!(provider_comfy_part_payload_matches(&cache_path, &record, 8).unwrap());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn provider_parts_pull_offline_refuses_missing_payload_without_fetching_sources() {
+        let temp = test_temp_dir("mayhem-provider-parts-pull-offline");
+        let source_dir = temp.join("source");
+        let layout_dir = temp.join("layout");
+        let cache_dir = temp.join("cache");
+        fs::create_dir_all(&source_dir).unwrap();
+        let payload_path = temp.join("payload.bin");
+        fs::write(&payload_path, b"openmayhem offline part payload").unwrap();
+        let record = test_comfy_part_record_for_payload("offline part", &payload_path, 8);
+        let record_path = source_dir.join("record.json");
+        write_json_file(&record_path, &record).unwrap();
+        admin_parts_build_index(&AdminPartsBuildIndexArgs {
+            records: vec![record_path],
+            output_dir: layout_dir.clone(),
+            index_ver: 4,
+            blessed_runtimes: vec!["comfyui-v0.30.1".to_owned()],
+            whitelist_ver: 1,
+            outcome_classes_ver: 1,
+        })
+        .unwrap();
+
+        let err = provider_parts_pull(ProviderPartsPullArgs {
+            home: Some(temp.join("home")),
+            layout_dir,
+            part_ids: vec![record.part_id.clone()],
+            all: false,
+            payload_dir: None,
+            hf_token_file: None,
+            cache_dir: Some(cache_dir),
+            disk_reserve: None,
+            offline: true,
+            require_payload: true,
+            chunk_size: 8,
+            json: true,
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("pass --payload-dir with a matching payload"),
+            "{err:#}"
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn provider_parts_pull_rejects_authenticated_non_hf_sources() {
+        let temp = test_temp_dir("mayhem-provider-parts-non-hf-auth");
+        let payload_path = temp.join("payload.bin");
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(&payload_path, b"openmayhem hf part payload").unwrap();
+        let mut record = test_comfy_part_record_for_payload("hf gated part", &payload_path, 8);
+        record.sources.require_auth = true;
+        record.sources.mirrors[0].kind = "civitai".to_owned();
+        let cache_path = provider_comfy_part_cache_path(&temp.join("cache"), &record);
+
+        let err = provider_comfy_part_download_source(
+            &record.sources.mirrors[0],
+            record.sources.require_auth,
+            &cache_path,
+            &record,
+            8,
+            None,
+            Some("0GB"),
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("authenticated Comfy part source kind civitai is not supported"),
+            "{err:#}"
+        );
         let _ = fs::remove_dir_all(temp);
     }
 
