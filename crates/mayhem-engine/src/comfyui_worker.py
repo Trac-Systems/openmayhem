@@ -125,6 +125,25 @@ def progress_matches_prompt(data, prompt_id):
     return False
 
 
+def append_history_progress(progress, history, prompt_id):
+    status = history.get("status") if isinstance(history, dict) else None
+    messages = status.get("messages") if isinstance(status, dict) else None
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        if not isinstance(message, (list, tuple)) or len(message) < 2:
+            continue
+        event = message[0]
+        data = message[1]
+        if not isinstance(event, str) or not progress_matches_prompt(data, prompt_id):
+            continue
+        append_progress(progress, {
+            "kind": event,
+            "node": progress_node(data),
+            "value": progress_value(data),
+        })
+
+
 @contextlib.contextmanager
 def capture_prompt_server_progress(prompt_id, progress):
     original_send_sync = prompt_server.send_sync
@@ -240,6 +259,7 @@ async def run_workflow(payload):
     status = history.get("status", {})
     if status.get("status_str") != "success":
         raise RuntimeError(f"ComfyUI workflow failed: {status}")
+    append_history_progress(progress, history, prompt_id)
     artifacts = collect_artifacts(prompt_id, history)
     return {
         "prompt_id": prompt_id,
@@ -287,6 +307,7 @@ async def run_workflow_internal(payload):
     status = history.get("status", {})
     if status.get("status_str") != "success":
         raise RuntimeError(f"ComfyUI workflow failed: {status}")
+    append_history_progress(progress, history, prompt_id)
     artifacts = collect_artifacts(prompt_id, history)
     return {
         "prompt_id": prompt_id,
