@@ -163,6 +163,8 @@ def main() -> int:
     (out_dir / "drafts").mkdir(parents=True, exist_ok=True)
 
     all_drafts: list[dict[str, Any]] = []
+    mirrorable_drafts: list[dict[str, Any]] = []
+    origin_only_drafts: list[dict[str, Any]] = []
     mirrorable: list[dict[str, Any]] = []
     origin_only: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
@@ -200,9 +202,13 @@ def main() -> int:
                 "origin-only source requires provider-side pickle-to-safetensors "
                 "conversion before it can be provider-pulled"
             )
+            entry["blocked_draft"] = provider_draft(draft, result, None)
             blocked.append(entry)
         elif is_origin_only:
             origin_only.append(entry)
+            provider_entry = provider_draft(draft, result, None)
+            origin_only_drafts.append(provider_entry)
+            all_drafts.append(provider_entry)
         else:
             ext = extension_for(file_format, payload)
             repo_path = f"{args.mirror_prefix}/{sha256[:2]}/{sha256}.{ext}"
@@ -212,11 +218,25 @@ def main() -> int:
             if args.mirror_revision:
                 mirror = mirror_source(args.mirror_repo, args.mirror_revision, repo_path)
             mirrorable.append(entry)
+            provider_entry = provider_draft(draft, result, mirror)
+            mirrorable_drafts.append(provider_entry)
+            all_drafts.append(provider_entry)
         payload_manifest.append(entry)
-        all_drafts.append(provider_draft(draft, result, mirror))
 
     (out_dir / "drafts" / "all.json").write_text(
         json.dumps(all_drafts, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (out_dir / "drafts" / "mirrorable.json").write_text(
+        json.dumps(mirrorable_drafts, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (out_dir / "drafts" / "origin-only.json").write_text(
+        json.dumps(origin_only_drafts, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (out_dir / "drafts" / "blocked.json").write_text(
+        json.dumps(blocked, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     (out_dir / "payload-manifest.json").write_text(
@@ -227,6 +247,7 @@ def main() -> int:
         "ok": True,
         "current_drafts": len(drafts),
         "verified_results": len(results),
+        "provider_ready_count": len(all_drafts),
         "mirror_count": len(mirrorable),
         "mirror_bytes": sum(int(item["size_bytes"]) for item in mirrorable),
         "origin_only_direct_count": len(origin_only),
