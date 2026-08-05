@@ -598,6 +598,8 @@ enum ProviderPartsCommands {
     Remove(ProviderPartsRemoveArgs),
     /// List this provider's advertised Comfy parts inventory.
     List(ProviderPartsListArgs),
+    /// Check whether this provider can honestly advertise a Comfy outcome class.
+    Admit(ProviderPartsAdmitArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -5924,6 +5926,57 @@ struct ProviderPartsRemoveArgs {
 }
 
 #[derive(Debug, Parser)]
+struct ProviderPartsAdmitArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Outcome class this provider wants to advertise, e.g. image.workflow.sdxl.
+    #[arg(long = "outcome-class", value_name = "CLASS")]
+    outcome_class: String,
+
+    /// Blessed Comfy runtime id used by the reference envelope.
+    #[arg(long = "runtime-id", default_value = mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID)]
+    runtime_id: String,
+
+    /// Required inventory part id. Repeat for every part in the admitted class envelope.
+    #[arg(long = "part-id", required = true, value_name = "HEX")]
+    part_ids: Vec<String>,
+
+    /// Usable RAM/VRAM budget after local reserves, e.g. 24GB.
+    #[arg(long = "usable-bytes", value_name = "SIZE")]
+    usable_bytes: String,
+
+    /// Extra per-request working set beyond resident part bytes, e.g. 4GB.
+    #[arg(long = "working-set-bytes", default_value = "0", value_name = "SIZE")]
+    working_set_bytes: String,
+
+    /// Safety headroom applied to the computed peak, in percent.
+    #[arg(long = "headroom-pct", default_value_t = 20, value_name = "PCT")]
+    headroom_pct: u32,
+
+    /// Concurrent sessions to admit for this class.
+    #[arg(long = "max-sessions", default_value_t = 1, value_name = "N")]
+    max_sessions: u32,
+
+    /// Optional staged load plan JSON. Without it all required parts must fit together.
+    #[arg(long = "load-plan", value_name = "PATH")]
+    load_plan: Option<PathBuf>,
+
+    /// Chunk size for BLAKE3 Merkle-root verification.
+    #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
+    chunk_size: usize,
+
+    /// Persist the successful admission envelope so provider heartbeats may advertise it.
+    #[arg(long)]
+    write: bool,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
 struct ProviderPartsListArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
@@ -6947,6 +7000,7 @@ async fn provider_command(command: ProviderCommands, verbose: bool) -> Result<()
             ProviderPartsCommands::Add(args) => provider_parts_add(args),
             ProviderPartsCommands::Remove(args) => provider_parts_remove(args),
             ProviderPartsCommands::List(args) => provider_parts_list(args),
+            ProviderPartsCommands::Admit(args) => provider_parts_admit(args),
         },
         ProviderCommands::Drain(args) => provider_drain(args).await,
         ProviderCommands::Earnings(args) => provider_earnings(args).await,
@@ -25558,7 +25612,8 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
         "--canary-tolerance-method must be non-empty"
     );
 
-    let (mut draft, row_index) = read_comfy_part_draft_input(&input.input, input.row_index)?;
+    let (mut draft, row_index) =
+        read_comfy_part_draft_input(&input.input, input.row_index, input.payload.is_some())?;
     ensure!(
         !comfy_part_requires_pickle_conversion(&draft.file_format),
         "Comfy part {} uses {}; convert the payload to safetensors before onboarding so providers pull signed non-pickle bytes",
@@ -25631,6 +25686,10 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
             draft.file_format = file_format;
         }
     }
+    ensure!(
+        !draft.file_format.eq_ignore_ascii_case("unknown"),
+        "file_format is unknown; split archives/containers and pin the provider-facing payload first"
+    );
     steps.push(admin_parts_onboard_step(
         "payload_verified",
         &[
@@ -26958,6 +27017,7 @@ fn admin_comfy_part_source_token(
 fn read_comfy_part_draft_input(
     path: &Path,
     row_index: usize,
+    allow_unknown_file_format: bool,
 ) -> Result<(mayhem_proto::ComfyPartDraft, usize)> {
     let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let value = serde_json::from_str::<Value>(&text)
@@ -26975,7 +27035,8 @@ fn read_comfy_part_draft_input(
         );
         (value, 1)
     };
-    if let Some(reason) = comfy_part_yaml_skip_reason(&row) {
+    if let Some(reason) = comfy_part_yaml_skip_reason_with_options(&row, allow_unknown_file_format)
+    {
         bail!(
             "{} row {} is not directly onboardable: {}",
             path.display(),
@@ -27480,6 +27541,7 @@ struct ProviderPartsPullItem {
 }
 
 const PROVIDER_COMFY_INVENTORY_SCHEMA_VERSION: u32 = 1;
+const PROVIDER_COMFY_ADMISSION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -27524,8 +27586,81 @@ struct ProviderPartsInventoryItem {
     cache_path: String,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderPartsAdmissionReport {
+    ok: bool,
+    admitted: bool,
+    outcome_class: String,
+    runtime_id: String,
+    inventory_root: String,
+    part_count: u64,
+    mode: String,
+    usable_bytes: u64,
+    usable_human: String,
+    headroom_pct: u32,
+    max_sessions: u32,
+    working_set_bytes_per_session: u64,
+    all_at_once_bytes: u64,
+    peak_bytes: u64,
+    required_bytes: u64,
+    required_human: String,
+    max_safe_sessions: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal_reason: Option<String>,
+    phases: Vec<ProviderPartsAdmissionPhaseReport>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderPartsAdmissionPhaseReport {
+    id: String,
+    resident_parts: Vec<String>,
+    resident_bytes: u64,
+    working_set_bytes_per_session: u64,
+    peak_bytes: u64,
+    boundary_outputs: Vec<String>,
+    safe_unload_after: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderComfyAdmission {
+    schema_version: u32,
+    admitted_at: u64,
+    report: ProviderPartsAdmissionReport,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderPartsAdmissionLoadPlan {
+    schema_version: u32,
+    phases: Vec<ProviderPartsAdmissionLoadPlanPhase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderPartsAdmissionLoadPlanPhase {
+    id: String,
+    resident_parts: Vec<String>,
+    #[serde(default)]
+    working_set_bytes: Option<u64>,
+    #[serde(default)]
+    boundary_outputs: Vec<String>,
+    #[serde(default)]
+    safe_unload_after: Vec<String>,
+}
+
 fn provider_comfy_inventory_path(home: &Path) -> PathBuf {
     home.join("provider").join("comfy-inventory.json")
+}
+
+fn provider_comfy_admissions_dir(home: &Path) -> PathBuf {
+    home.join("provider").join("comfy-admissions")
+}
+
+fn provider_comfy_admission_path(home: &Path, outcome_class: &str) -> PathBuf {
+    provider_comfy_admissions_dir(home).join(format!("{}.json", safe_path_component(outcome_class)))
 }
 
 fn empty_provider_comfy_inventory(
@@ -27561,6 +27696,39 @@ fn write_provider_comfy_inventory(home: &Path, inventory: &ProviderComfyInventor
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     write_json_file(&path, inventory).with_context(|| format!("writing {}", path.display()))
+}
+
+fn write_provider_comfy_admission(
+    home: &Path,
+    report: &ProviderPartsAdmissionReport,
+) -> Result<PathBuf> {
+    ensure!(
+        report.admitted,
+        "only successful Comfy admissions can be persisted"
+    );
+    validate_provider_parts_admission_report(report)?;
+    let admission = ProviderComfyAdmission {
+        schema_version: PROVIDER_COMFY_ADMISSION_SCHEMA_VERSION,
+        admitted_at: unix_epoch_seconds()?,
+        report: report.clone(),
+    };
+    let path = provider_comfy_admission_path(home, &report.outcome_class);
+    write_json_file(&path, &admission).with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+fn read_provider_comfy_admission(
+    home: &Path,
+    outcome_class: &str,
+) -> Result<Option<ProviderComfyAdmission>> {
+    let path = provider_comfy_admission_path(home, outcome_class);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let admission: ProviderComfyAdmission = serde_json::from_value(read_json_file(&path)?)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    validate_provider_comfy_admission(&admission)?;
+    Ok(Some(admission))
 }
 
 fn validate_provider_comfy_inventory(inventory: &ProviderComfyInventory) -> Result<()> {
@@ -27611,6 +27779,128 @@ fn validate_provider_comfy_inventory(inventory: &ProviderComfyInventory) -> Resu
     Ok(())
 }
 
+fn validate_provider_comfy_admission(admission: &ProviderComfyAdmission) -> Result<()> {
+    ensure!(
+        admission.schema_version == PROVIDER_COMFY_ADMISSION_SCHEMA_VERSION,
+        "Comfy provider admission schema mismatch: expected {}, got {}",
+        PROVIDER_COMFY_ADMISSION_SCHEMA_VERSION,
+        admission.schema_version
+    );
+    ensure!(
+        admission.admitted_at > 0,
+        "Comfy provider admission timestamp is missing"
+    );
+    validate_provider_parts_admission_report(&admission.report)
+}
+
+fn validate_provider_parts_admission_report(report: &ProviderPartsAdmissionReport) -> Result<()> {
+    ensure!(
+        report.ok == report.admitted,
+        "Comfy admission ok/admitted mismatch"
+    );
+    ensure!(report.admitted, "Comfy admission report is not admitted");
+    ensure!(
+        valid_provider_admission_ref(&report.outcome_class),
+        "Comfy admission outcome class is invalid"
+    );
+    ensure!(
+        valid_provider_admission_ref(&report.runtime_id),
+        "Comfy admission runtime id is invalid"
+    );
+    validate_hex32_config(
+        "Comfy admission inventory root",
+        Some(&report.inventory_root),
+    )?;
+    ensure!(
+        report.part_count <= 512,
+        "Comfy admission has too many parts"
+    );
+    ensure!(
+        matches!(report.mode.as_str(), "all-at-once" | "staged"),
+        "Comfy admission mode is invalid"
+    );
+    ensure!(
+        report.max_sessions > 0,
+        "Comfy admission max_sessions must be positive"
+    );
+    ensure!(
+        report.max_safe_sessions >= report.max_sessions,
+        "Comfy admission max_sessions exceeds max_safe_sessions"
+    );
+    ensure!(
+        report.required_bytes >= report.peak_bytes,
+        "Comfy admission required bytes cannot be below peak bytes"
+    );
+    ensure!(
+        report.required_human == human_bytes(report.required_bytes),
+        "Comfy admission required byte label mismatch"
+    );
+    ensure!(
+        report.usable_human == human_bytes(report.usable_bytes),
+        "Comfy admission usable byte label mismatch"
+    );
+    ensure!(!report.phases.is_empty(), "Comfy admission has no phases");
+    let mut seen_phase = BTreeSet::new();
+    let mut covered_parts = BTreeSet::new();
+    for phase in &report.phases {
+        ensure!(
+            seen_phase.insert(phase.id.clone()) && valid_load_plan_label(&phase.id),
+            "Comfy admission phase id is invalid or duplicated"
+        );
+        let resident = normalized_unique_part_ids(&phase.resident_parts)?;
+        ensure!(
+            resident == phase.resident_parts,
+            "Comfy admission phase resident parts are not canonical"
+        );
+        ensure!(
+            !resident.is_empty(),
+            "Comfy admission phase {} has no resident parts",
+            phase.id
+        );
+        for part_id in resident {
+            covered_parts.insert(part_id);
+        }
+        let expected_peak = phase.resident_bytes.saturating_add(
+            phase
+                .working_set_bytes_per_session
+                .saturating_mul(u64::from(report.max_sessions)),
+        );
+        ensure!(
+            expected_peak == phase.peak_bytes,
+            "Comfy admission phase {} peak bytes mismatch",
+            phase.id
+        );
+        for boundary in &phase.boundary_outputs {
+            ensure!(
+                valid_load_plan_label(boundary),
+                "Comfy admission phase {} boundary output is invalid",
+                phase.id
+            );
+        }
+        let safe = normalized_unique_part_ids(&phase.safe_unload_after)?;
+        ensure!(
+            safe == phase.safe_unload_after,
+            "Comfy admission phase {} safe unload list is not canonical",
+            phase.id
+        );
+    }
+    ensure!(
+        covered_parts.len() == report.part_count as usize,
+        "Comfy admission covered part count does not match part_count"
+    );
+    ensure!(
+        report
+            .phases
+            .iter()
+            .map(|phase| phase.peak_bytes)
+            .max()
+            .unwrap_or(0)
+            == report.peak_bytes,
+        "Comfy admission peak bytes mismatch"
+    );
+    Ok(())
+}
+
 fn provider_comfy_inventory_root(home: &Path) -> Result<Option<String>> {
     Ok(read_provider_comfy_inventory(home)?.map(|inventory| inventory.index_root))
 }
@@ -27653,6 +27943,102 @@ fn provider_comfy_workflow_inventory_root(
         selected.enclave.model_id
     );
     Ok(Some(actual))
+}
+
+fn provider_comfy_workflow_output_modality(selected: &ProviderCandidate) -> Option<&'static str> {
+    if !catalog_model_has_comfy_workflow_endpoint(&selected.model) {
+        return None;
+    }
+    if selected
+        .served_modalities
+        .iter()
+        .any(|modality| modality == "video")
+    {
+        Some("video")
+    } else if selected
+        .served_modalities
+        .iter()
+        .any(|modality| modality == "audio")
+    {
+        Some("audio")
+    } else {
+        Some("image")
+    }
+}
+
+fn provider_comfy_workflow_required_part_ids(selected: &ProviderCandidate) -> Result<Vec<String>> {
+    let Some(policy) = selected.model.workflow.as_ref() else {
+        return Ok(Vec::new());
+    };
+    normalized_unique_part_ids(
+        &policy
+            .parts
+            .iter()
+            .map(|part| part.part_id.clone())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn provider_comfy_workflow_admission(
+    home: &Path,
+    selected: &ProviderCandidate,
+    workflow_inventory_root: Option<&str>,
+) -> Result<Option<ProviderComfyAdmission>> {
+    let Some(modality) = provider_comfy_workflow_output_modality(selected) else {
+        return Ok(None);
+    };
+    let policy = selected.model.workflow.as_ref().with_context(|| {
+        format!(
+            "Comfy workflow {} requires signed workflow policy before admission",
+            selected.enclave.model_id
+        )
+    })?;
+    let outcome_class = policy.outcome_class_for(modality);
+    let runtime_id = policy.runtime_id();
+    let inventory_root = workflow_inventory_root.with_context(|| {
+        format!(
+            "Comfy workflow {} requires a verified provider inventory root before admission",
+            selected.enclave.model_id
+        )
+    })?;
+    let admission = read_provider_comfy_admission(home, &outcome_class)?.with_context(|| {
+        format!(
+            "Comfy workflow {} outcome class {} has no local admission proof; run `mayhem provider parts admit --write` before serving",
+            selected.enclave.model_id, outcome_class
+        )
+    })?;
+    let report = &admission.report;
+    ensure!(
+        report.runtime_id == runtime_id,
+        "Comfy workflow {} outcome class {} was admitted for runtime {}, but signed catalog requires {}",
+        selected.enclave.model_id,
+        outcome_class,
+        report.runtime_id,
+        runtime_id
+    );
+    ensure!(
+        report.inventory_root == inventory_root,
+        "Comfy workflow {} outcome class {} was admitted against inventory root {}, but signed catalog requires {}",
+        selected.enclave.model_id,
+        outcome_class,
+        report.inventory_root,
+        inventory_root
+    );
+    let admitted_ids = report
+        .phases
+        .iter()
+        .flat_map(|phase| phase.resident_parts.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let required_ids = provider_comfy_workflow_required_part_ids(selected)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        admitted_ids == required_ids,
+        "Comfy workflow {} outcome class {} admission parts do not match the signed catalog envelope",
+        selected.enclave.model_id,
+        outcome_class
+    );
+    Ok(Some(admission))
 }
 
 fn provider_comfy_workflow_inventory_resident_bytes(
@@ -28270,6 +28656,350 @@ fn print_provider_parts_inventory_report(
     Ok(())
 }
 
+fn provider_parts_admit(args: ProviderPartsAdmitArgs) -> Result<()> {
+    let report = provider_parts_admission_report(&args)?;
+    let written = if args.write && report.admitted {
+        let home = absolutize(args.home.clone().map(Ok).unwrap_or_else(default_home)?)?;
+        Some(write_provider_comfy_admission(&home, &report)?)
+    } else {
+        None
+    };
+    if args.json {
+        let mut value = serde_json::to_value(&report)?;
+        if let Some(path) = written.as_ref() {
+            value["admission_path"] = json!(path.display().to_string());
+        }
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else if report.admitted {
+        println!(
+            "Comfy outcome class {} admitted: peak {} fits {} with {}% headroom; max_sessions {}",
+            report.outcome_class,
+            human_bytes(report.peak_bytes),
+            report.usable_human,
+            report.headroom_pct,
+            report.max_sessions
+        );
+        if let Some(path) = written.as_ref() {
+            println!("Admission written: {}", path.display());
+        }
+    } else {
+        println!(
+            "Comfy outcome class {} refused: {}",
+            report.outcome_class,
+            report
+                .refusal_reason
+                .as_deref()
+                .unwrap_or("admission did not fit")
+        );
+    }
+    ensure!(
+        report.admitted,
+        "Comfy admission refused for {}: {}",
+        report.outcome_class,
+        report
+            .refusal_reason
+            .as_deref()
+            .unwrap_or("admission did not fit")
+    );
+    Ok(())
+}
+
+fn provider_parts_admission_report(
+    args: &ProviderPartsAdmitArgs,
+) -> Result<ProviderPartsAdmissionReport> {
+    ensure!(
+        args.max_sessions > 0,
+        "--max-sessions must be greater than zero"
+    );
+    ensure!(
+        args.headroom_pct <= 900,
+        "--headroom-pct must be between 0 and 900"
+    );
+    ensure!(
+        valid_provider_admission_ref(&args.outcome_class),
+        "--outcome-class must be a safe capability reference"
+    );
+    ensure!(
+        valid_provider_admission_ref(&args.runtime_id),
+        "--runtime-id must be a safe capability reference"
+    );
+    let home = absolutize(args.home.clone().map(Ok).unwrap_or_else(default_home)?)?;
+    let inventory = read_provider_comfy_inventory(&home)?.with_context(|| {
+        "this provider has no verified Comfy inventory; run `mayhem provider parts add` first"
+    })?;
+    let usable_bytes = parse_provider_admission_bytes(&args.usable_bytes, "--usable-bytes")?;
+    let working_set_bytes =
+        parse_provider_admission_bytes(&args.working_set_bytes, "--working-set-bytes")?;
+    let required_ids = normalized_unique_part_ids(&args.part_ids)?;
+    let by_part_id = inventory
+        .parts
+        .iter()
+        .map(|part| (part.part_id.as_str(), part))
+        .collect::<BTreeMap<_, _>>();
+    for part_id in &required_ids {
+        let part = by_part_id
+            .get(part_id.as_str())
+            .with_context(|| format!("required Comfy part {part_id} is not in this inventory"))?;
+        ensure!(
+            provider_comfy_part_payload_matches(
+                Path::new(&part.cache_path),
+                &part.record,
+                args.chunk_size
+            )?,
+            "required Comfy part {part_id} is missing or no longer matches its signed payload"
+        );
+    }
+    let phases = if let Some(load_plan) = args.load_plan.as_deref() {
+        provider_parts_admission_load_plan_phases(
+            load_plan,
+            &required_ids,
+            &by_part_id,
+            working_set_bytes,
+            args.max_sessions,
+        )?
+    } else {
+        let resident_bytes = required_ids.iter().try_fold(0_u64, |total, part_id| {
+            let part = by_part_id.get(part_id.as_str()).with_context(|| {
+                format!("required Comfy part {part_id} is not in this inventory")
+            })?;
+            Ok::<_, anyhow::Error>(total.saturating_add(part.record.size_bytes))
+        })?;
+        vec![ProviderPartsAdmissionPhaseReport {
+            id: "all-at-once".to_owned(),
+            resident_parts: required_ids.clone(),
+            resident_bytes,
+            working_set_bytes_per_session: working_set_bytes,
+            peak_bytes: resident_bytes
+                .saturating_add(working_set_bytes.saturating_mul(u64::from(args.max_sessions))),
+            boundary_outputs: Vec::new(),
+            safe_unload_after: Vec::new(),
+        }]
+    };
+    let all_at_once_bytes = required_ids.iter().try_fold(0_u64, |total, part_id| {
+        let part = by_part_id
+            .get(part_id.as_str())
+            .with_context(|| format!("required Comfy part {part_id} is not in this inventory"))?;
+        Ok::<_, anyhow::Error>(total.saturating_add(part.record.size_bytes))
+    })?;
+    let peak_bytes = phases
+        .iter()
+        .map(|phase| phase.peak_bytes)
+        .max()
+        .unwrap_or(0);
+    let required_bytes = apply_headroom_pct(peak_bytes, args.headroom_pct);
+    let admitted = required_bytes <= usable_bytes;
+    let refusal_reason = (!admitted).then(|| {
+        format!(
+            "peak {} plus {}% headroom requires {}, but only {} is usable",
+            human_bytes(peak_bytes),
+            args.headroom_pct,
+            human_bytes(required_bytes),
+            human_bytes(usable_bytes)
+        )
+    });
+    Ok(ProviderPartsAdmissionReport {
+        ok: admitted,
+        admitted,
+        outcome_class: args.outcome_class.clone(),
+        runtime_id: args.runtime_id.clone(),
+        inventory_root: inventory.index_root,
+        part_count: required_ids.len() as u64,
+        mode: if args.load_plan.is_some() {
+            "staged".to_owned()
+        } else {
+            "all-at-once".to_owned()
+        },
+        usable_bytes,
+        usable_human: human_bytes(usable_bytes),
+        headroom_pct: args.headroom_pct,
+        max_sessions: args.max_sessions,
+        working_set_bytes_per_session: working_set_bytes,
+        all_at_once_bytes,
+        peak_bytes,
+        required_bytes,
+        required_human: human_bytes(required_bytes),
+        max_safe_sessions: provider_parts_max_safe_sessions(
+            &phases,
+            usable_bytes,
+            args.headroom_pct,
+        ),
+        refusal_reason,
+        phases,
+    })
+}
+
+fn provider_parts_admission_load_plan_phases(
+    path: &Path,
+    required_ids: &[String],
+    by_part_id: &BTreeMap<&str, &ProviderComfyInventoryPart>,
+    default_working_set_bytes: u64,
+    max_sessions: u32,
+) -> Result<Vec<ProviderPartsAdmissionPhaseReport>> {
+    let plan: ProviderPartsAdmissionLoadPlan = serde_json::from_value(read_json_file(path)?)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    ensure!(
+        plan.schema_version == 1,
+        "Comfy load plan schema mismatch: expected 1, got {}",
+        plan.schema_version
+    );
+    ensure!(!plan.phases.is_empty(), "Comfy load plan has no phases");
+    ensure!(
+        plan.phases.len() <= 64,
+        "Comfy load plan has too many phases"
+    );
+    let required = required_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let mut covered = BTreeSet::new();
+    let mut reports = Vec::new();
+    let mut previous_resident = BTreeSet::<String>::new();
+    let mut previous_phase: Option<&ProviderPartsAdmissionLoadPlanPhase> = None;
+    for phase in &plan.phases {
+        ensure!(
+            valid_load_plan_label(&phase.id),
+            "Comfy load plan phase id {:?} is invalid",
+            phase.id
+        );
+        let resident = normalized_unique_part_ids(&phase.resident_parts)?;
+        ensure!(
+            !resident.is_empty(),
+            "Comfy load plan phase {} has no resident parts",
+            phase.id
+        );
+        let resident_set = resident.iter().cloned().collect::<BTreeSet<_>>();
+        for part_id in &resident_set {
+            ensure!(
+                required.contains(part_id),
+                "Comfy load plan phase {} references part {} outside the admitted envelope",
+                phase.id,
+                part_id
+            );
+            covered.insert(part_id.clone());
+        }
+        if let Some(previous) = previous_phase {
+            let dropped = previous_resident
+                .difference(&resident_set)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !dropped.is_empty() {
+                ensure!(
+                    !previous.boundary_outputs.is_empty(),
+                    "Comfy load plan phase {} unloads parts before phase {} but declares no boundary_outputs",
+                    previous.id,
+                    phase.id
+                );
+                for boundary in &previous.boundary_outputs {
+                    ensure!(
+                        valid_load_plan_label(boundary),
+                        "Comfy load plan phase {} has invalid boundary output {:?}",
+                        previous.id,
+                        boundary
+                    );
+                }
+                let safe = previous
+                    .safe_unload_after
+                    .iter()
+                    .map(|part_id| part_id.to_ascii_lowercase())
+                    .collect::<BTreeSet<_>>();
+                for part_id in &dropped {
+                    ensure!(
+                        safe.contains(part_id),
+                        "Comfy load plan phase {} unloads part {} before phase {} without listing it in safe_unload_after",
+                        previous.id,
+                        part_id,
+                        phase.id
+                    );
+                }
+            }
+        }
+        let resident_bytes = resident.iter().try_fold(0_u64, |total, part_id| {
+            let part = by_part_id.get(part_id.as_str()).with_context(|| {
+                format!("required Comfy part {part_id} is not in this inventory")
+            })?;
+            Ok::<_, anyhow::Error>(total.saturating_add(part.record.size_bytes))
+        })?;
+        let phase_working_set = phase.working_set_bytes.unwrap_or(default_working_set_bytes);
+        reports.push(ProviderPartsAdmissionPhaseReport {
+            id: phase.id.clone(),
+            resident_parts: resident,
+            resident_bytes,
+            working_set_bytes_per_session: phase_working_set,
+            peak_bytes: resident_bytes
+                .saturating_add(phase_working_set.saturating_mul(u64::from(max_sessions))),
+            boundary_outputs: phase.boundary_outputs.clone(),
+            safe_unload_after: phase.safe_unload_after.clone(),
+        });
+        previous_resident = resident_set;
+        previous_phase = Some(phase);
+    }
+    for part_id in required {
+        ensure!(
+            covered.contains(&part_id),
+            "Comfy load plan never loads required part {part_id}"
+        );
+    }
+    Ok(reports)
+}
+
+fn provider_parts_max_safe_sessions(
+    phases: &[ProviderPartsAdmissionPhaseReport],
+    usable_bytes: u64,
+    headroom_pct: u32,
+) -> u32 {
+    let allowed_peak = usable_bytes.saturating_mul(100) / u64::from(100 + headroom_pct);
+    phases.iter().fold(u32::MAX, |limit, phase| {
+        if phase.resident_bytes > allowed_peak {
+            return 0;
+        }
+        if phase.working_set_bytes_per_session == 0 {
+            return limit;
+        }
+        let sessions = (allowed_peak - phase.resident_bytes) / phase.working_set_bytes_per_session;
+        limit.min(u32::try_from(sessions).unwrap_or(u32::MAX))
+    })
+}
+
+fn apply_headroom_pct(bytes: u64, headroom_pct: u32) -> u64 {
+    let numerator = u64::from(100 + headroom_pct);
+    multiply_ratio_ceil(bytes, numerator, 100)
+}
+
+fn parse_provider_admission_bytes(value: &str, flag: &str) -> Result<u64> {
+    if value.trim() == "0" {
+        return Ok(0);
+    }
+    parse_provider_modality_bytes(value).with_context(|| format!("parsing {flag}"))
+}
+
+fn normalized_unique_part_ids(part_ids: &[String]) -> Result<Vec<String>> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for part_id in part_ids {
+        let part_id = part_id.to_ascii_lowercase();
+        ensure!(
+            is_hex_len(&part_id, 64),
+            "Comfy part id must be 32-byte hex"
+        );
+        ensure!(
+            seen.insert(part_id.clone()),
+            "duplicate Comfy part id {part_id}"
+        );
+        out.push(part_id);
+    }
+    Ok(out)
+}
+
+fn valid_load_plan_label(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 128
+        && trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':'))
+}
+
+fn valid_provider_admission_ref(value: &str) -> bool {
+    valid_load_plan_label(value) && !value.contains("..")
+}
+
 fn provider_comfy_part_cache_path(
     cache_dir: &Path,
     record: &mayhem_proto::ComfyPartRecord,
@@ -28693,6 +29423,13 @@ fn provider_comfy_part_payload_candidates(
 }
 
 fn comfy_part_yaml_skip_reason(row: &Value) -> Option<String> {
+    comfy_part_yaml_skip_reason_with_options(row, false)
+}
+
+fn comfy_part_yaml_skip_reason_with_options(
+    row: &Value,
+    allow_unknown_file_format: bool,
+) -> Option<String> {
     let object = row.as_object()?;
     if object
         .get("status")
@@ -28729,7 +29466,7 @@ fn comfy_part_yaml_skip_reason(row: &Value) -> Option<String> {
         }
         Some(_) => {
             let draft = mayhem_proto::ComfyPartDraft::from_yaml_value(row).ok()?;
-            if draft.file_format.eq_ignore_ascii_case("unknown") {
+            if draft.file_format.eq_ignore_ascii_case("unknown") && !allow_unknown_file_format {
                 return Some(
                     "file_format is unknown; split archives/containers and pin the provider-facing payload first"
                         .to_owned(),
@@ -55106,6 +55843,7 @@ struct HeartbeatContext<'a> {
     identity_anchor: &'a str,
     tpm_activation_hello: Option<&'a mayhem_proto::TpmActivateCredentialHello>,
     workflow_inventory_root: Option<&'a str>,
+    workflow_admission: Option<&'a ProviderComfyAdmission>,
     max_sessions: u32,
 }
 
@@ -56105,6 +56843,7 @@ struct ProviderSessionHeartbeatTask {
     identity_anchor: String,
     tpm_activation_hello: Option<mayhem_proto::TpmActivateCredentialHello>,
     workflow_inventory_root: Option<String>,
+    workflow_admission: Option<ProviderComfyAdmission>,
     min_ask_au: MoneyAu,
     max_sessions: u32,
     load: ProviderHeartbeatLoad,
@@ -56765,6 +57504,7 @@ struct ProviderSessionContext<'a> {
     identity_anchor: &'a str,
     tpm_activation_hello: Option<&'a mayhem_proto::TpmActivateCredentialHello>,
     workflow_inventory_root: Option<String>,
+    workflow_admission: Option<ProviderComfyAdmission>,
     rules: &'a RulesRef,
 }
 
@@ -58845,6 +59585,8 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         requested_enclave.as_deref(),
     )?;
     let workflow_inventory_root = provider_comfy_workflow_inventory_root(&home, &selected)?;
+    let workflow_admission =
+        provider_comfy_workflow_admission(&home, &selected, workflow_inventory_root.as_deref())?;
     args.load_progress = Some(ProviderLoadProgressContext::new(
         &home,
         &wallet.public_key,
@@ -59101,6 +59843,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         identity_anchor: &identity_anchor,
         tpm_activation_hello: attestation_material.tpm_activation_hello.as_ref(),
         workflow_inventory_root: workflow_inventory_root.clone(),
+        workflow_admission,
         rules: &rules,
     };
     let (session_responder, modality_health) = if args.serve_sessions {
@@ -59180,6 +59923,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             identity_anchor: &identity_anchor,
             tpm_activation_hello: attestation_material.tpm_activation_hello.as_ref(),
             workflow_inventory_root: workflow_inventory_root.as_deref(),
+            workflow_admission: session_context.workflow_admission.as_ref(),
             max_sessions: protection_config.max_sessions,
         })
         .await?
@@ -59344,6 +60088,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
                 identity_anchor: &identity_anchor,
                 tpm_activation_hello: attestation_material.tpm_activation_hello.as_ref(),
                 workflow_inventory_root: workflow_inventory_root.clone(),
+                workflow_admission: session_context.workflow_admission.clone(),
                 rules: &rules,
             },
             ProviderSessionRuntime {
@@ -72381,6 +73126,7 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
                 ctx.identity_anchor,
                 ctx.tpm_activation_hello,
                 ctx.workflow_inventory_root,
+                ctx.workflow_admission,
                 ctx.args.min_ask_au,
                 ctx.max_sessions,
                 Some(transport_peer.as_str()),
@@ -72406,6 +73152,7 @@ async fn send_provider_heartbeat_round(
     identity_anchor: &str,
     tpm_activation_hello: Option<&mayhem_proto::TpmActivateCredentialHello>,
     workflow_inventory_root: Option<&str>,
+    workflow_admission: Option<&ProviderComfyAdmission>,
     min_ask_au: MoneyAu,
     max_sessions: u32,
     transport_peer: Option<&str>,
@@ -72489,17 +73236,26 @@ async fn send_provider_heartbeat_round(
             "ts": ts,
             "nonce": blake3::hash(format!("{}:{}:{}:{}", room.room_id, provider_pubkey, ts, seq).as_bytes()).to_hex().to_string(),
         });
-        if let Some(workflow_classes) =
-            provider_heartbeat_workflow_classes(selected, heartbeat_min_ask_au, max_sessions, &load)
-        {
-            heartbeat["runtime_id"] = json!(selected
-                .model
-                .workflow
-                .as_ref()
-                .map(mayhem_proto::ComfyWorkflowCatalogPolicy::runtime_id)
-                .unwrap_or(mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID));
-            if let Some(root) = workflow_inventory_root {
-                heartbeat["inventory_root"] = json!(root);
+        if let Some(workflow_classes) = provider_heartbeat_workflow_classes(
+            selected,
+            heartbeat_min_ask_au,
+            max_sessions,
+            &load,
+            workflow_admission,
+        ) {
+            if let Some(admission) = workflow_admission {
+                heartbeat["runtime_id"] = json!(admission.report.runtime_id);
+                heartbeat["inventory_root"] = json!(admission.report.inventory_root);
+            } else {
+                heartbeat["runtime_id"] = json!(selected
+                    .model
+                    .workflow
+                    .as_ref()
+                    .map(mayhem_proto::ComfyWorkflowCatalogPolicy::runtime_id)
+                    .unwrap_or(mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID));
+                if let Some(root) = workflow_inventory_root {
+                    heartbeat["inventory_root"] = json!(root);
+                }
             }
             heartbeat["workflow_classes"] = workflow_classes;
         }
@@ -72773,6 +73529,7 @@ async fn run_provider_session_heartbeat_connection(
                 &ctx.identity_anchor,
                 ctx.tpm_activation_hello.as_ref(),
                 ctx.workflow_inventory_root.as_deref(),
+                ctx.workflow_admission.as_ref(),
                 ctx.min_ask_au,
                 ctx.max_sessions,
                 Some(transport_peer.as_str()),
@@ -72882,43 +73639,18 @@ fn provider_heartbeat_workflow_classes(
     min_ask_au: MoneyAu,
     max_sessions: u32,
     load: &ProviderLoadSnapshot,
+    admission: Option<&ProviderComfyAdmission>,
 ) -> Option<Value> {
-    if !selected
-        .model
-        .adapter
-        .endpoint_families
-        .iter()
-        .any(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS)
-    {
-        return None;
-    }
-    let modality = if selected
-        .served_modalities
-        .iter()
-        .any(|modality| modality == "video")
-    {
-        "video"
-    } else if selected
-        .served_modalities
-        .iter()
-        .any(|modality| modality == "audio")
-    {
-        "audio"
-    } else {
-        "image"
-    };
-    let outcome_class = selected
-        .model
-        .workflow
-        .as_ref()
-        .map(|policy| policy.outcome_class_for(modality))
-        .unwrap_or_else(|| format!("{modality}.workflow"));
+    let modality = provider_comfy_workflow_output_modality(selected)?;
+    let admission = admission?;
+    let outcome_class = admission.report.outcome_class.clone();
     let max_concurrent = selected
         .modality_capacities
         .get(modality)
         .map(|capacity| capacity.max_inflight_items.max(1))
         .unwrap_or_else(|| max_sessions.max(1))
-        .min(max_sessions.max(1));
+        .min(max_sessions.max(1))
+        .min(admission.report.max_sessions.max(1));
     let active = load
         .modality_active_items
         .get(modality)
@@ -73064,6 +73796,7 @@ async fn serve_provider_sessions(
         identity_anchor: ctx.identity_anchor.to_owned(),
         tpm_activation_hello: ctx.tpm_activation_hello.cloned(),
         workflow_inventory_root: ctx.workflow_inventory_root.clone(),
+        workflow_admission: ctx.workflow_admission.clone(),
         min_ask_au: ctx.args.min_ask_au,
         max_sessions: protection_config.max_sessions,
         load: heartbeat_load.clone(),
@@ -92226,6 +92959,58 @@ status: linked
     }
 
     #[test]
+    fn provider_parts_admit_cli_parses_staged_plan() {
+        let parsed = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "parts",
+            "admit",
+            "--home",
+            "home",
+            "--outcome-class",
+            "image.workflow.sdxl",
+            "--runtime-id",
+            "comfyui-v0.30.1",
+            "--part-id",
+            &"aa".repeat(32),
+            "--usable-bytes",
+            "24GB",
+            "--working-set-bytes",
+            "2GB",
+            "--headroom-pct",
+            "25",
+            "--max-sessions",
+            "2",
+            "--load-plan",
+            "load-plan.json",
+            "--chunk-size",
+            "8",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = parsed.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::Parts { command } = *command else {
+            panic!("expected provider parts command");
+        };
+        let ProviderPartsCommands::Admit(args) = command else {
+            panic!("expected provider parts admit command");
+        };
+        assert_eq!(args.home, Some(PathBuf::from("home")));
+        assert_eq!(args.outcome_class, "image.workflow.sdxl");
+        assert_eq!(args.runtime_id, "comfyui-v0.30.1");
+        assert_eq!(args.part_ids, vec!["aa".repeat(32)]);
+        assert_eq!(args.usable_bytes, "24GB");
+        assert_eq!(args.working_set_bytes, "2GB");
+        assert_eq!(args.headroom_pct, 25);
+        assert_eq!(args.max_sessions, 2);
+        assert_eq!(args.load_plan, Some(PathBuf::from("load-plan.json")));
+        assert_eq!(args.chunk_size, 8);
+        assert!(args.json);
+    }
+
+    #[test]
     fn provider_parts_pull_verifies_layout_and_installs_matching_payload() {
         let temp = test_temp_dir("mayhem-provider-parts-pull");
         let source_dir = temp.join("source");
@@ -92269,6 +93054,207 @@ status: linked
         let cache_path = provider_comfy_part_cache_path(&cache_dir, &record);
         assert!(cache_path.exists());
         assert!(provider_comfy_part_payload_matches(&cache_path, &record, 8).unwrap());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn provider_parts_admit_refuses_overcommit_but_accepts_declared_staging() {
+        let temp = test_temp_dir("mayhem-provider-parts-admit-staged");
+        let source_dir = temp.join("source");
+        let layout_dir = temp.join("layout");
+        let payload_dir = temp.join("payloads");
+        let cache_dir = temp.join("cache");
+        let home = temp.join("home");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&payload_dir).unwrap();
+        let base_payload = payload_dir.join("base.safetensors");
+        let refiner_payload = payload_dir.join("refiner.safetensors");
+        fs::write(&base_payload, vec![0x41; 60]).unwrap();
+        fs::write(&refiner_payload, vec![0x42; 50]).unwrap();
+        let base = test_comfy_part_record_for_payload("base.safetensors", &base_payload, 8);
+        let refiner =
+            test_comfy_part_record_for_payload("refiner.safetensors", &refiner_payload, 8);
+        let base_record = source_dir.join("base.json");
+        let refiner_record = source_dir.join("refiner.json");
+        write_json_file(&base_record, &base).unwrap();
+        write_json_file(&refiner_record, &refiner).unwrap();
+        admin_parts_build_index(&AdminPartsBuildIndexArgs {
+            records: vec![base_record, refiner_record],
+            output_dir: layout_dir.clone(),
+            index_ver: 31,
+            blessed_runtimes: vec!["comfyui-v0.30.1".to_owned()],
+            whitelist_ver: 1,
+            outcome_classes_ver: 1,
+        })
+        .unwrap();
+        provider_parts_add(ProviderPartsPullArgs {
+            home: Some(home.clone()),
+            layout_dir,
+            part_ids: Vec::new(),
+            all: true,
+            payload_dir: Some(payload_dir),
+            hf_token_file: None,
+            source_token_file: None,
+            cache_dir: Some(cache_dir),
+            disk_reserve: None,
+            offline: true,
+            require_payload: false,
+            chunk_size: 8,
+            json: true,
+        })
+        .unwrap();
+
+        let all_at_once = provider_parts_admission_report(&ProviderPartsAdmitArgs {
+            home: Some(home.clone()),
+            outcome_class: "image.workflow.test".to_owned(),
+            runtime_id: "comfyui-v0.30.1".to_owned(),
+            part_ids: vec![base.part_id.clone(), refiner.part_id.clone()],
+            usable_bytes: "100".to_owned(),
+            working_set_bytes: "10".to_owned(),
+            headroom_pct: 0,
+            max_sessions: 2,
+            load_plan: None,
+            chunk_size: 8,
+            write: false,
+            json: true,
+        })
+        .unwrap();
+        assert!(!all_at_once.admitted);
+        assert_eq!(all_at_once.mode, "all-at-once");
+        assert_eq!(all_at_once.peak_bytes, 130);
+        assert!(all_at_once
+            .refusal_reason
+            .as_deref()
+            .unwrap()
+            .contains("requires 130B"));
+
+        let load_plan = temp.join("load-plan.json");
+        write_json_file(
+            &load_plan,
+            &json!({
+                "schema_version": 1,
+                "phases": [
+                    {
+                        "id": "base",
+                        "resident_parts": [base.part_id],
+                        "boundary_outputs": ["latent"],
+                        "safe_unload_after": [base.part_id]
+                    },
+                    {
+                        "id": "refiner",
+                        "resident_parts": [refiner.part_id]
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+        let staged = provider_parts_admission_report(&ProviderPartsAdmitArgs {
+            home: Some(home),
+            outcome_class: "image.workflow.test".to_owned(),
+            runtime_id: "comfyui-v0.30.1".to_owned(),
+            part_ids: vec![base.part_id.clone(), refiner.part_id.clone()],
+            usable_bytes: "100".to_owned(),
+            working_set_bytes: "10".to_owned(),
+            headroom_pct: 0,
+            max_sessions: 2,
+            load_plan: Some(load_plan),
+            chunk_size: 8,
+            write: false,
+            json: true,
+        })
+        .unwrap();
+        assert!(staged.admitted);
+        assert_eq!(staged.mode, "staged");
+        assert_eq!(staged.all_at_once_bytes, 110);
+        assert_eq!(staged.peak_bytes, 80);
+        assert_eq!(staged.required_bytes, 80);
+        assert_eq!(staged.max_safe_sessions, 4);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn provider_parts_admit_refuses_staged_unload_without_boundary() {
+        let temp = test_temp_dir("mayhem-provider-parts-admit-bad-boundary");
+        let source_dir = temp.join("source");
+        let layout_dir = temp.join("layout");
+        let payload_dir = temp.join("payloads");
+        let cache_dir = temp.join("cache");
+        let home = temp.join("home");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&payload_dir).unwrap();
+        let first_payload = payload_dir.join("first.safetensors");
+        let second_payload = payload_dir.join("second.safetensors");
+        fs::write(&first_payload, vec![0x11; 32]).unwrap();
+        fs::write(&second_payload, vec![0x22; 32]).unwrap();
+        let first = test_comfy_part_record_for_payload("first.safetensors", &first_payload, 8);
+        let second = test_comfy_part_record_for_payload("second.safetensors", &second_payload, 8);
+        let first_record = source_dir.join("first.json");
+        let second_record = source_dir.join("second.json");
+        write_json_file(&first_record, &first).unwrap();
+        write_json_file(&second_record, &second).unwrap();
+        admin_parts_build_index(&AdminPartsBuildIndexArgs {
+            records: vec![first_record, second_record],
+            output_dir: layout_dir.clone(),
+            index_ver: 32,
+            blessed_runtimes: vec!["comfyui-v0.30.1".to_owned()],
+            whitelist_ver: 1,
+            outcome_classes_ver: 1,
+        })
+        .unwrap();
+        provider_parts_add(ProviderPartsPullArgs {
+            home: Some(home.clone()),
+            layout_dir,
+            part_ids: Vec::new(),
+            all: true,
+            payload_dir: Some(payload_dir),
+            hf_token_file: None,
+            source_token_file: None,
+            cache_dir: Some(cache_dir),
+            disk_reserve: None,
+            offline: true,
+            require_payload: false,
+            chunk_size: 8,
+            json: true,
+        })
+        .unwrap();
+        let load_plan = temp.join("bad-load-plan.json");
+        write_json_file(
+            &load_plan,
+            &json!({
+                "schema_version": 1,
+                "phases": [
+                    {
+                        "id": "first",
+                        "resident_parts": [first.part_id],
+                        "safe_unload_after": [first.part_id]
+                    },
+                    {
+                        "id": "second",
+                        "resident_parts": [second.part_id]
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+        let err = provider_parts_admission_report(&ProviderPartsAdmitArgs {
+            home: Some(home),
+            outcome_class: "image.workflow.test".to_owned(),
+            runtime_id: "comfyui-v0.30.1".to_owned(),
+            part_ids: vec![first.part_id, second.part_id],
+            usable_bytes: "100".to_owned(),
+            working_set_bytes: "0".to_owned(),
+            headroom_pct: 0,
+            max_sessions: 1,
+            load_plan: Some(load_plan),
+            chunk_size: 8,
+            write: false,
+            json: true,
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("declares no boundary_outputs"),
+            "{err:#}"
+        );
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -92486,6 +93472,128 @@ status: linked
             provider_comfy_workflow_inventory_root(&temp, &selected).unwrap(),
             Some(expected_root)
         );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn provider_workflow_heartbeat_requires_matching_saved_admission() {
+        let temp = test_temp_dir("mayhem-provider-workflow-saved-admission");
+        let source_dir = temp.join("source");
+        let layout_dir = temp.join("layout");
+        let payload_dir = temp.join("payloads");
+        let cache_dir = temp.join("cache");
+        let home = temp.join("home");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&payload_dir).unwrap();
+        let payload_path = payload_dir.join("tiny.safetensors");
+        fs::write(&payload_path, b"workflow admission payload").unwrap();
+        let record = test_comfy_part_record_for_payload("tiny.safetensors", &payload_path, 8);
+        let record_path = source_dir.join("record.json");
+        write_json_file(&record_path, &record).unwrap();
+        admin_parts_build_index(&AdminPartsBuildIndexArgs {
+            records: vec![record_path],
+            output_dir: layout_dir.clone(),
+            index_ver: 6,
+            blessed_runtimes: vec!["comfyui-v0.31.0".to_owned()],
+            whitelist_ver: 1,
+            outcome_classes_ver: 1,
+        })
+        .unwrap();
+        provider_parts_add(ProviderPartsPullArgs {
+            home: Some(home.clone()),
+            layout_dir,
+            part_ids: vec![record.part_id.clone()],
+            all: false,
+            payload_dir: Some(payload_dir),
+            hf_token_file: None,
+            source_token_file: None,
+            cache_dir: Some(cache_dir),
+            disk_reserve: None,
+            offline: true,
+            require_payload: false,
+            chunk_size: 8,
+            json: true,
+        })
+        .unwrap();
+        let inventory_root = provider_comfy_inventory_root(&home).unwrap().unwrap();
+        let report = provider_parts_admission_report(&ProviderPartsAdmitArgs {
+            home: Some(home.clone()),
+            outcome_class: "image.custom.512".to_owned(),
+            runtime_id: "comfyui-v0.31.0".to_owned(),
+            part_ids: vec![record.part_id.clone()],
+            usable_bytes: "1KB".to_owned(),
+            working_set_bytes: "10".to_owned(),
+            headroom_pct: 0,
+            max_sessions: 2,
+            load_plan: None,
+            chunk_size: 8,
+            write: false,
+            json: true,
+        })
+        .unwrap();
+        write_provider_comfy_admission(&home, &report).unwrap();
+
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0].adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            )
+            .unwrap()];
+        catalog.models[0].workflow = Some(mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["CheckpointLoaderSimple".to_owned(), "SaveImage".to_owned()],
+            parts: vec![mayhem_proto::ComfyWorkflowPartRef {
+                name: record.name.clone(),
+                part_id: record.part_id.clone(),
+                part_type: record.part_type.clone(),
+                sha256: record.sha256.clone(),
+            }],
+            runtime_id: Some("comfyui-v0.31.0".to_owned()),
+            outcome_class: Some("image.custom.512".to_owned()),
+            inventory_root: Some(inventory_root.clone()),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        });
+        let contract = test_contract(&root);
+        let artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        let mut selected = ProviderCandidate {
+            enclave: contract.enclaves[0].clone(),
+            model: catalog.models[0].clone(),
+            artifact_name: "gguf-q4_k_m".to_owned(),
+            artifact,
+            verdict: BackendVerdict {
+                backend: "comfyui".to_owned(),
+                status: VerdictStatus::FullOffload,
+                reason: None,
+                est_tok_s: None,
+                n_layers_gpu: None,
+                max_sessions: 3,
+                kv_cache_bytes_budget: 0,
+            },
+            price: contract.prices.first().cloned(),
+            served_ctx: 1,
+            served_modalities: vec!["image".to_owned()],
+            served_specialities: BTreeMap::new(),
+            modality_capacities: test_modality_capacities("image"),
+            feasibility: ProviderCtxFeasibility::not_applicable(1, 0),
+            ctx_bracket_schedule: default_ctx_bracket_schedule(),
+        };
+        let admission = provider_comfy_workflow_admission(&home, &selected, Some(&inventory_root))
+            .unwrap()
+            .unwrap();
+        let classes = provider_heartbeat_workflow_classes(
+            &selected,
+            5,
+            3,
+            &ProviderLoadSnapshot::idle(3),
+            Some(&admission),
+        )
+        .unwrap();
+        assert_eq!(classes["image.custom.512"]["max_concurrent"], json!(1));
+
+        selected.model.workflow.as_mut().unwrap().runtime_id = Some("comfyui-v9.9.9".to_owned());
+        let err =
+            provider_comfy_workflow_admission(&home, &selected, Some(&inventory_root)).unwrap_err();
+        assert!(err.to_string().contains("was admitted for runtime"));
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -107205,6 +108313,48 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(provider_heartbeat_caps(&selected).tools);
     }
 
+    fn test_provider_comfy_admission(
+        outcome_class: &str,
+        runtime_id: &str,
+        max_sessions: u32,
+    ) -> ProviderComfyAdmission {
+        let part_id = "11".repeat(32);
+        let peak_bytes = 50_u64.saturating_add(10_u64.saturating_mul(u64::from(max_sessions)));
+        ProviderComfyAdmission {
+            schema_version: PROVIDER_COMFY_ADMISSION_SCHEMA_VERSION,
+            admitted_at: 1,
+            report: ProviderPartsAdmissionReport {
+                ok: true,
+                admitted: true,
+                outcome_class: outcome_class.to_owned(),
+                runtime_id: runtime_id.to_owned(),
+                inventory_root: "33".repeat(32),
+                part_count: 1,
+                mode: "all-at-once".to_owned(),
+                usable_bytes: 100,
+                usable_human: "100B".to_owned(),
+                headroom_pct: 0,
+                max_sessions,
+                working_set_bytes_per_session: 10,
+                all_at_once_bytes: 50,
+                peak_bytes,
+                required_bytes: peak_bytes,
+                required_human: human_bytes(peak_bytes),
+                max_safe_sessions: max_sessions,
+                refusal_reason: None,
+                phases: vec![ProviderPartsAdmissionPhaseReport {
+                    id: "all-at-once".to_owned(),
+                    resident_parts: vec![part_id],
+                    resident_bytes: 50,
+                    working_set_bytes_per_session: 10,
+                    peak_bytes,
+                    boundary_outputs: Vec::new(),
+                    safe_unload_after: Vec::new(),
+                }],
+            },
+        }
+    }
+
     #[test]
     fn provider_heartbeat_advertises_workflow_classes_only_for_comfy_models() {
         let root = "aa".repeat(32);
@@ -107235,7 +108385,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         };
         let load = ProviderLoadSnapshot::idle(2);
         assert!(
-            provider_heartbeat_workflow_classes(&selected, 7, 2, &load).is_none(),
+            provider_heartbeat_workflow_classes(&selected, 7, 2, &load, None).is_none(),
             "non-Comfy endpoint models must not gain workflow heartbeat fields"
         );
 
@@ -107244,8 +108394,20 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
             )
             .unwrap()];
-        let classes = provider_heartbeat_workflow_classes(&selected, 7, 2, &load)
-            .expect("Comfy endpoint should advertise workflow class");
+        assert!(
+            provider_heartbeat_workflow_classes(&selected, 7, 2, &load, None).is_none(),
+            "Comfy endpoints must not advertise workflow classes without admission"
+        );
+        let image_workflow_admission =
+            test_provider_comfy_admission("image.workflow", "comfyui-v0.30.1", 2);
+        let classes = provider_heartbeat_workflow_classes(
+            &selected,
+            7,
+            2,
+            &load,
+            Some(&image_workflow_admission),
+        )
+        .expect("Comfy endpoint should advertise workflow class");
         assert_eq!(classes["image.workflow"]["min_ask_au"], json!("7"));
         assert_eq!(classes["image.workflow"]["max_concurrent"], json!(1));
         assert_eq!(classes["image.workflow"]["active"], json!(0));
@@ -107266,8 +108428,11 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             modality_active_items: BTreeMap::from([("image".to_owned(), 2)]),
             ..ProviderLoadSnapshot::idle(3)
         };
-        let classes = provider_heartbeat_workflow_classes(&selected, 9, 3, &load)
-            .expect("Comfy endpoint should advertise signed workflow class");
+        let custom_admission =
+            test_provider_comfy_admission("image.custom.512", "comfyui-v0.31.0", 5);
+        let classes =
+            provider_heartbeat_workflow_classes(&selected, 9, 3, &load, Some(&custom_admission))
+                .expect("Comfy endpoint should advertise signed workflow class");
         assert_eq!(classes["image.custom.512"]["min_ask_au"], json!("9"));
         assert_eq!(classes["image.custom.512"]["max_concurrent"], json!(3));
         assert_eq!(classes["image.custom.512"]["active"], json!(2));
@@ -107327,6 +108492,11 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             heartbeat_min_ask,
             1,
             &ProviderLoadSnapshot::idle(1),
+            Some(&test_provider_comfy_admission(
+                "image.workflow",
+                "comfyui-v0.30.1",
+                1,
+            )),
         )
         .expect("Comfy endpoint should advertise workflow class");
         assert_eq!(classes["image.workflow"]["min_ask_au"], json!("11"));
