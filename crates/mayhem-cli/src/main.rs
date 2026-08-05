@@ -28654,6 +28654,13 @@ fn provider_comfy_part_payload_candidates(
 
 fn comfy_part_yaml_skip_reason(row: &Value) -> Option<String> {
     let object = row.as_object()?;
+    if object
+        .get("status")
+        .and_then(Value::as_str)
+        .is_some_and(|status| status.eq_ignore_ascii_case("excluded"))
+    {
+        return Some("status is excluded; row is documented but not importable".to_owned());
+    }
     if object.get("files").is_some() {
         return Some("composite row uses files[]; split into single file rows".to_owned());
     }
@@ -90733,6 +90740,20 @@ mod tests {
         );
         assert!(args.include_drafts);
         assert!(!args.strict);
+    }
+
+    #[test]
+    fn admin_parts_validate_yaml_skips_excluded_rows() {
+        let row = json!({
+            "name": "face_yolov8m",
+            "status": "excluded",
+            "sha256": "717923c19b3f4bbf5250b728f1fa6b2cb72a33aed1d236ea9caf0e21ad943e5f"
+        });
+
+        assert_eq!(
+            comfy_part_yaml_skip_reason(&row).as_deref(),
+            Some("status is excluded; row is documented but not importable")
+        );
     }
 
     #[test]
