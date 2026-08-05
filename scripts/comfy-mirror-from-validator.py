@@ -199,11 +199,18 @@ def main() -> int:
     parser.add_argument("--max-count", type=int, default=0, help="Process at most N actionable rows; 0 means all.")
     parser.add_argument("--only-part-id", action="append", default=[])
     parser.add_argument("--include-unknown", action="store_true", help="Download unknown-format rows too.")
+    parser.add_argument("--worker-count", type=int, default=1, help="Shard actionable rows across N workers.")
+    parser.add_argument("--worker-index", type=int, default=0, help="Zero-based shard index for this worker.")
+    parser.add_argument("--results-name", default="mirror-results.jsonl", help="Result JSONL filename under results/.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force-convert", action="store_true")
     parser.add_argument("--retries", type=int, default=4)
     parser.add_argument("--timeout-seconds", type=int, default=90)
     args = parser.parse_args()
+    if args.worker_count < 1:
+        raise SystemExit("--worker-count must be at least 1")
+    if args.worker_index < 0 or args.worker_index >= args.worker_count:
+        raise SystemExit("--worker-index must be in [0, --worker-count)")
 
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     drafts = manifest.get("drafts") or []
@@ -212,13 +219,14 @@ def main() -> int:
     converted_dir = output_dir / "converted"
     results_dir = output_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
-    results_path = results_dir / "mirror-results.jsonl"
+    results_path = results_dir / safe_component(args.results_name, "mirror-results.jsonl")
     hf_token = read_token(args.hf_token_file)
     civitai_token = read_token(args.civitai_token_file)
     selected_ids = set(args.only_part_id)
     counts: dict[str, int] = {}
     failures = 0
     processed = 0
+    actionable_index = 0
 
     with results_path.open("a", encoding="utf-8") as results:
         for draft in drafts:
@@ -232,6 +240,10 @@ def main() -> int:
                 continue
             if category == "unknown_hold" and args.include_unknown:
                 category = "direct_unknown"
+            current_actionable_index = actionable_index
+            actionable_index += 1
+            if current_actionable_index % args.worker_count != args.worker_index:
+                continue
             if args.max_count and processed >= args.max_count:
                 continue
             source = choose_source(draft)
@@ -255,6 +267,8 @@ def main() -> int:
                 "download_path": str(download_path),
                 "expected_sha256": expected_sha256,
                 "expected_size_bytes": expected_size,
+                "worker_count": args.worker_count,
+                "worker_index": args.worker_index,
             }
             try:
                 if not args.dry_run:
@@ -293,6 +307,8 @@ def main() -> int:
                     "category": category,
                     "source_kind": source.get("kind"),
                     "error": str(error),
+                    "worker_count": args.worker_count,
+                    "worker_index": args.worker_index,
                 }
             results.write(result_line(record) + "\n")
             results.flush()
@@ -306,6 +322,8 @@ def main() -> int:
         "counts": counts,
         "results": str(results_path),
         "dry_run": args.dry_run,
+        "worker_count": args.worker_count,
+        "worker_index": args.worker_index,
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0 if failures == 0 else 1
