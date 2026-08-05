@@ -25062,6 +25062,9 @@ struct AdminPartsDraftSummary {
     size_bytes: u64,
     size_bytes_exact: bool,
     file_format: String,
+    license: String,
+    permissions: Vec<String>,
+    policy_flags: Vec<String>,
     status: String,
     require_auth: bool,
     source_kinds: Vec<String>,
@@ -25294,6 +25297,9 @@ fn admin_parts_validate_yaml(args: &AdminPartsValidateYamlArgs) -> Result<()> {
                         size_bytes: draft.size_bytes,
                         size_bytes_exact: draft.size_bytes_exact,
                         file_format: draft.file_format,
+                        license: draft.license,
+                        permissions: draft.permissions,
+                        policy_flags: draft.policy_flags,
                         status: draft.status,
                         require_auth: draft.sources.require_auth,
                         source_kinds,
@@ -28663,6 +28669,22 @@ fn comfy_part_yaml_skip_reason(row: &Value) -> Option<String> {
     {
         return Some("status is excluded; row is documented but not importable".to_owned());
     }
+    let policy_flags = comfy_part_yaml_policy_flags(object.get("policy_flags"));
+    if policy_flags
+        .iter()
+        .any(|flag| flag.eq_ignore_ascii_case("non-commercial"))
+    {
+        return Some("policy flag non-commercial; row stays out of the servable corpus".to_owned());
+    }
+    if policy_flags
+        .iter()
+        .any(|flag| flag.eq_ignore_ascii_case("rentcivit-only"))
+    {
+        return Some(
+            "policy flag rentcivit-only; creator permission is required before onboarding"
+                .to_owned(),
+        );
+    }
     if object.get("files").is_some() {
         return Some("composite row uses files[]; split into single file rows".to_owned());
     }
@@ -28673,8 +28695,34 @@ fn comfy_part_yaml_skip_reason(row: &Value) -> Option<String> {
         Some(value) if value.eq_ignore_ascii_case("gated") => {
             Some("sha256 is GATED; terms must be accepted and the file pinned first".to_owned())
         }
-        Some(_) => None,
+        Some(_) => {
+            let draft = mayhem_proto::ComfyPartDraft::from_yaml_value(row).ok()?;
+            if draft.file_format.eq_ignore_ascii_case("unknown") {
+                return Some(
+                    "file_format is unknown; split archives/containers and pin the provider-facing payload first"
+                        .to_owned(),
+                );
+            }
+            None
+        }
         None => Some("missing sha256; row is not a pinned downloadable part".to_owned()),
+    }
+}
+
+fn comfy_part_yaml_policy_flags(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        Some(Value::String(text)) => text
+            .split(',')
+            .map(|flag| flag.trim().trim_matches(|ch| ch == '[' || ch == ']'))
+            .filter(|flag| !flag.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -90755,6 +90803,51 @@ mod tests {
         assert_eq!(
             comfy_part_yaml_skip_reason(&row).as_deref(),
             Some("status is excluded; row is documented but not importable")
+        );
+    }
+
+    #[test]
+    fn admin_parts_validate_yaml_skips_policy_blocked_rows() {
+        let non_commercial = json!({
+            "name": "PiD",
+            "status": "policy-review",
+            "policy_flags": ["non-commercial"],
+            "sha256": "717923c19b3f4bbf5250b728f1fa6b2cb72a33aed1d236ea9caf0e21ad943e5f"
+        });
+        let rentcivit_only = json!({
+            "name": "NoobAI",
+            "status": "policy-review",
+            "policy_flags": ["nsfw", "rentcivit-only"],
+            "sha256": "817923c19b3f4bbf5250b728f1fa6b2cb72a33aed1d236ea9caf0e21ad943e5f"
+        });
+
+        assert_eq!(
+            comfy_part_yaml_skip_reason(&non_commercial).as_deref(),
+            Some("policy flag non-commercial; row stays out of the servable corpus")
+        );
+        assert_eq!(
+            comfy_part_yaml_skip_reason(&rentcivit_only).as_deref(),
+            Some("policy flag rentcivit-only; creator permission is required before onboarding")
+        );
+    }
+
+    #[test]
+    fn admin_parts_validate_yaml_skips_unknown_container_rows() {
+        let row = json!({
+            "name": "Archived GGUF",
+            "type": "text-encoder",
+            "lane": "z-image",
+            "license": "apache-2.0",
+            "sha256": "917923c19b3f4bbf5250b728f1fa6b2cb72a33aed1d236ea9caf0e21ad943e5f",
+            "size_bytes": 64,
+            "download_url": "https://civitai.com/api/download/models/2470137",
+            "file_format": "unknown",
+            "status": "linked"
+        });
+
+        assert_eq!(
+            comfy_part_yaml_skip_reason(&row).as_deref(),
+            Some("file_format is unknown; split archives/containers and pin the provider-facing payload first")
         );
     }
 
