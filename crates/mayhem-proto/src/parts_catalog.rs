@@ -262,7 +262,19 @@ impl ComfyPartDraft {
         let permissions = parse_permissions(object.get("permissions"));
         let policy_flags = parse_string_list(object.get("policy_flags"))?;
         let status = yaml_string(object, "status").unwrap_or_else(|_| "draft".to_owned());
-        let sources = yaml_sources(object)?;
+        let sources = if let Some(value) = object.get("sources") {
+            let sources: ComfyPartSources =
+                serde_json::from_value(value.clone()).map_err(|error| {
+                    ComfyPartsCatalogError::InvalidField {
+                        field: "sources",
+                        reason: error.to_string(),
+                    }
+                })?;
+            sources.validate()?;
+            sources
+        } else {
+            yaml_sources(object)?
+        };
         let mut adapter = BTreeMap::new();
         for key in [
             "role",
@@ -280,6 +292,18 @@ impl ComfyPartDraft {
             "openmodeldb",
         ] {
             if let Some(value) = object.get(key) {
+                adapter.insert(key.to_owned(), value.clone());
+            }
+        }
+        if let Some(value) = object.get("adapter") {
+            let explicit =
+                value
+                    .as_object()
+                    .ok_or_else(|| ComfyPartsCatalogError::InvalidField {
+                        field: "adapter",
+                        reason: "must be an object".to_owned(),
+                    })?;
+            for (key, value) in explicit {
                 adapter.insert(key.to_owned(), value.clone());
             }
         }
@@ -1325,6 +1349,75 @@ mod tests {
             .iter()
             .any(|origin| origin.kind == "civitai"
                 && origin.url == "https://civitai.com/api/download/models/889818"));
+    }
+
+    #[test]
+    fn yaml_import_accepts_explicit_sources_for_final_records() {
+        let row = serde_json::json!({
+            "name": "Mirrored checkpoint",
+            "type": "checkpoint",
+            "lane": "sdxl",
+            "sha256": HEX_A,
+            "size_bytes": 1024_u64,
+            "file_format": "safetensors",
+            "license": "apache-2.0",
+            "status": "linked",
+            "sources": {
+                "mirrors": [{
+                    "kind": "huggingface",
+                    "url": "https://huggingface.co/openmayhem/comfy-parts/resolve/abc123/checkpoints/mirrored.safetensors",
+                    "repository": "openmayhem/comfy-parts",
+                    "path": "checkpoints/mirrored.safetensors",
+                    "revision": "abc123"
+                }],
+                "origins": [{
+                    "kind": "civitai",
+                    "url": "https://civitai.com/api/download/models/889818",
+                    "revision": "889818"
+                }],
+                "require_auth": true
+            }
+        });
+        let draft = ComfyPartDraft::from_yaml_value(&row).unwrap();
+        assert!(draft.sources.require_auth);
+        assert_eq!(draft.sources.mirrors.len(), 1);
+        assert_eq!(draft.sources.origins.len(), 1);
+        assert_eq!(
+            draft.sources.mirrors[0].path.as_deref(),
+            Some("checkpoints/mirrored.safetensors")
+        );
+        assert_eq!(draft.sources.origins[0].kind, "civitai");
+    }
+
+    #[test]
+    fn yaml_import_merges_explicit_adapter_metadata() {
+        let row = serde_json::json!({
+            "name": "Adapter-rich controlnet",
+            "type": "controlnet",
+            "lane": "sdxl",
+            "role": "legacy role",
+            "sha256": HEX_B,
+            "size_bytes": 2048_u64,
+            "file_format": "safetensors",
+            "license": "apache-2.0",
+            "status": "linked",
+            "download_url": "https://huggingface.co/openmayhem/comfy/resolve/main/controlnet.safetensors",
+            "adapter": {
+                "role": "conditioning",
+                "placement": "phase:condition",
+                "resident": false
+            }
+        });
+        let draft = ComfyPartDraft::from_yaml_value(&row).unwrap();
+        assert_eq!(
+            draft.adapter.get("role"),
+            Some(&Value::from("conditioning"))
+        );
+        assert_eq!(
+            draft.adapter.get("placement"),
+            Some(&Value::from("phase:condition"))
+        );
+        assert_eq!(draft.adapter.get("resident"), Some(&Value::from(false)));
     }
 
     #[test]
