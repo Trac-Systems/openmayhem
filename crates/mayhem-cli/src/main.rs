@@ -72591,12 +72591,22 @@ fn provider_heartbeat_workflow_classes(
         .as_ref()
         .map(|policy| policy.outcome_class_for(modality))
         .unwrap_or_else(|| format!("{modality}.workflow"));
-    let active = u32::try_from(load.active_slots).unwrap_or(u32::MAX);
+    let max_concurrent = selected
+        .modality_capacities
+        .get(modality)
+        .map(|capacity| capacity.max_inflight_items.max(1))
+        .unwrap_or_else(|| max_sessions.max(1))
+        .min(max_sessions.max(1));
+    let active = load
+        .modality_active_items
+        .get(modality)
+        .copied()
+        .unwrap_or_else(|| u32::try_from(load.active_slots).unwrap_or(u32::MAX));
     Some(json!({
         outcome_class: {
             "min_ask_au": money_au_json(min_ask_au),
-            "max_concurrent": max_sessions.max(1),
-            "active": active.min(max_sessions.max(1)),
+            "max_concurrent": max_concurrent,
+            "active": active.min(max_concurrent),
         }
     }))
 }
@@ -106652,7 +106662,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let classes = provider_heartbeat_workflow_classes(&selected, 7, 2, &load)
             .expect("Comfy endpoint should advertise workflow class");
         assert_eq!(classes["image.workflow"]["min_ask_au"], json!("7"));
-        assert_eq!(classes["image.workflow"]["max_concurrent"], json!(2));
+        assert_eq!(classes["image.workflow"]["max_concurrent"], json!(1));
         assert_eq!(classes["image.workflow"]["active"], json!(0));
 
         selected.model.workflow = Some(mayhem_proto::ComfyWorkflowCatalogPolicy {
@@ -106662,10 +106672,20 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             outcome_class: Some("image.custom.512".to_owned()),
             ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
         });
+        selected
+            .modality_capacities
+            .get_mut("image")
+            .expect("test image capacity")
+            .max_inflight_items = 4;
+        let load = ProviderLoadSnapshot {
+            modality_active_items: BTreeMap::from([("image".to_owned(), 2)]),
+            ..ProviderLoadSnapshot::idle(3)
+        };
         let classes = provider_heartbeat_workflow_classes(&selected, 9, 3, &load)
             .expect("Comfy endpoint should advertise signed workflow class");
         assert_eq!(classes["image.custom.512"]["min_ask_au"], json!("9"));
         assert_eq!(classes["image.custom.512"]["max_concurrent"], json!(3));
+        assert_eq!(classes["image.custom.512"]["active"], json!(2));
         assert!(classes.get("image.workflow").is_none());
     }
 
