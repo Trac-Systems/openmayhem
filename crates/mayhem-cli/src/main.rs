@@ -25262,7 +25262,7 @@ fn admin_parts_validate_yaml(args: &AdminPartsValidateYamlArgs) -> Result<()> {
                     if draft.sources.require_auth {
                         requires_auth_count += 1;
                     }
-                    if draft.file_format.to_ascii_lowercase().contains("pickle") {
+                    if comfy_part_requires_pickle_conversion(&draft.file_format) {
                         requires_pickle_conversion_count += 1;
                     }
                     let mut source_kinds = Vec::new();
@@ -25543,6 +25543,12 @@ fn admin_parts_onboard_report(input: AdminPartsOnboardInput) -> Result<AdminPart
     );
 
     let (mut draft, row_index) = read_comfy_part_draft_input(&input.input, input.row_index)?;
+    ensure!(
+        !comfy_part_requires_pickle_conversion(&draft.file_format),
+        "Comfy part {} uses {}; convert the payload to safetensors before onboarding so providers pull signed non-pickle bytes",
+        draft.name,
+        draft.file_format
+    );
     let draft_part_id =
         mayhem_proto::derive_comfy_part_id(&draft.part_type, &draft.name, &draft.sha256);
     let mut steps = vec![admin_parts_onboard_step(
@@ -28659,6 +28665,10 @@ fn comfy_part_yaml_skip_reason(row: &Value) -> Option<String> {
         Some(_) => None,
         None => Some("missing sha256; row is not a pinned downloadable part".to_owned()),
     }
+}
+
+fn comfy_part_requires_pickle_conversion(file_format: &str) -> bool {
+    file_format.to_ascii_lowercase().contains("pickle")
 }
 
 fn comfy_part_yaml_string(row: &Value, key: &str) -> Option<String> {
@@ -91612,6 +91622,70 @@ status: linked
             assert_eq!(part.payload_source, "download");
             assert!(part.steps.iter().any(|step| step.step == "record_written"));
         }
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn admin_parts_onboard_rejects_pickle_payload_until_converted() {
+        let temp = test_temp_dir("mayhem-admin-parts-onboard-pickle-reject");
+        fs::create_dir_all(&temp).unwrap();
+        let payload_path = temp.join("payload.pth");
+        fs::write(&payload_path, b"pickle bytes").unwrap();
+        let sha256 = file_sha256_hex(&payload_path).unwrap();
+        let size_bytes = fs::metadata(&payload_path).unwrap().len();
+        let input_path = temp.join("part.yaml");
+        fs::write(
+            &input_path,
+            format!(
+                r#"
+name: "legacy pickle tensor"
+type: controlnet
+lane: image
+license: MIT
+file_format: "pickle(.pth)"
+sha256: "{sha256}"
+size_bytes: {size_bytes}
+download_url: "https://huggingface.co/TracNetwork/openmayhem-parts/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/payload.pth"
+status: linked
+"#
+            ),
+        )
+        .unwrap();
+
+        let err = admin_parts_onboard_report(AdminPartsOnboardInput {
+            input: input_path,
+            row_index: 1,
+            payload: Some(payload_path),
+            download_dir: None,
+            source_token_file: None,
+            disk_reserve: None,
+            output: temp.join("record.json"),
+            receipt_dir: None,
+            min_runtime: "comfyui-v0.30.1".to_owned(),
+            license_doc: None,
+            license_doc_hash: Some("33".repeat(32)),
+            license_ref: "license:test".to_owned(),
+            license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
+            canary_graph: None,
+            canary_graph_hash: Some("44".repeat(32)),
+            canary_output_ref: "canaries/test.png".to_owned(),
+            canary_output: None,
+            canary_run_runtime: None,
+            canary_run_cache_dir: None,
+            canary_run_output_dir: None,
+            canary_run_timeout_ms: 120_000,
+            canary_tolerance_method: "phash".to_owned(),
+            canary_max_distance_bps: 10,
+            chunk_size: 8,
+            force: false,
+        })
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("convert the payload to safetensors"),
+            "{err:#}"
+        );
         let _ = fs::remove_dir_all(temp);
     }
 
