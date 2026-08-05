@@ -734,10 +734,7 @@ fn yaml_sources(
                 .get("repository")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            path: object
-                .get("file")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+            path: source_path.clone(),
             revision: None,
         });
     }
@@ -777,7 +774,11 @@ fn yaml_sources(
             reason: "YAML row has no download_url or source".to_owned(),
         });
     }
-    origins.sort_by(|left, right| left.url.cmp(&right.url));
+    origins.sort_by(|left, right| {
+        comfy_part_source_payload_rank(left)
+            .cmp(&comfy_part_source_payload_rank(right))
+            .then_with(|| left.url.cmp(&right.url))
+    });
     origins.dedup_by(|left, right| left.url == right.url);
     let require_auth = origins.iter().any(|origin| origin.kind == "civitai");
     Ok(ComfyPartSources {
@@ -785,6 +786,26 @@ fn yaml_sources(
         origins,
         require_auth,
     })
+}
+
+fn comfy_part_source_payload_rank(source: &ComfyPartSource) -> u8 {
+    if source.path.is_some() || looks_like_direct_comfy_payload_url(&source.url) {
+        0
+    } else {
+        1
+    }
+}
+
+fn looks_like_direct_comfy_payload_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.contains("/resolve/")
+        || lower.contains("/api/download/")
+        || lower.contains("/releases/download/")
+        || lower.ends_with(".safetensors")
+        || lower.ends_with(".gguf")
+        || lower.ends_with(".pt")
+        || lower.ends_with(".pth")
+        || lower.ends_with(".bin")
 }
 
 fn safe_comfy_source_path(value: &str) -> Result<String, ComfyPartsCatalogError> {
@@ -1247,6 +1268,37 @@ mod tests {
         assert_eq!(
             draft.sources.origins[0].path.as_deref(),
             Some("split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors")
+        );
+    }
+
+    #[test]
+    fn yaml_import_prefers_payload_urls_over_repository_pages() {
+        let row = serde_json::json!({
+            "name": "LatentSync 1.6 UNet",
+            "type": "lipsync",
+            "lane": "shared",
+            "source": "https://huggingface.co/ByteDance/LatentSync-1.6",
+            "file": "latentsync_unet.pt",
+            "download_url": "https://huggingface.co/ByteDance/LatentSync-1.6/resolve/main/latentsync_unet.pt",
+            "sha256": "0a478e89eb660f82da4c35dbdde8a5adfb27f99d1b4e50edd03729e1e98316d3",
+            "size_bytes": 5_443_871_048_u64,
+            "file_format": "pickle",
+            "license": "openrail++",
+            "status": "linked",
+        });
+        let draft = ComfyPartDraft::from_yaml_value(&row).unwrap();
+        assert_eq!(draft.sources.origins.len(), 2);
+        assert_eq!(
+            draft.sources.origins[0].url,
+            "https://huggingface.co/ByteDance/LatentSync-1.6/resolve/main/latentsync_unet.pt"
+        );
+        assert_eq!(
+            draft.sources.origins[0].path.as_deref(),
+            Some("latentsync_unet.pt")
+        );
+        assert_eq!(
+            draft.sources.origins[1].url,
+            "https://huggingface.co/ByteDance/LatentSync-1.6"
         );
     }
 

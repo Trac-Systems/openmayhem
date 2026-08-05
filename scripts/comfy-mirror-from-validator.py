@@ -70,7 +70,27 @@ def source_candidates(draft: dict[str, Any]) -> list[dict[str, Any]]:
     sources = draft.get("sources") or {}
     # For mirroring, prefer canonical origins. Existing mirrors are fallback
     # inputs only when a row has no origin block.
-    return list(sources.get("origins") or []) + list(sources.get("mirrors") or [])
+    candidates = list(sources.get("origins") or []) + list(sources.get("mirrors") or [])
+    return sorted(candidates, key=source_payload_sort_key)
+
+
+def source_payload_sort_key(source: dict[str, Any]) -> tuple[int, str]:
+    url = str(source.get("url") or "")
+    if source.get("path") or looks_like_direct_payload_url(url):
+        rank = 0
+    else:
+        rank = 1
+    return (rank, url)
+
+
+def looks_like_direct_payload_url(url: str) -> bool:
+    lower = url.lower()
+    return (
+        "/resolve/" in lower
+        or "/api/download/" in lower
+        or "/releases/download/" in lower
+        or lower.endswith((".safetensors", ".gguf", ".pt", ".pth", ".bin"))
+    )
 
 
 def choose_source(draft: dict[str, Any]) -> dict[str, Any] | None:
@@ -90,10 +110,13 @@ def headers_for(source: dict[str, Any], hf_token: str | None, civitai_token: str
     return headers
 
 
-def verify_existing(path: Path, expected_sha256: str, expected_size: int) -> bool:
+def verify_existing(path: Path, expected_sha256: str, expected_size: int, expected_size_exact: bool) -> bool:
     if not path.is_file():
         return False
-    if path.stat().st_size != expected_size:
+    actual_size = path.stat().st_size
+    if expected_size_exact and actual_size != expected_size:
+        return False
+    if not expected_size_exact and actual_size > expected_size:
         return False
     return sha256_file(path) == expected_sha256
 
@@ -151,18 +174,23 @@ def download_verified(
     headers: dict[str, str],
     expected_sha256: str,
     expected_size: int,
+    expected_size_exact: bool,
     retries: int,
     timeout: int,
 ) -> None:
-    if verify_existing(destination, expected_sha256, expected_size):
+    if verify_existing(destination, expected_sha256, expected_size, expected_size_exact):
         return
     last_error: Exception | None = None
     for attempt in range(retries + 1):
         try:
             download_once(url, destination, headers, timeout)
             actual_size = destination.stat().st_size
-            if actual_size != expected_size:
+            if expected_size_exact and actual_size != expected_size:
                 raise RuntimeError(f"size mismatch: expected {expected_size}, got {actual_size}")
+            if not expected_size_exact and actual_size > expected_size:
+                raise RuntimeError(
+                    f"size exceeds approximate cap: cap {expected_size}, got {actual_size}"
+                )
             actual_sha256 = sha256_file(destination)
             if actual_sha256 != expected_sha256:
                 raise RuntimeError(f"sha256 mismatch: expected {expected_sha256}, got {actual_sha256}")
@@ -294,6 +322,7 @@ def main() -> int:
             download_path = downloads_dir / part_id / source_name
             expected_sha256 = str(draft["sha256"])
             expected_size = int(draft["size_bytes"])
+            expected_size_exact = bool(draft.get("size_bytes_exact"))
             record: dict[str, Any] = {
                 "ok": True,
                 "part_id": part_id,
@@ -304,6 +333,7 @@ def main() -> int:
                 "download_path": str(download_path),
                 "expected_sha256": expected_sha256,
                 "expected_size_bytes": expected_size,
+                "expected_size_exact": expected_size_exact,
                 "worker_count": args.worker_count,
                 "worker_index": args.worker_index,
             }
@@ -316,9 +346,11 @@ def main() -> int:
                         headers,
                         expected_sha256,
                         expected_size,
+                        expected_size_exact,
                         args.retries,
                         args.timeout_seconds,
                     )
+                    record["actual_size_bytes"] = download_path.stat().st_size
                     if category == "pickle_convert":
                         converted_path = converted_dir / f"{part_id}.safetensors"
                         converted = convert_pickle(
