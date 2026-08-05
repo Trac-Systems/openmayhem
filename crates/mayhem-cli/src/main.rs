@@ -25025,6 +25025,10 @@ struct AdminPartsValidateYamlReport {
     skipped_count: u64,
     by_status: BTreeMap<String, u64>,
     by_type: BTreeMap<String, u64>,
+    by_file_format: BTreeMap<String, u64>,
+    by_source_kind: BTreeMap<String, u64>,
+    requires_auth_count: u64,
+    requires_pickle_conversion_count: u64,
     skipped: Vec<AdminPartsSkippedRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     drafts: Option<Vec<AdminPartsDraftSummary>>,
@@ -25056,8 +25060,10 @@ struct AdminPartsDraftSummary {
     lane: String,
     sha256: String,
     size_bytes: u64,
+    file_format: String,
     status: String,
     require_auth: bool,
+    source_kinds: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -25222,6 +25228,10 @@ fn admin_parts_validate_yaml(args: &AdminPartsValidateYamlArgs) -> Result<()> {
     let mut skipped = Vec::new();
     let mut by_status = BTreeMap::new();
     let mut by_type = BTreeMap::new();
+    let mut by_file_format = BTreeMap::new();
+    let mut by_source_kind = BTreeMap::new();
+    let mut requires_auth_count = 0_u64;
+    let mut requires_pickle_conversion_count = 0_u64;
     let mut rows_total = 0_u64;
 
     for input in &args.inputs {
@@ -25248,6 +25258,25 @@ fn admin_parts_validate_yaml(args: &AdminPartsValidateYamlArgs) -> Result<()> {
                 Ok(draft) => {
                     *by_status.entry(draft.status.clone()).or_insert(0) += 1;
                     *by_type.entry(draft.part_type.clone()).or_insert(0) += 1;
+                    *by_file_format.entry(draft.file_format.clone()).or_insert(0) += 1;
+                    if draft.sources.require_auth {
+                        requires_auth_count += 1;
+                    }
+                    if draft.file_format.to_ascii_lowercase().contains("pickle") {
+                        requires_pickle_conversion_count += 1;
+                    }
+                    let mut source_kinds = Vec::new();
+                    for source in draft
+                        .sources
+                        .mirrors
+                        .iter()
+                        .chain(draft.sources.origins.iter())
+                    {
+                        *by_source_kind.entry(source.kind.clone()).or_insert(0) += 1;
+                        source_kinds.push(source.kind.clone());
+                    }
+                    source_kinds.sort();
+                    source_kinds.dedup();
                     drafts.push(AdminPartsDraftSummary {
                         path: path.display().to_string(),
                         row_index,
@@ -25261,8 +25290,10 @@ fn admin_parts_validate_yaml(args: &AdminPartsValidateYamlArgs) -> Result<()> {
                         lane: draft.lane,
                         sha256: draft.sha256,
                         size_bytes: draft.size_bytes,
+                        file_format: draft.file_format,
                         status: draft.status,
                         require_auth: draft.sources.require_auth,
+                        source_kinds,
                     });
                 }
                 Err(error) => skipped.push(AdminPartsSkippedRow {
@@ -25293,6 +25324,10 @@ fn admin_parts_validate_yaml(args: &AdminPartsValidateYamlArgs) -> Result<()> {
         skipped_count: skipped.len() as u64,
         by_status,
         by_type,
+        by_file_format,
+        by_source_kind,
+        requires_auth_count,
+        requires_pickle_conversion_count,
         skipped,
         drafts: args.include_drafts.then_some(drafts),
     };
