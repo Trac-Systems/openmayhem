@@ -9976,6 +9976,104 @@ mod tests {
     }
 
     #[cfg(feature = "comfyui")]
+    #[test]
+    #[ignore = "requires MAYHEM_COMFYUI_REAL_RUNTIME, MAYHEM_COMFYUI_PYTHON, and MAYHEM_COMFYUI_REAL_CHECKPOINT"]
+    fn comfyui_real_runtime_sdxl_checkpoint_workflow() {
+        let runtime = std::env::var_os("MAYHEM_COMFYUI_REAL_RUNTIME")
+            .map(PathBuf::from)
+            .expect("MAYHEM_COMFYUI_REAL_RUNTIME must point at a ComfyUI checkout");
+        let checkpoint = std::env::var_os("MAYHEM_COMFYUI_REAL_CHECKPOINT")
+            .map(PathBuf::from)
+            .expect("MAYHEM_COMFYUI_REAL_CHECKPOINT must point at a verified checkpoint file");
+        let checkpoint_name = checkpoint
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("checkpoint path must have a UTF-8 file name")
+            .to_owned();
+        let cache = std::env::temp_dir().join(format!(
+            "mayhem-engine-test-{}-{}",
+            std::process::id(),
+            "comfyui-sdxl"
+        ));
+        let model_dir = cache.join("base").join("models").join("checkpoints");
+        std::fs::create_dir_all(&model_dir).expect("create ComfyUI checkpoint model dir");
+        std::fs::copy(&checkpoint, model_dir.join(&checkpoint_name))
+            .expect("copy verified checkpoint into isolated ComfyUI base dir");
+
+        let mut config = LoadConfig::comfyui_runtime(runtime);
+        config.backend_cache_dir = Some(cache.clone());
+        let mut backend = ComfyUiBackend::new();
+        backend.load(config).expect("load sandboxed ComfyUI");
+        assert!(backend.component_healthy());
+
+        let workflow = json!({
+            "1": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {"ckpt_name": checkpoint_name}
+            },
+            "2": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"clip": ["1", 1], "text": "openmayhem calibration image, simple blue cube"}
+            },
+            "3": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"clip": ["1", 1], "text": "low quality, distorted, text, watermark"}
+            },
+            "4": {
+                "class_type": "EmptyLatentImage",
+                "inputs": {"width": 64, "height": 64, "batch_size": 1}
+            },
+            "5": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "model": ["1", 0],
+                    "positive": ["2", 0],
+                    "negative": ["3", 0],
+                    "latent_image": ["4", 0],
+                    "seed": 7,
+                    "steps": 1,
+                    "cfg": 1.0,
+                    "sampler_name": "euler",
+                    "scheduler": "normal",
+                    "denoise": 1.0
+                }
+            },
+            "6": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["5", 0], "vae": ["1", 2]}
+            },
+            "7": {
+                "class_type": "SaveImage",
+                "inputs": {"images": ["6", 0], "filename_prefix": "mayhem-comfyui-sdxl"}
+            }
+        });
+
+        let (image, output) = run_real_comfy_workflow_collect(&mut backend, workflow);
+        assert_eq!(png_dimensions(&image), Some((64, 64)));
+        assert!(
+            output
+                .progress_events
+                .iter()
+                .any(|event| event.kind == "execution_start"
+                    || event.kind == "executing"
+                    || event.kind == "progress_state"),
+            "ComfyUI SDXL proof must capture runtime progress events"
+        );
+
+        if let Some(output_dir) = std::env::var_os("MAYHEM_COMFYUI_REAL_OUTPUT_DIR") {
+            let output_dir = PathBuf::from(output_dir);
+            std::fs::create_dir_all(&output_dir).expect("create ComfyUI test output dir");
+            let label =
+                std::env::var("MAYHEM_COMFYUI_REAL_LABEL").unwrap_or_else(|_| "local".to_owned());
+            std::fs::write(output_dir.join(format!("comfy-sdxl-{label}.png")), &image)
+                .expect("write ComfyUI SDXL proof output");
+        }
+
+        drop(backend);
+        let _ = std::fs::remove_dir_all(cache);
+    }
+
+    #[cfg(feature = "comfyui")]
     fn run_real_comfy_workflow_collect(
         backend: &mut ComfyUiBackend,
         workflow: Value,
