@@ -27696,6 +27696,20 @@ struct ProviderPartsAdmissionReferenceProof {
     output_sha256: String,
     artifact_count: u32,
     progress_event_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    phase_graphs: Vec<ProviderPartsAdmissionReferencePhaseProof>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderPartsAdmissionReferencePhaseProof {
+    id: String,
+    graph_path: String,
+    graph_sha256: String,
+    output_path: String,
+    output_content_type: String,
+    output_sha256: String,
+    progress_event_count: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -27718,6 +27732,8 @@ struct ProviderPartsAdmissionLoadPlan {
 struct ProviderPartsAdmissionLoadPlanPhase {
     id: String,
     resident_parts: Vec<String>,
+    #[serde(default)]
+    reference_graph: Option<String>,
     #[serde(default)]
     working_set_bytes: Option<u64>,
     #[serde(default)]
@@ -28015,10 +28031,48 @@ fn validate_provider_parts_admission_report(report: &ProviderPartsAdmissionRepor
             !reference.output_content_type.trim().is_empty(),
             "Comfy admission reference output content type is empty"
         );
-        ensure!(
-            reference.artifact_count == 1,
-            "Comfy admission reference must emit exactly one artifact"
-        );
+        if reference.phase_graphs.is_empty() {
+            ensure!(
+                reference.artifact_count == 1,
+                "Comfy admission reference must emit exactly one artifact"
+            );
+        } else {
+            ensure!(
+                reference.phase_graphs.len() <= 64,
+                "Comfy admission reference has too many phase graphs"
+            );
+            ensure!(
+                reference.artifact_count == reference.phase_graphs.len() as u32,
+                "Comfy admission reference artifact count does not match phase graph count"
+            );
+            let mut seen_phase = BTreeSet::new();
+            for phase in &reference.phase_graphs {
+                ensure!(
+                    seen_phase.insert(phase.id.clone()) && valid_load_plan_label(&phase.id),
+                    "Comfy admission reference phase id is invalid or duplicated"
+                );
+                ensure!(
+                    !phase.graph_path.trim().is_empty(),
+                    "Comfy admission reference phase graph path is empty"
+                );
+                validate_hex32_config(
+                    "Comfy admission reference phase graph hash",
+                    Some(&phase.graph_sha256),
+                )?;
+                ensure!(
+                    !phase.output_path.trim().is_empty(),
+                    "Comfy admission reference phase output path is empty"
+                );
+                ensure!(
+                    !phase.output_content_type.trim().is_empty(),
+                    "Comfy admission reference phase output content type is empty"
+                );
+                validate_hex32_config(
+                    "Comfy admission reference phase output hash",
+                    Some(&phase.output_sha256),
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -28948,8 +29002,13 @@ fn provider_parts_admission_report(
         phases,
         reference: None,
     };
-    report.reference =
-        provider_parts_admission_reference_proof(args, &inventory, &required_ids, report.admitted)?;
+    report.reference = provider_parts_admission_reference_proof(
+        args,
+        &inventory,
+        &required_ids,
+        &report.phases,
+        report.admitted,
+    )?;
     Ok(report)
 }
 
@@ -28957,6 +29016,7 @@ fn provider_parts_admission_reference_proof(
     args: &ProviderPartsAdmitArgs,
     inventory: &ProviderComfyInventory,
     required_ids: &[String],
+    phases: &[ProviderPartsAdmissionPhaseReport],
     admitted: bool,
 ) -> Result<Option<ProviderPartsAdmissionReferenceProof>> {
     let Some(runtime) = args.reference_runtime.as_deref() else {
@@ -28972,10 +29032,6 @@ fn provider_parts_admission_reference_proof(
         admitted,
         "reference runtime proof is only run after the memory admission envelope fits"
     );
-    let graph = args
-        .reference_graph
-        .as_deref()
-        .context("--reference-graph is required with --reference-runtime")?;
     let output_dir = args
         .reference_output_dir
         .as_deref()
@@ -28987,8 +29043,10 @@ fn provider_parts_admission_reference_proof(
     provider_parts_admission_reference_proof_with_runtime(
         inventory,
         required_ids,
+        phases,
         &args.runtime_id,
-        graph,
+        args.load_plan.as_deref(),
+        args.reference_graph.as_deref(),
         runtime,
         args.reference_cache_dir.as_deref(),
         output_dir,
@@ -29002,8 +29060,10 @@ fn provider_parts_admission_reference_proof(
 fn provider_parts_admission_reference_proof_with_runtime(
     inventory: &ProviderComfyInventory,
     required_ids: &[String],
+    phases: &[ProviderPartsAdmissionPhaseReport],
     runtime_id: &str,
-    graph: &Path,
+    load_plan: Option<&Path>,
+    graph: Option<&Path>,
     runtime: &Path,
     cache_dir: Option<&Path>,
     output_dir: &Path,
@@ -29015,7 +29075,9 @@ fn provider_parts_admission_reference_proof_with_runtime(
         provider_parts_admission_reference_proof_with_runtime_inner(
             inventory,
             required_ids,
+            phases,
             runtime_id,
+            load_plan,
             graph,
             runtime,
             cache_dir,
@@ -29029,7 +29091,9 @@ fn provider_parts_admission_reference_proof_with_runtime(
         let _ = (
             inventory,
             required_ids,
+            phases,
             runtime_id,
+            load_plan,
             graph,
             runtime,
             cache_dir,
@@ -29046,18 +29110,16 @@ fn provider_parts_admission_reference_proof_with_runtime(
 fn provider_parts_admission_reference_proof_with_runtime_inner(
     inventory: &ProviderComfyInventory,
     required_ids: &[String],
+    phases: &[ProviderPartsAdmissionPhaseReport],
     runtime_id: &str,
-    graph: &Path,
+    load_plan: Option<&Path>,
+    graph: Option<&Path>,
     runtime: &Path,
     cache_dir: Option<&Path>,
     output_dir: &Path,
     timeout_ms: u64,
     chunk_size: usize,
 ) -> Result<ProviderPartsAdmissionReferenceProof> {
-    let graph_hash = file_sha256_hex(graph)
-        .with_context(|| format!("hashing reference graph {}", graph.display()))?;
-    let workflow: Value = serde_json::from_value(read_json_file(graph)?)
-        .with_context(|| format!("parsing reference graph {}", graph.display()))?;
     fs::create_dir_all(output_dir)
         .with_context(|| format!("creating reference output dir {}", output_dir.display()))?;
     let cache_root = cache_dir
@@ -29068,8 +29130,183 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
         .iter()
         .map(|part| (part.part_id.as_str(), part))
         .collect::<BTreeMap<_, _>>();
+    if let Some(phase_plans) = provider_parts_admission_reference_phase_graphs(load_plan, phases)? {
+        let mut phase_proofs = Vec::new();
+        let mut total_progress_events = 0_usize;
+        for phase in phase_plans {
+            let model_files = provider_parts_admission_reference_model_files(
+                &by_part_id,
+                &phase.resident_parts,
+                chunk_size,
+            )?;
+            let phase_cache = cache_root
+                .join("phases")
+                .join(safe_path_component(&phase.id));
+            let proof = provider_parts_run_comfy_reference_graph(
+                runtime_id,
+                &phase.id,
+                &phase.graph,
+                runtime,
+                &phase_cache,
+                model_files,
+                output_dir,
+                timeout_ms,
+            )?;
+            total_progress_events =
+                total_progress_events.saturating_add(proof.progress_event_count);
+            phase_proofs.push(proof);
+        }
+        let final_phase = phase_proofs
+            .last()
+            .context("staged Comfy reference proof has no phase outputs")?;
+        if let Some(graph) = graph {
+            let all_at_once = provider_parts_run_comfy_reference_graph(
+                runtime_id,
+                "all-at-once",
+                graph,
+                runtime,
+                &cache_root.join("all-at-once"),
+                provider_parts_admission_reference_model_files(
+                    &by_part_id,
+                    required_ids,
+                    chunk_size,
+                )?,
+                output_dir,
+                timeout_ms,
+            )?;
+            ensure!(
+                all_at_once.output_content_type == final_phase.output_content_type
+                    && all_at_once.output_sha256 == final_phase.output_sha256,
+                "staged Comfy reference output does not match all-at-once reference output"
+            );
+            total_progress_events =
+                total_progress_events.saturating_add(all_at_once.progress_event_count);
+        }
+        return Ok(ProviderPartsAdmissionReferenceProof {
+            graph_path: load_plan
+                .context("staged Comfy reference proof requires --load-plan")?
+                .display()
+                .to_string(),
+            graph_sha256: file_sha256_hex(
+                load_plan.context("staged Comfy reference proof requires --load-plan")?,
+            )?,
+            runtime: runtime_id.to_owned(),
+            cache_dir: cache_root.display().to_string(),
+            output_path: final_phase.output_path.clone(),
+            output_content_type: final_phase.output_content_type.clone(),
+            output_sha256: final_phase.output_sha256.clone(),
+            artifact_count: phase_proofs.len() as u32,
+            progress_event_count: total_progress_events,
+            phase_graphs: phase_proofs,
+        });
+    }
+
+    let graph = graph.context("--reference-graph is required with --reference-runtime")?;
+    let proof = provider_parts_run_comfy_reference_graph(
+        runtime_id,
+        "reference",
+        graph,
+        runtime,
+        &cache_root,
+        provider_parts_admission_reference_model_files(&by_part_id, required_ids, chunk_size)?,
+        output_dir,
+        timeout_ms,
+    )?;
+    Ok(ProviderPartsAdmissionReferenceProof {
+        graph_path: proof.graph_path,
+        graph_sha256: proof.graph_sha256,
+        runtime: runtime_id.to_owned(),
+        cache_dir: cache_root.display().to_string(),
+        output_path: proof.output_path,
+        output_content_type: proof.output_content_type,
+        output_sha256: proof.output_sha256,
+        artifact_count: 1,
+        progress_event_count: proof.progress_event_count,
+        phase_graphs: Vec::new(),
+    })
+}
+
+#[cfg(feature = "comfyui")]
+#[derive(Debug)]
+struct ProviderPartsAdmissionReferencePhasePlan {
+    id: String,
+    resident_parts: Vec<String>,
+    graph: PathBuf,
+}
+
+#[cfg(feature = "comfyui")]
+fn provider_parts_admission_reference_phase_graphs(
+    load_plan: Option<&Path>,
+    phases: &[ProviderPartsAdmissionPhaseReport],
+) -> Result<Option<Vec<ProviderPartsAdmissionReferencePhasePlan>>> {
+    let Some(load_plan) = load_plan else {
+        return Ok(None);
+    };
+    let plan: ProviderPartsAdmissionLoadPlan =
+        serde_json::from_value(read_json_file(load_plan)?)
+            .with_context(|| format!("parsing {}", load_plan.display()))?;
+    let has_phase_graph = plan
+        .phases
+        .iter()
+        .any(|phase| phase.reference_graph.is_some());
+    if !has_phase_graph {
+        return Ok(None);
+    }
+    ensure!(
+        plan.phases.len() == phases.len(),
+        "Comfy staged reference phase count does not match admission phases"
+    );
+    let mut out = Vec::new();
+    for (phase, report) in plan.phases.iter().zip(phases.iter()) {
+        ensure!(
+            phase.id == report.id,
+            "Comfy staged reference phase {} does not match admission phase {}",
+            phase.id,
+            report.id
+        );
+        let graph = phase.reference_graph.as_deref().with_context(|| {
+            format!(
+                "Comfy staged reference phase {} is missing reference_graph",
+                phase.id
+            )
+        })?;
+        out.push(ProviderPartsAdmissionReferencePhasePlan {
+            id: phase.id.clone(),
+            resident_parts: report.resident_parts.clone(),
+            graph: resolve_load_plan_reference_graph(load_plan, graph)?,
+        });
+    }
+    Ok(Some(out))
+}
+
+#[cfg(feature = "comfyui")]
+fn resolve_load_plan_reference_graph(load_plan: &Path, value: &str) -> Result<PathBuf> {
+    let trimmed = value.trim();
+    ensure!(
+        !trimmed.is_empty(),
+        "Comfy load plan reference_graph cannot be empty"
+    );
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    ensure!(
+        path.components()
+            .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "Comfy load plan reference_graph must be a normal relative path or an absolute path"
+    );
+    let parent = load_plan.parent().unwrap_or_else(|| Path::new("."));
+    Ok(parent.join(path))
+}
+
+#[cfg(feature = "comfyui")]
+fn provider_parts_admission_reference_model_files(
+    by_part_id: &BTreeMap<&str, &ProviderComfyInventoryPart>,
+    part_ids: &[String],
+    chunk_size: usize,
+) -> Result<Vec<ComfyUiModelFile>> {
     let mut model_files = Vec::new();
-    for part_id in required_ids {
+    for part_id in part_ids {
         let part = by_part_id
             .get(part_id.as_str())
             .with_context(|| format!("required Comfy part {part_id} is not in this inventory"))?;
@@ -29084,8 +29321,27 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
             model_path: comfy_part_record_reference_model_path(&part.record)?,
         });
     }
+    Ok(model_files)
+}
+
+#[cfg(feature = "comfyui")]
+#[allow(clippy::too_many_arguments)]
+fn provider_parts_run_comfy_reference_graph(
+    runtime_id: &str,
+    label: &str,
+    graph: &Path,
+    runtime: &Path,
+    cache_root: &Path,
+    model_files: Vec<ComfyUiModelFile>,
+    output_dir: &Path,
+    timeout_ms: u64,
+) -> Result<ProviderPartsAdmissionReferencePhaseProof> {
+    let graph_hash = file_sha256_hex(graph)
+        .with_context(|| format!("hashing reference graph {}", graph.display()))?;
+    let workflow: Value = serde_json::from_value(read_json_file(graph)?)
+        .with_context(|| format!("parsing reference graph {}", graph.display()))?;
     let mut config = LoadConfig::comfyui_runtime(runtime);
-    config.backend_cache_dir = Some(cache_root.clone());
+    config.backend_cache_dir = Some(cache_root.to_path_buf());
     config.comfyui_model_files = model_files;
     let mut backend = ComfyUiBackend::new();
     backend
@@ -29108,22 +29364,30 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
     );
     let artifact = collector.finish()?;
     let ext = comfy_canary_content_extension(&artifact.content_type);
-    let output_path = output_dir.join(format!(
-        "{}-{}-reference.{ext}",
-        safe_path_component(&runtime_id.replace('.', "_")),
-        blake3::hash(graph_hash.as_bytes()).to_hex()
-    ));
+    let label = safe_path_component(label);
+    let output_path = if label == "reference" {
+        output_dir.join(format!(
+            "{}-{}-reference.{ext}",
+            safe_path_component(&runtime_id.replace('.', "_")),
+            blake3::hash(graph_hash.as_bytes()).to_hex()
+        ))
+    } else {
+        output_dir.join(format!(
+            "{}-{}-{}-reference.{ext}",
+            safe_path_component(&runtime_id.replace('.', "_")),
+            label,
+            blake3::hash(graph_hash.as_bytes()).to_hex()
+        ))
+    };
     let output_sha256 = sha256_bytes_hex(&artifact.bytes);
     write_comfy_canary_artifact_idempotent(&output_path, &artifact.bytes, false)?;
-    Ok(ProviderPartsAdmissionReferenceProof {
+    Ok(ProviderPartsAdmissionReferencePhaseProof {
+        id: label,
         graph_path: graph.display().to_string(),
         graph_sha256: graph_hash,
-        runtime: runtime_id.to_owned(),
-        cache_dir: cache_root.display().to_string(),
         output_path: output_path.display().to_string(),
         output_content_type: artifact.content_type,
         output_sha256,
-        artifact_count: output.artifact_count,
         progress_event_count: output.progress_events.len(),
     })
 }
@@ -93596,6 +93860,125 @@ status: linked
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(feature = "comfyui")]
+    #[test]
+    fn provider_parts_staged_reference_requires_every_phase_graph() {
+        let temp = test_temp_dir("mayhem-provider-parts-staged-reference-graphs");
+        fs::create_dir_all(&temp).unwrap();
+        let first = "11".repeat(32);
+        let second = "22".repeat(32);
+        let load_plan = temp.join("load-plan.json");
+        write_json_file(
+            &load_plan,
+            &json!({
+                "schema_version": 1,
+                "phases": [
+                    {
+                        "id": "first",
+                        "resident_parts": [first.clone()],
+                        "reference_graph": "graphs/first.json",
+                        "boundary_outputs": ["latent"],
+                        "safe_unload_after": [first.clone()]
+                    },
+                    {
+                        "id": "second",
+                        "resident_parts": [second.clone()]
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+        let phases = vec![
+            ProviderPartsAdmissionPhaseReport {
+                id: "first".to_owned(),
+                resident_parts: vec![first.clone()],
+                resident_bytes: 10,
+                working_set_bytes_per_session: 1,
+                peak_bytes: 11,
+                boundary_outputs: vec!["latent".to_owned()],
+                safe_unload_after: vec![first.clone()],
+            },
+            ProviderPartsAdmissionPhaseReport {
+                id: "second".to_owned(),
+                resident_parts: vec![second.clone()],
+                resident_bytes: 10,
+                working_set_bytes_per_session: 1,
+                peak_bytes: 11,
+                boundary_outputs: Vec::new(),
+                safe_unload_after: Vec::new(),
+            },
+        ];
+        let err =
+            provider_parts_admission_reference_phase_graphs(Some(&load_plan), &phases).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("phase second is missing reference_graph"),
+            "{err:#}"
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(feature = "comfyui")]
+    #[test]
+    fn provider_parts_staged_reference_resolves_safe_relative_graphs() {
+        let temp = test_temp_dir("mayhem-provider-parts-staged-reference-paths");
+        fs::create_dir_all(temp.join("graphs")).unwrap();
+        let first = "11".repeat(32);
+        let load_plan = temp.join("load-plan.json");
+        write_json_file(
+            &load_plan,
+            &json!({
+                "schema_version": 1,
+                "phases": [
+                    {
+                        "id": "first",
+                        "resident_parts": [first.clone()],
+                        "reference_graph": "graphs/first.json"
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+        let phases = vec![ProviderPartsAdmissionPhaseReport {
+            id: "first".to_owned(),
+            resident_parts: vec![first.clone()],
+            resident_bytes: 10,
+            working_set_bytes_per_session: 1,
+            peak_bytes: 11,
+            boundary_outputs: Vec::new(),
+            safe_unload_after: Vec::new(),
+        }];
+        let refs =
+            provider_parts_admission_reference_phase_graphs(Some(&load_plan), &phases).unwrap();
+        let refs = refs.expect("phase reference graphs");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].graph, temp.join("graphs/first.json"));
+
+        let escaped = temp.join("escaped.json");
+        write_json_file(
+            &escaped,
+            &json!({
+                "schema_version": 1,
+                "phases": [
+                    {
+                        "id": "first",
+                        "resident_parts": [first.clone()],
+                        "reference_graph": "../escape.json"
+                    }
+                ]
+            }),
+        )
+        .unwrap();
+        let err =
+            provider_parts_admission_reference_phase_graphs(Some(&escaped), &phases).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("normal relative path or an absolute path"),
+            "{err:#}"
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
     #[test]
     fn provider_parts_reference_model_path_uses_safe_selector_or_adapter() {
         let mut record = test_comfy_part_record("Fancy Upscaler", "66");
@@ -93917,6 +94300,7 @@ status: linked
             output_sha256: "55".repeat(32),
             artifact_count: 1,
             progress_event_count: 1,
+            phase_graphs: Vec::new(),
         });
         write_provider_comfy_admission(&home, &report).unwrap();
 
@@ -108748,6 +109132,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     output_sha256: "55".repeat(32),
                     artifact_count: 1,
                     progress_event_count: 1,
+                    phase_graphs: Vec::new(),
                 }),
             },
         }
