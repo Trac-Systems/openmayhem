@@ -592,6 +592,12 @@ enum ProviderServeCommands {
 enum ProviderPartsCommands {
     /// Verify part records/proofs and install matching local payloads into the provider cache.
     Pull(ProviderPartsPullArgs),
+    /// Verify and add installed Comfy parts to this provider's advertised inventory.
+    Add(ProviderPartsPullArgs),
+    /// Remove Comfy parts from this provider's advertised inventory.
+    Remove(ProviderPartsRemoveArgs),
+    /// List this provider's advertised Comfy parts inventory.
+    List(ProviderPartsListArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -5870,6 +5876,32 @@ struct ProviderPartsPullArgs {
 }
 
 #[derive(Debug, Parser)]
+struct ProviderPartsRemoveArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Part id to remove from the advertised inventory. Repeat for multiple parts.
+    #[arg(long = "part-id", required = true, value_name = "HEX")]
+    part_ids: Vec<String>,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderPartsListArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
 struct ProviderDrainArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
@@ -6879,6 +6911,9 @@ async fn provider_command(command: ProviderCommands, verbose: bool) -> Result<()
         },
         ProviderCommands::Parts { command } => match command {
             ProviderPartsCommands::Pull(args) => provider_parts_pull(args),
+            ProviderPartsCommands::Add(args) => provider_parts_add(args),
+            ProviderPartsCommands::Remove(args) => provider_parts_remove(args),
+            ProviderPartsCommands::List(args) => provider_parts_list(args),
         },
         ProviderCommands::Drain(args) => provider_drain(args).await,
         ProviderCommands::Earnings(args) => provider_earnings(args).await,
@@ -27163,7 +27198,280 @@ struct ProviderPartsPullItem {
     install_error: Option<String>,
 }
 
+const PROVIDER_COMFY_INVENTORY_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderComfyInventory {
+    schema_version: u32,
+    index_ver: u32,
+    index_root: String,
+    anchor_hash: String,
+    updated_at: u64,
+    parts: Vec<ProviderComfyInventoryPart>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderComfyInventoryPart {
+    part_id: String,
+    record_hash: String,
+    cache_path: String,
+    added_at: u64,
+    record: mayhem_proto::ComfyPartRecord,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderPartsInventoryReport {
+    ok: bool,
+    inventory_path: String,
+    schema_version: u32,
+    index_root: String,
+    part_count: u64,
+    parts: Vec<ProviderPartsInventoryItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct ProviderPartsInventoryItem {
+    part_id: String,
+    record_hash: String,
+    name: String,
+    #[serde(rename = "type")]
+    part_type: String,
+    lane: String,
+    status: String,
+    cache_path: String,
+}
+
+fn provider_comfy_inventory_path(home: &Path) -> PathBuf {
+    home.join("provider").join("comfy-inventory.json")
+}
+
+fn empty_provider_comfy_inventory(
+    index_ver: u32,
+    anchor_hash: String,
+) -> Result<ProviderComfyInventory> {
+    let index = mayhem_proto::build_comfy_parts_index(&[], index_ver)?;
+    Ok(ProviderComfyInventory {
+        schema_version: PROVIDER_COMFY_INVENTORY_SCHEMA_VERSION,
+        index_ver,
+        index_root: index.root,
+        anchor_hash,
+        updated_at: unix_epoch_seconds()?,
+        parts: Vec::new(),
+    })
+}
+
+fn read_provider_comfy_inventory(home: &Path) -> Result<Option<ProviderComfyInventory>> {
+    let path = provider_comfy_inventory_path(home);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let inventory: ProviderComfyInventory = serde_json::from_value(read_json_file(&path)?)
+        .with_context(|| format!("parsing {}", path.display()))?;
+    validate_provider_comfy_inventory(&inventory)?;
+    Ok(Some(inventory))
+}
+
+fn write_provider_comfy_inventory(home: &Path, inventory: &ProviderComfyInventory) -> Result<()> {
+    validate_provider_comfy_inventory(inventory)?;
+    let path = provider_comfy_inventory_path(home);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    write_json_file(&path, inventory).with_context(|| format!("writing {}", path.display()))
+}
+
+fn validate_provider_comfy_inventory(inventory: &ProviderComfyInventory) -> Result<()> {
+    ensure!(
+        inventory.schema_version == PROVIDER_COMFY_INVENTORY_SCHEMA_VERSION,
+        "Comfy provider inventory schema mismatch: expected {}, got {}",
+        PROVIDER_COMFY_INVENTORY_SCHEMA_VERSION,
+        inventory.schema_version
+    );
+    validate_hex32_config("Comfy provider inventory root", Some(&inventory.index_root))?;
+    validate_hex32_config(
+        "Comfy provider inventory anchor hash",
+        Some(&inventory.anchor_hash),
+    )?;
+    let mut seen = BTreeSet::new();
+    let records = inventory
+        .parts
+        .iter()
+        .map(|part| {
+            ensure!(
+                seen.insert(part.part_id.clone()),
+                "duplicate Comfy provider inventory part {}",
+                part.part_id
+            );
+            part.record.validate()?;
+            ensure!(
+                part.record.part_id == part.part_id,
+                "Comfy provider inventory part {} stores record for {}",
+                part.part_id,
+                part.record.part_id
+            );
+            let record_hash = mayhem_proto::comfy_part_record_hash(&part.record)?;
+            ensure!(
+                record_hash == part.record_hash,
+                "Comfy provider inventory part {} record hash mismatch",
+                part.part_id
+            );
+            Ok(part.record.clone())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let index = mayhem_proto::build_comfy_parts_index(&records, inventory.index_ver)?;
+    ensure!(
+        index.root == inventory.index_root,
+        "Comfy provider inventory root mismatch: stored {}, recomputed {}",
+        inventory.index_root,
+        index.root
+    );
+    Ok(())
+}
+
+fn provider_comfy_inventory_root(home: &Path) -> Result<Option<String>> {
+    Ok(read_provider_comfy_inventory(home)?.map(|inventory| inventory.index_root))
+}
+
+fn provider_comfy_workflow_required_inventory_root(selected: &ProviderCandidate) -> Option<&str> {
+    if !selected
+        .model
+        .adapter
+        .endpoint_families
+        .iter()
+        .any(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS)
+    {
+        return None;
+    }
+    selected
+        .model
+        .workflow
+        .as_ref()
+        .and_then(|policy| policy.inventory_root.as_deref())
+}
+
+fn provider_comfy_workflow_inventory_root(
+    home: &Path,
+    selected: &ProviderCandidate,
+) -> Result<Option<String>> {
+    let Some(required) = provider_comfy_workflow_required_inventory_root(selected) else {
+        return Ok(provider_comfy_inventory_root(home)?);
+    };
+    let actual = provider_comfy_inventory_root(home)?.with_context(|| {
+        format!(
+            "Comfy workflow {} requires provider parts inventory root {required}, but this provider has no verified Comfy inventory; run `mayhem provider parts add` first",
+            selected.enclave.model_id
+        )
+    })?;
+    ensure!(
+        actual == required,
+        "Comfy workflow {} requires provider parts inventory root {required}, but local verified inventory root is {actual}",
+        selected.enclave.model_id
+    );
+    Ok(Some(actual))
+}
+
+fn read_verified_comfy_part_record_from_layout(
+    layout_dir: &Path,
+    part_id: &str,
+) -> Result<(mayhem_proto::ComfyPartRecord, String, u32, String)> {
+    let part_id = part_id.to_ascii_lowercase();
+    ensure!(is_hex_len(&part_id, 64), "--part-id must be 32-byte hex");
+    let index_path = layout_dir.join("index.json");
+    let anchor_path = layout_dir.join("anchor.json");
+    let index: mayhem_proto::ComfyPartsIndex = serde_json::from_value(read_json_file(&index_path)?)
+        .with_context(|| format!("parsing {}", index_path.display()))?;
+    let anchor: mayhem_proto::ComfyPartsAnchor =
+        serde_json::from_value(read_json_file(&anchor_path)?)
+            .with_context(|| format!("parsing {}", anchor_path.display()))?;
+    anchor
+        .validate()
+        .with_context(|| format!("validating {}", anchor_path.display()))?;
+    ensure!(
+        anchor.parts_index_root == index.root,
+        "Comfy parts anchor root {} does not match index root {}",
+        anchor.parts_index_root,
+        index.root
+    );
+    let entry = index
+        .parts
+        .iter()
+        .find(|entry| entry.part_id == part_id)
+        .with_context(|| format!("part_id {part_id} is not listed by index.json"))?;
+    let record_path = layout_dir.join("records").join(format!("{part_id}.json"));
+    let proof_path = layout_dir
+        .join("proofs")
+        .join(format!("{part_id}.proof.json"));
+    let record: mayhem_proto::ComfyPartRecord =
+        serde_json::from_value(read_json_file(&record_path)?)
+            .with_context(|| format!("parsing {}", record_path.display()))?;
+    record
+        .validate()
+        .with_context(|| format!("validating {}", record_path.display()))?;
+    ensure!(
+        record.part_id == part_id,
+        "record {} contains part_id {}, expected {}",
+        record_path.display(),
+        record.part_id,
+        part_id
+    );
+    let record_hash = mayhem_proto::comfy_part_record_hash(&record)?;
+    ensure!(
+        record_hash == entry.record_hash,
+        "record hash mismatch for {part_id}: index has {}, record hashes to {}",
+        entry.record_hash,
+        record_hash
+    );
+    let proof: mayhem_proto::ComfyPartMerkleProof =
+        serde_json::from_value(read_json_file(&proof_path)?)
+            .with_context(|| format!("parsing {}", proof_path.display()))?;
+    mayhem_proto::verify_comfy_part_proof(&record, &proof, &index.root)
+        .with_context(|| format!("verifying proof {}", proof_path.display()))?;
+    Ok((
+        record,
+        record_hash,
+        index.index_ver,
+        mayhem_proto::comfy_parts_anchor_hash(&anchor)?,
+    ))
+}
+
+fn provider_parts_inventory_report(home: &Path) -> Result<ProviderPartsInventoryReport> {
+    let inventory = read_provider_comfy_inventory(home)?.unwrap_or(empty_provider_comfy_inventory(
+        0,
+        blake3::hash(b"mayhem:empty-comfy-inventory-anchor:v1")
+            .to_hex()
+            .to_string(),
+    )?);
+    let parts = inventory
+        .parts
+        .iter()
+        .map(|part| ProviderPartsInventoryItem {
+            part_id: part.part_id.clone(),
+            record_hash: part.record_hash.clone(),
+            name: part.record.name.clone(),
+            part_type: part.record.part_type.clone(),
+            lane: part.record.lane.clone(),
+            status: part.record.status.clone(),
+            cache_path: part.cache_path.clone(),
+        })
+        .collect::<Vec<_>>();
+    Ok(ProviderPartsInventoryReport {
+        ok: true,
+        inventory_path: provider_comfy_inventory_path(home).display().to_string(),
+        schema_version: PROVIDER_COMFY_INVENTORY_SCHEMA_VERSION,
+        index_root: inventory.index_root,
+        part_count: parts.len() as u64,
+        parts,
+    })
+}
+
 fn provider_parts_pull(args: ProviderPartsPullArgs) -> Result<()> {
+    let report = provider_parts_pull_report(&args)?;
+    print_provider_parts_pull_report(&report, args.json)
+}
+
+fn provider_parts_pull_report(args: &ProviderPartsPullArgs) -> Result<ProviderPartsPullReport> {
     ensure!(
         args.chunk_size > 0,
         "--chunk-size must be greater than zero"
@@ -27244,7 +27552,7 @@ fn provider_parts_pull(args: ProviderPartsPullArgs) -> Result<()> {
     } else {
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
-        for part_id in args.part_ids {
+        for part_id in &args.part_ids {
             let part_id = part_id.to_ascii_lowercase();
             ensure!(is_hex_len(&part_id, 64), "--part-id must be 32-byte hex");
             ensure!(
@@ -27375,7 +27683,7 @@ fn provider_parts_pull(args: ProviderPartsPullArgs) -> Result<()> {
     }
 
     let installed_count = parts.iter().filter(|part| part.installed).count() as u64;
-    let report = ProviderPartsPullReport {
+    Ok(ProviderPartsPullReport {
         ok: true,
         layout_dir: layout_dir.display().to_string(),
         cache_dir: cache_dir.display().to_string(),
@@ -27385,8 +27693,11 @@ fn provider_parts_pull(args: ProviderPartsPullArgs) -> Result<()> {
         requested_count: requested.len() as u64,
         installed_count,
         parts,
-    };
-    if args.json {
+    })
+}
+
+fn print_provider_parts_pull_report(report: &ProviderPartsPullReport, json: bool) -> Result<()> {
+    if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
@@ -27397,6 +27708,155 @@ fn provider_parts_pull(args: ProviderPartsPullArgs) -> Result<()> {
             println!(
                 "{} {} {} installed={}",
                 part.part_id, part.part_type, part.status, part.installed
+            );
+        }
+    }
+    Ok(())
+}
+
+fn provider_parts_add(args: ProviderPartsPullArgs) -> Result<()> {
+    let mut pull_args = args;
+    pull_args.require_payload = true;
+    let report = provider_parts_pull_report(&pull_args)?;
+    let home = absolutize(
+        pull_args
+            .home
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(default_home)?,
+    )?;
+    let layout_dir = absolutize(pull_args.layout_dir.clone())?;
+    let cache_dir = absolutize(
+        pull_args
+            .cache_dir
+            .clone()
+            .unwrap_or_else(|| home.join("comfy-parts")),
+    )?;
+    let now = unix_epoch_seconds()?;
+    let mut inventory = read_provider_comfy_inventory(&home)?.unwrap_or_else(|| {
+        empty_provider_comfy_inventory(report.index_ver, report.anchor_hash.clone())
+            .expect("empty inventory root is valid")
+    });
+    ensure!(
+        inventory.anchor_hash == report.anchor_hash,
+        "local Comfy inventory is anchored to {}, but --layout-dir is anchored to {}; remove stale parts or use the matching layout",
+        inventory.anchor_hash,
+        report.anchor_hash
+    );
+    let mut by_part_id = inventory
+        .parts
+        .into_iter()
+        .map(|part| (part.part_id.clone(), part))
+        .collect::<BTreeMap<_, _>>();
+    for item in &report.parts {
+        ensure!(
+            item.installed,
+            "part {} was verified but not installed; refusing to advertise it",
+            item.part_id
+        );
+        let (record, record_hash, index_ver, anchor_hash) =
+            read_verified_comfy_part_record_from_layout(&layout_dir, &item.part_id)?;
+        ensure!(
+            anchor_hash == report.anchor_hash && index_ver == report.index_ver,
+            "verified layout changed while adding Comfy part {}",
+            item.part_id
+        );
+        let cache_path = provider_comfy_part_cache_path(&cache_dir, &record);
+        ensure!(
+            provider_comfy_part_payload_matches(&cache_path, &record, pull_args.chunk_size)?,
+            "verified Comfy part {} is not installed at {}",
+            item.part_id,
+            cache_path.display()
+        );
+        by_part_id.insert(
+            item.part_id.clone(),
+            ProviderComfyInventoryPart {
+                part_id: item.part_id.clone(),
+                record_hash,
+                cache_path: cache_path.display().to_string(),
+                added_at: now,
+                record,
+            },
+        );
+    }
+    let parts = by_part_id.into_values().collect::<Vec<_>>();
+    let records = parts
+        .iter()
+        .map(|part| part.record.clone())
+        .collect::<Vec<_>>();
+    let index = mayhem_proto::build_comfy_parts_index(&records, report.index_ver)?;
+    inventory = ProviderComfyInventory {
+        schema_version: PROVIDER_COMFY_INVENTORY_SCHEMA_VERSION,
+        index_ver: report.index_ver,
+        index_root: index.root,
+        anchor_hash: report.anchor_hash,
+        updated_at: now,
+        parts,
+    };
+    write_provider_comfy_inventory(&home, &inventory)?;
+    let inventory_report = provider_parts_inventory_report(&home)?;
+    print_provider_parts_inventory_report(
+        &inventory_report,
+        pull_args.json,
+        "Comfy provider inventory updated.",
+    )
+}
+
+fn provider_parts_remove(args: ProviderPartsRemoveArgs) -> Result<()> {
+    let home = absolutize(args.home.clone().map(Ok).unwrap_or_else(default_home)?)?;
+    let mut inventory = read_provider_comfy_inventory(&home)?
+        .with_context(|| "this provider has no Comfy inventory to update")?;
+    let mut remove = BTreeSet::new();
+    for part_id in &args.part_ids {
+        let part_id = part_id.to_ascii_lowercase();
+        ensure!(is_hex_len(&part_id, 64), "--part-id must be 32-byte hex");
+        ensure!(
+            remove.insert(part_id.clone()),
+            "duplicate --part-id {part_id}"
+        );
+    }
+    let before = inventory.parts.len();
+    inventory
+        .parts
+        .retain(|part| !remove.contains(&part.part_id));
+    ensure!(
+        inventory.parts.len() != before,
+        "none of the requested Comfy part ids were present in the provider inventory"
+    );
+    let records = inventory
+        .parts
+        .iter()
+        .map(|part| part.record.clone())
+        .collect::<Vec<_>>();
+    let index = mayhem_proto::build_comfy_parts_index(&records, inventory.index_ver)?;
+    inventory.index_root = index.root;
+    inventory.updated_at = unix_epoch_seconds()?;
+    write_provider_comfy_inventory(&home, &inventory)?;
+    let report = provider_parts_inventory_report(&home)?;
+    print_provider_parts_inventory_report(&report, args.json, "Comfy provider inventory updated.")
+}
+
+fn provider_parts_list(args: ProviderPartsListArgs) -> Result<()> {
+    let home = absolutize(args.home.clone().map(Ok).unwrap_or_else(default_home)?)?;
+    let report = provider_parts_inventory_report(&home)?;
+    print_provider_parts_inventory_report(&report, args.json, "Comfy provider inventory.")
+}
+
+fn print_provider_parts_inventory_report(
+    report: &ProviderPartsInventoryReport,
+    json: bool,
+    title: &str,
+) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+    } else {
+        println!("{title}");
+        println!("Inventory root: {}", report.index_root);
+        println!("Parts: {}", report.part_count);
+        for part in &report.parts {
+            println!(
+                "{} {} {} {}",
+                part.part_id, part.part_type, part.status, part.name
             );
         }
     }
@@ -54160,6 +54620,7 @@ struct HeartbeatContext<'a> {
     attestation_head: &'a str,
     identity_anchor: &'a str,
     tpm_activation_hello: Option<&'a mayhem_proto::TpmActivateCredentialHello>,
+    workflow_inventory_root: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55146,6 +55607,7 @@ struct ProviderSessionHeartbeatTask {
     attestation_head: String,
     identity_anchor: String,
     tpm_activation_hello: Option<mayhem_proto::TpmActivateCredentialHello>,
+    workflow_inventory_root: Option<String>,
     min_ask_au: MoneyAu,
     max_sessions: u32,
     load: ProviderHeartbeatLoad,
@@ -55805,6 +56267,7 @@ struct ProviderSessionContext<'a> {
     attestation_head: &'a str,
     identity_anchor: &'a str,
     tpm_activation_hello: Option<&'a mayhem_proto::TpmActivateCredentialHello>,
+    workflow_inventory_root: Option<String>,
     rules: &'a RulesRef,
 }
 
@@ -57884,6 +58347,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         config.as_ref(),
         requested_enclave.as_deref(),
     )?;
+    let workflow_inventory_root = provider_comfy_workflow_inventory_root(&home, &selected)?;
     args.load_progress = Some(ProviderLoadProgressContext::new(
         &home,
         &wallet.public_key,
@@ -58138,6 +58602,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         attestation_head: &attestation.report_head,
         identity_anchor: &identity_anchor,
         tpm_activation_hello: attestation_material.tpm_activation_hello.as_ref(),
+        workflow_inventory_root: workflow_inventory_root.clone(),
         rules: &rules,
     };
     let (session_responder, modality_health) = if args.serve_sessions {
@@ -58212,6 +58677,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             attestation_head: &attestation.report_head,
             identity_anchor: &identity_anchor,
             tpm_activation_hello: attestation_material.tpm_activation_hello.as_ref(),
+            workflow_inventory_root: workflow_inventory_root.as_deref(),
         })
         .await?
     };
@@ -58374,6 +58840,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
                 attestation_head: &attestation.report_head,
                 identity_anchor: &identity_anchor,
                 tpm_activation_hello: attestation_material.tpm_activation_hello.as_ref(),
+                workflow_inventory_root: workflow_inventory_root.clone(),
                 rules: &rules,
             },
             ProviderSessionRuntime {
@@ -61598,6 +62065,7 @@ async fn provider_join(args: ProviderJoinArgs) -> Result<()> {
         .candidates
         .first()
         .context("provider join did not select a hardware-fitting candidate")?;
+    provider_comfy_workflow_inventory_root(&ctx.home, selected)?;
     let enclave = selected.enclave.clone();
     let contract = read_contract_catalog(&ctx.rpc).await?;
     ensure!(
@@ -71399,6 +71867,7 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
                 ctx.attestation_head,
                 ctx.identity_anchor,
                 ctx.tpm_activation_hello,
+                ctx.workflow_inventory_root,
                 ctx.args.min_ask_au,
                 protection.max_sessions,
                 Some(transport_peer.as_str()),
@@ -71423,6 +71892,7 @@ async fn send_provider_heartbeat_round(
     attestation_head: &str,
     identity_anchor: &str,
     tpm_activation_hello: Option<&mayhem_proto::TpmActivateCredentialHello>,
+    workflow_inventory_root: Option<&str>,
     min_ask_au: MoneyAu,
     max_sessions: u32,
     transport_peer: Option<&str>,
@@ -71515,6 +71985,9 @@ async fn send_provider_heartbeat_round(
                 .as_ref()
                 .map(mayhem_proto::ComfyWorkflowCatalogPolicy::runtime_id)
                 .unwrap_or(mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID));
+            if let Some(root) = workflow_inventory_root {
+                heartbeat["inventory_root"] = json!(root);
+            }
             heartbeat["workflow_classes"] = workflow_classes;
         }
         project_provider_heartbeat_attestation(&mut heartbeat, attestation, tpm_activation_hello)?;
@@ -71541,6 +72014,10 @@ async fn send_provider_heartbeat_round(
             "served_modalities": &selected.served_modalities,
             "served_specialities": &selected.served_specialities,
             "runtime_id": heartbeat.get("runtime_id").cloned().unwrap_or(Value::Null),
+            "inventory_root": heartbeat
+                .get("inventory_root")
+                .cloned()
+                .unwrap_or(Value::Null),
             "workflow_classes": heartbeat
                 .get("workflow_classes")
                 .cloned()
@@ -71782,6 +72259,7 @@ async fn run_provider_session_heartbeat_connection(
                 &ctx.attestation_head,
                 &ctx.identity_anchor,
                 ctx.tpm_activation_hello.as_ref(),
+                ctx.workflow_inventory_root.as_deref(),
                 ctx.min_ask_au,
                 ctx.max_sessions,
                 Some(transport_peer.as_str()),
@@ -72062,6 +72540,7 @@ async fn serve_provider_sessions(
         attestation_head: ctx.attestation_head.to_owned(),
         identity_anchor: ctx.identity_anchor.to_owned(),
         tpm_activation_hello: ctx.tpm_activation_hello.cloned(),
+        workflow_inventory_root: ctx.workflow_inventory_root.clone(),
         min_ask_au: ctx.args.min_ask_au,
         max_sessions: protection_config.max_sessions,
         load: heartbeat_load.clone(),
@@ -90962,7 +91441,9 @@ status: linked
         let ProviderCommands::Parts { command } = *command else {
             panic!("expected provider parts command");
         };
-        let ProviderPartsCommands::Pull(args) = command;
+        let ProviderPartsCommands::Pull(args) = command else {
+            panic!("expected provider parts pull command");
+        };
         assert_eq!(args.layout_dir, PathBuf::from("parts-index"));
         assert_eq!(args.part_ids, vec!["aa".repeat(32)]);
         assert_eq!(args.payload_dir, Some(PathBuf::from("payloads")));
@@ -91017,6 +91498,152 @@ status: linked
         let cache_path = provider_comfy_part_cache_path(&cache_dir, &record);
         assert!(cache_path.exists());
         assert!(provider_comfy_part_payload_matches(&cache_path, &record, 8).unwrap());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn provider_parts_add_list_remove_persists_verified_inventory_root() {
+        let temp = test_temp_dir("mayhem-provider-parts-inventory");
+        let source_dir = temp.join("source");
+        let layout_dir = temp.join("layout");
+        let payload_dir = temp.join("payloads");
+        let cache_dir = temp.join("cache");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&payload_dir).unwrap();
+        let payload_path = payload_dir.join("payload.bin");
+        fs::write(&payload_path, b"openmayhem advertised comfy inventory").unwrap();
+        let record = test_comfy_part_record_for_payload("inventory part", &payload_path, 8);
+        let record_path = source_dir.join("record.json");
+        write_json_file(&record_path, &record).unwrap();
+        admin_parts_build_index(&AdminPartsBuildIndexArgs {
+            records: vec![record_path],
+            output_dir: layout_dir.clone(),
+            index_ver: 17,
+            blessed_runtimes: vec!["comfyui-v0.30.1".to_owned()],
+            whitelist_ver: 1,
+            outcome_classes_ver: 1,
+        })
+        .unwrap();
+
+        provider_parts_add(ProviderPartsPullArgs {
+            home: Some(temp.join("home")),
+            layout_dir,
+            part_ids: vec![record.part_id.clone()],
+            all: false,
+            payload_dir: Some(payload_dir),
+            hf_token_file: None,
+            cache_dir: Some(cache_dir.clone()),
+            disk_reserve: None,
+            offline: true,
+            require_payload: false,
+            chunk_size: 8,
+            json: true,
+        })
+        .unwrap();
+
+        let report = provider_parts_inventory_report(&temp.join("home")).unwrap();
+        let expected = mayhem_proto::build_comfy_parts_index(std::slice::from_ref(&record), 17)
+            .unwrap()
+            .root;
+        assert_eq!(report.index_root, expected);
+        assert_eq!(report.part_count, 1);
+        assert_eq!(report.parts[0].part_id, record.part_id);
+        assert_eq!(
+            provider_comfy_inventory_root(&temp.join("home")).unwrap(),
+            Some(expected)
+        );
+
+        provider_parts_remove(ProviderPartsRemoveArgs {
+            home: Some(temp.join("home")),
+            part_ids: vec![record.part_id.clone()],
+            json: true,
+        })
+        .unwrap();
+        assert_eq!(
+            provider_parts_inventory_report(&temp.join("home"))
+                .unwrap()
+                .part_count,
+            0
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn provider_workflow_inventory_admission_requires_signed_root_match() {
+        let root = "aa".repeat(32);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0].adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            )
+            .unwrap()];
+        let record = test_comfy_part_record("workflow inventory", "66");
+        let expected_root = mayhem_proto::build_comfy_parts_index(std::slice::from_ref(&record), 5)
+            .unwrap()
+            .root;
+        catalog.models[0].workflow = Some(mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["CheckpointLoaderSimple".to_owned(), "SaveImage".to_owned()],
+            parts: vec![mayhem_proto::ComfyWorkflowPartRef {
+                name: record.name.clone(),
+                part_id: record.part_id.clone(),
+                part_type: record.part_type.clone(),
+                sha256: record.sha256.clone(),
+            }],
+            inventory_root: Some(expected_root.clone()),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        });
+        let contract = test_contract(&root);
+        let artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        let selected = ProviderCandidate {
+            enclave: contract.enclaves[0].clone(),
+            model: catalog.models[0].clone(),
+            artifact_name: "gguf-q4_k_m".to_owned(),
+            artifact,
+            verdict: BackendVerdict {
+                backend: "comfyui".to_owned(),
+                status: VerdictStatus::FullOffload,
+                reason: None,
+                est_tok_s: None,
+                n_layers_gpu: None,
+                max_sessions: 1,
+                kv_cache_bytes_budget: 0,
+            },
+            price: contract.prices.first().cloned(),
+            served_ctx: 1,
+            served_modalities: vec!["image".to_owned()],
+            served_specialities: BTreeMap::new(),
+            modality_capacities: test_modality_capacities("image"),
+            feasibility: ProviderCtxFeasibility::not_applicable(1, 0),
+            ctx_bracket_schedule: default_ctx_bracket_schedule(),
+        };
+        let temp = test_temp_dir("mayhem-provider-workflow-inventory-admission");
+        let missing = provider_comfy_workflow_inventory_root(&temp, &selected).unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("has no verified Comfy inventory"),
+            "{missing:#}"
+        );
+
+        let inventory = ProviderComfyInventory {
+            schema_version: PROVIDER_COMFY_INVENTORY_SCHEMA_VERSION,
+            index_ver: 5,
+            index_root: expected_root.clone(),
+            anchor_hash: "77".repeat(32),
+            updated_at: unix_epoch_seconds().unwrap(),
+            parts: vec![ProviderComfyInventoryPart {
+                part_id: record.part_id.clone(),
+                record_hash: mayhem_proto::comfy_part_record_hash(&record).unwrap(),
+                cache_path: temp.join("cache.bin").display().to_string(),
+                added_at: unix_epoch_seconds().unwrap(),
+                record,
+            }],
+        };
+        write_provider_comfy_inventory(&temp, &inventory).unwrap();
+        assert_eq!(
+            provider_comfy_workflow_inventory_root(&temp, &selected).unwrap(),
+            Some(expected_root)
+        );
         let _ = fs::remove_dir_all(temp);
     }
 
