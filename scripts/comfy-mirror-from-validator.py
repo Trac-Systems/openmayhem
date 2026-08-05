@@ -236,7 +236,11 @@ def main() -> int:
             category = classify(draft)
             counts[category] = counts.get(category, 0) + 1
             if category == "unknown_hold" and not args.include_unknown:
-                results.write(result_line({"ok": True, "part_id": part_id, "status": "skipped_unknown"}) + "\n")
+                if args.worker_index == 0:
+                    results.write(
+                        result_line({"ok": True, "part_id": part_id, "status": "skipped_unknown"})
+                        + "\n"
+                    )
                 continue
             if category == "unknown_hold" and args.include_unknown:
                 category = "direct_unknown"

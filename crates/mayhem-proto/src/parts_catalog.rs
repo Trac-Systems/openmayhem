@@ -273,6 +273,7 @@ impl ComfyPartDraft {
             "version_name",
             "repository",
             "file",
+            "file_path",
             "note",
             "notes",
             "admission_note",
@@ -719,6 +720,12 @@ fn yaml_sources(
     object: &serde_json::Map<String, Value>,
 ) -> Result<ComfyPartSources, ComfyPartsCatalogError> {
     let mut origins = Vec::new();
+    let source_path = object
+        .get("file")
+        .or_else(|| object.get("file_path"))
+        .and_then(Value::as_str)
+        .map(safe_comfy_source_path)
+        .transpose()?;
     if let Some(url) = object.get("download_url").and_then(Value::as_str) {
         origins.push(ComfyPartSource {
             kind: infer_source_kind(url).to_owned(),
@@ -735,8 +742,26 @@ fn yaml_sources(
         });
     }
     if let Some(source) = object.get("source").and_then(Value::as_str) {
+        let source_kind = infer_source_kind(source);
+        if origins.is_empty() && source_kind == "huggingface" {
+            if let Some(path) = source_path.as_deref() {
+                let repository = source.trim().trim_end_matches('/').to_owned();
+                origins.push(ComfyPartSource {
+                    kind: "huggingface".to_owned(),
+                    url: format!("{repository}/resolve/main/{path}"),
+                    repository: Some(repository),
+                    path: Some(path.to_owned()),
+                    revision: None,
+                });
+                return Ok(ComfyPartSources {
+                    mirrors: Vec::new(),
+                    origins,
+                    require_auth: false,
+                });
+            }
+        }
         origins.push(ComfyPartSource {
-            kind: infer_source_kind(source).to_owned(),
+            kind: source_kind.to_owned(),
             url: source.to_owned(),
             repository: None,
             path: None,
@@ -754,14 +779,30 @@ fn yaml_sources(
     }
     origins.sort_by(|left, right| left.url.cmp(&right.url));
     origins.dedup_by(|left, right| left.url == right.url);
-    let require_auth = origins
-        .iter()
-        .any(|origin| origin.kind == "civitai" && object.get("download_url").is_none());
+    let require_auth = origins.iter().any(|origin| origin.kind == "civitai");
     Ok(ComfyPartSources {
         mirrors: Vec::new(),
         origins,
         require_auth,
     })
+}
+
+fn safe_comfy_source_path(value: &str) -> Result<String, ComfyPartsCatalogError> {
+    let path = value.trim();
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.starts_with('\\')
+        || path.contains('\\')
+        || path
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(ComfyPartsCatalogError::InvalidField {
+            field: "file_path",
+            reason: "must be a safe relative repository path".to_owned(),
+        });
+    }
+    Ok(path.to_owned())
 }
 
 fn infer_source_kind(url: &str) -> &'static str {
@@ -813,7 +854,7 @@ fn infer_part_type(
 }
 
 fn infer_file_format(object: &serde_json::Map<String, Value>) -> String {
-    for key in ["file", "download_url"] {
+    for key in ["file", "file_path", "download_url"] {
         if let Some(value) = object.get(key).and_then(Value::as_str) {
             let lower = value.to_ascii_lowercase();
             if lower.ends_with(".safetensors") {
@@ -1163,6 +1204,7 @@ mod tests {
             drafts[0].permissions,
             vec!["Rent".to_owned(), "RentCivit".to_owned()]
         );
+        assert!(drafts[0].sources.require_auth);
         assert_eq!(drafts[1].part_type, "controlnet");
         assert!(drafts[1].size_bytes_exact);
         assert_eq!(drafts[2].part_type, "upscaler");
@@ -1181,6 +1223,56 @@ mod tests {
             finalized.part_id,
             derive_comfy_part_id(&finalized.part_type, &finalized.name, &finalized.sha256)
         );
+    }
+
+    #[test]
+    fn yaml_import_resolves_huggingface_file_path_sources() {
+        let row = serde_json::json!({
+            "name": "UMT5-XXL fp8 scaled",
+            "type": "text-encoder",
+            "lane": "wan",
+            "source": "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged",
+            "file_path": "split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+            "sha256": "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68",
+            "size_bytes": 7_237_545_820_u64,
+            "license": "apache-2.0",
+            "status": "linked",
+        });
+        let draft = ComfyPartDraft::from_yaml_value(&row).unwrap();
+        assert_eq!(draft.file_format, "safetensors");
+        assert_eq!(
+            draft.sources.origins[0].url,
+            "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+        );
+        assert_eq!(
+            draft.sources.origins[0].path.as_deref(),
+            Some("split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors")
+        );
+    }
+
+    #[test]
+    fn yaml_import_marks_civitai_download_urls_auth_required() {
+        let row = serde_json::json!({
+            "name": "Illustrious-XL v0.1",
+            "type": "checkpoint",
+            "lane": "sdxl",
+            "source": "https://civitai.com/models/795765",
+            "version_id": 889818_u64,
+            "sha256": "3E15BA00387DB678AB4A099F75771C4F5AC67FDA9E7100A01D263EAF30145AA9",
+            "size_bytes": 6_938_040_760_u64,
+            "file_format": "safetensors",
+            "download_url": "https://civitai.com/api/download/models/889818",
+            "license": "TBD",
+            "status": "linked",
+        });
+        let draft = ComfyPartDraft::from_yaml_value(&row).unwrap();
+        assert!(draft.sources.require_auth);
+        assert!(draft
+            .sources
+            .origins
+            .iter()
+            .any(|origin| origin.kind == "civitai"
+                && origin.url == "https://civitai.com/api/download/models/889818"));
     }
 
     #[test]
