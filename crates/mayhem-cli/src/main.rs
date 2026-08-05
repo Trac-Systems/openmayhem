@@ -26358,7 +26358,6 @@ fn comfy_part_type_model_subdir(
     safe_relative_comfy_model_subdir(subdir)
 }
 
-#[cfg(feature = "comfyui")]
 fn safe_relative_comfy_model_subdir(path: &str) -> Result<PathBuf> {
     let path = Path::new(path);
     ensure!(
