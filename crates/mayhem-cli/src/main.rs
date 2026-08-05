@@ -5963,6 +5963,26 @@ struct ProviderPartsAdmitArgs {
     #[arg(long = "load-plan", value_name = "PATH")]
     load_plan: Option<PathBuf>,
 
+    /// Reference Comfy graph JSON to execute for this outcome-class admission.
+    #[arg(long = "reference-graph", value_name = "PATH")]
+    reference_graph: Option<PathBuf>,
+
+    /// Verified ComfyUI runtime checkout to execute the reference graph.
+    #[arg(long = "reference-runtime", value_name = "PATH")]
+    reference_runtime: Option<PathBuf>,
+
+    /// Optional isolated cache root for the reference run.
+    #[arg(long = "reference-cache-dir", value_name = "PATH")]
+    reference_cache_dir: Option<PathBuf>,
+
+    /// Directory where the reference proof artifact is written.
+    #[arg(long = "reference-output-dir", value_name = "PATH")]
+    reference_output_dir: Option<PathBuf>,
+
+    /// Timeout for the reference runtime proof.
+    #[arg(long = "reference-timeout-ms", default_value_t = 120_000)]
+    reference_timeout_ms: u64,
+
     /// Chunk size for BLAKE3 Merkle-root verification.
     #[arg(long, default_value_t = DEFAULT_CHUNK_SIZE)]
     chunk_size: usize,
@@ -27609,6 +27629,8 @@ struct ProviderPartsAdmissionReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     refusal_reason: Option<String>,
     phases: Vec<ProviderPartsAdmissionPhaseReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference: Option<ProviderPartsAdmissionReferenceProof>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -27621,6 +27643,20 @@ struct ProviderPartsAdmissionPhaseReport {
     peak_bytes: u64,
     boundary_outputs: Vec<String>,
     safe_unload_after: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderPartsAdmissionReferenceProof {
+    graph_path: String,
+    graph_sha256: String,
+    runtime: String,
+    cache_dir: String,
+    output_path: String,
+    output_content_type: String,
+    output_sha256: String,
+    artifact_count: u32,
+    progress_event_count: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -27707,6 +27743,10 @@ fn write_provider_comfy_admission(
         "only successful Comfy admissions can be persisted"
     );
     validate_provider_parts_admission_report(report)?;
+    ensure!(
+        report.reference.is_some(),
+        "persisted Comfy admissions require a reference runtime proof; pass --reference-graph, --reference-runtime, and --reference-output-dir"
+    );
     let admission = ProviderComfyAdmission {
         schema_version: PROVIDER_COMFY_ADMISSION_SCHEMA_VERSION,
         admitted_at: unix_epoch_seconds()?,
@@ -27790,7 +27830,12 @@ fn validate_provider_comfy_admission(admission: &ProviderComfyAdmission) -> Resu
         admission.admitted_at > 0,
         "Comfy provider admission timestamp is missing"
     );
-    validate_provider_parts_admission_report(&admission.report)
+    validate_provider_parts_admission_report(&admission.report)?;
+    ensure!(
+        admission.report.reference.is_some(),
+        "Comfy provider admission is missing reference runtime proof"
+    );
+    Ok(())
 }
 
 fn validate_provider_parts_admission_report(report: &ProviderPartsAdmissionReport) -> Result<()> {
@@ -27898,6 +27943,44 @@ fn validate_provider_parts_admission_report(report: &ProviderPartsAdmissionRepor
             == report.peak_bytes,
         "Comfy admission peak bytes mismatch"
     );
+    if let Some(reference) = &report.reference {
+        validate_hex32_config(
+            "Comfy admission reference graph hash",
+            Some(&reference.graph_sha256),
+        )?;
+        validate_hex32_config(
+            "Comfy admission reference output hash",
+            Some(&reference.output_sha256),
+        )?;
+        ensure!(
+            !reference.graph_path.trim().is_empty(),
+            "Comfy admission reference graph path is empty"
+        );
+        ensure!(
+            valid_provider_admission_ref(&reference.runtime),
+            "Comfy admission reference runtime is invalid"
+        );
+        ensure!(
+            reference.runtime == report.runtime_id,
+            "Comfy admission reference runtime does not match admitted runtime"
+        );
+        ensure!(
+            !reference.cache_dir.trim().is_empty(),
+            "Comfy admission reference cache dir is empty"
+        );
+        ensure!(
+            !reference.output_path.trim().is_empty(),
+            "Comfy admission reference output path is empty"
+        );
+        ensure!(
+            !reference.output_content_type.trim().is_empty(),
+            "Comfy admission reference output content type is empty"
+        );
+        ensure!(
+            reference.artifact_count == 1,
+            "Comfy admission reference must emit exactly one artifact"
+        );
+    }
     Ok(())
 }
 
@@ -28797,12 +28880,12 @@ fn provider_parts_admission_report(
             human_bytes(usable_bytes)
         )
     });
-    Ok(ProviderPartsAdmissionReport {
+    let mut report = ProviderPartsAdmissionReport {
         ok: admitted,
         admitted,
         outcome_class: args.outcome_class.clone(),
         runtime_id: args.runtime_id.clone(),
-        inventory_root: inventory.index_root,
+        inventory_root: inventory.index_root.clone(),
         part_count: required_ids.len() as u64,
         mode: if args.load_plan.is_some() {
             "staged".to_owned()
@@ -28825,6 +28908,185 @@ fn provider_parts_admission_report(
         ),
         refusal_reason,
         phases,
+        reference: None,
+    };
+    report.reference =
+        provider_parts_admission_reference_proof(args, &inventory, &required_ids, report.admitted)?;
+    Ok(report)
+}
+
+fn provider_parts_admission_reference_proof(
+    args: &ProviderPartsAdmitArgs,
+    inventory: &ProviderComfyInventory,
+    required_ids: &[String],
+    admitted: bool,
+) -> Result<Option<ProviderPartsAdmissionReferenceProof>> {
+    let Some(runtime) = args.reference_runtime.as_deref() else {
+        ensure!(
+            args.reference_graph.is_none()
+                && args.reference_cache_dir.is_none()
+                && args.reference_output_dir.is_none(),
+            "--reference-graph, --reference-cache-dir, and --reference-output-dir require --reference-runtime"
+        );
+        return Ok(None);
+    };
+    ensure!(
+        admitted,
+        "reference runtime proof is only run after the memory admission envelope fits"
+    );
+    let graph = args
+        .reference_graph
+        .as_deref()
+        .context("--reference-graph is required with --reference-runtime")?;
+    let output_dir = args
+        .reference_output_dir
+        .as_deref()
+        .context("--reference-output-dir is required with --reference-runtime")?;
+    ensure!(
+        args.reference_timeout_ms > 0,
+        "--reference-timeout-ms must be positive"
+    );
+    provider_parts_admission_reference_proof_with_runtime(
+        inventory,
+        required_ids,
+        &args.runtime_id,
+        graph,
+        runtime,
+        args.reference_cache_dir.as_deref(),
+        output_dir,
+        args.reference_timeout_ms,
+        args.chunk_size,
+    )
+    .map(Some)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn provider_parts_admission_reference_proof_with_runtime(
+    inventory: &ProviderComfyInventory,
+    required_ids: &[String],
+    runtime_id: &str,
+    graph: &Path,
+    runtime: &Path,
+    cache_dir: Option<&Path>,
+    output_dir: &Path,
+    timeout_ms: u64,
+    chunk_size: usize,
+) -> Result<ProviderPartsAdmissionReferenceProof> {
+    #[cfg(feature = "comfyui")]
+    {
+        provider_parts_admission_reference_proof_with_runtime_inner(
+            inventory,
+            required_ids,
+            runtime_id,
+            graph,
+            runtime,
+            cache_dir,
+            output_dir,
+            timeout_ms,
+            chunk_size,
+        )
+    }
+    #[cfg(not(feature = "comfyui"))]
+    {
+        let _ = (
+            inventory,
+            required_ids,
+            runtime_id,
+            graph,
+            runtime,
+            cache_dir,
+            output_dir,
+            timeout_ms,
+            chunk_size,
+        );
+        bail!("Comfy admission reference execution requires rebuilding mayhem-cli with --features comfyui")
+    }
+}
+
+#[cfg(feature = "comfyui")]
+#[allow(clippy::too_many_arguments)]
+fn provider_parts_admission_reference_proof_with_runtime_inner(
+    inventory: &ProviderComfyInventory,
+    required_ids: &[String],
+    runtime_id: &str,
+    graph: &Path,
+    runtime: &Path,
+    cache_dir: Option<&Path>,
+    output_dir: &Path,
+    timeout_ms: u64,
+    chunk_size: usize,
+) -> Result<ProviderPartsAdmissionReferenceProof> {
+    let graph_hash = file_sha256_hex(graph)
+        .with_context(|| format!("hashing reference graph {}", graph.display()))?;
+    let workflow: Value = serde_json::from_value(read_json_file(graph)?)
+        .with_context(|| format!("parsing reference graph {}", graph.display()))?;
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("creating reference output dir {}", output_dir.display()))?;
+    let cache_root = cache_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| output_dir.join(".runtime-cache"));
+    let by_part_id = inventory
+        .parts
+        .iter()
+        .map(|part| (part.part_id.as_str(), part))
+        .collect::<BTreeMap<_, _>>();
+    let mut model_files = Vec::new();
+    for part_id in required_ids {
+        let part = by_part_id
+            .get(part_id.as_str())
+            .with_context(|| format!("required Comfy part {part_id} is not in this inventory"))?;
+        let source = PathBuf::from(&part.cache_path);
+        ensure!(
+            provider_comfy_part_payload_matches(&source, &part.record, chunk_size)?,
+            "required Comfy part {part_id} is missing or no longer matches its signed payload"
+        );
+        model_files.push(ComfyUiModelFile {
+            source,
+            model_subdir: comfy_part_record_model_subdir(&part.record)?,
+            model_path: safe_relative_comfy_model_path(&part.record.name)?,
+        });
+    }
+    let mut config = LoadConfig::comfyui_runtime(runtime);
+    config.backend_cache_dir = Some(cache_root.clone());
+    config.comfyui_model_files = model_files;
+    let mut backend = ComfyUiBackend::new();
+    backend
+        .load(config)
+        .context("loading ComfyUI runtime for provider admission reference proof")?;
+    let mut request = WorkflowGenerationRequest::new(workflow);
+    request.timeout_ms = timeout_ms;
+    let mut collector = AdminPartsCanaryArtifactCollector::default();
+    let output = backend
+        .run_workflow(
+            request,
+            &mut |chunk: ArtifactChunk| collector.push(chunk),
+            &CancellationToken::new(),
+        )
+        .context("running ComfyUI provider admission reference graph")?;
+    ensure!(
+        output.artifact_count == 1,
+        "Comfy admission reference graph must emit exactly one artifact, got {}",
+        output.artifact_count
+    );
+    let artifact = collector.finish()?;
+    let ext = comfy_canary_content_extension(&artifact.content_type);
+    let output_path = output_dir.join(format!(
+        "{}-{}-reference.{ext}",
+        safe_path_component(&runtime_id.replace('.', "_")),
+        blake3::hash(graph_hash.as_bytes()).to_hex()
+    ));
+    let output_sha256 = sha256_bytes_hex(&artifact.bytes);
+    write_comfy_canary_artifact_idempotent(&output_path, &artifact.bytes, false)?;
+    Ok(ProviderPartsAdmissionReferenceProof {
+        graph_path: graph.display().to_string(),
+        graph_sha256: graph_hash,
+        runtime: runtime_id.to_owned(),
+        cache_dir: cache_root.display().to_string(),
+        output_path: output_path.display().to_string(),
+        output_content_type: artifact.content_type,
+        output_sha256,
+        artifact_count: output.artifact_count,
+        progress_event_count: output.progress_events.len(),
     })
 }
 
@@ -92983,8 +93245,19 @@ status: linked
             "2",
             "--load-plan",
             "load-plan.json",
+            "--reference-graph",
+            "reference.json",
+            "--reference-runtime",
+            "ComfyUI",
+            "--reference-cache-dir",
+            "cache",
+            "--reference-output-dir",
+            "proofs",
+            "--reference-timeout-ms",
+            "60000",
             "--chunk-size",
             "8",
+            "--write",
             "--json",
         ])
         .unwrap();
@@ -93006,7 +93279,13 @@ status: linked
         assert_eq!(args.headroom_pct, 25);
         assert_eq!(args.max_sessions, 2);
         assert_eq!(args.load_plan, Some(PathBuf::from("load-plan.json")));
+        assert_eq!(args.reference_graph, Some(PathBuf::from("reference.json")));
+        assert_eq!(args.reference_runtime, Some(PathBuf::from("ComfyUI")));
+        assert_eq!(args.reference_cache_dir, Some(PathBuf::from("cache")));
+        assert_eq!(args.reference_output_dir, Some(PathBuf::from("proofs")));
+        assert_eq!(args.reference_timeout_ms, 60_000);
         assert_eq!(args.chunk_size, 8);
+        assert!(args.write);
         assert!(args.json);
     }
 
@@ -93114,6 +93393,11 @@ status: linked
             headroom_pct: 0,
             max_sessions: 2,
             load_plan: None,
+            reference_graph: None,
+            reference_runtime: None,
+            reference_cache_dir: None,
+            reference_output_dir: None,
+            reference_timeout_ms: 120_000,
             chunk_size: 8,
             write: false,
             json: true,
@@ -93149,7 +93433,7 @@ status: linked
         )
         .unwrap();
         let staged = provider_parts_admission_report(&ProviderPartsAdmitArgs {
-            home: Some(home),
+            home: Some(home.clone()),
             outcome_class: "image.workflow.test".to_owned(),
             runtime_id: "comfyui-v0.30.1".to_owned(),
             part_ids: vec![base.part_id.clone(), refiner.part_id.clone()],
@@ -93158,6 +93442,11 @@ status: linked
             headroom_pct: 0,
             max_sessions: 2,
             load_plan: Some(load_plan),
+            reference_graph: None,
+            reference_runtime: None,
+            reference_cache_dir: None,
+            reference_output_dir: None,
+            reference_timeout_ms: 120_000,
             chunk_size: 8,
             write: false,
             json: true,
@@ -93169,6 +93458,12 @@ status: linked
         assert_eq!(staged.peak_bytes, 80);
         assert_eq!(staged.required_bytes, 80);
         assert_eq!(staged.max_safe_sessions, 4);
+        let err = write_provider_comfy_admission(&home, &staged).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("persisted Comfy admissions require a reference runtime proof"),
+            "{err:#}"
+        );
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -93246,6 +93541,11 @@ status: linked
             headroom_pct: 0,
             max_sessions: 1,
             load_plan: Some(load_plan),
+            reference_graph: None,
+            reference_runtime: None,
+            reference_cache_dir: None,
+            reference_output_dir: None,
+            reference_timeout_ms: 120_000,
             chunk_size: 8,
             write: false,
             json: true,
@@ -93516,7 +93816,7 @@ status: linked
         })
         .unwrap();
         let inventory_root = provider_comfy_inventory_root(&home).unwrap().unwrap();
-        let report = provider_parts_admission_report(&ProviderPartsAdmitArgs {
+        let mut report = provider_parts_admission_report(&ProviderPartsAdmitArgs {
             home: Some(home.clone()),
             outcome_class: "image.custom.512".to_owned(),
             runtime_id: "comfyui-v0.31.0".to_owned(),
@@ -93526,11 +93826,27 @@ status: linked
             headroom_pct: 0,
             max_sessions: 2,
             load_plan: None,
+            reference_graph: None,
+            reference_runtime: None,
+            reference_cache_dir: None,
+            reference_output_dir: None,
+            reference_timeout_ms: 120_000,
             chunk_size: 8,
             write: false,
             json: true,
         })
         .unwrap();
+        report.reference = Some(ProviderPartsAdmissionReferenceProof {
+            graph_path: "reference.json".to_owned(),
+            graph_sha256: "44".repeat(32),
+            runtime: "comfyui-v0.31.0".to_owned(),
+            cache_dir: "cache".to_owned(),
+            output_path: "reference.png".to_owned(),
+            output_content_type: "image/png".to_owned(),
+            output_sha256: "55".repeat(32),
+            artifact_count: 1,
+            progress_event_count: 1,
+        });
         write_provider_comfy_admission(&home, &report).unwrap();
 
         let root = "aa".repeat(32);
@@ -108351,6 +108667,17 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     boundary_outputs: Vec::new(),
                     safe_unload_after: Vec::new(),
                 }],
+                reference: Some(ProviderPartsAdmissionReferenceProof {
+                    graph_path: "reference.json".to_owned(),
+                    graph_sha256: "44".repeat(32),
+                    runtime: runtime_id.to_owned(),
+                    cache_dir: "cache".to_owned(),
+                    output_path: "reference.png".to_owned(),
+                    output_content_type: "image/png".to_owned(),
+                    output_sha256: "55".repeat(32),
+                    artifact_count: 1,
+                    progress_event_count: 1,
+                }),
             },
         }
     }
