@@ -30365,6 +30365,7 @@ struct PayTnkRate {
     tnk_usd_au: MoneyAu,
     source: String,
     ts: Option<u64>,
+    updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -32346,6 +32347,7 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         tnk_usd_au: payment_state.tnk_rate.tnk_usd_au,
         source: payment_state.tnk_rate.source.clone(),
         ts: Some(payment_state.tnk_rate.ts),
+        updated_at: Some(payment_state.tnk_rate.updated_at.clone()),
     };
     let nonce = resolve_tnk_nonce(
         &wallet.public_key,
@@ -42778,7 +42780,7 @@ fn pay_tnk_deposit_intent_payload(
     quoted_au: MoneyAu,
     rate: &PayTnkRate,
 ) -> Value {
-    json!({
+    let mut payload = json!({
         "op": "deposit_tnk",
         "memo_hash": memo_hash,
         "treasury_address": treasury_address,
@@ -42786,7 +42788,12 @@ fn pay_tnk_deposit_intent_payload(
         "quoted_au": money_au_json(quoted_au),
         "rate_tnk_usd_au": money_au_json(rate.tnk_usd_au),
         "rate_source": rate.source,
-    })
+    });
+    if let (Some(ts), Some(updated_at)) = (rate.ts, rate.updated_at.as_deref()) {
+        payload["rate_ts"] = json!(ts);
+        payload["rate_record_key"] = json!(updated_at);
+    }
+    payload
 }
 
 fn deposit_tnk_intent_message(intent: &Value) -> String {
@@ -42807,6 +42814,10 @@ fn parse_tnk_rate(value: &Value) -> Result<PayTnkRate> {
             .unwrap_or("rate/latest")
             .to_owned(),
         ts: value.get("ts").and_then(Value::as_u64),
+        updated_at: value
+            .get("updated_at")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 
@@ -102066,6 +102077,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     tnk_usd_au: 50_000_000_000_000_000,
                     source: "gate-spot".to_owned(),
                     ts: Some(3_600),
+                    updated_at: Some(format!("rate/tnk/3600/{}", "22".repeat(32))),
                 },
             ),
             json!({
@@ -102076,6 +102088,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "quoted_au": "10000000000000000000",
                 "rate_tnk_usd_au": "50000000000000000",
                 "rate_source": "gate-spot",
+                "rate_ts": 3600,
+                "rate_record_key": format!("rate/tnk/3600/{}", "22".repeat(32)),
             })
         );
     }

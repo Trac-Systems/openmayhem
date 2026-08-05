@@ -7,6 +7,7 @@ import {
   execute,
   executeDepositFeature,
   executeRateFeature,
+  rateFeatureKey,
   executeTapAccountBindingFeature,
   makeEthereumIdentity,
   makeIdentity,
@@ -102,28 +103,40 @@ async function consentUser(ctx, txNo = 2) {
   assert.equal(result.ok, true, result.message);
 }
 
-async function setRate(ctx) {
+async function setRate(ctx, overrides = {}) {
+  const value = {
+    op: 'rate_oracle',
+    tnk_usd_au: '2000000000000000000',
+    source: 'gate-spot',
+    ts: 1_000,
+    ...overrides,
+  };
+  const key = await rateFeatureKey(ctx.contract, value);
   const result = await executeRateFeature(
     ctx.contract,
     ctx.storage,
-    {
-      op: 'rate_oracle',
-      tnk_usd_au: '2000000000000000000',
-      source: 'gate-spot',
-      ts: 1_000,
-    },
+    value,
     ctx.admin.publicKey,
   );
   assert.equal(result.ok, true, result.message);
+  ctx.lastTnkRate = { ...value, key };
+  return key;
 }
 
-async function depositIntent(ctx, memoHash, txNo, extra = {}) {
+async function depositIntent(ctx, memoHash, txNo, extra = {}, options = {}) {
+  const includeRateLock = options.includeRateLock ?? Boolean(ctx.lastTnkRate);
   const quoted = {
     treasury_address: treasury,
     tnk_e18: oneTnkE18,
     quoted_au: '2000000000000000000',
     rate_tnk_usd_au: '2000000000000000000',
     rate_source: 'gate-spot',
+    ...(includeRateLock && ctx.lastTnkRate
+      ? {
+        rate_ts: ctx.lastTnkRate.ts,
+        rate_record_key: ctx.lastTnkRate.key,
+      }
+      : {}),
     ...extra,
   };
   const intent = {
@@ -201,6 +214,8 @@ test('MayhemContract binds TNK deposits to a user memo intent and credits balanc
     quoted_au: '2000000000000000000',
     rate_tnk_usd_au: '2000000000000000000',
     rate_source: 'gate-spot',
+    rate_ts: 1_000,
+    rate_record_key: ctx.lastTnkRate.key,
   });
 
   const duplicateIntent = await depositIntent(ctx, 'memo-a', 6);
@@ -290,6 +305,8 @@ test('MayhemContract stores canonical TNK quote fields and enforces them', async
     quoted_au: '2000000000000000000',
     rate_tnk_usd_au: '2000000000000000000',
     rate_source: 'gate-spot',
+    rate_ts: 1_000,
+    rate_record_key: ctx.lastTnkRate.key,
   });
   assert.equal(intent.ok, true, intent.message);
   assert.deepEqual((await ctx.storage.get('dep/pending/memo-quoted')).value, {
@@ -304,6 +321,8 @@ test('MayhemContract stores canonical TNK quote fields and enforces them', async
     quoted_au: '2000000000000000000',
     rate_tnk_usd_au: '2000000000000000000',
     rate_source: 'gate-spot',
+    rate_ts: 1_000,
+    rate_record_key: ctx.lastTnkRate.key,
   });
 
   const bareHash = await executeDepositFeature(
@@ -376,6 +395,114 @@ test('MayhemContract stores canonical TNK quote fields and enforces them', async
   assert.equal(confirmed.ok, true, confirmed.message);
   assert.equal(confirmed.au, '2000000000000000000');
   assert.equal(await ctx.storage.get('dep/pending/memo-quoted'), null);
+});
+
+test('MayhemContract credits TNK deposits against their locked intent rate', async () => {
+  const ctx = await setupDepositContract();
+  await consentUser(ctx, 2);
+  const originalRateKey = await setRate(ctx, {
+    tnk_usd_au: '2000000000000000000',
+    source: 'gate-spot',
+    ts: 1_000,
+  });
+
+  const intent = await depositIntent(ctx, 'memo-rate-lock', 4);
+  assert.equal(intent.ok, true, intent.message);
+
+  await setRate(ctx, {
+    tnk_usd_au: '1000000000000000000',
+    source: 'gate-spot',
+    ts: 1_200,
+  });
+
+  const confirmed = await confirmDeposit(ctx, 'memo-rate-lock', oneTnkE18, '8'.repeat(64), 5);
+  assert.equal(confirmed.ok, true, confirmed.message);
+  assert.equal(confirmed.au, '2000000000000000000');
+  assert.equal(confirmed.rate_ts, 1_000);
+  const credited = (await ctx.storage.get('dep/tnk-credited/memo-rate-lock')).value;
+  assert.equal(credited.rate_tnk_usd_au, '2000000000000000000');
+  assert.equal(credited.rate_ts, 1_000);
+  assert.equal(
+    (await ctx.storage.get(originalRateKey)).value.tnk_usd_au,
+    '2000000000000000000'
+  );
+});
+
+test('MayhemContract rejects fresh TNK intents that do not match the current oracle', async () => {
+  const ctx = await setupDepositContract();
+  await consentUser(ctx, 2);
+  await setRate(ctx, {
+    tnk_usd_au: '2000000000000000000',
+    source: 'gate-spot',
+    ts: 1_000,
+  });
+
+  const staleUnsigned = await depositIntent(ctx, 'memo-stale-rate', 4, {
+    rate_tnk_usd_au: '1000000000000000000',
+    quoted_au: '1000000000000000000',
+  }, { includeRateLock: false });
+  assert.match(staleUnsigned.message, /rate does not match current oracle/i);
+});
+
+test('MayhemContract bounded legacy TNK intent recovery tolerates small oracle drift only', async () => {
+  const ctx = await setupDepositContract();
+  await consentUser(ctx, 2);
+  await setRate(ctx, {
+    tnk_usd_au: '106350000000000000',
+    source: 'gate-spot',
+    ts: 1_000,
+  });
+  const legacy = await depositIntent(ctx, 'memo-legacy-rate', 4, {
+    quoted_au: '106350000000000000',
+    rate_tnk_usd_au: '106350000000000000',
+  }, { includeRateLock: false });
+  assert.equal(legacy.ok, true, legacy.message);
+  const legacyPendingKey = 'dep/pending/memo-legacy-rate';
+  const legacyPending = (await ctx.storage.get(legacyPendingKey)).value;
+  delete legacyPending.rate_ts;
+  delete legacyPending.rate_record_key;
+  await ctx.storage.put(legacyPendingKey, legacyPending);
+
+  await setRate(ctx, {
+    tnk_usd_au: '105700000000000000',
+    source: 'gate-spot',
+    ts: 1_200,
+  });
+  const confirmed = await confirmDeposit(ctx, 'memo-legacy-rate', oneTnkE18, '9'.repeat(64), 5);
+  assert.equal(confirmed.ok, true, confirmed.message);
+  assert.equal(confirmed.au, '106350000000000000');
+
+  await setRate(ctx, {
+    tnk_usd_au: '2000000000000000000',
+    source: 'gate-spot',
+    ts: 1_300,
+  });
+  const farLegacy = await depositIntent(
+    ctx,
+    'memo-legacy-rate-far',
+    6,
+    {},
+    { includeRateLock: false }
+  );
+  assert.equal(farLegacy.ok, true, farLegacy.message);
+  const farLegacyPendingKey = 'dep/pending/memo-legacy-rate-far';
+  const farLegacyPending = (await ctx.storage.get(farLegacyPendingKey)).value;
+  delete farLegacyPending.rate_ts;
+  delete farLegacyPending.rate_record_key;
+  await ctx.storage.put(farLegacyPendingKey, farLegacyPending);
+  await setRate(ctx, {
+    tnk_usd_au: '1000000000000000000',
+    source: 'gate-spot',
+    ts: 1_400,
+  });
+  const rejected = await confirmDeposit(
+    ctx,
+    'memo-legacy-rate-far',
+    oneTnkE18,
+    'a'.repeat(64),
+    7
+  );
+  assert.match(rejected.message, /rate does not match pending intent/i);
 });
 
 test('MayhemContract deposit root accumulation is deterministic and root-only', async () => {
