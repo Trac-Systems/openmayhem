@@ -173,11 +173,16 @@ def main() -> int:
     for part_id, draft in sorted(drafts.items(), key=lambda item: item[1]["name"]):
         result = results[part_id]
         converted = result.get("status") == "converted"
+        result = dict(result)
         payload = Path(result.get("converted_path") or result["download_path"])
         if not payload.is_file():
             raise SystemExit(f"payload is missing: {payload}")
+        if converted:
+            result.setdefault("converted_size_bytes", payload.stat().st_size)
+        else:
+            result.setdefault("actual_size_bytes", payload.stat().st_size)
         sha256 = result.get("converted_sha256") if converted else draft["sha256"]
-        size_bytes = int(result.get("converted_size_bytes") or result["actual_size_bytes"])
+        size_bytes = int(result["converted_size_bytes"] if converted else result["actual_size_bytes"])
         file_format = "safetensors" if converted else draft["file_format"]
         is_origin_only = (
             part_id.lower() in origin_only_ids
