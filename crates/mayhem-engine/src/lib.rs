@@ -445,6 +445,8 @@ impl ModelArtifact {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LoadConfig {
     pub artifact: ModelArtifact,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comfyui_model_files: Vec<ComfyUiModelFile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision_projector: Option<ModelArtifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -505,6 +507,14 @@ pub struct LoadConfig {
     pub use_mlock: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_limit_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComfyUiModelFile {
+    pub source: PathBuf,
+    pub model_subdir: PathBuf,
+    pub model_path: PathBuf,
 }
 
 impl LoadConfig {
@@ -590,6 +600,7 @@ impl Default for LoadConfig {
     fn default() -> Self {
         Self {
             artifact: ModelArtifact::gguf(PathBuf::new()),
+            comfyui_model_files: Vec::new(),
             vision_projector: None,
             prompt_enhancer_model: None,
             prompt_enhancer_projector: None,

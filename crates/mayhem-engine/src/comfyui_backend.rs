@@ -129,6 +129,7 @@ impl EngineBackend for ComfyUiBackend {
                 cache_root.display()
             ))
         })?;
+        materialize_comfyui_model_files(&cache_root, &config.comfyui_model_files)?;
         let python = env::var_os(PYTHON_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("python3"));
@@ -257,6 +258,90 @@ impl EngineBackend for ComfyUiBackend {
             progress_events: response.progress_events,
         })
     }
+}
+
+fn materialize_comfyui_model_files(
+    cache_root: &Path,
+    files: &[super::ComfyUiModelFile],
+) -> Result<()> {
+    let models_root = cache_root.join("base").join("models");
+    for file in files {
+        validate_comfyui_model_file(file)?;
+        let target_dir = models_root.join(&file.model_subdir);
+        fs::create_dir_all(&target_dir).map_err(|error| {
+            EngineError::ComfyUi(format!(
+                "creating ComfyUI model directory {} failed: {error}",
+                target_dir.display()
+            ))
+        })?;
+        let target = target_dir.join(&file.model_path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                EngineError::ComfyUi(format!(
+                    "creating ComfyUI model directory {} failed: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        if fs::symlink_metadata(&target)
+            .is_ok_and(|metadata| metadata.is_file() || metadata.file_type().is_symlink())
+        {
+            fs::remove_file(&target).map_err(|error| {
+                EngineError::ComfyUi(format!(
+                    "replacing ComfyUI model file {} failed: {error}",
+                    target.display()
+                ))
+            })?;
+        }
+        fs::hard_link(&file.source, &target)
+            .or_else(|_| fs::copy(&file.source, &target).map(|_| ()))
+            .map_err(|error| {
+                EngineError::ComfyUi(format!(
+                    "materializing ComfyUI model file {} at {} failed: {error}",
+                    file.source.display(),
+                    target.display()
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+fn validate_comfyui_model_file(file: &super::ComfyUiModelFile) -> Result<()> {
+    let metadata = fs::symlink_metadata(&file.source).map_err(|error| {
+        EngineError::ComfyUi(format!(
+            "inspecting ComfyUI model source {} failed: {error}",
+            file.source.display()
+        ))
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(EngineError::ComfyUi(format!(
+            "ComfyUI model source {} must be a regular non-symlink file",
+            file.source.display()
+        )));
+    }
+    if file.model_path.as_os_str().is_empty()
+        || file.model_path.is_absolute()
+        || file
+            .model_path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(EngineError::ComfyUi(
+            "ComfyUI model path must be relative under the selected models subdir".to_owned(),
+        ));
+    }
+    if file.model_subdir.as_os_str().is_empty()
+        || file.model_subdir.is_absolute()
+        || file
+            .model_subdir
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(EngineError::ComfyUi(
+            "ComfyUI model subdir must be a relative path under models/".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 impl Drop for ComfyUiBackend {

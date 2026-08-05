@@ -68,7 +68,7 @@ use mayhem_enclave::{
 use mayhem_engine::ComfyUiBackend;
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, CancellationToken,
-    EngineBackend, EngineError, GenerateRequest, GenerateSpecialityParameter,
+    ComfyUiModelFile, EngineBackend, EngineError, GenerateRequest, GenerateSpecialityParameter,
     GenerateSpecialityTarget, GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest,
     LoadConfig, MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
     SpeechReferenceAudio, SpeechRequest, TokenChunk, ToolSpec, WorkflowGenerationRequest,
@@ -26200,14 +26200,21 @@ impl AdminPartsCanaryArtifactCollector {
 
 #[cfg(feature = "comfyui")]
 fn comfy_part_model_subdir(draft: &mayhem_proto::ComfyPartDraft) -> Result<PathBuf> {
-    if let Some(path) = draft
-        .adapter
-        .get("comfy_model_subdir")
-        .and_then(Value::as_str)
-    {
+    comfy_part_type_model_subdir(&draft.part_type, &draft.adapter)
+}
+
+fn comfy_part_record_model_subdir(record: &mayhem_proto::ComfyPartRecord) -> Result<PathBuf> {
+    comfy_part_type_model_subdir(&record.part_type, &record.adapter)
+}
+
+fn comfy_part_type_model_subdir(
+    part_type: &str,
+    adapter: &BTreeMap<String, Value>,
+) -> Result<PathBuf> {
+    if let Some(path) = adapter.get("comfy_model_subdir").and_then(Value::as_str) {
         return safe_relative_comfy_model_subdir(path);
     }
-    let subdir = match draft.part_type.as_str() {
+    let subdir = match part_type {
         "audio-model" => "audio",
         "checkpoint" => "checkpoints",
         "clip-vision" => "clip_vision",
@@ -26252,6 +26259,37 @@ fn safe_relative_comfy_model_subdir(path: &str) -> Result<PathBuf> {
     ensure!(
         !out.as_os_str().is_empty(),
         "comfy_model_subdir cannot be empty"
+    );
+    Ok(out)
+}
+
+fn safe_relative_comfy_model_path(path: &str) -> Result<PathBuf> {
+    let path = Path::new(path);
+    ensure!(
+        !path.is_absolute(),
+        "Comfy model filename must be relative under its model directory"
+    );
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => {
+                let Some(value) = value.to_str() else {
+                    bail!("Comfy model filename must be UTF-8");
+                };
+                let safe = safe_path_component(value);
+                ensure!(
+                    !safe.is_empty() && safe == value,
+                    "Comfy model filename contains an unsafe component"
+                );
+                out.push(value);
+            }
+            Component::CurDir => {}
+            _ => bail!("Comfy model filename cannot contain parent or prefix components"),
+        }
+    }
+    ensure!(
+        !out.as_os_str().is_empty(),
+        "Comfy model filename cannot be empty"
     );
     Ok(out)
 }
@@ -27334,14 +27372,16 @@ fn provider_comfy_inventory_root(home: &Path) -> Result<Option<String>> {
     Ok(read_provider_comfy_inventory(home)?.map(|inventory| inventory.index_root))
 }
 
-fn provider_comfy_workflow_required_inventory_root(selected: &ProviderCandidate) -> Option<&str> {
-    if !selected
-        .model
+fn catalog_model_has_comfy_workflow_endpoint(model: &catalog::CatalogModel) -> bool {
+    model
         .adapter
         .endpoint_families
         .iter()
         .any(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS)
-    {
+}
+
+fn provider_comfy_workflow_required_inventory_root(selected: &ProviderCandidate) -> Option<&str> {
+    if !catalog_model_has_comfy_workflow_endpoint(&selected.model) {
         return None;
     }
     selected
@@ -27370,6 +27410,129 @@ fn provider_comfy_workflow_inventory_root(
         selected.enclave.model_id
     );
     Ok(Some(actual))
+}
+
+fn provider_comfy_workflow_inventory_resident_bytes(
+    home: Option<&Path>,
+    model: &catalog::CatalogModel,
+) -> Result<u64> {
+    if !catalog_model_has_comfy_workflow_endpoint(model) {
+        return Ok(0);
+    }
+    let Some(policy) = model.workflow.as_ref() else {
+        return Ok(0);
+    };
+    if policy.parts.is_empty() {
+        return Ok(0);
+    }
+    let home = home.with_context(|| {
+        format!(
+            "Comfy workflow {} requires local provider inventory for memory admission",
+            model.model_id
+        )
+    })?;
+    let inventory = read_provider_comfy_inventory(home)?.with_context(|| {
+        format!(
+            "Comfy workflow {} requires verified provider parts before memory admission; run `mayhem provider parts add` first",
+            model.model_id
+        )
+    })?;
+    if let Some(required_root) = policy.inventory_root.as_deref() {
+        ensure!(
+            inventory.index_root == required_root,
+            "Comfy workflow {} requires provider parts inventory root {required_root}, but local verified inventory root is {}",
+            model.model_id,
+            inventory.index_root
+        );
+    }
+    let by_part_id = inventory
+        .parts
+        .iter()
+        .map(|part| (part.part_id.as_str(), part))
+        .collect::<BTreeMap<_, _>>();
+    let mut total = 0_u64;
+    for required in &policy.parts {
+        let part = by_part_id.get(required.part_id.as_str()).with_context(|| {
+            format!(
+                "Comfy workflow {} requires part {} ({}) but it is not installed in the verified provider inventory",
+                model.model_id, required.part_id, required.name
+            )
+        })?;
+        ensure!(
+            part.record.name == required.name
+                && part.record.part_type == required.part_type
+                && part.record.sha256.eq_ignore_ascii_case(&required.sha256),
+            "Comfy workflow {} part {} metadata does not match the signed workflow policy",
+            model.model_id,
+            required.part_id
+        );
+        total = total.saturating_add(part.record.size_bytes);
+    }
+    Ok(total)
+}
+
+fn provider_comfy_workflow_model_files(
+    home: &Path,
+    model: &catalog::CatalogModel,
+    chunk_size: usize,
+) -> Result<Vec<ComfyUiModelFile>> {
+    if !catalog_model_has_comfy_workflow_endpoint(model) {
+        return Ok(Vec::new());
+    }
+    let Some(policy) = model.workflow.as_ref() else {
+        return Ok(Vec::new());
+    };
+    if policy.parts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let inventory = read_provider_comfy_inventory(home)?.with_context(|| {
+        format!(
+            "Comfy workflow {} requires verified provider parts before engine load; run `mayhem provider parts add` first",
+            model.model_id
+        )
+    })?;
+    if let Some(required_root) = policy.inventory_root.as_deref() {
+        ensure!(
+            inventory.index_root == required_root,
+            "Comfy workflow {} requires provider parts inventory root {required_root}, but local verified inventory root is {}",
+            model.model_id,
+            inventory.index_root
+        );
+    }
+    let by_part_id = inventory
+        .parts
+        .iter()
+        .map(|part| (part.part_id.as_str(), part))
+        .collect::<BTreeMap<_, _>>();
+    let mut files = Vec::new();
+    for required in &policy.parts {
+        let part = by_part_id.get(required.part_id.as_str()).with_context(|| {
+            format!(
+                "Comfy workflow {} requires part {} ({}) but it is not installed in the verified provider inventory",
+                model.model_id, required.part_id, required.name
+            )
+        })?;
+        ensure!(
+            part.record.name == required.name
+                && part.record.part_type == required.part_type
+                && part.record.sha256.eq_ignore_ascii_case(&required.sha256),
+            "Comfy workflow {} part {} metadata does not match the signed workflow policy",
+            model.model_id,
+            required.part_id
+        );
+        let source = PathBuf::from(&part.cache_path);
+        ensure!(
+            provider_comfy_part_payload_matches(&source, &part.record, chunk_size)?,
+            "verified Comfy part {} is missing or no longer matches its signed payload",
+            part.part_id
+        );
+        files.push(ComfyUiModelFile {
+            source,
+            model_subdir: comfy_part_record_model_subdir(&part.record)?,
+            model_path: safe_relative_comfy_model_path(&required.name)?,
+        });
+    }
+    Ok(files)
 }
 
 fn read_verified_comfy_part_record_from_layout(
@@ -67208,8 +67371,10 @@ fn provider_memory_estimate(
     served_modalities: &[String],
     configured_modalities: &BTreeMap<String, ConfigProviderModalityLimits>,
     served_ctx: u64,
+    workflow_inventory_bytes: u64,
 ) -> Result<ProviderMemoryEstimate> {
-    let weights_bytes = catalog_artifact_resident_bytes(artifact);
+    let weights_bytes =
+        catalog_artifact_resident_bytes(artifact).saturating_add(workflow_inventory_bytes);
     let kv_bytes =
         served_ctx.saturating_mul(provider_kv_bytes_per_token(enclave, model, artifact)?);
     let overhead_bytes = (weights_bytes / 5).max(512 * 1024 * 1024);
@@ -67240,8 +67405,10 @@ fn provider_model_memory_fit(
     configured_modalities: &BTreeMap<String, ConfigProviderModalityLimits>,
     usable_bytes: u64,
     requested_ctx: u64,
+    workflow_inventory_bytes: u64,
 ) -> Result<mayhem_hwprobe::ModelMemoryFit> {
-    let weights_bytes = catalog_artifact_resident_bytes(artifact);
+    let weights_bytes =
+        catalog_artifact_resident_bytes(artifact).saturating_add(workflow_inventory_bytes);
     let overhead_bytes = (weights_bytes / 5).max(512 * 1024 * 1024).saturating_add(
         provider_modality_reserved_bytes(&provider_modality_capacities(
             model,
@@ -67470,6 +67637,8 @@ fn provider_context_feasibility(
     at: u64,
 ) -> Result<ProviderCtxFeasibility> {
     let requested_ctx = resolve_provider_served_ctx(model, args.ctx)?;
+    let workflow_inventory_bytes =
+        provider_comfy_workflow_inventory_resident_bytes(args.home.as_deref(), model)?;
     if enclave.model_class != DEFAULT_MODEL_CLASS || requested_ctx == 0 {
         let memory_budget = provider_memory_budget(hardware, verdict, enclave, args)?;
         let estimate = provider_memory_estimate(
@@ -67480,6 +67649,7 @@ fn provider_context_feasibility(
             served_modalities,
             &args.modality_limits,
             requested_ctx,
+            workflow_inventory_bytes,
         )?;
         let fit = provider_model_memory_fit(
             enclave,
@@ -67490,6 +67660,7 @@ fn provider_context_feasibility(
             &args.modality_limits,
             memory_budget.budget_bytes,
             requested_ctx,
+            workflow_inventory_bytes,
         )?;
         if estimate.required_bytes > memory_budget.budget_bytes {
             bail!(
@@ -67531,6 +67702,7 @@ fn provider_context_feasibility(
         &args.modality_limits,
         memory_budget.budget_bytes,
         requested_ctx,
+        workflow_inventory_bytes,
     )?;
     let candidates = if args.ctx.is_some() {
         vec![requested_ctx]
@@ -67551,6 +67723,7 @@ fn provider_context_feasibility(
         served_modalities,
         &args.modality_limits,
         min_ctx,
+        workflow_inventory_bytes,
     )?;
     for served_ctx in candidates {
         let estimate = provider_memory_estimate(
@@ -67561,6 +67734,7 @@ fn provider_context_feasibility(
             served_modalities,
             &args.modality_limits,
             served_ctx,
+            workflow_inventory_bytes,
         )?;
         if served_ctx == min_ctx {
             min_estimate = estimate;
@@ -78907,6 +79081,14 @@ fn provider_engine_load_config(
         .then_some(selected.feasibility.memory_budget.worker_limit_bytes);
     config.backend_cache_dir = backend_runtime.cache_dir.clone();
     config.stable_diffusion_backend = backend_runtime.stable_diffusion_backend.clone();
+    if selected.artifact.engine == "comfyui" {
+        let home = args
+            .home
+            .as_deref()
+            .context("ComfyUI provider start requires a resolved Mayhem home")?;
+        config.comfyui_model_files =
+            provider_comfy_workflow_model_files(home, &selected.model, args.chunk_size)?;
+    }
     if selected.artifact.engine == "stable-diffusion.cpp" {
         config.stable_diffusion_cpp = selected
             .artifact
@@ -91569,6 +91751,75 @@ status: linked
     }
 
     #[test]
+    fn provider_comfy_inventory_feeds_memory_and_engine_mounts() {
+        let temp = test_temp_dir("mayhem-provider-comfy-inventory-memory");
+        let source_dir = temp.join("source");
+        let layout_dir = temp.join("layout");
+        let payload_dir = temp.join("payloads");
+        let cache_dir = temp.join("cache");
+        let home = temp.join("home");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&payload_dir).unwrap();
+        let payload_path = payload_dir.join("payload.bin");
+        fs::write(&payload_path, b"openmayhem comfy resident bytes").unwrap();
+        let record = test_comfy_part_record_for_payload("tiny-upscaler.bin", &payload_path, 8);
+        let record_path = source_dir.join("record.json");
+        write_json_file(&record_path, &record).unwrap();
+        admin_parts_build_index(&AdminPartsBuildIndexArgs {
+            records: vec![record_path],
+            output_dir: layout_dir.clone(),
+            index_ver: 23,
+            blessed_runtimes: vec!["comfyui-v0.30.1".to_owned()],
+            whitelist_ver: 1,
+            outcome_classes_ver: 1,
+        })
+        .unwrap();
+        provider_parts_add(ProviderPartsPullArgs {
+            home: Some(home.clone()),
+            layout_dir,
+            part_ids: vec![record.part_id.clone()],
+            all: false,
+            payload_dir: Some(payload_dir),
+            hf_token_file: None,
+            cache_dir: Some(cache_dir),
+            disk_reserve: None,
+            offline: true,
+            require_payload: false,
+            chunk_size: 8,
+            json: true,
+        })
+        .unwrap();
+        let inventory_root = provider_comfy_inventory_root(&home).unwrap().unwrap();
+        let mut model = test_catalog(&"aa".repeat(32)).models[0].clone();
+        model.adapter.endpoint_families = vec![mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+        )
+        .unwrap()];
+        model.workflow = Some(mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["UpscaleModelLoader".to_owned(), "SaveImage".to_owned()],
+            parts: vec![mayhem_proto::ComfyWorkflowPartRef {
+                part_id: record.part_id.clone(),
+                name: record.name.clone(),
+                part_type: record.part_type.clone(),
+                sha256: record.sha256.clone(),
+            }],
+            inventory_root: Some(inventory_root),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        });
+
+        assert_eq!(
+            provider_comfy_workflow_inventory_resident_bytes(Some(&home), &model).unwrap(),
+            record.size_bytes
+        );
+        let files = provider_comfy_workflow_model_files(&home, &model, 8).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].model_subdir, PathBuf::from("upscale_models"));
+        assert_eq!(files[0].model_path, PathBuf::from("tiny-upscaler.bin"));
+        assert!(files[0].source.is_file());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn provider_workflow_inventory_admission_requires_signed_root_match() {
         let root = "aa".repeat(32);
         let mut catalog = test_catalog(&root);
@@ -96598,6 +96849,7 @@ status: linked
             &["text".to_owned()],
             &BTreeMap::new(),
             262_144,
+            0,
         )
         .unwrap();
 
@@ -96639,6 +96891,7 @@ status: linked
             &["text".to_owned()],
             &BTreeMap::new(),
             262_144,
+            0,
         )
         .unwrap();
 
@@ -96674,6 +96927,7 @@ status: linked
             &["text".to_owned()],
             &BTreeMap::new(),
             4_096,
+            0,
         )
         .unwrap();
 
@@ -96713,6 +96967,7 @@ status: linked
             &["text".to_owned(), "image".to_owned()],
             &configured,
             4096,
+            0,
         )
         .unwrap();
 
