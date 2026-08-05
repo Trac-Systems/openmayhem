@@ -48832,13 +48832,16 @@ where
     validate_external_helper_option_pairs(&helper_args)?;
     let helper_timeout = msb_transfer_helper_process_timeout(command, &helper_args)?;
     let intercom_app = repo_path("intercom")?;
-    let pear_runtime = resolve_pear_runtime_path()?;
-    let mut process = Command::new(&pear_runtime);
+    let node_path = resolve_node_path()?;
+    let helper_args = intercom_helper_runner_args(
+        &intercom_app,
+        format!("--msb-transfer-helper={command}"),
+        &helper_args,
+    );
+    let mut process = Command::new(&node_path);
     process
         .kill_on_drop(true)
-        .arg("run")
-        .arg(&intercom_app)
-        .arg(format!("--msb-transfer-helper={command}"))
+        .current_dir(&intercom_app)
         .args(&helper_args);
     let output = timeout(helper_timeout, process.output())
         .await
@@ -48847,15 +48850,16 @@ where
         })?
         .with_context(|| {
             format!(
-                "running MSB transfer helper via pear-runtime app {}",
-                intercom_app.display()
+                "running MSB transfer helper via pear-runner {} with {}",
+                intercom_app.display(),
+                node_path.display()
             )
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         bail!(
-            "MSB transfer helper failed via pear-runtime: {}{}{}",
+            "MSB transfer helper failed via pear-runner: {}{}{}",
             stderr.trim(),
             if stderr.trim().is_empty() || stdout.trim().is_empty() {
                 ""
@@ -81690,19 +81694,20 @@ where
     validate_wallet_helper_public_args(&helper_args)?;
     secrets.apply_environment_fallbacks();
     let intercom_app = repo_path("intercom")?;
-    let pear_runtime = resolve_pear_runtime_path()?;
+    let node_path = resolve_node_path()?;
     let process_args = wallet_helper_runtime_args(command, &intercom_app, &helper_args);
-    let mut process = Command::new(&pear_runtime);
+    let mut process = Command::new(&node_path);
     process
+        .current_dir(&intercom_app)
         .args(&process_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = process.spawn().with_context(|| {
         format!(
-            "running wallet helper via pear-runtime app {} with {}",
+            "running wallet helper via pear-runner {} with {}",
             intercom_app.display(),
-            pear_runtime.display()
+            node_path.display()
         )
     })?;
     let encoded_secrets =
@@ -81745,10 +81750,25 @@ fn wallet_helper_runtime_args(
     intercom_app: &Path,
     helper_args: &[String],
 ) -> Vec<OsString> {
+    intercom_helper_runner_args(
+        intercom_app,
+        format!("--wallet-helper={command}"),
+        helper_args,
+    )
+}
+
+fn intercom_helper_runner_args(
+    intercom_app: &Path,
+    helper_flag: String,
+    helper_args: &[String],
+) -> Vec<OsString> {
     let mut args = vec![
-        OsString::from("run"),
-        intercom_app.as_os_str().to_os_string(),
-        OsString::from(format!("--wallet-helper={command}")),
+        intercom_app
+            .join("scripts")
+            .join("pear-runner.mjs")
+            .as_os_str()
+            .to_os_string(),
+        OsString::from(helper_flag),
     ];
     args.extend(helper_args.iter().map(OsString::from));
     args
@@ -83052,7 +83072,7 @@ mod tests {
     }
 
     #[test]
-    fn wallet_helper_uses_absolute_pear_app_path() {
+    fn wallet_helper_uses_absolute_pear_runner_path() {
         let app = PathBuf::from("/opt/mayhem/source/intercom");
         let args = wallet_helper_runtime_args(
             "inspect",
@@ -83066,8 +83086,7 @@ mod tests {
         assert_eq!(
             rendered,
             [
-                "run",
-                "/opt/mayhem/source/intercom",
+                "/opt/mayhem/source/intercom/scripts/pear-runner.mjs",
                 "--wallet-helper=inspect",
                 "--keypair",
                 "wallet.json",
