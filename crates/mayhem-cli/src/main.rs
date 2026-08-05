@@ -5879,6 +5879,10 @@ struct ProviderPartsPullArgs {
     #[arg(long = "hf-token-file", value_name = "PATH")]
     hf_token_file: Option<PathBuf>,
 
+    /// Generic source token file for authenticated origin-pull part sources such as Civitai.
+    #[arg(long = "source-token-file", value_name = "PATH")]
+    source_token_file: Option<PathBuf>,
+
     /// Destination cache directory. Defaults to <home>/comfy-parts.
     #[arg(long = "cache-dir", value_name = "PATH")]
     cache_dir: Option<PathBuf>,
@@ -25065,6 +25069,7 @@ struct AdminPartsDraftSummary {
     license: String,
     permissions: Vec<String>,
     policy_flags: Vec<String>,
+    adapter: BTreeMap<String, Value>,
     status: String,
     require_auth: bool,
     source_kinds: Vec<String>,
@@ -25300,6 +25305,7 @@ fn admin_parts_validate_yaml(args: &AdminPartsValidateYamlArgs) -> Result<()> {
                         license: draft.license,
                         permissions: draft.permissions,
                         policy_flags: draft.policy_flags,
+                        adapter: draft.adapter,
                         status: draft.status,
                         require_auth: draft.sources.require_auth,
                         source_kinds,
@@ -28042,6 +28048,7 @@ fn provider_parts_pull_report(args: &ProviderPartsPullArgs) -> Result<ProviderPa
                 &record,
                 args.chunk_size,
                 args.hf_token_file.as_deref(),
+                args.source_token_file.as_deref(),
                 args.disk_reserve.as_deref(),
             ) {
                 Ok(Some(source)) => {
@@ -28344,6 +28351,7 @@ fn provider_comfy_part_install_from_sources(
     record: &mayhem_proto::ComfyPartRecord,
     chunk_size: usize,
     hf_token_file: Option<&Path>,
+    source_token_file: Option<&Path>,
     disk_reserve: Option<&str>,
 ) -> Result<Option<String>> {
     let mut attempted = false;
@@ -28362,6 +28370,7 @@ fn provider_comfy_part_install_from_sources(
             record,
             chunk_size,
             hf_token_file,
+            source_token_file,
             disk_reserve,
         ) {
             Ok(()) => return Ok(Some(source.url.clone())),
@@ -28385,12 +28394,14 @@ fn provider_comfy_part_download_source(
     record: &mayhem_proto::ComfyPartRecord,
     chunk_size: usize,
     hf_token_file: Option<&Path>,
+    source_token_file: Option<&Path>,
     disk_reserve: Option<&str>,
 ) -> Result<()> {
     let source = source.clone();
     let cache_path = cache_path.to_path_buf();
     let record = record.clone();
     let hf_token_file = hf_token_file.map(Path::to_path_buf);
+    let source_token_file = source_token_file.map(Path::to_path_buf);
     let disk_reserve = disk_reserve.map(str::to_owned);
     let handle = std::thread::Builder::new()
         .name("mayhem-comfy-provider-download".to_owned())
@@ -28402,6 +28413,7 @@ fn provider_comfy_part_download_source(
                 &record,
                 chunk_size,
                 hf_token_file.as_deref(),
+                source_token_file.as_deref(),
                 disk_reserve.as_deref(),
             )
         })
@@ -28416,6 +28428,7 @@ fn provider_comfy_part_download_source_blocking(
     record: &mayhem_proto::ComfyPartRecord,
     chunk_size: usize,
     hf_token_file: Option<&Path>,
+    source_token_file: Option<&Path>,
     disk_reserve: Option<&str>,
 ) -> Result<()> {
     let parsed = reqwest::Url::parse(&source.url)
@@ -28424,7 +28437,8 @@ fn provider_comfy_part_download_source_blocking(
         parsed.scheme() == "https",
         "Comfy part source URLs must be HTTPS"
     );
-    let token = provider_comfy_part_source_token(source, require_auth, hf_token_file)?;
+    let token =
+        provider_comfy_part_source_token(source, require_auth, hf_token_file, source_token_file)?;
     provider_comfy_part_disk_preflight(cache_path, record.size_bytes, disk_reserve)?;
     let parent = cache_path
         .parent()
@@ -28577,12 +28591,30 @@ fn provider_comfy_part_source_token(
     source: &mayhem_proto::ComfyPartSource,
     require_auth: bool,
     hf_token_file: Option<&Path>,
+    source_token_file: Option<&Path>,
 ) -> Result<Option<String>> {
     if source.kind == "huggingface" {
-        let token = read_optional_token(hf_token_file)?;
+        let token = read_optional_token(hf_token_file.or(source_token_file))?;
         if require_auth && token.is_none() {
             bail!(
-                "Comfy part source {} requires Hugging Face auth; pass --hf-token-file or set HF_TOKEN",
+                "Comfy part source {} requires Hugging Face auth; pass --hf-token-file, --source-token-file, or set HF_TOKEN",
+                source.url
+            );
+        }
+        return Ok(token);
+    }
+    if source.kind == "civitai" {
+        let token = source_token_file
+            .map(|path| {
+                fs::read_to_string(path)
+                    .with_context(|| format!("reading source token file {}", path.display()))
+                    .map(|value| value.trim().to_owned())
+            })
+            .transpose()?
+            .filter(|value| !value.is_empty());
+        if require_auth && token.is_none() {
+            bail!(
+                "Comfy part source {} requires Civitai auth; pass --source-token-file",
                 source.url
             );
         }
@@ -92161,6 +92193,8 @@ status: linked
             "payloads",
             "--hf-token-file",
             "hf.token",
+            "--source-token-file",
+            "source.token",
             "--cache-dir",
             "cache",
             "--disk-reserve",
@@ -92183,6 +92217,7 @@ status: linked
         assert_eq!(args.part_ids, vec!["aa".repeat(32)]);
         assert_eq!(args.payload_dir, Some(PathBuf::from("payloads")));
         assert_eq!(args.hf_token_file, Some(PathBuf::from("hf.token")));
+        assert_eq!(args.source_token_file, Some(PathBuf::from("source.token")));
         assert_eq!(args.cache_dir, Some(PathBuf::from("cache")));
         assert_eq!(args.disk_reserve, Some("1GB".to_owned()));
         assert!(args.offline);
@@ -92221,6 +92256,7 @@ status: linked
             all: false,
             payload_dir: Some(payload_dir),
             hf_token_file: None,
+            source_token_file: None,
             cache_dir: Some(cache_dir.clone()),
             disk_reserve: None,
             offline: false,
@@ -92267,6 +92303,7 @@ status: linked
             all: false,
             payload_dir: Some(payload_dir),
             hf_token_file: None,
+            source_token_file: None,
             cache_dir: Some(cache_dir.clone()),
             disk_reserve: None,
             offline: true,
@@ -92334,6 +92371,7 @@ status: linked
             all: false,
             payload_dir: Some(payload_dir),
             hf_token_file: None,
+            source_token_file: None,
             cache_dir: Some(cache_dir),
             disk_reserve: None,
             offline: true,
@@ -92554,6 +92592,7 @@ status: linked
             all: false,
             payload_dir: None,
             hf_token_file: None,
+            source_token_file: None,
             cache_dir: Some(cache_dir),
             disk_reserve: None,
             offline: true,
@@ -92572,14 +92611,17 @@ status: linked
     }
 
     #[test]
-    fn provider_parts_pull_rejects_authenticated_non_hf_sources() {
-        let temp = test_temp_dir("mayhem-provider-parts-non-hf-auth");
+    fn provider_parts_pull_accepts_explicit_civitai_origin_token() {
+        let temp = test_temp_dir("mayhem-provider-parts-civitai-auth");
         let payload_path = temp.join("payload.bin");
+        let token_path = temp.join("civitai.token");
         fs::create_dir_all(&temp).unwrap();
         fs::write(&payload_path, b"openmayhem hf part payload").unwrap();
+        fs::write(&token_path, "test-civitai-token\n").unwrap();
         let mut record = test_comfy_part_record_for_payload("hf gated part", &payload_path, 8);
         record.sources.require_auth = true;
         record.sources.mirrors[0].kind = "civitai".to_owned();
+        record.sources.mirrors[0].url = "https://127.0.0.1:1/provider.bin".to_owned();
         let cache_path = provider_comfy_part_cache_path(&temp.join("cache"), &record);
 
         let err = provider_comfy_part_download_source(
@@ -92589,13 +92631,29 @@ status: linked
             &record,
             8,
             None,
-            Some("0GB"),
+            None,
+            None,
         )
         .unwrap_err();
 
         assert!(
             err.to_string()
-                .contains("authenticated Comfy part source kind civitai is not supported"),
+                .contains("requires Civitai auth; pass --source-token-file"),
+            "{err:#}"
+        );
+        let err = provider_comfy_part_download_source(
+            &record.sources.mirrors[0],
+            record.sources.require_auth,
+            &cache_path,
+            &record,
+            8,
+            None,
+            Some(&token_path),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("downloading Comfy part source"),
             "{err:#}"
         );
         let _ = fs::remove_dir_all(temp);
@@ -92677,6 +92735,7 @@ status: linked
                 &temp.join("cache").join("provider.bin"),
                 &record,
                 8,
+                None,
                 None,
                 None,
             )
