@@ -25064,6 +25064,7 @@ struct AdminPartsDraftSummary {
     status: String,
     require_auth: bool,
     source_kinds: Vec<String>,
+    sources: mayhem_proto::ComfyPartSources,
 }
 
 #[derive(Debug, Serialize)]
@@ -25294,6 +25295,7 @@ fn admin_parts_validate_yaml(args: &AdminPartsValidateYamlArgs) -> Result<()> {
                         status: draft.status,
                         require_auth: draft.sources.require_auth,
                         source_kinds,
+                        sources: draft.sources,
                     });
                 }
                 Err(error) => skipped.push(AdminPartsSkippedRow {
