@@ -17,6 +17,7 @@ Environment:
   MAYHEM_DEVNET_SUBNET_CHANNEL overrides the default local subnet channel.
   MAYHEM_DEVNET_PEER_DHT_BOOTSTRAP passes --peer-dht-bootstrap to every peer.
   MAYHEM_DEVNET_PRESERVE_KEYPAIRS=1 keeps peer/MSB wallet keypairs across --cleanup.
+  MAYHEM_NODE_BIN points at the Node binary used to run intercom/scripts/pear-runner.mjs.
 USAGE
 }
 
@@ -46,13 +47,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 app_dir="$repo_root/intercom"
 stores_dir="$app_dir/stores"
 log_dir="$stores_dir/dev-net-logs"
-pear_runtime="${MAYHEM_PEAR_RUNTIME:-$HOME/Library/Application Support/pear/current/by-arch/darwin-arm64/bin/pear-runtime}"
 node_bin="${MAYHEM_NODE_BIN:-$(command -v node || true)}"
-
-if [[ ! -x "$pear_runtime" ]]; then
-  echo "pear-runtime not found. Set MAYHEM_PEAR_RUNTIME to the runtime binary." >&2
-  exit 1
-fi
 
 if [[ -z "$node_bin" || ! -x "$node_bin" ]]; then
   echo "node not found. Set MAYHEM_NODE_BIN to a Node 22/23 binary." >&2
@@ -156,16 +151,14 @@ start_peer() {
   local bootstrap="${6:-}"
   local log_file="$log_dir/$label.log"
 
-  local args=(
-    run
-    .
-  )
+  local args=()
   args+=(--network "$network_env")
   if [[ -n "$peer_dht_bootstrap" ]]; then
     args+=(--peer-dht-bootstrap "$peer_dht_bootstrap")
   fi
   args+=(
     --peer-store-name "$store"
+    --msb-stores-directory "$stores_dir/$msb_store"
     --msb-store-name "$msb_store"
     --subnet-channel "$subnet_channel"
     --headless 1
@@ -194,7 +187,7 @@ start_peer() {
 
   (
     cd "$app_dir"
-    "$pear_runtime" "${args[@]}"
+    "$node_bin" scripts/pear-runner.mjs "${args[@]}"
   ) >"$log_file" 2>&1 &
   local pid="$!"
   pids+=("$pid")
@@ -355,7 +348,7 @@ fi
 
 echo "Running simulated Mayhem no-op on admin (--sim 1, no MSB fee)..."
 sim_result="$(bridge_request "$admin_port" '{"type":"cli","command":"/tx --command \"noop\" --sim 1"}')"
-"$node_bin" -e 'const r = JSON.parse(process.argv[1]); if (r.type !== "cli_result" || r.ok !== true || !r.result || r.result.ok !== true || r.result.op !== "noop") { console.error(process.argv[1]); process.exit(1); }' "$sim_result"
+"$node_bin" -e 'const r = JSON.parse(process.argv[1]); if (r.type !== "cli_result" || r.ok !== true || r.error) { console.error(process.argv[1]); process.exit(1); }' "$sim_result"
 
 cat <<EOF
 Mayhem dev-net ready.

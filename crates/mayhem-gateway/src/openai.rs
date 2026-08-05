@@ -2474,7 +2474,8 @@ pub fn normalize_endpoint_request_for_provider(
         | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
         | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
         | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
-        | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => {}
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
+        | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS => {}
         other => {
             return Err(format!(
                 "endpoint family {other} has no gateway normalization path"
@@ -27189,22 +27190,7 @@ async fn build_artifact_generation(
     let model = require_model(state, &request.model)?;
     let mut request = request;
     apply_artifact_generation_specialities(&model, &mut request)?;
-    let signed_endpoint_capability = model
-        .mayhem
-        .adapter
-        .endpoint_families
-        .iter()
-        .any(|contract| contract.family == request.endpoint_family);
-    let class_allowed = match request.endpoint_family.as_str() {
-        mayhem_proto::ENDPOINT_OPENAI_VIDEOS | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO => {
-            model.mayhem.model_class == "video-generation"
-        }
-        mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
-        | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
-        | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => signed_endpoint_capability,
-        _ => false,
-    };
-    if !class_allowed {
+    if !artifact_generation_endpoint_supported(&model, &request.endpoint_family) {
         return Err(ApiError::bad_request(
             format!(
                 "model {} does not support endpoint family {}",
@@ -27242,23 +27228,20 @@ async fn build_artifact_generation(
             Some("model"),
         ));
     }
-    let expected_prefix = if request.output_modality == "video" {
-        "video/"
-    } else {
-        "audio/"
-    };
-    if let Some(artifact) = output
-        .artifacts
-        .iter()
-        .find(|artifact| !artifact.content_type.starts_with(expected_prefix))
-    {
-        return Err(ApiError::bad_gateway(
-            format!(
-                "provider returned content type {}, expected {expected_prefix}*",
-                artifact.content_type
-            ),
-            Some("model"),
-        ));
+    if let Some(expected_prefix) = artifact_generation_expected_content_type_prefix(&request) {
+        if let Some(artifact) = output
+            .artifacts
+            .iter()
+            .find(|artifact| !artifact.content_type.starts_with(expected_prefix))
+        {
+            return Err(ApiError::bad_gateway(
+                format!(
+                    "provider returned content type {}, expected {expected_prefix}*",
+                    artifact.content_type
+                ),
+                Some("model"),
+            ));
+        }
     }
     if request.endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
         && output.artifacts.iter().any(|artifact| {
@@ -27304,6 +27287,38 @@ async fn build_artifact_generation(
         receipt,
         session_id: invocation.session_id,
     })
+}
+
+fn artifact_generation_expected_content_type_prefix(
+    request: &ArtifactGenerationRequest,
+) -> Option<&'static str> {
+    match request.output_modality.as_str() {
+        "image" => Some("image/"),
+        "video" => Some("video/"),
+        "audio" => Some("audio/"),
+        _ => None,
+    }
+}
+
+fn artifact_generation_endpoint_supported(model: &GatewayModel, endpoint_family: &str) -> bool {
+    let signed_endpoint_capability = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .any(|contract| contract.family == endpoint_family);
+    match endpoint_family {
+        mayhem_proto::ENDPOINT_OPENAI_VIDEOS | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO => {
+            model.mayhem.model_class == "video-generation"
+        }
+        mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS => {
+            signed_endpoint_capability && model.mayhem.workflow.is_some()
+        }
+        mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+        | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
+        | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => signed_endpoint_capability,
+        _ => false,
+    }
 }
 
 async fn build_audio_speech(
@@ -43918,6 +43933,103 @@ mod tests {
         let image_load = requirements.modality_load.get("image").unwrap();
         assert_eq!(image_load.item_count, 2);
         assert_eq!(image_load.max_item_units, 512 * 512);
+        assert_eq!(
+            artifact_generation_expected_content_type_prefix(&request),
+            Some("image/")
+        );
+    }
+
+    #[test]
+    fn comfy_workflow_endpoint_normalizes_through_gateway_contract() {
+        let graph = json!({
+            "1": {
+                "class_type": "EmptyImage",
+                "inputs": { "width": 64, "height": 64, "batch_size": 1, "color": 0 }
+            },
+            "2": {
+                "class_type": "SaveImage",
+                "inputs": { "images": ["1", 0], "filename_prefix": "mayhem-w5-empty" }
+            }
+        });
+        let mut model = test_model();
+        model.id = "mayhem/comfy-normalize-test".to_owned();
+        model.mayhem.model_class = "image-generation".to_owned();
+        model.mayhem.adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            )
+            .unwrap()];
+        model.mayhem.workflow = Some(mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["EmptyImage".to_owned(), "SaveImage".to_owned()],
+            runtime_id: Some("comfyui-v0.30.1".to_owned()),
+            outcome_class: Some("image.light.64".to_owned()),
+            max_width: Some(64),
+            max_height: Some(64),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        });
+        let state = GatewayState::from_models(vec![model.clone()]);
+
+        let prepared = normalize_catalog_endpoint_request_with_metadata(
+            &state,
+            &model.id,
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            &json!({
+                "model": model.id,
+                "workflow": graph,
+                "runtime_id": "comfyui-v0.30.1",
+                "outcome_class": "image.light.64",
+                "response_format": "artifact"
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(prepared.normalized["model"], model.id);
+        assert_eq!(prepared.normalized["runtime_id"], "comfyui-v0.30.1");
+        assert_eq!(prepared.normalized["outcome_class"], "image.light.64");
+        let request = artifact_generation_request_with_workflow_policy(
+            &model.id,
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            prepared.normalized,
+            prepared.video,
+            model.mayhem.workflow.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(
+            artifact_generation_usage_for_request(&request),
+            ReceiptUsage::from_units([(USAGE_IMAGE, 1)])
+        );
+    }
+
+    #[test]
+    fn comfy_workflow_endpoint_is_artifact_dispatch_supported() {
+        let mut model = test_model();
+        model.mayhem.model_class = "image-generation".to_owned();
+        model.mayhem.adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            )
+            .unwrap()];
+        assert!(!artifact_generation_endpoint_supported(
+            &model,
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
+        ));
+
+        model.mayhem.workflow = Some(mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["EmptyImage".to_owned(), "SaveImage".to_owned()],
+            runtime_id: Some("comfyui-v0.30.1".to_owned()),
+            outcome_class: Some("image.light.64".to_owned()),
+            max_width: Some(64),
+            max_height: Some(64),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        });
+        assert!(artifact_generation_endpoint_supported(
+            &model,
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
+        ));
+        assert!(!artifact_generation_endpoint_supported(
+            &model,
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS
+        ));
     }
 
     #[test]

@@ -1310,6 +1310,131 @@ pub fn seal_artifact(options: &SealOptions) -> Result<SealReport> {
     })
 }
 
+pub fn seal_artifact_chunks<I>(
+    options: &SealOptions,
+    merkle: MerkleManifest,
+    chunks: I,
+) -> Result<SealReport>
+where
+    I: IntoIterator<Item = (MerkleChunk, Vec<u8>)>,
+{
+    validate_chunk_size(options.chunk_size)?;
+    validate_key_context(&options.key_context)?;
+    validate_provider_secret(&options.provider_secret)?;
+    ensure_empty_or_missing_dir(&options.store_dir)?;
+    if merkle.kind != MERKLE_KIND {
+        return Err(EnclaveError::InvalidInput(format!(
+            "unsupported merkle kind {}",
+            merkle.kind
+        )));
+    }
+    if merkle.chunk_size != options.chunk_size {
+        return Err(EnclaveError::InvalidInput(format!(
+            "merkle chunk size mismatch: expected {}, got {}",
+            options.chunk_size, merkle.chunk_size
+        )));
+    }
+    if let Some(expected) = &options.expected_merkle_root {
+        ensure_merkle_root(expected, &merkle.root)?;
+    }
+
+    let chunks_dir = options.store_dir.join("chunks");
+    fs::create_dir_all(&chunks_dir)?;
+    let key = derive_sealing_key(&options.provider_secret, &options.key_context)?;
+    let cipher = Aes256Gcm::new_from_slice(&key)
+        .map_err(|_| EnclaveError::Crypto("invalid AES key".into()))?;
+    let mut sealed_chunks = Vec::with_capacity(merkle.chunks.len());
+    let mut total_bytes = 0_u64;
+    let mut leaves = Vec::with_capacity(merkle.chunks.len());
+
+    for (position, (chunk, plaintext)) in chunks.into_iter().enumerate() {
+        let Some(expected_chunk) = merkle.chunks.get(position) else {
+            return Err(EnclaveError::InvalidInput(format!(
+                "too many materialized chunks; first extra chunk index {}",
+                chunk.index
+            )));
+        };
+        if &chunk != expected_chunk {
+            return Err(EnclaveError::InvalidInput(format!(
+                "materialized chunk metadata mismatch at position {position}"
+            )));
+        }
+        if plaintext.len() as u64 != chunk.len {
+            return Err(EnclaveError::InvalidInput(format!(
+                "materialized chunk length mismatch at chunk {}",
+                chunk.index
+            )));
+        }
+        let actual_hash = hex::encode(merkle_leaf_hash(chunk.index, chunk.len, &plaintext));
+        if actual_hash != chunk.blake3 {
+            return Err(EnclaveError::InvalidInput(format!(
+                "materialized chunk hash mismatch at chunk {}",
+                chunk.index
+            )));
+        }
+
+        let nonce = random_nonce()?;
+        let aad = chunk_aad(&options.key_context, &merkle.root, &chunk)?;
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext.as_slice(),
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| EnclaveError::Crypto("AES-GCM encryption failed".into()))?;
+        let sealed_path = format!("chunks/{:08}.seal", chunk.index);
+        fs::write(options.store_dir.join(&sealed_path), &ciphertext)?;
+        leaves.push(decode_fixed::<32>(&chunk.blake3)?);
+        total_bytes = total_bytes.saturating_add(chunk.len);
+        sealed_chunks.push(SealedChunk {
+            index: chunk.index,
+            offset: chunk.offset,
+            plain_len: chunk.len,
+            plain_blake3: chunk.blake3,
+            sealed_path,
+            nonce: hex::encode(nonce),
+            sealed_len: ciphertext.len() as u64,
+        });
+    }
+
+    if sealed_chunks.len() != merkle.chunks.len() {
+        return Err(EnclaveError::InvalidInput(format!(
+            "materialized chunk count mismatch: expected {}, got {}",
+            merkle.chunks.len(),
+            sealed_chunks.len()
+        )));
+    }
+    if total_bytes != merkle.total_bytes {
+        return Err(EnclaveError::InvalidInput(format!(
+            "materialized byte count mismatch: expected {}, got {}",
+            merkle.total_bytes, total_bytes
+        )));
+    }
+    let actual_root = hex::encode(merkle_root_from_leaves(&leaves));
+    ensure_merkle_root(&merkle.root, &actual_root)?;
+
+    let manifest = SealedStoreManifest {
+        schema_version: 1,
+        cipher: "AES-256-GCM".to_owned(),
+        kdf: "HKDF-SHA256".to_owned(),
+        merkle: merkle.clone(),
+        key_context: options.key_context.clone(),
+        chunks: sealed_chunks,
+    };
+    let manifest_path = options.store_dir.join(SEALED_STORE_MANIFEST);
+    write_json_pretty(&manifest_path, &manifest)?;
+
+    Ok(SealReport {
+        store_dir: options.store_dir.clone(),
+        manifest_path,
+        merkle_root: merkle.root,
+        total_bytes: merkle.total_bytes,
+        chunk_count: merkle.chunks.len(),
+    })
+}
+
 pub fn boot_sealed_store(options: &BootOptions) -> Result<BootReport> {
     validate_key_context(&options.key_context)?;
     validate_provider_secret(&options.provider_secret)?;

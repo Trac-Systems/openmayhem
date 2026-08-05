@@ -59,10 +59,10 @@ use mayhem_enclave::{
     load_or_create_runtime_keypair_store, measure_binary, prepare_hardware_quote_binding,
     prepare_hardware_quote_binding_for_measured_binary, prepare_tier1_attestation_report,
     prepare_tier1_attestation_report_for_measured_binary, read_sealed_manifest, seal_artifact,
-    DownloadReport, HardwareAttestationOptions, HardwareQuoteBindingOptions, KeyContext,
-    ProgressEvent, ProgressPhase, RuntimeKeyContext, RuntimeKeypair, RuntimeKeypairStoreOptions,
-    SealOptions, Tier1AttestationReport, Tier1ExternalProviderAttestationOptions,
-    DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
+    seal_artifact_chunks, DownloadReport, HardwareAttestationOptions, HardwareQuoteBindingOptions,
+    KeyContext, MerkleChunk, MerkleManifest, ProgressEvent, ProgressPhase, RuntimeKeyContext,
+    RuntimeKeypair, RuntimeKeypairStoreOptions, SealOptions, Tier1AttestationReport,
+    Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
 };
 #[cfg(feature = "comfyui")]
 use mayhem_engine::ComfyUiBackend;
@@ -12780,16 +12780,8 @@ fn catalog_artifact_file_metadata(
     chunk_size: usize,
     source_revision: Option<String>,
 ) -> Result<(CatalogArtifactMetadataPatch, u64, usize)> {
-    let metadata =
-        fs::metadata(artifact_path).with_context(|| format!("stat {}", artifact_path.display()))?;
-    if !metadata.is_file() {
-        bail!(
-            "artifact metadata requires a file artifact; archive snapshots before catalog finalization: {}",
-            artifact_path.display()
-        );
-    }
-    let source_sha256 = file_sha256_hex(artifact_path)?;
-    let merkle = build_merkle_manifest(artifact_path, chunk_size)?;
+    let source_sha256 = artifact_source_sha256_hex(artifact_path)?;
+    let merkle = build_artifact_merkle_manifest(artifact_path, chunk_size)?;
     let patch = CatalogArtifactMetadataPatch {
         artifact_root_kind: "blake3_merkle_v1".to_owned(),
         artifact_root: merkle.root,
@@ -23020,8 +23012,10 @@ fn catalog_calibration_backend(
     if artifact.engine == "sulphur" {
         bind_sulphur_primary_hash_path(&mut config.artifact, artifact)?;
     }
-    if let Some(sha256) = &artifact.source_sha256 {
-        config.artifact = config.artifact.with_sha256(sha256.clone());
+    if artifact.engine != "comfyui" {
+        if let Some(sha256) = &artifact.source_sha256 {
+            config.artifact = config.artifact.with_sha256(sha256.clone());
+        }
     }
     if let Some(path) = sidecar_paths.get("mmproj") {
         let sidecar = artifact
@@ -65851,6 +65845,7 @@ fn filter_gateway_models_by_app_version(
             model.mayhem.family = catalog_model.family.clone();
             model.mayhem.adapter = gateway_shape_adapter(&catalog_model.adapter);
             model.mayhem.sampling = gateway_sampling_profile(&catalog_model.sampling);
+            model.mayhem.workflow = catalog_model.workflow.clone();
             if let Some(min_app_version) = catalog_model.min_app_version.as_deref() {
                 model.mayhem.min_app_version = Some(min_app_version.to_owned());
                 if let Some(gate) = model_app_version_gate(&model.id, Some(min_app_version))? {
@@ -69533,17 +69528,19 @@ fn download_provider_artifact_blocking(
     require_provider_merkle_artifact(selected)?;
     let primary = if let Some(path) = &args.artifact {
         let source = absolutize(path.clone())?;
+        require_local_artifact_path_supported(&source, selected)?;
         let mut progress =
             ProviderProgressBars::new(args, format!("{} local artifact", selected.artifact_name));
-        let merkle = build_merkle_manifest_with_progress(&source, args.chunk_size, |event| {
-            progress.update(event);
-        })
-        .with_context(|| {
-            format!(
-                "verifying local admin-approved artifact {}",
-                source.display()
-            )
-        })?;
+        let merkle =
+            build_artifact_merkle_manifest_with_progress(&source, args.chunk_size, |event| {
+                progress.update(event);
+            })
+            .with_context(|| {
+                format!(
+                    "verifying local admin-approved artifact {}",
+                    source.display()
+                )
+            })?;
         progress.finish();
         if merkle.root != selected.enclave.artifact_root {
             bail!(
@@ -69605,6 +69602,20 @@ fn download_provider_artifact_blocking(
     }
 
     Ok(ProviderArtifactPaths { primary, sidecars })
+}
+
+fn require_local_artifact_path_supported(
+    source: &Path,
+    selected: &ProviderCandidate,
+) -> Result<()> {
+    if source.is_dir() && selected.artifact.engine != "comfyui" {
+        bail!(
+            "local directory artifacts are only supported for ComfyUI runtimes; {} uses engine {}",
+            selected.model.model_id,
+            selected.artifact.engine
+        );
+    }
+    Ok(())
 }
 
 fn download_provider_primary_artifact(
@@ -70171,10 +70182,7 @@ fn artifact_sha256_matches(path: &Path, artifact: &catalog::CatalogArtifact) -> 
     let Some(expected) = &artifact.source_sha256 else {
         return Ok(true);
     };
-    if path.is_dir() {
-        return Ok(true);
-    }
-    Ok(file_sha256_hex(path)? == expected.to_ascii_lowercase())
+    Ok(artifact_source_sha256_hex(path)? == expected.to_ascii_lowercase())
 }
 
 fn verify_artifact_sha256(path: &Path, artifact: &catalog::CatalogArtifact) -> Result<()> {
@@ -70202,6 +70210,335 @@ fn file_sha256_hex(path: &Path) -> Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn artifact_source_sha256_hex(path: &Path) -> Result<String> {
+    if path.is_dir() {
+        let digest = build_directory_artifact_digest(path, DEFAULT_CHUNK_SIZE, |_| {})?;
+        return Ok(digest.source_sha256);
+    }
+    file_sha256_hex(path)
+}
+
+fn build_artifact_merkle_manifest(path: &Path, chunk_size: usize) -> Result<MerkleManifest> {
+    build_artifact_merkle_manifest_with_progress(path, chunk_size, |_| {})
+}
+
+fn build_artifact_merkle_manifest_with_progress<F>(
+    path: &Path,
+    chunk_size: usize,
+    progress: F,
+) -> Result<MerkleManifest>
+where
+    F: FnMut(ProgressEvent),
+{
+    if path.is_dir() {
+        return Ok(build_directory_artifact_digest(path, chunk_size, progress)?.merkle);
+    }
+    Ok(build_merkle_manifest_with_progress(
+        path, chunk_size, progress,
+    )?)
+}
+
+struct DirectoryArtifactDigest {
+    source_sha256: String,
+    merkle: MerkleManifest,
+    seal_chunks: Option<Vec<(MerkleChunk, Vec<u8>)>>,
+}
+
+#[derive(Debug)]
+enum DirectoryArtifactEntryKind {
+    Directory,
+    File { len: u64 },
+}
+
+#[derive(Debug)]
+struct DirectoryArtifactEntry {
+    rel: String,
+    path: PathBuf,
+    kind: DirectoryArtifactEntryKind,
+}
+
+struct VirtualMerkleBuilder {
+    chunk_size: usize,
+    buffer: Vec<u8>,
+    chunks: Vec<MerkleChunk>,
+    leaves: Vec<[u8; 32]>,
+    seal_chunks: Option<Vec<(MerkleChunk, Vec<u8>)>>,
+    total_bytes: u64,
+    sha256: Sha256,
+}
+
+impl VirtualMerkleBuilder {
+    fn new(chunk_size: usize, collect_seal_chunks: bool) -> Result<Self> {
+        if chunk_size == 0 {
+            bail!("--chunk-size must be positive");
+        }
+        Ok(Self {
+            chunk_size,
+            buffer: Vec::with_capacity(chunk_size),
+            chunks: Vec::new(),
+            leaves: Vec::new(),
+            seal_chunks: collect_seal_chunks.then(Vec::new),
+            total_bytes: 0,
+            sha256: Sha256::new(),
+        })
+    }
+
+    fn push(&mut self, mut data: &[u8]) {
+        self.sha256.update(data);
+        while !data.is_empty() {
+            let available = self.chunk_size - self.buffer.len();
+            let take = available.min(data.len());
+            self.buffer.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.buffer.len() == self.chunk_size {
+                self.flush_chunk();
+            }
+        }
+    }
+
+    fn flush_chunk(&mut self) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        let index = self.chunks.len() as u64;
+        let len = self.buffer.len() as u64;
+        let hash = cli_merkle_leaf_hash(index, len, &self.buffer);
+        let chunk = MerkleChunk {
+            index,
+            offset: self.total_bytes,
+            len,
+            blake3: hex_encode(&hash),
+        };
+        if let Some(seal_chunks) = self.seal_chunks.as_mut() {
+            seal_chunks.push((chunk.clone(), self.buffer.clone()));
+        }
+        self.chunks.push(chunk);
+        self.leaves.push(hash);
+        self.total_bytes = self.total_bytes.saturating_add(len);
+        self.buffer.clear();
+    }
+
+    fn finish(mut self) -> DirectoryArtifactDigest {
+        self.flush_chunk();
+        DirectoryArtifactDigest {
+            source_sha256: format!("{:x}", self.sha256.finalize()),
+            merkle: MerkleManifest {
+                kind: "blake3_merkle_v1".to_owned(),
+                chunk_size: self.chunk_size,
+                total_bytes: self.total_bytes,
+                root: hex_encode(&cli_merkle_root_from_leaves(&self.leaves)),
+                chunks: self.chunks,
+            },
+            seal_chunks: self.seal_chunks,
+        }
+    }
+}
+
+fn build_directory_artifact_digest<F>(
+    root: &Path,
+    chunk_size: usize,
+    progress: F,
+) -> Result<DirectoryArtifactDigest>
+where
+    F: FnMut(ProgressEvent),
+{
+    build_directory_artifact_digest_inner(root, chunk_size, false, progress)
+}
+
+fn build_directory_artifact_digest_for_sealing<F>(
+    root: &Path,
+    chunk_size: usize,
+    progress: F,
+) -> Result<DirectoryArtifactDigest>
+where
+    F: FnMut(ProgressEvent),
+{
+    build_directory_artifact_digest_inner(root, chunk_size, true, progress)
+}
+
+fn build_directory_artifact_digest_inner<F>(
+    root: &Path,
+    chunk_size: usize,
+    collect_seal_chunks: bool,
+    mut progress: F,
+) -> Result<DirectoryArtifactDigest>
+where
+    F: FnMut(ProgressEvent),
+{
+    let metadata = fs::metadata(root).with_context(|| format!("stat {}", root.display()))?;
+    ensure!(
+        metadata.is_dir(),
+        "directory artifact digest requires a directory: {}",
+        root.display()
+    );
+    let mut entries = Vec::new();
+    collect_directory_artifact_entries(root, root, &mut entries)?;
+    entries.sort_by(|left, right| left.rel.cmp(&right.rel));
+    let total_payload_bytes = entries
+        .iter()
+        .filter_map(|entry| match entry.kind {
+            DirectoryArtifactEntryKind::File { len } => Some(len),
+            DirectoryArtifactEntryKind::Directory => None,
+        })
+        .fold(0_u64, |acc, len| acc.saturating_add(len));
+    progress(ProgressEvent {
+        phase: ProgressPhase::Verify,
+        path: root.to_path_buf(),
+        position: 0,
+        total: Some(total_payload_bytes),
+    });
+    let mut builder = VirtualMerkleBuilder::new(chunk_size, collect_seal_chunks)?;
+    builder.push(b"mayhem-directory-artifact-v1\0");
+    let mut position = 0_u64;
+    let mut buffer = [0_u8; 1024 * 64];
+    for entry in entries {
+        match entry.kind {
+            DirectoryArtifactEntryKind::Directory => {
+                builder.push(b"dir\0");
+                builder.push(entry.rel.as_bytes());
+                builder.push(b"\0");
+            }
+            DirectoryArtifactEntryKind::File { len } => {
+                builder.push(b"file\0");
+                builder.push(entry.rel.as_bytes());
+                builder.push(b"\0");
+                builder.push(len.to_string().as_bytes());
+                builder.push(b"\0");
+                let mut file = fs::File::open(&entry.path)
+                    .with_context(|| format!("opening {}", entry.path.display()))?;
+                loop {
+                    let read = file
+                        .read(&mut buffer)
+                        .with_context(|| format!("reading {}", entry.path.display()))?;
+                    if read == 0 {
+                        break;
+                    }
+                    builder.push(&buffer[..read]);
+                    position = position.saturating_add(read as u64);
+                    progress(ProgressEvent {
+                        phase: ProgressPhase::Verify,
+                        path: root.to_path_buf(),
+                        position,
+                        total: Some(total_payload_bytes),
+                    });
+                }
+                builder.push(b"\0");
+            }
+        }
+    }
+    Ok(builder.finish())
+}
+
+fn collect_directory_artifact_entries(
+    root: &Path,
+    dir: &Path,
+    entries: &mut Vec<DirectoryArtifactEntry>,
+) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("reading file type for {}", path.display()))?;
+        if file_type.is_symlink() {
+            bail!(
+                "directory artifact contains a symlink; archive or remove it first: {}",
+                path.display()
+            );
+        }
+        let rel = directory_artifact_relative_path(root, &path)?;
+        if file_type.is_dir() {
+            entries.push(DirectoryArtifactEntry {
+                rel,
+                path: path.clone(),
+                kind: DirectoryArtifactEntryKind::Directory,
+            });
+            collect_directory_artifact_entries(root, &path, entries)?;
+        } else if file_type.is_file() {
+            let len = entry
+                .metadata()
+                .with_context(|| format!("stat {}", path.display()))?
+                .len();
+            entries.push(DirectoryArtifactEntry {
+                rel,
+                path,
+                kind: DirectoryArtifactEntryKind::File { len },
+            });
+        } else {
+            bail!(
+                "directory artifact contains an unsupported file type: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn directory_artifact_relative_path(root: &Path, path: &Path) -> Result<String> {
+    let rel = path
+        .strip_prefix(root)
+        .with_context(|| format!("{} is not below {}", path.display(), root.display()))?;
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        match component {
+            Component::Normal(part) => parts.push(part.to_str().with_context(|| {
+                format!(
+                    "directory artifact path is not valid UTF-8: {}",
+                    path.display()
+                )
+            })?),
+            _ => bail!(
+                "directory artifact path contains an unsupported component: {}",
+                path.display()
+            ),
+        }
+    }
+    ensure!(
+        !parts.is_empty(),
+        "directory artifact entry cannot be the root directory"
+    );
+    Ok(parts.join("/"))
+}
+
+fn cli_merkle_leaf_hash(index: u64, len: u64, data: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mayhem-blake3-merkle-v1:leaf");
+    hasher.update(&index.to_le_bytes());
+    hasher.update(&len.to_le_bytes());
+    hasher.update(data);
+    *hasher.finalize().as_bytes()
+}
+
+fn cli_merkle_parent_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mayhem-blake3-merkle-v1:node");
+    hasher.update(left);
+    hasher.update(right);
+    *hasher.finalize().as_bytes()
+}
+
+fn cli_merkle_empty_hash() -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mayhem-blake3-merkle-v1:empty");
+    *hasher.finalize().as_bytes()
+}
+
+fn cli_merkle_root_from_leaves(leaves: &[[u8; 32]]) -> [u8; 32] {
+    if leaves.is_empty() {
+        return cli_merkle_empty_hash();
+    }
+    let mut level = leaves.to_vec();
+    while level.len() > 1 {
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
+        for pair in level.chunks(2) {
+            let right = pair.get(1).unwrap_or(&pair[0]);
+            next.push(cli_merkle_parent_hash(&pair[0], right));
+        }
+        level = next;
+    }
+    level[0]
 }
 
 fn sha256_bytes_hex(bytes: &[u8]) -> String {
@@ -70287,6 +70624,42 @@ fn seal_provider_artifact(
             resumed_from: 0,
             bytes_written: 0,
             total_bytes: manifest.merkle.total_bytes,
+            merkle: manifest.merkle,
+        });
+    }
+
+    if artifact_path.is_dir() {
+        let digest =
+            build_directory_artifact_digest_for_sealing(artifact_path, chunk_size, |_| {})?;
+        if digest.merkle.root != key_context.artifact_root {
+            bail!(
+                "local artifact root mismatch for {}; expected admin catalog artifact_root {}, got {}",
+                artifact_path.display(),
+                key_context.artifact_root,
+                digest.merkle.root
+            );
+        }
+        let mut options = SealOptions::new(
+            artifact_path,
+            sealed_store,
+            key_context.clone(),
+            provider_secret.to_vec(),
+        );
+        options.chunk_size = chunk_size;
+        options.expected_merkle_root = Some(key_context.artifact_root.clone());
+        let report = seal_artifact_chunks(
+            &options,
+            digest.merkle,
+            digest
+                .seal_chunks
+                .context("directory artifact sealing chunks were not retained")?,
+        )?;
+        let manifest = read_sealed_manifest(&report.store_dir)?;
+        return Ok(DownloadReport {
+            destination: report.store_dir,
+            resumed_from: 0,
+            bytes_written: report.total_bytes,
+            total_bytes: report.total_bytes,
             merkle: manifest.merkle,
         });
     }
@@ -71060,6 +71433,7 @@ async fn send_provider_heartbeat_round(
     let mut sent = Vec::new();
     let caps = provider_heartbeat_caps(selected);
     let (tok_s, tok_s_source) = provider_heartbeat_tok_s(&load, selected.verdict.est_tok_s);
+    let heartbeat_min_ask_au = provider_heartbeat_min_ask_au(selected, min_ask_au);
     let mut modality_capacity = selected.modality_capacities.clone();
     for (modality, active_items) in &load.modality_active_items {
         let capacity = modality_capacity
@@ -71115,7 +71489,7 @@ async fn send_provider_heartbeat_round(
                 .and_then(|price| price.current.as_ref())
                 .map(|price| price.ver)
                 .unwrap_or(0),
-            "min_ask_au": money_au_json(min_ask_au),
+            "min_ask_au": money_au_json(heartbeat_min_ask_au),
             "caps": {
                 "tools": caps.tools,
                 "json": caps.json,
@@ -71133,7 +71507,7 @@ async fn send_provider_heartbeat_round(
             "nonce": blake3::hash(format!("{}:{}:{}:{}", room.room_id, provider_pubkey, ts, seq).as_bytes()).to_hex().to_string(),
         });
         if let Some(workflow_classes) =
-            provider_heartbeat_workflow_classes(selected, min_ask_au, max_sessions, &load)
+            provider_heartbeat_workflow_classes(selected, heartbeat_min_ask_au, max_sessions, &load)
         {
             heartbeat["runtime_id"] = json!(selected
                 .model
@@ -71159,7 +71533,7 @@ async fn send_provider_heartbeat_round(
             "room_id": room.room_id,
             "sidechannel": room.sidechannel,
             "seq": seq,
-            "min_ask_au": money_au_json(min_ask_au),
+            "min_ask_au": money_au_json(heartbeat_min_ask_au),
             "max_sessions": max_sessions,
             "transport_peer": transport_peer,
             "accepting_new": load.accepting_new,
@@ -71485,6 +71859,31 @@ fn provider_heartbeat_caps(selected: &ProviderCandidate) -> ModelCaps {
         caps.vision = false;
     }
     caps
+}
+
+fn provider_heartbeat_min_ask_au(
+    selected: &ProviderCandidate,
+    configured_min_ask_au: MoneyAu,
+) -> MoneyAu {
+    if configured_min_ask_au > 0 {
+        return configured_min_ask_au;
+    }
+    let Some(price) = selected
+        .price
+        .as_ref()
+        .and_then(|price| price.current.as_ref())
+    else {
+        return 0;
+    };
+    price
+        .rate_map
+        .iter()
+        .map(|entry| entry.per_unit_au)
+        .chain(std::iter::once(price.per_req_au))
+        .chain(std::iter::once(price.min_session_au))
+        .filter(|value| *value > 0)
+        .min()
+        .unwrap_or(0)
 }
 
 fn provider_heartbeat_workflow_classes(
@@ -77223,6 +77622,9 @@ fn provider_canary_self_test_body(
             "input": canary_prompt_text(prompt)?,
         })),
         "image-generation" => {
+            if let Some(body) = provider_comfy_workflow_canary_self_test_body(model)? {
+                return Ok(body);
+            }
             let mut body = json!({
                 "kind": "image_generation",
                 "prompt": canary_prompt_text(prompt)?,
@@ -77539,6 +77941,67 @@ fn provider_canary_self_test_body(
         }
         other => bail!("functional modality self-test is not wired for model_class {other}"),
     }
+}
+
+fn provider_comfy_workflow_contract(
+    model: &catalog::CatalogModel,
+) -> Option<&mayhem_proto::EndpointFamilyContract> {
+    model
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS)
+}
+
+fn provider_comfy_workflow_canary_self_test_body(
+    model: &catalog::CatalogModel,
+) -> Result<Option<Value>> {
+    let Some(contract) = provider_comfy_workflow_contract(model) else {
+        return Ok(None);
+    };
+    let workflow = endpoint_contract_first_calibration_value(contract, "workflow")?;
+    let mut body = json!({
+        "kind": "workflow_generation",
+        "endpoint_family": mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+        "workflow": workflow,
+    });
+    let object = body
+        .as_object_mut()
+        .context("workflow self-test body must be an object")?;
+    for path in [
+        "runtime_id",
+        "outcome_class",
+        "timeout_ms",
+        "response_format",
+    ] {
+        if let Some(value) = endpoint_contract_calibration_or_default_value(contract, path) {
+            object.insert(path.to_owned(), value);
+        }
+    }
+    Ok(Some(body))
+}
+
+fn endpoint_contract_first_calibration_value(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    path: &str,
+) -> Result<Value> {
+    endpoint_contract_calibration_or_default_value(contract, path).with_context(|| {
+        format!(
+            "endpoint family {} has no calibration/default for required request attribute {path}",
+            contract.family
+        )
+    })
+}
+
+fn endpoint_contract_calibration_or_default_value(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    path: &str,
+) -> Option<Value> {
+    let spec = contract.request_attribute_specs.get(path)?;
+    spec.calibration_values
+        .first()
+        .cloned()
+        .or_else(|| spec.default.clone())
 }
 
 fn provider_tts_canary_endpoint_family(
@@ -77922,8 +78385,12 @@ fn provider_engine_load_config(
     if selected.artifact.engine == "sulphur" {
         bind_sulphur_primary_hash_path(&mut artifact, &selected.artifact)?;
     }
-    let artifact = if let Some(sha256) = &selected.artifact.source_sha256 {
-        artifact.with_sha256(sha256.clone())
+    let artifact = if selected.artifact.engine != "comfyui" {
+        if let Some(sha256) = &selected.artifact.source_sha256 {
+            artifact.with_sha256(sha256.clone())
+        } else {
+            artifact
+        }
     } else {
         artifact
     };
@@ -97899,6 +98366,46 @@ esac
     }
 
     #[test]
+    fn gateway_model_filter_carries_signed_workflow_endpoint_metadata() {
+        let root = "aa".repeat(32);
+        let contract = test_contract(&root);
+        let mut catalog = test_catalog(&root);
+        catalog.models[0].adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            )
+            .unwrap()];
+        catalog.models[0].adapter.modality_set = vec!["image".to_owned()];
+        catalog.models[0].adapter.tool_call_strategy = "none".to_owned();
+        catalog.models[0].workflow = Some(mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["EmptyImage".to_owned(), "SaveImage".to_owned()],
+            runtime_id: Some("comfyui-v0.30.1".to_owned()),
+            outcome_class: Some("image.light.64".to_owned()),
+            max_width: Some(64),
+            max_height: Some(64),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        });
+
+        let models = gateway_models_from_contract(&contract).unwrap();
+        assert!(models[0].mayhem.workflow.is_none());
+        let (allowed, blocked) = filter_gateway_models_by_app_version(models, &catalog).unwrap();
+
+        assert!(blocked.is_empty());
+        assert_eq!(
+            allowed[0].mayhem.adapter.endpoint_families[0].family,
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
+        );
+        assert_eq!(
+            allowed[0]
+                .mayhem
+                .workflow
+                .as_ref()
+                .map(mayhem_proto::ComfyWorkflowCatalogPolicy::runtime_id),
+            Some("comfyui-v0.30.1")
+        );
+    }
+
+    #[test]
     fn gateway_models_keep_multiple_models_and_provider_routes_in_one_snapshot() {
         let root = "aa".repeat(32);
         let mut contract = test_contract(&root);
@@ -102215,6 +102722,33 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn comfy_provider_modality_canary_uses_workflow_endpoint() {
+        let terms = test_provider_comfy_session_terms();
+        let mut model = test_catalog(&"aa".repeat(32)).models[0].clone();
+        model.model_id = "test/model@4bit".to_owned();
+        model.model_class = "image-generation".to_owned();
+        model.adapter = terms.adapter;
+        let prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "comfy-workflow-smoke",
+            "prompt": "unused for workflow self-test"
+        }))
+        .unwrap();
+
+        let body = provider_canary_self_test_body(&model, &prompt).unwrap();
+
+        assert_eq!(body["kind"], json!("workflow_generation"));
+        assert_eq!(
+            body["endpoint_family"],
+            json!(mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS)
+        );
+        assert!(body["workflow"].is_object());
+        let sealed =
+            provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
+        assert_eq!(sealed["kind"], json!("workflow_generation"));
+        provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter).unwrap();
+    }
+
+    #[test]
     fn provider_rejects_remote_or_malformed_media_before_engine_dispatch() {
         let mut terms = test_provider_session_terms();
         terms.served_modalities = vec!["text".to_owned(), "image".to_owned()];
@@ -104986,6 +105520,77 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn comfy_directory_artifact_metadata_is_deterministic_and_content_bound() {
+        let temp = test_temp_dir("mayhem-comfy-directory-artifact");
+        let runtime = temp.join("ComfyUI-v0.30.1");
+        fs::create_dir_all(runtime.join("nodes")).unwrap();
+        fs::write(runtime.join("main.py"), b"print('comfy')\n").unwrap();
+        fs::write(runtime.join("nodes/example.py"), b"NODE = True\n").unwrap();
+
+        let (first, total_bytes, chunk_count) =
+            catalog_artifact_file_metadata(&runtime, 8, Some("1".repeat(40))).unwrap();
+        let (second, _, _) =
+            catalog_artifact_file_metadata(&runtime, 8, Some("1".repeat(40))).unwrap();
+        assert_eq!(first.artifact_root, second.artifact_root);
+        assert_eq!(first.source_sha256, second.source_sha256);
+        assert_eq!(first.weights_bytes, second.weights_bytes);
+        assert_eq!(first.source_revision, second.source_revision);
+        assert_eq!(first.artifact_root_kind, "blake3_merkle_v1");
+        assert_eq!(first.artifact_root.len(), 64);
+        assert_eq!(first.source_sha256.len(), 64);
+        assert_eq!(first.weights_bytes, total_bytes);
+        assert!(total_bytes > 0);
+        assert!(chunk_count > 0);
+
+        fs::write(runtime.join("nodes/example.py"), b"NODE = False\n").unwrap();
+        let (changed, _, _) = catalog_artifact_file_metadata(&runtime, 8, None).unwrap();
+        assert_ne!(changed.artifact_root, first.artifact_root);
+        assert_ne!(changed.source_sha256, first.source_sha256);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn local_directory_artifacts_are_restricted_to_comfy_runtime_backends() {
+        let temp = test_temp_dir("mayhem-non-comfy-directory-artifact");
+        let runtime = temp.join("not-a-flat-model");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::write(runtime.join("main.py"), b"not comfy enough").unwrap();
+        let root = "aa".repeat(32);
+        let catalog = test_catalog(&root);
+        let contract = test_contract(&root);
+        let artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        let verdict = test_hardware(FixtureProfile::CpuOnly)
+            .backend_verdicts
+            .into_iter()
+            .find(|verdict| verdict.backend == "llama.cpp")
+            .unwrap();
+        let selected = ProviderCandidate {
+            enclave: contract.enclaves[0].clone(),
+            model: catalog.models[0].clone(),
+            artifact_name: "gguf-q4_k_m".to_owned(),
+            artifact,
+            verdict,
+            price: None,
+            served_ctx: 4096,
+            served_modalities: vec!["text".to_owned()],
+            served_specialities: BTreeMap::new(),
+            modality_capacities: test_modality_capacities("text"),
+            feasibility: ProviderCtxFeasibility::not_applicable(4096, 4096),
+            ctx_bracket_schedule: default_ctx_bracket_schedule(),
+        };
+
+        let err = require_local_artifact_path_supported(&runtime, &selected)
+            .expect_err("non-Comfy directory artifacts must be rejected");
+        assert!(
+            format!("{err:#}").contains("only supported for ComfyUI runtimes"),
+            "{err:#}"
+        );
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn seal_provider_artifact_reuses_cached_sealed_store_without_plaintext() {
         let temp = test_temp_dir("mayhem-seal-cache");
         let artifact = temp.join("model.bin");
@@ -105014,6 +105619,52 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(cached.bytes_written, 0);
         assert_eq!(cached.total_bytes, merkle.total_bytes);
         assert_eq!(cached.merkle.root, merkle.root);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn seal_provider_artifact_supports_directory_artifact_streams() {
+        let temp = test_temp_dir("mayhem-seal-directory");
+        let runtime = temp.join("ComfyUI");
+        fs::create_dir_all(runtime.join("custom_nodes")).unwrap();
+        fs::write(runtime.join("main.py"), b"print('comfy')\n").unwrap();
+        fs::write(runtime.join("custom_nodes/node.py"), b"class Node: pass\n").unwrap();
+        let digest = build_directory_artifact_digest(&runtime, 8, |_| {}).unwrap();
+        let sealed_store = temp.join("sealed");
+        let key_context = KeyContext {
+            provider_id: "11".repeat(32),
+            enclave_id: "22".repeat(32),
+            artifact_root: digest.merkle.root.clone(),
+            manifest_hash: "33".repeat(32),
+        };
+        let provider_secret = vec![7_u8; 32];
+
+        let first =
+            seal_provider_artifact(&runtime, &sealed_store, &key_context, &provider_secret, 8)
+                .unwrap();
+
+        assert_eq!(first.destination, sealed_store);
+        assert_eq!(first.total_bytes, digest.merkle.total_bytes);
+        assert_eq!(first.merkle.root, digest.merkle.root);
+        assert_eq!(first.bytes_written, digest.merkle.total_bytes);
+        let manifest = read_sealed_manifest(&first.destination).unwrap();
+        assert_eq!(manifest.chunks.len(), digest.merkle.chunks.len());
+        assert!(manifest
+            .chunks
+            .iter()
+            .all(|chunk| first.destination.join(&chunk.sealed_path).is_file()));
+
+        fs::remove_dir_all(&runtime).unwrap();
+        let cached = seal_provider_artifact(
+            &runtime,
+            &first.destination,
+            &key_context,
+            &provider_secret,
+            8,
+        )
+        .unwrap();
+        assert_eq!(cached.bytes_written, 0);
+        assert_eq!(cached.merkle.root, digest.merkle.root);
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -105117,6 +105768,64 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(classes["image.custom.512"]["min_ask_au"], json!("9"));
         assert_eq!(classes["image.custom.512"]["max_concurrent"], json!(3));
         assert!(classes.get("image.workflow").is_none());
+    }
+
+    #[test]
+    fn provider_heartbeat_min_ask_falls_back_to_positive_rate_map() {
+        let root = "aa".repeat(32);
+        let catalog = test_catalog(&root);
+        let contract = test_contract(&root);
+        let artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        let mut selected = ProviderCandidate {
+            enclave: contract.enclaves[0].clone(),
+            model: catalog.models[0].clone(),
+            artifact_name: "gguf-q4_k_m".to_owned(),
+            artifact,
+            verdict: BackendVerdict {
+                backend: "comfyui".to_owned(),
+                status: VerdictStatus::FullOffload,
+                reason: None,
+                est_tok_s: None,
+                n_layers_gpu: None,
+                max_sessions: 1,
+                kv_cache_bytes_budget: 0,
+            },
+            price: contract.prices.first().cloned(),
+            served_ctx: 1,
+            served_modalities: vec!["image".to_owned()],
+            served_specialities: BTreeMap::new(),
+            modality_capacities: test_modality_capacities("image"),
+            feasibility: ProviderCtxFeasibility::not_applicable(1, 0),
+            ctx_bracket_schedule: default_ctx_bracket_schedule(),
+        };
+        selected.model.adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            )
+            .unwrap()];
+        let price = selected
+            .price
+            .as_mut()
+            .and_then(|schedule| schedule.current.as_mut())
+            .expect("test price schedule");
+        price.min_session_au = 0;
+        price.per_req_au = 0;
+        price.rate_map = vec![RateMapEntry {
+            unit: "image".to_owned(),
+            per_unit_au: 11,
+            granularity: 1,
+        }];
+
+        let heartbeat_min_ask = provider_heartbeat_min_ask_au(&selected, 0);
+        assert_eq!(heartbeat_min_ask, 11);
+        let classes = provider_heartbeat_workflow_classes(
+            &selected,
+            heartbeat_min_ask,
+            1,
+            &ProviderLoadSnapshot::idle(1),
+        )
+        .expect("Comfy endpoint should advertise workflow class");
+        assert_eq!(classes["image.workflow"]["min_ask_au"], json!("11"));
     }
 
     #[test]

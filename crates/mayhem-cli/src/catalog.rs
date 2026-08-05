@@ -3513,6 +3513,15 @@ fn valid_endpoint_family(family: &str) -> bool {
 }
 
 fn required_endpoint_families(model: &CatalogModel) -> BTreeSet<&'static str> {
+    if model.workflow.is_some()
+        || model
+            .adapter
+            .endpoint_families
+            .iter()
+            .any(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS)
+    {
+        return BTreeSet::from([mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS]);
+    }
     let mut required =
         required_endpoint_family_names(&model.model_class, &model.adapter.modality_set);
     let tools_only = model.model_class == DEFAULT_MODEL_CLASS
@@ -7249,6 +7258,81 @@ mod tests {
         validate_model(&text_with_image_shape, &mut errors);
         assert!(errors.iter().any(|error| error.contains(
             "endpoint family openai_image_generations is not compatible with model_class text-generation"
+        )));
+    }
+
+    #[test]
+    fn comfy_workflow_image_generation_requires_workflow_endpoint_only() {
+        let mut model = verification_test_model(
+            "admin/comfy-empty@workflow",
+            "image-generation",
+            "comfyui",
+            CanaryRef {
+                set_id: "canary-launch-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_SEED_PERCEPTUAL_HASH.to_owned(),
+                verification_tolerance_bps: Some(128),
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([("fixed-image".to_owned(), "a".repeat(16))]),
+                )]),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
+            },
+        );
+        model.family = "comfy-workflow".to_owned();
+        model.adapter.tool_call_strategy = "none".to_owned();
+        model.adapter.modality_set = vec!["image".to_owned()];
+        model.adapter.endpoint_families =
+            vec![
+                endpoint_contract_template(mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS).unwrap(),
+            ];
+        model.workflow = Some(mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["EmptyImage".to_owned(), "SaveImage".to_owned()],
+            runtime_id: Some("comfyui-v0.30.1".to_owned()),
+            outcome_class: Some("image.light.64".to_owned()),
+            max_nodes: Some(8),
+            max_width: Some(64),
+            max_height: Some(64),
+            max_frames: Some(1),
+            max_duration_seconds: Some(1),
+            max_steps: Some(1),
+            max_artifacts: Some(1),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        });
+        model.price_ref_au.in_per_1k = 0;
+        model.price_ref_au.out_per_1k = 0;
+        model.price_ref_au.rate_map = vec![
+            CatalogRateMapEntry {
+                unit: USAGE_IMAGE.to_owned(),
+                per_unit_au: 10,
+                granularity: 1,
+            },
+            CatalogRateMapEntry {
+                unit: USAGE_STEP.to_owned(),
+                per_unit_au: 1,
+                granularity: 1,
+            },
+        ];
+
+        let mut errors = Vec::new();
+        validate_model(&model, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        let mut missing_workflow_endpoint = model.clone();
+        missing_workflow_endpoint.adapter.endpoint_families =
+            vec![
+                endpoint_contract_template(mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS)
+                    .unwrap(),
+            ];
+        let mut errors = Vec::new();
+        validate_model(&missing_workflow_endpoint, &mut errors);
+        assert!(errors.iter().any(|error| error.contains(
+            "adapter.endpoint_families missing required compatible family mayhem_comfy_workflows"
         )));
     }
 

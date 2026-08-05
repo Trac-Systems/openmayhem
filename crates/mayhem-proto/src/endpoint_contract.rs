@@ -979,19 +979,19 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
         "metadata" => object_spec_with_default(json!({})),
         "workflow" if family == ENDPOINT_MAYHEM_COMFY_WORKFLOWS => object_spec(json!({
             "1": {
-                "class_type": "EmptyLatentImage",
-                "inputs": {"width": 512, "height": 512, "batch_size": 1}
+                "class_type": "EmptyImage",
+                "inputs": {"width": 64, "height": 64, "batch_size": 1, "color": 0}
             },
             "2": {
                 "class_type": "SaveImage",
-                "inputs": {"images": ["1", 0]}
+                "inputs": {"images": ["1", 0], "filename_prefix": "mayhem-comfy-smoke"}
             }
         })),
         "runtime_id" if family == ENDPOINT_MAYHEM_COMFY_WORKFLOWS => {
             string_spec(1, 128, json!("comfyui-v0.30.1"))
         }
         "outcome_class" if family == ENDPOINT_MAYHEM_COMFY_WORKFLOWS => {
-            string_spec(1, 128, json!("image.light.512"))
+            string_spec(1, 128, json!("image.light.64"))
         }
         "timeout_ms" if family == ENDPOINT_MAYHEM_COMFY_WORKFLOWS => {
             with_default(integer_spec(1_000.0, 3_600_000.0, 120_000), json!(120_000))
