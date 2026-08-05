@@ -24,13 +24,21 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import urljoin, urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 
 DIRECT_FORMATS = {"safetensors", "gguf"}
 PICKLE_MARKER = "pickle"
 CHUNK_BYTES = 4 * 1024 * 1024
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        return None
+
+
+NO_REDIRECT_OPENER = build_opener(NoRedirect)
 
 
 def sha256_file(path: Path) -> str:
@@ -97,8 +105,7 @@ def download_once(url: str, destination: Path, headers: dict[str, str], timeout:
     request_headers = dict(headers)
     if offset:
         request_headers["Range"] = f"bytes={offset}-"
-    request = Request(url, headers=request_headers)
-    with urlopen(request, timeout=timeout) as response:
+    with open_following_redirects(url, request_headers, timeout) as response:
         status = getattr(response, "status", response.getcode())
         mode = "ab" if offset and status == 206 else "wb"
         if offset and status != 206:
@@ -110,6 +117,32 @@ def download_once(url: str, destination: Path, headers: dict[str, str], timeout:
                     break
                 output.write(chunk)
     os.replace(partial, destination)
+
+
+def open_following_redirects(url: str, headers: dict[str, str], timeout: int):
+    current_url = url
+    current_headers = dict(headers)
+    for _ in range(10):
+        request = Request(current_url, headers=current_headers)
+        try:
+            return NO_REDIRECT_OPENER.open(request, timeout=timeout)
+        except HTTPError as error:
+            if error.code not in (301, 302, 303, 307, 308):
+                raise
+            location = error.headers.get("Location")
+            if not location:
+                raise
+            if error.fp is not None:
+                error.fp.close()
+            next_url = urljoin(current_url, location)
+            if urlparse(next_url).netloc.lower() != urlparse(current_url).netloc.lower():
+                current_headers = {
+                    key: value
+                    for key, value in current_headers.items()
+                    if key.lower() != "authorization"
+                }
+            current_url = next_url
+    raise RuntimeError(f"too many redirects while downloading {url}")
 
 
 def download_verified(
