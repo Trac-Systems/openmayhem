@@ -188,7 +188,31 @@ pub struct ComfyPartCanaryTolerance {
 
 impl ComfyPartCanaryTolerance {
     fn validate(&self) -> Result<(), ComfyPartsCatalogError> {
-        validate_non_empty("canary.tolerance.method", &self.method)
+        validate_non_empty("canary.tolerance.method", &self.method)?;
+        let method = self.method.trim().to_ascii_lowercase();
+        if !matches!(
+            method.as_str(),
+            "phash"
+                | "average_hash"
+                | "image_average_hash"
+                | "seed_perceptual_hash"
+                | "audio_fingerprint"
+                | "video_av_fingerprint"
+                | "sha256"
+                | "exact_sha256"
+        ) {
+            return Err(ComfyPartsCatalogError::InvalidField {
+                field: "canary.tolerance.method",
+                reason: format!("unsupported method {}", self.method),
+            });
+        }
+        if self.max_distance_bps > 10_000 {
+            return Err(ComfyPartsCatalogError::InvalidField {
+                field: "canary.tolerance.max_distance_bps",
+                reason: "must be at most 10000".to_owned(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -987,6 +1011,20 @@ mod tests {
                 max_distance_bps: 100,
             },
         }
+    }
+
+    #[test]
+    fn canary_tolerance_rejects_unknown_method_and_overflow_distance() {
+        let mut unknown_method = canary();
+        unknown_method.tolerance.method = "shell_exec".to_owned();
+        assert!(unknown_method.validate().is_err());
+
+        let mut overflow_distance = canary();
+        overflow_distance.tolerance.max_distance_bps = 10_001;
+        assert!(overflow_distance.validate().is_err());
+
+        let valid = canary();
+        assert!(valid.validate().is_ok());
     }
 
     fn record(name: &str, sha256: &str) -> ComfyPartRecord {

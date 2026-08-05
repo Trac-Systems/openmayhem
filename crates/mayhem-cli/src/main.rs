@@ -787,6 +787,8 @@ enum AdminPartsCommands {
     ValidateYaml(AdminPartsValidateYamlArgs),
     /// Finalize one Comfy part draft into a verified record JSON.
     Onboard(AdminPartsOnboardArgs),
+    /// Verify an observed Comfy part canary output against a finalized record.
+    VerifyCanary(AdminPartsVerifyCanaryArgs),
     /// Add a verified mirror source to a finalized Comfy part record.
     AddMirror(AdminPartsAddMirrorArgs),
     /// Build a machine-pullable Comfy parts index from finalized part records.
@@ -4330,6 +4332,33 @@ struct AdminPartsOnboardArgs {
     /// Overwrite an existing different output record.
     #[arg(long)]
     force: bool,
+
+    /// Print machine-readable output.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct AdminPartsVerifyCanaryArgs {
+    /// Finalized Comfy part record JSON carrying the tolerance policy.
+    #[arg(long = "record", value_name = "PATH")]
+    record: PathBuf,
+
+    /// Reference canary output artifact captured during onboarding.
+    #[arg(long = "reference-output", value_name = "PATH")]
+    reference_output: PathBuf,
+
+    /// Observed canary output artifact from a provider/auditor probe.
+    #[arg(long = "observed-output", value_name = "PATH")]
+    observed_output: PathBuf,
+
+    /// Override the record's canary tolerance method for local calibration only.
+    #[arg(long = "method")]
+    method: Option<String>,
+
+    /// Override the record's canary maximum distance for local calibration only.
+    #[arg(long = "max-distance-bps")]
+    max_distance_bps: Option<u32>,
 
     /// Print machine-readable output.
     #[arg(long)]
@@ -25099,6 +25128,22 @@ struct AdminPartsOnboardCanaryReport {
     max_distance_bps: u32,
 }
 
+#[derive(Debug, Serialize)]
+struct AdminPartsVerifyCanaryReport {
+    ok: bool,
+    record: String,
+    part_id: String,
+    reference_output: String,
+    observed_output: String,
+    reference_sha256: String,
+    observed_sha256: String,
+    method: String,
+    reference_fingerprint: String,
+    observed_fingerprint: String,
+    distance_bps: u32,
+    max_distance_bps: u32,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct AdminPartsOnboardStepReport {
     step: String,
@@ -25164,6 +25209,7 @@ async fn admin_parts(command: &AdminPartsCommands) -> Result<()> {
     match command {
         AdminPartsCommands::ValidateYaml(args) => admin_parts_validate_yaml(args),
         AdminPartsCommands::Onboard(args) => admin_parts_onboard(args),
+        AdminPartsCommands::VerifyCanary(args) => admin_parts_verify_canary(args),
         AdminPartsCommands::AddMirror(args) => admin_parts_add_mirror(args),
         AdminPartsCommands::BuildIndex(args) => admin_parts_build_index(args),
         AdminPartsCommands::UploadPlan(args) => admin_parts_upload_plan(args),
@@ -25884,6 +25930,87 @@ fn admin_parts_onboard_step(step: &str, fields: &[(&str, String)]) -> AdminParts
     }
 }
 
+fn admin_parts_verify_canary(args: &AdminPartsVerifyCanaryArgs) -> Result<()> {
+    let record = absolutize(args.record.clone())?;
+    let reference_output = absolutize(args.reference_output.clone())?;
+    let observed_output = absolutize(args.observed_output.clone())?;
+    let report = admin_parts_verify_canary_report(
+        record,
+        reference_output,
+        observed_output,
+        args.method.clone(),
+        args.max_distance_bps,
+    )?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.ok {
+        println!("Comfy part canary verified.");
+        println!("Part: {}", report.part_id);
+        println!("Method: {}", report.method);
+        println!(
+            "Distance: {} bps (max {})",
+            report.distance_bps, report.max_distance_bps
+        );
+    }
+    ensure!(
+        report.ok,
+        "Comfy part canary verification failed for {}: distance {} bps exceeds max {} bps",
+        report.part_id,
+        report.distance_bps,
+        report.max_distance_bps
+    );
+    Ok(())
+}
+
+fn admin_parts_verify_canary_report(
+    record_path: PathBuf,
+    reference_output: PathBuf,
+    observed_output: PathBuf,
+    method_override: Option<String>,
+    max_distance_bps_override: Option<u32>,
+) -> Result<AdminPartsVerifyCanaryReport> {
+    let record: mayhem_proto::ComfyPartRecord =
+        serde_json::from_value(read_json_file(&record_path)?)
+            .with_context(|| format!("parsing Comfy part record {}", record_path.display()))?;
+    record
+        .validate()
+        .with_context(|| format!("validating Comfy part record {}", record_path.display()))?;
+    let method = normalize_comfy_part_canary_tolerance_method(
+        method_override
+            .as_deref()
+            .unwrap_or(record.canary.tolerance.method.as_str()),
+    )?;
+    let max_distance_bps =
+        max_distance_bps_override.unwrap_or(record.canary.tolerance.max_distance_bps);
+    ensure!(
+        max_distance_bps <= 10_000,
+        "Comfy part canary max distance must be at most 10000 bps"
+    );
+    let reference = comfy_part_canary_output_evidence(Some(&reference_output), &method)?
+        .context("reference canary output evidence was not produced")?;
+    let observed = comfy_part_canary_output_evidence(Some(&observed_output), &method)?
+        .context("observed canary output evidence was not produced")?;
+    let distance_bps = comfy_part_canary_fingerprint_distance_bps(
+        &method,
+        &reference.fingerprint,
+        &observed.fingerprint,
+    )?;
+    Ok(AdminPartsVerifyCanaryReport {
+        ok: distance_bps <= max_distance_bps,
+        record: record_path.display().to_string(),
+        part_id: record.part_id,
+        reference_output: reference_output.display().to_string(),
+        observed_output: observed_output.display().to_string(),
+        reference_sha256: reference.sha256,
+        observed_sha256: observed.sha256,
+        method,
+        reference_fingerprint: reference.fingerprint,
+        observed_fingerprint: observed.fingerprint,
+        distance_bps,
+        max_distance_bps,
+    })
+}
+
 struct AdminPartsCanaryOutputEvidence {
     path: String,
     sha256: String,
@@ -26350,9 +26477,9 @@ fn comfy_part_canary_output_evidence(
     let bytes =
         fs::read(path).with_context(|| format!("reading canary output {}", path.display()))?;
     let sha256 = sha256_bytes_hex(&bytes);
-    let method = tolerance_method.trim().to_ascii_lowercase();
+    let method = normalize_comfy_part_canary_tolerance_method(tolerance_method)?;
     let fingerprint = match method.as_str() {
-        "phash" | "average_hash" | "image_average_hash" => {
+        "phash" => {
             image_average_hash_hex(&bytes).map_err(anyhow::Error::msg)?
         }
         "audio_fingerprint" => audio_fingerprint(&bytes),
@@ -26369,6 +26496,66 @@ fn comfy_part_canary_output_evidence(
         sha256,
         fingerprint,
     }))
+}
+
+fn normalize_comfy_part_canary_tolerance_method(method: &str) -> Result<String> {
+    let method = method.trim().to_ascii_lowercase();
+    let normalized = match method.as_str() {
+        "phash" | "average_hash" | "image_average_hash" | "seed_perceptual_hash" => "phash",
+        "audio_fingerprint" => "audio_fingerprint",
+        CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT => CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT,
+        "sha256" | "exact_sha256" => "sha256",
+        "" => bail!("Comfy part canary tolerance method must not be empty"),
+        other => bail!("unsupported Comfy part canary tolerance method {other}"),
+    };
+    Ok(normalized.to_owned())
+}
+
+fn comfy_part_canary_fingerprint_distance_bps(
+    method: &str,
+    reference: &str,
+    observed: &str,
+) -> Result<u32> {
+    match normalize_comfy_part_canary_tolerance_method(method)?.as_str() {
+        "phash" => fingerprint_hex_hamming_distance_bps(reference, observed, 16),
+        "sha256" => Ok(if reference.eq_ignore_ascii_case(observed) {
+            0
+        } else {
+            10_000
+        }),
+        "audio_fingerprint" => {
+            let similarity = mayhem_gateway::audio_fingerprint_similarity_bps(reference, observed)
+                .context("canary audio fingerprints are not comparable")?;
+            Ok(10_000_u32.saturating_sub(similarity))
+        }
+        CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT => {
+            let similarity = video_av_fingerprint_similarity_bps(reference, observed)
+                .context("canary video/audio fingerprints are not comparable")?;
+            Ok(10_000_u32.saturating_sub(similarity))
+        }
+        _ => unreachable!("method was normalized"),
+    }
+}
+
+fn fingerprint_hex_hamming_distance_bps(
+    reference: &str,
+    observed: &str,
+    hex_len: usize,
+) -> Result<u32> {
+    ensure!(
+        reference.len() == hex_len
+            && observed.len() == hex_len
+            && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && observed.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "canary image fingerprints must be {hex_len}-character hexadecimal hashes"
+    );
+    let reference =
+        u64::from_str_radix(reference, 16).context("parsing reference canary image fingerprint")?;
+    let observed =
+        u64::from_str_radix(observed, 16).context("parsing observed canary image fingerprint")?;
+    let bits = (hex_len as u32).saturating_mul(4);
+    let distance_bits = (reference ^ observed).count_ones();
+    Ok(distance_bits.saturating_mul(10_000) / bits.max(1))
 }
 
 fn admin_parts_resolve_payload(
@@ -91193,6 +91380,119 @@ status: linked
             .fields
             .contains_key("reference_output_fingerprint"));
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn admin_parts_verify_canary_enforces_record_tolerance() {
+        let temp = test_temp_dir("mayhem-admin-parts-verify-canary");
+        fs::create_dir_all(&temp).unwrap();
+        let payload_path = temp.join("payload.bin");
+        fs::write(&payload_path, b"canary verification payload").unwrap();
+        let reference_path = temp.join("reference.bin");
+        fs::write(&reference_path, b"reference canary bytes").unwrap();
+        let observed_path = temp.join("observed.bin");
+        fs::write(&observed_path, b"reference canary bytes").unwrap();
+        let changed_path = temp.join("changed.bin");
+        fs::write(&changed_path, b"different canary bytes").unwrap();
+        let sha256 = file_sha256_hex(&payload_path).unwrap();
+        let size_bytes = fs::metadata(&payload_path).unwrap().len();
+        let input_path = temp.join("part.yaml");
+        fs::write(
+            &input_path,
+            format!(
+                r#"
+name: "canary verifier"
+type: upscaler
+lane: all
+license: MIT
+file_format: bin
+sha256: "{sha256}"
+size_bytes: {size_bytes}
+download_url: "https://huggingface.co/TracNetwork/openmayhem-parts/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/payload.bin"
+status: linked
+"#
+            ),
+        )
+        .unwrap();
+        let record_path = temp.join("record.json");
+        admin_parts_onboard_report(AdminPartsOnboardInput {
+            input: input_path,
+            row_index: 1,
+            payload: Some(payload_path),
+            download_dir: None,
+            source_token_file: None,
+            disk_reserve: None,
+            output: record_path.clone(),
+            receipt_dir: None,
+            min_runtime: "comfyui-v0.30.1".to_owned(),
+            license_doc: None,
+            license_doc_hash: Some("33".repeat(32)),
+            license_ref: "license:test".to_owned(),
+            license_captured_at: "2026-08-04T00:00:00Z".to_owned(),
+            canary_graph: None,
+            canary_graph_hash: Some("44".repeat(32)),
+            canary_output_ref: "canaries/reference.bin".to_owned(),
+            canary_output: Some(reference_path.clone()),
+            canary_run_runtime: None,
+            canary_run_cache_dir: None,
+            canary_run_output_dir: None,
+            canary_run_timeout_ms: 120_000,
+            canary_tolerance_method: "sha256".to_owned(),
+            canary_max_distance_bps: 0,
+            chunk_size: 8,
+            force: false,
+        })
+        .unwrap();
+
+        let ok = admin_parts_verify_canary_report(
+            record_path.clone(),
+            reference_path.clone(),
+            observed_path,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(ok.ok);
+        assert_eq!(ok.method, "sha256");
+        assert_eq!(ok.distance_bps, 0);
+
+        let mismatch =
+            admin_parts_verify_canary_report(record_path, reference_path, changed_path, None, None)
+                .unwrap();
+        assert!(!mismatch.ok);
+        assert_eq!(mismatch.distance_bps, 10_000);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn comfy_part_canary_image_distance_uses_bit_distance_bps() {
+        assert_eq!(
+            comfy_part_canary_fingerprint_distance_bps(
+                "phash",
+                "0000000000000000",
+                "0000000000000000"
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            comfy_part_canary_fingerprint_distance_bps(
+                "seed_perceptual_hash",
+                "0000000000000000",
+                "ffffffffffffffff"
+            )
+            .unwrap(),
+            10_000
+        );
+        assert_eq!(
+            comfy_part_canary_fingerprint_distance_bps(
+                "average_hash",
+                "0000000000000000",
+                "0000000000000001"
+            )
+            .unwrap(),
+            156
+        );
     }
 
     #[test]
