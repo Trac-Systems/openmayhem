@@ -98,6 +98,32 @@ const stableValue = (value) => {
 
 const stableJson = (value) => JSON.stringify(stableValue(value));
 
+const relayResponseOk = (response) => (
+  response &&
+  typeof response === 'object' &&
+  !Array.isArray(response) &&
+  response.ok === true
+);
+
+const relayResponseRejected = (response) => (
+  response &&
+  typeof response === 'object' &&
+  !Array.isArray(response) &&
+  response.ok === false
+);
+
+const relayResponseCacheable = (response) => (
+  relayResponseOk(response) ||
+  (
+    relayResponseRejected(response) &&
+    response.accepted === false &&
+    /^Mayhem (feature|service) result exceeds \d+ bytes\.$/i.test(String(response.message ?? ''))
+  )
+);
+
+const cachedRelayResponse = (cached) =>
+  cached?.result?.message?.response ?? cached?.response ?? null;
+
 // MAYHEM PATCH: return a bounded relay error for over-large feature appends
 // instead of wedging the writer on Hypercore's block-size guard.
 const appendBlockSizeError = (error) =>
@@ -566,8 +592,11 @@ class MayhemFeature extends Feature {
     this._pruneMap(this.completed);
     const completed = this.completed.get(requestId);
     if (completed) {
-      completed.at = Date.now();
-      return completed.response;
+      if (relayResponseCacheable(completed.response)) {
+        completed.at = Date.now();
+        return completed.response;
+      }
+      this.completed.delete(requestId);
     }
     const existing = this.pending.get(requestId);
     if (existing) return await existing.promise;
@@ -621,8 +650,11 @@ class MayhemFeature extends Feature {
     this._pruneMap(this.serviceCompleted);
     const completed = this.serviceCompleted.get(requestId);
     if (completed) {
-      completed.at = Date.now();
-      return completed.response;
+      if (relayResponseCacheable(completed.response)) {
+        completed.at = Date.now();
+        return completed.response;
+      }
+      this.serviceCompleted.delete(requestId);
     }
     const existing = this.servicePending.get(requestId);
     if (existing) return await existing.promise;
@@ -1009,6 +1041,16 @@ class MayhemFeature extends Feature {
 
     this._pruneProcessed();
     let cached = this.processed.get(expectedId);
+    if (
+      cached &&
+      !cached.pending &&
+      cached.acked === true &&
+      !relayResponseCacheable(cachedRelayResponse(cached))
+    ) {
+      this._clearServiceResultRetry(cached);
+      this.processed.delete(expectedId);
+      cached = null;
+    }
     if (!cached && this._processedInFlight(this.processed) >= this.processedInFlightMax) {
       const busy = this._prepareFeatureResult(
         expectedId,
@@ -1297,17 +1339,21 @@ class MayhemFeature extends Feature {
     }
     this._sendFeatureResultAck(admin, requestId, resultDigest);
     if (!pending) {
-      completed.at = Date.now();
+      if (completed && relayResponseCacheable(completed.response)) completed.at = Date.now();
       return;
     }
     this.pending.delete(requestId);
     const response = { ...message.response, relayed: true, request_id: requestId };
-    this.completed.set(requestId, {
-      at: Date.now(),
-      response,
-      resultDigest,
-    });
-    this._pruneMap(this.completed);
+    if (relayResponseCacheable(response)) {
+      this.completed.set(requestId, {
+        at: Date.now(),
+        response,
+        resultDigest,
+      });
+      this._pruneMap(this.completed);
+    } else {
+      this.completed.delete(requestId);
+    }
     pending.resolve(response);
   }
 
@@ -1425,6 +1471,9 @@ class MayhemFeature extends Feature {
     cached.acked = true;
     cached.at = Date.now();
     this._clearServiceResultRetry(cached);
+    if (!relayResponseCacheable(cachedRelayResponse(cached))) {
+      this.processed.delete(requestId);
+    }
   }
 
   _prepareServiceResult(requestId, transport, response) {
@@ -1536,6 +1585,16 @@ class MayhemFeature extends Feature {
 
     this._pruneMap(this.serviceProcessed);
     let cached = this.serviceProcessed.get(expectedId);
+    if (
+      cached &&
+      !cached.pending &&
+      cached.acked === true &&
+      !relayResponseCacheable(cachedRelayResponse(cached))
+    ) {
+      this._clearServiceResultRetry(cached);
+      this.serviceProcessed.delete(expectedId);
+      cached = null;
+    }
     if (!cached && this._processedInFlight(this.serviceProcessed) >= this.processedInFlightMax) {
       const busy = this._prepareServiceResult(
         expectedId,
@@ -1597,17 +1656,21 @@ class MayhemFeature extends Feature {
     }
     this._sendServiceResultAck(admin, requestId, resultDigest);
     if (!pending) {
-      completed.at = Date.now();
+      if (completed && relayResponseCacheable(completed.response)) completed.at = Date.now();
       return;
     }
     const response = { ...message.response, relayed: true, request_id: requestId };
     this.servicePending.delete(requestId);
-    this.serviceCompleted.set(requestId, {
-      at: Date.now(),
-      response,
-      resultDigest,
-    });
-    this._pruneMap(this.serviceCompleted);
+    if (relayResponseCacheable(response)) {
+      this.serviceCompleted.set(requestId, {
+        at: Date.now(),
+        response,
+        resultDigest,
+      });
+      this._pruneMap(this.serviceCompleted);
+    } else {
+      this.serviceCompleted.delete(requestId);
+    }
     pending.resolve(response);
   }
 
@@ -1633,6 +1696,9 @@ class MayhemFeature extends Feature {
     cached.acked = true;
     cached.at = Date.now();
     this._clearServiceResultRetry(cached);
+    if (!relayResponseCacheable(cachedRelayResponse(cached))) {
+      this.serviceProcessed.delete(requestId);
+    }
   }
 
   async _applyRelayed(key, value, requestId) {

@@ -134,6 +134,9 @@ const viewFor = (state) => ({
   },
 });
 
+const isPeerAck = (operation) =>
+  operation === null || operation?.type === '_trac_peer_ack_v1';
+
 const peerFor = (publicKey, { writable = false, bootstrap = '11'.repeat(32) } = {}) => {
   const state = new Map([['admin', adminKey]]);
   const appended = [];
@@ -161,7 +164,7 @@ const peerFor = (publicKey, { writable = false, bootstrap = '11'.repeat(32) } = 
       writable,
       view: viewFor(state),
       async append(op) {
-        if (op === null) {
+        if (isPeerAck(op)) {
           flushes.push(true);
           return;
         }
@@ -635,7 +638,7 @@ test('admin writer can retry a transient rejection under a fresh feature hash', 
   const replies = [];
   let rejectNext = true;
   writer.peer.base.append = async (op) => {
-    if (op === null) {
+    if (isPeerAck(op)) {
       writer.flushes.push(true);
       return;
     }
@@ -683,7 +686,20 @@ test('admin writer can retry a transient rejection under a fresh feature hash', 
   });
 
   await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
-  writerFeature.processed.clear();
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].response.ok, false);
+  assert.match(replies[0].response.message, /Consent required/);
+  await writerFeature.handleSidechannelMessage(
+    MAYHEM_RELAY_CHANNEL,
+    relayPayload(providerKey, {
+      control: 'mayhem_feature_result_ack',
+      version: 1,
+      request_id: requestId,
+      result_digest: replies[0].result_digest,
+      to: adminKey,
+    })
+  );
+  assert.equal(writerFeature.processed.has(requestId), false);
   await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
 
   assert.equal(writer.appended.length, 2);
@@ -693,16 +709,14 @@ test('admin writer can retry a transient rejection under a fresh feature hash', 
     writer.appended[1].value.dispatch.hash
   );
   assert.equal(replies.length, 2);
-  assert.equal(replies[0].response.ok, false);
-  assert.match(replies[0].response.message, /Consent required/);
   assert.equal(replies[1].response.ok, true);
 });
 
-test('lost rejection result is replayed from settled cache without duplicate append', async () => {
+test('lost rejection result is replayed until ACK, then evicted', async () => {
   const participant = peerFor(providerKey);
   const writer = peerFor(adminKey, { writable: true });
   writer.peer.base.append = async (op) => {
-    if (op === null) {
+    if (isPeerAck(op)) {
       writer.flushes.push(true);
       return;
     }
@@ -762,9 +776,7 @@ test('lost rejection result is replayed from settled cache without duplicate app
   assert.equal(writer.appended.length, 1);
   assert.equal(writer.flushes.length, 1);
   assert.ok(resultBroadcasts >= 2);
-  assert.equal(cached.pending, false);
-  cached.at = 0;
-  writerFeature._pruneProcessed();
+  if (cached) assert.equal(cached.pending, false);
   assert.equal(writerFeature.processed.has(requestId), false);
   await participantFeature.stop();
   await writerFeature.stop();
@@ -781,7 +793,7 @@ test('admin writer returns a bounded relay error when an accepted feature never 
   const participant = peerFor(providerKey);
   const writer = peerFor(adminKey, { writable: true });
   writer.peer.base.append = async (operation) => {
-    if (operation === null) {
+    if (isPeerAck(operation)) {
       writer.flushes.push(true);
       return;
     }
@@ -992,7 +1004,7 @@ test('feature relay collapses in-flight duplicates and retries one cached result
     markAppendStarted = resolve;
   });
   writer.peer.base.append = async (operation) => {
-    if (operation === null) {
+    if (isPeerAck(operation)) {
       writer.flushes.push(true);
       return;
     }
@@ -1092,7 +1104,7 @@ test('feature result uses joined channel even when direct reconnect is unavailab
   writerFeature.key = 'mayhem';
 
   writer.peer.base.append = async (operation) => {
-    if (operation === null) {
+    if (isPeerAck(operation)) {
       writer.flushes.push(true);
       return;
     }
@@ -1164,7 +1176,7 @@ test('feature relay never freezes a nonterminal pending result', async () => {
   const participant = peerFor(providerKey);
   const writer = peerFor(adminKey, { writable: true });
   writer.peer.base.append = async (operation) => {
-    if (operation === null) {
+    if (isPeerAck(operation)) {
       writer.flushes.push(true);
       return;
     }
@@ -2047,6 +2059,65 @@ test('read-only transport relays a wallet-signed Stripe checkout without appendi
   assert.equal(participant.appended.length, 0);
   assert.equal(writer.appended.length, 0);
   assert.equal(writer.flushes.length, 0);
+});
+
+test('service relay evicts rejected results so state-dependent retries re-evaluate', async () => {
+  const participant = peerFor(otherKey);
+  const signer = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  let serviceCalls = 0;
+  let rejectNext = true;
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    timeoutMs: 1_000,
+    retryMs: 100,
+    async serviceHandler(service, value) {
+      serviceCalls += 1;
+      assert.equal(service, 'stripe_checkout');
+      assert.deepEqual(value, stripeCheckoutValue());
+      if (rejectNext) {
+        rejectNext = false;
+        return {
+          ok: false,
+          status: 'rejected',
+          message: 'Rules consent required before checkout.',
+        };
+      }
+      return {
+        ok: true,
+        rail: 'fiat',
+        processor_rail: 'stripe',
+        checkout_session: {
+          id: 'cs_live_retry',
+          url: 'https://checkout.stripe.com/c/pay/cs_live_retry',
+        },
+      };
+    },
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+  connect(participant.peer, participantFeature, writer.peer, writerFeature);
+  connect(writer.peer, writerFeature, participant.peer, participantFeature);
+
+  const checkout = stripeCheckoutValue();
+  const signed = signedServiceValue(signer.peer, 'stripe_checkout', checkout, otherKey);
+  const requestId = serviceRequestIdFor('stripe_checkout', signed);
+  const rejected = await requestStripeCheckout(participant.peer, signed);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const accepted = await requestStripeCheckout(participant.peer, signed);
+
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.message, /Rules consent required/);
+  assert.equal(accepted.ok, true);
+  assert.equal(accepted.checkout_session.url, 'https://checkout.stripe.com/c/pay/cs_live_retry');
+  assert.equal(serviceCalls, 2);
+  assert.equal(writerFeature.serviceProcessed.has(requestId), true);
+  assert.equal(participantFeature.serviceCompleted.has(requestId), true);
 });
 
 test('Stripe checkout relay rejects caller-selected currency before forwarding', async () => {

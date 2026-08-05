@@ -30701,6 +30701,14 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
     let wallet = inspect_wallet(&keypair_path, &password)
         .await
         .with_context(|| format!("reading wallet {}", keypair_path.display()))?;
+    let rules_consent = if args.confirm {
+        Some(
+            ensure_current_rules_consent(&peer_rpc, &keypair_path, &password, &wallet, false)
+                .await?,
+        )
+    } else {
+        None
+    };
     let eth_key = ethereum_wallet_key(&keypair_path, &password)
         .await
         .with_context(|| {
@@ -30797,6 +30805,7 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
                 "token_address": tap.token_address,
                 "pool_address": tap.pool_address,
             },
+            "rules_consent": rules_consent,
             "tap_account_binding": binding,
         });
         if args.json {
@@ -30837,6 +30846,9 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
         preflight
     };
     report["tap_account_binding"] = binding;
+    if let Some(consent) = rules_consent {
+        report["rules_consent"] = serde_json::to_value(consent)?;
+    }
     let amount_wei = report
         .get("amount_wei")
         .and_then(Value::as_str)
@@ -32425,6 +32437,15 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         None
     };
 
+    let rules_consent = if args.submit_intent {
+        Some(
+            ensure_current_rules_consent(&rpc, &keypair_path, wallet_password, &wallet, args.sim)
+                .await?,
+        )
+    } else {
+        None
+    };
+
     let submitted = if args.submit_intent {
         if args.sim {
             Some(json!({ "sim": true, "submitted": false }))
@@ -32519,6 +32540,7 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
             "feature": intent_feature,
             "submitted": args.submit_intent && !args.sim,
             "sim": args.submit_intent && args.sim,
+            "rules_consent": rules_consent,
             "result": submitted,
         },
         "tnk": {
@@ -81807,6 +81829,30 @@ fn consent_matches(consent: Option<&Value>, rules: &RulesRef) -> bool {
     })
 }
 
+async fn ensure_current_rules_consent(
+    rpc: &PeerRpcClient,
+    keypair_path: &Path,
+    password: &str,
+    wallet: &WalletInfo,
+    sim: bool,
+) -> Result<ConsentReport> {
+    let rules = resolve_rules(None, None, rpc, None).await?;
+    let prior = read_consent_state(rpc, &wallet.public_key).await?;
+    if consent_matches(prior.as_ref(), &rules) {
+        return Ok(ConsentReport {
+            skipped: true,
+            simulated: sim,
+            rules: Some(rules),
+            tx: None,
+            command_hash: None,
+            feature: None,
+            result: None,
+            state: prior,
+        });
+    }
+    submit_consent(rpc, keypair_path, password, wallet, rules, sim).await
+}
+
 async fn submit_consent(
     rpc: &PeerRpcClient,
     keypair_path: &Path,
@@ -81962,6 +82008,31 @@ mod tests {
             );
         }
         available
+    }
+
+    #[test]
+    fn consent_state_matches_current_rules_exactly() {
+        let rules = RulesRef {
+            ver: 7,
+            hash: "ab".repeat(32),
+        };
+        let matching = json!({
+            "ver": 7,
+            "hash": "ab".repeat(32),
+        });
+        let stale_version = json!({
+            "ver": 6,
+            "hash": "ab".repeat(32),
+        });
+        let stale_hash = json!({
+            "ver": 7,
+            "hash": "cd".repeat(32),
+        });
+
+        assert!(consent_matches(Some(&matching), &rules));
+        assert!(!consent_matches(Some(&stale_version), &rules));
+        assert!(!consent_matches(Some(&stale_hash), &rules));
+        assert!(!consent_matches(None, &rules));
     }
 
     #[test]
