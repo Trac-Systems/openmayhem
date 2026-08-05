@@ -54784,6 +54784,7 @@ struct HeartbeatContext<'a> {
     identity_anchor: &'a str,
     tpm_activation_hello: Option<&'a mayhem_proto::TpmActivateCredentialHello>,
     workflow_inventory_root: Option<&'a str>,
+    max_sessions: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -55131,6 +55132,17 @@ impl ProviderProtectionConfig {
             budget_period: Duration::from_secs(86_400),
         }
     }
+}
+
+fn provider_effective_protection_config(
+    config: ProviderProtectionConfig,
+    responder: Option<&dyn ProviderSessionResponder>,
+) -> ProviderProtectionConfig {
+    responder
+        .map(|responder| {
+            config.limit_to_execution_capacity(responder.concurrent_session_capacity())
+        })
+        .unwrap_or(config)
 }
 
 #[derive(Clone, Debug)]
@@ -58545,7 +58557,8 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         );
     }
     let rooms = select_provider_rooms(&contract.rooms, &selected.enclave, &args.rooms)?;
-    let protection_config = ProviderProtectionConfig::from_provider_args(&args, &selected)?;
+    let configured_protection_config =
+        ProviderProtectionConfig::from_provider_args(&args, &selected)?;
     if rooms.is_empty() {
         bail!(
             "no open admin-created canonical rooms found for {}; ask the admin to open one",
@@ -58778,6 +58791,10 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     } else {
         (None, Vec::new())
     };
+    let protection_config = provider_effective_protection_config(
+        configured_protection_config,
+        session_responder.as_deref(),
+    );
 
     let activation_leave_replay = replay_provider_leaves_before_activation(
         &home,
@@ -58841,6 +58858,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             identity_anchor: &identity_anchor,
             tpm_activation_hello: attestation_material.tpm_activation_hello.as_ref(),
             workflow_inventory_root: workflow_inventory_root.as_deref(),
+            max_sessions: protection_config.max_sessions,
         })
         .await?
     };
@@ -72027,7 +72045,6 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
     let transport_peer = sc_bridge_transport_peer(&mut bridge).await?;
     let mut sent = Vec::new();
     let count = u64::from(ctx.args.heartbeat_count.max(1));
-    let protection = ProviderProtectionConfig::from_provider_args(ctx.args, ctx.selected)?;
     for seq in 0..count {
         sent.extend(
             send_provider_heartbeat_round(
@@ -72043,11 +72060,11 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
                 ctx.tpm_activation_hello,
                 ctx.workflow_inventory_root,
                 ctx.args.min_ask_au,
-                protection.max_sessions,
+                ctx.max_sessions,
                 Some(transport_peer.as_str()),
                 seq,
                 seq == 0,
-                ProviderLoadSnapshot::idle(protection.max_sessions),
+                ProviderLoadSnapshot::idle(ctx.max_sessions),
             )
             .await?,
         );
@@ -72593,7 +72610,7 @@ async fn serve_provider_sessions(
     let configured_protection =
         ProviderProtectionConfig::from_provider_args(ctx.args, ctx.selected)?;
     let protection_config =
-        configured_protection.limit_to_execution_capacity(responder.concurrent_session_capacity());
+        provider_effective_protection_config(configured_protection, Some(responder.as_ref()));
     let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
         ctx.args.home.as_ref(),
         ctx.args.sc_bridge_url.as_deref(),
@@ -107784,8 +107801,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     #[test]
     fn provider_execution_capacity_limits_admission_and_heartbeat_slots() {
         let responder = DeterministicProviderSessionResponder;
-        let config = ProviderProtectionConfig::unlimited_for_tests(8)
-            .limit_to_execution_capacity(responder.concurrent_session_capacity());
+        let config = provider_effective_protection_config(
+            ProviderProtectionConfig::unlimited_for_tests(8),
+            Some(&responder),
+        );
         assert_eq!(config.max_sessions, 1);
 
         let mut protection = ProviderProtectionState::new(config);
