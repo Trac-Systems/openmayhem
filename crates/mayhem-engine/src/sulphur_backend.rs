@@ -38,6 +38,7 @@ const RUNTIME_MODULE_ENV: &str = "MAYHEM_SULPHUR_RUNTIME_MODULE";
 const FFMPEG_ENV: &str = "MAYHEM_SULPHUR_FFMPEG";
 const FFPROBE_ENV: &str = "MAYHEM_SULPHUR_FFPROBE";
 const PROMPT_ENHANCER_GPU_LAYERS_ENV: &str = "MAYHEM_SULPHUR_ENHANCER_GPU_LAYERS";
+const SANDBOX_HELPER_ENV: &str = "MAYHEM_ENCLAVE_SANDBOX_HELPER";
 const DEFAULT_RUNTIME_MODULE: &str = "mayhem_sulphur_runtime";
 const MLX_RUNTIME_MANIFEST_NAME: &str = "mayhem-sulphur-mlx-runtime.json";
 const ENDPOINT_OPENAI_VIDEOS: &str = "openai_videos";
@@ -1849,6 +1850,9 @@ impl SulphurWorker {
         let mut sandbox = SandboxConfig::new(read_only_dirs, vec![cache_root.to_path_buf()]);
         sandbox.materialized_read_only_dir(model_root);
         let mut command = SandboxedCommand::new(&python);
+        if let Some(helper) = env::var_os(SANDBOX_HELPER_ENV) {
+            command.sandbox_helper(PathBuf::from(helper));
+        }
         if let Some(limit) = memory_limit_bytes {
             command.memory_limit_bytes(limit);
         }

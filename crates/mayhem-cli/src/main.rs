@@ -35951,6 +35951,7 @@ struct PayTnkRate {
     tnk_usd_au: MoneyAu,
     source: String,
     ts: Option<u64>,
+    updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -36287,6 +36288,14 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
     let wallet = inspect_wallet(&keypair_path, &password)
         .await
         .with_context(|| format!("reading wallet {}", keypair_path.display()))?;
+    let rules_consent = if args.confirm {
+        Some(
+            ensure_current_rules_consent(&peer_rpc, &keypair_path, &password, &wallet, false)
+                .await?,
+        )
+    } else {
+        None
+    };
     let eth_key = ethereum_wallet_key(&keypair_path, &password)
         .await
         .with_context(|| {
@@ -36383,6 +36392,7 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
                 "token_address": tap.token_address,
                 "pool_address": tap.pool_address,
             },
+            "rules_consent": rules_consent,
             "tap_account_binding": binding,
         });
         if args.json {
@@ -36423,6 +36433,9 @@ async fn deposit_tap(args: DepositTapArgs) -> Result<()> {
         preflight
     };
     report["tap_account_binding"] = binding;
+    if let Some(consent) = rules_consent {
+        report["rules_consent"] = serde_json::to_value(consent)?;
+    }
     let amount_wei = report
         .get("amount_wei")
         .and_then(Value::as_str)
@@ -37920,6 +37933,7 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         tnk_usd_au: payment_state.tnk_rate.tnk_usd_au,
         source: payment_state.tnk_rate.source.clone(),
         ts: Some(payment_state.tnk_rate.ts),
+        updated_at: Some(payment_state.tnk_rate.updated_at.clone()),
     };
     let nonce = resolve_tnk_nonce(
         &wallet.public_key,
@@ -38007,6 +38021,15 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
 
     let before_au = if args.wait {
         Some(read_user_balance_au(&rpc, &wallet.public_key, "tnk").await?)
+    } else {
+        None
+    };
+
+    let rules_consent = if args.submit_intent {
+        Some(
+            ensure_current_rules_consent(&rpc, &keypair_path, wallet_password, &wallet, args.sim)
+                .await?,
+        )
     } else {
         None
     };
@@ -38105,6 +38128,7 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
             "feature": intent_feature,
             "submitted": args.submit_intent && !args.sim,
             "sim": args.submit_intent && args.sim,
+            "rules_consent": rules_consent,
             "result": submitted,
         },
         "tnk": {
@@ -48342,7 +48366,7 @@ fn pay_tnk_deposit_intent_payload(
     quoted_au: MoneyAu,
     rate: &PayTnkRate,
 ) -> Value {
-    json!({
+    let mut payload = json!({
         "op": "deposit_tnk",
         "memo_hash": memo_hash,
         "treasury_address": treasury_address,
@@ -48350,7 +48374,12 @@ fn pay_tnk_deposit_intent_payload(
         "quoted_au": money_au_json(quoted_au),
         "rate_tnk_usd_au": money_au_json(rate.tnk_usd_au),
         "rate_source": rate.source,
-    })
+    });
+    if let (Some(ts), Some(updated_at)) = (rate.ts, rate.updated_at.as_deref()) {
+        payload["rate_ts"] = json!(ts);
+        payload["rate_record_key"] = json!(updated_at);
+    }
+    payload
 }
 
 fn deposit_tnk_intent_message(intent: &Value) -> String {
@@ -48371,6 +48400,10 @@ fn parse_tnk_rate(value: &Value) -> Result<PayTnkRate> {
             .unwrap_or("rate/latest")
             .to_owned(),
         ts: value.get("ts").and_then(Value::as_u64),
+        updated_at: value
+            .get("updated_at")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 
@@ -54385,13 +54418,16 @@ where
     validate_external_helper_option_pairs(&helper_args)?;
     let helper_timeout = msb_transfer_helper_process_timeout(command, &helper_args)?;
     let intercom_app = repo_path("intercom")?;
-    let pear_runtime = resolve_pear_runtime_path()?;
-    let mut process = Command::new(&pear_runtime);
+    let node_path = resolve_node_path()?;
+    let helper_args = intercom_helper_runner_args(
+        &intercom_app,
+        format!("--msb-transfer-helper={command}"),
+        &helper_args,
+    );
+    let mut process = Command::new(&node_path);
     process
         .kill_on_drop(true)
-        .arg("run")
-        .arg(&intercom_app)
-        .arg(format!("--msb-transfer-helper={command}"))
+        .current_dir(&intercom_app)
         .args(&helper_args);
     let output = timeout(helper_timeout, process.output())
         .await
@@ -54400,15 +54436,16 @@ where
         })?
         .with_context(|| {
             format!(
-                "running MSB transfer helper via pear-runtime app {}",
-                intercom_app.display()
+                "running MSB transfer helper via pear-runner {} with {}",
+                intercom_app.display(),
+                node_path.display()
             )
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         bail!(
-            "MSB transfer helper failed via pear-runtime: {}{}{}",
+            "MSB transfer helper failed via pear-runner: {}{}{}",
             stderr.trim(),
             if stderr.trim().is_empty() || stdout.trim().is_empty() {
                 ""
@@ -57427,6 +57464,8 @@ const RECEIPT_SETTLEMENT_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const RECEIPT_SETTLEMENT_RETRY_MAX: Duration = Duration::from_secs(60);
 const RECEIPT_SETTLEMENT_SUBMIT_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS);
+const RECEIPT_SETTLEMENT_OBSOLETE_CONTRACT_ERROR: &str =
+    "receipt settlement feature has the wrong operation or contract version";
 
 #[derive(Clone)]
 struct ReceiptSettlementOutbox {
@@ -57668,7 +57707,70 @@ impl ReceiptSettlementOutbox {
             paths.len() <= RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES.saturating_mul(2),
             "receipt settlement outbox exceeded its bounded recovery file count"
         );
-        paths.iter().map(|path| self.load_entry(path)).collect()
+        let mut entries = Vec::new();
+        for path in paths {
+            match self.load_entry(&path) {
+                Ok(entry) => entries.push(entry),
+                Err(error) if receipt_settlement_outbox_error_is_obsolete_contract(&error) => {
+                    self.quarantine_obsolete_contract_entry(&path, &error)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(entries)
+    }
+
+    fn quarantine_obsolete_contract_entry(&self, path: &Path, error: &anyhow::Error) -> Result<()> {
+        let directory_name = self
+            .directory
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("outbox");
+        let quarantine = self.directory.with_file_name(format!(
+            "{directory_name}.quarantine-contract-v{CONTRACT_VERSION}"
+        ));
+        fs::create_dir_all(&quarantine)
+            .with_context(|| format!("creating {}", quarantine.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("restricting {}", quarantine.display()))?;
+        }
+        let filename = path
+            .file_name()
+            .context("receipt settlement outbox entry path is missing filename")?;
+        let mut destination = quarantine.join(filename);
+        if destination.exists() {
+            let suffix = blake3::hash(format!("{}:{error:#}", path.display()).as_bytes())
+                .to_hex()
+                .to_string();
+            let mut renamed = filename.to_os_string();
+            renamed.push(".");
+            renamed.push(&suffix[..16]);
+            destination = quarantine.join(renamed);
+        }
+        match fs::rename(path, &destination) {
+            Ok(()) => {
+                eprintln!(
+                    "Mayhem quarantined obsolete receipt settlement outbox entry {} -> {}: {error:#}",
+                    path.display(),
+                    destination.display()
+                );
+                sync_receipt_settlement_directory(&self.directory)?;
+                sync_receipt_settlement_directory(&quarantine)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "quarantining obsolete receipt settlement outbox entry {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+        Ok(())
     }
 
     fn load_entries(&self) -> Result<Vec<ReceiptSettlementOutboxEntry>> {
@@ -57974,6 +58076,14 @@ fn sync_receipt_settlement_directory(directory: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn sync_receipt_settlement_directory(_directory: &Path) -> Result<()> {
     Ok(())
+}
+
+fn receipt_settlement_outbox_error_is_obsolete_contract(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains(RECEIPT_SETTLEMENT_OBSOLETE_CONTRACT_ERROR)
+    })
 }
 
 fn validate_receipt_settlement_feature(feature: &Value) -> Result<String> {
@@ -88088,19 +88198,20 @@ where
     validate_wallet_helper_public_args(&helper_args)?;
     secrets.apply_environment_fallbacks();
     let intercom_app = repo_path("intercom")?;
-    let pear_runtime = resolve_pear_runtime_path()?;
+    let node_path = resolve_node_path()?;
     let process_args = wallet_helper_runtime_args(command, &intercom_app, &helper_args);
-    let mut process = Command::new(&pear_runtime);
+    let mut process = Command::new(&node_path);
     process
+        .current_dir(&intercom_app)
         .args(&process_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = process.spawn().with_context(|| {
         format!(
-            "running wallet helper via pear-runtime app {} with {}",
+            "running wallet helper via pear-runner {} with {}",
             intercom_app.display(),
-            pear_runtime.display()
+            node_path.display()
         )
     })?;
     let encoded_secrets =
@@ -88143,10 +88254,25 @@ fn wallet_helper_runtime_args(
     intercom_app: &Path,
     helper_args: &[String],
 ) -> Vec<OsString> {
+    intercom_helper_runner_args(
+        intercom_app,
+        format!("--wallet-helper={command}"),
+        helper_args,
+    )
+}
+
+fn intercom_helper_runner_args(
+    intercom_app: &Path,
+    helper_flag: String,
+    helper_args: &[String],
+) -> Vec<OsString> {
     let mut args = vec![
-        OsString::from("run"),
-        intercom_app.as_os_str().to_os_string(),
-        OsString::from(format!("--wallet-helper={command}")),
+        intercom_app
+            .join("scripts")
+            .join("pear-runner.mjs")
+            .as_os_str()
+            .to_os_string(),
+        OsString::from(helper_flag),
     ];
     args.extend(helper_args.iter().map(OsString::from));
     args
@@ -88311,6 +88437,30 @@ fn consent_matches(consent: Option<&Value>, rules: &RulesRef) -> bool {
     })
 }
 
+async fn ensure_current_rules_consent(
+    rpc: &PeerRpcClient,
+    keypair_path: &Path,
+    password: &str,
+    wallet: &WalletInfo,
+    sim: bool,
+) -> Result<ConsentReport> {
+    let rules = resolve_rules(None, None, rpc, None).await?;
+    let prior = read_consent_state(rpc, &wallet.public_key).await?;
+    if consent_matches(prior.as_ref(), &rules) {
+        return Ok(ConsentReport {
+            skipped: true,
+            simulated: sim,
+            rules: Some(rules),
+            tx: None,
+            command_hash: None,
+            feature: None,
+            result: None,
+            state: prior,
+        });
+    }
+    submit_consent(rpc, keypair_path, password, wallet, rules, sim).await
+}
+
 async fn submit_consent(
     rpc: &PeerRpcClient,
     keypair_path: &Path,
@@ -88466,6 +88616,31 @@ mod tests {
             );
         }
         available
+    }
+
+    #[test]
+    fn consent_state_matches_current_rules_exactly() {
+        let rules = RulesRef {
+            ver: 7,
+            hash: "ab".repeat(32),
+        };
+        let matching = json!({
+            "ver": 7,
+            "hash": "ab".repeat(32),
+        });
+        let stale_version = json!({
+            "ver": 6,
+            "hash": "ab".repeat(32),
+        });
+        let stale_hash = json!({
+            "ver": 7,
+            "hash": "cd".repeat(32),
+        });
+
+        assert!(consent_matches(Some(&matching), &rules));
+        assert!(!consent_matches(Some(&stale_version), &rules));
+        assert!(!consent_matches(Some(&stale_hash), &rules));
+        assert!(!consent_matches(None, &rules));
     }
 
     #[test]
@@ -89401,7 +89576,7 @@ mod tests {
     }
 
     #[test]
-    fn wallet_helper_uses_absolute_pear_app_path() {
+    fn wallet_helper_uses_absolute_pear_runner_path() {
         let app = PathBuf::from("/opt/mayhem/source/intercom");
         let args = wallet_helper_runtime_args(
             "inspect",
@@ -89415,8 +89590,7 @@ mod tests {
         assert_eq!(
             rendered,
             [
-                "run",
-                "/opt/mayhem/source/intercom",
+                "/opt/mayhem/source/intercom/scripts/pear-runner.mjs",
                 "--wallet-helper=inspect",
                 "--keypair",
                 "wallet.json",
@@ -102806,6 +102980,38 @@ esac
     }
 
     #[test]
+    fn receipt_outbox_quarantines_obsolete_contract_entries_on_recovery() {
+        let root = test_temp_dir("mayhem-provider-receipt-outbox-obsolete-contract");
+        let directory = root.join("gateway");
+        fs::create_dir_all(&directory).unwrap();
+        let mut feature = signed_receipt_settlement_feature_for_test(7);
+        feature["value"]["contract_version"] = json!(CONTRACT_VERSION.saturating_sub(1));
+        let stale_path = directory.join("obsolete-contract-entry.json");
+        fs::write(
+            &stale_path,
+            serde_json::to_vec(&json!({
+                "schema_version": RECEIPT_SETTLEMENT_OUTBOX_SCHEMA_VERSION,
+                "feature": feature,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&stale_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let outbox = ReceiptSettlementOutbox::new(directory.clone()).unwrap();
+
+        assert!(outbox.load_entries().unwrap().is_empty());
+        assert!(!stale_path.exists());
+        let quarantine = root.join(format!("gateway.quarantine-contract-v{CONTRACT_VERSION}"));
+        assert_eq!(fs::read_dir(quarantine).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn receipt_outbox_compacts_long_relay_outage_by_attempt_high_water() {
         let root = test_temp_dir("mayhem-receipt-outbox-high-water");
         let outbox = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
@@ -111811,6 +112017,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     tnk_usd_au: 50_000_000_000_000_000,
                     source: "gate-spot".to_owned(),
                     ts: Some(3_600),
+                    updated_at: Some(format!("rate/tnk/3600/{}", "22".repeat(32))),
                 },
             ),
             json!({
@@ -111821,6 +112028,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "quoted_au": "10000000000000000000",
                 "rate_tnk_usd_au": "50000000000000000",
                 "rate_source": "gate-spot",
+                "rate_ts": 3600,
+                "rate_record_key": format!("rate/tnk/3600/{}", "22".repeat(32)),
             })
         );
     }

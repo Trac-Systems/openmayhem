@@ -26,6 +26,7 @@ const FIAT_DEPOSIT_RAILS = new Set(['stripe']);
 const REQUIRED_FIAT_PAYOUT_CURRENCIES = Object.freeze(['eur', 'gbp', 'usd']);
 const PRICE_DENOMINATION = 'au_usd';
 const RATE_SOURCES = new Set(['gate-spot', 'mexc-spot']);
+const LEGACY_TNK_DEPOSIT_RATE_DRIFT_BPS = 100n;
 const CATALOG_SOURCE_KINDS = new Set(['https', 'huggingface']);
 const CATALOG_RUNTIME_STATUSES = new Set(['blessed', 'deprecated', 'revoked']);
 const CATALOG_OUTCOME_CLASS_STATUSES = new Set(['active', 'deprecated', 'revoked']);
@@ -14311,6 +14312,8 @@ class MayhemContract extends Contract {
     if (this.value.treasury_address !== payment.treasury_address) {
       return new Error('TNK deposit intent treasury does not match canonical payment config.');
     }
+    const rateLock = await this.guardianAcceptTnkDepositIntentRate(this.value);
+    if (rateLock instanceof Error) return rateLock;
     const msbFrom = this.msbAddressForPublicKey(this.address, payment.network);
     if (msbFrom instanceof Error) return msbFrom;
 
@@ -14331,7 +14334,9 @@ class MayhemContract extends Contract {
       tnk_e18: this.value.tnk_e18,
       quoted_au: quotedAu,
       rate_tnk_usd_au: quotedRate,
-      rate_source: this.value.rate_source,
+      rate_source: rateLock.source,
+      rate_ts: rateLock.ts,
+      rate_record_key: rateLock.updated_at,
     };
     await this.put(key, record);
     console.log('mayhem depositTnk', record);
@@ -14385,8 +14390,6 @@ class MayhemContract extends Contract {
       };
     }
 
-    const rate = await this.guardianRequireFreshRate(this.value.at);
-    if (rate instanceof Error) return rate;
     const pendingKey = `dep/pending/${this.value.memo_hash}`;
     const pending = await this.get(pendingKey);
     if (!pending || pending.status !== 'pending') return new Error('Pending TNK deposit intent not found.');
@@ -14416,10 +14419,9 @@ class MayhemContract extends Contract {
     const pendingTnkE18 = this.parseTnkE18(pending.tnk_e18);
     if (pendingTnkE18 instanceof Error) return pendingTnkE18;
     if (pendingTnkE18 !== tnkE18) return new Error('TNK deposit amount does not match pending intent.');
-    if (this.compareAu(pending.rate_tnk_usd_au, rate.tnk_usd_au) !== 0) {
-      return new Error('TNK deposit rate does not match pending intent.');
-    }
-    const au = this.tnkE18ToAu(tnkE18, rate.tnk_usd_au);
+    const rate = await this.guardianRequireTnkDepositRateLock(pending, this.value.at);
+    if (rate instanceof Error) return rate;
+    const au = this.tnkE18ToAu(tnkE18, pending.rate_tnk_usd_au);
     if (au instanceof Error) return au;
     if (this.isZeroAu(au)) return new Error('TNK deposit converts to zero au.');
     if (this.compareAu(pending.quoted_au, au) !== 0) {
@@ -14440,6 +14442,7 @@ class MayhemContract extends Contract {
       rate_ts: rate.ts,
       treasury_address_hash: await this.opaqueHash('deposit-treasury', pending.treasury_address),
       quoted_au: pending.quoted_au,
+      rate_tnk_usd_au: pending.rate_tnk_usd_au,
     });
     const depositRoot = await this.nextDepositRoot({
       epoch: this.value.epoch,
@@ -14466,6 +14469,8 @@ class MayhemContract extends Contract {
       au,
       epoch: this.value.epoch,
       rate_ts: rate.ts,
+      rate_source: rate.source,
+      rate_tnk_usd_au: pending.rate_tnk_usd_au,
       deposit_root: depositRoot.merkle_root,
       msb_transfer: transfer,
       credited_at: this.tx,
@@ -14485,6 +14490,7 @@ class MayhemContract extends Contract {
       tnk_e18: transfer.amount_e18,
       msb_tx_hash: transfer.tx_hash,
       rate_ts: rate.ts,
+      rate_tnk_usd_au: pending.rate_tnk_usd_au,
       epoch: this.value.epoch,
     });
     return {
@@ -19903,17 +19909,20 @@ class MayhemContract extends Contract {
   }
 
   validateDepositTnkIntent(intent) {
+    const fields = [
+      'op',
+      'memo_hash',
+      'treasury_address',
+      'tnk_e18',
+      'quoted_au',
+      'rate_tnk_usd_au',
+      'rate_source',
+    ];
+    if (hasOwn(intent, 'rate_ts')) fields.push('rate_ts');
+    if (hasOwn(intent, 'rate_record_key')) fields.push('rate_record_key');
     const shapeError = this.validateExactObjectKeys(
       intent,
-      [
-        'op',
-        'memo_hash',
-        'treasury_address',
-        'tnk_e18',
-        'quoted_au',
-        'rate_tnk_usd_au',
-        'rate_source',
-      ],
+      fields,
       'deposit TNK intent'
     );
     if (shapeError) return shapeError;
@@ -19929,6 +19938,23 @@ class MayhemContract extends Contract {
       return new Error('Invalid TNK quoted rate.');
     }
     if (!this.isSafeKeyPart(intent.rate_source)) return new Error('Invalid TNK rate source.');
+    const hasRateTs = hasOwn(intent, 'rate_ts');
+    const hasRateRecordKey = hasOwn(intent, 'rate_record_key');
+    if (hasRateTs !== hasRateRecordKey) {
+      return new Error('TNK rate timestamp and record key must be paired.');
+    }
+    if (hasRateTs &&
+        (!Number.isSafeInteger(intent.rate_ts) || intent.rate_ts < 0)) {
+      return new Error('Invalid TNK rate timestamp.');
+    }
+    if (hasRateRecordKey) {
+      const prefix = `rate/tnk/${intent.rate_ts}/`;
+      if (typeof intent.rate_record_key !== 'string' ||
+          !intent.rate_record_key.startsWith(prefix) ||
+          !this.isHexBytes(intent.rate_record_key.slice(prefix.length), 32)) {
+        return new Error('Invalid TNK rate record key.');
+      }
+    }
     const tnkE18 = this.parseTnkE18(intent.tnk_e18);
     if (tnkE18 instanceof Error) return tnkE18;
     return null;
@@ -22472,6 +22498,168 @@ class MayhemContract extends Contract {
       return new Error('Rate oracle is stale.');
     }
     return rate;
+  }
+
+  validateTnkRateRecord(
+    rate,
+    {
+      tnkUsdAu = null,
+      source = null,
+      ts = null,
+      updatedAt = null,
+      admin = null,
+      label = 'TNK rate',
+    } = {}
+  ) {
+    if (!rate || typeof rate !== 'object' || Array.isArray(rate)) {
+      return new Error(`${label} is missing.`);
+    }
+    const normalized = this.normalizeAu(
+      rate.tnk_usd_au,
+      `${label} TNK/USD atto-rate`,
+      { allowZero: false }
+    );
+    if (normalized instanceof Error || normalized !== rate.tnk_usd_au ||
+        rate.denom !== 'tnk_usd_au' ||
+        typeof rate.source !== 'string' ||
+        rate.source.length < 1 ||
+        rate.source.length > 64 ||
+        !Number.isSafeInteger(rate.ts) ||
+        rate.ts < 0 ||
+        typeof rate.updated_at !== 'string' ||
+        !rate.updated_at.startsWith(`rate/tnk/${rate.ts}/`) ||
+        !this.isHexBytes(rate.updated_at.slice(`rate/tnk/${rate.ts}/`.length), 32) ||
+        !this.isHexBytes(rate.posted_by, 32) ||
+        rate.posted_by !== rate.posted_by.toLowerCase() ||
+        rate.posted_by_role !== 'admin') {
+      return new Error(`${label} is invalid.`);
+    }
+    if (admin !== null && rate.posted_by !== admin) {
+      return new Error(`${label} is not admin-posted.`);
+    }
+    if (tnkUsdAu !== null && this.compareAu(rate.tnk_usd_au, tnkUsdAu) !== 0) {
+      return new Error(`${label} amount mismatch.`);
+    }
+    if (source !== null && rate.source !== source) {
+      return new Error(`${label} source mismatch.`);
+    }
+    if (ts !== null && rate.ts !== ts) {
+      return new Error(`${label} timestamp mismatch.`);
+    }
+    if (updatedAt !== null && rate.updated_at !== updatedAt) {
+      return new Error(`${label} record key mismatch.`);
+    }
+    return null;
+  }
+
+  async currentTnkRateRecord(label = 'Current TNK rate') {
+    const rate = await this.get('rate/latest');
+    const admin = await this.get('admin');
+    if (!rate || admin === null) return new Error(`${label} is missing.`);
+    const rateError = this.validateTnkRateRecord(rate, { admin, label });
+    if (rateError) return rateError;
+    return rate;
+  }
+
+  async guardianAcceptTnkDepositIntentRate(intent) {
+    const rate = await this.currentTnkRateRecord('TNK deposit rate');
+    if (rate instanceof Error) return rate;
+    const exactError = this.validateTnkRateRecord(rate, {
+      tnkUsdAu: intent.rate_tnk_usd_au,
+      source: intent.rate_source,
+      label: 'TNK deposit rate',
+    });
+    if (exactError) {
+      return new Error('TNK deposit rate does not match current oracle.');
+    }
+    if (
+      (hasOwn(intent, 'rate_ts') && intent.rate_ts !== rate.ts) ||
+      (hasOwn(intent, 'rate_record_key') && intent.rate_record_key !== rate.updated_at)
+    ) {
+      return new Error('TNK deposit rate record is not current.');
+    }
+    return rate;
+  }
+
+  legacyTnkDepositRateCloseToCurrent(lockedRate, currentRate) {
+    const locked = this.parseAu(lockedRate, 'legacy TNK deposit locked rate', { allowZero: false });
+    const current = this.parseAu(currentRate, 'current TNK deposit rate', { allowZero: false });
+    if (locked instanceof Error || current instanceof Error) return false;
+    const diff = locked > current ? locked - current : current - locked;
+    const ceiling = locked > current ? locked : current;
+    return diff * 10_000n <= ceiling * LEGACY_TNK_DEPOSIT_RATE_DRIFT_BPS;
+  }
+
+  async guardianRequireHistoricalTnkDepositRate(pending, at) {
+    const oracleValue = {
+      op: 'rate_oracle',
+      tnk_usd_au: pending.rate_tnk_usd_au,
+      source: pending.rate_source,
+      ts: pending.rate_ts,
+    };
+    const key = await this.rateFeatureKey(oracleValue);
+    if (key instanceof Error) {
+      return new Error(`Guardian TNK deposit rate invariant failed: ${key.message}`);
+    }
+    if (key !== pending.rate_record_key) {
+      return new Error('Guardian TNK deposit rate invariant failed: rate record key mismatch.');
+    }
+    const rate = await this.get(key);
+    const admin = await this.get('admin');
+    if (!rate || admin === null) {
+      return new Error('Guardian TNK deposit rate invariant failed: exact admin-posted oracle history required.');
+    }
+    const rateError = this.validateTnkRateRecord(rate, {
+      tnkUsdAu: pending.rate_tnk_usd_au,
+      source: pending.rate_source,
+      ts: pending.rate_ts,
+      updatedAt: pending.rate_record_key,
+      admin,
+      label: 'Guardian TNK deposit rate',
+    });
+    if (rateError) {
+      return new Error(`Guardian TNK deposit rate invariant failed: ${rateError.message}`);
+    }
+    if (rate.ts > at) {
+      return new Error('Guardian TNK deposit rate invariant failed: oracle timestamp is in the future.');
+    }
+    return rate;
+  }
+
+  async guardianRequireTnkDepositRateLock(pending, at) {
+    const pendingRate = this.normalizeAu(
+      pending?.rate_tnk_usd_au,
+      'pending TNK deposit rate',
+      { allowZero: false }
+    );
+    if (pendingRate instanceof Error || pendingRate !== pending.rate_tnk_usd_au ||
+        !this.isSafeKeyPart(pending.rate_source)) {
+      return new Error('Guardian TNK deposit rate invariant failed: pending rate is invalid.');
+    }
+    const hasRateTs = hasOwn(pending, 'rate_ts');
+    const hasRateRecordKey = hasOwn(pending, 'rate_record_key');
+    if (hasRateTs || hasRateRecordKey) {
+      if (!hasRateTs || !hasRateRecordKey ||
+          !Number.isSafeInteger(pending.rate_ts) ||
+          pending.rate_ts < 0 ||
+          typeof pending.rate_record_key !== 'string') {
+        return new Error('Guardian TNK deposit rate invariant failed: pending rate lock is invalid.');
+      }
+      return await this.guardianRequireHistoricalTnkDepositRate(pending, at);
+    }
+
+    const current = await this.guardianRequireFreshRate(at);
+    if (current instanceof Error) return current;
+    if (current.source !== pending.rate_source ||
+        !this.legacyTnkDepositRateCloseToCurrent(pending.rate_tnk_usd_au, current.tnk_usd_au)) {
+      return new Error('TNK deposit rate does not match pending intent.');
+    }
+    return {
+      ...current,
+      tnk_usd_au: pending.rate_tnk_usd_au,
+      source: pending.rate_source,
+      legacy_rate_lock: true,
+    };
   }
 
   async requireFreshTapRate(at) {
