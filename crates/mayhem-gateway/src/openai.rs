@@ -27997,6 +27997,36 @@ fn model_supports_image_generation(model: &GatewayModel) -> bool {
             .any(|modality| modality == "image")
 }
 
+fn model_supports_comfy_workflow_endpoint(model: &GatewayModel) -> bool {
+    model.mayhem.workflow.is_some()
+        && model
+            .mayhem
+            .adapter
+            .endpoint_families
+            .iter()
+            .any(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS)
+}
+
+fn model_supports_comfy_workflow_modality(model: &GatewayModel, modality: &str) -> bool {
+    model_supports_comfy_workflow_endpoint(model)
+        && (model.mayhem.caps.output_modality.as_deref() == Some(modality)
+            || model
+                .mayhem
+                .caps
+                .output_modalities
+                .iter()
+                .any(|served| served == modality)
+            || model
+                .mayhem
+                .adapter
+                .modality_set
+                .iter()
+                .any(|served| served == modality)
+            || (modality == "image" && model.mayhem.caps.image)
+            || (modality == "video" && model.mayhem.caps.video)
+            || (modality == "audio" && model.mayhem.caps.audio))
+}
+
 fn model_supports_tts(model: &GatewayModel) -> bool {
     model.mayhem.model_class == "tts"
         || model.mayhem.caps.output_modality.as_deref() == Some("audio")
@@ -28012,7 +28042,7 @@ fn model_supports_audio_fingerprint_canary(model: &GatewayModel) -> bool {
     matches!(
         model.mayhem.model_class.as_str(),
         "tts" | "audio-generation" | "music-generation"
-    )
+    ) || model_supports_comfy_workflow_modality(model, "audio")
 }
 
 fn model_supports_stt(model: &GatewayModel) -> bool {
@@ -28579,7 +28609,9 @@ impl GatewayState {
                 }
             }
             CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT => {
-                if model.mayhem.model_class != "video-generation" {
+                if model.mayhem.model_class != "video-generation"
+                    && !model_supports_comfy_workflow_modality(model, "video")
+                {
                     return;
                 }
             }
@@ -29396,22 +29428,63 @@ impl GatewayState {
             if !expected_hashes.contains_key(&prompt.id) {
                 continue;
             }
-            let request = canary_image_generation_request(model, prompt, self.canary_policy.seed)?;
-            validate_image_generation_request(model, &request)?;
-            let invocation = self.prepare_image_generation_invocation_for_route(
-                model,
-                &request,
-                route.as_ref(),
-                &GatewayRequestOptions::default(),
-            )?;
-            let result = self
-                .session_backend
-                .run_image_generation(model, &request, &invocation)
-                .await
-                .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
-            let artifact = result
-                .output
-                .artifacts
+            let (artifacts, receipt, request_body, session_id) =
+                if model_supports_comfy_workflow_endpoint(model) {
+                    let request = canary_artifact_generation_request(self, model, prompt)?;
+                    let invocation = self.prepare_artifact_generation_invocation_for_route(
+                        model,
+                        &request,
+                        route.as_ref(),
+                        &GatewayRequestOptions::default(),
+                    )?;
+                    let result = self
+                        .session_backend
+                        .run_artifact_generation(model, &request, &invocation)
+                        .await
+                        .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+                    let receipt = self.meter_artifact_generation_session(
+                        model,
+                        &request,
+                        &result.output,
+                        &invocation,
+                        result.provider_receipt.as_ref(),
+                    )?;
+                    (
+                        result.output.artifacts,
+                        receipt,
+                        request.contract_request,
+                        invocation.session_id,
+                    )
+                } else {
+                    let request =
+                        canary_image_generation_request(model, prompt, self.canary_policy.seed)?;
+                    validate_image_generation_request(model, &request)?;
+                    let invocation = self.prepare_image_generation_invocation_for_route(
+                        model,
+                        &request,
+                        route.as_ref(),
+                        &GatewayRequestOptions::default(),
+                    )?;
+                    let result = self
+                        .session_backend
+                        .run_image_generation(model, &request, &invocation)
+                        .await
+                        .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+                    let receipt = self.meter_image_generation_session(
+                        model,
+                        &request,
+                        &result.output,
+                        &invocation,
+                        result.provider_receipt.as_ref(),
+                    )?;
+                    (
+                        result.output.artifacts,
+                        receipt,
+                        serde_json::to_value(&request).unwrap_or(Value::Null),
+                        invocation.session_id,
+                    )
+                };
+            let artifact = artifacts
                 .iter()
                 .find(|artifact| artifact.content_type.starts_with("image/"))
                 .ok_or_else(|| {
@@ -29423,22 +29496,15 @@ impl GatewayState {
             let observed_hash = image_average_hash_hex(&artifact.bytes)
                 .map_err(|err| ApiError::bad_gateway(err, Some("model")))?;
             observed_hashes.insert(prompt.id.clone(), observed_hash.clone());
-            let receipt = self.meter_image_generation_session(
-                model,
-                &request,
-                &result.output,
-                &invocation,
-                result.provider_receipt.as_ref(),
-            )?;
             let receipt_hash = stable_value_hash(&json!(receipt));
             receipt_hashes.push(receipt_hash.clone());
             stored_receipts.push(receipt);
             prompt_reports.push(json!({
                 "prompt_id": prompt.id,
-                "request": request,
+                "request": request_body,
                 "artifact": artifact_summaries(std::slice::from_ref(artifact)),
                 "observed_perceptual_hash": observed_hash,
-                "session_id": invocation.session_id,
+                "session_id": session_id,
                 "receipt_hash": receipt_hash,
             }));
         }
@@ -32200,41 +32266,45 @@ fn canary_artifact_generation_request(
     model: &GatewayModel,
     prompt: &GatewayCanaryPrompt,
 ) -> Result<ArtifactGenerationRequest, ApiError> {
-    let endpoint_family = match model.mayhem.model_class.as_str() {
-        "video-generation" => prompt
-            .endpoint_attributes
-            .get("endpoint_family")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                [
-                    mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
-                    mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
-                ]
-                .into_iter()
-                .find(|family| {
-                    model
-                        .mayhem
-                        .adapter
-                        .endpoint_families
-                        .iter()
-                        .any(|contract| contract.family == *family)
-                })
+    let endpoint_family = if model_supports_comfy_workflow_endpoint(model) {
+        mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS.to_owned()
+    } else {
+        match model.mayhem.model_class.as_str() {
+            "video-generation" => prompt
+                .endpoint_attributes
+                .get("endpoint_family")
+                .and_then(Value::as_str)
                 .map(str::to_owned)
-            })
-            .ok_or_else(|| {
-                ApiError::bad_gateway(
-                    "video canary model has no signed video-generation endpoint family",
+                .or_else(|| {
+                    [
+                        mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO,
+                        mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+                    ]
+                    .into_iter()
+                    .find(|family| {
+                        model
+                            .mayhem
+                            .adapter
+                            .endpoint_families
+                            .iter()
+                            .any(|contract| contract.family == *family)
+                    })
+                    .map(str::to_owned)
+                })
+                .ok_or_else(|| {
+                    ApiError::bad_gateway(
+                        "video canary model has no signed video-generation endpoint family",
+                        Some("model"),
+                    )
+                })?,
+            "music-generation" => mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS.to_owned(),
+            "audio-generation" => mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS.to_owned(),
+            other => {
+                return Err(ApiError::bad_gateway(
+                    format!("artifact fingerprint canary is not wired for model class {other}"),
                     Some("model"),
-                )
-            })?,
-        "music-generation" => mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS.to_owned(),
-        "audio-generation" => mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS.to_owned(),
-        other => {
-            return Err(ApiError::bad_gateway(
-                format!("artifact fingerprint canary is not wired for model class {other}"),
-                Some("model"),
-            ))
+                ))
+            }
         }
     };
     let mut request = Map::from_iter(prompt.endpoint_attributes.clone());
@@ -32244,6 +32314,9 @@ fn canary_artifact_generation_request(
             if let Some(value) = prompt.prompt.as_ref().or(prompt.input.as_ref()) {
                 request.entry("inputs").or_insert_with(|| json!(value));
             }
+        }
+        mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS => {
+            request.entry("model").or_insert_with(|| json!(model.id));
         }
         _ => {
             request.entry("model").or_insert_with(|| json!(model.id));
@@ -32299,7 +32372,7 @@ fn canary_artifact_generation_request(
             })?;
             set_json_path(&mut raw_request, &target, json!(value))
                 .map_err(|error| ApiError::bad_gateway(error, Some("model")))?;
-        } else {
+        } else if !model_supports_comfy_workflow_endpoint(model) {
             raw_request
                 .as_object_mut()
                 .expect("artifact canary request is an object")
@@ -32332,11 +32405,12 @@ fn canary_artifact_generation_request(
         &endpoint_family,
         &raw_request,
     )?;
-    let mut request = artifact_generation_request(
+    let mut request = artifact_generation_request_with_workflow_policy(
         &model.id,
         &endpoint_family,
         prepared.normalized,
         prepared.video,
+        model.mayhem.workflow.as_ref(),
     )?;
     apply_artifact_generation_specialities(model, &mut request)?;
     if let Some(descriptor) = model
@@ -39723,6 +39797,12 @@ mod tests {
     struct ArtifactGenerationSuccessBackend;
 
     #[derive(Debug)]
+    struct WorkflowImageCanaryBackend {
+        requests: Arc<Mutex<Vec<ArtifactGenerationRequest>>>,
+        image: Vec<u8>,
+    }
+
+    #[derive(Debug)]
     struct DisconnectCompletesImageBackend {
         started: Arc<tokio::sync::Notify>,
         cancelled: Arc<tokio::sync::Notify>,
@@ -39769,6 +39849,49 @@ mod tests {
                             (USAGE_IMAGE, u64::from(image_generation_count(request))),
                             (USAGE_STEP, u64::from(request.steps.unwrap_or(1))),
                         ]),
+                    },
+                    backend: self.name().to_owned(),
+                    direct_session: false,
+                    provider_receipt: None,
+                    quality: None,
+                })
+            })
+        }
+    }
+
+    impl GatewaySessionBackend for WorkflowImageCanaryBackend {
+        fn name(&self) -> &str {
+            "test-workflow-image-canary"
+        }
+
+        fn run_chat<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            _request: &'a ChatCompletionRequest,
+            _invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            Box::pin(async { Err(GatewaySessionError::new("chat not used")) })
+        }
+
+        fn run_artifact_generation<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            request: &'a ArtifactGenerationRequest,
+            _invocation: &'a GatewaySessionInvocation,
+        ) -> GatewayArtifactGenerationFuture<'a> {
+            Box::pin(async move {
+                self.requests
+                    .lock_recover("workflow canary requests")
+                    .push(request.clone());
+                Ok(GatewayArtifactGenerationResult {
+                    output: ArtifactGenerationOutput {
+                        artifacts: vec![GatewayArtifactOutput {
+                            id: "workflow-canary-image".to_owned(),
+                            content_type: "image/png".to_owned(),
+                            bytes: self.image.clone(),
+                            blake3: blake3_hex(&self.image),
+                        }],
+                        usage: artifact_generation_usage_for_request(request),
                     },
                     backend: self.name().to_owned(),
                     direct_session: false,
@@ -39886,6 +40009,29 @@ mod tests {
                             )
                         })
                         .collect();
+                    if let Some(workflow) = model.mayhem.workflow.as_ref() {
+                        let runtime_id = workflow.runtime_id.clone().unwrap_or_else(|| {
+                            mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID.to_owned()
+                        });
+                        let outcome_class = workflow.outcome_class_for(
+                            model
+                                .mayhem
+                                .caps
+                                .output_modality
+                                .as_deref()
+                                .unwrap_or("image"),
+                        );
+                        heartbeat.runtime_id = Some(runtime_id);
+                        heartbeat.inventory_root = workflow.inventory_root.clone();
+                        heartbeat.workflow_classes.insert(
+                            outcome_class,
+                            crate::HeartbeatWorkflowClass {
+                                min_ask_au: route.min_ask_au,
+                                max_concurrent: 2,
+                                active: 0,
+                            },
+                        );
+                    }
                     heartbeat.sig = "aa".repeat(64);
                     heartbeat
                 })
@@ -44032,6 +44178,67 @@ mod tests {
         ));
     }
 
+    fn routed_comfy_workflow_image_test_model() -> GatewayModel {
+        let mut model = test_routed_model_with_id("admin/comfy-workflow-fixture", 0, 1);
+        model.mayhem.model_class = "workflow-image".to_owned();
+        model.mayhem.price_ref_au = PriceRefAu {
+            denom: "au_usd".to_owned(),
+            ver: 4,
+            rate_map: vec![RateMapEntry {
+                unit: USAGE_IMAGE.to_owned(),
+                per_unit_au: 500,
+                granularity: 1,
+            }],
+            per_req_au: 0,
+            min_session_au: 0,
+            derivation: None,
+            history: Vec::new(),
+        };
+        model.mayhem.caps = ModelCaps {
+            tools: false,
+            json: false,
+            ctx: 4096,
+            vision: false,
+            image: true,
+            video: false,
+            audio: false,
+            max_image_width: Some(64),
+            max_image_height: Some(64),
+            max_image_steps: None,
+            output_modality: Some("image".to_owned()),
+            output_modalities: vec!["image".to_owned()],
+        };
+        model.mayhem.adapter.modality_set = vec!["image".to_owned()];
+        model.mayhem.adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            )
+            .unwrap()];
+        model.mayhem.workflow = Some(mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["EmptyImage".to_owned(), "SaveImage".to_owned()],
+            runtime_id: Some("comfyui-v0.30.1".to_owned()),
+            outcome_class: Some("image.workflow.64".to_owned()),
+            max_width: Some(64),
+            max_height: Some(64),
+            max_artifacts: Some(1),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        });
+        for candidate in &mut model.mayhem.route_candidates {
+            candidate.served_modalities = vec!["image".to_owned()];
+            candidate.price_ver = 4;
+            candidate.artifact_root = "ab".repeat(32);
+            candidate.caps = json!({
+                "ctx_max": 4096,
+                "image": true,
+                "max_image_width": 64,
+                "max_image_height": 64,
+                "output_modality": "image",
+                "output_modalities": ["image"]
+            });
+        }
+        model
+    }
+
     #[test]
     fn comfy_workflow_request_uses_catalog_policy_defaults_and_parts() {
         let graph = json!({
@@ -44121,6 +44328,165 @@ mod tests {
         assert!(missing_part
             .message
             .contains("requires unknown part missing.safetensors"));
+    }
+
+    #[tokio::test]
+    async fn automatic_seed_perceptual_hash_probe_uses_comfy_workflow_surface() {
+        let model = routed_comfy_workflow_image_test_model();
+        let image = {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(8, 8)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            bytes.into_inner()
+        };
+        let expected_hash = image_average_hash_hex(&image).expect("workflow image hash");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(WorkflowImageCanaryBackend {
+                requests: requests.clone(),
+                image,
+            }),
+        );
+        let config = GatewayCanaryModelConfig {
+            canary_set: "comfy-canary-v1".to_owned(),
+            requires_launch_evidence: false,
+            match_min_bps: 10_000,
+            verification_method: CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH.to_owned(),
+            verification_tolerance_bps: None,
+            prompts: vec![GatewayCanaryPrompt {
+                id: "fixed-workflow-image".to_owned(),
+                calibration_only: false,
+                messages: Vec::new(),
+                tools: None,
+                specialities: BTreeMap::new(),
+                max_tokens: 1,
+                temperature: None,
+                top_p: None,
+                top_k: None,
+                min_p: None,
+                repeat_penalty: None,
+                frequency_penalty: None,
+                presence_penalty: None,
+                prompt: None,
+                input: None,
+                audio_b64: None,
+                content_type: None,
+                filename: None,
+                language: None,
+                voice: None,
+                response_format: None,
+                require_word_timestamps: false,
+                require_segment_timestamps: false,
+                size: None,
+                steps: None,
+                cfg_scale: None,
+                shift: None,
+                seed: Some(7),
+                endpoint_attributes: BTreeMap::from([
+                    (
+                        "workflow".to_owned(),
+                        json!({
+                            "1": {
+                                "class_type": "EmptyImage",
+                                "inputs": {
+                                    "width": 8,
+                                    "height": 8,
+                                    "batch_size": 1,
+                                    "color": 1
+                                }
+                            },
+                            "2": {
+                                "class_type": "SaveImage",
+                                "inputs": {
+                                    "images": ["1", 0],
+                                    "filename_prefix": "mayhem-canary"
+                                }
+                            }
+                        }),
+                    ),
+                    ("runtime_id".to_owned(), json!("comfyui-v0.30.1")),
+                    ("outcome_class".to_owned(), json!("image.workflow.64")),
+                    ("response_format".to_owned(), json!("artifact")),
+                ]),
+            }],
+            fingerprints_by_artifact_root: BTreeMap::new(),
+            token_prefixes_by_artifact_root: BTreeMap::new(),
+            perceptual_hashes_by_artifact_root: BTreeMap::from([(
+                "ab".repeat(32),
+                BTreeMap::from([("fixed-workflow-image".to_owned(), expected_hash)]),
+            )]),
+            embedding_vectors_by_artifact_root: BTreeMap::new(),
+            transcripts_by_artifact_root: BTreeMap::new(),
+            audio_fingerprints_by_artifact_root: BTreeMap::new(),
+            video_fingerprints_by_artifact_root: BTreeMap::new(),
+            speciality_calibrations_by_artifact_root: BTreeMap::new(),
+            default_fingerprint: None,
+            default_token_prefixes: None,
+            default_perceptual_hashes: None,
+            default_embedding_vectors: None,
+            default_transcripts: None,
+            default_audio_fingerprints: None,
+            default_video_fingerprints: None,
+        };
+        let served_request = artifact_generation_request_with_workflow_policy(
+            &model.id,
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            json!({
+                "model": model.id,
+                "workflow": {
+                    "1": {
+                        "class_type": "EmptyImage",
+                        "inputs": {
+                            "width": 8,
+                            "height": 8,
+                            "batch_size": 1,
+                            "color": 0
+                        }
+                    },
+                    "2": {
+                        "class_type": "SaveImage",
+                        "inputs": {
+                            "images": ["1", 0],
+                            "filename_prefix": "user-request"
+                        }
+                    }
+                },
+                "runtime_id": "comfyui-v0.30.1",
+                "outcome_class": "image.workflow.64",
+                "response_format": "artifact"
+            }),
+            VideoRequestPreparation::default(),
+            model.mayhem.workflow.as_ref(),
+        )
+        .unwrap();
+        let invocation = state
+            .prepare_artifact_generation_invocation_for_route(
+                &model,
+                &served_request,
+                model.mayhem.route_candidates.first(),
+                &GatewayRequestOptions::default(),
+            )
+            .expect("served workflow invocation");
+
+        let probe = state
+            .run_seed_perceptual_hash_probe_for_route(&model, &invocation, &config)
+            .await
+            .expect("workflow image canary probe");
+
+        assert!(probe.pass);
+        assert_eq!(
+            requests.lock_recover("workflow canary requests")[0].endpoint_family,
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
+        );
+        let receipts = state.receipts();
+        assert_eq!(receipts.len(), 1);
+        assert!(receipts[0].receipt.body.workflow.is_some());
+        assert!(receipts[0].receipt.body.workflow_output.is_some());
+        assert_eq!(
+            probe.evidence["evidence"]["prompts"][0]["request"]["workflow"]["1"]["class_type"],
+            "EmptyImage"
+        );
     }
 
     #[tokio::test]
