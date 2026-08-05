@@ -26556,6 +26556,45 @@ fn safe_relative_comfy_model_path(path: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
+#[cfg(any(feature = "comfyui", test))]
+fn comfy_part_file_format_extension(file_format: &str) -> Result<&'static str> {
+    match file_format.trim().to_ascii_lowercase().as_str() {
+        "safetensors" => Ok("safetensors"),
+        "pickle(.pth)" | "pth" => Ok("pth"),
+        "pickle(.pt)" | "pt" => Ok("pt"),
+        "checkpoint(.ckpt)" | "ckpt" => Ok("ckpt"),
+        "bin" => Ok("bin"),
+        other => bail!("unsupported Comfy part file_format for model mount: {other}"),
+    }
+}
+
+#[cfg(any(feature = "comfyui", test))]
+fn comfy_part_record_reference_model_path(
+    record: &mayhem_proto::ComfyPartRecord,
+) -> Result<PathBuf> {
+    if let Some(path) = record
+        .adapter
+        .get("comfy_model_path")
+        .and_then(Value::as_str)
+    {
+        return safe_relative_comfy_model_path(path);
+    }
+    let mut name = safe_path_component(record.name.trim());
+    ensure!(
+        !name.is_empty(),
+        "Comfy part name cannot derive an empty model path"
+    );
+    let has_extension = Path::new(&name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| !value.is_empty());
+    if !has_extension {
+        name.push('.');
+        name.push_str(comfy_part_file_format_extension(&record.file_format)?);
+    }
+    safe_relative_comfy_model_path(&name)
+}
+
 #[cfg(feature = "comfyui")]
 fn comfy_canary_content_extension(content_type: &str) -> &'static str {
     match content_type.trim().to_ascii_lowercase().as_str() {
@@ -28171,8 +28210,7 @@ fn provider_comfy_workflow_inventory_resident_bytes(
             )
         })?;
         ensure!(
-            part.record.name == required.name
-                && part.record.part_type == required.part_type
+            part.record.part_type == required.part_type
                 && part.record.sha256.eq_ignore_ascii_case(&required.sha256),
             "Comfy workflow {} part {} metadata does not match the signed workflow policy",
             model.model_id,
@@ -29043,7 +29081,7 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
         model_files.push(ComfyUiModelFile {
             source,
             model_subdir: comfy_part_record_model_subdir(&part.record)?,
-            model_path: safe_relative_comfy_model_path(&part.record.name)?,
+            model_path: comfy_part_record_reference_model_path(&part.record)?,
         });
     }
     let mut config = LoadConfig::comfyui_runtime(runtime);
@@ -93559,6 +93597,35 @@ status: linked
     }
 
     #[test]
+    fn provider_parts_reference_model_path_uses_safe_selector_or_adapter() {
+        let mut record = test_comfy_part_record("Fancy Upscaler", "66");
+        assert_eq!(
+            comfy_part_record_reference_model_path(&record).unwrap(),
+            PathBuf::from("Fancy_Upscaler.safetensors")
+        );
+
+        record.adapter.insert(
+            "comfy_model_path".to_owned(),
+            Value::from("custom/FancyUpscaler.safetensors"),
+        );
+        assert_eq!(
+            comfy_part_record_reference_model_path(&record).unwrap(),
+            PathBuf::from("custom/FancyUpscaler.safetensors")
+        );
+
+        record.adapter.insert(
+            "comfy_model_path".to_owned(),
+            Value::from("../bad.safetensors"),
+        );
+        let err = comfy_part_record_reference_model_path(&record).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Comfy model filename cannot contain parent"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
     fn provider_parts_add_list_remove_persists_verified_inventory_root() {
         let temp = test_temp_dir("mayhem-provider-parts-inventory");
         let source_dir = temp.join("source");
@@ -93693,6 +93760,10 @@ status: linked
         assert_eq!(files[0].model_subdir, PathBuf::from("upscale_models"));
         assert_eq!(files[0].model_path, PathBuf::from("tiny-upscaler.bin"));
         assert!(files[0].source.is_file());
+
+        model.workflow.as_mut().unwrap().parts[0].name = "mounted-upscaler.bin".to_owned();
+        let files = provider_comfy_workflow_model_files(&home, &model, 8).unwrap();
+        assert_eq!(files[0].model_path, PathBuf::from("mounted-upscaler.bin"));
         let _ = fs::remove_dir_all(temp);
     }
 
