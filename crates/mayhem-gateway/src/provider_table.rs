@@ -926,6 +926,7 @@ pub fn evaluate_eligibility(
     }) {
         return Err(IneligibilityReason::Speciality);
     }
+    let mut provider_min_ask_au = heartbeat.min_ask_au;
     if let Some(workflow) = &request.workflow {
         if heartbeat.runtime_id.as_deref() != Some(workflow.runtime_id.as_str())
             || workflow
@@ -943,6 +944,7 @@ pub fn evaluate_eligibility(
         if class.active >= class.max_concurrent {
             return Err(IneligibilityReason::Saturated);
         }
+        provider_min_ask_au = class.min_ask_au;
     }
     for modality in request
         .required_modalities
@@ -987,7 +989,7 @@ pub fn evaluate_eligibility(
     {
         return Err(IneligibilityReason::Price);
     }
-    if MoneyAu::from(heartbeat.min_ask_au) > market_rate_au {
+    if MoneyAu::from(provider_min_ask_au) > market_rate_au {
         return Err(IneligibilityReason::ProviderMinAsk);
     }
     if let Some(floor) = request
@@ -1752,6 +1754,32 @@ mod tests {
         make_workflow_route(&mut entry);
         let request = workflow_request(now + 1);
         assert_eq!(evaluate_eligibility(&entry, &request), Ok(100));
+
+        let mut global_min_ask_above_market = entry.clone();
+        global_min_ask_above_market
+            .heartbeat
+            .as_mut()
+            .unwrap()
+            .min_ask_au = 1_000_000;
+        assert_eq!(
+            evaluate_eligibility(&global_min_ask_above_market, &request),
+            Ok(100),
+            "workflow routes use the per-class min-ask, not the global model floor"
+        );
+
+        let mut class_min_ask_above_market = entry.clone();
+        class_min_ask_above_market
+            .heartbeat
+            .as_mut()
+            .unwrap()
+            .workflow_classes
+            .get_mut("image.workflow")
+            .unwrap()
+            .min_ask_au = 100_001;
+        assert_eq!(
+            evaluate_eligibility(&class_min_ask_above_market, &request),
+            Err(IneligibilityReason::ProviderMinAsk)
+        );
 
         let mut missing = entry.clone();
         missing.heartbeat.as_mut().unwrap().workflow_classes.clear();
