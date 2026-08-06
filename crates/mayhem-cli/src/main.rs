@@ -81,13 +81,13 @@ use mayhem_gateway::{
     openai::{
         gateway_bind_is_loopback, gateway_token_hash, serve as serve_gateway,
         validate_gateway_bind_access, GatewayAccessControl, GatewayAttestationAuthority,
-        GatewayAttestationCollateral, GatewayCanaryProbePolicy, GatewayCanaryRegistry,
-        GatewayLocalRunBadge, GatewayMarketInfo, GatewayModel, GatewayReceiptSettlementPublisher,
-        GatewayRouteCandidate, GatewayState, GatewayTokenBudgetPeriod, GatewayTokenRecord,
-        GatewayTokenStore, GatewayUpdateModelNotice, MayhemModelInfo, ModelCaps, PriceRefAu,
-        ProviderKybInfo, SamplingProfile, ScBridgeGatewaySessionBackend,
-        ScBridgeGatewaySessionConfig, ShapeAdapterInfo, DEFAULT_ROUTE_MAX_WAIT_MS,
-        MAX_PREFERRED_PROVIDERS_PER_MODEL, MAX_ROUTE_MAX_WAIT_MS,
+        GatewayAttestationCollateral, GatewayCanaryChallengeContext, GatewayCanaryProbePolicy,
+        GatewayCanaryRegistry, GatewayLocalRunBadge, GatewayMarketInfo, GatewayModel,
+        GatewayReceiptSettlementPublisher, GatewayRouteCandidate, GatewayState,
+        GatewayTokenBudgetPeriod, GatewayTokenRecord, GatewayTokenStore, GatewayUpdateModelNotice,
+        MayhemModelInfo, ModelCaps, PriceRefAu, ProviderKybInfo, SamplingProfile,
+        ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig, ShapeAdapterInfo,
+        DEFAULT_ROUTE_MAX_WAIT_MS, MAX_PREFERRED_PROVIDERS_PER_MODEL, MAX_ROUTE_MAX_WAIT_MS,
     },
     rate_gate_basis_au, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_au,
     valid_video_av_fingerprint, video_av_fingerprint, video_av_fingerprint_similarity_bps,
@@ -42049,6 +42049,18 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             .with_receipt_balance_au(balance_au)
             .with_receipt_settlement_publisher(receipt_outbox)
             .with_session_backend(Arc::new(backend));
+        if let Some(probe_epoch) = args.canary_probe_epoch {
+            let challenge_epoch = probe_epoch.checked_sub(1).context(
+                "--canary-probe-epoch must be at least 1 so it follows a finalized challenge epoch",
+            )?;
+            let challenge_apply_hash =
+                read_canary_challenge_apply_hash(&rpc, challenge_epoch).await?;
+            state = state.with_canary_challenge_context(GatewayCanaryChallengeContext {
+                catalog_hash: catalog_hash.clone(),
+                challenge_epoch,
+                challenge_apply_hash,
+            });
+        }
         if let Some(authority) = gateway_attestation_authority {
             state = state.with_attestation_authority(authority);
         }

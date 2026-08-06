@@ -275,6 +275,7 @@ pub struct GatewayState {
     tpm_activation_inflight: Arc<Mutex<BTreeSet<GatewayTpmActivationOwnershipScope>>>,
     tpm_activation_supervisor: Arc<GatewayTpmActivationSupervisor>,
     canary_policy: GatewayCanaryProbePolicy,
+    canary_challenge: Arc<Option<GatewayCanaryChallengeContext>>,
     canary_scheduler: Arc<Mutex<GatewayCanaryScheduler>>,
     dashboard_session: Arc<DashboardSession>,
     provider_earnings: Arc<Mutex<GatewayProviderEarningsSnapshot>>,
@@ -1717,6 +1718,7 @@ pub struct StoredReputationEvent {
 #[derive(Clone, Debug, Default)]
 pub struct GatewayCanaryRegistry {
     pub models: BTreeMap<String, GatewayCanaryModelConfig>,
+    pub prompt_ids_by_set: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1743,6 +1745,21 @@ pub struct GatewayCanaryModelConfig {
     pub default_transcripts: Option<BTreeMap<String, String>>,
     pub default_audio_fingerprints: Option<BTreeMap<String, String>>,
     pub default_video_fingerprints: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayCanaryChallengeContext {
+    pub catalog_hash: String,
+    pub challenge_epoch: u64,
+    pub challenge_apply_hash: String,
+}
+
+#[derive(Clone, Debug)]
+struct CanaryChallengeBinding {
+    canary_prompt_id: String,
+    challenge_epoch: u64,
+    challenge_apply_hash: String,
+    challenge_seed: String,
 }
 
 #[derive(Clone, Debug)]
@@ -4237,6 +4254,7 @@ impl GatewayState {
             tpm_activation_inflight: Arc::new(Mutex::new(BTreeSet::new())),
             tpm_activation_supervisor: Arc::new(GatewayTpmActivationSupervisor::default()),
             canary_policy: GatewayCanaryProbePolicy::default(),
+            canary_challenge: Arc::new(None),
             canary_scheduler: Arc::new(Mutex::new(GatewayCanaryScheduler::default())),
             dashboard_session: Arc::new(DashboardSession::new()),
             provider_earnings: Arc::new(Mutex::new(GatewayProviderEarningsSnapshot::default())),
@@ -4565,6 +4583,11 @@ impl GatewayState {
     pub fn with_canary_probe_policy(mut self, policy: GatewayCanaryProbePolicy) -> Self {
         self.canary_policy = policy;
         self.canary_scheduler = Arc::new(Mutex::new(GatewayCanaryScheduler::default()));
+        self
+    }
+
+    pub fn with_canary_challenge_context(mut self, context: GatewayCanaryChallengeContext) -> Self {
+        self.canary_challenge = Arc::new(Some(context));
         self
     }
 
@@ -12465,8 +12488,12 @@ fn canary_registry_from_catalog_root(
 ) -> GatewayCanaryRegistry {
     let mut models = BTreeMap::new();
     let Some(model_values) = root.get("models").and_then(Value::as_array) else {
-        return GatewayCanaryRegistry { models };
+        return GatewayCanaryRegistry {
+            models,
+            prompt_ids_by_set: BTreeMap::new(),
+        };
     };
+    let mut prompt_ids_by_set = BTreeMap::new();
     for model in model_values {
         let Some(model_id) = model.get("model_id").and_then(Value::as_str) else {
             continue;
@@ -12478,10 +12505,13 @@ fn canary_registry_from_catalog_root(
             continue;
         };
         let requires_launch_evidence = model.get("tier").and_then(Value::as_str) == Some("launch");
-        let Some(prompts) = canary_sets.get(canary_set).cloned() else {
+        let Some(all_prompts) = canary_sets.get(canary_set).cloned() else {
             continue;
         };
-        let prompts = prompts
+        prompt_ids_by_set
+            .entry(canary_set.to_owned())
+            .or_insert_with(|| all_prompts.iter().map(|prompt| prompt.id.clone()).collect());
+        let prompts = all_prompts
             .into_iter()
             .filter(|prompt| !prompt.calibration_only)
             .collect::<Vec<_>>();
@@ -12635,7 +12665,10 @@ fn canary_registry_from_catalog_root(
             },
         );
     }
-    GatewayCanaryRegistry { models }
+    GatewayCanaryRegistry {
+        models,
+        prompt_ids_by_set,
+    }
 }
 
 fn canary_token_prefixes_by_artifact(
@@ -28667,6 +28700,12 @@ impl GatewayState {
                 }
             }
             Err(err) => {
+                let provider = invocation
+                    .provider_pubkey
+                    .clone()
+                    .unwrap_or_else(|| "local-provider".to_owned());
+                let challenge_binding =
+                    self.canary_challenge_binding(&config, &provider, &invocation.enclave_id);
                 self.record_probe(failed_canary_runtime_probe(
                     model,
                     invocation,
@@ -28674,6 +28713,7 @@ impl GatewayState {
                     err.message,
                     self.canary_policy.epoch,
                     &self.receipt_config.user_seed,
+                    challenge_binding.as_ref(),
                 ));
             }
         }
@@ -28712,6 +28752,12 @@ impl GatewayState {
         {
             Ok(result) => result,
             Err(err) => {
+                let provider = served_invocation
+                    .provider_pubkey
+                    .clone()
+                    .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
+                let challenge_binding =
+                    self.canary_challenge_binding(config, &provider, &served_invocation.enclave_id);
                 return Ok(Some(failed_context_needle_runtime_probe(
                     model,
                     served_invocation,
@@ -28720,6 +28766,7 @@ impl GatewayState {
                     err.message,
                     self.canary_policy.epoch,
                     &self.receipt_config.user_seed,
+                    challenge_binding.as_ref(),
                 )));
             }
         };
@@ -28740,6 +28787,8 @@ impl GatewayState {
             .clone()
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
         let binary_hash = served_invocation.runtime_binary_hash_evidence();
+        let challenge_binding =
+            self.canary_challenge_binding(config, &provider, &served_invocation.enclave_id);
         let expected_fingerprint = stable_value_hash(&json!({
             "domain": "mayhem-context-needle-expected-v1",
             "answer": spec.answer.clone(),
@@ -28749,7 +28798,7 @@ impl GatewayState {
             "response": response,
             "token_fingerprint": token_fingerprint,
         }));
-        let evidence = json!({
+        let mut evidence = json!({
             "schema_version": 1,
             "kind": "mayhem-context-needle-probe-evidence",
             "model": model.id,
@@ -28770,6 +28819,7 @@ impl GatewayState {
             "match_bps": match_bps,
             "receipt_hash": receipt_hash,
         });
+        apply_canary_challenge_binding(&mut evidence, challenge_binding.as_ref());
         let evidence_hash = stable_value_hash(&evidence);
         let at = now_secs();
         let probe_id = stable_value_hash(&json!({
@@ -28798,6 +28848,7 @@ impl GatewayState {
             "session_receipt_hash": receipt_hash,
             "evidence_hash": evidence_hash,
         });
+        apply_canary_challenge_binding(&mut probe_command, challenge_binding.as_ref());
         probe_command["auditor_sig"] = json!(probe_result_signature(
             &self.receipt_config.user_seed,
             &probe_command,
@@ -28828,6 +28879,60 @@ impl GatewayState {
             evidence_hash,
             probe_command,
         }))
+    }
+
+    fn canary_challenge_binding(
+        &self,
+        config: &GatewayCanaryModelConfig,
+        provider: &str,
+        enclave_id: &str,
+    ) -> Option<CanaryChallengeBinding> {
+        let context = self.canary_challenge.as_ref().as_ref()?;
+        if self.canary_policy.epoch != context.challenge_epoch.saturating_add(1) {
+            return None;
+        }
+        if !is_hex_len(&context.catalog_hash, 64) || !is_hex_len(&context.challenge_apply_hash, 64)
+        {
+            return None;
+        }
+        let prompt_ids = self
+            .catalog_runtime
+            .lock_recover("gateway catalog runtime")
+            .canaries
+            .prompt_ids_by_set
+            .get(&config.canary_set)
+            .cloned()
+            .unwrap_or_else(|| {
+                config
+                    .prompts
+                    .iter()
+                    .map(|prompt| prompt.id.clone())
+                    .collect()
+            });
+        if prompt_ids.is_empty() {
+            return None;
+        }
+        let auditor = verifying_key_hex(&self.receipt_config.user_seed);
+        let challenge_seed = opaque_value_hash(
+            "mayhem-canary-challenge-v1",
+            &json!({
+                "challenge_epoch": context.challenge_epoch,
+                "challenge_apply_hash": context.challenge_apply_hash,
+                "probe_epoch": self.canary_policy.epoch,
+                "auditor": auditor,
+                "provider": provider,
+                "enclave_id": enclave_id,
+                "canary_set": config.canary_set,
+                "catalog_hash": context.catalog_hash,
+            }),
+        );
+        let selected_index = hexadecimal_modulo(&challenge_seed, prompt_ids.len())?;
+        Some(CanaryChallengeBinding {
+            canary_prompt_id: prompt_ids[selected_index].clone(),
+            challenge_epoch: context.challenge_epoch,
+            challenge_apply_hash: context.challenge_apply_hash.clone(),
+            challenge_seed,
+        })
     }
 
     async fn run_canary_probe_for_route(
@@ -28968,7 +29073,9 @@ impl GatewayState {
             .clone()
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
         let binary_hash = served_invocation.runtime_binary_hash_evidence();
-        let evidence = json!({
+        let challenge_binding =
+            self.canary_challenge_binding(config, &provider, &served_invocation.enclave_id);
+        let mut evidence = json!({
             "schema_version": 1,
             "kind": "mayhem-automatic-canary-probe-evidence",
             "model": model.id,
@@ -28984,6 +29091,7 @@ impl GatewayState {
             "prompts": prompt_reports,
             "receipt_hashes": receipt_hashes,
         });
+        apply_canary_challenge_binding(&mut evidence, challenge_binding.as_ref());
         let evidence_hash = stable_value_hash(&evidence);
         let session_receipt_hash = stable_value_hash(&json!({
             "domain": "mayhem-canary-receipt-bundle-v1",
@@ -29013,6 +29121,7 @@ impl GatewayState {
             "session_receipt_hash": session_receipt_hash,
             "evidence_hash": evidence_hash,
         });
+        apply_canary_challenge_binding(&mut probe_command, challenge_binding.as_ref());
         probe_command["auditor_sig"] = json!(probe_result_signature(
             &self.receipt_config.user_seed,
             &probe_command,
@@ -29324,7 +29433,9 @@ impl GatewayState {
             .clone()
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
         let binary_hash = served_invocation.runtime_binary_hash_evidence();
-        let evidence = json!({
+        let challenge_binding =
+            self.canary_challenge_binding(config, &provider, &served_invocation.enclave_id);
+        let mut evidence = json!({
             "schema_version": 1,
             "kind": "mayhem-automatic-speciality-canary-probe-evidence",
             "model": model.id,
@@ -29341,6 +29452,7 @@ impl GatewayState {
             "levels": reports,
             "receipt_hashes": receipt_hashes,
         });
+        apply_canary_challenge_binding(&mut evidence, challenge_binding.as_ref());
         let evidence_hash = stable_value_hash(&evidence);
         let session_receipt_hash = stable_value_hash(&json!({
             "domain": "mayhem-canary-receipt-bundle-v1",
@@ -29370,6 +29482,7 @@ impl GatewayState {
             "session_receipt_hash": session_receipt_hash,
             "evidence_hash": evidence_hash,
         });
+        apply_canary_challenge_binding(&mut probe_command, challenge_binding.as_ref());
         probe_command["auditor_sig"] = json!(probe_result_signature(
             &self.receipt_config.user_seed,
             &probe_command,
@@ -29542,7 +29655,9 @@ impl GatewayState {
             .clone()
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
         let binary_hash = served_invocation.runtime_binary_hash_evidence();
-        let evidence = json!({
+        let challenge_binding =
+            self.canary_challenge_binding(config, &provider, &served_invocation.enclave_id);
+        let mut evidence = json!({
             "schema_version": 1,
             "kind": "mayhem-automatic-image-canary-probe-evidence",
             "model": model.id,
@@ -29558,6 +29673,7 @@ impl GatewayState {
             "prompts": prompt_reports,
             "receipt_hashes": receipt_hashes,
         });
+        apply_canary_challenge_binding(&mut evidence, challenge_binding.as_ref());
         let evidence_hash = stable_value_hash(&evidence);
         let session_receipt_hash = stable_value_hash(&json!({
             "domain": "mayhem-canary-receipt-bundle-v1",
@@ -29588,6 +29704,7 @@ impl GatewayState {
             "session_receipt_hash": session_receipt_hash,
             "evidence_hash": evidence_hash,
         });
+        apply_canary_challenge_binding(&mut probe_command, challenge_binding.as_ref());
         probe_command["auditor_sig"] = json!(probe_result_signature(
             &self.receipt_config.user_seed,
             &probe_command,
@@ -30194,12 +30311,15 @@ impl GatewayState {
             .clone()
             .unwrap_or_else(|| verifying_key_hex(&self.receipt_config.provider_seed));
         let binary_hash = served_invocation.runtime_binary_hash_evidence();
+        let challenge_binding =
+            self.canary_challenge_binding(config, &provider, &served_invocation.enclave_id);
         evidence["model"] = json!(model.id);
         evidence["provider"] = json!(provider);
         evidence["enclave_id"] = json!(served_invocation.enclave_id);
         evidence["binary_hash"] = json!(binary_hash);
         evidence["canary_set"] = json!(config.canary_set);
         evidence["verification_method"] = json!(config.verification_method);
+        apply_canary_challenge_binding(&mut evidence, challenge_binding.as_ref());
         let evidence_hash = stable_value_hash(&evidence);
         let session_receipt_hash = stable_value_hash(&json!({
             "domain": "mayhem-canary-receipt-bundle-v1",
@@ -30230,6 +30350,7 @@ impl GatewayState {
             "session_receipt_hash": session_receipt_hash,
             "evidence_hash": evidence_hash,
         });
+        apply_canary_challenge_binding(&mut probe_command, challenge_binding.as_ref());
         probe_command["auditor_sig"] = json!(probe_result_signature(
             &self.receipt_config.user_seed,
             &probe_command,
@@ -32537,13 +32658,14 @@ fn failed_canary_runtime_probe(
     reason: String,
     epoch: u64,
     auditor_seed: &[u8; 32],
+    challenge_binding: Option<&CanaryChallengeBinding>,
 ) -> StoredProbeEvent {
     let provider = invocation
         .provider_pubkey
         .clone()
         .unwrap_or_else(|| "local-provider".to_owned());
     let binary_hash = invocation.runtime_binary_hash_evidence();
-    let evidence = json!({
+    let mut evidence = json!({
         "schema_version": 1,
         "kind": "mayhem-automatic-canary-probe-runtime-failure",
         "model": model.id,
@@ -32554,6 +32676,7 @@ fn failed_canary_runtime_probe(
         "verification_method": config.verification_method,
         "reason": reason,
     });
+    apply_canary_challenge_binding(&mut evidence, challenge_binding);
     let evidence_hash = stable_value_hash(&evidence);
     let at = now_secs();
     let probe_id = stable_value_hash(&json!({
@@ -32582,6 +32705,7 @@ fn failed_canary_runtime_probe(
         })),
         "evidence_hash": evidence_hash,
     });
+    apply_canary_challenge_binding(&mut probe_command, challenge_binding);
     probe_command["auditor_sig"] = json!(probe_result_signature(
         auditor_seed,
         &probe_command,
@@ -32618,6 +32742,7 @@ fn failed_context_needle_runtime_probe(
     reason: String,
     epoch: u64,
     auditor_seed: &[u8; 32],
+    challenge_binding: Option<&CanaryChallengeBinding>,
 ) -> StoredProbeEvent {
     let provider = invocation
         .provider_pubkey
@@ -32628,7 +32753,7 @@ fn failed_context_needle_runtime_probe(
         "domain": "mayhem-context-needle-expected-v1",
         "answer": spec.answer.clone(),
     }));
-    let evidence = json!({
+    let mut evidence = json!({
         "schema_version": 1,
         "kind": "mayhem-context-needle-runtime-failure",
         "model": model.id,
@@ -32645,6 +32770,7 @@ fn failed_context_needle_runtime_probe(
         "answer_hash": expected_fingerprint,
         "reason": reason,
     });
+    apply_canary_challenge_binding(&mut evidence, challenge_binding);
     let evidence_hash = stable_value_hash(&evidence);
     let at = now_secs();
     let session_receipt_hash = stable_value_hash(&json!({
@@ -32676,6 +32802,7 @@ fn failed_context_needle_runtime_probe(
         "session_receipt_hash": session_receipt_hash,
         "evidence_hash": evidence_hash,
     });
+    apply_canary_challenge_binding(&mut probe_command, challenge_binding);
     probe_command["auditor_sig"] = json!(probe_result_signature(
         auditor_seed,
         &probe_command,
@@ -33669,6 +33796,40 @@ fn stable_value_hash(value: &Value) -> String {
         .to_string()
 }
 
+fn opaque_value_hash(domain: &str, value: &Value) -> String {
+    stable_value_hash(&json!({
+        "domain": domain,
+        "value": value,
+    }))
+}
+
+fn hexadecimal_modulo(value: &str, modulus: usize) -> Option<usize> {
+    if modulus == 0 || value.is_empty() || !value.as_bytes().iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let mut remainder = 0usize;
+    for byte in value.as_bytes() {
+        let digit = match *byte {
+            b'0'..=b'9' => usize::from(*byte - b'0'),
+            b'a'..=b'f' => usize::from(*byte - b'a' + 10),
+            b'A'..=b'F' => usize::from(*byte - b'A' + 10),
+            _ => return None,
+        };
+        remainder = (remainder * 16 + digit) % modulus;
+    }
+    Some(remainder)
+}
+
+fn apply_canary_challenge_binding(value: &mut Value, binding: Option<&CanaryChallengeBinding>) {
+    let Some(binding) = binding else {
+        return;
+    };
+    value["canary_prompt_id"] = json!(binding.canary_prompt_id);
+    value["challenge_epoch"] = json!(binding.challenge_epoch);
+    value["challenge_apply_hash"] = json!(binding.challenge_apply_hash);
+    value["challenge_seed"] = json!(binding.challenge_seed);
+}
+
 #[derive(Clone, Copy, Debug)]
 struct BoundedAudioMetadata {
     content_type: &'static str,
@@ -33773,6 +33934,10 @@ fn probe_result_signature(auditor_seed: &[u8; 32], value: &Value, auditor: &str)
         "enclave_id": value.get("enclave_id").cloned().unwrap_or(Value::Null),
         "binary_hash": value.get("binary_hash").cloned().unwrap_or(Value::Null),
         "canary_set": value.get("canary_set").cloned().unwrap_or(Value::Null),
+        "canary_prompt_id": value.get("canary_prompt_id").cloned().unwrap_or(Value::Null),
+        "challenge_epoch": value.get("challenge_epoch").cloned().unwrap_or(Value::Null),
+        "challenge_apply_hash": value.get("challenge_apply_hash").cloned().unwrap_or(Value::Null),
+        "challenge_seed": value.get("challenge_seed").cloned().unwrap_or(Value::Null),
         "verification_method": value.get("verification_method").cloned().unwrap_or(Value::Null),
         "session_receipt_hash": value.get("session_receipt_hash").cloned().unwrap_or(Value::Null),
         "evidence_hash": value.get("evidence_hash").cloned().unwrap_or(Value::Null),
@@ -44342,12 +44507,20 @@ mod tests {
         };
         let expected_hash = image_average_hash_hex(&image).expect("workflow image hash");
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
-            Arc::new(WorkflowImageCanaryBackend {
+        let state = test_gateway_state_from_models(vec![model.clone()])
+            .with_session_backend(Arc::new(WorkflowImageCanaryBackend {
                 requests: requests.clone(),
                 image,
-            }),
-        );
+            }))
+            .with_canary_probe_policy(GatewayCanaryProbePolicy {
+                epoch: 2,
+                ..GatewayCanaryProbePolicy::default()
+            })
+            .with_canary_challenge_context(GatewayCanaryChallengeContext {
+                catalog_hash: "11".repeat(32),
+                challenge_epoch: 1,
+                challenge_apply_hash: "22".repeat(32),
+            });
         let config = GatewayCanaryModelConfig {
             canary_set: "comfy-canary-v1".to_owned(),
             requires_launch_evidence: false,
@@ -44487,6 +44660,18 @@ mod tests {
             probe.evidence["evidence"]["prompts"][0]["request"]["workflow"]["1"]["class_type"],
             "EmptyImage"
         );
+        assert_eq!(
+            probe.probe_command["canary_prompt_id"],
+            json!("fixed-workflow-image")
+        );
+        assert_eq!(probe.probe_command["challenge_epoch"], json!(1));
+        assert_eq!(
+            probe.probe_command["challenge_apply_hash"],
+            json!("22".repeat(32))
+        );
+        assert!(probe.probe_command["challenge_seed"]
+            .as_str()
+            .is_some_and(|value| is_hex_len(value, 64)));
     }
 
     #[tokio::test]

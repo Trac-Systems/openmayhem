@@ -6633,6 +6633,10 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                 default_video_fingerprints: None,
             },
         )]),
+        prompt_ids_by_set: BTreeMap::from([(
+            "canary-test-v1".to_owned(),
+            vec!["fixed-probe".to_owned()],
+        )]),
     }
 }
 
@@ -6697,6 +6701,10 @@ fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
                 default_video_fingerprints: None,
             },
         )]),
+        prompt_ids_by_set: BTreeMap::from([(
+            "canary-image-test-v1".to_owned(),
+            vec!["fixed-image".to_owned()],
+        )]),
     }
 }
 
@@ -6760,6 +6768,10 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
                 default_audio_fingerprints: None,
                 default_video_fingerprints: None,
             },
+        )]),
+        prompt_ids_by_set: BTreeMap::from([(
+            "canary-embedding-test-v1".to_owned(),
+            vec!["fixed-embedding".to_owned()],
         )]),
     }
 }
@@ -6835,6 +6847,10 @@ fn test_transcript_canary_registry(audio: Vec<u8>) -> GatewayCanaryRegistry {
                 default_video_fingerprints: None,
             },
         )]),
+        prompt_ids_by_set: BTreeMap::from([(
+            "canary-stt-test-v1".to_owned(),
+            vec!["fixed-stt".to_owned(), "long-calibration-only".to_owned()],
+        )]),
     }
 }
 
@@ -6898,6 +6914,10 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
                 default_audio_fingerprints: None,
                 default_video_fingerprints: None,
             },
+        )]),
+        prompt_ids_by_set: BTreeMap::from([(
+            "canary-tts-test-v1".to_owned(),
+            vec!["fixed-tts".to_owned()],
         )]),
     }
 }
@@ -6978,6 +6998,10 @@ fn test_music_audio_fingerprint_canary_registry(
                 default_audio_fingerprints: None,
                 default_video_fingerprints: None,
             },
+        )]),
+        prompt_ids_by_set: BTreeMap::from([(
+            "canary-music-test-v1".to_owned(),
+            vec!["fixed-music".to_owned()],
         )]),
     }
 }
