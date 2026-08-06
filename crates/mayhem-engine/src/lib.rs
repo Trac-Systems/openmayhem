@@ -10085,6 +10085,88 @@ mod tests {
     }
 
     #[cfg(feature = "comfyui")]
+    #[test]
+    #[ignore = "requires MAYHEM_COMFYUI_REAL_RUNTIME, MAYHEM_COMFYUI_PYTHON, and MAYHEM_COMFYUI_REAL_VAE"]
+    fn comfyui_real_runtime_standalone_vae_workflow() {
+        let runtime = std::env::var_os("MAYHEM_COMFYUI_REAL_RUNTIME")
+            .map(PathBuf::from)
+            .expect("MAYHEM_COMFYUI_REAL_RUNTIME must point at a ComfyUI checkout");
+        let vae = std::env::var_os("MAYHEM_COMFYUI_REAL_VAE")
+            .map(PathBuf::from)
+            .expect("MAYHEM_COMFYUI_REAL_VAE must point at a verified VAE file");
+        let vae_name = vae
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("VAE path must have a UTF-8 file name")
+            .to_owned();
+        let cache = std::env::temp_dir().join(format!(
+            "mayhem-engine-test-{}-{}",
+            std::process::id(),
+            "comfyui-standalone-vae"
+        ));
+        let model_dir = cache.join("base").join("models").join("vae");
+        std::fs::create_dir_all(&model_dir).expect("create ComfyUI VAE model dir");
+        std::fs::copy(&vae, model_dir.join(&vae_name))
+            .expect("copy verified VAE into isolated ComfyUI base dir");
+
+        let mut config = LoadConfig::comfyui_runtime(runtime);
+        config.backend_cache_dir = Some(cache.clone());
+        let mut backend = ComfyUiBackend::new();
+        backend.load(config).expect("load sandboxed ComfyUI");
+        assert!(backend.component_healthy());
+
+        let workflow = json!({
+            "1": {
+                "class_type": "VAELoader",
+                "inputs": {"vae_name": vae_name}
+            },
+            "2": {
+                "class_type": "EmptyImage",
+                "inputs": {"width": 64, "height": 64, "batch_size": 1, "color": 3368703}
+            },
+            "3": {
+                "class_type": "VAEEncode",
+                "inputs": {"pixels": ["2", 0], "vae": ["1", 0]}
+            },
+            "4": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["3", 0], "vae": ["1", 0]}
+            },
+            "5": {
+                "class_type": "SaveImage",
+                "inputs": {"images": ["4", 0], "filename_prefix": "mayhem-comfyui-standalone-vae"}
+            }
+        });
+
+        let (image, output) = run_real_comfy_workflow_collect(&mut backend, workflow);
+        assert_eq!(png_dimensions(&image), Some((64, 64)));
+        assert!(
+            output
+                .progress_events
+                .iter()
+                .any(|event| event.kind == "execution_start"
+                    || event.kind == "executing"
+                    || event.kind == "progress_state"),
+            "ComfyUI standalone VAE proof must capture runtime progress events"
+        );
+
+        if let Some(output_dir) = std::env::var_os("MAYHEM_COMFYUI_REAL_OUTPUT_DIR") {
+            let output_dir = PathBuf::from(output_dir);
+            std::fs::create_dir_all(&output_dir).expect("create ComfyUI test output dir");
+            let label =
+                std::env::var("MAYHEM_COMFYUI_REAL_LABEL").unwrap_or_else(|_| "local".to_owned());
+            std::fs::write(
+                output_dir.join(format!("comfy-standalone-vae-{label}.png")),
+                &image,
+            )
+            .expect("write ComfyUI standalone VAE proof output");
+        }
+
+        drop(backend);
+        let _ = std::fs::remove_dir_all(cache);
+    }
+
+    #[cfg(feature = "comfyui")]
     fn run_real_comfy_workflow_collect(
         backend: &mut ComfyUiBackend,
         workflow: Value,
