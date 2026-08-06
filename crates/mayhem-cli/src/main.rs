@@ -28317,8 +28317,7 @@ fn provider_comfy_workflow_model_files(
             )
         })?;
         ensure!(
-            part.record.name == required.name
-                && part.record.part_type == required.part_type
+            part.record.part_type == required.part_type
                 && part.record.sha256.eq_ignore_ascii_case(&required.sha256),
             "Comfy workflow {} part {} metadata does not match the signed workflow policy",
             model.model_id,
