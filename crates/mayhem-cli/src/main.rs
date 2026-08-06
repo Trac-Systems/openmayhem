@@ -4225,6 +4225,9 @@ struct AdminPublishCatalogArgs {
 
 #[derive(Debug, Parser)]
 struct AdminWorkflowGridBuildArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
     /// Path to the machine-readable outcome-class grid.
     #[arg(long = "input", value_name = "PATH")]
     input: Option<PathBuf>,
@@ -4239,6 +4242,11 @@ struct AdminWorkflowGridBuildArgs {
     /// Immutable repository revision containing the class-definition artifacts.
     #[arg(long = "artifact-revision")]
     artifact_revision: String,
+
+    /// Contract admin public key used to derive canonical outcome-class enclave ids.
+    /// Omit only when using --submit, where the current dev contract admin is read from peer RPC.
+    #[arg(long = "admin-pubkey")]
+    admin_pubkey: Option<String>,
 
     /// Directory prefix inside --artifact-repo for the class-definition artifacts.
     #[arg(
@@ -4267,9 +4275,9 @@ struct AdminWorkflowGridBuildArgs {
     #[arg(long = "room-nonce-prefix", default_value = "comfy-grid-v1")]
     room_nonce_prefix: String,
 
-    /// Print a machine-readable report.
-    #[arg(long)]
-    json: bool,
+    /// Submit only the first N classes. Intended for isolated devnet smoke tests.
+    #[arg(long = "limit-classes")]
+    limit_classes: Option<usize>,
 }
 
 #[derive(Debug, Parser)]
@@ -25072,7 +25080,7 @@ async fn admin(command: AdminCommands) -> Result<()> {
         AdminCommands::Ban { command } => return admin_ban(command).await,
         AdminCommands::Tier3 { command } => return admin_tier3(command).await,
         AdminCommands::Parts { command } => return admin_parts(command).await,
-        AdminCommands::WorkflowGrid { command } => return admin_workflow_grid(command),
+        AdminCommands::WorkflowGrid { command } => return admin_workflow_grid(command).await,
         AdminCommands::EpochApply(args) => return run_admin_epoch_apply_feature(args).await,
         AdminCommands::PublishPayoutContext(args) => {
             return run_admin_publish_payout_context_feature(args).await;
@@ -32335,13 +32343,13 @@ struct AdminWorkflowOutcomeClassDefinition {
     caps: Value,
 }
 
-fn admin_workflow_grid(command: &AdminWorkflowGridCommands) -> Result<()> {
+async fn admin_workflow_grid(command: &AdminWorkflowGridCommands) -> Result<()> {
     match command {
-        AdminWorkflowGridCommands::Build(args) => admin_workflow_grid_build(args),
+        AdminWorkflowGridCommands::Build(args) => admin_workflow_grid_build(args).await,
     }
 }
 
-fn admin_workflow_grid_build(args: &AdminWorkflowGridBuildArgs) -> Result<()> {
+async fn admin_workflow_grid_build(args: &AdminWorkflowGridBuildArgs) -> Result<()> {
     validate_launch_enclave_attestation_tier(args.att_tier)?;
     validate_hex32_config("--binary-hash", Some(&args.binary_hash))?;
     validate_hex32_config("--manifest-hash", Some(&args.manifest_hash))?;
@@ -32364,8 +32372,18 @@ fn admin_workflow_grid_build(args: &AdminWorkflowGridBuildArgs) -> Result<()> {
             .with_context(|| format!("reading Comfy outcome-class grid {}", input.display()))?,
     )
     .with_context(|| format!("parsing Comfy outcome-class grid {}", input.display()))?;
-    let report = admin_workflow_grid_report(args, &grid, &input)?;
-    if args.json {
+    let admin_pubkey = workflow_grid_admin_pubkey(args).await?;
+    let mut report = admin_workflow_grid_report(args, &grid, &input, &admin_pubkey)?;
+    if args.tx.submit {
+        let submissions = submit_workflow_grid_payloads(args, &report).await?;
+        report["submitted"] = json!(true);
+        report["sim"] = json!(args.tx.sim);
+        report["submissions"] = submissions;
+    } else {
+        report["submitted"] = json!(false);
+        report["sim"] = json!(false);
+    }
+    if args.tx.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!("Comfy outcome-class grid ready.");
@@ -32392,14 +32410,116 @@ fn admin_workflow_grid_build(args: &AdminWorkflowGridBuildArgs) -> Result<()> {
                 .map(Vec::len)
                 .unwrap_or(0)
         );
+        println!(
+            "Submitted: {}",
+            report["submitted"].as_bool().unwrap_or(false)
+        );
     }
     Ok(())
+}
+
+async fn workflow_grid_admin_pubkey(args: &AdminWorkflowGridBuildArgs) -> Result<String> {
+    if let Some(admin_pubkey) = args.admin_pubkey.as_deref() {
+        let admin_pubkey = admin_pubkey.to_ascii_lowercase();
+        ensure!(
+            is_hex_len(&admin_pubkey, 64),
+            "--admin-pubkey must be a 32-byte hexadecimal public key"
+        );
+        return Ok(admin_pubkey);
+    }
+    ensure!(
+        args.tx.submit,
+        "pass --admin-pubkey when building offline workflow-grid payloads"
+    );
+    let home = args.tx.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.tx.rpc_url.as_deref())?;
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let admin = read_state_value(&rpc, "admin")
+        .await?
+        .and_then(|value| value.as_str().map(str::to_ascii_lowercase))
+        .context("contract admin is not initialized")?;
+    ensure!(
+        is_hex_len(&admin, 64),
+        "contract admin must be 32-byte hexadecimal"
+    );
+    Ok(admin)
+}
+
+async fn submit_workflow_grid_payloads(
+    args: &AdminWorkflowGridBuildArgs,
+    report: &Value,
+) -> Result<Value> {
+    let home = args.tx.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let config = read_mayhem_config(&home)?;
+    let rpc_url = resolve_cli_rpc_url(Some(&home), args.tx.rpc_url.as_deref())?;
+    let wallet_password = args.tx.wallet_password.as_deref().unwrap_or("");
+    let wallet = resolve_cli_wallet_with_keypair(
+        &home,
+        config.as_ref(),
+        args.tx.keypair.as_deref(),
+        &args.tx.peer_store_name,
+        wallet_password,
+    )
+    .await?;
+    let keypair_path = PathBuf::from(&wallet.keypair_path);
+    let rpc = PeerRpcClient::new(&rpc_url)?;
+    let groups = [
+        ("set_model_ref_payloads", "setModelRef"),
+        ("register_enclave_payloads", "registerEnclave"),
+        ("set_price_payloads", "setPrice"),
+        ("open_room_payloads", "openRoom"),
+    ];
+    let mut submissions = Vec::new();
+    for (field, tx_type) in groups {
+        let payloads = report
+            .get(field)
+            .and_then(Value::as_array)
+            .with_context(|| format!("workflow-grid report missing {field} array"))?;
+        for (index, payload) in payloads.iter().enumerate() {
+            if tx_type == "registerEnclave" {
+                validate_admin_register_enclave_identity(&wallet.public_key, payload)?;
+            }
+            let result = submit_contract_command(
+                &rpc,
+                &keypair_path,
+                wallet_password,
+                &wallet,
+                tx_type,
+                payload.clone(),
+                args.tx.sim,
+            )
+            .await
+            .with_context(|| format!("submitting workflow-grid {tx_type} #{index}"))?;
+            submissions.push(json!({
+                "field": field,
+                "tx_type": tx_type,
+                "index": index,
+                "class_id": payload
+                    .get("model_id")
+                    .or_else(|| payload.get("enclave_id"))
+                    .and_then(Value::as_str),
+                "result": result,
+            }));
+        }
+    }
+    Ok(json!({
+        "rpc_url": rpc_url,
+        "wallet": {
+            "public_key": wallet.public_key,
+            "keypair_path": wallet.keypair_path,
+        },
+        "count": submissions.len(),
+        "items": submissions,
+    }))
 }
 
 fn admin_workflow_grid_report(
     args: &AdminWorkflowGridBuildArgs,
     grid: &AdminWorkflowOutcomeGrid,
     input: &Path,
+    admin_pubkey: &str,
 ) -> Result<Value> {
     ensure!(
         grid.schema == "openmayhem.comfy.outcome-class-grid.v1",
@@ -32414,6 +32534,9 @@ fn admin_workflow_grid_report(
         !grid.classes.is_empty(),
         "Comfy outcome-class grid is empty"
     );
+    if args.limit_classes == Some(0) {
+        bail!("--limit-classes must be positive when provided");
+    }
     let mut seen = BTreeSet::new();
     let mut outcome_classes = Vec::new();
     let mut class_artifacts = Vec::new();
@@ -32421,7 +32544,11 @@ fn admin_workflow_grid_report(
     let mut set_model_ref_payloads = Vec::new();
     let mut set_price_payloads = Vec::new();
     let mut open_room_payloads = Vec::new();
-    for class in &grid.classes {
+    for class in grid
+        .classes
+        .iter()
+        .take(args.limit_classes.unwrap_or(grid.classes.len()))
+    {
         validate_workflow_outcome_class_definition(class)?;
         ensure!(
             seen.insert(class.class_id.clone()),
@@ -32437,13 +32564,14 @@ fn admin_workflow_grid_report(
             hasher.update(&bytes);
             hex_encode(&hasher.finalize())
         };
-        let enclave_id = opaque_value_hash(
-            "mayhem-comfy-outcome-class-enclave-v1",
-            &json!({
-                "class_id": class.class_id,
-                "definition_hash": definition_hash,
-            }),
-        );
+        let enclave_id = catalog_enclave_id(&CatalogEnclaveIdentity {
+            admin_pubkey: admin_pubkey.to_owned(),
+            model_id: class.class_id.clone(),
+            artifact_root: definition_hash.clone(),
+            artifact_sidecar_roots: BTreeMap::new(),
+            manifest_hash: args.manifest_hash.to_ascii_lowercase(),
+            binary_hash: args.binary_hash.to_ascii_lowercase(),
+        });
         let artifact_path = format!(
             "{}/{}.json",
             args.artifact_path_prefix.trim_matches('/'),
@@ -32520,7 +32648,9 @@ fn admin_workflow_grid_report(
         "schema": grid.schema,
         "version": grid.version,
         "source": grid.source,
-        "class_count": grid.classes.len(),
+        "admin_pubkey": admin_pubkey,
+        "class_count": outcome_classes.len(),
+        "source_class_count": grid.classes.len(),
         "outcome_classes": outcome_classes,
         "class_artifacts": class_artifacts,
         "register_enclave_payloads": register_enclave_payloads,
@@ -92681,19 +92811,22 @@ mod tests {
         let input = repo_path(DEFAULT_COMFY_OUTCOME_GRID_PATH).unwrap();
         let grid: AdminWorkflowOutcomeGrid =
             serde_json::from_value(read_json_file(&input).unwrap()).unwrap();
+        let admin_pubkey = "d".repeat(64);
         let args = AdminWorkflowGridBuildArgs {
+            tx: test_admin_tx_args(),
             input: Some(input.clone()),
             artifact_repo: "TracNetwork/openmayhem-parts-index".to_owned(),
             artifact_revision: "a".repeat(40),
+            admin_pubkey: Some(admin_pubkey.clone()),
             artifact_path_prefix: "comfy/outcome-classes/v1".to_owned(),
             binary_hash: "b".repeat(64),
             manifest_hash: "c".repeat(64),
             att_tier: 1,
             effective_at: 86_400,
             room_nonce_prefix: "comfy-grid-v1".to_owned(),
-            json: true,
+            limit_classes: None,
         };
-        let report = admin_workflow_grid_report(&args, &grid, &input).unwrap();
+        let report = admin_workflow_grid_report(&args, &grid, &input, &admin_pubkey).unwrap();
         assert_eq!(report["class_count"], json!(18));
         assert_eq!(report["outcome_classes"].as_array().unwrap().len(), 18);
         assert_eq!(
@@ -92729,6 +92862,7 @@ mod tests {
             "comfy/outcome-classes/v1/image.light.le1_2mp.json"
         );
         assert_eq!(first_register["caps"]["output_modality"], "image");
+        validate_admin_register_enclave_identity(&admin_pubkey, first_register).unwrap();
 
         let first_price = &report["set_price_payloads"][0];
         assert_eq!(first_price["effective_at"], json!(86_400));
