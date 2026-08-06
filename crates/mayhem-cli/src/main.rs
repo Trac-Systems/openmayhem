@@ -32609,7 +32609,6 @@ fn admin_workflow_grid_report(
             "att_tier": args.att_tier,
             "quant": "unknown",
             "binary_hash": args.binary_hash.to_ascii_lowercase(),
-            "approved_binary_hashes": [args.binary_hash.to_ascii_lowercase()],
             "source_sha256": source_sha256,
             "caps": caps,
         }));
@@ -92862,6 +92861,10 @@ mod tests {
             "comfy/outcome-classes/v1/image.light.le1_2mp.json"
         );
         assert_eq!(first_register["caps"]["output_modality"], "image");
+        assert!(
+            first_register.get("approved_binary_hashes").is_none(),
+            "workflow-grid register payload must match the strict registerEnclave schema"
+        );
         validate_admin_register_enclave_identity(&admin_pubkey, first_register).unwrap();
 
         let first_price = &report["set_price_payloads"][0];

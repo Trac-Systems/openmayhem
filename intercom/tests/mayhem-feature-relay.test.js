@@ -305,6 +305,58 @@ const signedAdminTxValue = async (
   };
 };
 
+test('admin writer simulates admin contract tx through shipped protocol tx API', async () => {
+  const writer = peerFor(adminKey, { writable: true });
+  const calls = [];
+  const contexts = [];
+  const simulationTx = '34'.repeat(32);
+  writer.peer.protocol.instance.versionedTransactionObject = (value) => ({
+    ...value,
+    value: { ...value.value, contract_version: CONTRACT_VERSION },
+  });
+  writer.peer.protocol.instance.safeJsonStringify = JSON.stringify;
+  writer.peer.protocol.instance.simulateTransaction = async (...args) => {
+    calls.push(args);
+    return { ok: true, op: 'setModelRef', ver: 2 };
+  };
+  writer.peer.protocol.instance.api = {
+    async generateTx(address, commandHash, nonce) {
+      contexts.push({ address, commandHash, nonce });
+      return simulationTx;
+    },
+  };
+  const feature = new MayhemFeature(writer.peer, {});
+  const prepared = {
+    type: 'setModelRef',
+    value: {
+      op: 'set_model_ref',
+      model_id: 'workflow.image.light.le1_2mp',
+      model_class: 'workflow',
+      rate_map: [{ unit: 'image', per_unit_au: '1', granularity: 1 }],
+    },
+  };
+  const value = await signedAdminTxValue(prepared, { sim: true });
+
+  const result = await feature.submit(`admin/contract-tx/${value.tx}`, value);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.status, 'simulated');
+  assert.equal(contexts.length, 1);
+  assert.equal(contexts[0].address, adminKey);
+  assert.match(contexts[0].commandHash, /^[0-9a-f]{64}$/);
+  assert.match(contexts[0].nonce, /^[0-9a-f]{64}$/);
+  assert.deepEqual(calls, [[
+    '0'.repeat(64),
+    prepared,
+    {
+      tx: simulationTx,
+      nonce: contexts[0].nonce,
+      signature: fakeSignature(adminKey, b4a.from(simulationTx, 'hex')),
+      address: adminKey,
+    },
+  ]]);
+});
+
 test('service signing message has one cross-runtime canonical form', () => {
   const payload = {
     provider: providerKey,

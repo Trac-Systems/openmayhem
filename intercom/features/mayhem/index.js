@@ -435,10 +435,39 @@ class MayhemFeature extends Feature {
     this.adminTxHandler = typeof config.adminTxHandler === 'function'
       ? config.adminTxHandler
       : async (value) => {
+          const txApi = this.peer?.protocol?.instance?.api;
+          if (
+            !txApi ||
+            (typeof txApi.generateTxContext !== 'function' &&
+              typeof txApi.generateTx !== 'function')
+          ) {
+            throw new Error('Mayhem admin transaction API is not available.');
+          }
+          const safeJsonStringify = this.peer?.protocol?.instance?.safeJsonStringify ??
+            ((input) => JSON.stringify(input));
+          const versionedCommand = typeof this.peer?.protocol?.instance?.versionedTransactionObject === 'function'
+            ? this.peer.protocol.instance.versionedTransactionObject(value.prepared_command)
+            : value.prepared_command;
+          const commandHash = b4a.toString(
+            await blake3(safeJsonStringify(versionedCommand)),
+            'hex'
+          );
+          const simNonce = crypto.randomBytes(32).toString('hex');
+          const simContext = typeof txApi.generateTxContext === 'function'
+            ? await txApi.generateTxContext(commandHash, simNonce)
+            : {
+                tx: await txApi.generateTx(value.address, commandHash, simNonce),
+                nonce: simNonce,
+              };
+          const simSignature = this.peer.wallet.sign(b4a.from(simContext.tx, 'hex'));
           const result = await this.peer.protocol.instance.simulateTransaction(
             '0'.repeat(64),
             value.prepared_command,
-            { address: value.address }
+            {
+              ...simContext,
+              signature: simSignature,
+              address: value.address,
+            }
           );
           return { result };
         };
