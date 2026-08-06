@@ -1316,6 +1316,89 @@ test('MayhemContract validates per-class rate maps including image prices', asyn
   ]);
 });
 
+test('MayhemContract validates workflow outcome-class governed rate units', async () => {
+  const admin = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(admin.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+  const workflowEnclave = {
+    ...enclaveRegistration,
+    enclave_id: 'f'.repeat(64),
+    model_id: 'image.light.le1_2mp',
+    model_class: 'workflow',
+    caps: {
+      image: true,
+      output_modality: 'image',
+      output_modalities: ['image'],
+      modality_set: ['image'],
+      speciality_levels: {},
+    },
+  };
+
+  let result = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    workflowEnclave,
+    admin.publicKey,
+    1
+  );
+  assert.equal(result.ok, true, result.message);
+
+  result = await execute(
+    contract,
+    storage,
+    'setModelRef',
+    {
+      op: 'set_model_ref',
+      model_id: workflowEnclave.model_id,
+      model_class: 'workflow',
+      rate_map: [
+        { unit: 'megapixel_step', per_unit_au: '180000000000000', granularity: 1000 },
+      ],
+    },
+    admin.publicKey,
+    2
+  );
+  assert.equal(result.ok, true, result.message);
+
+  const invalidTextUnit = await execute(
+    contract,
+    storage,
+    'setPrice',
+    {
+      op: 'set_price',
+      enclave_id: workflowEnclave.enclave_id,
+      rate_map: textRateMap(20, 60),
+      per_req_au: '0',
+      min_session_au: '0',
+      effective_at: 0,
+    },
+    admin.publicKey,
+    3
+  );
+  assert.match(invalidTextUnit.message, /input_token is not allowed for model_class workflow/i);
+
+  result = await execute(
+    contract,
+    storage,
+    'setPrice',
+    {
+      op: 'set_price',
+      enclave_id: workflowEnclave.enclave_id,
+      rate_map: [
+        { unit: 'megapixel_step', per_unit_au: '200000000000000', granularity: 1000 },
+      ],
+      per_req_au: '0',
+      min_session_au: '0',
+      effective_at: 0,
+    },
+    admin.publicKey,
+    4
+  );
+  assert.equal(result.ok, true, result.message);
+});
+
 test('MayhemContract rejects unsafe enclave identifiers in price reads and writes', async () => {
   const provider = await makeIdentity();
   const admin = await makeIdentity();

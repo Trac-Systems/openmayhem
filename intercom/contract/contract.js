@@ -288,6 +288,7 @@ const MODEL_CLASSES = new Set([
   'stt',
   'audio-generation',
   'music-generation',
+  'workflow',
 ]);
 const RATE_MAP_MAX_ENTRIES = 16;
 const MODEL_CLASS_RATE_UNITS = Object.freeze({
@@ -303,6 +304,17 @@ const MODEL_CLASS_RATE_UNITS = Object.freeze({
   stt: new Set(['audio_second']),
   'audio-generation': new Set(['input_character', 'audio_second']),
   'music-generation': new Set(['input_character', 'audio_second']),
+  workflow: new Set([
+    'megapixel_step',
+    'megapixel',
+    'compute_second',
+    'audio_second',
+    'input_character',
+    'frame',
+    'image',
+    'step',
+    'video_second',
+  ]),
 });
 const CAP_OUTPUT_MODALITIES = new Set(['text', 'embedding', 'image', 'video', 'audio']);
 const ENCLAVE_MODALITIES = new Set(['text', 'embedding', 'image', 'video', 'audio']);
@@ -315,6 +327,7 @@ const MODEL_CLASS_OUTPUT_MODALITIES = Object.freeze({
   stt: new Set(['text']),
   'audio-generation': new Set(['audio']),
   'music-generation': new Set(['audio']),
+  workflow: new Set(['image', 'video', 'audio']),
 });
 const ENCLAVE_ARTIFACT_ROOT_KIND = 'blake3_merkle_v1';
 const ENCLAVE_CAP_BOOLEAN_FIELDS = [

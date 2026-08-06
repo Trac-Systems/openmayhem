@@ -12,8 +12,9 @@ use mayhem_proto::{
     default_model_class, AdminAttestationPolicy, AdminEnclaveAttestationBinding,
     EndpointFamilyContract, EndpointSpecialitySelector, EndpointSpecialityTarget,
     EndpointValueType, ModelSpecialityDescriptor, MoneyAu, DEFAULT_MODEL_CLASS,
-    ENDPOINT_OPENAI_CHAT_COMPLETIONS, USAGE_AUDIO_SECOND, USAGE_FRAME, USAGE_IMAGE,
-    USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
+    ENDPOINT_OPENAI_CHAT_COMPLETIONS, USAGE_AUDIO_SECOND, USAGE_COMPUTE_SECOND, USAGE_FRAME,
+    USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_MEGAPIXEL, USAGE_MEGAPIXEL_STEP,
+    USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -32,6 +33,7 @@ const MODEL_CLASS_TTS: &str = "tts";
 const MODEL_CLASS_STT: &str = "stt";
 const MODEL_CLASS_AUDIO_GENERATION: &str = "audio-generation";
 const MODEL_CLASS_MUSIC_GENERATION: &str = "music-generation";
+const MODEL_CLASS_WORKFLOW: &str = "workflow";
 
 #[derive(Debug, Clone)]
 pub struct VerifyOptions {
@@ -1567,6 +1569,17 @@ fn validate_price_rate_map(model: &CatalogModel, errors: &mut Vec<String>) {
         MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION => {
             &[USAGE_INPUT_CHARACTER, USAGE_AUDIO_SECOND]
         }
+        MODEL_CLASS_WORKFLOW => &[
+            USAGE_MEGAPIXEL_STEP,
+            USAGE_MEGAPIXEL,
+            USAGE_COMPUTE_SECOND,
+            USAGE_AUDIO_SECOND,
+            USAGE_INPUT_CHARACTER,
+            USAGE_FRAME,
+            USAGE_IMAGE,
+            USAGE_STEP,
+            USAGE_VIDEO_SECOND,
+        ],
         _ => &["input_token", "cached_input_token", "output_token"],
     };
     for entry in &model.price_ref_au.rate_map {
@@ -1603,15 +1616,21 @@ fn validate_price_rate_map(model: &CatalogModel, errors: &mut Vec<String>) {
         }
     }
 
-    let required_units: &[&str] = match model.model_class.as_str() {
-        MODEL_CLASS_IMAGE_GENERATION => &[USAGE_IMAGE, USAGE_STEP],
-        MODEL_CLASS_VIDEO_GENERATION => &[USAGE_VIDEO_SECOND, USAGE_FRAME],
-        MODEL_CLASS_EMBEDDING => &[USAGE_INPUT_TOKEN],
-        MODEL_CLASS_STT => &[USAGE_AUDIO_SECOND],
+    let required_units: Vec<&str> = match model.model_class.as_str() {
+        MODEL_CLASS_IMAGE_GENERATION => vec![USAGE_IMAGE, USAGE_STEP],
+        MODEL_CLASS_VIDEO_GENERATION => vec![USAGE_VIDEO_SECOND, USAGE_FRAME],
+        MODEL_CLASS_EMBEDDING => vec![USAGE_INPUT_TOKEN],
+        MODEL_CLASS_STT => vec![USAGE_AUDIO_SECOND],
         MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION => {
-            &[USAGE_INPUT_CHARACTER, USAGE_AUDIO_SECOND]
+            vec![USAGE_INPUT_CHARACTER, USAGE_AUDIO_SECOND]
         }
-        _ => &[USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN],
+        MODEL_CLASS_WORKFLOW => model
+            .workflow
+            .as_ref()
+            .and_then(|policy| policy.pricing_unit.as_deref())
+            .into_iter()
+            .collect(),
+        _ => vec![USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN],
     };
     for unit in required_units {
         if !units.contains(unit) {
@@ -1881,6 +1900,12 @@ fn canary_verification_method_allowed_for_class(model_class: &str, method: &str)
             | (
                 MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION,
                 VERIFICATION_AUDIO_FINGERPRINT
+            )
+            | (
+                MODEL_CLASS_WORKFLOW,
+                VERIFICATION_SEED_PERCEPTUAL_HASH
+                    | VERIFICATION_AUDIO_FINGERPRINT
+                    | VERIFICATION_VIDEO_AV_FINGERPRINT
             )
             | (_, VERIFICATION_ATTESTATION_OF_COMPUTE)
     )
@@ -2291,6 +2316,7 @@ fn valid_model_class(model_class: &str) -> bool {
             | MODEL_CLASS_STT
             | MODEL_CLASS_AUDIO_GENERATION
             | MODEL_CLASS_MUSIC_GENERATION
+            | MODEL_CLASS_WORKFLOW
     )
 }
 
@@ -2310,6 +2336,7 @@ fn output_modality_allowed_for_class(model_class: &str, modality: &str) -> bool 
                 "audio"
             )
             | (MODEL_CLASS_STT, "text")
+            | (MODEL_CLASS_WORKFLOW, "image" | "video" | "audio")
     )
 }
 
@@ -3581,6 +3608,7 @@ fn required_endpoint_family_names(
             mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
             mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO,
         ]),
+        MODEL_CLASS_WORKFLOW => BTreeSet::from([mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS]),
         _ => BTreeSet::new(),
     };
     if model_class == DEFAULT_MODEL_CLASS
@@ -3646,6 +3674,7 @@ fn endpoint_family_allowed_for_model(model: &CatalogModel, family: &str) -> bool
                 | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
                 | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
         ),
+        MODEL_CLASS_WORKFLOW => family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
         _ => false,
     }
 }
@@ -7337,6 +7366,66 @@ mod tests {
     }
 
     #[test]
+    fn comfy_workflow_model_class_accepts_governed_pricing_units() {
+        let mut model = verification_test_model(
+            "admin/comfy-image-class",
+            MODEL_CLASS_WORKFLOW,
+            "comfyui",
+            CanaryRef {
+                set_id: "canary-launch-v1".to_owned(),
+                match_min: 0.9,
+                verification_method: VERIFICATION_SEED_PERCEPTUAL_HASH.to_owned(),
+                verification_tolerance_bps: Some(128),
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::from([(
+                    "fixture".to_owned(),
+                    BTreeMap::from([("fixed-image".to_owned(), "a".repeat(16))]),
+                )]),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
+            },
+        );
+        model.family = "comfy-workflow".to_owned();
+        model.workflow = Some(mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["EmptyImage".to_owned(), "SaveImage".to_owned()],
+            runtime_id: Some("comfyui-v0.30.1".to_owned()),
+            outcome_class: Some("image.light.le1_2mp".to_owned()),
+            pricing_unit: Some(USAGE_MEGAPIXEL_STEP.to_owned()),
+            max_nodes: Some(8),
+            max_width: Some(1024),
+            max_height: Some(1024),
+            max_steps: Some(40),
+            max_artifacts: Some(1),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        });
+        model.price_ref_au.in_per_1k = 0;
+        model.price_ref_au.out_per_1k = 0;
+        model.price_ref_au.rate_map = vec![CatalogRateMapEntry {
+            unit: USAGE_MEGAPIXEL_STEP.to_owned(),
+            per_unit_au: 180_000_000_000_000,
+            granularity: 1_000,
+        }];
+
+        let mut errors = Vec::new();
+        validate_model(&model, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        model.price_ref_au.rate_map = vec![CatalogRateMapEntry {
+            unit: USAGE_OUTPUT_TOKEN.to_owned(),
+            per_unit_au: 1,
+            granularity: 1,
+        }];
+        let mut errors = Vec::new();
+        validate_model(&model, &mut errors);
+        assert!(errors.iter().any(|error| error.contains(
+            "price_ref_au.rate_map unit output_token is not allowed for model_class workflow"
+        )));
+    }
+
+    #[test]
     fn non_llm_roster_rate_maps_cover_every_required_machine_unit() {
         let mut model = verification_test_model(
             "admin/non-llm-rate-map-fixture",
@@ -7537,6 +7626,7 @@ mod tests {
             MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION => {
                 "audio"
             }
+            MODEL_CLASS_WORKFLOW => "image",
             _ => "text",
         };
         let modality_set = vec![output_modality.to_owned()];
@@ -7636,7 +7726,10 @@ mod tests {
                 json: model_class == DEFAULT_MODEL_CLASS,
                 ctx_max: 1024,
                 vision: false,
-                image: model_class == MODEL_CLASS_IMAGE_GENERATION,
+                image: matches!(
+                    model_class,
+                    MODEL_CLASS_IMAGE_GENERATION | MODEL_CLASS_WORKFLOW
+                ),
                 video: model_class == MODEL_CLASS_VIDEO_GENERATION,
                 audio: matches!(
                     model_class,

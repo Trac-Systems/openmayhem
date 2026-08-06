@@ -2,11 +2,11 @@
   "schema": 1,
   "release_version": "0.2.101",
   "contract_version": 20,
-  "contract_code_sha256": "db42a341127b57f33c9a940efa22f9d3e72bc663997e9e96eb9fcd919c3a017b",
+  "contract_code_sha256": "a30595e1c37469fdd7e4502a9a6ec6ed36998c4f1dc580902ff339052b90da2b",
   "files": [
     {
       "path": "contract/contract.js",
-      "sha256": "37124727186aa2cbadc62a572ccc7b42c0bfed19a68efdde41993602cef65cb4"
+      "sha256": "e5a6cee17287aed0e01c855148478f90134f44a1cf840de574d8f9fbbc4200cc"
     },
     {
       "path": "contract/protocol.js",

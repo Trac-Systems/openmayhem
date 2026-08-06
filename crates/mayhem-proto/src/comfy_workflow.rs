@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    stable_json_bytes, ReceiptUsage, WorkflowOutputBinding, USAGE_AUDIO_SECOND, USAGE_FRAME,
-    USAGE_IMAGE, USAGE_STEP, USAGE_VIDEO_SECOND,
+    stable_json_bytes, ReceiptUsage, WorkflowOutputBinding, USAGE_AUDIO_SECOND,
+    USAGE_COMPUTE_SECOND, USAGE_FRAME, USAGE_IMAGE, USAGE_MEGAPIXEL, USAGE_MEGAPIXEL_STEP,
+    USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 
 pub const COMFY_WORKFLOW_DERIVATION_SCHEMA_VERSION: u32 = 1;
@@ -42,6 +43,8 @@ pub struct ComfyWorkflowCatalogPolicy {
     pub runtime_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_unit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inventory_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,10 +103,18 @@ impl ComfyWorkflowCatalogPolicy {
                 )));
             }
         }
+        if let Some(unit) = self.pricing_unit.as_deref() {
+            if !valid_comfy_pricing_unit(unit) {
+                return Err(ComfyWorkflowDerivationError::InvalidPolicy(format!(
+                    "unsupported pricing_unit {unit}"
+                )));
+            }
+        }
         let defaults = ComfyWorkflowDerivationPolicy::default();
         Ok(ComfyWorkflowDerivationPolicy {
             whitelisted_nodes,
             parts_by_name,
+            pricing_unit: self.pricing_unit.clone(),
             max_nodes: self.max_nodes.unwrap_or(defaults.max_nodes).max(1),
             max_width: self.max_width.unwrap_or(defaults.max_width).max(1),
             max_height: self.max_height.unwrap_or(defaults.max_height).max(1),
@@ -130,10 +141,25 @@ impl ComfyWorkflowCatalogPolicy {
     }
 }
 
+pub fn valid_comfy_pricing_unit(unit: &str) -> bool {
+    matches!(
+        unit,
+        USAGE_MEGAPIXEL_STEP
+            | USAGE_MEGAPIXEL
+            | USAGE_COMPUTE_SECOND
+            | USAGE_AUDIO_SECOND
+            | USAGE_FRAME
+            | USAGE_IMAGE
+            | USAGE_STEP
+            | USAGE_VIDEO_SECOND
+    )
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ComfyWorkflowDerivationPolicy {
     pub whitelisted_nodes: BTreeSet<String>,
     pub parts_by_name: BTreeMap<String, ComfyWorkflowPartRef>,
+    pub pricing_unit: Option<String>,
     pub max_nodes: usize,
     pub max_width: u64,
     pub max_height: u64,
@@ -148,6 +174,7 @@ impl Default for ComfyWorkflowDerivationPolicy {
         Self {
             whitelisted_nodes: BTreeSet::new(),
             parts_by_name: BTreeMap::new(),
+            pricing_unit: None,
             max_nodes: DEFAULT_COMFY_WORKFLOW_MAX_NODES,
             max_width: DEFAULT_COMFY_WORKFLOW_MAX_WIDTH,
             max_height: DEFAULT_COMFY_WORKFLOW_MAX_HEIGHT,
@@ -274,7 +301,7 @@ pub fn derive_comfy_workflow(
     }
 
     let outcome_spec = metrics.into_outcome_spec(policy)?;
-    let quoted_usage = workflow_usage_from_outcome(&outcome_spec);
+    let quoted_usage = workflow_usage_from_outcome(&outcome_spec, policy.pricing_unit.as_deref());
     let workflow_output = workflow_output_from_outcome(&outcome_spec);
     let graph_hash = graph_hash(graph)?;
     Ok(ComfyWorkflowDerivation {
@@ -528,7 +555,13 @@ fn numeric_u64(value: &Value) -> Option<u64> {
     }
 }
 
-fn workflow_usage_from_outcome(outcome: &ComfyWorkflowOutcomeSpec) -> ReceiptUsage {
+fn workflow_usage_from_outcome(
+    outcome: &ComfyWorkflowOutcomeSpec,
+    pricing_unit: Option<&str>,
+) -> ReceiptUsage {
+    if let Some(unit) = pricing_unit {
+        return workflow_usage_for_pricing_unit(outcome, unit);
+    }
     let artifact_count = outcome.artifact_count.max(1);
     let mut units = BTreeMap::new();
     if outcome
@@ -566,6 +599,65 @@ fn workflow_usage_from_outcome(outcome: &ComfyWorkflowOutcomeSpec) -> ReceiptUsa
         units.insert(USAGE_STEP.to_owned(), steps.max(1) * artifact_count);
     }
     ReceiptUsage::from_units(units)
+}
+
+fn workflow_usage_for_pricing_unit(outcome: &ComfyWorkflowOutcomeSpec, unit: &str) -> ReceiptUsage {
+    let artifact_count = outcome.artifact_count.max(1);
+    let count = match unit {
+        USAGE_MEGAPIXEL_STEP => ceil_megapixels(outcome)
+            .saturating_mul(
+                if outcome
+                    .output_modalities
+                    .iter()
+                    .any(|value| value == "video")
+                {
+                    outcome.frames.unwrap_or(1).max(1)
+                } else {
+                    outcome.steps.unwrap_or(1).max(1)
+                },
+            )
+            .saturating_mul(artifact_count),
+        USAGE_MEGAPIXEL => ceil_megapixels(outcome).saturating_mul(artifact_count),
+        USAGE_FRAME => outcome
+            .frames
+            .unwrap_or(1)
+            .max(1)
+            .saturating_mul(artifact_count),
+        USAGE_AUDIO_SECOND => outcome
+            .duration_seconds
+            .unwrap_or(1)
+            .max(1)
+            .saturating_mul(artifact_count),
+        USAGE_COMPUTE_SECOND => outcome
+            .duration_seconds
+            .or(outcome.steps)
+            .or(outcome.frames)
+            .unwrap_or(1)
+            .max(1)
+            .saturating_mul(artifact_count),
+        USAGE_STEP => outcome
+            .steps
+            .unwrap_or(1)
+            .max(1)
+            .saturating_mul(artifact_count),
+        USAGE_IMAGE => artifact_count,
+        USAGE_VIDEO_SECOND => outcome
+            .duration_seconds
+            .unwrap_or(1)
+            .max(1)
+            .saturating_mul(artifact_count),
+        _ => 1_u64.saturating_mul(artifact_count),
+    };
+    ReceiptUsage::from_units([(unit.to_owned(), count.max(1))])
+}
+
+fn ceil_megapixels(outcome: &ComfyWorkflowOutcomeSpec) -> u64 {
+    let pixels = outcome
+        .width
+        .unwrap_or(1)
+        .max(1)
+        .saturating_mul(outcome.height.unwrap_or(1).max(1));
+    pixels.saturating_add(999_999) / 1_000_000
 }
 
 fn workflow_output_from_outcome(outcome: &ComfyWorkflowOutcomeSpec) -> WorkflowOutputBinding {
@@ -759,6 +851,31 @@ mod tests {
     }
 
     #[test]
+    fn pricing_unit_derives_grid_units_from_declared_outcome() {
+        let mut image_policy = policy();
+        image_policy.pricing_unit = Some(USAGE_MEGAPIXEL_STEP.to_owned());
+        let image = derive_comfy_workflow(&image_graph(), &image_policy).unwrap();
+        assert_eq!(image.quoted_usage.get(USAGE_MEGAPIXEL_STEP), 40);
+        assert_eq!(image.quoted_usage.units().len(), 1);
+
+        image_policy.pricing_unit = Some(USAGE_MEGAPIXEL.to_owned());
+        let upscaler = derive_comfy_workflow(&image_graph(), &image_policy).unwrap();
+        assert_eq!(upscaler.quoted_usage.get(USAGE_MEGAPIXEL), 2);
+        assert_eq!(upscaler.quoted_usage.units().len(), 1);
+
+        let mut video_policy = av_policy();
+        video_policy.pricing_unit = Some(USAGE_MEGAPIXEL_STEP.to_owned());
+        let video = derive_comfy_workflow(&av_graph(), &video_policy).unwrap();
+        assert_eq!(video.quoted_usage.get(USAGE_MEGAPIXEL_STEP), 96);
+        assert_eq!(video.quoted_usage.units().len(), 1);
+
+        video_policy.pricing_unit = Some(USAGE_AUDIO_SECOND.to_owned());
+        let audio = derive_comfy_workflow(&av_graph(), &video_policy).unwrap();
+        assert_eq!(audio.quoted_usage.get(USAGE_AUDIO_SECOND), 12);
+        assert_eq!(audio.quoted_usage.units().len(), 1);
+    }
+
+    #[test]
     fn refuses_non_whitelisted_node() {
         let mut graph = image_graph();
         graph["666"] = json!({"class_type": "ShellExec", "inputs": {}});
@@ -922,6 +1039,7 @@ mod tests {
             }],
             runtime_id: Some("comfyui-v0.31.0".to_owned()),
             outcome_class: Some("image.light.512".to_owned()),
+            pricing_unit: Some(USAGE_MEGAPIXEL_STEP.to_owned()),
             inventory_root: Some("33".repeat(32)),
             max_width: Some(512),
             ..ComfyWorkflowCatalogPolicy::default()
@@ -935,8 +1053,27 @@ mod tests {
         assert_eq!(policy.runtime_id(), "comfyui-v0.31.0");
         assert_eq!(policy.outcome_class_for("image"), "image.light.512");
         assert_eq!(
+            derived_policy.pricing_unit.as_deref(),
+            Some(USAGE_MEGAPIXEL_STEP)
+        );
+        assert_eq!(
             err,
             ComfyWorkflowDerivationError::OutcomeOverflow("width exceeds 512".to_owned())
+        );
+    }
+
+    #[test]
+    fn catalog_policy_refuses_unknown_pricing_unit() {
+        let policy = ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["SaveImage".to_owned()],
+            pricing_unit: Some("seller_second".to_owned()),
+            ..ComfyWorkflowCatalogPolicy::default()
+        };
+        assert_eq!(
+            policy.derivation_policy().unwrap_err(),
+            ComfyWorkflowDerivationError::InvalidPolicy(
+                "unsupported pricing_unit seller_second".to_owned()
+            )
         );
     }
 
