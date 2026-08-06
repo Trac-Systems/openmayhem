@@ -5760,7 +5760,7 @@ struct ProviderMinAskGetArgs {
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
 
-    /// Market target: default, enclave id, model id, or model:T<tier>.
+    /// Market target: default, enclave id, model id, model:T<tier>, or workflow outcome class.
     target: Option<String>,
 
     /// Print a machine-readable report.
@@ -5774,7 +5774,7 @@ struct ProviderMinAskSetArgs {
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
 
-    /// Market target: default, enclave id, model id, or model:T<tier>.
+    /// Market target: default, enclave id, model id, model:T<tier>, or workflow outcome class.
     target: String,
 
     /// Local provider floor in integer atto-USD. 0 accepts the admin market price.
@@ -63027,15 +63027,28 @@ fn normalize_provider_market_target(value: &str) -> Result<String> {
 }
 
 fn provider_market_config_keys(selected: &ProviderCandidate) -> Vec<String> {
-    vec![
-        selected.enclave.enclave_id.to_ascii_lowercase(),
-        format!(
-            "{}:T{}",
-            selected.enclave.model_id, selected.enclave.att_tier
-        ),
-        selected.enclave.model_id.clone(),
-        "default".to_owned(),
-    ]
+    let mut keys = Vec::new();
+    let mut push_key = |key: String| {
+        if !keys.iter().any(|existing| existing == &key) {
+            keys.push(key);
+        }
+    };
+    push_key(selected.enclave.enclave_id.to_ascii_lowercase());
+    if let (Some(policy), Some(modality)) = (
+        selected.model.workflow.as_ref(),
+        provider_comfy_workflow_output_modality(selected),
+    ) {
+        let outcome_class = policy.outcome_class_for(modality);
+        push_key(format!("{}:T{}", outcome_class, selected.enclave.att_tier));
+        push_key(outcome_class);
+    }
+    push_key(format!(
+        "{}:T{}",
+        selected.enclave.model_id, selected.enclave.att_tier
+    ));
+    push_key(selected.enclave.model_id.clone());
+    push_key("default".to_owned());
+    keys
 }
 
 fn provider_config_min_ask(
@@ -90392,6 +90405,34 @@ mod tests {
         apply_provider_config_defaults(&mut cli_args, Some(&config), &selected);
         assert_eq!(cli_args.max_sessions, Some(7));
         assert_eq!(cli_args.accept_rate_per_minute, 3);
+
+        let mut workflow_selected = selected.clone();
+        workflow_selected.served_modalities = vec!["image".to_owned()];
+        workflow_selected.model.adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            )
+            .unwrap()];
+        workflow_selected.model.workflow = Some(mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["EmptyImage".to_owned(), "SaveImage".to_owned()],
+            outcome_class: Some("image.custom.512".to_owned()),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        });
+        let workflow_config: MayhemConfig = toml::from_str(
+            r#"
+            [provider.min_ask]
+            "test/model@4bit:T1" = "700"
+            "image.custom.512" = "900"
+            "#,
+        )
+        .unwrap();
+        let mut workflow_args = test_provider_start_args();
+        apply_provider_config_defaults(
+            &mut workflow_args,
+            Some(&workflow_config),
+            &workflow_selected,
+        );
+        assert_eq!(workflow_args.min_ask_au, 900);
     }
 
     #[test]
