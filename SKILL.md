@@ -26,6 +26,13 @@ selector, signed artifact, endpoint and modality surface, supported backend/plat
 pin, resource floor, measured guidance, unsupported combination, and provider start command. Live
 enclave IDs, rooms, routes, and prices must still come from `mayhem models --gateway`.
 
+ComfyUI workflows are not a second app. They use the same gateway, provider, route, voucher,
+receipt, and settlement machinery, with the Mayhem-native endpoint `/v1/workflows` and endpoint
+family `mayhem_comfy_workflows`. A user submits a bounded `workflow` graph; Mayhem derives the
+required parts, graph hash, runtime id, output class, and usage from the signed workflow policy.
+Providers choose and verify their own parts from the anchored parts index; a user request must never
+trigger a provider download.
+
 When one host will serve multiple models, start their provider workers **serially**. Wait for each
 worker to finish artifact verification, model load, functional canary, and fresh-heartbeat
 stabilization before admitting and starting the next worker. Concurrent startup can overlap
@@ -113,6 +120,11 @@ executes the toolkit probe, selects exactly one llama.cpp backend, and verifies 
 binary before succeeding. Managed Python backends need no system Python, `venv`, `ensurepip`, or
 `pip`: Mayhem downloads the exact hash-pinned standalone `uv` for the host and atomically creates
 the frozen runtime under `~/.mayhem`.
+**ComfyUI workflows:** verify the blessed ComfyUI runtime checkout, currently
+`comfyui-v0.30.1`, and the Python executable that belongs to it. Use `python3` only when it is the
+runtime environment's interpreter; otherwise set `MAYHEM_COMFYUI_PYTHON` to the exact executable.
+Workflow parts still come only from the signed parts index and require `mayhem provider parts pull`
+plus `mayhem provider parts admit --write` before serving.
 **Tier 2:** install `tpm2-tools`; the provider uses `/dev/tpmrm0` unprivileged. If the distro owns
 that device as `root:tss`, add the login to the existing group with
 `sudo usermod -aG tss "$USER"`, then start a new login. Mayhem never creates users/groups or changes
@@ -536,6 +548,33 @@ repair a stale executable. If the exact current binary still rejects the binding
 unabridged `--verbose` output together with the version and enclave id. The operator then compares
 the immutable ledger enclave tuple with the ledger-pinned signed catalog; providers never work
 around a genuine mismatch locally.
+
+For Comfy workflow providers, do not serve a workflow class until the parts inventory and admission
+proof both pass. Pull only from a verified parts-index layout:
+
+```bash
+mayhem provider parts pull --layout-dir <parts-index-layout> --part-id <part-id> --require-payload
+```
+
+Use `--all` only when the machine is intended to mirror the whole provider-facing parts index and
+has enough disk. For each class, run admission against the blessed runtime and reference graph:
+
+```bash
+mayhem provider parts admit \
+  --outcome-class <workflow-class> \
+  --runtime-id comfyui-v0.30.1 \
+  --part-id <part-id> \
+  --usable-bytes <size> \
+  --working-set-bytes <size> \
+  --reference-graph <path.json> \
+  --reference-runtime <comfy-runtime-dir> \
+  --write
+```
+
+If the class uses staged load/unload, pass the approved `--load-plan`. Without it, Mayhem assumes
+all required parts must fit together. A workflow heartbeat without a matching saved admission is a
+bug or stale worker; do not paper over it with a manual heartbeat, local route edit, memory
+override, or catalog change.
 
 For explicit Tier 2, pass `--provider-hardware-quote-kind tpm2-quote-ek` and the platform helper
 to `mayhem up --provider --yes`: `scripts/hardware/mayhem-tpm2-quote-linux.sh` on Linux or

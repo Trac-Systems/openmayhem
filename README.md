@@ -31,6 +31,7 @@ your OpenAI client ──▶ local gateway (127.0.0.1) ──▶ encrypted P2P s
 - **One command on any machine.** `mayhem up --provider` probes your hardware, picks an engine, fetches a model that fits, and starts earning. Works the same on a Windows gaming PC that only serves evenings and on a Linux fleet serving ten models around the clock.
 - **Room for every kind of provider.** Casuals set a daily budget and forget about it. Professionals run multi-model fleets, verify their business identity (Tier 4), or bring confidential-compute hardware and sell Tier 3, the only tier where prompts stay private. Higher trust clears at higher prices.
 - **Built for agentic work.** Standard OpenAI-compatible routes — chat, tools, JSON mode, streaming, vision, embeddings, image generation, speech in and out. The 8B–14B instruct models that agent loops actually run on serve from consumer GPUs and Macs, with tool calling verified per route.
+- **Workflow serving without a separate app.** ComfyUI workflows use the same gateway, catalog, provider admission, vouchers, receipts, and settlement path as model inference. Providers choose verified parts; users submit bounded graphs.
 - **Pay how you already pay.** Card via Stripe by default. If you'd rather pay on-chain, TAP (Ethereum) and TNK (Trac) work too; OpenRouter gives its users the same choice, and it's supported here to a similar extent. A payment option, not a crypto project. Everything is priced in dollars and network gas is sponsored, so you never need to hold a token to use or provide.
 - **Four trust tiers.** From community hardware up to confidential compute. Each tier is its own market with its own price, and the tier table below says exactly what each one does and doesn't protect.
 - **Evidence over trust.** Receipts are signed, work settles in public epochs, prices carry their derivation. The ledger is open and it is the source of truth.
@@ -209,6 +210,11 @@ sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config git 
   `pip`. Mayhem downloads the exact standalone `uv` archive for the host over
   HTTPS, verifies both archive and executable hashes, and atomically creates
   each frozen runtime under `~/.mayhem`.
+- ComfyUI workflow providers need a verified ComfyUI runtime checkout for the
+  blessed runtime, currently `comfyui-v0.30.1`. Use `python3` on `PATH`, or set
+  `MAYHEM_COMFYUI_PYTHON` to the executable belonging to that checkout's
+  environment. Workflow parts still come only from the signed parts index and
+  must pass `mayhem provider parts pull` plus `mayhem provider parts admit`.
 - AMD GPUs: ROCm, or a Vulkan loader for the Vulkan path.
 - Tier 2 needs a TPM 2.0 exposed at `/dev/tpmrm0` plus `tpm2-tools` (`sudo apt-get install -y tpm2-tools`). The quote helper runs as the provider user. If the distro exposes the device as `root:tss`, add the existing login to that existing distro group once with `sudo usermod -aG tss "$USER"`, then log out and back in. Mayhem never creates users or groups, changes device ACLs, or runs hardware-proof helpers merely because it detected a TPM.
 
@@ -241,6 +247,10 @@ Most installs are driven by a coding agent. Agent: execute in THIS order, verify
 5. **Preflight before serving**: run `mayhem doctor` and read its verdicts. It reports per-backend feasibility for this machine (which engines can run, expected tok/s, memory fit). Do not start a provider whose chosen backend the doctor marks insufficient.
 6. **Backend-specific extras — install only what the hardware/models need:**
    - **vLLM, TensorRT-LLM, and MLX**: Mayhem creates exact-version Python environments under `~/.mayhem/venvs`, discovers CUDA when applicable, and owns the backend caches. The `MAYHEM_*_PYTHON` variables are diagnostic overrides, not setup steps.
+   - **ComfyUI workflows**: verify the blessed ComfyUI runtime checkout and its
+     Python executable. Use `python3` if it belongs to that checkout; otherwise
+     set `MAYHEM_COMFYUI_PYTHON` explicitly. Then pull verified parts and run
+     `mayhem provider parts admit --write` before serving.
    - **Audio/image serving**: the engines are external binaries that must be on `PATH` (or pointed at by env): `whisper-cli` (`MAYHEM_WHISPER_CPP_BIN`), `piper` (`MAYHEM_PIPER_BIN`), `sd-cli` (`MAYHEM_STABLE_DIFFUSION_CPP_BIN`). Accelerator selection is automatic. Text-only providers can ignore this.
 7. **Start and verify**: `mayhem up --yes` (or `--provider`), then confirm the gateway answers (`curl http://127.0.0.1:11435/v1/models`) and, for providers, `mayhem provider health` is green AND the served model appears in `/v1/models`. A green health with a missing route means the model failed to load — re-run `mayhem doctor` and check the backend extras above.
 8. **Explain to the human** what was installed, where the dashboards are, and (providers) what their earnings depend on.
@@ -788,6 +798,38 @@ Class = smallest machine class that serves it well: **A** CPU/laptop, **B** cons
 | Video generation | `/v1/videos` |
 | Speech and transcription | `/v1/audio/speech`, `/v1/audio/transcriptions` |
 | Audio and music generation | `/v1/audio/generations`, `/v1/music/generations` |
+| ComfyUI workflows | `/v1/workflows` — Mayhem-native workflow graph execution |
+
+### ComfyUI workflows
+
+When the signed catalog exposes a workflow-enabled model, users call the same
+local gateway with a JSON body containing `model` and `workflow`. The gateway
+derives the graph hash, required parts, output class, runtime id, and quoted
+usage from the admin-signed workflow policy before it opens a paid session.
+Graphs using non-whitelisted nodes, unknown parts, unsafe paths, or outputs
+outside the signed caps fail before spend.
+
+Discover live workflow capacity:
+
+```bash
+curl 'http://127.0.0.1:11435/v1/models?endpoint_family=mayhem_comfy_workflows&live=true'
+```
+
+Schematic request shape:
+
+```json
+{
+  "model": "<workflow-enabled-model-id>",
+  "workflow": { "<node-id>": { "class_type": "<whitelisted-node>", "inputs": {} } },
+  "response_format": "artifact"
+}
+```
+
+Providers never download parts because a user asks for them. A provider first
+pulls verified parts from the anchored parts index, proves a reference graph and
+headroom for an outcome class, then advertises that class through ordinary
+heartbeats. The dashboard route counts for workflows therefore mean live
+admitted capacity, not merely catalog presence.
 
 Chatterbox uses `voice: "default"` for ordinary speech. For zero-shot cloning, add a bounded
 base64 WAV reference:

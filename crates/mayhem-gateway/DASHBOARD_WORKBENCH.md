@@ -39,6 +39,13 @@ Earn Overview, Jobs, Setup, Model fit, Earnings, and Reliability; Network
 Overview, Models, Providers, Markets, Activity, and Evidence; plus Help and
 Settings. Help is available at `/mayhem/dashboard/help`.
 
+Workflow-capable catalog entries appear through the same model and market
+surfaces. Production `/v1/models` and dashboard filters can select
+`endpoint_family=mayhem_comfy_workflows` plus workflow media, runtime id,
+outcome class, inventory root, and liveness. A workflow route is live only when
+the provider heartbeat carries a saved admission for the signed workflow class;
+installed parts alone are not serving capacity.
+
 No inference worker runs in the workbench. Playground exercises the complete
 browser/request/receipt UI flow against deterministic workbench responses.
 
