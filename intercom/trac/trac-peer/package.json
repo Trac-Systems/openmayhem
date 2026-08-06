@@ -1,7 +1,7 @@
 {
   "name": "trac-peer",
   "main": "src/index.js",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "type": "module",
   "pear": {
     "name": "trac-peer",
