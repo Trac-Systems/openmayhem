@@ -12,7 +12,7 @@ function normalizePublicKey(publicKey) {
     return null;
 }
 
-async function loadNetwork() {
+async function loadNetwork(options = {}) {
     const { default: esmock } = await import('esmock');
     let swarmInstance = null;
     let connectionManagerInstance = null;
@@ -30,7 +30,9 @@ async function loadNetwork() {
             this.leavePeer = sinon.stub();
             this.join = sinon.stub();
             this.flush = sinon.stub();
-            this.destroy = sinon.stub();
+            this.destroy = sinon.stub().callsFake(async () => {
+                this.removeAllListeners();
+            });
         }
     }
 
@@ -114,7 +116,11 @@ async function loadNetwork() {
     }
 
     class NetworkMessagesMock {
-        async setupProtomuxMessages() {}
+        async setupProtomuxMessages(connection) {
+            if (options.setupProtomuxMessages) {
+                return options.setupProtomuxMessages(connection);
+            }
+        }
     }
 
     class TransactionRateLimiterServiceMock {}
@@ -154,9 +160,20 @@ async function loadNetwork() {
     };
 
     const network = new Network({}, config, wallet.address);
-    await network.replicate({}, {}, wallet);
+    const store = options.store ?? {
+        replicate: sinon.stub().returns(new EventEmitter()),
+    };
+    await network.replicate({}, store, wallet);
 
-    return { network, swarmInstance, connectionManagerInstance };
+    return { network, swarmInstance, connectionManagerInstance, store };
+}
+
+function deferred() {
+    let resolve;
+    const promise = new Promise((done) => {
+        resolve = done;
+    });
+    return { promise, resolve };
 }
 
 if (isBareRuntime) {
@@ -207,5 +224,35 @@ if (isBareRuntime) {
         t.absent(disconnected, 'non-validator peer should be ignored by validator disconnect helper');
         t.ok(network.isConnectionPending(publicKey), 'non-validator pending connection should remain tracked');
         t.is(swarmInstance.leavePeer.callCount, 0, 'generic peer should not be left');
+    });
+
+    test('Network#close prevents late connection setup from replicating a closed Corestore', async t => {
+        const setupEntered = deferred();
+        const resumeSetup = deferred();
+        const store = {
+            replicate: sinon.stub().throws(new Error('Corestore is closed')),
+        };
+        const setupProtomuxMessages = sinon.stub().callsFake(async (connection) => {
+            connection.protocolSession = {
+                close: sinon.stub(),
+            };
+            setupEntered.resolve();
+            await resumeSetup.promise;
+        });
+        const { network, swarmInstance } = await loadNetwork({ store, setupProtomuxMessages });
+        const connection = new EventEmitter();
+        connection.remotePublicKey = b4a.alloc(32, 4);
+        connection.destroy = sinon.stub();
+
+        swarmInstance.emit('connection', connection);
+        await setupEntered.promise;
+
+        const closePromise = network.close();
+        resumeSetup.resolve();
+        await closePromise;
+        await new Promise(resolve => setTimeout(resolve, 0));
+
+        t.is(store.replicate.callCount, 0, 'late connection should not replicate after network close begins');
+        t.is(connection.destroy.callCount, 1, 'late connection should be destroyed');
     });
 }

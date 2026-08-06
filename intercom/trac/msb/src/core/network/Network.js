@@ -39,6 +39,7 @@ class Network extends ReadyResource {
     #wallet;
     #validatorHealthCheckService;
     #logger;
+    #closing = false;
 
     /**
      * @param {State} state
@@ -82,6 +83,7 @@ class Network extends ReadyResource {
 
     async _open() {
         this.#logger.info('Network initialization...');
+        this.#closing = false;
 
         this.setupNetworkListeners();
 
@@ -91,6 +93,7 @@ class Network extends ReadyResource {
 
     async _close() {
         this.#logger.info('Network: closing gracefully...');
+        this.#closing = true;
         await this.transactionPoolService.stopPool();
         await sleep(100);
         await this.#validatorObserverService.stopValidatorObserver();
@@ -104,8 +107,15 @@ class Network extends ReadyResource {
         this.#pendingRequestsService.close();
         this.#transactionCommitService.close();
 
-        if (this.#swarm !== null) {
-            this.#swarm.destroy();
+        const swarm = this.#swarm;
+        if (swarm !== null) {
+            if (typeof swarm.removeAllListeners === 'function') {
+                swarm.removeAllListeners('connection');
+            }
+            await swarm.destroy();
+            if (this.#swarm === swarm) {
+                this.#swarm = null;
+            }
         }
     }
 
@@ -198,14 +208,42 @@ class Network extends ReadyResource {
             this.#logger.info(`Channel: ${b4a.toString(this.#config.channel)}`);
 
             this.#swarm.on('connection', async (connection) => {
-                // Per-peer connection initialization:
-                // - attach Protomux (legacy + v1 channels/messages)
-                // - attach connection.protocolSession (used later by tryConnect / orchestrators to send messages)
-                await this.#networkMessages.setupProtomuxMessages(connection);
+                if (this.#closing) {
+                    this.#destroyConnection(connection);
+                    return;
+                }
 
-                // ATTENTION: Must be called AFTER the protomux init above
-                const stream = store.replicate(connection);
-                wakeup.addStream(stream);
+                try {
+                    // Per-peer connection initialization:
+                    // - attach Protomux (legacy + v1 channels/messages)
+                    // - attach connection.protocolSession (used later by tryConnect / orchestrators to send messages)
+                    await this.#networkMessages.setupProtomuxMessages(connection);
+
+                    // Pear v3 can deliver a late swarm connection while shutdown is
+                    // already closing the Corestore. Do not replicate a connection
+                    // after close has begun; store.replicate would otherwise throw.
+                    if (this.#closing || this.#swarm === null) {
+                        this.#destroyConnection(connection);
+                        return;
+                    }
+
+                    // ATTENTION: Must be called AFTER the protomux init above
+                    const stream = store.replicate(connection);
+                    wakeup.addStream(stream);
+                } catch (error) {
+                    const publicKey = connection.remotePublicKey
+                        ? b4a.toString(connection.remotePublicKey, 'hex')
+                        : 'unknown';
+                    this.#pendingRequestsService.rejectPendingRequestsForPeer(
+                        publicKey,
+                        error ?? new Error('Connection setup failed')
+                    );
+                    this.#destroyConnection(connection);
+                    if (!this.#closing) {
+                        this.#logger.error(error?.message ?? 'Unknown network connection setup error');
+                    }
+                    return;
+                }
 
                 const publicKey = b4a.toString(connection.remotePublicKey, 'hex');
                 if (this.#pendingConnections.has(publicKey)) {
@@ -218,9 +256,13 @@ class Network extends ReadyResource {
                         publicKey,
                         new Error('Connection closed before response')
                     );
-                    this.#swarm.leavePeer(connection.remotePublicKey);
+                    this.#swarm?.leavePeer(connection.remotePublicKey);
                     this.#validatorConnectionManager.remove(publicKey);
-                    connection.protocolSession.close();
+                    if (connection.protocolSession) {
+                        try {
+                            connection.protocolSession.close();
+                        } catch {}
+                    }
                 });
 
                 connection.on('error', (error) => {
@@ -343,6 +385,20 @@ class Network extends ReadyResource {
         clearTimeout(timeoutId);
         this.#pendingConnections.delete(publicKeyHex);
         return true;
+    }
+
+    #destroyConnection(connection) {
+        if (!connection) return;
+        if (connection.protocolSession) {
+            try {
+                connection.protocolSession.close();
+            } catch {}
+        }
+        if (typeof connection.destroy === 'function') {
+            connection.destroy();
+        } else if (typeof connection.end === 'function') {
+            connection.end();
+        }
     }
 }
 
