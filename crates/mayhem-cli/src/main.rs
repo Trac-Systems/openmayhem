@@ -57994,6 +57994,8 @@ const RECEIPT_SETTLEMENT_SUBMIT_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS);
 const RECEIPT_SETTLEMENT_OBSOLETE_CONTRACT_ERROR: &str =
     "receipt settlement feature has the wrong operation or contract version";
+const RECEIPT_SETTLEMENT_OBSOLETE_RECEIPT_SCHEMA_ERROR: &str =
+    "receipt settlement outer binding does not match its signed receipt";
 
 #[derive(Clone)]
 struct ReceiptSettlementOutbox {
@@ -58239,24 +58241,32 @@ impl ReceiptSettlementOutbox {
         for path in paths {
             match self.load_entry(&path) {
                 Ok(entry) => entries.push(entry),
-                Err(error) if receipt_settlement_outbox_error_is_obsolete_contract(&error) => {
-                    self.quarantine_obsolete_contract_entry(&path, &error)?;
+                Err(error) => {
+                    if let Some(reason) = receipt_settlement_outbox_quarantine_reason(&error) {
+                        self.quarantine_unsubmitable_entry(&path, &error, &reason)?;
+                    } else {
+                        return Err(error);
+                    }
                 }
-                Err(error) => return Err(error),
             }
         }
         Ok(entries)
     }
 
-    fn quarantine_obsolete_contract_entry(&self, path: &Path, error: &anyhow::Error) -> Result<()> {
+    fn quarantine_unsubmitable_entry(
+        &self,
+        path: &Path,
+        error: &anyhow::Error,
+        reason: &str,
+    ) -> Result<()> {
         let directory_name = self
             .directory
             .file_name()
             .and_then(OsStr::to_str)
             .unwrap_or("outbox");
-        let quarantine = self.directory.with_file_name(format!(
-            "{directory_name}.quarantine-contract-v{CONTRACT_VERSION}"
-        ));
+        let quarantine = self
+            .directory
+            .with_file_name(format!("{directory_name}.quarantine-{reason}"));
         fs::create_dir_all(&quarantine)
             .with_context(|| format!("creating {}", quarantine.display()))?;
         #[cfg(unix)]
@@ -58606,12 +58616,24 @@ fn sync_receipt_settlement_directory(_directory: &Path) -> Result<()> {
     Ok(())
 }
 
-fn receipt_settlement_outbox_error_is_obsolete_contract(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
+fn receipt_settlement_outbox_quarantine_reason(error: &anyhow::Error) -> Option<String> {
+    let obsolete_contract = error.chain().any(|cause| {
         cause
             .to_string()
             .contains(RECEIPT_SETTLEMENT_OBSOLETE_CONTRACT_ERROR)
-    })
+    });
+    if obsolete_contract {
+        return Some(format!("contract-v{CONTRACT_VERSION}"));
+    }
+    let obsolete_receipt_schema = error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains(RECEIPT_SETTLEMENT_OBSOLETE_RECEIPT_SCHEMA_ERROR)
+    });
+    if obsolete_receipt_schema {
+        return Some(format!("receipt-schema-v{SESSION_RECEIPT_SCHEMA_VERSION}"));
+    }
+    None
 }
 
 fn validate_receipt_settlement_feature(feature: &Value) -> Result<String> {
@@ -103658,6 +103680,41 @@ esac
         assert!(outbox.load_entries().unwrap().is_empty());
         assert!(!stale_path.exists());
         let quarantine = root.join(format!("gateway.quarantine-contract-v{CONTRACT_VERSION}"));
+        assert_eq!(fs::read_dir(quarantine).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_outbox_quarantines_obsolete_receipt_schema_entries_on_recovery() {
+        let root = test_temp_dir("mayhem-provider-receipt-outbox-obsolete-receipt-schema");
+        let directory = root.join("provider");
+        fs::create_dir_all(&directory).unwrap();
+        let mut feature = signed_receipt_settlement_feature_for_test(7);
+        feature["value"]["receipt"]["body"]["schema_version"] =
+            json!(SESSION_RECEIPT_SCHEMA_VERSION.saturating_sub(1));
+        let stale_path = directory.join("obsolete-receipt-schema-entry.json");
+        fs::write(
+            &stale_path,
+            serde_json::to_vec(&json!({
+                "schema_version": RECEIPT_SETTLEMENT_OUTBOX_SCHEMA_VERSION,
+                "feature": feature,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&stale_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let outbox = ReceiptSettlementOutbox::new(directory.clone()).unwrap();
+
+        assert!(outbox.load_entries().unwrap().is_empty());
+        assert!(!stale_path.exists());
+        let quarantine = root.join(format!(
+            "provider.quarantine-receipt-schema-v{SESSION_RECEIPT_SCHEMA_VERSION}"
+        ));
         assert_eq!(fs::read_dir(quarantine).unwrap().count(), 1);
         let _ = fs::remove_dir_all(root);
     }
