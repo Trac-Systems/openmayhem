@@ -22,6 +22,20 @@ base_dir = None
 control_mode = None
 
 
+def prefer_internal_queue_control():
+    return os.name == "nt"
+
+
+def comfy_path(path):
+    text = str(path)
+    if os.name == "nt":
+        if text.startswith("\\\\?\\UNC\\"):
+            return "\\\\" + text[8:]
+        if text.startswith("\\\\?\\"):
+            return text[4:]
+    return text
+
+
 def reply(message_id, ok, result=None, error=None):
     response = {"id": message_id, "ok": ok}
     if result is not None:
@@ -166,9 +180,9 @@ def capture_prompt_server_progress(prompt_id, progress):
 
 def load(payload):
     global prompt_server, base_dir, control_mode
-    runtime_root = Path(payload["runtime_root"]).resolve()
-    base_dir = Path(payload["base_dir"]).resolve()
-    socket_path = Path(payload["socket_path"]).resolve()
+    runtime_root = Path(comfy_path(Path(payload["runtime_root"]).resolve()))
+    base_dir = Path(comfy_path(Path(payload["base_dir"]).resolve()))
+    socket_path = Path(comfy_path(Path(payload["socket_path"]).resolve()))
     device = payload.get("device", "cpu")
     for path in (base_dir / "input", base_dir / "output", base_dir / "temp", base_dir / "user"):
         path.mkdir(parents=True, exist_ok=True)
@@ -176,7 +190,7 @@ def load(payload):
     with contextlib.suppress(FileNotFoundError):
         socket_path.unlink()
 
-    sys.path.insert(0, str(runtime_root))
+    sys.path.insert(0, comfy_path(runtime_root))
     argv = [
         "main.py",
         "--disable-auto-launch",
@@ -184,16 +198,29 @@ def load(payload):
         "--disable-api-nodes",
         "--dont-print-server",
         "--base-directory",
-        str(base_dir),
+        comfy_path(base_dir),
     ]
     if device == "cpu":
         argv.append("--cpu")
     sys.argv = argv
-    os.chdir(runtime_root)
+    os.chdir(comfy_path(runtime_root))
 
     import main
 
+    if prefer_internal_queue_control():
+        main.server.PromptServer.add_routes = lambda self: None
+
     _, prompt_server, _ = main.start_comfyui(loop)
+    if prefer_internal_queue_control():
+        loop.run_until_complete(prompt_server.setup())
+        control_mode = "internal_queue"
+        import nodes
+        return {
+            "object_info_classes": len(nodes.NODE_CLASS_MAPPINGS),
+            "node_classes": sorted(nodes.NODE_CLASS_MAPPINGS.keys()),
+            "socket_path": None,
+            "control_mode": "internal_queue",
+        }
     try:
         result = loop.run_until_complete(load_socket_async(socket_path))
         control_mode = "unix_socket"
@@ -320,6 +347,10 @@ async def shutdown():
     global runner, session
     if session is not None:
         await session.close()
+    if prompt_server is not None:
+        client_session = getattr(prompt_server, "client_session", None)
+        if client_session is not None:
+            await client_session.close()
     if runner is not None:
         await runner.cleanup()
 
