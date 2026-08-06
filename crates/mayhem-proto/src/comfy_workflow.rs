@@ -6,8 +6,8 @@ use serde_json::Value;
 
 use crate::{
     stable_json_bytes, ReceiptUsage, WorkflowOutputBinding, USAGE_AUDIO_SECOND,
-    USAGE_COMPUTE_SECOND, USAGE_FRAME, USAGE_IMAGE, USAGE_MEGAPIXEL, USAGE_MEGAPIXEL_STEP,
-    USAGE_STEP, USAGE_VIDEO_SECOND,
+    USAGE_COMPUTE_SECOND, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_MEGAPIXEL,
+    USAGE_MEGAPIXEL_STEP, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 
 pub const COMFY_WORKFLOW_DERIVATION_SCHEMA_VERSION: u32 = 1;
@@ -148,6 +148,7 @@ pub fn valid_comfy_pricing_unit(unit: &str) -> bool {
             | USAGE_MEGAPIXEL
             | USAGE_COMPUTE_SECOND
             | USAGE_AUDIO_SECOND
+            | USAGE_INPUT_CHARACTER
             | USAGE_FRAME
             | USAGE_IMAGE
             | USAGE_STEP
@@ -873,6 +874,8 @@ mod tests {
         let audio = derive_comfy_workflow(&av_graph(), &video_policy).unwrap();
         assert_eq!(audio.quoted_usage.get(USAGE_AUDIO_SECOND), 12);
         assert_eq!(audio.quoted_usage.units().len(), 1);
+
+        assert!(valid_comfy_pricing_unit(USAGE_INPUT_CHARACTER));
     }
 
     #[test]

@@ -1,0 +1,211 @@
+{
+  "schema": "openmayhem.comfy.outcome-class-grid.v1",
+  "version": 1,
+  "source": "docs/comfy/PRICING-GRID-2026-08-04.md",
+  "classes": [
+    {
+      "class_id": "image.light.le1_2mp",
+      "title": "Image light <=1.2MP",
+      "media": "image",
+      "lane": "light",
+      "pricing_unit": "megapixel_step",
+      "rate_map": [{ "unit": "megapixel_step", "per_unit_au": "180000000000000000", "granularity": 1000 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_megapixels": "1.2", "max_steps": 60, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "image.light.le4_5mp",
+      "title": "Image light <=4.5MP",
+      "media": "image",
+      "lane": "light",
+      "pricing_unit": "megapixel_step",
+      "rate_map": [{ "unit": "megapixel_step", "per_unit_au": "207000000000000000", "granularity": 1000 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_megapixels": "4.5", "max_steps": 60, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "image.light.le17mp",
+      "title": "Image light <=17MP",
+      "media": "image",
+      "lane": "light",
+      "pricing_unit": "megapixel_step",
+      "rate_map": [{ "unit": "megapixel_step", "per_unit_au": "252000000000000000", "granularity": 1000 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_megapixels": "17", "max_steps": 60, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "image.heavy.le1_2mp",
+      "title": "Image heavy <=1.2MP",
+      "media": "image",
+      "lane": "heavy",
+      "pricing_unit": "megapixel_step",
+      "rate_map": [{ "unit": "megapixel_step", "per_unit_au": "450000000000000000", "granularity": 1000 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_megapixels": "1.2", "max_steps": 60, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "image.heavy.le4_5mp",
+      "title": "Image heavy <=4.5MP",
+      "media": "image",
+      "lane": "heavy",
+      "pricing_unit": "megapixel_step",
+      "rate_map": [{ "unit": "megapixel_step", "per_unit_au": "517500000000000000", "granularity": 1000 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_megapixels": "4.5", "max_steps": 60, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "image.heavy.le17mp",
+      "title": "Image heavy <=17MP",
+      "media": "image",
+      "lane": "heavy",
+      "pricing_unit": "megapixel_step",
+      "rate_map": [{ "unit": "megapixel_step", "per_unit_au": "630000000000000000", "granularity": 1000 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_megapixels": "17", "max_steps": 60, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "video.light.le0_5mpf",
+      "title": "Video light <=0.5MP/frame",
+      "media": "video",
+      "lane": "light",
+      "pricing_unit": "megapixel_step",
+      "rate_map": [{ "unit": "megapixel_step", "per_unit_au": "36000000000000000", "granularity": 1000 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_megapixels_per_frame": "0.5", "max_seconds": 30, "max_frames": 720, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "video.light.le2_2mpf",
+      "title": "Video light <=2.2MP/frame",
+      "media": "video",
+      "lane": "light",
+      "pricing_unit": "megapixel_step",
+      "rate_map": [{ "unit": "megapixel_step", "per_unit_au": "41400000000000000", "granularity": 1000 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_megapixels_per_frame": "2.2", "max_seconds": 30, "max_frames": 720, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "video.heavy.le0_5mpf",
+      "title": "Video heavy <=0.5MP/frame",
+      "media": "video",
+      "lane": "heavy",
+      "pricing_unit": "megapixel_step",
+      "rate_map": [{ "unit": "megapixel_step", "per_unit_au": "90000000000000000", "granularity": 1000 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_megapixels_per_frame": "0.5", "max_seconds": 30, "max_frames": 720, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "video.heavy.le2_2mpf",
+      "title": "Video heavy <=2.2MP/frame",
+      "media": "video",
+      "lane": "heavy",
+      "pricing_unit": "megapixel_step",
+      "rate_map": [{ "unit": "megapixel_step", "per_unit_au": "103500000000000000", "granularity": 1000 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_megapixels_per_frame": "2.2", "max_seconds": 30, "max_frames": 720, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "upscale.conv.le24mp",
+      "title": "Convolutional upscale/restore <=24MP",
+      "media": "image",
+      "lane": "upscale-conv",
+      "pricing_unit": "megapixel",
+      "rate_map": [{ "unit": "megapixel", "per_unit_au": "300000000000000", "granularity": 1 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_output_megapixels": "24", "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "upscale.conv.le512mp",
+      "title": "Convolutional upscale/restore <=512MP",
+      "media": "image",
+      "lane": "upscale-conv",
+      "pricing_unit": "megapixel",
+      "rate_map": [{ "unit": "megapixel", "per_unit_au": "300000000000000", "granularity": 1 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_output_megapixels": "512", "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "upscale.diffusion",
+      "title": "Diffusion upscale/restore",
+      "media": "image",
+      "lane": "upscale-diffusion",
+      "pricing_unit": "megapixel_step",
+      "rate_map": [{ "unit": "megapixel_step", "per_unit_au": "180000000000000000", "granularity": 1000 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_output_megapixels": "17", "max_steps": 60, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "audio.tts",
+      "title": "Text to speech",
+      "media": "audio",
+      "lane": "tts",
+      "pricing_unit": "audio_second",
+      "rate_map": [
+        { "unit": "input_character", "per_unit_au": "1", "granularity": 1 },
+        { "unit": "audio_second", "per_unit_au": "60000000000000", "granularity": 1 }
+      ],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_audio_seconds": 600, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "audio.generation",
+      "title": "Audio generation",
+      "media": "audio",
+      "lane": "audio-generation",
+      "pricing_unit": "audio_second",
+      "rate_map": [
+        { "unit": "input_character", "per_unit_au": "1", "granularity": 1 },
+        { "unit": "audio_second", "per_unit_au": "100000000000000", "granularity": 1 }
+      ],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_audio_seconds": 600, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "audio.stt",
+      "title": "Speech to text",
+      "media": "audio",
+      "lane": "stt",
+      "pricing_unit": "audio_second",
+      "rate_map": [{ "unit": "audio_second", "per_unit_au": "1000000000000000", "granularity": 60 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_audio_seconds": 3600, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "video.lipsync",
+      "title": "Lip sync",
+      "media": "video",
+      "lane": "lipsync",
+      "pricing_unit": "frame",
+      "rate_map": [{ "unit": "frame", "per_unit_au": "200000000000000", "granularity": 1 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_frames": 720, "max_seconds": 30, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "class_id": "compute.norm",
+      "title": "Normalized residual compute",
+      "media": "image",
+      "lane": "residual",
+      "pricing_unit": "compute_second",
+      "rate_map": [{ "unit": "compute_second", "per_unit_au": "1000000000000000", "granularity": 1 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_compute_seconds": 600, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    }
+  ]
+}

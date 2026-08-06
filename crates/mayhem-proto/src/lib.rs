@@ -14,9 +14,9 @@ mod parts_catalog;
 mod validated_audio;
 
 pub use comfy_workflow::{
-    derive_comfy_workflow, ComfyWorkflowCatalogPolicy, ComfyWorkflowDerivation,
-    ComfyWorkflowDerivationError, ComfyWorkflowDerivationPolicy, ComfyWorkflowOutcomeSpec,
-    ComfyWorkflowPartRef, COMFY_WORKFLOW_DERIVATION_SCHEMA_VERSION,
+    derive_comfy_workflow, valid_comfy_pricing_unit, ComfyWorkflowCatalogPolicy,
+    ComfyWorkflowDerivation, ComfyWorkflowDerivationError, ComfyWorkflowDerivationPolicy,
+    ComfyWorkflowOutcomeSpec, ComfyWorkflowPartRef, COMFY_WORKFLOW_DERIVATION_SCHEMA_VERSION,
     DEFAULT_COMFY_WORKFLOW_RUNTIME_ID,
 };
 pub use endpoint_contract::{

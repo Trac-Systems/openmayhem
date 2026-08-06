@@ -353,6 +353,8 @@ const MODEL_CLASS_TTS: &str = "tts";
 const MODEL_CLASS_STT: &str = "stt";
 const MODEL_CLASS_AUDIO_GENERATION: &str = "audio-generation";
 const MODEL_CLASS_MUSIC_GENERATION: &str = "music-generation";
+const MODEL_CLASS_WORKFLOW: &str = "workflow";
+const DEFAULT_COMFY_OUTCOME_GRID_PATH: &str = "catalog/comfy/outcome-classes-v1.json";
 
 #[derive(Debug, Parser)]
 #[command(name = "mayhem")]
@@ -684,6 +686,11 @@ enum AdminCommands {
     SetModelRef(AdminSetModelRefArgs),
     /// Publish the latest signed catalog release anchor for network discovery.
     PublishCatalog(AdminPublishCatalogArgs),
+    /// Build local admin payloads for Comfy outcome-class markets.
+    WorkflowGrid {
+        #[command(subcommand)]
+        command: AdminWorkflowGridCommands,
+    },
     /// Local Comfy parts catalog preparation helpers.
     Parts {
         #[command(subcommand)]
@@ -781,6 +788,12 @@ enum AdminCommands {
 enum AdminPriceCommands {
     /// Seed the admin-owned initial market price P0 for an enclave.
     Seed(AdminPriceSeedArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum AdminWorkflowGridCommands {
+    /// Verify a Comfy outcome-class grid and emit catalog/enclave/price payloads.
+    Build(AdminWorkflowGridBuildArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -4208,6 +4221,55 @@ struct AdminPublishCatalogArgs {
     /// Path to a JSON array of workflow outcome-class references.
     #[arg(long = "outcome-classes-file", value_name = "PATH")]
     outcome_classes_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminWorkflowGridBuildArgs {
+    /// Path to the machine-readable outcome-class grid.
+    #[arg(long = "input", value_name = "PATH")]
+    input: Option<PathBuf>,
+
+    /// Hugging Face repository that will publish one class-definition JSON per outcome class.
+    #[arg(
+        long = "artifact-repo",
+        default_value = "TracNetwork/openmayhem-parts-index"
+    )]
+    artifact_repo: String,
+
+    /// Immutable repository revision containing the class-definition artifacts.
+    #[arg(long = "artifact-revision")]
+    artifact_revision: String,
+
+    /// Directory prefix inside --artifact-repo for the class-definition artifacts.
+    #[arg(
+        long = "artifact-path-prefix",
+        default_value = "comfy/outcome-classes/v1"
+    )]
+    artifact_path_prefix: String,
+
+    /// Admin-published Comfy workflow runtime binary hash for class-enclave launch metadata.
+    #[arg(long = "binary-hash")]
+    binary_hash: String,
+
+    /// Admin-published Comfy workflow class manifest hash.
+    #[arg(long = "manifest-hash")]
+    manifest_hash: String,
+
+    /// Enclave attestation tier to use in generated register_enclave payloads.
+    #[arg(long = "att-tier", default_value_t = 1)]
+    att_tier: u8,
+
+    /// Contract timestamp/slot at which seed prices become active.
+    #[arg(long = "effective-at", default_value_t = 0)]
+    effective_at: u64,
+
+    /// Room nonce prefix. The class id is appended to keep room ids stable and unique.
+    #[arg(long = "room-nonce-prefix", default_value = "comfy-grid-v1")]
+    room_nonce_prefix: String,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -25010,6 +25072,7 @@ async fn admin(command: AdminCommands) -> Result<()> {
         AdminCommands::Ban { command } => return admin_ban(command).await,
         AdminCommands::Tier3 { command } => return admin_tier3(command).await,
         AdminCommands::Parts { command } => return admin_parts(command).await,
+        AdminCommands::WorkflowGrid { command } => return admin_workflow_grid(command),
         AdminCommands::EpochApply(args) => return run_admin_epoch_apply_feature(args).await,
         AdminCommands::PublishPayoutContext(args) => {
             return run_admin_publish_payout_context_feature(args).await;
@@ -31700,6 +31763,9 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::PublishPayoutContext(args) => &args.tx,
         AdminCommands::SetModelRef(args) => &args.tx,
         AdminCommands::PublishCatalog(args) => &args.tx,
+        AdminCommands::WorkflowGrid { .. } => {
+            unreachable!("admin workflow-grid commands are local prep commands")
+        }
         AdminCommands::Parts { .. } => {
             unreachable!("admin parts commands are handled before admin_tx_args")
         }
@@ -31766,6 +31832,9 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
         AdminCommands::SetModelRef(args) => Ok(("setModelRef", admin_set_model_ref_payload(args)?)),
         AdminCommands::PublishCatalog(args) => {
             Ok(("publishCatalog", admin_publish_catalog_payload(args)?))
+        }
+        AdminCommands::WorkflowGrid { .. } => {
+            bail!("admin workflow-grid commands are local prep commands, not paid admin txs")
         }
         AdminCommands::Parts { .. } => {
             bail!("admin parts commands are handled outside generic paid admin commands")
@@ -32239,6 +32308,324 @@ fn admin_publish_catalog_parts_anchor_payload(
         "record_count": verified.index.parts.len() as u64,
         "repo_revision": repo_revision,
     })))
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct AdminWorkflowOutcomeGrid {
+    schema: String,
+    version: u32,
+    source: String,
+    classes: Vec<AdminWorkflowOutcomeClassDefinition>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct AdminWorkflowOutcomeClassDefinition {
+    class_id: String,
+    title: String,
+    media: String,
+    #[serde(default)]
+    lane: Option<String>,
+    pricing_unit: String,
+    rate_map: Vec<RateMapEntry>,
+    #[serde(default, with = "mayhem_proto::decimal_u128")]
+    per_req_au: MoneyAu,
+    #[serde(default, with = "mayhem_proto::decimal_u128")]
+    min_session_au: MoneyAu,
+    #[serde(default)]
+    caps: Value,
+}
+
+fn admin_workflow_grid(command: &AdminWorkflowGridCommands) -> Result<()> {
+    match command {
+        AdminWorkflowGridCommands::Build(args) => admin_workflow_grid_build(args),
+    }
+}
+
+fn admin_workflow_grid_build(args: &AdminWorkflowGridBuildArgs) -> Result<()> {
+    validate_launch_enclave_attestation_tier(args.att_tier)?;
+    validate_hex32_config("--binary-hash", Some(&args.binary_hash))?;
+    validate_hex32_config("--manifest-hash", Some(&args.manifest_hash))?;
+    ensure!(
+        is_hex_len(&args.artifact_revision, 40),
+        "--artifact-revision must be a 40-hex immutable Hugging Face revision"
+    );
+    ensure!(
+        valid_provider_admission_ref(&args.artifact_path_prefix.replace('/', "-")),
+        "--artifact-path-prefix must be a safe path prefix"
+    );
+    let input = args
+        .input
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| repo_path(DEFAULT_COMFY_OUTCOME_GRID_PATH))?;
+    let input = absolutize(input)?;
+    let grid: AdminWorkflowOutcomeGrid = serde_json::from_value(
+        read_json_file(&input)
+            .with_context(|| format!("reading Comfy outcome-class grid {}", input.display()))?,
+    )
+    .with_context(|| format!("parsing Comfy outcome-class grid {}", input.display()))?;
+    let report = admin_workflow_grid_report(args, &grid, &input)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("Comfy outcome-class grid ready.");
+        println!("Grid: {}", input.display());
+        println!("Classes: {}", report["class_count"]);
+        println!(
+            "Catalog outcome_classes: {}",
+            report["outcome_classes"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or(0)
+        );
+        println!(
+            "Register payloads: {}",
+            report["register_enclave_payloads"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or(0)
+        );
+        println!(
+            "Seed payloads: {}",
+            report["set_price_payloads"]
+                .as_array()
+                .map(Vec::len)
+                .unwrap_or(0)
+        );
+    }
+    Ok(())
+}
+
+fn admin_workflow_grid_report(
+    args: &AdminWorkflowGridBuildArgs,
+    grid: &AdminWorkflowOutcomeGrid,
+    input: &Path,
+) -> Result<Value> {
+    ensure!(
+        grid.schema == "openmayhem.comfy.outcome-class-grid.v1",
+        "unsupported Comfy outcome-class grid schema {}",
+        grid.schema
+    );
+    ensure!(
+        grid.version > 0,
+        "Comfy outcome-class grid version must be positive"
+    );
+    ensure!(
+        !grid.classes.is_empty(),
+        "Comfy outcome-class grid is empty"
+    );
+    let mut seen = BTreeSet::new();
+    let mut outcome_classes = Vec::new();
+    let mut class_artifacts = Vec::new();
+    let mut register_enclave_payloads = Vec::new();
+    let mut set_model_ref_payloads = Vec::new();
+    let mut set_price_payloads = Vec::new();
+    let mut open_room_payloads = Vec::new();
+    for class in &grid.classes {
+        validate_workflow_outcome_class_definition(class)?;
+        ensure!(
+            seen.insert(class.class_id.clone()),
+            "duplicate Comfy outcome class {}",
+            class.class_id
+        );
+        let definition = workflow_outcome_class_definition_value(grid, class);
+        let definition_hash =
+            opaque_value_hash("mayhem-comfy-outcome-class-definition-v1", &definition);
+        let source_sha256 = {
+            let bytes = stable_json_bytes(&definition)?;
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            hex_encode(&hasher.finalize())
+        };
+        let enclave_id = opaque_value_hash(
+            "mayhem-comfy-outcome-class-enclave-v1",
+            &json!({
+                "class_id": class.class_id,
+                "definition_hash": definition_hash,
+            }),
+        );
+        let artifact_path = format!(
+            "{}/{}.json",
+            args.artifact_path_prefix.trim_matches('/'),
+            class.class_id
+        );
+        let caps = workflow_outcome_class_enclave_caps(class);
+        outcome_classes.push(json!({
+            "class_id": class.class_id,
+            "enclave_id": enclave_id,
+            "definition_hash": definition_hash,
+            "status": "active",
+        }));
+        class_artifacts.push(json!({
+            "class_id": class.class_id,
+            "path": artifact_path,
+            "definition_hash": definition_hash,
+            "source_sha256": source_sha256,
+            "definition": definition,
+        }));
+        register_enclave_payloads.push(json!({
+            "op": "register_enclave",
+            "enclave_id": enclave_id,
+            "model_id": class.class_id,
+            "model_class": MODEL_CLASS_WORKFLOW,
+            "backend": "comfyui",
+            "artifact_root": definition_hash,
+            "artifact_root_kind": "blake3_merkle_v1",
+            "artifact_source": {
+                "kind": "huggingface",
+                "repo": args.artifact_repo,
+                "revision": args.artifact_revision.to_ascii_lowercase(),
+                "path": artifact_path,
+            },
+            "manifest_hash": args.manifest_hash.to_ascii_lowercase(),
+            "att_tier": args.att_tier,
+            "quant": "unknown",
+            "binary_hash": args.binary_hash.to_ascii_lowercase(),
+            "approved_binary_hashes": [args.binary_hash.to_ascii_lowercase()],
+            "source_sha256": source_sha256,
+            "caps": caps,
+        }));
+        set_model_ref_payloads.push(json!({
+            "op": "set_model_ref",
+            "model_id": class.class_id,
+            "model_class": MODEL_CLASS_WORKFLOW,
+            "rate_map": normalize_rate_map(class.rate_map.clone()),
+            "source_hash": definition_hash,
+        }));
+        set_price_payloads.push(json!({
+            "op": "set_price",
+            "enclave_id": enclave_id,
+            "rate_map": normalize_rate_map(class.rate_map.clone()),
+            "per_req_au": money_au_json(class.per_req_au),
+            "min_session_au": money_au_json(class.min_session_au),
+            "effective_at": args.effective_at,
+        }));
+        open_room_payloads.push(json!({
+            "op": "open_room",
+            "enclave_id": enclave_id,
+            "model_id": class.class_id,
+            "nonce": format!(
+                "{}-{}",
+                args.room_nonce_prefix,
+                class.class_id.replace('.', "-")
+            ),
+            "label": class.title,
+            "policy": {},
+        }));
+    }
+    Ok(json!({
+        "ok": true,
+        "action": "admin.workflow_grid.build",
+        "grid_path": input,
+        "schema": grid.schema,
+        "version": grid.version,
+        "source": grid.source,
+        "class_count": grid.classes.len(),
+        "outcome_classes": outcome_classes,
+        "class_artifacts": class_artifacts,
+        "register_enclave_payloads": register_enclave_payloads,
+        "set_model_ref_payloads": set_model_ref_payloads,
+        "set_price_payloads": set_price_payloads,
+        "open_room_payloads": open_room_payloads,
+    }))
+}
+
+fn validate_workflow_outcome_class_definition(
+    class: &AdminWorkflowOutcomeClassDefinition,
+) -> Result<()> {
+    ensure!(
+        valid_provider_admission_ref(&class.class_id),
+        "invalid Comfy outcome class id {}",
+        class.class_id
+    );
+    ensure!(
+        !class.title.trim().is_empty() && class.title.len() <= 128,
+        "Comfy outcome class {} title must be 1..=128 characters",
+        class.class_id
+    );
+    ensure!(
+        matches!(class.media.as_str(), "image" | "video" | "audio"),
+        "Comfy outcome class {} has unsupported media {}",
+        class.class_id,
+        class.media
+    );
+    if let Some(lane) = class.lane.as_deref() {
+        ensure!(
+            valid_provider_admission_ref(lane),
+            "Comfy outcome class {} has invalid lane {}",
+            class.class_id,
+            lane
+        );
+    }
+    ensure!(
+        mayhem_proto::valid_comfy_pricing_unit(&class.pricing_unit),
+        "Comfy outcome class {} has unsupported pricing unit {}",
+        class.class_id,
+        class.pricing_unit
+    );
+    validate_rate_map_entries(&class.rate_map, false, "workflow outcome-class rate_map")?;
+    for entry in &class.rate_map {
+        ensure!(
+            mayhem_proto::valid_comfy_pricing_unit(&entry.unit),
+            "Comfy outcome class {} rate_map unit {} is not valid for workflow pricing",
+            class.class_id,
+            entry.unit
+        );
+    }
+    ensure!(
+        class
+            .rate_map
+            .iter()
+            .any(|entry| entry.unit == class.pricing_unit),
+        "Comfy outcome class {} rate_map must contain pricing_unit {}",
+        class.class_id,
+        class.pricing_unit
+    );
+    ensure!(
+        class.caps.is_object(),
+        "Comfy outcome class {} caps must be a JSON object",
+        class.class_id
+    );
+    Ok(())
+}
+
+fn workflow_outcome_class_definition_value(
+    grid: &AdminWorkflowOutcomeGrid,
+    class: &AdminWorkflowOutcomeClassDefinition,
+) -> Value {
+    json!({
+        "schema": grid.schema,
+        "grid_version": grid.version,
+        "source": grid.source,
+        "class_id": class.class_id,
+        "title": class.title,
+        "media": class.media,
+        "lane": class.lane,
+        "pricing_unit": class.pricing_unit,
+        "rate_map": normalize_rate_map(class.rate_map.clone()),
+        "per_req_au": money_au_json(class.per_req_au),
+        "min_session_au": money_au_json(class.min_session_au),
+        "caps": class.caps,
+    })
+}
+
+fn workflow_outcome_class_enclave_caps(class: &AdminWorkflowOutcomeClassDefinition) -> Value {
+    let modalities: Vec<&str> = match class.media.as_str() {
+        "image" => vec!["image"],
+        "video" => vec!["video"],
+        "audio" => vec!["audio"],
+        _ => Vec::new(),
+    };
+    let output_modality = modalities.first().copied().unwrap_or("image");
+    json!({
+        "image": class.media == "image",
+        "video": class.media == "video",
+        "audio": class.media == "audio",
+        "output_modality": output_modality,
+        "output_modalities": modalities,
+        "modality_set": modalities,
+        "speciality_levels": {},
+    })
 }
 
 fn admin_register_enclave_payload(args: &AdminRegisterEnclaveArgs) -> Result<Value> {
@@ -92287,6 +92674,80 @@ mod tests {
         );
         assert_eq!(payload["outcome_classes"][0]["class_id"], "image.light.512");
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn admin_workflow_grid_build_emits_class_enclave_and_seed_payloads() {
+        let input = repo_path(DEFAULT_COMFY_OUTCOME_GRID_PATH).unwrap();
+        let grid: AdminWorkflowOutcomeGrid =
+            serde_json::from_value(read_json_file(&input).unwrap()).unwrap();
+        let args = AdminWorkflowGridBuildArgs {
+            input: Some(input.clone()),
+            artifact_repo: "TracNetwork/openmayhem-parts-index".to_owned(),
+            artifact_revision: "a".repeat(40),
+            artifact_path_prefix: "comfy/outcome-classes/v1".to_owned(),
+            binary_hash: "b".repeat(64),
+            manifest_hash: "c".repeat(64),
+            att_tier: 1,
+            effective_at: 86_400,
+            room_nonce_prefix: "comfy-grid-v1".to_owned(),
+            json: true,
+        };
+        let report = admin_workflow_grid_report(&args, &grid, &input).unwrap();
+        assert_eq!(report["class_count"], json!(18));
+        assert_eq!(report["outcome_classes"].as_array().unwrap().len(), 18);
+        assert_eq!(
+            report["register_enclave_payloads"]
+                .as_array()
+                .unwrap()
+                .len(),
+            18
+        );
+        assert_eq!(
+            report["set_model_ref_payloads"].as_array().unwrap().len(),
+            18
+        );
+        assert_eq!(report["set_price_payloads"].as_array().unwrap().len(), 18);
+        assert_eq!(report["open_room_payloads"].as_array().unwrap().len(), 18);
+
+        let first_ref = &report["outcome_classes"][0];
+        assert_eq!(first_ref["class_id"], "image.light.le1_2mp");
+        assert_eq!(first_ref["enclave_id"].as_str().unwrap().len(), 64);
+        assert_eq!(first_ref["definition_hash"].as_str().unwrap().len(), 64);
+
+        let first_register = &report["register_enclave_payloads"][0];
+        assert_eq!(first_register["op"], "register_enclave");
+        assert_eq!(first_register["model_class"], MODEL_CLASS_WORKFLOW);
+        assert_eq!(first_register["backend"], "comfyui");
+        assert_eq!(first_register["artifact_root_kind"], "blake3_merkle_v1");
+        assert_eq!(
+            first_register["artifact_source"]["revision"],
+            "a".repeat(40)
+        );
+        assert_eq!(
+            first_register["artifact_source"]["path"],
+            "comfy/outcome-classes/v1/image.light.le1_2mp.json"
+        );
+        assert_eq!(first_register["caps"]["output_modality"], "image");
+
+        let first_price = &report["set_price_payloads"][0];
+        assert_eq!(first_price["effective_at"], json!(86_400));
+        assert_eq!(
+            first_price["rate_map"],
+            json!([{ "unit": "megapixel_step", "per_unit_au": "180000000000000000", "granularity": 1000 }])
+        );
+
+        let tts_ref = report["set_model_ref_payloads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|payload| payload["model_id"] == "audio.tts")
+            .expect("tts class");
+        assert!(tts_ref["rate_map"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["unit"] == USAGE_INPUT_CHARACTER));
     }
 
     #[test]
