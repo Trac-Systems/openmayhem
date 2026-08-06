@@ -1399,6 +1399,156 @@ test('MayhemContract validates workflow outcome-class governed rate units', asyn
   assert.equal(result.ok, true, result.message);
 });
 
+test('MayhemContract floats workflow outcome-class markets from settled utilization', async () => {
+  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
+  const user = await makeIdentity();
+  const providerTwo = await makeIdentity();
+  const workflowEnclaveId = 'e'.repeat(64);
+  const workflowModelId = 'image.light.le1_2mp';
+  const workflowRateMap = [
+    { unit: 'megapixel_step', per_unit_au: '200000000000000', granularity: 1000 },
+  ];
+  const workflowEnclave = {
+    ...enclaveRegistration,
+    enclave_id: workflowEnclaveId,
+    model_id: workflowModelId,
+    model_class: 'workflow',
+    caps: {
+      image: true,
+      output_modality: 'image',
+      output_modalities: ['image'],
+      modality_set: ['image'],
+      speciality_levels: {},
+    },
+  };
+  const workflowJoin = {
+    ...providerJoin,
+    enclave_id: workflowEnclaveId,
+    served_ctx: 0,
+    served_modalities: ['image'],
+    served_specialities: {},
+    ctx_bracket: null,
+    ctx_bracket_table_ver: null,
+  };
+
+  for (const op of [
+    {
+      type: 'registerEnclave',
+      value: workflowEnclave,
+      sender: admin.publicKey,
+      txNo: 5,
+    },
+    {
+      type: 'setModelRef',
+      value: {
+        op: 'set_model_ref',
+        model_id: workflowModelId,
+        model_class: 'workflow',
+        rate_map: workflowRateMap,
+      },
+      sender: admin.publicKey,
+      txNo: 6,
+    },
+    {
+      type: 'setPrice',
+      value: {
+        op: 'set_price',
+        enclave_id: workflowEnclaveId,
+        rate_map: workflowRateMap,
+        per_req_au: '0',
+        min_session_au: '0',
+        effective_at: 21_600,
+      },
+      sender: admin.publicKey,
+      txNo: 7,
+    },
+    {
+      type: 'joinEnclave',
+      value: workflowJoin,
+      sender: provider.publicKey,
+      txNo: 8,
+    },
+  ]) {
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
+    assert.equal(result.ok, true, result.message);
+  }
+
+  for (const op of [
+    {
+      type: 'consent',
+      value: {
+        op: 'consent',
+        ver: 1,
+        hash: rulesHash,
+        sig: signConsent(providerTwo.wallet, 1, rulesHash),
+      },
+      sender: providerTwo.publicKey,
+      txNo: 9,
+    },
+    {
+      type: 'registerProvider',
+      value: providerRegistration,
+      sender: providerTwo.publicKey,
+      txNo: 10,
+    },
+    {
+      type: 'joinEnclave',
+      value: workflowJoin,
+      sender: providerTwo.publicKey,
+      txNo: 11,
+    },
+  ]) {
+    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
+    assert.equal(result.ok, true, result.message);
+  }
+  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000_000));
+
+  const applyValue = {
+    op: 'epoch_apply',
+    epoch: 1,
+    at: 43_201,
+    debits: [{ rail: 'fiat', user: user.publicKey, au: '2000000' }],
+    earnings: [
+      { rail: 'fiat', provider: provider.publicKey, gross_au: '1000000' },
+      { rail: 'fiat', provider: providerTwo.publicKey, gross_au: '1000000' },
+    ],
+    market_usage: [{
+      enclave_id: workflowEnclaveId,
+      demand_au: '2000000',
+      session_count: 4,
+      provider_count: 2,
+    }],
+  };
+  await seedSpendHoldsForApply(storage, applyValue);
+  const applied = await executeEpochApplyFeature(contract, storage, applyValue, admin.publicKey);
+  assert.equal(applied.ok, true, applied.message);
+  assert.equal(applied.market_prices.length, 1);
+  assert.deepEqual(
+    { ...applied.market_prices[0], derivation_hash: '<hash>' },
+    {
+      enclave_id: workflowEnclaveId,
+      ver: 2,
+      utilization_bps: 10_000,
+      ema_utilization_bps: 8_875,
+      active_supply: 2,
+      active_demand_au: '2000000',
+      frozen: false,
+      derivation_hash: '<hash>',
+    }
+  );
+  assertHash(applied.market_prices[0].derivation_hash);
+
+  const schedule = (await storage.get(`price/${workflowEnclaveId}`)).value;
+  assert.equal(schedule.current.price_source, 'market_float');
+  assert.equal(schedule.current.model_id, workflowModelId);
+  assert.equal(rateFor(schedule.current.rate_map, 'megapixel_step'), '220000000000000');
+  assert.equal(schedule.current.seed.rate_map[0].unit, 'megapixel_step');
+  const derivation = (await storage.get(`ev/price/1/${workflowEnclaveId}`)).value;
+  assert.equal(derivation.controller.frozen, false);
+  assert.equal(derivation.controller.active_supply, 2);
+  assert.equal(derivation.usage.active_demand_au, '2000000');
+});
+
 test('MayhemContract rejects unsafe enclave identifiers in price reads and writes', async () => {
   const provider = await makeIdentity();
   const admin = await makeIdentity();
