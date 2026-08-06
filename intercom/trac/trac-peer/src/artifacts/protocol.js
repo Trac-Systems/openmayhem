@@ -237,10 +237,11 @@ class Protocol{
             return await this.simulateTransaction(validator_pub_key, obj, surrogate);
         }
 
-        const txvHex = await this.peer.msbClient.getTxvHex();
-        const msbBootstrapHex = this.peer.msbClient.bootstrapHex;
-        const subnetBootstrapHex = (b4a.isBuffer(this.peer.config.bootstrap) ? this.peer.config.bootstrap.toString('hex') : (''+this.peer.config.bootstrap)).toLowerCase();
-        const content_hash = await createHash(this.safeJsonStringify(obj));
+        let txvHex = await this.peer.msbClient.getTxvHex();
+        let msbBootstrapHex = this.peer.msbClient.bootstrapHex;
+        let subnetBootstrapHex = (b4a.isBuffer(this.peer.config.bootstrap) ? this.peer.config.bootstrap.toString('hex') : (''+this.peer.config.bootstrap)).toLowerCase();
+        let incomingWritingKeyHex = this.peer.writerLocalKey;
+        let content_hash = await createHash(this.safeJsonStringify(obj));
 
         let nonceHex, txHex, signatureHex, pubKeyHex;
         if(surrogate !== null) {
@@ -248,12 +249,17 @@ class Protocol{
             txHex = surrogate.tx;
             signatureHex = surrogate.signature;
             pubKeyHex = surrogate.address;
+            txvHex = surrogate.txv || txvHex;
+            incomingWritingKeyHex = surrogate.iw || incomingWritingKeyHex;
+            content_hash = surrogate.ch || content_hash;
+            subnetBootstrapHex = surrogate.bs || subnetBootstrapHex;
+            msbBootstrapHex = surrogate.mbs || msbBootstrapHex;
         } else {
             nonceHex = this.generateNonce();
             txHex = await this.generateTx(
                 this.peer.msbClient.networkId,
                 txvHex,
-                this.peer.writerLocalKey,
+                incomingWritingKeyHex,
                 content_hash,
                 subnetBootstrapHex,
                 msbBootstrapHex,
@@ -272,7 +278,7 @@ class Protocol{
             txo: {
                 tx: txHex,
                 txv: txvHex,
-                iw: this.peer.writerLocalKey,
+                iw: incomingWritingKeyHex,
                 in: nonceHex,
                 ch: content_hash,
                 is: signatureHex,
@@ -282,8 +288,27 @@ class Protocol{
         };
 
         await this.peer.msbClient.validateTransaction(payload);
-        await this.peer.msbClient.broadcastTransaction(payload);
-        if(this.peer.txPool.isNotFull() && !this.peer.txPool.contains(txHex)){
+        const broadcast = await this.peer.msbClient.broadcastTransaction(payload);
+        if (
+            broadcast?.localCommit &&
+            Number.isSafeInteger(broadcast.localCommit.msbsl) &&
+            typeof broadcast.localCommit.validator === 'string' &&
+            /^[0-9a-f]{64}$/.test(broadcast.localCommit.validator)
+        ) {
+            await this.peer.base.append({
+                type: 'tx',
+                key: txHex,
+                value: {
+                    msbsl: broadcast.localCommit.msbsl,
+                    dispatch: obj,
+                    ipk: pubKeyHex,
+                    wp: broadcast.localCommit.validator,
+                },
+            });
+            if (typeof this.peer.base.update === 'function') {
+                await this.peer.base.update();
+            }
+        } else if(this.peer.txPool.isNotFull() && !this.peer.txPool.contains(txHex)){
             this.peer.txPool.add(txHex, { dispatch : obj, ipk : pubKeyHex, address : address });
         }
         return payload;

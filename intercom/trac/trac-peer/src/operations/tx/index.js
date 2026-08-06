@@ -59,8 +59,20 @@ export class TxOperation {
         if (null === decoded.txo.bs || decoded.txo.bs.toString('hex') !== subnetBootstrapHex) return;
         if (null === decoded.txo.mbs || decoded.txo.mbs.toString('hex') !== this.#msbClient.bootstrapHex) return;
         // Cross-check: content hash matches the subnet dispatch payload (blake3)
-        const contentHash = await createHash(jsonStringify(op.value.dispatch));
-        if (null === decoded.txo.ch || decoded.txo.ch.toString('hex') !== contentHash) return;
+        const expectedContentHash = decoded.txo.ch?.toString('hex') ?? null;
+        const dispatchCandidates =
+            typeof this.#protocolInstance.txHashDispatchCandidates === 'function'
+                ? this.#protocolInstance.txHashDispatchCandidates(op.value.dispatch)
+                : [op.value.dispatch];
+        let contentHashMatches = false;
+        for (const dispatchCandidate of dispatchCandidates) {
+            const contentHash = await createHash(this.#protocolInstance.safeJsonStringify(dispatchCandidate));
+            if (expectedContentHash === contentHash) {
+                contentHashMatches = true;
+                break;
+            }
+        }
+        if (!contentHashMatches) return;
         // Cross-check: requester identity matches ipk
         const invokerAddress = decoded.address ? decoded.address.toString('ascii') : null;
         const invokerPubKeyHex = invokerAddress ? this.#msbClient.addressToPubKeyHex(invokerAddress) : null;

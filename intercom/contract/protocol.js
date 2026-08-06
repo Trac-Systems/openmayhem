@@ -4,6 +4,26 @@ import { CONTRACT_VERSION } from './contract.js';
 const DEFAULT_MAYHEM_TX_MAX_BYTES = 64_000;
 const DEFAULT_MAYHEM_FEATURE_MAX_BYTES = 64_000;
 
+const stableValue = (value) => {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value).sort().map((key) => [key, stableValue(value[key])])
+    );
+  }
+  return value;
+};
+
+const uniqueByJson = (values) => {
+  const seen = new Set();
+  return values.filter((value) => {
+    const key = JSON.stringify(value);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+};
+
 export const mayhemFeatureParticipant = (value) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   if (value.op === 'record_usage_receipt') {
@@ -68,6 +88,23 @@ class MayhemProtocol extends Protocol {
         contract_version: CONTRACT_VERSION,
       },
     };
+  }
+
+  txHashDispatchCandidates(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return [value];
+    }
+    const candidates = [value, stableValue(value)];
+    if (value.value && typeof value.value === 'object' && !Array.isArray(value.value) &&
+        Object.hasOwn(value.value, 'contract_version')) {
+      const unversioned = {
+        ...value,
+        value: { ...value.value },
+      };
+      delete unversioned.value.contract_version;
+      candidates.push(unversioned, stableValue(unversioned));
+    }
+    return uniqueByJson(candidates);
   }
 
   async simulateTransaction(validatorPublicKey, value, surrogate = null) {

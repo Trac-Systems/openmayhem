@@ -86,7 +86,9 @@ use mayhem_attestation::{
     AttestationReadiness, CollateralInventory, TpmVerificationMaterials, VerifierCapabilities,
     DEFAULT_TPM_CHALLENGE_TTL_SECS,
 };
-use mayhem_bridge::{sc_bridge_session_transport, BridgeError, ScBridgeClient, ScBridgeConfig};
+use mayhem_bridge::{
+    sc_bridge_session_transport, BridgeError, PeerRpcClient, ScBridgeClient, ScBridgeConfig,
+};
 #[cfg(test)]
 use mayhem_proto::record_usage_receipt_envelope;
 use mayhem_proto::{
@@ -276,6 +278,7 @@ pub struct GatewayState {
     tpm_activation_supervisor: Arc<GatewayTpmActivationSupervisor>,
     canary_policy: GatewayCanaryProbePolicy,
     canary_challenge: Arc<Option<GatewayCanaryChallengeContext>>,
+    canary_probe_contract_rpc: Arc<Option<PeerRpcClient>>,
     canary_scheduler: Arc<Mutex<GatewayCanaryScheduler>>,
     dashboard_session: Arc<DashboardSession>,
     provider_earnings: Arc<Mutex<GatewayProviderEarningsSnapshot>>,
@@ -4255,6 +4258,7 @@ impl GatewayState {
             tpm_activation_supervisor: Arc::new(GatewayTpmActivationSupervisor::default()),
             canary_policy: GatewayCanaryProbePolicy::default(),
             canary_challenge: Arc::new(None),
+            canary_probe_contract_rpc: Arc::new(None),
             canary_scheduler: Arc::new(Mutex::new(GatewayCanaryScheduler::default())),
             dashboard_session: Arc::new(DashboardSession::new()),
             provider_earnings: Arc::new(Mutex::new(GatewayProviderEarningsSnapshot::default())),
@@ -4588,6 +4592,11 @@ impl GatewayState {
 
     pub fn with_canary_challenge_context(mut self, context: GatewayCanaryChallengeContext) -> Self {
         self.canary_challenge = Arc::new(Some(context));
+        self
+    }
+
+    pub fn with_canary_probe_contract_rpc(mut self, rpc: PeerRpcClient) -> Self {
+        self.canary_probe_contract_rpc = Arc::new(Some(rpc));
         self
     }
 
@@ -5014,8 +5023,82 @@ impl GatewayState {
             .len()
     }
 
-    fn record_probe(&self, probe: StoredProbeEvent) {
+    async fn record_probe(&self, probe: StoredProbeEvent) {
+        let probe_command = probe.probe_command.clone();
         self.probes.lock_recover("probe store").push(probe);
+        if let Err(err) = self.submit_probe_result_contract_tx(&probe_command).await {
+            eprintln!("Mayhem canary probe contract submission is pending: {err}");
+        }
+    }
+
+    async fn submit_probe_result_contract_tx(&self, probe_command: &Value) -> Result<(), String> {
+        let Some(rpc) = self.canary_probe_contract_rpc.as_ref().as_ref() else {
+            return Ok(());
+        };
+        if probe_command.get("op").and_then(Value::as_str) != Some("probe_result") {
+            return Ok(());
+        }
+        let auditor = verifying_key_hex(&self.receipt_config.user_seed);
+        let prepared_command = stable_json_value(&json!({
+            "type": "probeResult",
+            "value": probe_command,
+        }));
+        let mut last_error = None;
+        for _ in 0..4 {
+            let nonce_response = rpc
+                .contract_nonce()
+                .await
+                .map_err(|err| format!("requesting contract nonce failed: {err}"))?;
+            let nonce = nonce_response
+                .get("nonce")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "contract nonce response omitted nonce".to_owned())?;
+            let context = rpc
+                .get("contract/tx/context")
+                .await
+                .map_err(|err| format!("reading contract tx context failed: {err}"))?;
+            let tx = gateway_contract_tx_digest(&prepared_command, nonce, &context)?;
+            let tx_bytes = hex::decode(&tx)
+                .map_err(|err| format!("computed probe tx id is not hex: {err}"))?;
+            let signature = sign_hex(&self.receipt_config.user_seed, &tx_bytes);
+            let submitted = match rpc
+                .submit_tx(json!({
+                    "tx": tx,
+                    "prepared_command": prepared_command,
+                    "address": auditor,
+                    "signature": signature,
+                    "nonce": nonce,
+                    "sim": false,
+                }))
+                .await
+            {
+                Ok(submitted) => submitted,
+                Err(err) => {
+                    let message = format!("submitting probeResult tx failed: {err}");
+                    if gateway_contract_tx_retryable_error(&message) {
+                        last_error = Some(message);
+                        continue;
+                    }
+                    return Err(message);
+                }
+            };
+            if submitted.get("ok").and_then(Value::as_bool) == Some(false)
+                || submitted
+                    .get("result")
+                    .and_then(|result| result.get("ok"))
+                    .and_then(Value::as_bool)
+                    == Some(false)
+            {
+                let message = format!("probeResult tx was rejected: {submitted}");
+                if gateway_contract_tx_retryable_error(&message) {
+                    last_error = Some(message);
+                    continue;
+                }
+                return Err(message);
+            }
+            return Ok(());
+        }
+        Err(last_error.unwrap_or_else(|| "probeResult tx was not accepted".to_owned()))
     }
 
     fn record_reputation_event(&self, event: StoredReputationEvent) {
@@ -28688,14 +28771,14 @@ impl GatewayState {
         match probes {
             Ok(probes) => {
                 for probe in probes {
-                    self.record_probe(probe);
+                    self.record_probe(probe).await;
                 }
                 if config.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT {
                     if let Ok(Some(context_probe)) = self
                         .run_context_needle_probe_for_route(model, invocation, &config)
                         .await
                     {
-                        self.record_probe(context_probe);
+                        self.record_probe(context_probe).await;
                     }
                 }
             }
@@ -28714,7 +28797,8 @@ impl GatewayState {
                     self.canary_policy.epoch,
                     &self.receipt_config.user_seed,
                     challenge_binding.as_ref(),
-                ));
+                ))
+                .await;
             }
         }
     }
@@ -33923,6 +34007,79 @@ fn stable_json_value(value: &Value) -> Value {
         }
         other => other.clone(),
     }
+}
+
+fn gateway_contract_tx_digest(
+    prepared_command: &Value,
+    nonce: &str,
+    context: &Value,
+) -> Result<String, String> {
+    let msb = context
+        .get("msb")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "contract tx context omitted msb".to_owned())?;
+    let network_id = gateway_contract_u32_field(msb.get("networkId"), "msb.networkId")?;
+    let operation_type = gateway_contract_u32_field(msb.get("operationType"), "msb.operationType")?;
+    let command_hash =
+        gateway_peer_string_blake3_compat(&stable_json_value(prepared_command).to_string());
+    let mut message = Vec::with_capacity(4 + (6 * 32) + 4);
+    message.extend_from_slice(&network_id.to_be_bytes());
+    message.extend_from_slice(&gateway_contract_hex32(msb.get("txv"), "msb.txv")?);
+    message.extend_from_slice(&gateway_contract_hex32(msb.get("iw"), "msb.iw")?);
+    message.extend_from_slice(&gateway_contract_hex32(
+        Some(&Value::String(command_hash)),
+        "prepared command hash",
+    )?);
+    message.extend_from_slice(&gateway_contract_hex32(msb.get("bs"), "msb.bs")?);
+    message.extend_from_slice(&gateway_contract_hex32(msb.get("mbs"), "msb.mbs")?);
+    message.extend_from_slice(&gateway_contract_hex32(
+        Some(&Value::String(nonce.to_owned())),
+        "nonce",
+    )?);
+    message.extend_from_slice(&operation_type.to_be_bytes());
+    Ok(blake3::hash(&message).to_hex().to_string())
+}
+
+fn gateway_peer_string_blake3_compat(value: &str) -> String {
+    // trac-peer's historical @tracsystems/blake3 wrapper is called with a JS
+    // string for contract command hashes. TypedArray#set coerces each string
+    // character separately, so digits become 0..9 and all JSON punctuation /
+    // letters become 0. Match that wire behavior here; raw byte BLAKE3 would
+    // produce a different tx id.
+    let projected = value
+        .encode_utf16()
+        .map(|unit| match unit {
+            0x30..=0x39 => (unit - 0x30) as u8,
+            _ => 0,
+        })
+        .collect::<Vec<_>>();
+    blake3::hash(&projected).to_hex().to_string()
+}
+
+fn gateway_contract_tx_retryable_error(message: &str) -> bool {
+    message.contains("Regenerated transaction does not match incoming transaction in payload")
+        || message.contains("TX_HASH_MISMATCH")
+        || message.contains("Invalid MSB tx")
+}
+
+fn gateway_contract_u32_field(value: Option<&Value>, label: &str) -> Result<u32, String> {
+    let value = value
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("{label} must be an unsigned integer"))?;
+    u32::try_from(value).map_err(|_| format!("{label} exceeds uint32"))
+}
+
+fn gateway_contract_hex32(value: Option<&Value>, label: &str) -> Result<[u8; 32], String> {
+    let value = value
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{label} must be a hexadecimal string"))?;
+    if !is_hex_len(value, 64) {
+        return Err(format!("{label} must be 32-byte hexadecimal"));
+    }
+    let bytes = hex::decode(value).map_err(|err| format!("{label} is not hex: {err}"))?;
+    bytes
+        .try_into()
+        .map_err(|bytes: Vec<u8>| format!("{label} must be 32 bytes, got {}", bytes.len()))
 }
 
 fn probe_result_signature(auditor_seed: &[u8; 32], value: &Value, auditor: &str) -> String {
@@ -44672,6 +44829,37 @@ mod tests {
         assert!(probe.probe_command["challenge_seed"]
             .as_str()
             .is_some_and(|value| is_hex_len(value, 64)));
+    }
+
+    #[test]
+    fn gateway_contract_tx_digest_matches_peer_create_message_vector() {
+        let prepared_command = stable_json_value(&json!({
+            "type": "probeResult",
+            "value": {
+                "at": 7,
+                "op": "probe_result",
+                "pass": false,
+                "probe_id": "aa".repeat(32),
+            },
+        }));
+        let context = json!({
+            "msb": {
+                "networkId": 918,
+                "txv": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+                "iw": "b596e093b22f80d4f66ee25e79b95866b44133e5d2b2d673d4fcac443cf30661",
+                "bs": "b596e093b22f80d4f66ee25e79b95866b44133e5d2b2d673d4fcac443cf30661",
+                "mbs": "12f7f1668eac2e691e17cbc6a53e509c5cee78cdcac562313091c64e5fd077d6",
+                "operationType": 12,
+            },
+        });
+        assert_eq!(
+            gateway_peer_string_blake3_compat(&prepared_command.to_string()),
+            "43f47a87993e605041034edc2cc82fbff5e4eca1bf8654a9a857d3f214509a61"
+        );
+        assert_eq!(
+            gateway_contract_tx_digest(&prepared_command, &"01".repeat(32), &context).unwrap(),
+            "d0418782738f7c76472480d7ceb0c1ae8161ef201265abc8f9b3b764fe8aeaab"
+        );
     }
 
     #[tokio::test]

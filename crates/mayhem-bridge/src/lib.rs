@@ -697,7 +697,7 @@ fn json_value_bytes(value: &Value) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PeerRpcClient {
     base_url: Url,
     http: reqwest::Client,

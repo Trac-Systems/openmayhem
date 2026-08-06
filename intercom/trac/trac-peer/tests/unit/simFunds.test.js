@@ -60,6 +60,57 @@ function makeMsbStubUnfunded() {
   };
 }
 
+function makeMsbStubFundedAdvancingTxv() {
+  const bootstrap = b4a.alloc(32).fill(7);
+  const fee = b4a.alloc(16);
+  fee[15] = 1;
+  const balance = b4a.alloc(16);
+  balance[15] = 100;
+  const addressLength = PeerWallet.encodeBech32mSafe("trac", b4a.alloc(32).fill(2)).length;
+  let txvCalls = 0;
+  const sent = [];
+  return {
+    config: { bootstrap, addressPrefix: "trac", addressLength, networkId: 918 },
+    wallet: { address: "trac1test" },
+    network: {
+      validatorMessageOrchestrator: {
+        async send(payload) {
+          sent.push(payload);
+          return true;
+        },
+      },
+    },
+    sent,
+    state: {
+      base: {
+        view: {
+          core: { signedLength: 1, length: 1, once() {} },
+          checkout() {
+            return { async get() { return null; }, async close() {} };
+          },
+        },
+      },
+      getSignedLength() {
+        return 1;
+      },
+      getFee() {
+        return fee;
+      },
+      async get(_key) {
+        return null;
+      },
+      async getNodeEntryUnsigned(_address) {
+        return { balance };
+      },
+      async getIndexerSequenceState() {
+        txvCalls += 1;
+        return b4a.alloc(32).fill(txvCalls);
+      },
+    },
+    async ready() {},
+  };
+}
+
 async function prepareWallet(storesDirectory, storeName) {
   const wallet = new Wallet();
   await wallet.generateKeyPair();
@@ -115,6 +166,49 @@ test("rpc sim: fails when requester has no MSB entry/balance", async (t) => {
       () => api.tx(tx, prepared_command, externalWallet.publicKey, signature, nonce, true),
       /Invalid MSB tx:.*Requester address not found in state/i
     );
+  } finally {
+    await closePeer(peer);
+    await rmrfPortable(tmpRoot);
+  }
+});
+
+test("rpc tx preserves signed MSB context when tx validity advances before broadcast", async (t) => {
+  const tmpRoot = await mkdtempPortable(path.join(os.tmpdir(), "trac-peer-tx-context-"));
+  const storesDirectory = tmpRoot.endsWith(path.sep) ? tmpRoot : tmpRoot + path.sep;
+
+  const peerWallet = await prepareWallet(storesDirectory, "peer");
+  const externalWallet = new Wallet();
+  await externalWallet.generateKeyPair();
+  const msb = makeMsbStubFundedAdvancingTxv();
+
+  const config = createConfig(ENV.DEVELOPMENT, {
+    storesDirectory,
+    storeName: "peer",
+    apiTxExposed: true,
+  });
+
+  const peer = new Peer({
+    config,
+    msb,
+    wallet: peerWallet,
+    protocol: Protocol,
+    contract: CatchContract,
+  });
+
+  try {
+    await peer.ready();
+    const api = peer.protocol.instance.api;
+
+    const prepared_command = { type: "catch", value: {} };
+    const nonce = api.generateNonce();
+    const command_hash = await createHash(jsonStringify(prepared_command));
+    const tx = await api.generateTx(externalWallet.publicKey, command_hash, nonce);
+    const signature = externalWallet.sign(b4a.from(tx, "hex"));
+
+    const res = await api.tx(tx, prepared_command, externalWallet.publicKey, signature, nonce, false);
+    t.is(res.message, "Transaction broadcasted successfully.");
+    t.is(msb.sent.length, 1);
+    t.alike(msb.sent[0].txo.txv, "01".repeat(32));
   } finally {
     await closePeer(peer);
     await rmrfPortable(tmpRoot);

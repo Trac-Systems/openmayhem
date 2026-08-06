@@ -166,6 +166,31 @@ export class ProtocolApi {
         );
     }
 
+    async generateTxContext(command_hash, nonce) {
+        const txvHex = await this.peer.msbClient.getTxvHex();
+        const writerKeyHex = this.getPeerWriterKey();
+        const subnetBootstrapHex = (b4a.isBuffer(this.getPeerBootstrap()) ? this.getPeerBootstrap().toString('hex') : (''+this.getPeerBootstrap())).toLowerCase();
+        const msbBootstrapHex = this.getPeerMsbBootstrap();
+        const tx = await this.peer.protocol.instance.generateTx(
+            this.peer.msbClient.networkId,
+            txvHex,
+            writerKeyHex,
+            command_hash,
+            subnetBootstrapHex,
+            msbBootstrapHex,
+            nonce
+        );
+        return {
+            tx,
+            txv: txvHex,
+            iw: writerKeyHex,
+            ch: command_hash,
+            bs: subnetBootstrapHex,
+            mbs: msbBootstrapHex,
+            nonce
+        };
+    }
+
     /**
      *
      * @param command
@@ -222,9 +247,9 @@ export class ProtocolApi {
         const verified = this.peer.wallet.verify(signature, b4a.from(tx, 'hex'), address);
         if(false === verified) throw new Error('Invalid signature.');
         const content_hash = await createHash(this.peer.protocol.instance.safeJsonStringify(prepared_command));
-        let _tx = await this.generateTx(address, content_hash, nonce);
-        if(tx !== _tx) throw new Error('Invalid TX.');
-        const surrogate = { tx : _tx, nonce : ''+nonce, signature : ''+signature, address : ''+address };
+        const txContext = await this.generateTxContext(content_hash, nonce);
+        if(tx !== txContext.tx) throw new Error('Invalid TX.');
+        const surrogate = { ...txContext, signature : ''+signature, address : ''+address };
         const res = await this.peer.protocol.instance.broadcastTransaction(
             {
                 type: prepared_command.type,

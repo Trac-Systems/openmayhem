@@ -42048,6 +42048,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             .context("opening encrypted gateway job vault")?
             .with_receipt_balance_au(balance_au)
             .with_receipt_settlement_publisher(receipt_outbox)
+            .with_canary_probe_contract_rpc(rpc.clone())
             .with_session_backend(Arc::new(backend));
         if let Some(probe_epoch) = args.canary_probe_epoch {
             let challenge_epoch = probe_epoch.checked_sub(1).context(
