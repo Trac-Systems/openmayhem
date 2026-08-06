@@ -37041,6 +37041,80 @@ mod tests {
     }
 
     #[test]
+    fn gateway_body_preauthorization_rejects_before_body_extraction() {
+        let raw_token = "sk-mayhem-body-token";
+        let token = GatewayTokenRecord {
+            name: "body-gate".to_owned(),
+            token_hash: gateway_token_hash(raw_token),
+            token_id: "tok_body_gate".to_owned(),
+            created_at: 1,
+            expires_at: None,
+            budget_au: None,
+            budget_period: None,
+            spent_total_au: 0,
+            spent_period_au: 0,
+            period_started_at: Some(1),
+            max_rate_per_minute: None,
+            models: Vec::new(),
+            last_used_at: None,
+            revoked_at: None,
+        };
+        let access = GatewayAccessControl::new(
+            true,
+            GatewayTokenStore {
+                version: 1,
+                tokens: vec![token.clone()],
+            },
+            None,
+        );
+
+        assert_eq!(
+            access
+                .preauthorize_body_headers(&HeaderMap::new())
+                .unwrap_err()
+                .status,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let mut valid = HeaderMap::new();
+        valid.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {raw_token}")).unwrap(),
+        );
+        access
+            .preauthorize_body_headers(&valid)
+            .expect("valid bearer token passes the pre-body gate");
+
+        let mut wrong = HeaderMap::new();
+        wrong.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer sk-mayhem-wrong-body-token"),
+        );
+        assert_eq!(
+            access.preauthorize_body_headers(&wrong).unwrap_err().status,
+            StatusCode::UNAUTHORIZED
+        );
+
+        let capped = GatewayAccessControl::new(
+            true,
+            GatewayTokenStore {
+                version: 1,
+                tokens: vec![GatewayTokenRecord {
+                    budget_au: Some(5),
+                    budget_period: Some(GatewayTokenBudgetPeriod::Total),
+                    spent_total_au: 5,
+                    ..token
+                }],
+            },
+            None,
+        );
+        assert_eq!(
+            capped.preauthorize_body_headers(&valid).unwrap_err().status,
+            StatusCode::PAYMENT_REQUIRED
+        );
+    }
+
+    #[test]
     fn gateway_access_control_reloads_tokens_created_after_startup() {
         let raw_token = "sk-mayhem-hot-reload";
         let path = std::env::temp_dir().join(format!(
