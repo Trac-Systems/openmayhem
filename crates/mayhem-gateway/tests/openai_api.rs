@@ -7,17 +7,18 @@ use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 use mayhem_attestation::ValidatedAttestationPolicy;
 use mayhem_gateway::openai::{
-    openai_router, validate_loopback_dashboard_bind, ArtifactGenerationOutput,
+    gateway_token_hash, openai_router, validate_loopback_dashboard_bind, ArtifactGenerationOutput,
     ArtifactGenerationRequest, AudioSpeechOutput, AudioSpeechRequest, AudioTranscriptionOutput,
     AudioTranscriptionRequest, ChatCompletionRequest, ChatMessage, ChatOutput, EmbeddingOutput,
-    EmbeddingRequest, GatewayArtifactGenerationFuture, GatewayArtifactGenerationResult,
-    GatewayArtifactOutput, GatewayAttestationAuthority, GatewayAttestationCollateral,
-    GatewayAudioSpeechFuture, GatewayAudioSpeechResult, GatewayAudioTranscriptionFuture,
-    GatewayAudioTranscriptionResult, GatewayCanaryModelConfig, GatewayCanaryProbePolicy,
-    GatewayCanaryPrompt, GatewayCanaryRegistry, GatewayEmbeddingFuture, GatewayEmbeddingResult,
-    GatewayImageGenerationFuture, GatewayImageGenerationResult, GatewayMarketInfo, GatewayModel,
-    GatewayRouteCandidate, GatewaySessionBackend, GatewaySessionError, GatewaySessionFuture,
-    GatewaySessionInvocation, GatewaySessionResult, GatewaySpecialityCalibration, GatewayState,
+    EmbeddingRequest, GatewayAccessControl, GatewayArtifactGenerationFuture,
+    GatewayArtifactGenerationResult, GatewayArtifactOutput, GatewayAttestationAuthority,
+    GatewayAttestationCollateral, GatewayAudioSpeechFuture, GatewayAudioSpeechResult,
+    GatewayAudioTranscriptionFuture, GatewayAudioTranscriptionResult, GatewayCanaryModelConfig,
+    GatewayCanaryProbePolicy, GatewayCanaryPrompt, GatewayCanaryRegistry, GatewayEmbeddingFuture,
+    GatewayEmbeddingResult, GatewayImageGenerationFuture, GatewayImageGenerationResult,
+    GatewayMarketInfo, GatewayModel, GatewayRouteCandidate, GatewaySessionBackend,
+    GatewaySessionError, GatewaySessionFuture, GatewaySessionInvocation, GatewaySessionResult,
+    GatewaySpecialityCalibration, GatewayState, GatewayTokenRecord, GatewayTokenStore,
     ImageGenerationOutput, ImageGenerationRequest, MayhemModelInfo, ModelCaps, PriceRefAu,
     ProviderKybInfo, ProviderSignedReceipt, SamplingProfile, ShapeAdapterInfo, ToolCallOutput,
     Usage,
@@ -1385,6 +1386,71 @@ fn test_state_and_app() -> (GatewayState, Router) {
         .with_dev_session_shim();
     let app = openai_router(state.clone());
     (state, app)
+}
+
+#[tokio::test]
+async fn shared_gateway_authenticates_before_body_extraction() {
+    let raw_token = "sk-mayhem-auth-before-body";
+    let access = GatewayAccessControl::new(
+        true,
+        GatewayTokenStore {
+            version: 1,
+            tokens: vec![GatewayTokenRecord {
+                name: "agent".to_owned(),
+                token_hash: gateway_token_hash(raw_token),
+                token_id: "tok_auth_before_body".to_owned(),
+                created_at: 1,
+                expires_at: None,
+                budget_au: None,
+                budget_period: None,
+                spent_total_au: 0,
+                spent_period_au: 0,
+                period_started_at: Some(1),
+                max_rate_per_minute: None,
+                models: Vec::new(),
+                last_used_at: None,
+                revoked_at: None,
+            }],
+        },
+        None,
+    );
+    let app = openai_router(
+        GatewayState::from_embedded_catalog()
+            .with_receipt_balance_au(1_000_000_000_000_000_000)
+            .with_dev_session_shim()
+            .with_access_control(access),
+    );
+
+    let request = |auth: Option<&str>| {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(auth) = auth {
+            builder = builder.header(header::AUTHORIZATION, auth);
+        }
+        builder.body(Body::from("{")).expect("request builds")
+    };
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(request(None))
+        .await
+        .expect("unauthenticated response");
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let invalid_token = app
+        .clone()
+        .oneshot(request(Some("Bearer sk-mayhem-invalid")))
+        .await
+        .expect("invalid-token response");
+    assert_eq!(invalid_token.status(), StatusCode::UNAUTHORIZED);
+
+    let authorized = app
+        .oneshot(request(Some(&format!("Bearer {raw_token}"))))
+        .await
+        .expect("authorized malformed response");
+    assert_eq!(authorized.status(), StatusCode::BAD_REQUEST);
 }
 
 fn current_test_millis() -> u64 {

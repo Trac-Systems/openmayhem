@@ -63,8 +63,9 @@ use crate::{
 };
 use axum::{
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Multipart, OriginalUri, Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, OriginalUri, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
+    middleware::{self, Next},
     response::{
         sse::{Event, Sse},
         IntoResponse, Response,
@@ -1410,6 +1411,57 @@ impl GatewayAccessControl {
         };
         self.persist_store(&store)?;
         Ok(Some(attribution))
+    }
+
+    fn preauthorize_body_headers(&self, headers: &HeaderMap) -> Result<(), ApiError> {
+        let Some(raw_token) = gateway_bearer_token(headers)? else {
+            if self.require_auth {
+                return Err(ApiError::unauthorized(
+                    "missing bearer token",
+                    Some("Authorization"),
+                ));
+            }
+            return Ok(());
+        };
+        let token_hash = gateway_token_hash(&raw_token);
+        let now = now_secs();
+        let mut store = self.store.lock_recover("gateway token store");
+        self.reload_store(&mut store)?;
+        let Some(token) = store
+            .tokens
+            .iter()
+            .find(|token| token.token_hash == token_hash)
+        else {
+            if self.require_auth {
+                return Err(ApiError::unauthorized(
+                    "invalid bearer token",
+                    Some("Authorization"),
+                ));
+            }
+            return Ok(());
+        };
+        if token.revoked_at.is_some() {
+            return Err(ApiError::unauthorized(
+                "revoked bearer token",
+                Some("Authorization"),
+            ));
+        }
+        if token.expires_at.is_some_and(|expires_at| expires_at <= now) {
+            return Err(ApiError::unauthorized(
+                "expired bearer token",
+                Some("Authorization"),
+            ));
+        }
+        if token
+            .budget_au
+            .is_some_and(|budget_au| token.effective_spent_au_at(now) >= budget_au)
+        {
+            return Err(ApiError::payment_required(
+                "bearer token budget cap reached",
+                Some("Authorization"),
+            ));
+        }
+        Ok(())
     }
 
     fn reserve_budget(
@@ -5281,13 +5333,27 @@ pub fn openai_router(state: GatewayState) -> Router {
         "MAYHEM_GATEWAY_MAX_INFLIGHT_REQUESTS",
         DEFAULT_GATEWAY_MAX_INFLIGHT_REQUESTS,
     );
-    Router::new()
-        .route("/v1/models", get(list_models))
+    let state = Arc::new(state);
+    let body_routes = Router::new()
         .route("/v1/chat/completions", post(create_chat_completion))
         .route("/v1/completions", post(create_completion))
         .route("/v1/responses", post(create_response))
         .route("/v1/embeddings", post(create_embedding))
         .route("/v1/images/generations", post(create_image_generation))
+        .route("/v1/videos", post(create_video_generation))
+        .route("/v1/audio/speech", post(create_audio_speech))
+        .route("/v1/audio/transcriptions", post(create_audio_transcription))
+        .route("/v1/audio/generations", post(create_audio_generation))
+        .route("/v1/music/generations", post(create_music_generation))
+        .route("/v1/workflows", post(create_comfy_workflow_generation))
+        .route("/hf-inference/models/{*model}", post(create_hf_inference))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            preauthorize_gateway_body_request,
+        ));
+
+    Router::new()
+        .route("/v1/models", get(list_models))
         .route("/v1/jobs", get(list_gateway_jobs))
         .route(
             "/v1/jobs/{job_id}",
@@ -5298,10 +5364,7 @@ pub fn openai_router(state: GatewayState) -> Router {
             "/v1/jobs/{job_id}/artifacts/{artifact_id}",
             get(retrieve_gateway_job_artifact),
         )
-        .route(
-            "/v1/videos",
-            get(list_video_generations).post(create_video_generation),
-        )
+        .route("/v1/videos", get(list_video_generations))
         .route(
             "/v1/videos/{video_id}",
             get(retrieve_video_generation).delete(delete_video_generation),
@@ -5310,12 +5373,6 @@ pub fn openai_router(state: GatewayState) -> Router {
             "/v1/videos/{video_id}/content",
             get(retrieve_video_generation_content),
         )
-        .route("/v1/audio/speech", post(create_audio_speech))
-        .route("/v1/audio/transcriptions", post(create_audio_transcription))
-        .route("/v1/audio/generations", post(create_audio_generation))
-        .route("/v1/music/generations", post(create_music_generation))
-        .route("/v1/workflows", post(create_comfy_workflow_generation))
-        .route("/hf-inference/models/{*model}", post(create_hf_inference))
         .route("/mayhem/status", get(mayhem_status))
         .route("/mayhem/receipts", get(mayhem_receipts))
         .route("/mayhem/probes", get(mayhem_probes))
@@ -5344,9 +5401,24 @@ pub fn openai_router(state: GatewayState) -> Router {
             get(mayhem_dashboard_brand_asset),
         )
         .route("/mayhem/dashboard/{*page}", get(mayhem_dashboard_subpage))
+        .merge(body_routes)
         .layer(DefaultBodyLimit::max(request_body_limit))
         .layer(ConcurrencyLimitLayer::new(max_inflight_requests))
-        .with_state(Arc::new(state))
+        .with_state(state)
+}
+
+async fn preauthorize_gateway_body_request(
+    State(state): State<SharedState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Err(error) = state
+        .access_control
+        .preauthorize_body_headers(request.headers())
+    {
+        return error.into_response();
+    }
+    next.run(request).await
 }
 
 fn gateway_request_body_limit(state: &GatewayState) -> usize {
