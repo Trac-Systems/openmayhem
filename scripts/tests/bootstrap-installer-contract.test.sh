@@ -412,6 +412,11 @@ grep -F '& npm install -g "pear@$PearVersion"' "$ROOT_DIR/install.ps1" >/dev/nul
 if grep -E '& npm install -g "?pear"?([[:space:]]|$)' "$ROOT_DIR/install.ps1" >/dev/null; then
   fail "PowerShell Pear bootstrap retains an unversioned npm install"
 fi
+grep -F 'function Test-PearPackageVersion' "$ROOT_DIR/install.ps1" >/dev/null ||
+  fail "PowerShell Pear bootstrap does not verify package metadata with PowerShell JSON parsing"
+if grep -F '& node "-e" $versionCheck' "$ROOT_DIR/install.ps1" >/dev/null; then
+  fail "PowerShell Pear bootstrap uses inline node -e for package metadata verification"
+fi
 powershell_source_binary="$(
   sed -n '/^function Install-SourceBinary {/,/^}/p' "$ROOT_DIR/install.ps1"
 )"

@@ -1889,6 +1889,25 @@ function Ensure-Node {
     Write-Log "found $nodeVersion and npm $npmVersion"
 }
 
+function Test-PearPackageVersion {
+    param(
+        [string]$PackageJson,
+        [string]$ExpectedVersion
+    )
+
+    if (-not (Test-Path -LiteralPath $PackageJson -PathType Leaf)) {
+        return $false
+    }
+    Assert-RealFile -Path $PackageJson -Label "Pear package metadata"
+    try {
+        $metadata = Get-Content -Raw -LiteralPath $PackageJson |
+            ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return $false
+    }
+    return [string]$metadata.version -eq $ExpectedVersion
+}
+
 function Ensure-Pear {
     if ($SkipPear) {
         Write-Log "skipping Pear bootstrap"
@@ -1904,22 +1923,13 @@ function Ensure-Pear {
     }
 
     $packageJson = $null
-    $versionCheck = @'
-const fs = require("node:fs");
-const metadata = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-process.exit(metadata.version === process.argv[2] ? 0 : 1);
-'@
     foreach ($candidate in @(
         (Join-Path (Join-Path $NpmPrefix "node_modules") "pear\package.json"),
         (Join-Path (Join-Path (Join-Path $NpmPrefix "lib") "node_modules") "pear\package.json")
     )) {
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-            Assert-RealFile -Path $candidate -Label "Pear package metadata"
-            & node "-e" $versionCheck $candidate $PearVersion
-            if ($LASTEXITCODE -eq 0) {
-                $packageJson = $candidate
-                break
-            }
+        if (Test-PearPackageVersion -PackageJson $candidate -ExpectedVersion $PearVersion) {
+            $packageJson = $candidate
+            break
         }
     }
     if ($null -eq $packageJson) {
@@ -1932,13 +1942,9 @@ process.exit(metadata.version === process.argv[2] ? 0 : 1);
             (Join-Path (Join-Path $NpmPrefix "node_modules") "pear\package.json"),
             (Join-Path (Join-Path (Join-Path $NpmPrefix "lib") "node_modules") "pear\package.json")
         )) {
-            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-                Assert-RealFile -Path $candidate -Label "Pear package metadata"
-                & node "-e" $versionCheck $candidate $PearVersion
-                if ($LASTEXITCODE -eq 0) {
-                    $packageJson = $candidate
-                    break
-                }
+            if (Test-PearPackageVersion -PackageJson $candidate -ExpectedVersion $PearVersion) {
+                $packageJson = $candidate
+                break
             }
         }
         if ($null -eq $packageJson) {
