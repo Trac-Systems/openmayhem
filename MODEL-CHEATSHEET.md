@@ -91,6 +91,51 @@ routing, vouchers, receipts, and reporting. Current price brackets are:
 A lower context does not create a new enclave and does not need admin approval.
 If a provider changes its committed context, it signs its own leave/rejoin.
 
+## Comfy workflow provider workflow
+
+ComfyUI workflow classes are not ordinary single-weight model entries. They are
+admin-created workflow outcome classes exposed through endpoint family
+`mayhem_comfy_workflows` and served by the same provider, room, heartbeat,
+voucher, receipt, and settlement path as the models below.
+
+Discover workflow classes and live capacity from a local gateway:
+
+```bash
+curl 'http://127.0.0.1:11435/v1/models?endpoint_family=mayhem_comfy_workflows'
+curl 'http://127.0.0.1:11435/v1/models?endpoint_family=mayhem_comfy_workflows&live=true'
+```
+
+To become a Comfy workflow provider, install the current source release, verify
+the blessed runtime checkout, pull only the signed parts the machine intends to
+serve, admit the outcome class, then start the resolved workflow enclave:
+
+```bash
+mayhem doctor --provider-backend comfyui
+mayhem provider parts pull \
+  --layout-dir <parts-index-layout> \
+  --part-id <part-id> \
+  --require-payload
+mayhem provider parts admit \
+  --outcome-class <workflow-class> \
+  --runtime-id comfyui-v0.30.1 \
+  --part-id <part-id> \
+  --usable-bytes <size> \
+  --working-set-bytes <size> \
+  --reference-graph <path.json> \
+  --reference-runtime <comfy-runtime-dir> \
+  --reference-output-dir <proof-dir> \
+  --write
+mayhem up --provider --provider-enclave <workflow-enclave-id> --yes
+mayhem provider health --json
+```
+
+If the admitted class uses staged load/unload, pass its approved `--load-plan`
+to `mayhem provider parts admit`. Without a load plan, all required parts must
+fit together. A workflow provider is not routable until the saved admission
+envelope exists and heartbeats advertise the matching `workflow_classes`; an
+empty live query means no admitted provider is online, not that the catalog lacks
+workflow enclaves.
+
 ### Rooms, payments, and limits
 
 - `--rooms auto` joins existing canonical rooms. Providers cannot create a
