@@ -15,30 +15,19 @@ routes, and revisions. Never copy an enclave ID or price from documentation:
 mayhem models --gateway
 ```
 
-## v0.2.62 runtime status
+## v0.2.104 runtime status
 
-The `0.2.62` source release preserves the canonical Needle CPU/CUDA tools-only
-runtime from `0.2.54`, fixes co-resident host/unified-memory admission, makes
-startup probes honor signed endpoint output-token floors, and reports live
-small-context routes against the endpoint's signed output-token default instead
-of a global allowance. It also makes supervised children wait for their
-configured loopback dependencies without spending crash-loop attempts, verifies
-the selected llama.cpp backend after every local source install, and removes
-system `venv`/`ensurepip`/`pip` as managed-runtime prerequisites. Dedicated-VRAM
-reservations remain enforced. Needle has exactly two markets:
-`needle-cpu` across Linux, Windows x86_64, and Apple Silicon macOS, and
-CUDA-only `needle-gpu` on supported
-Linux aarch64/x86_64 and Windows x86_64 hosts. Apple Metal/MPS is not eligible for the GPU market. The release
-also carries the managed Linux/aarch64 CUDA 13 Chatterbox runtime, Linux
-llama.cpp acceleration selection, platform-aware Sulphur artifact admission,
-early Sulphur media-tool capability checks, and the audio/music
-receipt-duration correction described below.
-
-The restored sponsored Chatterbox endpoint has completed a real request.
-ACE-Step remains pending its final corrected-binary live request. The
-audio/music receipt ceiling now reserves a signed one-second encoding tolerance
-and checks billing against the measured returned bytes; that change remains
-pending the same final live proof and is not yet marked released.
+The `0.2.104` source release carries the previous source-install, managed
+runtime, co-resident memory, endpoint-floor, Sulphur, Chatterbox, ACE-Step, and
+Needle fixes, and adds the Comfy workflow market fix: ledger-only workflow
+outcome classes now expose endpoint family `mayhem_comfy_workflows`, providers
+can resolve workflow enclaves without a static `catalog/models.json` row, and
+workflow serving uses `--artifact <comfy-runtime-dir>` for the local ComfyUI
+runtime checkout while keeping the ledger artifact bound to the workflow class
+definition. Dedicated-VRAM reservations remain enforced. Needle still has
+exactly two markets: `needle-cpu` across Linux, Windows x86_64, and Apple
+Silicon macOS, and CUDA-only `needle-gpu` on supported Linux aarch64/x86_64 and
+Windows x86_64 hosts. Apple Metal/MPS is not eligible for the GPU market.
 
 ## How to read this document
 
@@ -128,7 +117,7 @@ mayhem provider parts admit \
   --reference-runtime <comfy-runtime-dir> \
   --reference-output-dir <proof-dir> \
   --write
-mayhem up --provider --provider-enclave <workflow-enclave-id> --yes
+mayhem up --provider --provider-enclave <workflow-enclave-id> --artifact <comfy-runtime-dir> --yes
 mayhem provider health --json
 ```
 
@@ -137,7 +126,8 @@ to `mayhem provider parts admit`. Without a load plan, all required parts must
 fit together. A workflow provider is not routable until the saved admission
 envelope exists and heartbeats advertise the matching `workflow_classes`; an
 empty live query means no admitted provider is online, not that the catalog lacks
-workflow enclaves.
+workflow enclaves. The `--artifact` path for workflow serving is the local
+ComfyUI runtime checkout, not the ledger-pinned workflow class artifact.
 
 ### Rooms, payments, and limits
 

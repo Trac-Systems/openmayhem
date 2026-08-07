@@ -79,7 +79,7 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.62` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.104` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -88,7 +88,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.62
+git checkout --detach v0.2.104
 ./install.sh --from-source
 ```
 
@@ -97,7 +97,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.62
+git checkout --detach v0.2.104
 .\install.ps1 -FromSource
 ```
 
@@ -252,7 +252,9 @@ Most installs are driven by a coding agent. Agent: execute in THIS order, verify
      Python executable. Use `python3` if it belongs to that checkout; otherwise
      set `MAYHEM_COMFYUI_PYTHON` explicitly. Then pull verified parts and run
      `mayhem provider parts add` and `mayhem provider parts admit --write`
-     before serving.
+     before serving. Start workflow providers with
+     `--artifact <comfy-runtime-dir>` so the worker uses the verified local
+     ComfyUI checkout; the ledger artifact is the workflow class definition.
    - **Audio/image serving**: the engines are external binaries that must be on `PATH` (or pointed at by env): `whisper-cli` (`MAYHEM_WHISPER_CPP_BIN`), `piper` (`MAYHEM_PIPER_BIN`), `sd-cli` (`MAYHEM_STABLE_DIFFUSION_CPP_BIN`). Accelerator selection is automatic. Text-only providers can ignore this.
 7. **Start and verify**: `mayhem up --yes` (or `--provider`), then confirm the gateway answers (`curl http://127.0.0.1:11435/v1/models`) and, for providers, `mayhem provider health` is green AND the served model appears in `/v1/models`. A green health with a missing route means the model failed to load — re-run `mayhem doctor` and check the backend extras above.
 8. **Explain to the human** what was installed, where the dashboards are, and (providers) what their earnings depend on.
@@ -833,6 +835,12 @@ headroom for an outcome class, then advertises that class through ordinary
 heartbeats. The dashboard route counts for workflows therefore mean live
 admitted capacity, not merely catalog presence.
 
+Provider start shape:
+
+```bash
+mayhem up --provider --provider-enclave <workflow-enclave-id> --artifact <comfy-runtime-dir> --yes
+```
+
 Chatterbox uses `voice: "default"` for ordinary speech. For zero-shot cloning, add a bounded
 base64 WAV reference:
 
@@ -905,7 +913,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.62` is source-only. The GitHub release contains the tagged source, not
+`v0.2.104` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -913,7 +921,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.62
+git checkout --detach v0.2.104
 ./install.sh --from-source
 ```
 
@@ -922,7 +930,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.62
+git checkout --detach v0.2.104
 .\install.ps1 -FromSource
 ```
 
@@ -946,7 +954,7 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
-The `0.2.62` source release makes local builds self-consistent across macOS,
+The `0.2.104` source release makes local builds self-consistent across macOS,
 Linux, and Windows. Source installers select exactly one available llama.cpp
 backend and verify the installed result; managed Python runtimes bootstrap from
 a version- and hash-pinned standalone `uv` executable without relying on system

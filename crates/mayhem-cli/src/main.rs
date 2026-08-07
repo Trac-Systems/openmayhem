@@ -28234,14 +28234,13 @@ fn provider_comfy_workflow_admission(
     let Some(modality) = provider_comfy_workflow_output_modality(selected) else {
         return Ok(None);
     };
-    let policy = selected.model.workflow.as_ref().with_context(|| {
-        format!(
-            "Comfy workflow {} requires signed workflow policy before admission",
-            selected.enclave.model_id
-        )
-    })?;
-    let outcome_class = policy.outcome_class_for(modality);
-    let runtime_id = policy.runtime_id();
+    let policy = selected.model.workflow.as_ref();
+    let outcome_class = policy
+        .map(|policy| policy.outcome_class_for(modality))
+        .unwrap_or_else(|| selected.enclave.model_id.clone());
+    let runtime_id = policy
+        .map(mayhem_proto::ComfyWorkflowCatalogPolicy::runtime_id)
+        .unwrap_or(mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID);
     let inventory_root = workflow_inventory_root.with_context(|| {
         format!(
             "Comfy workflow {} requires a verified provider inventory root before admission",
@@ -28265,12 +28264,12 @@ fn provider_comfy_workflow_admission(
     );
     ensure!(
         report.inventory_root == inventory_root,
-        "Comfy workflow {} outcome class {} was admitted against inventory root {}, but signed catalog requires {}",
-        selected.enclave.model_id,
-        outcome_class,
-        report.inventory_root,
-        inventory_root
-    );
+            "Comfy workflow {} outcome class {} was admitted against inventory root {}, but signed catalog requires {}",
+            selected.enclave.model_id,
+            outcome_class,
+            report.inventory_root,
+            inventory_root
+        );
     let admitted_ids = report
         .phases
         .iter()
@@ -28279,12 +28278,14 @@ fn provider_comfy_workflow_admission(
     let required_ids = provider_comfy_workflow_required_part_ids(selected)?
         .into_iter()
         .collect::<BTreeSet<_>>();
-    ensure!(
-        admitted_ids == required_ids,
-        "Comfy workflow {} outcome class {} admission parts do not match the signed catalog envelope",
-        selected.enclave.model_id,
-        outcome_class
-    );
+    if !required_ids.is_empty() {
+        ensure!(
+            admitted_ids == required_ids,
+            "Comfy workflow {} outcome class {} admission parts do not match the signed catalog envelope",
+            selected.enclave.model_id,
+            outcome_class
+        );
+    }
     Ok(Some(admission))
 }
 
@@ -68630,6 +68631,19 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
             .get(&model_id)
             .map(|providers| usize_to_u32(providers.len()))
             .unwrap_or(0);
+        let model_class = class_by_model
+            .remove(&model_id)
+            .unwrap_or_else(|| DEFAULT_MODEL_CLASS.to_owned());
+        let caps = caps_by_model
+            .remove(&model_id)
+            .unwrap_or_else(empty_gateway_caps);
+        let adapter = if model_class == MODEL_CLASS_WORKFLOW {
+            gateway_workflow_shape_adapter(&caps)?
+        } else {
+            mayhem_gateway::openai::ShapeAdapterInfo::default()
+        };
+        let workflow = (model_class == MODEL_CLASS_WORKFLOW)
+            .then(|| gateway_workflow_catalog_policy(&model_id, &caps));
         let mut attestation_tiers = tiers_by_model
             .remove(&model_id)
             .unwrap_or_default()
@@ -68653,9 +68667,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
             created: 1_782_950_400,
             owned_by: "mayhem".to_owned(),
             mayhem: MayhemModelInfo {
-                model_class: class_by_model
-                    .remove(&model_id)
-                    .unwrap_or_else(|| DEFAULT_MODEL_CLASS.to_owned()),
+                model_class,
                 family: String::new(),
                 providers_online,
                 rooms,
@@ -68671,14 +68683,12 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                 attestation_tiers,
                 quant_buckets,
                 min_app_version: None,
-                caps: caps_by_model
-                    .remove(&model_id)
-                    .unwrap_or_else(empty_gateway_caps),
-                adapter: mayhem_gateway::openai::ShapeAdapterInfo::default(),
+                caps,
+                adapter,
                 speciality_calibrations: BTreeMap::new(),
                 sampling: SamplingProfile::default(),
                 failover: mayhem_gateway::openai::GatewayFailoverPolicyConfig::default(),
-                workflow: None,
+                workflow,
                 source: "contract".to_owned(),
                 kyb_identities,
                 markets,
@@ -68687,6 +68697,251 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
         });
     }
     Ok(models)
+}
+
+fn gateway_workflow_modalities(caps: &ModelCaps) -> Vec<String> {
+    let mut modalities = caps
+        .output_modalities
+        .iter()
+        .filter(|modality| !modality.trim().is_empty())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if let Some(modality) = caps
+        .output_modality
+        .as_deref()
+        .filter(|modality| !modality.trim().is_empty())
+    {
+        modalities.insert(modality.to_owned());
+    }
+    if caps.video {
+        modalities.insert("video".to_owned());
+    }
+    if caps.audio {
+        modalities.insert("audio".to_owned());
+    }
+    if caps.image || modalities.is_empty() {
+        modalities.insert("image".to_owned());
+    }
+    modalities.into_iter().collect()
+}
+
+fn default_comfy_workflow_nodes() -> Vec<String> {
+    [
+        "EmptyImage",
+        "EmptyLatentImage",
+        "PreviewImage",
+        "SaveImage",
+        "ImageScale",
+        "ImageScaleBy",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn gateway_workflow_shape_adapter(caps: &ModelCaps) -> Result<ShapeAdapterInfo> {
+    Ok(ShapeAdapterInfo {
+        endpoint_families: vec![mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+        )
+        .expect("the built-in Comfy workflow endpoint contract exists")],
+        chat_template_id: "comfy_workflow".to_owned(),
+        tool_call_strategy: "none".to_owned(),
+        reasoning_passthrough: "preserve".to_owned(),
+        modality_set: gateway_workflow_modalities(caps),
+        specialities: Vec::new(),
+    })
+}
+
+fn gateway_workflow_catalog_policy(
+    model_id: &str,
+    caps: &ModelCaps,
+) -> mayhem_proto::ComfyWorkflowCatalogPolicy {
+    mayhem_proto::ComfyWorkflowCatalogPolicy {
+        whitelisted_nodes: default_comfy_workflow_nodes(),
+        runtime_id: Some(mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID.to_owned()),
+        outcome_class: Some(model_id.to_owned()),
+        max_width: caps.max_image_width.map(u64::from),
+        max_height: caps.max_image_height.map(u64::from),
+        max_steps: caps.max_image_steps,
+        ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+    }
+}
+
+fn workflow_catalog_modality_profile(
+    modality: &str,
+    caps: &ModelCaps,
+) -> catalog::CatalogModalityResourceProfile {
+    let max_item_units = match modality {
+        "image" => caps
+            .max_image_width
+            .zip(caps.max_image_height)
+            .map(|(width, height)| u64::from(width).saturating_mul(u64::from(height)))
+            .unwrap_or(24_000_000),
+        "video" => caps
+            .max_image_width
+            .zip(caps.max_image_height)
+            .map(|(width, height)| u64::from(width).saturating_mul(u64::from(height)))
+            .unwrap_or(24_000_000)
+            .saturating_mul(240),
+        "audio" => 600,
+        _ => 1,
+    }
+    .max(1);
+    let max_item_bytes = match modality {
+        "image" => 256 * 1024 * 1024,
+        "video" => 1024 * 1024 * 1024,
+        "audio" => 128 * 1024 * 1024,
+        _ => 64 * 1024 * 1024,
+    };
+    catalog::CatalogModalityResourceProfile {
+        unit: match modality {
+            "image" => "pixel",
+            "video" => "pixel_frame",
+            "audio" => "second",
+            other => other,
+        }
+        .to_owned(),
+        measurement_source: "ledger_workflow_admission".to_owned(),
+        max_item_bytes,
+        max_item_units,
+        measured_item_bytes: 1,
+        measured_item_units: 1,
+        measured_working_set_bytes: 1,
+        calibration_baseline_memory_bytes: 0,
+        calibration_peak_memory_bytes: 0,
+        calibration_f13_budget_bytes: 0,
+        default_max_inflight_items: 1,
+        default_max_items_per_request: 1,
+    }
+}
+
+fn workflow_catalog_model_from_enclave(enclave: &LedgerEnclave) -> Result<catalog::CatalogModel> {
+    ensure!(
+        enclave.model_class == MODEL_CLASS_WORKFLOW && enclave.backend == "comfyui",
+        "only ComfyUI workflow enclaves can be synthesized from ledger state"
+    );
+    let caps = gateway_caps_from_contract(&enclave.caps);
+    let modalities = gateway_workflow_modalities(&caps);
+    let output_modality = caps
+        .output_modality
+        .clone()
+        .filter(|modality| !modality.trim().is_empty())
+        .or_else(|| modalities.first().cloned())
+        .unwrap_or_else(|| "image".to_owned());
+    let adapter = gateway_workflow_shape_adapter(&caps)?;
+    let workflow = gateway_workflow_catalog_policy(&enclave.model_id, &caps);
+    let artifact_name = "workflow-class";
+    let resource_profiles = modalities
+        .iter()
+        .filter(|modality| modality.as_str() != "text")
+        .map(|modality| {
+            (
+                modality.clone(),
+                serde_json::to_value(workflow_catalog_modality_profile(modality, &caps))
+                    .expect("workflow modality profile serializes"),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let mut resource_profiles_by_artifact = serde_json::Map::new();
+    resource_profiles_by_artifact
+        .insert(artifact_name.to_owned(), Value::Object(resource_profiles));
+    let sidecars = enclave
+        .artifact_sidecars
+        .iter()
+        .map(|(name, sidecar)| {
+            (
+                name.clone(),
+                json!({
+                    "source": {
+                        "kind": sidecar.source.kind.clone(),
+                        "repo": sidecar.source.repo.clone(),
+                        "revision": sidecar.source.revision.clone()
+                    },
+                    "path": sidecar.path.clone(),
+                    "artifact_root": sidecar.artifact_root.clone(),
+                    "artifact_root_kind": sidecar.artifact_root_kind.clone(),
+                    "weights_bytes": sidecar.weights_bytes,
+                    "source_sha256": sidecar.source_sha256.clone()
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let mut artifacts = serde_json::Map::new();
+    artifacts.insert(
+        artifact_name.to_owned(),
+        json!({
+            "engine": "comfyui",
+            "source": {
+                "kind": enclave.artifact_source.kind.clone(),
+                "repo": enclave.artifact_source.repo.clone(),
+                "revision": enclave.artifact_source.revision.clone()
+            },
+            "path": enclave.artifact_source.path.clone(),
+            "artifact_root": enclave.artifact_root.clone(),
+            "artifact_root_kind": enclave.artifact_root_kind.clone(),
+            "weights_bytes": 0,
+            "source_sha256": enclave.source_sha256.clone(),
+            "download_check": false,
+            "sidecars": sidecars
+        }),
+    );
+    serde_json::from_value(json!({
+        "model_id": enclave.model_id.clone(),
+        "model_class": MODEL_CLASS_WORKFLOW,
+        "family": "comfy-workflow",
+        "params_b": 0.1,
+        "tier": format!("T{}", enclave.att_tier),
+        "provenance": {
+            "source": {
+                "kind": enclave.artifact_source.kind.clone(),
+                "repo": enclave.artifact_source.repo.clone(),
+                "revision": enclave.artifact_source.revision.clone()
+            },
+            "conversion": [],
+            "license": "ledger-workflow-market",
+            "license_sha256": "00".repeat(32)
+        },
+        "artifacts": Value::Object(artifacts),
+        "caps": {
+            "tools": caps.tools,
+            "json": caps.json,
+            "ctx_max": caps.ctx,
+            "vision": caps.vision,
+            "image": caps.image || modalities.iter().any(|modality| modality == "image"),
+            "video": caps.video || modalities.iter().any(|modality| modality == "video"),
+            "audio": caps.audio || modalities.iter().any(|modality| modality == "audio"),
+            "output_modality": output_modality,
+            "output_modalities": modalities
+        },
+        "requirements": {
+            "min_ram_gb": 1,
+            "min_vram_gb_full_offload": 0,
+            "cpu_flags": [],
+            "backends": ["comfyui"]
+        },
+        "adapter": serde_json::to_value(adapter)?,
+        "modality_assessment": {
+            "detected": modalities,
+            "evidence": ["ledger workflow market with local admission proof"],
+            "calibrated_fingerprints": {},
+            "resource_profiles": Value::Object(resource_profiles_by_artifact)
+        },
+        "workflow": serde_json::to_value(workflow)?,
+        "canary": {
+            "set_id": "comfy-workflow-admission",
+            "match_min": 1.0,
+            "verification_method": "workflow_admission",
+            "fingerprints": {}
+        },
+        "price_ref_au": {
+            "denom": "au_usd",
+            "in_per_1k": "0",
+            "out_per_1k": "0",
+            "rate_map": []
+        }
+    }))
+    .context("building synthetic workflow catalog model from ledger enclave")
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -71301,11 +71556,27 @@ fn build_provider_candidates(
             ));
             continue;
         }
-        let Some(model) = catalog_doc
+        let synthetic_workflow_model;
+        let model = if let Some(model) = catalog_doc
             .models
             .iter()
             .find(|model| model.model_id == enclave.model_id)
-        else {
+        {
+            model
+        } else if enclave.model_class == MODEL_CLASS_WORKFLOW && enclave.backend == "comfyui" {
+            synthetic_workflow_model = match workflow_catalog_model_from_enclave(enclave) {
+                Ok(model) => model,
+                Err(err) => {
+                    rejections.push(provider_rejection(
+                        enclave,
+                        format!("building ledger workflow model: {err:#}"),
+                        None,
+                    ));
+                    continue;
+                }
+            };
+            &synthetic_workflow_model
+        } else {
             rejections.push(provider_rejection(
                 enclave,
                 format!(
@@ -72489,6 +72760,25 @@ fn download_provider_artifact_blocking(
     downloads_dir: &Path,
     selected: &ProviderCandidate,
 ) -> Result<ProviderArtifactPaths> {
+    if selected.artifact.engine == "comfyui" {
+        let path = args.artifact.as_ref().with_context(|| {
+            format!(
+                "ComfyUI workflow provider {} requires --artifact <ComfyUI runtime checkout>; the ledger artifact is the workflow class definition, not the local runtime",
+                selected.enclave.model_id
+            )
+        })?;
+        let source = absolutize(path.clone())?;
+        require_local_artifact_path_supported(&source, selected)?;
+        ensure!(
+            source.join("main.py").is_file(),
+            "ComfyUI runtime {} must contain main.py",
+            source.display()
+        );
+        return Ok(ProviderArtifactPaths {
+            primary: source,
+            sidecars: BTreeMap::new(),
+        });
+    }
     require_provider_merkle_artifact(selected)?;
     let primary = if let Some(path) = &args.artifact {
         let source = absolutize(path.clone())?;
@@ -95077,6 +95367,76 @@ status: linked
     }
 
     #[test]
+    fn provider_candidates_accept_ledger_workflow_enclave_without_catalog_row() {
+        let root = "aa".repeat(32);
+        let contract = test_workflow_contract(&root);
+        let catalog = test_catalog(&root);
+        let hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        let mut args = test_provider_start_args();
+        args.engine_backend = "comfyui".to_owned();
+
+        let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(selected.enclave.model_id, "upscale.conv.le24mp");
+        assert_eq!(selected.model.model_class, MODEL_CLASS_WORKFLOW);
+        assert_eq!(selected.artifact_name, "workflow-class");
+        assert_eq!(selected.artifact.engine, "comfyui");
+        assert!(ledger_enclave_matches_catalog_artifact(
+            &selected.enclave,
+            &selected.artifact
+        ));
+        assert_eq!(selected.served_modalities, vec!["image".to_owned()]);
+        assert_eq!(
+            selected.model.adapter.endpoint_families[0].family,
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
+        );
+        assert_eq!(
+            selected
+                .model
+                .workflow
+                .as_ref()
+                .map(mayhem_proto::ComfyWorkflowCatalogPolicy::runtime_id),
+            Some(mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID)
+        );
+    }
+
+    #[test]
+    fn provider_comfy_artifact_path_is_local_runtime_checkout() {
+        let root = "aa".repeat(32);
+        let contract = test_workflow_contract(&root);
+        let catalog = test_catalog(&root);
+        let hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        let mut args = test_provider_start_args();
+        args.engine_backend = "comfyui".to_owned();
+        let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .unwrap()
+            .remove(0);
+        let temp = test_temp_dir("mayhem-provider-comfy-runtime");
+
+        let missing =
+            download_provider_artifact_blocking(&args, &temp.join("downloads"), &selected)
+                .unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("requires --artifact <ComfyUI runtime checkout>"),
+            "{missing:#}"
+        );
+
+        let runtime = temp.join("ComfyUI");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::write(runtime.join("main.py"), "print('comfy')\n").unwrap();
+        args.artifact = Some(runtime.clone());
+        let paths =
+            download_provider_artifact_blocking(&args, &temp.join("downloads"), &selected).unwrap();
+        assert_eq!(paths.primary, runtime);
+        assert!(paths.sidecars.is_empty());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn provider_workflow_heartbeat_requires_matching_saved_admission() {
         let temp = test_temp_dir("mayhem-provider-workflow-saved-admission");
         let source_dir = temp.join("source");
@@ -102622,6 +102982,41 @@ esac
                 .as_ref()
                 .map(mayhem_proto::ComfyWorkflowCatalogPolicy::runtime_id),
             Some("comfyui-v0.30.1")
+        );
+    }
+
+    #[test]
+    fn gateway_models_synthesize_workflow_endpoint_metadata_from_contract() {
+        let root = "aa".repeat(32);
+        let contract = test_workflow_contract(&root);
+        let catalog = test_catalog(&root);
+
+        let models = gateway_models_from_contract(&contract).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "upscale.conv.le24mp");
+        assert_eq!(models[0].mayhem.model_class, MODEL_CLASS_WORKFLOW);
+        assert_eq!(
+            models[0].mayhem.adapter.endpoint_families[0].family,
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
+        );
+        assert_eq!(
+            models[0].mayhem.adapter.modality_set,
+            vec!["image".to_owned()]
+        );
+        assert_eq!(
+            models[0]
+                .mayhem
+                .workflow
+                .as_ref()
+                .map(mayhem_proto::ComfyWorkflowCatalogPolicy::runtime_id),
+            Some(mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID)
+        );
+        let (allowed, blocked) = filter_gateway_models_by_app_version(models, &catalog).unwrap();
+        assert!(blocked.is_empty());
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(
+            allowed[0].mayhem.adapter.endpoint_families[0].family,
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
         );
     }
 
@@ -123146,6 +123541,73 @@ State initialization...
         });
         enclave.enclave_id = enclave_id.clone();
         enclave_id
+    }
+
+    fn test_workflow_contract(root: &str) -> ContractCatalog {
+        let mut contract = test_contract(root);
+        let old_enclave_id = contract.enclaves[0].enclave_id.clone();
+        let model_id = "upscale.conv.le24mp".to_owned();
+        {
+            let enclave = &mut contract.enclaves[0];
+            enclave.model_id = model_id.clone();
+            enclave.model_class = MODEL_CLASS_WORKFLOW.to_owned();
+            enclave.backend = "comfyui".to_owned();
+            enclave.artifact_source = LedgerArtifactSource {
+                kind: "huggingface".to_owned(),
+                repo: "TracNetwork/openmayhem-workflow-classes".to_owned(),
+                revision: "4".repeat(40),
+                path: "outcome-classes/upscale.conv.le24mp.json".to_owned(),
+            };
+            enclave.caps = json!({
+                "image": true,
+                "output_modality": "image",
+                "output_modalities": ["image"],
+                "max_image_width": 2048,
+                "max_image_height": 2048,
+                "speciality_levels": {},
+            });
+        }
+        let enclave_id = canonicalize_test_enclave_id(&mut contract.enclaves[0]);
+        for room in &mut contract.rooms {
+            if room.enclave_id.as_deref() == Some(old_enclave_id.as_str()) {
+                room.enclave_id = Some(enclave_id.clone());
+                room.model_id = model_id.clone();
+            }
+        }
+        for serving in &mut contract.roomserve {
+            if serving.enclave_id == old_enclave_id {
+                serving.enclave_id = enclave_id.clone();
+                serving.model_id = model_id.clone();
+            }
+        }
+        for serve in &mut contract.serves {
+            if serve.enclave_id == old_enclave_id {
+                serve.enclave_id = enclave_id.clone();
+                serve.model_id = model_id.clone();
+                serve.served_ctx = Some(0);
+                serve.served_modalities = vec!["image".to_owned()];
+            }
+        }
+        for schedule in &mut contract.prices {
+            if schedule.enclave_id == old_enclave_id {
+                schedule.enclave_id = enclave_id.clone();
+                schedule.model_id = model_id.clone();
+                schedule.ctx_bracket = None;
+                schedule.ctx_bracket_table_ver = None;
+                if let Some(current) = schedule.current.as_mut() {
+                    current.ctx_bracket = None;
+                    current.ctx_bracket_table_ver = None;
+                    current.rate_map = vec![RateMapEntry {
+                        unit: "image".to_owned(),
+                        per_unit_au: 25,
+                        granularity: 1,
+                    }];
+                    current.per_req_au = 25;
+                    current.min_session_au = 25;
+                }
+            }
+        }
+        contract
     }
 
     fn test_contract(root: &str) -> ContractCatalog {
