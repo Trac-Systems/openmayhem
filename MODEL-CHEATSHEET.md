@@ -115,6 +115,9 @@ mayhem provider parts pull \
   --layout-dir <parts-index-layout> \
   --part-id <part-id> \
   --require-payload
+mayhem provider parts add \
+  --layout-dir <parts-index-layout> \
+  --part-id <part-id>
 mayhem provider parts admit \
   --outcome-class <workflow-class> \
   --runtime-id comfyui-v0.30.1 \

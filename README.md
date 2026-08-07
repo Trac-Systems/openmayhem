@@ -214,7 +214,8 @@ sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config git 
   blessed runtime, currently `comfyui-v0.30.1`. Use `python3` on `PATH`, or set
   `MAYHEM_COMFYUI_PYTHON` to the executable belonging to that checkout's
   environment. Workflow parts still come only from the signed parts index and
-  must pass `mayhem provider parts pull` plus `mayhem provider parts admit`.
+  must pass `mayhem provider parts pull`, `mayhem provider parts add`, and
+  `mayhem provider parts admit`.
 - AMD GPUs: ROCm, or a Vulkan loader for the Vulkan path.
 - Tier 2 needs a TPM 2.0 exposed at `/dev/tpmrm0` plus `tpm2-tools` (`sudo apt-get install -y tpm2-tools`). The quote helper runs as the provider user. If the distro exposes the device as `root:tss`, add the existing login to that existing distro group once with `sudo usermod -aG tss "$USER"`, then log out and back in. Mayhem never creates users or groups, changes device ACLs, or runs hardware-proof helpers merely because it detected a TPM.
 
@@ -250,7 +251,8 @@ Most installs are driven by a coding agent. Agent: execute in THIS order, verify
    - **ComfyUI workflows**: verify the blessed ComfyUI runtime checkout and its
      Python executable. Use `python3` if it belongs to that checkout; otherwise
      set `MAYHEM_COMFYUI_PYTHON` explicitly. Then pull verified parts and run
-     `mayhem provider parts admit --write` before serving.
+     `mayhem provider parts add` and `mayhem provider parts admit --write`
+     before serving.
    - **Audio/image serving**: the engines are external binaries that must be on `PATH` (or pointed at by env): `whisper-cli` (`MAYHEM_WHISPER_CPP_BIN`), `piper` (`MAYHEM_PIPER_BIN`), `sd-cli` (`MAYHEM_STABLE_DIFFUSION_CPP_BIN`). Accelerator selection is automatic. Text-only providers can ignore this.
 7. **Start and verify**: `mayhem up --yes` (or `--provider`), then confirm the gateway answers (`curl http://127.0.0.1:11435/v1/models`) and, for providers, `mayhem provider health` is green AND the served model appears in `/v1/models`. A green health with a missing route means the model failed to load — re-run `mayhem doctor` and check the backend extras above.
 8. **Explain to the human** what was installed, where the dashboards are, and (providers) what their earnings depend on.

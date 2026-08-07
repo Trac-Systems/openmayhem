@@ -123,8 +123,8 @@ the frozen runtime under `~/.mayhem`.
 **ComfyUI workflows:** verify the blessed ComfyUI runtime checkout, currently
 `comfyui-v0.30.1`, and the Python executable that belongs to it. Use `python3` only when it is the
 runtime environment's interpreter; otherwise set `MAYHEM_COMFYUI_PYTHON` to the exact executable.
-Workflow parts still come only from the signed parts index and require `mayhem provider parts pull`
-plus `mayhem provider parts admit --write` before serving.
+Workflow parts still come only from the signed parts index and require `mayhem provider parts pull`,
+`mayhem provider parts add`, and `mayhem provider parts admit --write` before serving.
 **Tier 2:** install `tpm2-tools`; the provider uses `/dev/tpmrm0` unprivileged. If the distro owns
 that device as `root:tss`, add the login to the existing group with
 `sudo usermod -aG tss "$USER"`, then start a new login. Mayhem never creates users/groups or changes
@@ -554,6 +554,7 @@ proof both pass. Pull only from a verified parts-index layout:
 
 ```bash
 mayhem provider parts pull --layout-dir <parts-index-layout> --part-id <part-id> --require-payload
+mayhem provider parts add --layout-dir <parts-index-layout> --part-id <part-id>
 ```
 
 Use `--all` only when the machine is intended to mirror the whole provider-facing parts index and
