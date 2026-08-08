@@ -44554,6 +44554,119 @@ mod tests {
     }
 
     #[test]
+    fn comfy_workflow_upscaler_scale_drives_gateway_usage_and_route_load() {
+        let graph = json!({
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "krea2_turbo_fp8_scaled.safetensors", "weight_dtype": "default"}},
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors", "type": "krea2", "device": "default"}},
+            "3": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
+            "4": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": "commercial product photo"}},
+            "5": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}},
+            "6": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+            "7": {"class_type": "KSampler", "inputs": {"seed": 7, "steps": 8, "cfg": 1, "sampler_name": "euler", "scheduler": "simple", "denoise": 1, "model": ["1", 0], "positive": ["4", 0], "negative": ["5", 0], "latent_image": ["6", 0]}},
+            "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["3", 0]}},
+            "9": {"class_type": "UpscaleModelLoader", "inputs": {"model_name": "4x-spanx4-ch48.safetensors"}},
+            "10": {"class_type": "ImageUpscaleWithModel", "inputs": {"upscale_model": ["9", 0], "image": ["8", 0]}},
+            "11": {"class_type": "SaveImage", "inputs": {"images": ["10", 0], "filename_prefix": "mayhem-krea2-4x"}}
+        });
+        let policy = mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec![
+                "UNETLoader".to_owned(),
+                "CLIPLoader".to_owned(),
+                "VAELoader".to_owned(),
+                "CLIPTextEncode".to_owned(),
+                "ConditioningZeroOut".to_owned(),
+                "EmptyLatentImage".to_owned(),
+                "KSampler".to_owned(),
+                "VAEDecode".to_owned(),
+                "UpscaleModelLoader".to_owned(),
+                "ImageUpscaleWithModel".to_owned(),
+                "SaveImage".to_owned(),
+            ],
+            parts: vec![
+                mayhem_proto::ComfyWorkflowPartRef {
+                    part_id: "6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae"
+                        .to_owned(),
+                    name: "krea2_turbo_fp8_scaled.safetensors".to_owned(),
+                    part_type: "checkpoint".to_owned(),
+                    sha256: "eb4dd8c612cfd10f64f25b057e6e6bbcb5737c94a7372177e456dbf7579502f1"
+                        .to_owned(),
+                    scale: None,
+                },
+                mayhem_proto::ComfyWorkflowPartRef {
+                    part_id: "19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c"
+                        .to_owned(),
+                    name: "qwen3vl_4b_fp8_scaled.safetensors".to_owned(),
+                    part_type: "text-encoder".to_owned(),
+                    sha256: "54bd5144df0bbc25dd6ccadfcb826b521445a1b06ae5a42570bdd2974ca87094"
+                        .to_owned(),
+                    scale: None,
+                },
+                mayhem_proto::ComfyWorkflowPartRef {
+                    part_id: "106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70"
+                        .to_owned(),
+                    name: "qwen_image_vae.safetensors".to_owned(),
+                    part_type: "vae".to_owned(),
+                    sha256: "a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f"
+                        .to_owned(),
+                    scale: None,
+                },
+                mayhem_proto::ComfyWorkflowPartRef {
+                    part_id: "d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a"
+                        .to_owned(),
+                    name: "4x-spanx4-ch48.safetensors".to_owned(),
+                    part_type: "upscaler".to_owned(),
+                    sha256: "7889cc7180154767f581ca3dda031b2dfec268744880f5427255e88b34f9af07"
+                        .to_owned(),
+                    scale: Some(4),
+                },
+            ],
+            runtime_id: Some("comfyui-v0.30.1".to_owned()),
+            outcome_class: Some("image.heavy.le17mp".to_owned()),
+            pricing_unit: Some(mayhem_proto::USAGE_MEGAPIXEL_STEP.to_owned()),
+            max_width: Some(4096),
+            max_height: Some(4096),
+            max_steps: Some(8),
+            max_artifacts: Some(1),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        };
+        let request = artifact_generation_request_with_workflow_policy(
+            "image.heavy.le17mp",
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            json!({
+                "model": "image.heavy.le17mp",
+                "workflow": graph,
+                "response_format": "artifact"
+            }),
+            VideoRequestPreparation::default(),
+            Some(&policy),
+        )
+        .unwrap();
+
+        let workflow = request.workflow.as_ref().expect("workflow binding");
+        assert_eq!(workflow.outcome_class, "image.heavy.le17mp");
+        assert_eq!(
+            workflow
+                .quoted_usage
+                .get(mayhem_proto::USAGE_MEGAPIXEL_STEP),
+            136
+        );
+        assert_eq!(
+            artifact_generation_usage_for_request(&request),
+            workflow.quoted_usage
+        );
+        let output = request.workflow_output.as_ref().expect("workflow output");
+        assert_eq!(output.metrics.get("width"), Some(&4096));
+        assert_eq!(output.metrics.get("height"), Some(&4096));
+
+        let model = test_model();
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let requirements =
+            request_requirements_for_artifact_generation(&state, &model, &request, 1, None, None);
+        let image_load = requirements.modality_load.get("image").unwrap();
+        assert_eq!(image_load.max_item_units, 4096 * 4096);
+    }
+
+    #[test]
     fn comfy_workflow_endpoint_normalizes_through_gateway_contract() {
         let graph = json!({
             "1": {
@@ -44734,6 +44847,7 @@ mod tests {
                 name: "tiny.safetensors".to_owned(),
                 part_type: "checkpoint".to_owned(),
                 sha256: "22".repeat(32),
+                scale: None,
             }],
             runtime_id: Some("comfyui-v0.31.0".to_owned()),
             outcome_class: Some("image.custom.384".to_owned()),

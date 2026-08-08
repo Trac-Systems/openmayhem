@@ -15,9 +15,9 @@ routes, and revisions. Never copy an enclave ID or price from documentation:
 mayhem models --gateway
 ```
 
-## v0.2.106 runtime status
+## v0.2.107 runtime status
 
-The `0.2.106` source release keeps the previous source-install, managed
+The `0.2.107` source release keeps the previous source-install, managed
 runtime, co-resident memory, endpoint-floor, Sulphur, Chatterbox, ACE-Step,
 Needle, and Comfy workflow market fixes, and adds the current Comfy parts
 inventory below. Ledger-only workflow outcome classes expose endpoint family
@@ -26,7 +26,10 @@ static `catalog/models.json` row, and workflow serving uses
 `--artifact <comfy-runtime-dir>` for the local ComfyUI runtime checkout while
 keeping the ledger artifact bound to the workflow class definition. Workflow
 graph hashes canonicalize integer-valued JSON floats, so JS/Pear transport
-normalization of `1.0` to `1` does not break signed workflow vouchers.
+normalization of `1.0` to `1` does not break signed workflow vouchers. Signed
+Comfy upscaler parts may declare a scale; Krea+4x workflows must use v0.2.107 or
+newer on both buyer gateways and providers so route requirements, vouchers, and
+receipts meter the upscaled output dimensions.
 Dedicated-VRAM reservations remain enforced. Needle still has
 exactly two markets: `needle-cpu` across Linux, Windows x86_64, and Apple
 Silicon macOS, and CUDA-only `needle-gpu` on supported Linux aarch64/x86_64 and
@@ -149,6 +152,30 @@ Current proven Krea 2 Turbo workflow lane:
 | Pricing unit | `megapixel_step` |
 | 1024x1024, 8-step usage | `16` `megapixel_step` |
 
+Prepared Krea 2 Turbo + 4x upscaler workflow lane:
+
+| Field | Value |
+|---|---|
+| Outcome class / model | `image.heavy.le17mp` |
+| Endpoint family | `mayhem_comfy_workflows` |
+| Endpoint | `POST /v1/workflows` |
+| Enclave ID | `997a76256af8236e32c06ccc2d615c625b208ee435c798e73de0d738334e41f2` |
+| Room nonce | `comfy-grid-v1-image-heavy-le17mp` |
+| Workflow class artifact root | `13b11b153e7cdadf973e2efbe7f3269f43656b375917005875f130f089ec2aea` |
+| Workflow class source SHA-256 | `58db2ca0a564c200ebf6635544c57d6f1d9970df9e759b05d2b9c49ce14fb4d1` |
+| Required inventory root | `ed99758a107c3159b466f6970152a386619f1c9e62f9a6dabb1400b244ee427e` |
+| Runtime | `comfyui-v0.30.1` |
+| Pricing unit | `megapixel_step` |
+| 1024x1024, 8-step, 4x output usage | `136` `megapixel_step` |
+
+Krea 2 Turbo itself is the base image generator. A true 4x result is a single
+Comfy workflow graph that runs Krea and then an approved upscaler node. That is
+not the same market as the base lane: publish it under the `image.heavy.le17mp`
+outcome class, include `UpscaleModelLoader` and `ImageUpscaleWithModel` in the
+signed workflow policy, and add a signed upscaler part with `scale: 4`.
+Recommended first upscaler is `4x-spanx4-ch48.safetensors` because it is small,
+Apache-2.0, and signed for all lanes.
+
 Krea providers must add these signed parts before admission:
 
 | Part | Part ID | Purpose |
@@ -156,6 +183,7 @@ Krea providers must add these signed parts before admission:
 | `krea2_turbo_fp8_scaled.safetensors` | `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae` | Krea 2 Turbo checkpoint, [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae.json) |
 | `qwen3vl_4b_fp8_scaled.safetensors` | `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c` | Krea 2 text encoder, [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c.json) |
 | `qwen_image_vae.safetensors` | `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70` | Krea/Qwen image VAE, [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70.json) |
+| `4x-spanx4-ch48.safetensors` | `d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a` | Optional Krea+4x upscaler part with signed `scale: 4`, [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a.json) |
 
 ### Current Comfy parts inventory
 

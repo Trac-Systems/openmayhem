@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 
@@ -12,12 +13,17 @@ const DEFAULT_MAX_BYTES = 8 * 1024 ** 3;
 const DEFAULT_BRIDGE_URL = 'ws://127.0.0.1:49222';
 const DEFAULT_SERVICE = 'mayhem-stack.service';
 
+const defaultDiagnosticRoot = () => path.join(os.homedir(), 'mayhem-diagnostics');
+const defaultArtifactRoot = () => path.join(defaultDiagnosticRoot(), 'threshold-captures');
+const defaultBridgeTokenFile = () => path.join(os.homedir(), '.mayhem-mainnet-provider', 'sc-bridge-token');
+
 const redactKey = /TOKEN|SECRET|PASSWORD|BEARER|AUTH|PRIVATE|KEY/i;
 
 const usage = () => `Usage: pear-memory-threshold-capture.mjs [options]
 
 Options:
   --service <name>           systemd user service that owns pear-runtime
+  --diagnostic-root <path>   root for external diagnostic files
   --artifact-root <path>     directory for captures
   --state-file <path>        threshold state file
   --thresholds <list>        comma list, e.g. 4GiB,8GiB,16GiB
@@ -438,8 +444,8 @@ const captureDirs = (artifactRoot) => {
   }
 };
 
-const removeCaptureDir = (captureDir, artifactRoot) => {
-  const root = path.resolve(artifactRoot);
+const removeCaptureDir = (captureDir, options) => {
+  const root = path.resolve(options.artifactRoot);
   const target = path.resolve(captureDir.dir);
   if (!pathContains(root, target) || path.basename(target).startsWith('pear-') === false) {
     throw new Error(`refusing to prune unexpected capture path ${captureDir.dir}`);
@@ -449,7 +455,7 @@ const removeCaptureDir = (captureDir, artifactRoot) => {
     : null;
   fs.rmSync(target, { recursive: true, force: true });
   if (heapSnapshot && path.basename(heapSnapshot).startsWith('mayhem-peer-')) {
-    const diagnosticRoot = path.resolve('/home/trac/mayhem-diagnostics');
+    const diagnosticRoot = path.resolve(options.diagnosticRoot);
     if (pathContains(diagnosticRoot, heapSnapshot)) {
       fs.rmSync(heapSnapshot, { force: true });
     }
@@ -465,7 +471,7 @@ const enforceRetention = (options) => {
   while (dirs.length > maxCaptures || totalBytes > maxBytes) {
     const oldest = dirs.shift();
     if (!oldest) break;
-    removeCaptureDir(oldest, options.artifactRoot);
+    removeCaptureDir(oldest, options);
     removed.push({ dir: oldest.dir, bytes: oldest.size });
     totalBytes -= oldest.size;
   }
@@ -566,9 +572,11 @@ const capture = async (options, sample, trigger) => {
 const defaultStateFile = (artifactRoot) => path.join(artifactRoot, 'state.json');
 
 const optionsFromArgs = (args) => {
-  const artifactRoot = String(args['artifact-root'] ?? '/home/trac/mayhem-diagnostics/threshold-captures');
+  const diagnosticRoot = String(args['diagnostic-root'] ?? defaultDiagnosticRoot());
+  const artifactRoot = String(args['artifact-root'] ?? path.join(diagnosticRoot, 'threshold-captures'));
   return {
     service: String(args.service ?? DEFAULT_SERVICE),
+    diagnosticRoot,
     artifactRoot,
     stateFile: String(args['state-file'] ?? defaultStateFile(artifactRoot)),
     thresholds: parseThresholds(args.thresholds ?? DEFAULT_THRESHOLDS),
@@ -581,7 +589,7 @@ const optionsFromArgs = (args) => {
       'max-bytes'
     ),
     bridgeUrl: String(args['bridge-url'] ?? DEFAULT_BRIDGE_URL),
-    bridgeTokenFile: String(args['bridge-token-file'] ?? '/home/trac/.mayhem-mainnet-provider/sc-bridge-token'),
+    bridgeTokenFile: String(args['bridge-token-file'] ?? defaultBridgeTokenFile()),
     heapTimeoutMs: parsePositiveInteger(args['heap-timeout-ms'], DEFAULT_HEAP_TIMEOUT_MS, 'heap-timeout-ms'),
     once: args.once === true,
     force: args.force === true,

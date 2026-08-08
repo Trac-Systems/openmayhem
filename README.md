@@ -79,7 +79,7 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.106` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.107` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -88,7 +88,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.106
+git checkout --detach v0.2.107
 ./install.sh --from-source
 ```
 
@@ -97,7 +97,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.106
+git checkout --detach v0.2.107
 .\install.ps1 -FromSource
 ```
 
@@ -846,6 +846,13 @@ mayhem up --provider --provider-enclave <workflow-enclave-id> --artifact <comfy-
 integer-valued workflow JSON floats for graph hashing, so `1.0` and `1` bind to
 the same voucher.
 
+Krea 2 Turbo's base lane generates the image; a 4x result is a single workflow
+graph that adds an approved upscaler stage after Krea. It is published as a
+separate workflow market for honest pricing and admission, but users still send
+one `/v1/workflows` request and receive one receipt. Gateways and providers need
+`v0.2.107` or newer for Krea+4x because the voucher must meter the signed
+upscaler scale, not only the base latent size.
+
 Chatterbox uses `voice: "default"` for ordinary speech. For zero-shot cloning, add a bounded
 base64 WAV reference:
 
@@ -918,7 +925,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.106` is source-only. The GitHub release contains the tagged source, not
+`v0.2.107` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -926,7 +933,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.106
+git checkout --detach v0.2.107
 ./install.sh --from-source
 ```
 
@@ -935,7 +942,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.106
+git checkout --detach v0.2.107
 .\install.ps1 -FromSource
 ```
 
@@ -959,10 +966,13 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
-The `0.2.106` source release documents the current Comfy parts inventory,
+The `0.2.107` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the
-local ComfyUI runtime directory, and canonicalizes integer-valued workflow JSON
-floats before graph hashing.
+local ComfyUI runtime directory, canonicalizes integer-valued workflow JSON
+floats before graph hashing, and derives Comfy upscaler output dimensions from
+the signed upscaler part scale. A 1024x1024 Krea graph followed by a signed 4x
+upscaler is therefore routed and billed as a 4096x4096 workflow, not as the
+base image.
 
 The `0.2.104` source release makes local builds self-consistent across macOS,
 Linux, and Windows. Source installers select exactly one available llama.cpp

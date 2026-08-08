@@ -72,14 +72,14 @@ aggregate admission refusal or compensate with an undocumented memory override.
 ## 3. Install
 
 ### 3.1 Get the code — exact source release (MANDATORY rule)
-- `v0.2.106` is source-only. Never invent or offer a native archive URL: the release has no unsigned
+- `v0.2.107` is source-only. Never invent or offer a native archive URL: the release has no unsigned
   OpenMayhem executable assets. Clone the exact release tag and build it locally.
 
   **macOS/Linux:**
   ```bash
   git clone https://github.com/Trac-Systems/openmayhem.git
   cd openmayhem
-  git checkout --detach v0.2.106
+  git checkout --detach v0.2.107
   ./install.sh --from-source
   ```
 
@@ -87,7 +87,7 @@ aggregate admission refusal or compensate with an undocumented memory override.
   ```powershell
   git clone https://github.com/Trac-Systems/openmayhem.git
   Set-Location openmayhem
-  git checkout --detach v0.2.106
+  git checkout --detach v0.2.107
   .\install.ps1 -FromSource
   ```
 On updated source checkouts, `mayhem up` verifies and, when needed, deterministically repairs only
@@ -126,7 +126,10 @@ runtime environment's interpreter; otherwise set `MAYHEM_COMFYUI_PYTHON` to the 
 Workflow parts still come only from the signed parts index and require `mayhem provider parts pull`,
 `mayhem provider parts add`, and `mayhem provider parts admit --write` before serving. Workflow
 provider start must pass `--artifact <comfy-runtime-dir>`; that path is the local ComfyUI runtime
-checkout, while the ledger artifact is the workflow class definition.
+checkout, while the ledger artifact is the workflow class definition. Krea base generation is a
+1024x1024 workflow lane. A Krea+4x lane is one workflow graph with a signed upscaler part, but it
+requires the v0.2.107 upscaler-scale derivation on both gateway and provider so vouchers bill and
+route the 4096x4096 output instead of the base image.
 **Tier 2:** install `tpm2-tools`; the provider uses `/dev/tpmrm0` unprivileged. If the distro owns
 that device as `root:tss`, add the login to the existing group with
 `sudo usermod -aG tss "$USER"`, then start a new login. Mayhem never creates users/groups or changes
@@ -625,8 +628,8 @@ forwarded as-is.
 
 | Goal | Command |
 |---|---|
-| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.106 && ./install.sh --from-source` |
-| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.106; .\install.ps1 -FromSource` |
+| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.107 && ./install.sh --from-source` |
+| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.107; .\install.ps1 -FromSource` |
 | Start user gateway | `mayhem up --rail <fiat\|tap\|tnk> --yes` |
 | Start provider | `mayhem up --provider --yes` |
 | Stop and leave provider registrations | `mayhem down` |

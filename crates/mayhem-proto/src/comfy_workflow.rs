@@ -30,6 +30,8 @@ pub struct ComfyWorkflowPartRef {
     #[serde(rename = "type")]
     pub part_type: String,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -115,6 +117,20 @@ impl ComfyWorkflowCatalogPolicy {
                     "duplicate part name {}",
                     part.name
                 )));
+            }
+            if let Some(scale) = part.scale {
+                if part.part_type != "upscaler" {
+                    return Err(ComfyWorkflowDerivationError::InvalidPolicy(format!(
+                        "part {} declares scale but is not an upscaler",
+                        part.name
+                    )));
+                }
+                if scale == 0 || scale > 64 {
+                    return Err(ComfyWorkflowDerivationError::InvalidPolicy(format!(
+                        "part {} declares unsupported upscaler scale {scale}",
+                        part.name
+                    )));
+                }
             }
         }
         if let Some(unit) = self.pricing_unit.as_deref() {
@@ -314,6 +330,7 @@ pub fn derive_comfy_workflow(
             Some(class_type),
         )?;
     }
+    infer_linked_image_dimensions(nodes, policy, &mut metrics)?;
 
     let outcome_spec = metrics.into_outcome_spec(policy)?;
     let quoted_usage = workflow_usage_from_outcome(&outcome_spec, policy.pricing_unit.as_deref());
@@ -592,6 +609,155 @@ fn update_metric_from_key(key: &str, value: &Value, metrics: &mut OutcomeMetrics
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ImageDimensions {
+    width: u64,
+    height: u64,
+}
+
+fn infer_linked_image_dimensions(
+    nodes: &serde_json::Map<String, Value>,
+    policy: &ComfyWorkflowDerivationPolicy,
+    metrics: &mut OutcomeMetrics,
+) -> Result<(), ComfyWorkflowDerivationError> {
+    let mut dimensions = BTreeMap::<String, ImageDimensions>::new();
+    let mut upscaler_scales = BTreeMap::<String, u64>::new();
+    let mut changed = true;
+    let mut passes = 0_usize;
+    while changed && passes <= nodes.len() {
+        changed = false;
+        passes += 1;
+        for (node_id, node) in nodes {
+            let Some(object) = node.as_object() else {
+                continue;
+            };
+            let class_type = object
+                .get("class_type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let inputs = object.get("inputs").and_then(Value::as_object);
+            if class_type == "UpscaleModelLoader" {
+                if let Some(part_name) = inputs
+                    .and_then(|inputs| inputs.get("model_name"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    let part = policy.parts_by_name.get(part_name).ok_or_else(|| {
+                        ComfyWorkflowDerivationError::MissingPart(part_name.to_owned())
+                    })?;
+                    if let Some(scale) = part.scale {
+                        if upscaler_scales.insert(node_id.clone(), scale) != Some(scale) {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            let Some(inputs) = inputs else {
+                continue;
+            };
+            let inferred =
+                infer_node_image_dimensions(class_type, inputs, &dimensions, &upscaler_scales)?;
+            if let Some(inferred) = inferred {
+                update_metrics_from_dimensions(metrics, inferred);
+                if dimensions.insert(node_id.clone(), inferred) != Some(inferred) {
+                    changed = true;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn infer_node_image_dimensions(
+    class_type: &str,
+    inputs: &serde_json::Map<String, Value>,
+    dimensions: &BTreeMap<String, ImageDimensions>,
+    upscaler_scales: &BTreeMap<String, u64>,
+) -> Result<Option<ImageDimensions>, ComfyWorkflowDerivationError> {
+    if let Some(dimensions) = explicit_dimensions(inputs) {
+        return Ok(Some(dimensions));
+    }
+    match class_type {
+        "ImageScale" => Ok(linked_dimensions(inputs, dimensions, &["image", "images"])),
+        "ImageScaleBy" => {
+            let Some(source) = linked_dimensions(inputs, dimensions, &["image", "images"]) else {
+                return Ok(None);
+            };
+            let Some(scale) = inputs.get("scale_by").and_then(numeric_f64) else {
+                return Ok(Some(source));
+            };
+            if !scale.is_finite() || scale <= 0.0 || scale > 64.0 {
+                return Err(ComfyWorkflowDerivationError::InvalidGraph(
+                    "ImageScaleBy scale_by must be finite and between 0 and 64".to_owned(),
+                ));
+            }
+            Ok(Some(scale_dimensions(source, scale)))
+        }
+        "ImageUpscaleWithModel" => {
+            let Some(source) = linked_dimensions(inputs, dimensions, &["image", "images"]) else {
+                return Ok(None);
+            };
+            let Some(upscaler_node) = link_node_id(inputs.get("upscale_model")) else {
+                return Err(ComfyWorkflowDerivationError::InvalidGraph(
+                    "ImageUpscaleWithModel is missing linked upscale_model".to_owned(),
+                ));
+            };
+            let Some(scale) = upscaler_scales.get(upscaler_node) else {
+                return Err(ComfyWorkflowDerivationError::InvalidGraph(
+                    "ImageUpscaleWithModel requires signed upscaler part scale".to_owned(),
+                ));
+            };
+            Ok(Some(scale_dimensions(source, *scale as f64)))
+        }
+        _ => Ok(linked_dimensions(
+            inputs,
+            dimensions,
+            &["image", "images", "samples", "latent_image"],
+        )),
+    }
+}
+
+fn explicit_dimensions(inputs: &serde_json::Map<String, Value>) -> Option<ImageDimensions> {
+    Some(ImageDimensions {
+        width: inputs.get("width").and_then(numeric_u64)?.max(1),
+        height: inputs.get("height").and_then(numeric_u64)?.max(1),
+    })
+}
+
+fn linked_dimensions(
+    inputs: &serde_json::Map<String, Value>,
+    dimensions: &BTreeMap<String, ImageDimensions>,
+    keys: &[&str],
+) -> Option<ImageDimensions> {
+    for key in keys {
+        let Some(node_id) = link_node_id(inputs.get(*key)) else {
+            continue;
+        };
+        if let Some(dimensions) = dimensions.get(node_id) {
+            return Some(*dimensions);
+        }
+    }
+    None
+}
+
+fn link_node_id(value: Option<&Value>) -> Option<&str> {
+    let value = value?.as_array()?;
+    value.first()?.as_str()
+}
+
+fn scale_dimensions(dimensions: ImageDimensions, scale: f64) -> ImageDimensions {
+    ImageDimensions {
+        width: ((dimensions.width as f64) * scale).ceil().max(1.0) as u64,
+        height: ((dimensions.height as f64) * scale).ceil().max(1.0) as u64,
+    }
+}
+
+fn update_metrics_from_dimensions(metrics: &mut OutcomeMetrics, dimensions: ImageDimensions) {
+    metrics.width = Some(metrics.width.unwrap_or(0).max(dimensions.width));
+    metrics.height = Some(metrics.height.unwrap_or(0).max(dimensions.height));
+}
+
 fn numeric_u64(value: &Value) -> Option<u64> {
     if let Some(value) = value.as_u64() {
         return Some(value);
@@ -602,6 +768,10 @@ fn numeric_u64(value: &Value) -> Option<u64> {
     } else {
         None
     }
+}
+
+fn numeric_f64(value: &Value) -> Option<f64> {
+    value.as_f64()
 }
 
 fn workflow_usage_from_outcome(
@@ -757,6 +927,7 @@ mod tests {
                     name: "sdxl.safetensors".to_owned(),
                     part_type: "checkpoint".to_owned(),
                     sha256: "22".repeat(32),
+                    scale: None,
                 },
             )]),
             max_width: 1_024,
@@ -785,6 +956,7 @@ mod tests {
             name: name.to_owned(),
             part_type: part_type.to_owned(),
             sha256: byte.repeat(32),
+            scale: None,
         }
     }
 
@@ -944,6 +1116,95 @@ mod tests {
         assert_eq!(audio.quoted_usage.units().len(), 1);
 
         assert!(valid_comfy_pricing_unit(USAGE_INPUT_CHARACTER));
+    }
+
+    #[test]
+    fn signed_upscaler_scale_expands_derived_image_usage() {
+        let mut policy = ComfyWorkflowDerivationPolicy {
+            whitelisted_nodes: [
+                "UNETLoader",
+                "CLIPLoader",
+                "VAELoader",
+                "CLIPTextEncode",
+                "ConditioningZeroOut",
+                "EmptyLatentImage",
+                "KSampler",
+                "VAEDecode",
+                "UpscaleModelLoader",
+                "ImageUpscaleWithModel",
+                "SaveImage",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            parts_by_name: BTreeMap::from([
+                (
+                    "krea2_turbo_fp8_scaled.safetensors".to_owned(),
+                    part("krea2_turbo_fp8_scaled.safetensors", "checkpoint", "41"),
+                ),
+                (
+                    "qwen3vl_4b_fp8_scaled.safetensors".to_owned(),
+                    part("qwen3vl_4b_fp8_scaled.safetensors", "text-encoder", "42"),
+                ),
+                (
+                    "qwen_image_vae.safetensors".to_owned(),
+                    part("qwen_image_vae.safetensors", "vae", "43"),
+                ),
+                (
+                    "4x-spanx4-ch48.safetensors".to_owned(),
+                    ComfyWorkflowPartRef {
+                        scale: Some(4),
+                        ..part("4x-spanx4-ch48.safetensors", "upscaler", "44")
+                    },
+                ),
+            ]),
+            pricing_unit: Some(USAGE_MEGAPIXEL_STEP.to_owned()),
+            max_width: 4_096,
+            max_height: 4_096,
+            max_steps: 8,
+            ..ComfyWorkflowDerivationPolicy::default()
+        };
+        let graph = json!({
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "krea2_turbo_fp8_scaled.safetensors", "weight_dtype": "default"}},
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors", "type": "krea2", "device": "default"}},
+            "3": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
+            "4": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": "commercial product shot"}},
+            "5": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}},
+            "6": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024, "batch_size": 1}},
+            "7": {"class_type": "KSampler", "inputs": {"seed": 7, "steps": 8, "cfg": 1, "sampler_name": "euler", "scheduler": "simple", "denoise": 1, "model": ["1", 0], "positive": ["4", 0], "negative": ["5", 0], "latent_image": ["6", 0]}},
+            "8": {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["3", 0]}},
+            "9": {"class_type": "UpscaleModelLoader", "inputs": {"model_name": "4x-spanx4-ch48.safetensors"}},
+            "10": {"class_type": "ImageUpscaleWithModel", "inputs": {"upscale_model": ["9", 0], "image": ["8", 0]}},
+            "11": {"class_type": "SaveImage", "inputs": {"images": ["10", 0], "filename_prefix": "mayhem-krea2-4x"}}
+        });
+
+        let derivation = derive_comfy_workflow(&graph, &policy).unwrap();
+        let mut required_names = derivation
+            .parts_required
+            .iter()
+            .map(|part| part.name.as_str())
+            .collect::<Vec<_>>();
+        required_names.sort_unstable();
+
+        assert_eq!(derivation.outcome_spec.width, Some(4_096));
+        assert_eq!(derivation.outcome_spec.height, Some(4_096));
+        assert_eq!(derivation.quoted_usage.get(USAGE_MEGAPIXEL_STEP), 136);
+        assert_eq!(
+            required_names,
+            vec![
+                "4x-spanx4-ch48.safetensors",
+                "krea2_turbo_fp8_scaled.safetensors",
+                "qwen3vl_4b_fp8_scaled.safetensors",
+                "qwen_image_vae.safetensors"
+            ]
+        );
+
+        policy.max_width = 1_024;
+        let err = derive_comfy_workflow(&graph, &policy).unwrap_err();
+        assert_eq!(
+            err,
+            ComfyWorkflowDerivationError::OutcomeOverflow("width exceeds 1024".to_owned())
+        );
     }
 
     #[test]
@@ -1107,6 +1368,7 @@ mod tests {
                 name: "sdxl.safetensors".to_owned(),
                 part_type: "checkpoint".to_owned(),
                 sha256: "22".repeat(32),
+                scale: None,
             }],
             runtime_id: Some("comfyui-v0.31.0".to_owned()),
             outcome_class: Some("image.light.512".to_owned()),

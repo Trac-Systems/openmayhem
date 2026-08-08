@@ -95517,6 +95517,7 @@ status: linked
                 name: record.name.clone(),
                 part_type: record.part_type.clone(),
                 sha256: record.sha256.clone(),
+                scale: None,
             }],
             inventory_root: Some(inventory_root),
             ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
@@ -95558,6 +95559,7 @@ status: linked
                 part_id: record.part_id.clone(),
                 part_type: record.part_type.clone(),
                 sha256: record.sha256.clone(),
+                scale: None,
             }],
             inventory_root: Some(expected_root.clone()),
             ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
@@ -95776,6 +95778,7 @@ status: linked
                 part_id: record.part_id.clone(),
                 part_type: record.part_type.clone(),
                 sha256: record.sha256.clone(),
+                scale: None,
             }],
             runtime_id: Some("comfyui-v0.31.0".to_owned()),
             outcome_class: Some("image.custom.512".to_owned()),
@@ -121239,6 +121242,7 @@ State initialization...
                 name: "tiny.safetensors".to_owned(),
                 part_type: "checkpoint".to_owned(),
                 sha256: "22".repeat(32),
+                scale: None,
             }],
             runtime_id: Some("comfyui-v0.31.0".to_owned()),
             outcome_class: Some("image.custom.384".to_owned()),
