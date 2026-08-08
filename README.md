@@ -79,7 +79,7 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.105` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.106` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -88,7 +88,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.105
+git checkout --detach v0.2.106
 ./install.sh --from-source
 ```
 
@@ -97,7 +97,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.105
+git checkout --detach v0.2.106
 .\install.ps1 -FromSource
 ```
 
@@ -838,8 +838,13 @@ admitted capacity, not merely catalog presence.
 Provider start shape:
 
 ```bash
-mayhem up --provider --provider-enclave <workflow-enclave-id> --artifact <comfy-runtime-dir> --yes
+mayhem up --provider --provider-enclave <workflow-enclave-id> --artifact <comfy-runtime-dir> --workflow-class-definition <definition.json> --yes
 ```
+
+`--workflow-class-definition` may be omitted only when the signed catalog embeds
+`workflow.outcome_class_definition`. The source release canonicalizes
+integer-valued workflow JSON floats for graph hashing, so `1.0` and `1` bind to
+the same voucher.
 
 Chatterbox uses `voice: "default"` for ordinary speech. For zero-shot cloning, add a bounded
 base64 WAV reference:
@@ -913,7 +918,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.105` is source-only. The GitHub release contains the tagged source, not
+`v0.2.106` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -921,7 +926,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.105
+git checkout --detach v0.2.106
 ./install.sh --from-source
 ```
 
@@ -930,7 +935,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.105
+git checkout --detach v0.2.106
 .\install.ps1 -FromSource
 ```
 
@@ -954,8 +959,10 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
-The `0.2.105` source release documents the current Comfy parts inventory and
-points each major lane and sidecar at its immutable signed Hugging Face record.
+The `0.2.106` source release documents the current Comfy parts inventory,
+binds workflow providers to the signed outcome-class definition instead of the
+local ComfyUI runtime directory, and canonicalizes integer-valued workflow JSON
+floats before graph hashing.
 
 The `0.2.104` source release makes local builds self-consistent across macOS,
 Linux, and Windows. Source installers select exactly one available llama.cpp

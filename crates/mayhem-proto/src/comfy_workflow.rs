@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Number, Value};
 
 use crate::{
     stable_json_bytes, ReceiptUsage, WorkflowOutputBinding, USAGE_AUDIO_SECOND,
@@ -44,6 +44,8 @@ pub struct ComfyWorkflowCatalogPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_class_definition: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_unit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inventory_root: Option<String>,
@@ -61,6 +63,18 @@ pub struct ComfyWorkflowCatalogPolicy {
     pub max_steps: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_artifacts: Option<u64>,
+}
+
+pub fn comfy_outcome_class_definition_hash(
+    definition: &Value,
+) -> Result<String, serde_json::Error> {
+    let envelope = serde_json::json!({
+        "domain": "mayhem-comfy-outcome-class-definition-v1",
+        "value": definition,
+    });
+    Ok(blake3::hash(&stable_json_bytes(&envelope)?)
+        .to_hex()
+        .to_string())
 }
 
 impl ComfyWorkflowCatalogPolicy {
@@ -317,13 +331,47 @@ pub fn derive_comfy_workflow(
 }
 
 fn graph_hash(graph: &Value) -> Result<String, ComfyWorkflowDerivationError> {
-    let graph_bytes = stable_json_bytes(graph)
+    let graph = comfy_graph_hash_value(graph);
+    let graph_bytes = stable_json_bytes(&graph)
         .map_err(|err| ComfyWorkflowDerivationError::Hash(err.to_string()))?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(GRAPH_HASH_DOMAIN);
     hasher.update(&(graph_bytes.len() as u64).to_le_bytes());
     hasher.update(&graph_bytes);
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn comfy_graph_hash_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(comfy_graph_hash_value).collect()),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), comfy_graph_hash_value(value)))
+                .collect(),
+        ),
+        Value::Number(number) => comfy_graph_hash_number(number)
+            .map(Value::Number)
+            .unwrap_or_else(|| value.clone()),
+        _ => value.clone(),
+    }
+}
+
+fn comfy_graph_hash_number(number: &Number) -> Option<Number> {
+    if number.as_i64().is_some() || number.as_u64().is_some() {
+        return None;
+    }
+    let value = number.as_f64()?;
+    if !value.is_finite() || value.fract() != 0.0 {
+        return None;
+    }
+    if value >= 0.0 && value <= u64::MAX as f64 {
+        return Some(Number::from(value as u64));
+    }
+    if value >= i64::MIN as f64 && value <= i64::MAX as f64 {
+        return Some(Number::from(value as i64));
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -848,6 +896,26 @@ mod tests {
             derive_comfy_workflow(&reordered, &policy())
                 .unwrap()
                 .graph_hash
+        );
+    }
+
+    #[test]
+    fn graph_hash_canonicalizes_integer_valued_json_floats() {
+        let mut float_graph = image_graph();
+        float_graph["3"]["inputs"]["cfg"] = json!(1.0);
+        float_graph["3"]["inputs"]["denoise"] = json!(1.0);
+        let mut int_graph = image_graph();
+        int_graph["3"]["inputs"]["cfg"] = json!(1);
+        int_graph["3"]["inputs"]["denoise"] = json!(1);
+
+        let float_derivation = derive_comfy_workflow(&float_graph, &policy()).unwrap();
+        let int_derivation = derive_comfy_workflow(&int_graph, &policy()).unwrap();
+
+        assert_eq!(float_derivation.graph_hash, int_derivation.graph_hash);
+        assert_eq!(float_derivation.quoted_usage, int_derivation.quoted_usage);
+        assert_eq!(
+            float_derivation.workflow_output,
+            int_derivation.workflow_output
         );
     }
 

@@ -6464,6 +6464,10 @@ struct ProviderStartArgs {
     #[arg(long, value_name = "PATH")]
     artifact: Option<PathBuf>,
 
+    /// Local ComfyUI outcome-class definition JSON when the signed catalog does not embed it.
+    #[arg(long, value_name = "PATH")]
+    workflow_class_definition: Option<PathBuf>,
+
     /// Directory for downloaded/plain artifacts. Defaults to <home>/downloads.
     #[arg(long, value_name = "PATH")]
     downloads_dir: Option<PathBuf>,
@@ -8459,6 +8463,7 @@ fn provider_start_args_for_local_run_display(home: &Path) -> ProviderStartArgs {
         keys_dir: None,
         canaries_dir: None,
         artifact: None,
+        workflow_class_definition: None,
         downloads_dir: None,
         hf_token_file: None,
         engine_backend: "auto".to_owned(),
@@ -56877,6 +56882,8 @@ struct ProviderArtifactPaths {
     sidecars: BTreeMap<String, PathBuf>,
 }
 
+const PROVIDER_COMFY_WORKFLOW_DEFINITION_ARTIFACT: &str = "__workflow_class_definition";
+
 #[derive(Clone, Debug)]
 struct ProviderHardwareQuoteConfig {
     kind: HardwareQuoteKind,
@@ -60268,6 +60275,7 @@ fn provider_start_args_for_serve_plan(
         keys_dir: args.keys_dir.clone(),
         canaries_dir: args.canaries_dir.clone(),
         artifact: None,
+        workflow_class_definition: None,
         downloads_dir: None,
         hf_token_file: None,
         engine_backend: args.engine_backend.clone(),
@@ -60943,14 +60951,28 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         artifact_root: selected.enclave.artifact_root.clone(),
         manifest_hash: selected.enclave.manifest_hash.clone(),
     };
-    let seal_report = seal_provider_artifact(
-        &artifact_paths.primary,
-        &sealed_store,
-        &key_context,
-        &provider_secret,
-        args.chunk_size,
-    )?;
-    if seal_report.bytes_written == 0 {
+    let seal_report = if selected.artifact.engine == "comfyui" {
+        let definition_path = provider_seal_artifact_path(&artifact_paths, &selected)?;
+        bind_provider_comfy_workflow_artifact(definition_path, &sealed_store, &key_context)?
+    } else {
+        seal_provider_artifact(
+            &artifact_paths.primary,
+            &sealed_store,
+            &key_context,
+            &provider_secret,
+            args.chunk_size,
+        )?
+    };
+    if selected.artifact.engine == "comfyui" {
+        provider_log(
+            &args,
+            &format!(
+                "Bound ComfyUI workflow-class artifact: {} bytes, root {}",
+                seal_report.total_bytes,
+                seal_report.merkle.root
+            ),
+        );
+    } else if seal_report.bytes_written == 0 {
         provider_log(
             &args,
             &format!(
@@ -68880,7 +68902,7 @@ fn workflow_catalog_model_from_enclave(enclave: &LedgerEnclave) -> Result<catalo
             "path": enclave.artifact_source.path.clone(),
             "artifact_root": enclave.artifact_root.clone(),
             "artifact_root_kind": enclave.artifact_root_kind.clone(),
-            "weights_bytes": 0,
+            "weights_bytes": 1,
             "source_sha256": enclave.source_sha256.clone(),
             "download_check": false,
             "sidecars": sidecars
@@ -72774,9 +72796,16 @@ fn download_provider_artifact_blocking(
             "ComfyUI runtime {} must contain main.py",
             source.display()
         );
+        let definition_path =
+            materialize_provider_comfy_workflow_class_definition(args, downloads_dir, selected)?;
+        let mut sidecars = BTreeMap::new();
+        sidecars.insert(
+            PROVIDER_COMFY_WORKFLOW_DEFINITION_ARTIFACT.to_owned(),
+            definition_path,
+        );
         return Ok(ProviderArtifactPaths {
             primary: source,
-            sidecars: BTreeMap::new(),
+            sidecars,
         });
     }
     require_provider_merkle_artifact(selected)?;
@@ -72856,6 +72885,145 @@ fn download_provider_artifact_blocking(
     }
 
     Ok(ProviderArtifactPaths { primary, sidecars })
+}
+
+fn provider_seal_artifact_path<'a>(
+    artifact_paths: &'a ProviderArtifactPaths,
+    selected: &ProviderCandidate,
+) -> Result<&'a Path> {
+    if selected.artifact.engine == "comfyui" {
+        return artifact_paths
+            .sidecars
+            .get(PROVIDER_COMFY_WORKFLOW_DEFINITION_ARTIFACT)
+            .map(PathBuf::as_path)
+            .context(
+                "ComfyUI workflow-class definition artifact was not materialized for sealing",
+            );
+    }
+    Ok(&artifact_paths.primary)
+}
+
+fn materialize_provider_comfy_workflow_class_definition(
+    args: &ProviderStartArgs,
+    downloads_dir: &Path,
+    selected: &ProviderCandidate,
+) -> Result<PathBuf> {
+    let policy = selected.model.workflow.as_ref().with_context(|| {
+        format!(
+            "ComfyUI workflow provider {} requires a signed workflow policy",
+            selected.enclave.model_id
+        )
+    })?;
+    let definition = if let Some(path) = args.workflow_class_definition.as_ref() {
+        let path = absolutize(path.clone())?;
+        read_json_file(&path).with_context(|| {
+            format!(
+                "reading ComfyUI workflow class definition {}",
+                path.display()
+            )
+        })?
+    } else {
+        policy.outcome_class_definition.clone().with_context(|| {
+            format!(
+                "ComfyUI workflow provider {} requires --workflow-class-definition <definition.json> because this signed catalog does not embed workflow.outcome_class_definition",
+                selected.enclave.model_id
+            )
+        })?
+    };
+    validate_provider_comfy_workflow_class_definition(&definition, selected)?;
+    fs::create_dir_all(downloads_dir)
+        .with_context(|| format!("creating {}", downloads_dir.display()))?;
+    let destination = downloads_dir.join(format!(
+        "{}-workflow-class-definition.json",
+        selected.enclave.artifact_root
+    ));
+    write_json_file(&destination, &definition)
+        .with_context(|| format!("writing {}", destination.display()))?;
+    Ok(destination)
+}
+
+fn validate_provider_comfy_workflow_class_definition(
+    definition: &Value,
+    selected: &ProviderCandidate,
+) -> Result<()> {
+    ensure!(
+        definition.is_object(),
+        "ComfyUI workflow outcome-class definition must be a JSON object"
+    );
+    let class_id = definition
+        .get("class_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    ensure!(
+        class_id == selected.enclave.model_id,
+        "ComfyUI workflow outcome-class definition class_id {class_id:?} does not match {}",
+        selected.enclave.model_id
+    );
+    let definition_hash = mayhem_proto::comfy_outcome_class_definition_hash(definition)
+        .context("hashing Comfy workflow outcome-class definition")?;
+    ensure!(
+        definition_hash == selected.enclave.artifact_root,
+        "ComfyUI workflow outcome-class definition hash mismatch for {}; expected admin enclave artifact_root {}, got {}",
+        selected.enclave.model_id,
+        selected.enclave.artifact_root,
+        definition_hash
+    );
+    if let Some(expected_sha256) = selected.artifact.source_sha256.as_deref() {
+        let bytes = stable_json_bytes(definition)
+            .context("serializing Comfy workflow outcome-class definition")?;
+        let actual_sha256 = sha256_bytes_hex(&bytes);
+        ensure!(
+            actual_sha256 == expected_sha256,
+            "ComfyUI workflow outcome-class definition sha256 mismatch for {}; expected {}, got {}",
+            selected.enclave.model_id,
+            expected_sha256,
+            actual_sha256
+        );
+    }
+    Ok(())
+}
+
+fn bind_provider_comfy_workflow_artifact(
+    definition_path: &Path,
+    sealed_store: &Path,
+    key_context: &KeyContext,
+) -> Result<DownloadReport> {
+    let definition = read_json_file(definition_path)
+        .with_context(|| format!("reading {}", definition_path.display()))?;
+    let definition_hash = mayhem_proto::comfy_outcome_class_definition_hash(&definition)
+        .context("hashing Comfy workflow outcome-class definition")?;
+    ensure!(
+        definition_hash == key_context.artifact_root,
+        "ComfyUI workflow outcome-class definition hash mismatch for {}; expected {}, got {}",
+        definition_path.display(),
+        key_context.artifact_root,
+        definition_hash
+    );
+    fs::create_dir_all(sealed_store)
+        .with_context(|| format!("creating {}", sealed_store.display()))?;
+    let bytes = stable_json_bytes(&definition)
+        .context("serializing Comfy workflow outcome-class definition")?;
+    let total_bytes = bytes.len() as u64;
+    let chunk_hash = hex_encode(blake3::hash(&bytes).as_bytes());
+    let merkle = MerkleManifest {
+        kind: "mayhem_comfy_outcome_class_definition_v1".to_owned(),
+        chunk_size: bytes.len().max(1),
+        total_bytes,
+        root: key_context.artifact_root.clone(),
+        chunks: vec![MerkleChunk {
+            index: 0,
+            offset: 0,
+            len: total_bytes,
+            blake3: chunk_hash,
+        }],
+    };
+    Ok(DownloadReport {
+        destination: definition_path.to_path_buf(),
+        resumed_from: 0,
+        bytes_written: total_bytes,
+        total_bytes,
+        merkle,
+    })
 }
 
 fn require_local_artifact_path_supported(
@@ -76622,9 +76790,17 @@ fn validate_provider_session_request_modalities(
             terms.workflow_policy.as_ref(),
         ))?;
         if &actual_workflow != expected_workflow {
-            return Err(provider_session_request_error(
-                "workflow graph derivation does not match signed voucher binding",
-            ));
+            return Err(provider_session_request_error(format!(
+                "workflow graph derivation does not match signed voucher binding: expected graph={} runtime={} outcome={} usage={:?}; actual graph={} runtime={} outcome={} usage={:?}",
+                expected_workflow.graph_hash,
+                expected_workflow.runtime_id,
+                expected_workflow.outcome_class,
+                expected_workflow.quoted_usage,
+                actual_workflow.graph_hash,
+                actual_workflow.runtime_id,
+                actual_workflow.outcome_class,
+                actual_workflow.quoted_usage
+            )));
         }
     }
     let load = provider_session_modality_load(
@@ -80841,8 +81017,35 @@ fn provider_canary_prompt_modalities(
         }
         "stt" => BTreeSet::from(["audio".to_owned(), "text".to_owned()]),
         "tts" | "audio-generation" | "music-generation" => BTreeSet::from(["audio".to_owned()]),
+        MODEL_CLASS_WORKFLOW => provider_workflow_output_modalities(model),
         _ => BTreeSet::new(),
     }
+}
+
+fn provider_workflow_output_modalities(model: &catalog::CatalogModel) -> BTreeSet<String> {
+    let mut modalities = model
+        .caps
+        .output_modalities
+        .iter()
+        .filter(|modality| !modality.trim().is_empty())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if let Some(modality) = model.caps.output_modality.as_deref() {
+        if !modality.trim().is_empty() {
+            modalities.insert(modality.to_owned());
+        }
+    }
+    if modalities.is_empty() {
+        modalities.extend(
+            model
+                .adapter
+                .modality_set
+                .iter()
+                .filter(|modality| !modality.trim().is_empty())
+                .cloned(),
+        );
+    }
+    modalities
 }
 
 fn provider_canary_self_test_body(
@@ -80884,7 +81087,7 @@ fn provider_canary_self_test_body(
             "input": canary_prompt_text(prompt)?,
         })),
         "image-generation" => {
-            if let Some(body) = provider_comfy_workflow_canary_self_test_body(model)? {
+            if let Some(body) = provider_comfy_workflow_canary_self_test_body(model, prompt)? {
                 return Ok(body);
             }
             let mut body = json!({
@@ -81201,6 +81404,8 @@ fn provider_canary_self_test_body(
             }
             Ok(body)
         }
+        MODEL_CLASS_WORKFLOW => provider_comfy_workflow_canary_self_test_body(model, prompt)?
+            .context("workflow model has no signed Comfy workflow endpoint family"),
         other => bail!("functional modality self-test is not wired for model_class {other}"),
     }
 }
@@ -81217,19 +81422,26 @@ fn provider_comfy_workflow_contract(
 
 fn provider_comfy_workflow_canary_self_test_body(
     model: &catalog::CatalogModel,
+    prompt: &CanaryPrompt,
 ) -> Result<Option<Value>> {
     let Some(contract) = provider_comfy_workflow_contract(model) else {
         return Ok(None);
     };
-    let workflow = endpoint_contract_first_calibration_value(contract, "workflow")?;
-    let mut body = json!({
-        "kind": "workflow_generation",
-        "endpoint_family": mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
-        "workflow": workflow,
-    });
+    let mut body = Value::Object(prompt.endpoint_attributes.clone().into_iter().collect());
     let object = body
         .as_object_mut()
         .context("workflow self-test body must be an object")?;
+    object.insert("kind".to_owned(), json!("workflow_generation"));
+    object.insert(
+        "endpoint_family".to_owned(),
+        json!(mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS),
+    );
+    if !object.contains_key("workflow") {
+        object.insert(
+            "workflow".to_owned(),
+            endpoint_contract_first_calibration_value(contract, "workflow")?,
+        );
+    }
     for path in [
         "runtime_id",
         "outcome_class",
@@ -81571,8 +81783,47 @@ fn validate_provider_canary_self_test_output(
                 .any(|artifact| artifact.content_type.starts_with("audio/")),
             "audio modality canary produced no audio artifact"
         ),
+        MODEL_CLASS_WORKFLOW => validate_provider_workflow_canary_output(model, output)?,
         other => {
             bail!("functional modality output validation is not wired for model_class {other}")
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider_workflow_canary_output(
+    model: &catalog::CatalogModel,
+    output: &ProviderSessionOutput,
+) -> Result<()> {
+    let modalities = provider_workflow_output_modalities(model);
+    ensure!(
+        !modalities.is_empty(),
+        "workflow modality canary has no signed output modality"
+    );
+    for modality in modalities {
+        match modality.as_str() {
+            "image" => ensure!(
+                output
+                    .artifacts
+                    .iter()
+                    .any(|artifact| artifact.content_type.starts_with("image/")),
+                "workflow image canary produced no image artifact"
+            ),
+            "video" => ensure!(
+                output
+                    .artifacts
+                    .iter()
+                    .any(|artifact| artifact.content_type.starts_with("video/")),
+                "workflow video canary produced no video artifact"
+            ),
+            "audio" => ensure!(
+                output
+                    .artifacts
+                    .iter()
+                    .any(|artifact| artifact.content_type.starts_with("audio/")),
+                "workflow audio canary produced no audio artifact"
+            ),
+            other => bail!("workflow modality canary validation is not wired for {other}"),
         }
     }
     Ok(())
@@ -107428,6 +107679,30 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
         assert_eq!(sealed["kind"], json!("workflow_generation"));
         provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter).unwrap();
+
+        model.model_class = MODEL_CLASS_WORKFLOW.to_owned();
+        model.caps.output_modality = Some("image".to_owned());
+        model.caps.output_modalities = vec!["image".to_owned()];
+        let modalities = provider_canary_prompt_modalities(&model, &prompt);
+        assert_eq!(modalities, BTreeSet::from(["image".to_owned()]));
+        let workflow_body = provider_canary_self_test_body(&model, &prompt).unwrap();
+        assert_eq!(workflow_body["kind"], json!("workflow_generation"));
+
+        let explicit_prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "explicit-comfy-workflow-smoke",
+            "workflow": {
+                "1": {
+                    "class_type": "SaveImage",
+                    "inputs": {"filename_prefix": "explicit"}
+                }
+            }
+        }))
+        .unwrap();
+        let explicit_body = provider_canary_self_test_body(&model, &explicit_prompt).unwrap();
+        assert_eq!(
+            explicit_body["workflow"]["1"]["class_type"],
+            json!("SaveImage")
+        );
     }
 
     #[test]
@@ -110347,6 +110622,66 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         .unwrap();
         assert_eq!(cached.bytes_written, 0);
         assert_eq!(cached.merkle.root, digest.merkle.root);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn comfy_provider_requires_workflow_class_definition_when_catalog_omits_it() {
+        let temp = test_temp_dir("mayhem-comfy-missing-workflow-definition");
+        let runtime = temp.join("ComfyUI");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::write(runtime.join("main.py"), b"print('comfy')\n").unwrap();
+        let definition = test_comfy_workflow_class_definition();
+        let selected = test_comfy_workflow_candidate(&definition, false);
+        let mut args = test_provider_start_args();
+        args.artifact = Some(runtime);
+
+        let error = download_provider_artifact_blocking(&args, &temp.join("downloads"), &selected)
+            .expect_err("workflow providers must require an explicit class definition");
+
+        assert!(format!("{error:#}").contains("--workflow-class-definition"));
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn comfy_provider_binds_semantic_workflow_class_instead_of_runtime_merkle_root() {
+        let temp = test_temp_dir("mayhem-comfy-semantic-workflow-binding");
+        let runtime = temp.join("ComfyUI");
+        fs::create_dir_all(&runtime).unwrap();
+        fs::write(runtime.join("main.py"), b"print('comfy')\n").unwrap();
+        let definition = test_comfy_workflow_class_definition();
+        let definition_path = temp.join("workflow-class.json");
+        write_json_file(&definition_path, &definition).unwrap();
+        let selected = test_comfy_workflow_candidate(&definition, false);
+        let mut args = test_provider_start_args();
+        args.artifact = Some(runtime.clone());
+        args.workflow_class_definition = Some(definition_path);
+
+        let paths =
+            download_provider_artifact_blocking(&args, &temp.join("downloads"), &selected).unwrap();
+        assert_eq!(paths.primary, runtime);
+        let materialized = paths
+            .sidecars
+            .get(PROVIDER_COMFY_WORKFLOW_DEFINITION_ARTIFACT)
+            .expect("workflow-class sidecar");
+        let key_context = KeyContext {
+            provider_id: "11".repeat(32),
+            enclave_id: selected.enclave.enclave_id.clone(),
+            artifact_root: selected.enclave.artifact_root.clone(),
+            manifest_hash: selected.enclave.manifest_hash.clone(),
+        };
+        let sealed_store = temp.join("sealed");
+        let report =
+            bind_provider_comfy_workflow_artifact(materialized, &sealed_store, &key_context)
+                .unwrap();
+
+        assert_eq!(
+            report.merkle.kind,
+            "mayhem_comfy_outcome_class_definition_v1"
+        );
+        assert_eq!(report.merkle.root, selected.enclave.artifact_root);
+        assert_eq!(report.merkle.chunks.len(), 1);
+        assert!(!sealed_store.join(SEALED_STORE_MANIFEST).exists());
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -120636,6 +120971,7 @@ State initialization...
             keys_dir: None,
             canaries_dir: None,
             artifact: None,
+            workflow_class_definition: None,
             downloads_dir: None,
             hf_token_file: None,
             engine_backend: "auto".to_owned(),
@@ -120671,6 +121007,75 @@ State initialization...
             load_progress: None,
             modality_limits: BTreeMap::new(),
         }
+    }
+
+    fn test_comfy_workflow_class_definition() -> Value {
+        json!({
+            "schema_version": 1,
+            "class_id": "image.heavy.le1_2mp",
+            "label": "Image heavy <= 1.2MP",
+            "output_modality": "image",
+            "max_width": 1024,
+            "max_height": 1024,
+            "pricing_unit": "megapixel_step"
+        })
+    }
+
+    fn test_comfy_workflow_candidate(
+        definition: &Value,
+        embed_definition: bool,
+    ) -> ProviderCandidate {
+        let root = "aa".repeat(32);
+        let catalog = test_catalog(&root);
+        let contract = test_contract(&root);
+        let hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        let args = test_provider_start_args();
+        let mut selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .unwrap()
+            .remove(0);
+        let definition_hash =
+            mayhem_proto::comfy_outcome_class_definition_hash(definition).unwrap();
+        let source_sha256 = sha256_bytes_hex(&stable_json_bytes(definition).unwrap());
+        let model_id = definition["class_id"].as_str().unwrap().to_owned();
+
+        selected.enclave.model_id = model_id.clone();
+        selected.enclave.model_class = "workflow".to_owned();
+        selected.enclave.backend = "comfyui".to_owned();
+        selected.enclave.artifact_root = definition_hash.clone();
+        selected.enclave.artifact_root_kind =
+            "semantic_comfy_outcome_class_definition_v1".to_owned();
+        selected.enclave.artifact_source.path = format!("comfy/outcome-classes/v1/{model_id}.json");
+        selected.enclave.source_sha256 = Some(source_sha256.clone());
+        selected.enclave.enclave_id = "12".repeat(32);
+        selected.enclave.manifest_hash = "34".repeat(32);
+
+        selected.model.model_id = model_id.clone();
+        selected.model.model_class = "workflow".to_owned();
+        selected.model.caps.tools = false;
+        selected.model.caps.json = true;
+        selected.model.caps.ctx_max = 1;
+        selected.model.caps.image = true;
+        selected.model.caps.output_modality = Some("image".to_owned());
+        selected.model.caps.output_modalities = vec!["image".to_owned()];
+        selected.model.workflow = Some(mayhem_proto::ComfyWorkflowCatalogPolicy {
+            runtime_id: Some(mayhem_proto::DEFAULT_COMFY_WORKFLOW_RUNTIME_ID.to_owned()),
+            outcome_class: Some(model_id.clone()),
+            outcome_class_definition: embed_definition.then(|| definition.clone()),
+            pricing_unit: Some("megapixel_step".to_owned()),
+            inventory_root: Some("56".repeat(32)),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        });
+
+        selected.artifact_name = "workflow-class".to_owned();
+        selected.artifact.engine = "comfyui".to_owned();
+        selected.artifact.path = format!("comfy/outcome-classes/v1/{model_id}.json");
+        selected.artifact.artifact_root = definition_hash;
+        selected.artifact.artifact_root_kind =
+            "semantic_comfy_outcome_class_definition_v1".to_owned();
+        selected.artifact.weights_bytes = 1;
+        selected.artifact.source_sha256 = Some(source_sha256);
+        selected.artifact.sidecars.clear();
+        selected
     }
 
     #[test]

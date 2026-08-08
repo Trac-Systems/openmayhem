@@ -18,6 +18,7 @@ use mayhem_proto::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const VERIFICATION_TOKEN_FINGERPRINT: &str = "token_fingerprint";
 const VERIFICATION_SEED_PERCEPTUAL_HASH: &str = "seed_perceptual_hash";
@@ -1058,6 +1059,9 @@ fn validate_comfy_workflow_policy(model: &CatalogModel, errors: &mut Vec<String>
                     ));
                 }
             }
+            if let Some(definition) = policy.outcome_class_definition.as_ref() {
+                validate_comfy_outcome_class_definition_binding(model, definition, errors);
+            }
         }
         (None, true) => errors.push(format!(
             "{} endpoint family {} requires signed workflow policy",
@@ -1071,6 +1075,74 @@ fn validate_comfy_workflow_policy(model: &CatalogModel, errors: &mut Vec<String>
         )),
         (None, false) => {}
     }
+}
+
+fn validate_comfy_outcome_class_definition_binding(
+    model: &CatalogModel,
+    definition: &Value,
+    errors: &mut Vec<String>,
+) {
+    let Some(object) = definition.as_object() else {
+        errors.push(format!(
+            "{} workflow.outcome_class_definition must be a JSON object",
+            model.model_id
+        ));
+        return;
+    };
+    let class_id = object.get("class_id").and_then(Value::as_str);
+    if class_id != Some(model.model_id.as_str()) {
+        errors.push(format!(
+            "{} workflow.outcome_class_definition.class_id must match model_id",
+            model.model_id
+        ));
+    }
+    let Some(artifact) = model.artifacts.get("workflow-class") else {
+        errors.push(format!(
+            "{} workflow.outcome_class_definition requires a workflow-class artifact",
+            model.model_id
+        ));
+        return;
+    };
+    match mayhem_proto::comfy_outcome_class_definition_hash(definition) {
+        Ok(hash) if hash == artifact.artifact_root => {}
+        Ok(hash) => errors.push(format!(
+            "{} workflow.outcome_class_definition hash {hash} does not match workflow-class artifact_root {}",
+            model.model_id, artifact.artifact_root
+        )),
+        Err(err) => errors.push(format!(
+            "{} workflow.outcome_class_definition is not stable-serializable: {err}",
+            model.model_id
+        )),
+    }
+    if let Some(expected_sha256) = artifact.source_sha256.as_deref() {
+        match mayhem_proto::stable_json_bytes(definition) {
+            Ok(bytes) => {
+                let mut hasher = Sha256::new();
+                hasher.update(&bytes);
+                let actual = hex_encode_lower(&hasher.finalize());
+                if actual != expected_sha256 {
+                    errors.push(format!(
+                        "{} workflow.outcome_class_definition sha256 {actual} does not match workflow-class source_sha256 {expected_sha256}",
+                        model.model_id
+                    ));
+                }
+            }
+            Err(err) => errors.push(format!(
+                "{} workflow.outcome_class_definition cannot be hashed: {err}",
+                model.model_id
+            )),
+        }
+    }
+}
+
+fn hex_encode_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn model_targets_newer_app(model: &CatalogModel) -> bool {
@@ -4767,6 +4839,21 @@ fn canary_prompt_modalities<'a>(
                 prompt.endpoint_attributes.clone().into_iter().collect(),
             )) {
                 modalities.insert("image");
+            }
+        }
+        VERIFICATION_SEED_PERCEPTUAL_HASH
+            if model.model_class == MODEL_CLASS_WORKFLOW
+                && prompt.endpoint_attributes.contains_key("workflow") =>
+        {
+            for modality in &model.caps.output_modalities {
+                if !modality.trim().is_empty() {
+                    modalities.insert(modality.as_str());
+                }
+            }
+            if let Some(modality) = model.caps.output_modality.as_deref() {
+                if !modality.trim().is_empty() {
+                    modalities.insert(modality);
+                }
             }
         }
         _ => {}

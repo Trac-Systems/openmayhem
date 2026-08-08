@@ -14,10 +14,10 @@ mod parts_catalog;
 mod validated_audio;
 
 pub use comfy_workflow::{
-    derive_comfy_workflow, valid_comfy_pricing_unit, ComfyWorkflowCatalogPolicy,
-    ComfyWorkflowDerivation, ComfyWorkflowDerivationError, ComfyWorkflowDerivationPolicy,
-    ComfyWorkflowOutcomeSpec, ComfyWorkflowPartRef, COMFY_WORKFLOW_DERIVATION_SCHEMA_VERSION,
-    DEFAULT_COMFY_WORKFLOW_RUNTIME_ID,
+    comfy_outcome_class_definition_hash, derive_comfy_workflow, valid_comfy_pricing_unit,
+    ComfyWorkflowCatalogPolicy, ComfyWorkflowDerivation, ComfyWorkflowDerivationError,
+    ComfyWorkflowDerivationPolicy, ComfyWorkflowOutcomeSpec, ComfyWorkflowPartRef,
+    COMFY_WORKFLOW_DERIVATION_SCHEMA_VERSION, DEFAULT_COMFY_WORKFLOW_RUNTIME_ID,
 };
 pub use endpoint_contract::{
     artifact_generation_inline_audio_load, artifact_generation_input_characters,
