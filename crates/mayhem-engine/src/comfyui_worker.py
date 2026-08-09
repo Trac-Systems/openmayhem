@@ -178,6 +178,28 @@ def capture_prompt_server_progress(prompt_id, progress):
         prompt_server.send_sync = original_send_sync
 
 
+def patch_comfy_quantized_offload_probe():
+    import comfy.model_patcher
+
+    original = comfy.model_patcher.get_key_weight
+    if getattr(original, "_mayhem_quantized_guard", False):
+        return
+
+    def guarded_get_key_weight(model, key):
+        try:
+            return original(model, key)
+        except AttributeError as error:
+            # Mayhem patch: some Comfy FP4/NVFP4 modules expose custom packed
+            # parameters without normal weight/bias attributes; treat those as
+            # zero extra offload-estimate bytes instead of aborting the workflow.
+            if key.endswith((".weight", ".bias")) and "has no attribute" in str(error):
+                return None, None, None
+            raise
+
+    guarded_get_key_weight._mayhem_quantized_guard = True
+    comfy.model_patcher.get_key_weight = guarded_get_key_weight
+
+
 def load(payload):
     global prompt_server, base_dir, control_mode
     runtime_root = Path(comfy_path(Path(payload["runtime_root"]).resolve()))
@@ -206,6 +228,7 @@ def load(payload):
     os.chdir(comfy_path(runtime_root))
 
     import main
+    patch_comfy_quantized_offload_probe()
 
     if prefer_internal_queue_control():
         main.server.PromptServer.add_routes = lambda self: None
