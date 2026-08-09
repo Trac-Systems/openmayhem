@@ -1,0 +1,113 @@
+{
+  "set_id": "canary-krea2-workflow-launch-v1",
+  "description": "Launch canary for Krea 2 Turbo Comfy workflow providers using the signed Krea parts policy.",
+  "prompts": [
+    {
+      "id": "krea2-red-espresso-seed87345219",
+      "workflow": {
+        "1": {
+          "class_type": "UNETLoader",
+          "inputs": {
+            "unet_name": "krea2_turbo_fp8_scaled.safetensors",
+            "weight_dtype": "default"
+          }
+        },
+        "2": {
+          "class_type": "CLIPLoader",
+          "inputs": {
+            "clip_name": "qwen3vl_4b_fp8_scaled.safetensors",
+            "type": "krea2",
+            "device": "default"
+          }
+        },
+        "3": {
+          "class_type": "VAELoader",
+          "inputs": {
+            "vae_name": "qwen_image_vae.safetensors"
+          }
+        },
+        "4": {
+          "class_type": "CLIPTextEncode",
+          "inputs": {
+            "clip": [
+              "2",
+              0
+            ],
+            "text": "A crisp cinematic product photo of a red espresso machine on a bright kitchen counter, natural morning light, sharp focus, tasteful commercial styling"
+          }
+        },
+        "5": {
+          "class_type": "ConditioningZeroOut",
+          "inputs": {
+            "conditioning": [
+              "4",
+              0
+            ]
+          }
+        },
+        "6": {
+          "class_type": "EmptyLatentImage",
+          "inputs": {
+            "width": 1024,
+            "height": 1024,
+            "batch_size": 1
+          }
+        },
+        "7": {
+          "class_type": "KSampler",
+          "inputs": {
+            "seed": 87345219,
+            "steps": 8,
+            "cfg": 1.0,
+            "sampler_name": "euler",
+            "scheduler": "simple",
+            "denoise": 1.0,
+            "model": [
+              "1",
+              0
+            ],
+            "positive": [
+              "4",
+              0
+            ],
+            "negative": [
+              "5",
+              0
+            ],
+            "latent_image": [
+              "6",
+              0
+            ]
+          }
+        },
+        "8": {
+          "class_type": "VAEDecode",
+          "inputs": {
+            "samples": [
+              "7",
+              0
+            ],
+            "vae": [
+              "3",
+              0
+            ]
+          }
+        },
+        "9": {
+          "class_type": "SaveImage",
+          "inputs": {
+            "filename_prefix": "mayhem-krea2-turbo",
+            "images": [
+              "8",
+              0
+            ]
+          }
+        }
+      },
+      "runtime_id": "comfyui-v0.30.1",
+      "outcome_class": "image.heavy.le1_2mp",
+      "timeout_ms": 120000,
+      "response_format": "artifact"
+    }
+  ]
+}

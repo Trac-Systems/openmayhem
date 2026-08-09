@@ -374,7 +374,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-6,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -449,7 +449,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -689,7 +689,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-6,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -750,7 +750,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -1001,7 +1001,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-6,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -1053,7 +1053,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -1528,7 +1528,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-6,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -1590,7 +1590,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -4142,7 +4142,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-6,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -4240,7 +4240,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -4462,7 +4462,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-6,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -4543,7 +4543,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -4800,7 +4800,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-6,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -4874,7 +4874,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -5287,7 +5287,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-6,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -5370,7 +5370,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -7402,7 +7402,7 @@
                   "integer"
                 ],
                 "minimum": 0,
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "calibration_values": [
                   1
                 ]
@@ -11568,7 +11568,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-6,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -11657,7 +11657,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -11886,7 +11886,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-6,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -11961,7 +11961,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -12203,7 +12203,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-6,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -12269,7 +12269,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -12735,7 +12735,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-6,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -12811,7 +12811,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -18473,7 +18473,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -18483,7 +18483,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -18503,7 +18503,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -18551,7 +18551,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -20400,7 +20400,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-6,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -20485,7 +20485,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -20706,7 +20706,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-6,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -20766,7 +20766,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -20999,7 +20999,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-6,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -21061,7 +21061,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -21518,7 +21518,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-6,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -21606,7 +21606,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -22608,6 +22608,2615 @@
         "in_per_1k": "50000000000000",
         "out_per_1k": "350000000000000"
       }
+    },
+    {
+      "model_id": "Cactus-Compute/needle",
+      "min_app_version": "0.2.54",
+      "model_class": "text-generation",
+      "family": "needle",
+      "params_b": 0.0304,
+      "tier": "launch",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "publisher_key": "huggingface-repo",
+          "repo": "Cactus-Compute/needle",
+          "revision": "5f89b4307696d669c3df1d38ae057e6e1728b107"
+        },
+        "conversion": [
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:model.safetensors",
+            "input_sha256": "c5f9a3016e4537e492c362da5cb8ba05107d8595bec0d5ea5d8a65801db46531",
+            "output_sha256": "c5f9a3016e4537e492c362da5cb8ba05107d8595bec0d5ea5d8a65801db46531"
+          },
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:pinned-model-and-runtime-sidecars",
+            "input_sha256": "b1c31cb38517f9a53ab7e4104d2cf492a5b3bf5892ded0596a896e531ae22504",
+            "output_sha256": "b1c31cb38517f9a53ab7e4104d2cf492a5b3bf5892ded0596a896e531ae22504"
+          }
+        ],
+        "license": "mit",
+        "license_sha256": "40150e30169beeb87130c9f66ad56302432788d931eec1e4ce80875d838df855"
+      },
+      "artifacts": {
+        "transformers-bf16-cpu": {
+          "engine": "needle-cpu",
+          "source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "TracNetwork/mayhem-catalog-Cactus-Compute-needle-Transformers",
+            "revision": "36524459cf2f92fb52d4830c30be9fa9e935fa60"
+          },
+          "upstream_source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "Cactus-Compute/needle",
+            "revision": "5f89b4307696d669c3df1d38ae057e6e1728b107"
+          },
+          "path": "model.safetensors",
+          "artifact_root": "52f06e006db03d50f0d51b7b343458b9d59f4d6d959272e03a80ac332ff8286d",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 60881792,
+          "source_sha256": "c5f9a3016e4537e492c362da5cb8ba05107d8595bec0d5ea5d8a65801db46531",
+          "download_check": true,
+          "notes": "Canonical pinned Transformers BF16 Needle artifact for deterministic CPU inference.",
+          "sidecars": {
+            "needle_config": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-Cactus-Compute-needle-Transformers",
+                "revision": "36524459cf2f92fb52d4830c30be9fa9e935fa60"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "Cactus-Compute/needle",
+                "revision": "5f89b4307696d669c3df1d38ae057e6e1728b107"
+              },
+              "path": "config.json",
+              "artifact_root": "b2388ec619f3250335b7748bc8b4c876e6fd31f234669289a671d6f534d6241f",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 777,
+              "source_sha256": "670248e8493eeb4e073e4473df21d1eb27879d7b5eb83f62c909e7f8ae5499f4"
+            },
+            "needle_special_tokens": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-Cactus-Compute-needle-Transformers",
+                "revision": "36524459cf2f92fb52d4830c30be9fa9e935fa60"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "Cactus-Compute/needle",
+                "revision": "5f89b4307696d669c3df1d38ae057e6e1728b107"
+              },
+              "path": "special_tokens_map.json",
+              "artifact_root": "4640185bae3b730b720614a81638b6fabcbbdee31207c62a144526bd9f69433b",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 168,
+              "source_sha256": "aa08e5c7f1dce38780249064f6da23fcd46600ac921e45cda93f8cc59c480b5b"
+            },
+            "needle_tokenizer_model": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-Cactus-Compute-needle-Transformers",
+                "revision": "36524459cf2f92fb52d4830c30be9fa9e935fa60"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "Cactus-Compute/needle",
+                "revision": "5f89b4307696d669c3df1d38ae057e6e1728b107"
+              },
+              "path": "tokenizer.model",
+              "artifact_root": "c43bd2ddfdcd7a874b640b90a0290acc919d692e4ad26937ef534764735b1aff",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 124960,
+              "source_sha256": "0823f5b9133c68a8140addc5d7a425fa9119c4c8cb4a550363b4bffa4ba1c8c7"
+            },
+            "needle_tokenizer_config": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-Cactus-Compute-needle-Transformers",
+                "revision": "36524459cf2f92fb52d4830c30be9fa9e935fa60"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "Cactus-Compute/needle",
+                "revision": "5f89b4307696d669c3df1d38ae057e6e1728b107"
+              },
+              "path": "tokenizer_config.json",
+              "artifact_root": "e121c87352da3525485d3079583192f4a9ac0a0401f477e4e2a49a0d273f0689",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 435,
+              "source_sha256": "38cdcd3350464efccbbbbe24be7cde4b87dff17c70f74a92d9866452b19f8a23"
+            },
+            "needle_configuration_code": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-Cactus-Compute-needle-Transformers",
+                "revision": "36524459cf2f92fb52d4830c30be9fa9e935fa60"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "Cactus-Compute/needle-hf",
+                "revision": "ffd0d081401257fee31150d30c494b2f98910fc0"
+              },
+              "path": "configuration_needle.py",
+              "artifact_root": "dca187d91c8eb5ad99a3ef910303c242743a0bc2df22c2f30c4dabbf9dbd44df",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 2425,
+              "source_sha256": "b1c31cb38517f9a53ab7e4104d2cf492a5b3bf5892ded0596a896e531ae22504"
+            },
+            "needle_modeling_code": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-Cactus-Compute-needle-Transformers",
+                "revision": "36524459cf2f92fb52d4830c30be9fa9e935fa60"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "Cactus-Compute/needle-hf",
+                "revision": "ffd0d081401257fee31150d30c494b2f98910fc0"
+              },
+              "path": "modeling_needle.py",
+              "artifact_root": "594c67987b6354f11a9f78503cba23f18e8ee1a1f20067ca8abed5e72b72c298",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 17618,
+              "source_sha256": "e1ab60eecf4d938764ed21d08af39808d80031ef6ba6cc02fe7d9a18b24375d5"
+            },
+            "needle_tokenization_code": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-Cactus-Compute-needle-Transformers",
+                "revision": "36524459cf2f92fb52d4830c30be9fa9e935fa60"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "Cactus-Compute/needle-hf",
+                "revision": "ffd0d081401257fee31150d30c494b2f98910fc0"
+              },
+              "path": "tokenization_needle.py",
+              "artifact_root": "895fdcaeab7c16bbd6f53cde7bbc723670f0728a6714cc1cadbb06e938215a19",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 4056,
+              "source_sha256": "eed37a24efbcbec1877b44e1464e9bb8016fb033dc37a3ac7fcc9de71371dca6"
+            }
+          }
+        },
+        "transformers-bf16-gpu": {
+          "engine": "needle-gpu",
+          "source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "TracNetwork/mayhem-catalog-Cactus-Compute-needle-Transformers",
+            "revision": "36524459cf2f92fb52d4830c30be9fa9e935fa60"
+          },
+          "upstream_source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "Cactus-Compute/needle",
+            "revision": "5f89b4307696d669c3df1d38ae057e6e1728b107"
+          },
+          "path": "model.safetensors",
+          "artifact_root": "52f06e006db03d50f0d51b7b343458b9d59f4d6d959272e03a80ac332ff8286d",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 60881792,
+          "source_sha256": "c5f9a3016e4537e492c362da5cb8ba05107d8595bec0d5ea5d8a65801db46531",
+          "download_check": true,
+          "notes": "Canonical pinned Transformers BF16 Needle artifact for deterministic GPU inference on supported NVIDIA CUDA hosts.",
+          "sidecars": {
+            "needle_config": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-Cactus-Compute-needle-Transformers",
+                "revision": "36524459cf2f92fb52d4830c30be9fa9e935fa60"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "Cactus-Compute/needle",
+                "revision": "5f89b4307696d669c3df1d38ae057e6e1728b107"
+              },
+              "path": "config.json",
+              "artifact_root": "b2388ec619f3250335b7748bc8b4c876e6fd31f234669289a671d6f534d6241f",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 777,
+              "source_sha256": "670248e8493eeb4e073e4473df21d1eb27879d7b5eb83f62c909e7f8ae5499f4"
+            },
+            "needle_special_tokens": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-Cactus-Compute-needle-Transformers",
+                "revision": "36524459cf2f92fb52d4830c30be9fa9e935fa60"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "Cactus-Compute/needle",
+                "revision": "5f89b4307696d669c3df1d38ae057e6e1728b107"
+              },
+              "path": "special_tokens_map.json",
+              "artifact_root": "4640185bae3b730b720614a81638b6fabcbbdee31207c62a144526bd9f69433b",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 168,
+              "source_sha256": "aa08e5c7f1dce38780249064f6da23fcd46600ac921e45cda93f8cc59c480b5b"
+            },
+            "needle_tokenizer_model": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-Cactus-Compute-needle-Transformers",
+                "revision": "36524459cf2f92fb52d4830c30be9fa9e935fa60"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "Cactus-Compute/needle",
+                "revision": "5f89b4307696d669c3df1d38ae057e6e1728b107"
+              },
+              "path": "tokenizer.model",
+              "artifact_root": "c43bd2ddfdcd7a874b640b90a0290acc919d692e4ad26937ef534764735b1aff",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 124960,
+              "source_sha256": "0823f5b9133c68a8140addc5d7a425fa9119c4c8cb4a550363b4bffa4ba1c8c7"
+            },
+            "needle_tokenizer_config": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-Cactus-Compute-needle-Transformers",
+                "revision": "36524459cf2f92fb52d4830c30be9fa9e935fa60"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "Cactus-Compute/needle",
+                "revision": "5f89b4307696d669c3df1d38ae057e6e1728b107"
+              },
+              "path": "tokenizer_config.json",
+              "artifact_root": "e121c87352da3525485d3079583192f4a9ac0a0401f477e4e2a49a0d273f0689",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 435,
+              "source_sha256": "38cdcd3350464efccbbbbe24be7cde4b87dff17c70f74a92d9866452b19f8a23"
+            },
+            "needle_configuration_code": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-Cactus-Compute-needle-Transformers",
+                "revision": "36524459cf2f92fb52d4830c30be9fa9e935fa60"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "Cactus-Compute/needle-hf",
+                "revision": "ffd0d081401257fee31150d30c494b2f98910fc0"
+              },
+              "path": "configuration_needle.py",
+              "artifact_root": "dca187d91c8eb5ad99a3ef910303c242743a0bc2df22c2f30c4dabbf9dbd44df",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 2425,
+              "source_sha256": "b1c31cb38517f9a53ab7e4104d2cf492a5b3bf5892ded0596a896e531ae22504"
+            },
+            "needle_modeling_code": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-Cactus-Compute-needle-Transformers",
+                "revision": "36524459cf2f92fb52d4830c30be9fa9e935fa60"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "Cactus-Compute/needle-hf",
+                "revision": "ffd0d081401257fee31150d30c494b2f98910fc0"
+              },
+              "path": "modeling_needle.py",
+              "artifact_root": "594c67987b6354f11a9f78503cba23f18e8ee1a1f20067ca8abed5e72b72c298",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 17618,
+              "source_sha256": "e1ab60eecf4d938764ed21d08af39808d80031ef6ba6cc02fe7d9a18b24375d5"
+            },
+            "needle_tokenization_code": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-Cactus-Compute-needle-Transformers",
+                "revision": "36524459cf2f92fb52d4830c30be9fa9e935fa60"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "Cactus-Compute/needle-hf",
+                "revision": "ffd0d081401257fee31150d30c494b2f98910fc0"
+              },
+              "path": "tokenization_needle.py",
+              "artifact_root": "895fdcaeab7c16bbd6f53cde7bbc723670f0728a6714cc1cadbb06e938215a19",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 4056,
+              "source_sha256": "eed37a24efbcbec1877b44e1464e9bb8016fb033dc37a3ac7fcc9de71371dca6"
+            }
+          }
+        }
+      },
+      "caps": {
+        "tools": true,
+        "json": true,
+        "ctx_max": 1024,
+        "vision": false,
+        "output_modality": "text",
+        "output_modalities": [
+          "text"
+        ]
+      },
+      "requirements": {
+        "min_ram_gb": 4,
+        "min_vram_gb_full_offload": 1,
+        "cpu_flags": [
+          "avx2|neon"
+        ],
+        "backends": [
+          "needle-cpu",
+          "needle-gpu"
+        ]
+      },
+      "adapter": {
+        "chat_template_id": "generic_chatml",
+        "endpoint_families": [
+          {
+            "family": "openai_chat_completions",
+            "interaction_groups": [
+              [
+                "max_tokens",
+                "max_completion_tokens"
+              ],
+              [
+                "tools",
+                "tool_choice",
+                "parallel_tool_calls"
+              ],
+              [
+                "stream",
+                "stream_options.include_usage"
+              ],
+              [
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p",
+                "frequency_penalty",
+                "presence_penalty",
+                "seed"
+              ]
+            ],
+            "request_attribute_specs": {
+              "frequency_penalty": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0,
+                "minimum": 0,
+                "maximum": 0,
+                "calibration_values": [
+                  0
+                ]
+              },
+              "max_completion_tokens": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 128,
+                "minimum": 16,
+                "maximum": 512,
+                "calibration_values": [
+                  128
+                ]
+              },
+              "max_tokens": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 128,
+                "minimum": 16,
+                "maximum": 512,
+                "calibration_values": [
+                  128
+                ]
+              },
+              "messages": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 1,
+                "max_items": 1,
+                "calibration_values": [
+                  [
+                    {
+                      "role": "user",
+                      "content": "What's the weather in Berlin?"
+                    }
+                  ],
+                  [
+                    {
+                      "role": "user",
+                      "content": [
+                        {
+                          "type": "text",
+                          "text": "What's the weather in Berlin?"
+                        }
+                      ]
+                    }
+                  ]
+                ]
+              },
+              "messages.content.text": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 512,
+                "calibration_values": [
+                  "What's the weather in Berlin?"
+                ]
+              },
+              "messages.content.type": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "text"
+                ],
+                "calibration_values": [
+                  "text"
+                ]
+              },
+              "messages.role": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "user"
+                ],
+                "calibration_values": [
+                  "user"
+                ]
+              },
+              "metadata": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "min_p": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0,
+                "minimum": 0,
+                "maximum": 0,
+                "calibration_values": [
+                  0
+                ]
+              },
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "Cactus-Compute/needle"
+                ],
+                "calibration_values": [
+                  "Cactus-Compute/needle"
+                ]
+              },
+              "presence_penalty": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0,
+                "minimum": 0,
+                "maximum": 0,
+                "calibration_values": [
+                  0
+                ]
+              },
+              "seed": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 7,
+                "minimum": 0,
+                "maximum": 4294967295,
+                "calibration_values": [
+                  7
+                ]
+              },
+              "stream": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": false,
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "stream_options.include_usage": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": false,
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "temperature": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0,
+                "minimum": 0,
+                "maximum": 0,
+                "calibration_values": [
+                  0
+                ]
+              },
+              "tool_choice": {
+                "value_types": [
+                  "string",
+                  "object"
+                ],
+                "calibration_values": [
+                  "auto",
+                  "required",
+                  {
+                    "type": "function",
+                    "function": {
+                      "name": "get_weather"
+                    }
+                  }
+                ]
+              },
+              "tools": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 1,
+                "max_items": 10,
+                "calibration_values": [
+                  [
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "get_weather",
+                        "description": "Get current weather for a city.",
+                        "parameters": {
+                          "type": "object",
+                          "properties": {
+                            "city": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "city"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    }
+                  ],
+                  [
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "get_weather",
+                        "description": "Get current weather for a city.",
+                        "parameters": {
+                          "type": "object",
+                          "properties": {
+                            "city": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "city"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "set_timer",
+                        "description": "Set a timer.",
+                        "parameters": {
+                          "type": "object",
+                          "properties": {
+                            "time_human": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "time_human"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "toggle_lights",
+                        "description": "Turn lights on or off.",
+                        "parameters": {
+                          "type": "object",
+                          "properties": {
+                            "state": {
+                              "type": "string",
+                              "enum": [
+                                "on",
+                                "off"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "state"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "get_time",
+                        "description": "Get the current time in a timezone.",
+                        "parameters": {
+                          "type": "object",
+                          "properties": {
+                            "timezone": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "timezone"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "calculate",
+                        "description": "Calculate a mathematical expression.",
+                        "parameters": {
+                          "type": "object",
+                          "properties": {
+                            "expression": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "expression"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "search_web",
+                        "description": "Search the web.",
+                        "parameters": {
+                          "type": "object",
+                          "properties": {
+                            "query": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "query"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "send_email",
+                        "description": "Send an email.",
+                        "parameters": {
+                          "type": "object",
+                          "properties": {
+                            "recipient": {
+                              "type": "string"
+                            },
+                            "subject": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "recipient",
+                            "subject"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "create_calendar_event",
+                        "description": "Create a calendar event.",
+                        "parameters": {
+                          "type": "object",
+                          "properties": {
+                            "title": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "title"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "get_stock_price",
+                        "description": "Get a stock price.",
+                        "parameters": {
+                          "type": "object",
+                          "properties": {
+                            "symbol": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "symbol"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "function": {
+                        "name": "translate_text",
+                        "description": "Translate text into another language.",
+                        "parameters": {
+                          "type": "object",
+                          "properties": {
+                            "text": {
+                              "type": "string"
+                            },
+                            "language": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "text",
+                            "language"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    }
+                  ]
+                ]
+              },
+              "top_k": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 0,
+                "minimum": 0,
+                "maximum": 1,
+                "calibration_values": [
+                  0,
+                  1
+                ]
+              },
+              "top_p": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 1,
+                "minimum": 1,
+                "maximum": 1,
+                "calibration_values": [
+                  1
+                ]
+              },
+              "user": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 512,
+                "calibration_values": [
+                  "mayhem-calibration-user"
+                ]
+              },
+              "parallel_tool_calls": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": true,
+                "enum_values": [
+                  true
+                ],
+                "calibration_values": [
+                  true
+                ]
+              }
+            },
+            "request_attributes": [
+              "frequency_penalty",
+              "max_completion_tokens",
+              "max_tokens",
+              "messages",
+              "messages.content.text",
+              "messages.content.type",
+              "messages.role",
+              "metadata",
+              "min_p",
+              "model",
+              "parallel_tool_calls",
+              "presence_penalty",
+              "seed",
+              "stream",
+              "stream_options.include_usage",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_k",
+              "top_p",
+              "user"
+            ],
+            "required_request_attributes": [
+              "messages",
+              "messages.role",
+              "model",
+              "tools"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "created",
+              "model",
+              "choices",
+              "usage",
+              "mayhem"
+            ],
+            "response_attribute_specs": {
+              "choices": {
+                "calibration_values": [
+                  []
+                ],
+                "max_items": 1000000,
+                "min_items": 0,
+                "value_types": [
+                  "array"
+                ]
+              },
+              "created": {
+                "calibration_values": [
+                  1
+                ],
+                "maximum": 1.8446744073709552E+19,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "id": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "mayhem": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              },
+              "model": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "object": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "usage": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              }
+            },
+            "response_attributes": [
+              "id",
+              "object",
+              "created",
+              "model",
+              "choices",
+              "usage",
+              "mayhem"
+            ],
+            "speciality_mappings": {}
+          },
+          {
+            "family": "openai_responses",
+            "interaction_groups": [
+              [
+                "tools",
+                "tool_choice",
+                "parallel_tool_calls"
+              ],
+              [
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p"
+              ]
+            ],
+            "request_attribute_specs": {
+              "input": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 512,
+                "calibration_values": [
+                  "What's the weather in Berlin?"
+                ]
+              },
+              "max_output_tokens": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 128,
+                "minimum": 16,
+                "maximum": 512,
+                "calibration_values": [
+                  128
+                ]
+              },
+              "metadata": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "min_p": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0,
+                "minimum": 0,
+                "maximum": 0,
+                "calibration_values": [
+                  0
+                ]
+              },
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "Cactus-Compute/needle"
+                ],
+                "calibration_values": [
+                  "Cactus-Compute/needle"
+                ]
+              },
+              "stream": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": false,
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "temperature": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0,
+                "minimum": 0,
+                "maximum": 0,
+                "calibration_values": [
+                  0
+                ]
+              },
+              "tool_choice": {
+                "value_types": [
+                  "string",
+                  "object"
+                ],
+                "calibration_values": [
+                  "auto",
+                  "required",
+                  {
+                    "type": "function",
+                    "name": "get_weather"
+                  }
+                ]
+              },
+              "tools": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 1,
+                "max_items": 10,
+                "calibration_values": [
+                  [
+                    {
+                      "type": "function",
+                      "name": "get_weather",
+                      "description": "Get current weather for a city.",
+                      "parameters": {
+                        "type": "object",
+                        "properties": {
+                          "city": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "city"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  ],
+                  [
+                    {
+                      "type": "function",
+                      "name": "get_weather",
+                      "description": "Get current weather for a city.",
+                      "parameters": {
+                        "type": "object",
+                        "properties": {
+                          "city": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "city"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "name": "set_timer",
+                      "description": "Set a timer.",
+                      "parameters": {
+                        "type": "object",
+                        "properties": {
+                          "time_human": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "time_human"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "name": "toggle_lights",
+                      "description": "Turn lights on or off.",
+                      "parameters": {
+                        "type": "object",
+                        "properties": {
+                          "state": {
+                            "type": "string",
+                            "enum": [
+                              "on",
+                              "off"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "state"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "name": "get_time",
+                      "description": "Get the current time in a timezone.",
+                      "parameters": {
+                        "type": "object",
+                        "properties": {
+                          "timezone": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "timezone"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "name": "calculate",
+                      "description": "Calculate a mathematical expression.",
+                      "parameters": {
+                        "type": "object",
+                        "properties": {
+                          "expression": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "expression"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "name": "search_web",
+                      "description": "Search the web.",
+                      "parameters": {
+                        "type": "object",
+                        "properties": {
+                          "query": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "query"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "name": "send_email",
+                      "description": "Send an email.",
+                      "parameters": {
+                        "type": "object",
+                        "properties": {
+                          "recipient": {
+                            "type": "string"
+                          },
+                          "subject": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "recipient",
+                          "subject"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "name": "create_calendar_event",
+                      "description": "Create a calendar event.",
+                      "parameters": {
+                        "type": "object",
+                        "properties": {
+                          "title": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "title"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "name": "get_stock_price",
+                      "description": "Get a stock price.",
+                      "parameters": {
+                        "type": "object",
+                        "properties": {
+                          "symbol": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "symbol"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    {
+                      "type": "function",
+                      "name": "translate_text",
+                      "description": "Translate text into another language.",
+                      "parameters": {
+                        "type": "object",
+                        "properties": {
+                          "text": {
+                            "type": "string"
+                          },
+                          "language": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "text",
+                          "language"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  ]
+                ]
+              },
+              "top_k": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 0,
+                "minimum": 0,
+                "maximum": 1,
+                "calibration_values": [
+                  0,
+                  1
+                ]
+              },
+              "top_p": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 1,
+                "minimum": 1,
+                "maximum": 1,
+                "calibration_values": [
+                  1
+                ]
+              },
+              "user": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 512,
+                "calibration_values": [
+                  "mayhem-calibration-user"
+                ]
+              },
+              "parallel_tool_calls": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": true,
+                "enum_values": [
+                  true
+                ],
+                "calibration_values": [
+                  true
+                ]
+              }
+            },
+            "request_attributes": [
+              "input",
+              "max_output_tokens",
+              "metadata",
+              "min_p",
+              "model",
+              "parallel_tool_calls",
+              "stream",
+              "temperature",
+              "tool_choice",
+              "tools",
+              "top_k",
+              "top_p",
+              "user"
+            ],
+            "required_request_attributes": [
+              "input",
+              "model",
+              "tools"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "created_at",
+              "status",
+              "model",
+              "output",
+              "usage",
+              "mayhem"
+            ],
+            "response_attribute_specs": {
+              "created_at": {
+                "calibration_values": [
+                  1
+                ],
+                "maximum": 1.8446744073709552E+19,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "id": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "mayhem": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              },
+              "model": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "object": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "output": {
+                "calibration_values": [
+                  []
+                ],
+                "max_items": 1000000,
+                "min_items": 0,
+                "value_types": [
+                  "array"
+                ]
+              },
+              "status": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "usage": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              }
+            },
+            "response_attributes": [
+              "id",
+              "object",
+              "created_at",
+              "status",
+              "model",
+              "output",
+              "usage",
+              "mayhem"
+            ],
+            "speciality_mappings": {}
+          }
+        ],
+        "modality_set": [
+          "text"
+        ],
+        "reasoning_passthrough": "strip",
+        "specialities": [],
+        "tool_call_strategy": "mayhem_json"
+      },
+      "modality_assessment": {
+        "calibrated_fingerprints": {
+          "transformers-bf16-cpu": {
+            "text": "3d547c28816aca6e6e5e9b47ddf706e2db60d6b8df3e166683aa936bcf2e24a5"
+          },
+          "transformers-bf16-gpu": {
+            "text": "3d547c28816aca6e6e5e9b47ddf706e2db60d6b8df3e166683aa936bcf2e24a5"
+          }
+        },
+        "detected": [
+          "text"
+        ],
+        "evidence": [
+          "Pinned Cactus-Compute/needle@5f89b4307696d669c3df1d38ae057e6e1728b107 and Cactus-Compute/needle-hf@ffd0d081401257fee31150d30c494b2f98910fc0 expose a deterministic 30.4M-parameter encoder-decoder tool-selection model. It accepts one user query plus 1-10 bounded function schemas, emits one or more schema-validated calls, has a measured 1024-token combined encoder ceiling and 512-token decoder ceiling, and exposes no media, free-text chat, conversational history, reasoning-effort, or sampling surface. The upstream repository also contains JAX training/playground code; training and mutable provider-local finetunes are deliberately outside this inference-only artifact."
+        ],
+        "resource_profiles": {}
+      },
+      "speciality_assessment": {
+        "calibrated": {},
+        "detected": [],
+        "evidence": [
+          "Pinned Needle exposes deterministic tool selection only and no reasoning-effort or other model-speciality hierarchy."
+        ],
+        "unsupported": {}
+      },
+      "sampling": {
+        "temperature": 0,
+        "top_p": 1,
+        "top_k": 0,
+        "min_p": 0,
+        "repeat_penalty": 1,
+        "frequency_penalty": 0,
+        "presence_penalty": 0
+      },
+      "canary": {
+        "set_id": "canary-needle-launch-v1",
+        "match_min": 1,
+        "verification_method": "token_fingerprint",
+        "fingerprints": {
+          "transformers-bf16-cpu": "3d547c28816aca6e6e5e9b47ddf706e2db60d6b8df3e166683aa936bcf2e24a5",
+          "transformers-bf16-gpu": "3d547c28816aca6e6e5e9b47ddf706e2db60d6b8df3e166683aa936bcf2e24a5"
+        },
+        "token_prefixes": {
+          "transformers-bf16-cpu": {
+            "needle-distractor-selection": [
+              4,
+              356,
+              294,
+              264,
+              583,
+              8062,
+              2833,
+              265,
+              393,
+              282,
+              3818,
+              264,
+              1398,
+              503
+            ],
+            "needle-parallel-timer-lights": [
+              4,
+              356,
+              294,
+              264,
+              452,
+              8062,
+              863,
+              265,
+              393,
+              282,
+              384,
+              8062,
+              1012,
+              264,
+              383,
+              331,
+              662,
+              773,
+              294,
+              264,
+              583,
+              8062,
+              2833,
+              265,
+              393,
+              282,
+              3818,
+              264,
+              1398,
+              503
+            ],
+            "needle-weather-berlin": [
+              4,
+              356,
+              294,
+              264,
+              358,
+              8062,
+              1331,
+              265,
+              393,
+              282,
+              4796,
+              264,
+              8112,
+              6359,
+              503
+            ],
+            "needle-weather-paris": [
+              4,
+              356,
+              294,
+              264,
+              358,
+              8062,
+              1331,
+              265,
+              393,
+              282,
+              4796,
+              264,
+              8088,
+              6348,
+              503
+            ]
+          },
+          "transformers-bf16-gpu": {
+            "needle-distractor-selection": [
+              4,
+              356,
+              294,
+              264,
+              583,
+              8062,
+              2833,
+              265,
+              393,
+              282,
+              3818,
+              264,
+              1398,
+              503
+            ],
+            "needle-parallel-timer-lights": [
+              4,
+              356,
+              294,
+              264,
+              452,
+              8062,
+              863,
+              265,
+              393,
+              282,
+              384,
+              8062,
+              1012,
+              264,
+              383,
+              331,
+              662,
+              773,
+              294,
+              264,
+              583,
+              8062,
+              2833,
+              265,
+              393,
+              282,
+              3818,
+              264,
+              1398,
+              503
+            ],
+            "needle-weather-berlin": [
+              4,
+              356,
+              294,
+              264,
+              358,
+              8062,
+              1331,
+              265,
+              393,
+              282,
+              4796,
+              264,
+              8112,
+              6359,
+              503
+            ],
+            "needle-weather-paris": [
+              4,
+              356,
+              294,
+              264,
+              358,
+              8062,
+              1331,
+              265,
+              393,
+              282,
+              4796,
+              264,
+              8088,
+              6348,
+              503
+            ]
+          }
+        }
+      },
+      "price_ref_au": {
+        "denom": "au_usd",
+        "in_per_1k": "2000000000000",
+        "out_per_1k": "8000000000000"
+      }
+    },
+    {
+      "model_id": "image.heavy.le1_2mp",
+      "min_app_version": "0.2.103",
+      "model_class": "workflow",
+      "family": "comfy-krea2",
+      "params_b": 14,
+      "tier": "dev",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "publisher_key": "huggingface-repo",
+          "repo": "TracNetwork/openmayhem-parts-index",
+          "revision": "e23f4757c6e570abca40b1c35e08e3a1229d591d"
+        },
+        "conversion": [
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:krea2_turbo_fp8_scaled.safetensors",
+            "input_sha256": "eb4dd8c612cfd10f64f25b057e6e6bbcb5737c94a7372177e456dbf7579502f1",
+            "output_sha256": "eb4dd8c612cfd10f64f25b057e6e6bbcb5737c94a7372177e456dbf7579502f1"
+          },
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:qwen3vl_4b_fp8_scaled.safetensors",
+            "input_sha256": "54bd5144df0bbc25dd6ccadfcb826b521445a1b06ae5a42570bdd2974ca87094",
+            "output_sha256": "54bd5144df0bbc25dd6ccadfcb826b521445a1b06ae5a42570bdd2974ca87094"
+          }
+        ],
+        "license": "krea-2-community-license",
+        "license_sha256": "c28ecd175fc122540f684876e93af8d0809d5f88b58278fe14e4c31ad93b21f5"
+      },
+      "artifacts": {
+        "workflow-class": {
+          "engine": "comfyui",
+          "source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "TracNetwork/openmayhem-parts-index",
+            "revision": "3c04c5b87d833b858288c1a12ea6f2fc925ab030"
+          },
+          "path": "comfy/outcome-classes/v1/image.heavy.le1_2mp.json",
+          "artifact_root": "be5726d73958c4f3ec2fb89a17030308aad8059abfe884ae36ae9aad9c4724f1",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 625,
+          "source_sha256": "155ee5cf12374bdf24e4981614b5a21d6389c5b411390b6c852bd7f7e06d8f6b",
+          "download_check": false,
+          "notes": "Signed Comfy outcome-class definition; concrete Krea payload bytes are required through the workflow parts inventory."
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": false,
+        "ctx_max": 1,
+        "vision": false,
+        "image": true,
+        "video": false,
+        "audio": false,
+        "output_modality": "image",
+        "output_modalities": [
+          "image"
+        ],
+        "max_image_width": 1024,
+        "max_image_height": 1024,
+        "max_image_steps": 8
+      },
+      "requirements": {
+        "min_ram_gb": 48,
+        "min_vram_gb_full_offload": 24,
+        "cpu_flags": [],
+        "backends": [
+          "comfyui"
+        ]
+      },
+      "adapter": {
+        "endpoint_families": [
+          {
+            "family": "mayhem_comfy_workflows",
+            "request_attributes": [
+              "model",
+              "workflow",
+              "runtime_id",
+              "outcome_class",
+              "timeout_ms",
+              "response_format",
+              "user"
+            ],
+            "required_request_attributes": [
+              "model",
+              "workflow"
+            ],
+            "response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "request_attribute_specs": {
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "calibration_values": [
+                  "$MODEL"
+                ]
+              },
+              "outcome_class": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "image.heavy.le1_2mp"
+                ]
+              },
+              "response_format": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "artifact",
+                "enum_values": [
+                  "artifact",
+                  "json"
+                ],
+                "calibration_values": [
+                  "artifact",
+                  "json"
+                ]
+              },
+              "runtime_id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "comfyui-v0.30.1"
+                ]
+              },
+              "timeout_ms": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 120000,
+                "minimum": 1000,
+                "maximum": 3600000,
+                "calibration_values": [
+                  120000
+                ]
+              },
+              "user": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 512,
+                "calibration_values": [
+                  "mayhem-calibration-user"
+                ]
+              },
+              "workflow": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "1": {
+                      "class_type": "EmptyImage",
+                      "inputs": {
+                        "width": 64,
+                        "height": 64,
+                        "batch_size": 1,
+                        "color": 0
+                      }
+                    },
+                    "2": {
+                      "class_type": "SaveImage",
+                      "inputs": {
+                        "images": [
+                          "1",
+                          0
+                        ],
+                        "filename_prefix": "mayhem-comfy-smoke"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "response_attribute_specs": {
+              "artifacts": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 0,
+                "max_items": 1000000,
+                "calibration_values": [
+                  []
+                ]
+              },
+              "id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "mayhem": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "object": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "progress": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 0,
+                "maximum": 18446744073709552000,
+                "calibration_values": [
+                  1
+                ]
+              },
+              "status": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "usage": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              }
+            },
+            "interaction_groups": []
+          }
+        ],
+        "chat_template_id": "generic_chatml",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "preserve",
+        "modality_set": [
+          "image"
+        ]
+      },
+      "modality_assessment": {
+        "detected": [
+          "image"
+        ],
+        "evidence": [
+          "official Comfy-Org Krea 2 Turbo workflow template; signed parts-index v5; local workflow admission proof pending"
+        ],
+        "calibrated_fingerprints": {},
+        "resource_profiles": {
+          "workflow-class": {
+            "image": {
+              "unit": "pixel",
+              "measurement_source": "krea2_turbo_reference_profile_pending_live_admission",
+              "max_item_bytes": 268435456,
+              "max_item_units": 1048576,
+              "measured_item_bytes": 268435456,
+              "measured_item_units": 1048576,
+              "measured_working_set_bytes": 25769803776,
+              "calibration_baseline_memory_bytes": 21474836480,
+              "calibration_peak_memory_bytes": 47244640256,
+              "calibration_f13_budget_bytes": 55834574848,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            }
+          }
+        }
+      },
+      "speciality_assessment": {
+        "detected": [],
+        "evidence": [
+          "No endpoint speciality is advertised for Krea 2 Turbo; pinned Comfy-Org model card and workflow template reviewed."
+        ],
+        "unsupported": {},
+        "calibrated": {}
+      },
+      "sampling": {
+        "temperature": 1,
+        "top_p": 1
+      },
+      "workflow": {
+        "whitelisted_nodes": [
+          "UNETLoader",
+          "CLIPLoader",
+          "VAELoader",
+          "CLIPTextEncode",
+          "ConditioningZeroOut",
+          "EmptyLatentImage",
+          "KSampler",
+          "VAEDecode",
+          "SaveImage"
+        ],
+        "parts": [
+          {
+            "part_id": "6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae",
+            "name": "krea2_turbo_fp8_scaled.safetensors",
+            "type": "checkpoint",
+            "sha256": "eb4dd8c612cfd10f64f25b057e6e6bbcb5737c94a7372177e456dbf7579502f1"
+          },
+          {
+            "part_id": "19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c",
+            "name": "qwen3vl_4b_fp8_scaled.safetensors",
+            "type": "text-encoder",
+            "sha256": "54bd5144df0bbc25dd6ccadfcb826b521445a1b06ae5a42570bdd2974ca87094"
+          },
+          {
+            "part_id": "106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70",
+            "name": "qwen_image_vae.safetensors",
+            "type": "vae",
+            "sha256": "a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f"
+          }
+        ],
+        "runtime_id": "comfyui-v0.30.1",
+        "outcome_class": "image.heavy.le1_2mp",
+        "pricing_unit": "megapixel_step",
+        "inventory_root": "10b1fc60ccbaffa3a0cc90fcc1b4e3617016d1e76a815361e620c09647abadf3",
+        "max_nodes": 32,
+        "max_width": 1024,
+        "max_height": 1024,
+        "max_frames": 1,
+        "max_duration_seconds": 1,
+        "max_steps": 8,
+        "max_artifacts": 1
+      },
+      "canary": {
+        "set_id": "canary-krea2-workflow-launch-v1",
+        "match_min": 0.9,
+        "verification_method": "seed_perceptual_hash",
+        "verification_tolerance_bps": 500,
+        "fingerprints": {},
+        "token_prefixes": {},
+        "perceptual_hashes": {
+          "workflow-class": {
+            "red-cube-studio-seed7": "aaaaaaaaaaaaaaaa"
+          }
+        },
+        "embedding_vectors": {},
+        "transcripts": {},
+        "audio_fingerprints": {},
+        "video_fingerprints": {}
+      },
+      "price_ref_au": {
+        "denom": "au_usd",
+        "ver": 1,
+        "rate_map": [
+          {
+            "unit": "megapixel_step",
+            "per_unit_au": "450000000000000000",
+            "granularity": 1000
+          }
+        ],
+        "per_req_au": "0",
+        "min_session_au": "0"
+      }
+    },
+    {
+      "model_id": "image.heavy.le17mp",
+      "min_app_version": "0.2.107",
+      "model_class": "workflow",
+      "family": "comfy-krea2",
+      "params_b": 14,
+      "tier": "dev",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "publisher_key": "huggingface-repo",
+          "repo": "TracNetwork/openmayhem-parts-index",
+          "revision": "e23f4757c6e570abca40b1c35e08e3a1229d591d"
+        },
+        "conversion": [
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:krea2_turbo_fp8_scaled.safetensors",
+            "input_sha256": "eb4dd8c612cfd10f64f25b057e6e6bbcb5737c94a7372177e456dbf7579502f1",
+            "output_sha256": "eb4dd8c612cfd10f64f25b057e6e6bbcb5737c94a7372177e456dbf7579502f1"
+          },
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:qwen3vl_4b_fp8_scaled.safetensors",
+            "input_sha256": "54bd5144df0bbc25dd6ccadfcb826b521445a1b06ae5a42570bdd2974ca87094",
+            "output_sha256": "54bd5144df0bbc25dd6ccadfcb826b521445a1b06ae5a42570bdd2974ca87094"
+          }
+        ],
+        "license": "krea-2-community-license",
+        "license_sha256": "c28ecd175fc122540f684876e93af8d0809d5f88b58278fe14e4c31ad93b21f5"
+      },
+      "artifacts": {
+        "workflow-class": {
+          "engine": "comfyui",
+          "source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "TracNetwork/openmayhem-parts-index",
+            "revision": "3c04c5b87d833b858288c1a12ea6f2fc925ab030"
+          },
+          "path": "comfy/outcome-classes/v1/image.heavy.le17mp.json",
+          "artifact_root": "13b11b153e7cdadf973e2efbe7f3269f43656b375917005875f130f089ec2aea",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 485,
+          "source_sha256": "58db2ca0a564c200ebf6635544c57d6f1d9970df9e759b05d2b9c49ce14fb4d1",
+          "download_check": false,
+          "notes": "Signed Comfy outcome-class definition for Krea 2 Turbo followed by a signed 4x upscaler stage."
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": false,
+        "ctx_max": 1,
+        "vision": false,
+        "image": true,
+        "video": false,
+        "audio": false,
+        "output_modality": "image",
+        "output_modalities": [
+          "image"
+        ],
+        "max_image_width": 4096,
+        "max_image_height": 4096,
+        "max_image_steps": 8
+      },
+      "requirements": {
+        "min_ram_gb": 64,
+        "min_vram_gb_full_offload": 32,
+        "cpu_flags": [],
+        "backends": [
+          "comfyui"
+        ]
+      },
+      "adapter": {
+        "endpoint_families": [
+          {
+            "family": "mayhem_comfy_workflows",
+            "request_attributes": [
+              "model",
+              "workflow",
+              "runtime_id",
+              "outcome_class",
+              "timeout_ms",
+              "response_format",
+              "user"
+            ],
+            "required_request_attributes": [
+              "model",
+              "workflow"
+            ],
+            "response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "request_attribute_specs": {
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "calibration_values": [
+                  "$MODEL"
+                ]
+              },
+              "outcome_class": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "image.heavy.le17mp"
+                ]
+              },
+              "response_format": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "artifact",
+                "enum_values": [
+                  "artifact",
+                  "json"
+                ],
+                "calibration_values": [
+                  "artifact",
+                  "json"
+                ]
+              },
+              "runtime_id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "comfyui-v0.30.1"
+                ]
+              },
+              "timeout_ms": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 120000,
+                "minimum": 1000,
+                "maximum": 3600000,
+                "calibration_values": [
+                  120000
+                ]
+              },
+              "user": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 512,
+                "calibration_values": [
+                  "mayhem-calibration-user"
+                ]
+              },
+              "workflow": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "1": {
+                      "class_type": "UNETLoader",
+                      "inputs": {
+                        "unet_name": "krea2_turbo_fp8_scaled.safetensors",
+                        "weight_dtype": "default"
+                      }
+                    },
+                    "2": {
+                      "class_type": "CLIPLoader",
+                      "inputs": {
+                        "clip_name": "qwen3vl_4b_fp8_scaled.safetensors",
+                        "type": "krea2",
+                        "device": "default"
+                      }
+                    },
+                    "3": {
+                      "class_type": "VAELoader",
+                      "inputs": {
+                        "vae_name": "qwen_image_vae.safetensors"
+                      }
+                    },
+                    "4": {
+                      "class_type": "CLIPTextEncode",
+                      "inputs": {
+                        "clip": [
+                          "2",
+                          0
+                        ],
+                        "text": "High quality commercial photo of a Mercedes-Benz showroom, confident salesperson beside the car, glossy reflections, premium lighting, catchy tagline text style"
+                      }
+                    },
+                    "5": {
+                      "class_type": "ConditioningZeroOut",
+                      "inputs": {
+                        "conditioning": [
+                          "4",
+                          0
+                        ]
+                      }
+                    },
+                    "6": {
+                      "class_type": "EmptyLatentImage",
+                      "inputs": {
+                        "width": 1024,
+                        "height": 1024,
+                        "batch_size": 1
+                      }
+                    },
+                    "7": {
+                      "class_type": "KSampler",
+                      "inputs": {
+                        "seed": 87345219,
+                        "steps": 8,
+                        "cfg": 1,
+                        "sampler_name": "euler",
+                        "scheduler": "simple",
+                        "denoise": 1,
+                        "model": [
+                          "1",
+                          0
+                        ],
+                        "positive": [
+                          "4",
+                          0
+                        ],
+                        "negative": [
+                          "5",
+                          0
+                        ],
+                        "latent_image": [
+                          "6",
+                          0
+                        ]
+                      }
+                    },
+                    "8": {
+                      "class_type": "VAEDecode",
+                      "inputs": {
+                        "samples": [
+                          "7",
+                          0
+                        ],
+                        "vae": [
+                          "3",
+                          0
+                        ]
+                      }
+                    },
+                    "9": {
+                      "class_type": "UpscaleModelLoader",
+                      "inputs": {
+                        "model_name": "4x-spanx4-ch48.safetensors"
+                      }
+                    },
+                    "10": {
+                      "class_type": "ImageUpscaleWithModel",
+                      "inputs": {
+                        "upscale_model": [
+                          "9",
+                          0
+                        ],
+                        "image": [
+                          "8",
+                          0
+                        ]
+                      }
+                    },
+                    "11": {
+                      "class_type": "SaveImage",
+                      "inputs": {
+                        "images": [
+                          "10",
+                          0
+                        ],
+                        "filename_prefix": "mayhem-krea2-4x"
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "response_attribute_specs": {
+              "artifacts": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 0,
+                "max_items": 1000000,
+                "calibration_values": [
+                  []
+                ]
+              },
+              "id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "mayhem": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "object": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "progress": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 0,
+                "maximum": 18446744073709552000,
+                "calibration_values": [
+                  1
+                ]
+              },
+              "status": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "usage": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              }
+            },
+            "interaction_groups": []
+          }
+        ],
+        "chat_template_id": "generic_chatml",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "preserve",
+        "modality_set": [
+          "image"
+        ]
+      },
+      "modality_assessment": {
+        "detected": [
+          "image"
+        ],
+        "evidence": [
+          "official Comfy-Org Krea 2 Turbo workflow template plus signed 4x-spanx4 upscaler; signed parts-index v5; 4x voucher metering requires v0.2.107"
+        ],
+        "calibrated_fingerprints": {},
+        "resource_profiles": {
+          "workflow-class": {
+            "image": {
+              "unit": "pixel",
+              "measurement_source": "krea2_turbo_reference_profile_pending_live_admission",
+              "max_item_bytes": 1073741824,
+              "max_item_units": 16777216,
+              "measured_item_bytes": 1073741824,
+              "measured_item_units": 16777216,
+              "measured_working_set_bytes": 25769803776,
+              "calibration_baseline_memory_bytes": 21474836480,
+              "calibration_peak_memory_bytes": 47244640256,
+              "calibration_f13_budget_bytes": 55834574848,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            }
+          }
+        }
+      },
+      "speciality_assessment": {
+        "detected": [],
+        "evidence": [
+          "No endpoint speciality is advertised for Krea 2 Turbo; pinned Comfy-Org model card and workflow template reviewed."
+        ],
+        "unsupported": {},
+        "calibrated": {}
+      },
+      "sampling": {
+        "temperature": 1,
+        "top_p": 1
+      },
+      "workflow": {
+        "whitelisted_nodes": [
+          "CLIPLoader",
+          "CLIPTextEncode",
+          "ConditioningZeroOut",
+          "EmptyLatentImage",
+          "ImageUpscaleWithModel",
+          "KSampler",
+          "SaveImage",
+          "UNETLoader",
+          "UpscaleModelLoader",
+          "VAEDecode",
+          "VAELoader"
+        ],
+        "parts": [
+          {
+            "part_id": "6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae",
+            "name": "krea2_turbo_fp8_scaled.safetensors",
+            "type": "checkpoint",
+            "sha256": "eb4dd8c612cfd10f64f25b057e6e6bbcb5737c94a7372177e456dbf7579502f1"
+          },
+          {
+            "part_id": "19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c",
+            "name": "qwen3vl_4b_fp8_scaled.safetensors",
+            "type": "text-encoder",
+            "sha256": "54bd5144df0bbc25dd6ccadfcb826b521445a1b06ae5a42570bdd2974ca87094"
+          },
+          {
+            "part_id": "106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70",
+            "name": "qwen_image_vae.safetensors",
+            "type": "vae",
+            "sha256": "a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f"
+          },
+          {
+            "part_id": "d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a",
+            "name": "4x-spanx4-ch48.safetensors",
+            "type": "upscaler",
+            "sha256": "7889cc7180154767f581ca3dda031b2dfec268744880f5427255e88b34f9af07",
+            "scale": 4
+          }
+        ],
+        "runtime_id": "comfyui-v0.30.1",
+        "outcome_class": "image.heavy.le17mp",
+        "pricing_unit": "megapixel_step",
+        "inventory_root": "ed99758a107c3159b466f6970152a386619f1c9e62f9a6dabb1400b244ee427e",
+        "max_nodes": 32,
+        "max_width": 4096,
+        "max_height": 4096,
+        "max_frames": 1,
+        "max_duration_seconds": 1,
+        "max_steps": 8,
+        "max_artifacts": 1
+      },
+      "canary": {
+        "set_id": "canary-krea2-workflow-launch-v1",
+        "match_min": 0.9,
+        "verification_method": "seed_perceptual_hash",
+        "verification_tolerance_bps": 500,
+        "fingerprints": {},
+        "token_prefixes": {},
+        "perceptual_hashes": {
+          "workflow-class": {
+            "red-cube-studio-seed7": "aaaaaaaaaaaaaaaa"
+          }
+        },
+        "embedding_vectors": {},
+        "transcripts": {},
+        "audio_fingerprints": {},
+        "video_fingerprints": {}
+      },
+      "price_ref_au": {
+        "denom": "au_usd",
+        "ver": 1,
+        "rate_map": [
+          {
+            "unit": "megapixel_step",
+            "per_unit_au": "630000000000000000",
+            "granularity": 1000
+          }
+        ],
+        "per_req_au": "0",
+        "min_session_au": "0"
+      }
     }
   ],
   "schema_version": 1,
@@ -22704,6 +25313,10 @@
     }
   ],
   "enclave_attestation_bindings": [
+    {
+      "enclave_id": "1221166e530110bba7ace856faf38e2cd2440b90055e6fb72c4cad70b6751930",
+      "kind": "tpm2_quote_ek"
+    },
     {
       "enclave_id": "3eaaa9ca7ee95e8bf0840bbbe5de08142b45803fef3d0a7ba3dbf384e92df653",
       "kind": "tpm2_quote_ek"

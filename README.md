@@ -79,7 +79,7 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.107` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.108` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -88,7 +88,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.107
+git checkout --detach v0.2.108
 ./install.sh --from-source
 ```
 
@@ -97,7 +97,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.107
+git checkout --detach v0.2.108
 .\install.ps1 -FromSource
 ```
 
@@ -925,7 +925,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.107` is source-only. The GitHub release contains the tagged source, not
+`v0.2.108` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -933,7 +933,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.107
+git checkout --detach v0.2.108
 ./install.sh --from-source
 ```
 
@@ -942,7 +942,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.107
+git checkout --detach v0.2.108
 .\install.ps1 -FromSource
 ```
 
@@ -966,7 +966,7 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
-The `0.2.107` source release documents the current Comfy parts inventory,
+The `0.2.108` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the
 local ComfyUI runtime directory, canonicalizes integer-valued workflow JSON
 floats before graph hashing, and derives Comfy upscaler output dimensions from
