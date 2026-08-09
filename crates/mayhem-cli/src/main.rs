@@ -29852,6 +29852,9 @@ fn comfy_part_download_source_to_partial_with_chunk_bytes(
             .with_context(|| format!("removing oversized partial {}", part_path.display()))?;
         partial_bytes = 0;
     }
+    if partial_bytes == expected_bytes {
+        return Ok(partial_bytes);
+    }
 
     if prefer_chunked_ranges && size_exact {
         return comfy_part_download_source_to_partial_ranges(
@@ -30085,13 +30088,27 @@ fn write_comfy_part_response_to_partial(
         if read == 0 {
             break;
         }
-        written = written
-            .checked_add(u64::try_from(read).context("download chunk length overflowed")?)
+        let read_u64 = u64::try_from(read).context("download chunk length overflowed")?;
+        let next_written = written
+            .checked_add(read_u64)
             .context("download size overflowed")?;
-        if written > max_written {
-            let _ = fs::remove_file(part_path);
+        if next_written > max_written {
+            let allowed = usize::try_from(max_written.saturating_sub(written))
+                .context("allowed download chunk length overflowed")?;
+            if allowed > 0 {
+                output
+                    .write_all(&buffer[..allowed])
+                    .with_context(|| format!("writing {}", part_path.display()))?;
+            }
+            output
+                .set_len(max_written)
+                .with_context(|| format!("truncating {}", part_path.display()))?;
+            output
+                .sync_all()
+                .with_context(|| format!("syncing {}", part_path.display()))?;
             bail!("downloaded Comfy part {label} exceeded expected byte boundary {max_written}");
         }
+        written = next_written;
         output
             .write_all(&buffer[..read])
             .with_context(|| format!("writing {}", part_path.display()))?;
@@ -96442,6 +96459,84 @@ status: linked
             "{err:#}"
         );
         assert_eq!(fs::read(&part_path).unwrap(), partial);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn comfy_part_download_truncates_overlong_range_to_safe_boundary() {
+        let temp = test_temp_dir("mayhem-comfy-part-range-overlong-truncate");
+        fs::create_dir_all(&temp).unwrap();
+        let payload = b"0123456789".to_vec();
+        let part_path = temp.join("payload.bin.part");
+        fs::write(&part_path, &payload[..5]).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0, "range mock request ended before headers");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(
+                request.contains("Range: bytes=5-9") || request.contains("range: bytes=5-9"),
+                "expected final resume range in request, got {request}"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 206 Partial Content\r\ncontent-range: bytes 5-9/10\r\nconnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.write_all(b"56789EXTRA").unwrap();
+            stream.flush().unwrap();
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .unwrap();
+        let url = reqwest::Url::parse(&format!("http://{address}/payload.bin")).unwrap();
+        let err = comfy_part_download_source_to_partial_with_chunk_bytes(
+            &client,
+            &url,
+            None,
+            &part_path,
+            payload.len() as u64,
+            true,
+            "range fixture",
+            "range reset",
+            true,
+            7,
+        )
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert!(
+            format!("{err:#}").contains("exceeded expected byte boundary"),
+            "{err:#}"
+        );
+        assert_eq!(fs::read(&part_path).unwrap(), payload);
+        let written = comfy_part_download_source_to_partial_with_chunk_bytes(
+            &client,
+            &url,
+            None,
+            &part_path,
+            payload.len() as u64,
+            true,
+            "range fixture",
+            "range reset",
+            true,
+            7,
+        )
+        .unwrap();
+        assert_eq!(written, payload.len() as u64);
         let _ = fs::remove_dir_all(temp);
     }
 
