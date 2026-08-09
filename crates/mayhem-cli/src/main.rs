@@ -26908,6 +26908,10 @@ fn admin_comfy_part_source_filename(
     )
 }
 
+const COMFY_PART_RANGE_DOWNLOAD_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
+const COMFY_PART_RANGE_DOWNLOAD_CHUNK_BYTES: u64 = 1024 * 1024 * 1024;
+const COMFY_PART_DOWNLOAD_BUFFER_BYTES: usize = 1024 * 128;
+
 fn admin_comfy_part_download_source(
     source: &mayhem_proto::ComfyPartSource,
     require_auth: bool,
@@ -26967,101 +26971,22 @@ fn admin_comfy_part_download_source_blocking(
         .context("Comfy part download destination has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let part_path = provider_download_partial_path(destination);
-    let mut partial_bytes = fs::metadata(&part_path)
-        .ok()
-        .filter(|metadata| metadata.is_file())
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    if partial_bytes > draft.size_bytes {
-        fs::remove_file(&part_path)
-            .with_context(|| format!("removing oversized partial {}", part_path.display()))?;
-        partial_bytes = 0;
-    }
-
     let client = reqwest::blocking::Client::builder()
         .user_agent(format!("openmayhem/{}", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .context("building Comfy part download client")?;
-    let mut append = partial_bytes > 0;
-    let mut request = client.get(parsed);
-    if append {
-        request = request.header(reqwest::header::RANGE, format!("bytes={partial_bytes}-"));
-    }
-    if let Some(token) = token.as_deref() {
-        request = request.bearer_auth(token);
-    }
-
-    let mut response = request
-        .send()
-        .with_context(|| format!("downloading Comfy part source {}", source.url))?;
-    match response.status() {
-        reqwest::StatusCode::PARTIAL_CONTENT if append => {}
-        reqwest::StatusCode::OK => {
-            if append {
-                fs::remove_file(&part_path).with_context(|| {
-                    format!(
-                        "removing partial {} after source ignored range request",
-                        part_path.display()
-                    )
-                })?;
-                partial_bytes = 0;
-                append = false;
-            }
-        }
-        reqwest::StatusCode::RANGE_NOT_SATISFIABLE if append => {
-            fs::remove_file(&part_path).with_context(|| {
-                format!("removing rejected partial download {}", part_path.display())
-            })?;
-            bail!("source rejected the resume range; partial was reset, retry onboarding");
-        }
-        status => bail!("source returned HTTP status {status}"),
-    }
-    if let Some(content_length) = response.content_length() {
-        let expected_remaining = draft.size_bytes.saturating_sub(partial_bytes);
-        ensure!(
-            content_length <= expected_remaining,
-            "source response is too large for {}: got at least {}, expected at most {} remaining bytes",
-            draft.name,
-            content_length,
-            expected_remaining
-        );
-    }
-
-    let mut output = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(append)
-        .truncate(!append)
-        .open(&part_path)
-        .with_context(|| format!("opening partial download {}", part_path.display()))?;
-    let mut written = partial_bytes;
-    let mut buffer = [0u8; 1024 * 128];
-    loop {
-        let read = response
-            .read(&mut buffer)
-            .with_context(|| format!("reading Comfy part source {}", source.url))?;
-        if read == 0 {
-            break;
-        }
-        written = written
-            .checked_add(u64::try_from(read).context("download chunk length overflowed")?)
-            .context("download size overflowed")?;
-        if written > draft.size_bytes {
-            let _ = fs::remove_file(&part_path);
-            bail!(
-                "downloaded Comfy part {} exceeded expected size {}",
-                draft.name,
-                draft.size_bytes
-            );
-        }
-        output
-            .write_all(&buffer[..read])
-            .with_context(|| format!("writing {}", part_path.display()))?;
-    }
-    output
-        .sync_all()
-        .with_context(|| format!("syncing {}", part_path.display()))?;
+    let written = comfy_part_download_source_to_partial(
+        &client,
+        &parsed,
+        token.as_deref(),
+        &part_path,
+        draft.size_bytes,
+        draft.size_bytes_exact,
+        &draft.name,
+        "source rejected the resume range; partial was reset, retry onboarding",
+        comfy_part_source_prefers_chunked_ranges(source, draft.size_bytes, draft.size_bytes_exact),
+    )?;
     if draft.size_bytes_exact {
         ensure!(
             written == draft.size_bytes,
@@ -29815,103 +29740,22 @@ fn provider_comfy_part_download_source_blocking(
         .context("Comfy part cache destination has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     let part_path = provider_download_partial_path(cache_path);
-    let mut partial_bytes = fs::metadata(&part_path)
-        .ok()
-        .filter(|metadata| metadata.is_file())
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    if partial_bytes > record.size_bytes {
-        fs::remove_file(&part_path)
-            .with_context(|| format!("removing oversized partial {}", part_path.display()))?;
-        partial_bytes = 0;
-    }
-
     let client = reqwest::blocking::Client::builder()
         .user_agent(format!("openmayhem/{}", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .context("building Comfy part download client")?;
-    let mut append = partial_bytes > 0;
-    let mut request = client.get(parsed);
-    if append {
-        request = request.header(reqwest::header::RANGE, format!("bytes={partial_bytes}-"));
-    }
-    if let Some(token) = token.as_deref() {
-        request = request.bearer_auth(token);
-    }
-
-    let mut response = request
-        .send()
-        .with_context(|| format!("downloading Comfy part source {}", source.url))?;
-    match response.status() {
-        reqwest::StatusCode::PARTIAL_CONTENT if append => {}
-        reqwest::StatusCode::OK => {
-            if append {
-                fs::remove_file(&part_path).with_context(|| {
-                    format!(
-                        "removing partial {} after source ignored range request",
-                        part_path.display()
-                    )
-                })?;
-                partial_bytes = 0;
-                append = false;
-            }
-        }
-        reqwest::StatusCode::RANGE_NOT_SATISFIABLE if append => {
-            fs::remove_file(&part_path).with_context(|| {
-                format!("removing rejected partial download {}", part_path.display())
-            })?;
-            bail!("source rejected the resume range; partial was reset, retry the pull");
-        }
-        status => {
-            bail!("source returned HTTP status {status}");
-        }
-    }
-    if let Some(content_length) = response.content_length() {
-        let expected_remaining = record.size_bytes.saturating_sub(partial_bytes);
-        ensure!(
-            content_length <= expected_remaining,
-            "source response is too large for {}: got at least {}, expected at most {} remaining bytes",
-            record.part_id,
-            content_length,
-            expected_remaining
-        );
-    }
-
-    let mut output = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(append)
-        .truncate(!append)
-        .open(&part_path)
-        .with_context(|| format!("opening partial download {}", part_path.display()))?;
-    let mut written = partial_bytes;
-    let mut buffer = [0u8; 1024 * 128];
-    loop {
-        let read = response
-            .read(&mut buffer)
-            .with_context(|| format!("reading Comfy part source {}", source.url))?;
-        if read == 0 {
-            break;
-        }
-        written = written
-            .checked_add(u64::try_from(read).context("download chunk length overflowed")?)
-            .context("download size overflowed")?;
-        if written > record.size_bytes {
-            let _ = fs::remove_file(&part_path);
-            bail!(
-                "downloaded Comfy part {} exceeded expected size {}",
-                record.part_id,
-                record.size_bytes
-            );
-        }
-        output
-            .write_all(&buffer[..read])
-            .with_context(|| format!("writing {}", part_path.display()))?;
-    }
-    output
-        .sync_all()
-        .with_context(|| format!("syncing {}", part_path.display()))?;
+    let written = comfy_part_download_source_to_partial(
+        &client,
+        &parsed,
+        token.as_deref(),
+        &part_path,
+        record.size_bytes,
+        true,
+        &record.part_id,
+        "source rejected the resume range; partial was reset, retry the pull",
+        comfy_part_source_prefers_chunked_ranges(source, record.size_bytes, true),
+    )?;
     ensure!(
         written == record.size_bytes,
         "downloaded Comfy part {} is incomplete: got {}, expected {} bytes",
@@ -29937,6 +29781,335 @@ fn provider_comfy_part_download_source_blocking(
         )
     })?;
     Ok(())
+}
+
+fn comfy_part_source_prefers_chunked_ranges(
+    source: &mayhem_proto::ComfyPartSource,
+    expected_bytes: u64,
+    size_exact: bool,
+) -> bool {
+    size_exact
+        && expected_bytes >= COMFY_PART_RANGE_DOWNLOAD_THRESHOLD_BYTES
+        && source.kind.eq_ignore_ascii_case("huggingface")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn comfy_part_download_source_to_partial(
+    client: &reqwest::blocking::Client,
+    url: &reqwest::Url,
+    token: Option<&str>,
+    part_path: &Path,
+    expected_bytes: u64,
+    size_exact: bool,
+    label: &str,
+    range_reset_message: &str,
+    prefer_chunked_ranges: bool,
+) -> Result<u64> {
+    comfy_part_download_source_to_partial_with_chunk_bytes(
+        client,
+        url,
+        token,
+        part_path,
+        expected_bytes,
+        size_exact,
+        label,
+        range_reset_message,
+        prefer_chunked_ranges,
+        COMFY_PART_RANGE_DOWNLOAD_CHUNK_BYTES,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn comfy_part_download_source_to_partial_with_chunk_bytes(
+    client: &reqwest::blocking::Client,
+    url: &reqwest::Url,
+    token: Option<&str>,
+    part_path: &Path,
+    expected_bytes: u64,
+    size_exact: bool,
+    label: &str,
+    range_reset_message: &str,
+    prefer_chunked_ranges: bool,
+    range_chunk_bytes: u64,
+) -> Result<u64> {
+    ensure!(
+        range_chunk_bytes > 0,
+        "Comfy part range chunk size must be greater than zero"
+    );
+    let mut partial_bytes = fs::metadata(part_path)
+        .ok()
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if partial_bytes > expected_bytes {
+        fs::remove_file(part_path)
+            .with_context(|| format!("removing oversized partial {}", part_path.display()))?;
+        partial_bytes = 0;
+    }
+
+    if prefer_chunked_ranges && size_exact {
+        return comfy_part_download_source_to_partial_ranges(
+            client,
+            url,
+            token,
+            part_path,
+            expected_bytes,
+            label,
+            range_reset_message,
+            partial_bytes,
+            range_chunk_bytes,
+        );
+    }
+
+    comfy_part_download_source_to_partial_single(
+        client,
+        url,
+        token,
+        part_path,
+        expected_bytes,
+        label,
+        range_reset_message,
+        partial_bytes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn comfy_part_download_source_to_partial_single(
+    client: &reqwest::blocking::Client,
+    url: &reqwest::Url,
+    token: Option<&str>,
+    part_path: &Path,
+    expected_bytes: u64,
+    label: &str,
+    range_reset_message: &str,
+    mut partial_bytes: u64,
+) -> Result<u64> {
+    let append = partial_bytes > 0;
+    let mut request = client.get(url.clone());
+    if append {
+        request = request.header(reqwest::header::RANGE, format!("bytes={partial_bytes}-"));
+    }
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+
+    let response = request
+        .send()
+        .with_context(|| format!("downloading Comfy part source {}", url.as_str()))?;
+    let status = response.status();
+    let append = match status {
+        reqwest::StatusCode::PARTIAL_CONTENT if append => true,
+        reqwest::StatusCode::OK => {
+            if append {
+                fs::remove_file(part_path).with_context(|| {
+                    format!(
+                        "removing partial {} after source ignored range request",
+                        part_path.display()
+                    )
+                })?;
+                partial_bytes = 0;
+            }
+            false
+        }
+        reqwest::StatusCode::RANGE_NOT_SATISFIABLE if append => {
+            fs::remove_file(part_path).with_context(|| {
+                format!("removing rejected partial download {}", part_path.display())
+            })?;
+            bail!("{range_reset_message}");
+        }
+        status => bail!("source returned HTTP status {status}"),
+    };
+    if let Some(content_length) = response.content_length() {
+        let expected_remaining = expected_bytes.saturating_sub(partial_bytes);
+        ensure!(
+            content_length <= expected_remaining,
+            "source response is too large for {label}: got at least {content_length}, expected at most {expected_remaining} remaining bytes"
+        );
+    }
+
+    let mut output = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(part_path)
+        .with_context(|| format!("opening partial download {}", part_path.display()))?;
+    let written = write_comfy_part_response_to_partial(
+        response,
+        &mut output,
+        part_path,
+        url.as_str(),
+        label,
+        partial_bytes,
+        expected_bytes,
+    )?;
+    output
+        .sync_all()
+        .with_context(|| format!("syncing {}", part_path.display()))?;
+    Ok(written)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn comfy_part_download_source_to_partial_ranges(
+    client: &reqwest::blocking::Client,
+    url: &reqwest::Url,
+    token: Option<&str>,
+    part_path: &Path,
+    expected_bytes: u64,
+    label: &str,
+    range_reset_message: &str,
+    mut written: u64,
+    range_chunk_bytes: u64,
+) -> Result<u64> {
+    while written < expected_bytes {
+        let end = written
+            .saturating_add(range_chunk_bytes)
+            .saturating_sub(1)
+            .min(expected_bytes.saturating_sub(1));
+        let mut request = client
+            .get(url.clone())
+            .header(reqwest::header::RANGE, format!("bytes={written}-{end}"));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .with_context(|| format!("downloading Comfy part source {}", url.as_str()))?;
+        match response.status() {
+            reqwest::StatusCode::PARTIAL_CONTENT => {
+                let (range_start, range_end, total) = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_RANGE)
+                    .and_then(parse_http_content_range)
+                    .with_context(|| {
+                        format!(
+                            "ranged Comfy part source {} did not return a valid Content-Range",
+                            url.as_str()
+                        )
+                    })?;
+                ensure!(
+                    range_start == written && range_end == end,
+                    "ranged Comfy part source returned bytes {range_start}-{range_end}, expected {written}-{end}"
+                );
+                if let Some(total) = total {
+                    ensure!(
+                        total == expected_bytes,
+                        "ranged Comfy part source reports {total} total bytes for {label}, expected {expected_bytes}"
+                    );
+                }
+                let chunk_len = end
+                    .checked_sub(written)
+                    .and_then(|value| value.checked_add(1))
+                    .context("range chunk length overflowed")?;
+                if let Some(content_length) = response.content_length() {
+                    ensure!(
+                        content_length <= chunk_len,
+                        "source response is too large for {label}: got at least {content_length}, expected at most {chunk_len} range bytes"
+                    );
+                }
+                let mut output = fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .append(written > 0)
+                    .truncate(written == 0)
+                    .open(part_path)
+                    .with_context(|| format!("opening partial download {}", part_path.display()))?;
+                written = write_comfy_part_response_to_partial(
+                    response,
+                    &mut output,
+                    part_path,
+                    url.as_str(),
+                    label,
+                    written,
+                    end.checked_add(1).context("range end overflowed")?,
+                )?;
+                output
+                    .sync_all()
+                    .with_context(|| format!("syncing {}", part_path.display()))?;
+                ensure!(
+                    written == end + 1,
+                    "downloaded Comfy part {label} range is incomplete: got byte offset {written}, expected {}",
+                    end + 1
+                );
+            }
+            reqwest::StatusCode::OK => {
+                if written > 0 {
+                    fs::remove_file(part_path).with_context(|| {
+                        format!(
+                            "removing partial {} after source ignored range request",
+                            part_path.display()
+                        )
+                    })?;
+                }
+                return comfy_part_download_source_to_partial_single(
+                    client,
+                    url,
+                    token,
+                    part_path,
+                    expected_bytes,
+                    label,
+                    range_reset_message,
+                    0,
+                );
+            }
+            reqwest::StatusCode::RANGE_NOT_SATISFIABLE if written > 0 => {
+                fs::remove_file(part_path).with_context(|| {
+                    format!("removing rejected partial download {}", part_path.display())
+                })?;
+                bail!("{range_reset_message}");
+            }
+            status => bail!("source returned HTTP status {status}"),
+        }
+    }
+    Ok(written)
+}
+
+fn write_comfy_part_response_to_partial(
+    mut response: reqwest::blocking::Response,
+    output: &mut fs::File,
+    part_path: &Path,
+    source_url: &str,
+    label: &str,
+    mut written: u64,
+    max_written: u64,
+) -> Result<u64> {
+    let mut buffer = [0u8; COMFY_PART_DOWNLOAD_BUFFER_BYTES];
+    loop {
+        let read = response
+            .read(&mut buffer)
+            .with_context(|| format!("reading Comfy part source {source_url}"))?;
+        if read == 0 {
+            break;
+        }
+        written = written
+            .checked_add(u64::try_from(read).context("download chunk length overflowed")?)
+            .context("download size overflowed")?;
+        if written > max_written {
+            let _ = fs::remove_file(part_path);
+            bail!("downloaded Comfy part {label} exceeded expected byte boundary {max_written}");
+        }
+        output
+            .write_all(&buffer[..read])
+            .with_context(|| format!("writing {}", part_path.display()))?;
+    }
+    Ok(written)
+}
+
+fn parse_http_content_range(
+    value: &reqwest::header::HeaderValue,
+) -> Option<(u64, u64, Option<u64>)> {
+    let value = value.to_str().ok()?.trim();
+    let value = value.strip_prefix("bytes ")?;
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end = end.parse::<u64>().ok()?;
+    let total = if total == "*" {
+        None
+    } else {
+        Some(total.parse::<u64>().ok()?)
+    };
+    Some((start, end, total))
 }
 
 fn join_comfy_download_worker(
@@ -96085,6 +96258,92 @@ status: linked
                 "{provider_err:#}"
             );
         });
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn comfy_part_download_resumes_with_sequential_ranges() {
+        let temp = test_temp_dir("mayhem-comfy-part-range-resume");
+        fs::create_dir_all(&temp).unwrap();
+        let payload = b"0123456789abcdefghijkl".to_vec();
+        let part_path = temp.join("payload.bin.part");
+        fs::write(&part_path, &payload[..5]).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured_server = Arc::clone(&captured);
+        let payload_server = payload.clone();
+        let server = thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).unwrap();
+                    assert!(read > 0, "range mock request ended before headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).to_string();
+                let range_line = request
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("range:"))
+                    .expect("range request missing Range header");
+                let range = range_line
+                    .split_once(':')
+                    .unwrap()
+                    .1
+                    .trim()
+                    .strip_prefix("bytes=")
+                    .unwrap();
+                captured_server.lock().unwrap().push(range.to_owned());
+                let (start, end) = range.split_once('-').unwrap();
+                let start = start.parse::<usize>().unwrap();
+                let end = end.parse::<usize>().unwrap();
+                let body = &payload_server[start..=end];
+                write!(
+                    stream,
+                    "HTTP/1.1 206 Partial Content\r\ncontent-length: {}\r\ncontent-range: bytes {}-{}/{}\r\nconnection: close\r\n\r\n",
+                    body.len(),
+                    start,
+                    end,
+                    payload_server.len()
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .unwrap();
+        let url = reqwest::Url::parse(&format!("http://{address}/payload.bin")).unwrap();
+        let written = comfy_part_download_source_to_partial_with_chunk_bytes(
+            &client,
+            &url,
+            None,
+            &part_path,
+            payload.len() as u64,
+            true,
+            "range fixture",
+            "range reset",
+            true,
+            7,
+        )
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(written, payload.len() as u64);
+        assert_eq!(fs::read(&part_path).unwrap(), payload);
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec!["5-11".to_owned(), "12-18".to_owned(), "19-21".to_owned()]
+        );
         let _ = fs::remove_dir_all(temp);
     }
 
