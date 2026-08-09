@@ -15,19 +15,22 @@ routes, and revisions. Never copy an enclave ID or price from documentation:
 mayhem models --gateway
 ```
 
-## v0.2.107 runtime status
+## v0.2.115 runtime status
 
-The `0.2.107` source release keeps the previous source-install, managed
+The `0.2.115` source release keeps the previous source-install, managed
 runtime, co-resident memory, endpoint-floor, Sulphur, Chatterbox, ACE-Step,
 Needle, and Comfy workflow market fixes, and adds the current Comfy parts
-inventory below. Ledger-only workflow outcome classes expose endpoint family
+inventory. The dedicated Comfy provider/user reference is
+[`comfy-cheatsheet.md`](comfy-cheatsheet.md); it lists every outcome class, the
+current signed parts index, required part sets, and `/v1/workflows` usage.
+Ledger-only workflow outcome classes expose endpoint family
 `mayhem_comfy_workflows`, providers can resolve workflow enclaves without a
 static `catalog/models.json` row, and workflow serving uses
 `--artifact <comfy-runtime-dir>` for the local ComfyUI runtime checkout while
 keeping the ledger artifact bound to the workflow class definition. Workflow
 graph hashes canonicalize integer-valued JSON floats, so JS/Pear transport
 normalization of `1.0` to `1` does not break signed workflow vouchers. Signed
-Comfy upscaler parts may declare a scale; Krea+4x workflows must use v0.2.107 or
+Comfy upscaler parts may declare a scale; Krea+4x workflows must use v0.2.115 or
 newer on both buyer gateways and providers so route requirements, vouchers, and
 receipts meter the upscaled output dimensions.
 Dedicated-VRAM reservations remain enforced. Needle still has
@@ -187,71 +190,29 @@ Krea providers must add these signed parts before admission:
 
 ### Current Comfy parts inventory
 
-The live Comfy parts anchor points at the immutable Hugging Face dataset
-revision
-[`TracNetwork/openmayhem-parts-index@e23f4757c6e570abca40b1c35e08e3a1229d591d`](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/tree/e23f4757c6e570abca40b1c35e08e3a1229d591d).
-Use its
-[`index.json`](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/e23f4757c6e570abca40b1c35e08e3a1229d591d/index.json)
-and
-[`anchor.json`](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/e23f4757c6e570abca40b1c35e08e3a1229d591d/anchor.json)
-as the source of truth for signed part IDs, proofs, hashes, licenses, and
-origin URLs. At this revision the signed index contains 81 parts:
-12 checkpoints, 1 video model, 4 text encoders, 5 VAEs, 1 CLIP-vision encoder,
-5 lipsync parts, 35 ControlNet/control helpers, and 18 upscaler/restoration
-helpers. It contains zero standalone `lora` records; current customization is
-represented by checkpoint/video-model lanes and sidecar/control parts. Some
-payloads are mirrored in the Hugging Face dataset and some records point at
-their signed upstream origin, such as Civitai or another Hugging Face repo.
-Providers should still use `mayhem provider parts pull`; it verifies the record,
-payload hash, and proof before caching.
+The authoritative Comfy workflow reference is
+[`comfy-cheatsheet.md`](comfy-cheatsheet.md). It lists every workflow outcome
+class, the class-fit matrix, required Krea/LTX/lipsync part sets, provider
+commands, user API shape, and all 85 signed parts.
 
-Main generation lanes:
+Current signed parts anchor:
 
-| Lane | Part | Type | Purpose | Size | Source | Signed HF record |
-|---|---|---|---|---:|---|---|
-| `z-image` | Z-Image Turbo (tongyi) | checkpoint | Official Z-Image Turbo base lane. | 11.46 GiB | Civitai mirror, Apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/49bf30974fbe8db2044ac3a51cc458f52095dba030b8d01d36aed95ffd6c25d0.json) |
-| `z-image` | CyberRealistic Z-Image Turbo | checkpoint | Photoreal Z-Image Turbo finetune/variant. | 6.09 GiB | Civitai | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/53c5bb42154d15e9a6f1609df3258a52faf979bc16d07994347560424e10ef16.json) |
-| `sdxl` | Illustrious-XL v0.1 | checkpoint | Anime/illustration SDXL-family root; NSFW policy flag. | 6.46 GiB | Civitai | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/e403a8dca595a45a623db78af4f3058a4258ec3a5d28bb2588b643a47aa1bbe9.json) |
-| `sdxl` | CyberRealistic XL | checkpoint | Photoreal SDXL lane. | 12.92 GiB | Civitai | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/f8547da9bab83d8db5e9356c6d7c1c4f583d92336ea4eea02edc8e99982a85ac.json) |
-| `sdxl` | Nova Anime XL | checkpoint | Anime SDXL lane; NSFW policy flag. | 6.46 GiB | Civitai | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/ca45989f9e5d5af2c0b1a3b5b3e429db5a77cd70ed3b71089db07155dede231a.json) |
-| `sdxl` | Nova Furry XL | checkpoint | Furry/character SDXL lane; NSFW policy flag. | 6.46 GiB | Civitai | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/9489f2e2aeeac3e51eace20254c3ce693a69aa69c355ea8ac33630bc3fe3c57c.json) |
-| `sdxl` | PerfectDeliberate | checkpoint | General SDXL checkpoint lane; NSFW policy flag. | 6.46 GiB | Civitai | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/2321cb8dc6c16e7e2bbec43bba8df296b66c91ebf65bb7fada16ec9c9c5c6b38.json) |
-| `sdxl` | Realism Illustrious By Stable Yogi | checkpoint | Realistic Illustrious/SDXL variant; NSFW policy flag. | 6.46 GiB | Civitai | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/fdb4927c4c15241d9276a1290b2aebc7441d3e9f19c8a1674f344164d6061516.json) |
-| `sd15` | CyberRealistic (SD 1.5) | checkpoint | Legacy SD 1.5 photoreal lane; NSFW policy flag. | 3.97 GiB | Civitai | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/95566dab1bbd4b97341d45e54e5f3a16ad8449a3fd2e5b7fd0853be822cae879.json) |
-| `krea2` | Krea 2 Turbo Official Comfy-Org Checkpoints | checkpoint | Official Krea 2 Turbo fp8 lane root. | 12.24 GiB | Hugging Face mirror of Comfy-Org/Krea-2 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae.json) |
-| `krea2` | RedCraft (Krea 2) | checkpoint | Krea 2 style/photoreal variant; NSFW policy flag. | 12.24 GiB | Civitai | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/dc2b6383126b39fbeb0948145e31174996e2442f3498206b2e5883ff6d4417f3.json) |
-| `ltx` | LTX 2.3 GTAnimation (fast edition) | video-model | LTX video-generation lane; revenue-clause policy flag. | 16.47 GiB | Civitai | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/25055314e4c2194d3f1655e89830c325e276fd7963be6e43448f6f477460fc54.json) |
+- Dataset: `TracNetwork/openmayhem-parts-index`
+- Revision: `023ab52a79182d4027429c0c8a12ea5bf03b81da`
+- Index root: `8599b956d3e004ffe073601b2cc1a8fbf34f5b9a0f90550b08b2ed353d60b465`
+- Anchor hash: `a964aff2dd609d8672dd2e438a36d5b07aa74cd5e84ace87ee14124596ebe5c1`
+- Index version: `10`
+- Inventory: 85 parts: 12 checkpoint, 2 video-model, 4 text-encoder, 6 VAE,
+  1 CLIP-vision, 1 LoRA, 5 lipsync, 35 ControlNet/control helper, and 19
+  upscaler/restoration parts.
+- Index URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/023ab52a79182d4027429c0c8a12ea5bf03b81da/index.json
+- Anchor URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/023ab52a79182d4027429c0c8a12ea5bf03b81da/anchor.json
 
-Required encoders, VAEs, lipsync, and vision sidecars:
-
-| Lane | Part | Type | Purpose | Size | Signed HF record |
-|---|---|---|---|---:|---|
-| `krea2` | Qwen3-VL 4B fp8 scaled | text-encoder | Krea 2 text encoder for the proven Turbo lane. | 4.88 GiB | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c.json) |
-| `ltx` | Gemma 3 12B it fp4 mixed | text-encoder | LTX 2.3 text encoder; NSFW policy flag. | 8.80 GiB | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/20652c80fc8e88963343b9968722becb2118d507befbbf0272aa8d79e99893cc.json) |
-| `wan` | UMT5-XXL fp8 scaled | text-encoder | Wan text encoder. | 6.27 GiB | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/720ea5ea7b9de57ca87b403856b0a7e42c96d1f1176ff886726ab602b6923709.json) |
-| `z-image` | FLUX 16-channel VAE `ae.safetensors` | vae | Z-Image VAE sidecar. | 0.31 GiB | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/79ffae7fd76b9f05dcea88f316649b284d0808beb97eca819fcd25e4ad73ac68.json) |
-| `shared` | Qwen-Image VAE | vae | Shared by Krea 2, Anima, and Qwen-Image lanes. | 0.24 GiB | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70.json) |
-| `ltx` | taeltx2_3 tiny VAE | vae | LTX 2.3 VAE; revenue-clause policy flag. | 0.02 GiB | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/32b0af063555e81fd65c85b699b858fd9f3b65a72cfe284c10ab5039a984be11.json) |
-| `wan` | Wan 2.1 VAE | vae | Wan 2.2 A14B VAE. | 0.24 GiB | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/79f0076a485bca72333bfa34c767006606b4ff351e5d8abc2045865e12c8a664.json) |
-| `SeedVR2` | SeedVR2 VAE fp16 | vae | Required by both SeedVR2 builds. | 0.47 GiB | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/63e6908333939636708d0661208d534237a117d1a6a36f4c3544c1cff40be6a1.json) |
-| `SDXL` | CLIP-Vision image encoder (ViT-H) | clip-vision | SDXL image-conditioning encoder. | 2.35 GiB | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/89ca951fa719a374511f8fdb5499f6ace88704cdf1423956764ccc1327ad7ee7.json) |
-| `shared` | LatentSync Whisper tiny | lipsync | Audio feature extraction for lipsync flows. | 0.07 GiB | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/471fb7a00e799bdf0fcfa907d776173319aa582a015e051e130680ee94d9817b.json) |
-| `shared` | LatentSync 1.6 SyncNet | lipsync | LatentSync scorer/checkpoint. | 1.50 GiB | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/d4330bc7e63421602af23fab2c6b3063a0c8cac983b1a21e938a3a119b2d7726.json) |
-| `shared` | LatentSync 1.6 UNet | lipsync | LatentSync generation UNet; consent-sensitive policy flag. | 4.72 GiB | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/5cebda44e4154eecfa9979a4c91a99e3838b7dac3b1e00ae1479a85c265354f5.json) |
-| `wan` | InfiniteTalk single | lipsync | Wan/InfiniteTalk single-speaker build; consent-sensitive. | 2.53 GiB | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/20bbd00447acdd66885255339719b1d0d8ca2ac3c1ff1445e9b258c8d4d7e099.json) |
-| `wan` | InfiniteTalk multi | lipsync | Wan/InfiniteTalk multi-speaker build; consent-sensitive. | 2.53 GiB | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/e23f4757c6e570abca40b1c35e08e3a1229d591d/records/d8903b87934d344be09e38264918c082ba4c33d39aa6f85f36e0d8c2c07fc553.json) |
-
-Support pools are also signed parts in the same index:
-
-- Control/conditioning: Z-Image Fun tile/union ControlNets; Qwen-Image
-  InstantX inpaint/union ControlNets; SDXL OpenPose, Union, Tile, IP-Adapter,
-  IP-Adapter Face, and Fooocus LaMa; NoobAI canny/lineart/tile; Wan 2.2
-  Fun high/low noise control; RIFE 4.7/4.9 frame interpolation; general HED,
-  depth, Florence-2, GroundingDINO, SAM 2.1, MiDaS, MLSD, Swin2SR, BiRefNet,
-  WD14 tagger, and lineart helpers.
-- Upscale/restoration: RealESRGAN anime/video/photo variants, SeedVR2 3B/7B,
-  Nomos, LSDIR, spanx4, NMKD, RealisticRescaler, ModernSpanimation, ArtFaces,
-  DeJPG, and DeNoise helpers.
+Every Comfy calibration must list every file loaded by the reference graph in
+the signed workflow policy. Missing checkpoints, encoders, VAEs, LoRAs,
+ControlNets, upscalers, lipsync models, or helper models must be mirrored and
+signed as parts before the proof counts. Manual out-of-policy downloads are not
+OpenMayhem calibration evidence.
 
 ### Rooms, payments, and limits
 

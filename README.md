@@ -16,6 +16,8 @@ Models: **[huggingface.co/TracNetwork](https://huggingface.co/TracNetwork)** —
 
 Model cheatsheet: **[MODEL-CHEATSHEET.md](MODEL-CHEATSHEET.md)** — exact canonical model IDs, artifacts, endpoints, platform/backend support, runtime pins, resource guidance, controls, and provider commands.
 
+Comfy cheatsheet: **[comfy-cheatsheet.md](comfy-cheatsheet.md)** — workflow classes, signed parts, provider admission, and `/v1/workflows` usage.
+
 ```text
 your OpenAI client ──▶ local gateway (127.0.0.1) ──▶ encrypted P2P session ──▶ a provider's machine
                                      │                                                │
@@ -819,6 +821,13 @@ Discover live workflow capacity:
 curl 'http://127.0.0.1:11435/v1/models?endpoint_family=mayhem_comfy_workflows&live=true'
 ```
 
+The full provider/user workflow, outcome-class grid, and current signed parts inventory are in
+**[comfy-cheatsheet.md](comfy-cheatsheet.md)**.
+Every Comfy calibration must enumerate all files the graph loads in the signed
+workflow policy. Missing checkpoints, encoders, VAEs, LoRAs, ControlNets,
+upscalers, lipsync models, or helper models must be mirrored and signed as
+parts before the proof is valid.
+
 Schematic request shape:
 
 ```json
@@ -966,13 +975,14 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
-The `0.2.108` source release documents the current Comfy parts inventory,
+The `0.2.115` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the
 local ComfyUI runtime directory, canonicalizes integer-valued workflow JSON
 floats before graph hashing, and derives Comfy upscaler output dimensions from
 the signed upscaler part scale. A 1024x1024 Krea graph followed by a signed 4x
 upscaler is therefore routed and billed as a 4096x4096 workflow, not as the
-base image.
+base image. The dedicated Comfy reference is
+**[comfy-cheatsheet.md](comfy-cheatsheet.md)**.
 
 The `0.2.104` source release makes local builds self-consistent across macOS,
 Linux, and Windows. Source installers select exactly one available llama.cpp

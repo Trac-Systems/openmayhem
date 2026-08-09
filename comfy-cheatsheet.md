@@ -1,0 +1,279 @@
+# OpenMayhem Comfy Cheatsheet
+
+This is the operational guide for ComfyUI workflow providers and users. It is intentionally tied to signed OpenMayhem policies: providers must pull signed parts, admit a bounded outcome class, and serve only graphs that fit the signed workflow envelope. User requests must never trigger provider downloads or policy bypasses.
+
+## Current Signed Parts Index
+
+- Dataset: `TracNetwork/openmayhem-parts-index`
+- Revision: `023ab52a79182d4027429c0c8a12ea5bf03b81da`
+- Index root: `8599b956d3e004ffe073601b2cc1a8fbf34f5b9a0f90550b08b2ed353d60b465`
+- Anchor hash: `a964aff2dd609d8672dd2e438a36d5b07aa74cd5e84ace87ee14124596ebe5c1`
+- Index version: `10`
+- Parts: `85` (12 checkpoint, 1 clip-vision, 35 controlnet, 5 lipsync, 1 lora, 4 text-encoder, 19 upscaler, 6 vae, 2 video-model)
+- Index URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/023ab52a79182d4027429c0c8a12ea5bf03b81da/index.json
+- Anchor URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/023ab52a79182d4027429c0c8a12ea5bf03b81da/anchor.json
+
+## User API
+
+Discover workflow classes and live routes from a local gateway:
+
+```bash
+curl 'http://127.0.0.1:11435/v1/models?endpoint_family=mayhem_comfy_workflows'
+curl 'http://127.0.0.1:11435/v1/models?endpoint_family=mayhem_comfy_workflows&live=true'
+```
+
+Submit one paid workflow request through the gateway:
+
+```bash
+curl -X POST http://127.0.0.1:11435/v1/workflows \
+  -H 'authorization: Bearer <gateway-token>' \
+  -H 'content-type: application/json' \
+  -d @request.json
+```
+
+Minimal request shape:
+
+```json
+{
+  "model": "image.heavy.le1_2mp",
+  "workflow": { "1": { "class_type": "<whitelisted-node>", "inputs": {} } },
+  "response_format": "artifact"
+}
+```
+
+The gateway derives required parts, graph hash, runtime id, output class, modalities, and billable usage from the signed workflow policy. Unknown nodes, unsafe paths, missing parts, output dimensions outside caps, or wrong modality sets fail before spend.
+
+## Provider Path
+
+Verify the local runtime and backend:
+
+```bash
+mayhem doctor --provider-backend comfyui
+```
+
+Use a real ComfyUI `v0.30.1` runtime checkout. Set `MAYHEM_COMFYUI_PYTHON` when `python3` is not the interpreter from that runtime.
+
+Pull and advertise every required part for the workflow class:
+
+```bash
+mayhem provider parts pull --layout-dir <parts-index-layout> --part-id <part-id> --require-payload
+mayhem provider parts add --layout-dir <parts-index-layout> --part-id <part-id>
+```
+
+Repeat both commands for every required part. Then prove the class and persist admission:
+
+```bash
+mayhem provider parts admit \
+  --outcome-class <workflow-class> \
+  --runtime-id comfyui-v0.30.1 \
+  --part-id <part-id> \
+  --part-id <part-id> \
+  --usable-bytes <usable-ram-or-vram> \
+  --working-set-bytes <extra-working-set> \
+  --reference-graph <reference-graph.json> \
+  --reference-runtime <comfy-runtime-dir> \
+  --reference-output-dir <proof-output-dir> \
+  --write
+
+mayhem up --provider \
+  --provider-enclave <workflow-enclave-id> \
+  --artifact <comfy-runtime-dir> \
+  --workflow-class-definition <definition.json> \
+  --yes
+```
+
+Only use `--load-plan <plan.json>` when the signed workflow policy permits staged loading. Without a load plan, all required parts must fit together. The `--artifact` value is the local ComfyUI runtime directory; the ledger artifact remains the signed workflow class definition.
+
+## Outcome Classes
+
+| Class | Title | Media | Lane | Pricing unit | Caps |
+|---|---|---|---|---|---|
+| `image.light.le1_2mp` | Image light <=1.2MP | image | light | megapixel_step | {"max_megapixels":"1.2","max_steps":60,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `image.light.le4_5mp` | Image light <=4.5MP | image | light | megapixel_step | {"max_megapixels":"4.5","max_steps":60,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `image.light.le17mp` | Image light <=17MP | image | light | megapixel_step | {"max_megapixels":"17","max_steps":60,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `image.heavy.le1_2mp` | Image heavy <=1.2MP | image | heavy | megapixel_step | {"max_megapixels":"1.2","max_steps":60,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `image.heavy.le4_5mp` | Image heavy <=4.5MP | image | heavy | megapixel_step | {"max_megapixels":"4.5","max_steps":60,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `image.heavy.le17mp` | Image heavy <=17MP | image | heavy | megapixel_step | {"max_megapixels":"17","max_steps":60,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `video.light.le0_5mpf` | Video light <=0.5MP/frame | video | light | megapixel_step | {"max_megapixels_per_frame":"0.5","max_seconds":30,"max_frames":720,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `video.light.le2_2mpf` | Video light <=2.2MP/frame | video | light | megapixel_step | {"max_megapixels_per_frame":"2.2","max_seconds":30,"max_frames":720,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `video.heavy.le0_5mpf` | Video heavy <=0.5MP/frame | video | heavy | megapixel_step | {"max_megapixels_per_frame":"0.5","max_seconds":30,"max_frames":720,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `video.heavy.le2_2mpf` | Video heavy <=2.2MP/frame | video | heavy | megapixel_step | {"max_megapixels_per_frame":"2.2","max_seconds":30,"max_frames":720,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `upscale.conv.le24mp` | Convolutional upscale/restore <=24MP | image | upscale-conv | megapixel | {"max_output_megapixels":"24","priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `upscale.conv.le512mp` | Convolutional upscale/restore <=512MP | image | upscale-conv | megapixel | {"max_output_megapixels":"512","priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `upscale.diffusion` | Diffusion upscale/restore | image | upscale-diffusion | megapixel_step | {"max_output_megapixels":"17","max_steps":60,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `audio.tts` | Text to speech | audio | tts | audio_second | {"max_audio_seconds":600,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `audio.generation` | Audio generation | audio | audio-generation | audio_second | {"max_audio_seconds":600,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `audio.stt` | Speech to text | audio | stt | audio_second | {"max_audio_seconds":3600,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `video.lipsync` | Lip sync | video | lipsync | frame | {"max_frames":720,"max_seconds":30,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `compute.norm` | Normalized residual compute | image | residual | compute_second | {"max_compute_seconds":600,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+
+## Class Fit Matrix
+
+Fitting means a part is signed and belongs to the class family. It does not make
+the part automatically routable. A routable workflow also needs a signed policy,
+a reference graph, a canary/proof, provider `parts add`, and provider
+`parts admit --write`. The calibration graph must reference every file it loads,
+and every referenced file must appear in `workflow.parts`.
+
+| Classes | Current status | Fitting signed parts |
+|---|---|---|
+| `image.light.le1_2mp`, `image.light.le4_5mp`, `image.light.le17mp`, `image.heavy.le1_2mp`, `image.heavy.le4_5mp`, `image.heavy.le17mp` | Krea base and Krea+4x have class-ready policies. SD15, SDXL, Z-Image, Qwen-Image, RedCraft, and image-control workflows need their own signed policy and canary before serving. | Image checkpoints: `1d439e03` Krea 2 Turbo official, `63352412` Krea 2 Turbo fp8, `dc2b6383` RedCraft Krea 2, `95566dab` CyberRealistic SD1.5, `f8547da9` CyberRealistic XL, `e403a8dc` Illustrious XL, `ca45989f` Nova Anime XL, `9489f2e2` Nova Furry XL, `2321cb8d` PerfectDeliberate, `fdb4927c` Realism Illustrious, `49bf3097` Z-Image Turbo, `53c5bb42` CyberRealistic Z-Image. Image encoders/VAEs: `19d454e5` Qwen3-VL fp8, `e86b7075` Qwen3-VL bf16, `106d81a4` Qwen-Image VAE, `79ffae7f` FLUX/Z-Image VAE. Image control/support: `11a77fd6`, `16a2610c`, `180c156d`, `329dce97`, `3d8ced10`, `43b29ffc`, `5088ec20`, `5db7eae8`, `74bcdf6b`, `873a9610`, `89ca951f`, `92346602`, `8e6b6fb3`, `a213697e`, `b6e3f248`, `b90b785c`, `c3af9ca4`, `c7a89f21`, `cdd1c42c`, `d6dfa562`, `db1e1e32`, `dcf73d0e`, `dda4eb9a`, `ea14dc68`, `edb4d44e`, `f7cd56a9`. |
+| `upscale.conv.le24mp`, `upscale.conv.le512mp` | Class exists. A provider policy must choose one or more signed upscaler parts and prove the exact graph. | Convolutional/restoration upscalers: `121becf8`, `17b705c5`, `23178907`, `34889283`, `522bad49`, `6a1ac0ec`, `6adc20e6`, `776268ba`, `7c3058ae`, `7c985640`, `851b706a`, `8dc290bc`, `96cfc3a4`, `a95240c0`, `b40716b2`, `c21510f4`, `d871ba30`, `dfa6e5df`. Use `e0f339c2` only inside LTX-AV latent-upscale policies. |
+| `upscale.diffusion` | Class exists. SeedVR2 policies need a dedicated proof; do not mix them into a convolutional-upscale admission. | Diffusion/video restoration parts: `9c98aed7` SeedVR2 3B, `ca6bff3f` SeedVR2 7B, `63e69083` SeedVR2 VAE. Optional video preprocessing/interpolation support: `6cc88536` RIFE 4.7, `865582d1` RIFE 4.9. |
+| `video.light.le0_5mpf`, `video.light.le2_2mpf`, `video.heavy.le0_5mpf`, `video.heavy.le2_2mpf` | Official LTX-AV uses `video.heavy.le0_5mpf`. Other video classes need separate signed policy/canary if their caps or lane differ. | Video models: `34dfabbf` official LTX 2.3 fp8, `25055314` LTX GTAnimation low-VRAM candidate. Text encoders: `20652c80` Gemma 3 12B fp4, `720ea5ea` UMT5-XXL fp8 for Wan policies. LTX AV support: `988522cf` distilled LoRA, `e0f339c2` LTX spatial x2 latent upscaler, `8c108e3c` LTX audio VAE, `32b0af06` LTX tiny VAE. Video support: `40dd2b8b` Wan low-noise control, `660c1350` Wan high-noise control, `79f0076a` Wan VAE, `34889283` animevideo x2, `851b706a` animevideo x4, `6cc88536` RIFE 4.7, `865582d1` RIFE 4.9. |
+| `video.lipsync` | Class exists. Lipsync policies must include the exact lipsync model files plus whatever image/video/audio prerequisites their graph loads. | Lipsync parts: `471fb7a0` LatentSync Whisper tiny, `d4330bc7` LatentSync SyncNet, `5cebda44` LatentSync UNet, `20bbd004` InfiniteTalk single, `d8903b87` InfiniteTalk multi. Common companion video parts are the Wan/LTX video support parts above when the graph actually loads them. |
+| `audio.tts`, `audio.generation`, `audio.stt` | Classes exist but this parts index has no standalone TTS, audio-generation, or STT model policy ready for public serving. | No standalone audio-class parts are currently signed. `8c108e3c` is only the LTX AV audio VAE, and the lipsync parts are only for `video.lipsync` policies. |
+| `compute.norm` | Class exists for bounded residual workflow compute, not for arbitrary unsigned execution. | No class-ready parts in this index. A workflow must publish its own signed parts and policy before admission. |
+
+## Required Part Sets
+
+### Krea 2 Turbo Base Image
+
+Class: `image.heavy.le1_2mp`. Runtime: `comfyui-v0.30.1`. Output: image.
+
+| Selector | Part ID | Type | Purpose |
+|---|---|---|---|
+| `krea2_turbo_fp8_scaled.safetensors` | `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae` | checkpoint | base generator |
+| `qwen3vl_4b_fp8_scaled.safetensors` | `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c` | text-encoder | prompt encoder |
+| `qwen_image_vae.safetensors` | `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70` | vae | image decode |
+
+### Krea 2 Turbo + 4x Upscale
+
+Class: `image.heavy.le17mp`. Runtime: `comfyui-v0.30.1`. Output: image. The upscaler is part of the same workflow request and is priced/routed by the upscaled output dimensions.
+
+| Selector | Part ID | Type | Purpose |
+|---|---|---|---|
+| `krea2_turbo_fp8_scaled.safetensors` | `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae` | checkpoint | base generator |
+| `qwen3vl_4b_fp8_scaled.safetensors` | `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c` | text-encoder | prompt encoder |
+| `qwen_image_vae.safetensors` | `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70` | vae | image decode |
+| `4x-spanx4-ch48.safetensors` | `d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a` | upscaler | 4x upscaler stage |
+
+### Official LTX 2.3 Audio/Video
+
+Class: `video.heavy.le0_5mpf`. Runtime: `comfyui-v0.30.1`. Output modalities: `video,audio`. Required inventory root: `f2fae1953b9e327f264120b931a512a417910770a3bb357fae51e74c40933849`.
+
+| Selector | Part ID | Type | Purpose |
+|---|---|---|---|
+| `ltx-2.3-22b-dev-fp8.safetensors` | `34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2` | video-model | official fp8 LTX 2.3 checkpoint |
+| `gemma_3_12B_it_fp4_mixed.safetensors` | `20652c80fc8e88963343b9968722becb2118d507befbbf0272aa8d79e99893cc` | text-encoder | official prompt encoder |
+| `ltx-2.3-22b-distilled-lora-384.safetensors` | `988522cff35f19d7c5977472be163f05b49bf381e441963da4182b0a90b1116c` | lora | official distilled LoRA |
+| `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` | `e0f339c2b5c13fcae1b78cade132ae0307114026c6d20642335eccb4887a050d` | upscaler | official 2x latent upscaler |
+| `LTX23_audio_vae_bf16.safetensors` | `8c108e3ce85d127cef5dbb5747f8c30d2a30c6d92f215278399224e38ffe806c` | vae | official audio VAE |
+
+### Legacy LTX Low-VRAM Candidate
+
+This set is useful for exploratory local proofing but is not the official LTX-AV lane and must not replace the five-part official AV policy.
+
+| Selector | Part ID | Type | Purpose |
+|---|---|---|---|
+| `LTX 2.3 GTAnimation (fast edition)` | `25055314e4c2194d3f1655e89830c325e276fd7963be6e43448f6f477460fc54` | video-model | legacy low-VRAM path, not the official AV proof lane |
+| `gemma_3_12B_it_fp4_mixed.safetensors` | `20652c80fc8e88963343b9968722becb2118d507befbbf0272aa8d79e99893cc` | text-encoder | prompt encoder |
+| `LTX23_audio_vae_bf16.safetensors` | `8c108e3ce85d127cef5dbb5747f8c30d2a30c6d92f215278399224e38ffe806c` | vae | audio VAE if the lane is AV |
+
+### Lipsync and Talking-Video Parts
+
+These are signed support parts for lipsync/talking-video workflow classes. They are not automatically usable in arbitrary graphs; a workflow class must whitelist the relevant nodes and require the matching parts.
+
+| Selector | Part ID | Type | Purpose |
+|---|---|---|---|
+| `LatentSync Whisper tiny` | `471fb7a00e799bdf0fcfa907d776173319aa582a015e051e130680ee94d9817b` | lipsync | audio feature extraction |
+| `LatentSync 1.6 SyncNet` | `d4330bc7e63421602af23fab2c6b3063a0c8cac983b1a21e938a3a119b2d7726` | lipsync | sync scorer/checkpoint |
+| `LatentSync 1.6 UNet` | `5cebda44e4154eecfa9979a4c91a99e3838b7dac3b1e00ae1479a85c265354f5` | lipsync | generation UNet |
+| `InfiniteTalk single` | `20bbd00447acdd66885255339719b1d0d8ca2ac3c1ff1445e9b258c8d4d7e099` | lipsync | Wan single-speaker lipsync |
+| `InfiniteTalk multi` | `d8903b87934d344be09e38264918c082ba4c33d39aa6f85f36e0d8c2c07fc553` | lipsync | Wan multi-speaker lipsync |
+
+## All Signed Parts In This Index
+
+Use this table to choose fitting parts for a new workflow policy. The exact record JSON is authoritative for source URLs, license evidence, adapter subdirectory, scale, and canary policy.
+
+| Lane | Type | Name | Part ID | Size | License | Record |
+|---|---|---|---|---:|---|---|
+| shared | vae | Qwen-Image VAE (shared: Krea 2 + Anima + Qwen-Image) | `106d81a4...c7aa70` | 0.236 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70.json) |
+| all lanes | controlnet | BiRefNet | `11a77fd6...b83042` | 0.414 GiB | mit | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/11a77fd629eb9c3b46623b5ddfe29c3f6bad324a584a86c4d1dd4d7506b83042.json) |
+| all generated output | upscaler | 4x-NomosWebPhoto-RealPLKSR | `121becf8...e77fa1` | 0.028 GiB | CC-BY-4.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/121becf87164bcedabb853d51b92c820b38d17b8f73ad5ec4fcde5530ce77fa1.json) |
+| all lanes | controlnet | GroundingDINO tiny | `16a2610c...404c8b` | 0.642 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/16a2610c38bda16074cce874e24af7cc4fceeffaf1fe6a4dfb224032dc404c8b.json) |
+| Illustrious/Pony/Anima (16 checkpoints) | upscaler | 4x-realesrgan-x4plus-anime-6b | `17b705c5...31d345` | 0.017 GiB | BSD-3-Clause | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/17b705c50b991c230a294a81e45334333319f9b47555247154c29b7b1831d345.json) |
+| Qwen-Image | controlnet | Qwen-Image InstantX ControlNet Inpainting | `180c156d...0e4b10` | 3.94 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/180c156d1e9c67ee674e3e2119859bd19afefb0dd8c55203e213cb3f3e0e4b10.json) |
+| krea2 | text-encoder | qwen3vl_4b_fp8_scaled.safetensors | `19d454e5...66825c` | 4.88 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c.json) |
+| SDXL lanes | controlnet | IP-Adapter SDXL | `1ac6ed19...cbadbf` | 0.654 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/1ac6ed19bde9baecd26b4802477e49da273719836e5a5a52f020e4fc7bcbadbf.json) |
+| krea2 | checkpoint | Krea 2 Turbo Official Comfy-Org Checkpoints | `1d439e03...40cd3a` | 12.57 GiB | civitai-allow-commercial-use | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/1d439e0358bdf818c1f147ffbb729e2e706fc0991b1595f97f2cf2309b40cd3a.json) |
+| ltx | text-encoder | Gemma 3 12B it fp4 mixed (LTX 2.3 text encoder) | `20652c80...9893cc` | 8.80 GiB | gemma | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/20652c80fc8e88963343b9968722becb2118d507befbbf0272aa8d79e99893cc.json) |
+| Z-Image Turbo | controlnet | Z-Image Fun ControlNet Tile 2.1 lite | `20933d07...156932` | 1.88 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/20933d07dc572c7a45c95133d60063137a46b823d7700dc180770c02ee156932.json) |
+| wan | lipsync | InfiniteTalk single (ComfyUI build) | `20bbd004...d7e099` | 2.53 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/20bbd00447acdd66885255339719b1d0d8ca2ac3c1ff1445e9b258c8d4d7e099.json) |
+| influencer pipeline | upscaler | 4x-ArtFaces-realplksr-dysample | `23178907...4dc814` | 0.028 GiB | CC-BY-4.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/231789071bac88692b747cab60e19dda6e2cbd35ba2e8282236043ae2b4dc814.json) |
+| sdxl | checkpoint | PerfectDeliberate | `2321cb8d...5c6b38` | 6.46 GiB | civitai-allow-commercial-use | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/2321cb8dc6c16e7e2bbec43bba8df296b66c91ebf65bb7fada16ec9c9c5c6b38.json) |
+| ltx | video-model | LTX 2.3 GTAnimation (fast edition) | `25055314...60fc54` | 16.47 GiB | civitai-allow-commercial-use | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/25055314e4c2194d3f1655e89830c325e276fd7963be6e43448f6f477460fc54.json) |
+| anime lanes | controlnet | LineArt sk_model2 | `329dce97...d3a3cd` | 0.016 GiB | other | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/329dce97d4adc92e463c9863d266a8b03b68e5a1bdee44474502981487d3a3cd.json) |
+| ltx | vae | taeltx2_3 (LTX 2.3 tiny VAE) | `32b0af06...84be11` | 0.022 GiB | ltx-2-community-license-agreement | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/32b0af063555e81fd65c85b699b858fd9f3b65a72cfe284c10ab5039a984be11.json) |
+| Wan 2.2 / LTX / Sulphur | upscaler | 2x-realesrganv2-animevideo-xsx2 | `34889283...0b6326` | 0.002 GiB | BSD-3-Clause | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/34889283fae69ea3a2dc515fe565251abe768b71d4dfd8c8f54b9b214b0b6326.json) |
+| ltx-av | video-model | ltx-2.3-22b-dev-fp8.safetensors | `34dfabbf...0d3ae2` | 27.14 GiB | ltx-2-community-license-agreement | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2.json) |
+| SDXL lanes | controlnet | IP-Adapter Plus SDXL vit-h | `3633a45c...09a8fe` | 0.789 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/3633a45ca19bd17df627362ef9b330f469082dabc53aa6ed2ca65ac8e109a8fe.json) |
+| Illustrious / NoobAI / Pony | controlnet | NoobAI SDXL ControlNet canny (fp16) | `3d8ced10...bb662d` | 2.33 GiB | other | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/3d8ced100edf3933617400698049858206b10a31f439cae21d1bb74db4bb662d.json) |
+| Wan 2.2 | controlnet | Wan2.2-Fun-A14B-Control LowNoise Q4_K_M | `40dd2b8b...7babe0` | 9.00 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/40dd2b8b47ee8fe3707412c3dc289642726d1e0eade9c7d2abb77add957babe0.json) |
+| SDXL / Illustrious / Pony | controlnet | ControlNet OpenPose SDXL | `43b29ffc...900391` | 2.33 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/43b29ffc900b519e464ff71ebdfdda018b71b2a4a87b1862b1a93bc2a8900391.json) |
+| shared | lipsync | LatentSync Whisper tiny | `471fb7a0...d9817b` | 0.070 GiB | openrail++ | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/471fb7a00e799bdf0fcfa907d776173319aa582a015e051e130680ee94d9817b.json) |
+| z-image | checkpoint | Z-Image Turbo (tongyi) | `49bf3097...6c25d0` | 11.46 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/49bf30974fbe8db2044ac3a51cc458f52095dba030b8d01d36aed95ffd6c25d0.json) |
+| all lanes | controlnet | Depth Anything V2 Small | `5088ec20...8f8131` | 0.092 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/5088ec2033ec4f3cd8d8e22b2671845a80577bc7b93da0115a4a1725bf8f8131.json) |
+| photoreal lanes | upscaler | 4x-Nomos2-hq-dat2 | `522bad49...799714` | 0.130 GiB | CC-BY-4.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/522bad49d5f365a4228f203ede247ec0ed86b8efb924f049719da3437d799714.json) |
+| z-image | checkpoint | CyberRealistic Z-Image Turbo | `53c5bb42...10ef16` | 6.09 GiB | civitai-allow-commercial-use | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/53c5bb42154d15e9a6f1609df3258a52faf979bc16d07994347560424e10ef16.json) |
+| shared | lipsync | LatentSync 1.6 UNet | `5cebda44...5354f5` | 4.72 GiB | openrail++ | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/5cebda44e4154eecfa9979a4c91a99e3838b7dac3b1e00ae1479a85c265354f5.json) |
+| SDXL / Illustrious / Pony | controlnet | TTPlanet SDXL ControlNet Tile Realistic | `5db7eae8...090a1f` | 2.33 GiB | openrail | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/5db7eae8b1d1f22c82392579c97d50b2447ffc90caaf7d8829503aea6c090a1f.json) |
+| krea2 | checkpoint | krea2_turbo_fp8_scaled.safetensors | `63352412...36bdae` | 12.24 GiB | krea-2-community-license | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae.json) |
+| required by both SeedVR2 builds | vae | SeedVR2 VAE fp16 | `63e69083...0be6a1` | 0.467 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/63e6908333939636708d0661208d534237a117d1a6a36f4c3544c1cff40be6a1.json) |
+| Wan 2.2 | controlnet | Wan2.2-Fun-A14B-Control HighNoise Q4_K_M | `660c1350...52ede1` | 9.00 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/660c13500ebba8915f31830d3c9a9aed2610a176a17e6f55f3215e030752ede1.json) |
+| photoreal lanes | upscaler | 4x_NMKD-Siax_200k | `6a1ac0ec...eee3f1` | 0.062 GiB | WTFPL | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/6a1ac0ec66970b03e07d61eb40c7408745a54ccc47f4cf244e1cc0ad6deee3f1.json) |
+| all lanes | upscaler | 4x_NMKD-Superscale-SP_178000_G | `6adc20e6...cbd932` | 0.062 GiB | WTFPL | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/6adc20e68a7ad40cb29956e67bb672ced0b04eed5c757cdb578303dafacbd932.json) |
+| Wan 2.2 / LTX / Sulphur | controlnet | RIFE 4.7 | `6cc88536...7310da` | 0.020 GiB | MIT | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/6cc88536fb62ad95cd352916152b2657c34bc1597a8bb40672cda961027310da.json) |
+| wan | text-encoder | UMT5-XXL fp8 scaled (Wan text encoder) | `720ea5ea...923709` | 6.27 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/720ea5ea7b9de57ca87b403856b0a7e42c96d1f1176ff886726ab602b6923709.json) |
+| SDXL / Illustrious / Pony | controlnet | ControlNet Union SDXL promax | `74bcdf6b...ce5365` | 2.34 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/74bcdf6b03888927644665cfc02af3aeee483e7d957048f09f3552bf4cce5365.json) |
+| pre/post step, all lanes | upscaler | 1x-DeJPG-realplksr-otf | `776268ba...694181` | 0.027 GiB | CC-BY-4.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/776268ba05f5860203e7da6239441b4035bac0ff3c4864b8f86485bca9694181.json) |
+| wan | vae | Wan 2.1 VAE (for Wan 2.2 A14B models) | `79f0076a...c8a664` | 0.236 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/79f0076a485bca72333bfa34c767006606b4ff351e5d8abc2045865e12c8a664.json) |
+| z-image | vae | FLUX 16-channel VAE "ae.safetensors" (Z-Image lane) | `79ffae7f...73ac68` | 0.312 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/79ffae7fd76b9f05dcea88f316649b284d0808beb97eca819fcd25e4ad73ac68.json) |
+| photoreal lanes | upscaler | 4x-Nomos8kHAT-L-otf | `7c3058ae...4dad8b` | 0.154 GiB | CC-BY-4.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/7c3058aefee5cf994c35da3707e0d7ce7168e15eac71436d398e39010a4dad8b.json) |
+| photoreal lanes | upscaler | 4x_RealisticRescaler_100000_G | `7c985640...185e13` | 0.062 GiB | WTFPL | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/7c9856408b064228a0edc151e1deced1fc24a162b8d8aedce06f5dd7fa185e13.json) |
+| Wan 2.2 / LTX / Sulphur | upscaler | 4x-realesr-animevideo-v3 | `851b706a...dfb0bf` | 0.002 GiB | BSD-3-Clause | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/851b706a764144837446357c0f1d73341cbff9fedb160c26c5d4e6ba02dfb0bf.json) |
+| Wan 2.2 / LTX / Sulphur - fps doubling | controlnet | RIFE 4.9 | `865582d1...f305f3` | 0.020 GiB | MIT | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/865582d1e5218d7df071a14599554bd870204dca05242f2eba0b38436ff305f3.json) |
+| SDXL lanes | controlnet | IP-Adapter Plus Face SDXL vit-h | `873a9610...100efa` | 0.789 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/873a96101cda155d49bd26c6eef0b64565958cfdafacf06c736b8cfabe100efa.json) |
+| SDXL lanes | clip-vision | CLIP-Vision image encoder (ViT-H) | `89ca951f...ad7ee7` | 2.35 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/89ca951fa719a374511f8fdb5499f6ace88704cdf1423956764ccc1327ad7ee7.json) |
+| ltx | vae | LTX23_audio_vae_bf16.safetensors | `8c108e3c...fe806c` | 0.340 GiB | ltx-2-community-license-agreement | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/8c108e3ce85d127cef5dbb5747f8c30d2a30c6d92f215278399224e38ffe806c.json) |
+| all lanes | controlnet | 8x_NMKD-Superscale_150000_G | `8dc290bc...043b68` | 0.062 GiB | WTFPL | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/8dc290bc8b8ba3285ae61bf07e52862343755a01b78a7cab79d9fc6938043b68.json) |
+| Z-Image Turbo | controlnet | Z-Image Fun ControlNet Union 2.1 lite | `8e6b6fb3...90c8cc` | 1.88 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/8e6b6fb3926020ed5b54a4aae66479626479a13b9e54131f00c5e9c2bc90c8cc.json) |
+| Z-Image Turbo | controlnet | Z-Image Fun ControlNet Union 2.1 full | `92346602...83181d` | 6.25 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/92346602785bc2b71b44a0c57bfbc87e5c225191dacb9bcf4bed27b06e83181d.json) |
+| sdxl | checkpoint | Nova Furry XL | `9489f2e2...e3c57c` | 6.46 GiB | civitai-allow-commercial-use | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/9489f2e2aeeac3e51eace20254c3ce693a69aa69c355ea8ac33630bc3fe3c57c.json) |
+| sd15 | checkpoint | CyberRealistic (SD 1.5) | `95566dab...cae879` | 3.97 GiB | civitai-allow-commercial-use | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/95566dab1bbd4b97341d45e54e5f3a16ad8449a3fd2e5b7fd0853be822cae879.json) |
+| pre/post step, all lanes | upscaler | 1x-DeNoise-realplksr-otf | `96cfc3a4...c2de3a` | 0.027 GiB | CC-BY-4.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/96cfc3a48479f4d964ddb43663265c06e6a454bcc3bc98484f202a079dc2de3a.json) |
+| ltx-av | lora | ltx-2.3-22b-distilled-lora-384.safetensors | `988522cf...b1116c` | 7.08 GiB | ltx-2-community-license-agreement | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/988522cff35f19d7c5977472be163f05b49bf381e441963da4182b0a90b1116c.json) |
+| Wan 2.2 / LTX / Sulphur output | upscaler | SeedVR2 3B fp8_e4m3fn | `9c98aed7...015e78` | 3.16 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/9c98aed7d7de8a9d48ad72af7d2606ce4ae3ede88030f470a39cc02fa4015e78.json) |
+| Illustrious / NoobAI / Pony | controlnet | NoobAI SDXL ControlNet lineart_anime (fp16) | `a213697e...5f03e3` | 2.33 GiB | other | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/a213697ec466f2613588d0c0849a0f144dfaca79cc77243b9fdda6cc375f03e3.json) |
+| all lanes | controlnet | Swin2SR_RealworldSR_X4_64_BSRGAN_PSNR | `a95240c0...6b4cd6` | 0.064 GiB | Apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/a95240c005bb8344d6ec5f3e1ed3306e30f6f2fb2f244f8d063d1120366b4cd6.json) |
+| all lanes | upscaler | 4x-LSDIR | `b40716b2...1d0803` | 0.062 GiB | CC-BY-4.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/b40716b28b1f71f447532b68dfaf67d3619e346f0acd5983fcd9f47a951d0803.json) |
+| Illustrious / NoobAI / Pony | controlnet | NoobAI SDXL ControlNet tile (fp16) | `b6e3f248...c88e37` | 2.33 GiB | other | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/b6e3f2483de1ce2b06d63cafda69400d34d062ea37797c790f26a17ccbc88e37.json) |
+| Qwen-Image | controlnet | Qwen-Image InstantX ControlNet Union | `b90b785c...0f1a2a` | 3.29 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/b90b785ca1a2be3085041a7930ef905e0f39624b54c4779de040f646140f1a2a.json) |
+| photoreal lanes | upscaler | 4x-realesrgan-x4plus | `c21510f4...92feba` | 0.062 GiB | BSD-3-Clause | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/c21510f4c9969b34e9c865bdc9022375080a3dbf0606f58bd359edbe2992feba.json) |
+| all lanes | controlnet | Florence-2 large | `c3af9ca4...506ed2` | 1.45 GiB | mit | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/c3af9ca4dd7b7b892950e4b249ca4027c101fc5d997681c51bab676c20506ed2.json) |
+| all lanes | controlnet | MLSD large | `c7a89f21...efd8c3` | 0.006 GiB | other | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/c7a89f21b88019c11a0751d894cfb3db431910ef788952343a87e7aa1befd8c3.json) |
+| sdxl | checkpoint | Nova Anime XL | `ca45989f...de231a` | 6.46 GiB | civitai-allow-commercial-use | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/ca45989f9e5d5af2c0b1a3b5b3e429db5a77cd70ed3b71089db07155dede231a.json) |
+| Wan 2.2 / LTX / Sulphur output | upscaler | SeedVR2 7B fp8_e4m3fn | `ca6bff3f...99cc8f` | 7.67 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/ca6bff3fd46f39d119d050da73958402f4fb530e2fd864d42fb23bcd2799cc8f.json) |
+| SDXL lanes | controlnet | IP-Adapter SDXL vit-h | `cdd1c42c...6bd040` | 0.650 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/cdd1c42c52b3e8d2128b6a416b752c2dcc3178e53a136fd592b48a18c16bd040.json) |
+| shared | lipsync | LatentSync 1.6 SyncNet | `d4330bc7...2d7726` | 1.50 GiB | openrail++ | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/d4330bc7e63421602af23fab2c6b3063a0c8cac983b1a21e938a3a119b2d7726.json) |
+| SDXL lanes | controlnet | Fooocus LaMa (object removal) | `d6dfa562...3e09bf` | 0.095 GiB | openrail | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/d6dfa562d4f6f3e82eb80ca8dbc96b883db68e246e0d09b317bb7b06df3e09bf.json) |
+| all lanes | upscaler | 4x-spanx4-ch48 | `d871ba30...965e0a` | 0.008 GiB | Apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a.json) |
+| wan | lipsync | InfiniteTalk multi (ComfyUI build) | `d8903b87...7fc553` | 2.53 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/d8903b87934d344be09e38264918c082ba4c33d39aa6f85f36e0d8c2c07fc553.json) |
+| all lanes | controlnet | Florence-2 base | `db1e1e32...c6ecc9` | 0.431 GiB | mit | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/db1e1e32dfa3b46913289452054af88f9ac971b04ab736c061bec324a2c6ecc9.json) |
+| krea2 | checkpoint | RedCraft 赤佬3 (Krea 2) | `dc2b6383...4417f3` | 12.24 GiB | civitai-allow-commercial-use | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/dc2b6383126b39fbeb0948145e31174996e2442f3498206b2e5883ff6d4417f3.json) |
+| all lanes | controlnet | SAM 2.1 hiera large | `dcf73d0e...9a994a` | 0.836 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/dcf73d0e3d615c7923fd5db17d91d6585ad9529605d6f330c5ab3862de9a994a.json) |
+| all lanes | controlnet | MiDaS dpt_hybrid | `dda4eb9a...f9ad27` | 0.459 GiB | other | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/dda4eb9a127c8ebadfc774bb900e49621a3621e90140deb9ab343c2699f9ad27.json) |
+| Illustrious/Pony/Anima | controlnet | 4x_NMKD-YandereNeoXL_200k | `df5c42cf...ddbced` | 0.062 GiB | WTFPL | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/df5c42cfcd3fdefbe5a3f45cfe30bc48db4c8c86cd364bfd2b54b8ae05ddbced.json) |
+| anime lanes | upscaler | 2x-ModernSpanimationV1 | `dfa6e5df...afb435` | 0.015 GiB | MIT | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/dfa6e5df632624c4c08e81e4f5bc8eb09e609087bd86ad2eaaeef90d75afb435.json) |
+| ltx-av | upscaler | ltx-2.3-spatial-upscaler-x2-1.1.safetensors | `e0f339c2...7a050d` | 0.927 GiB | ltx-2-community-license-agreement | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/e0f339c2b5c13fcae1b78cade132ae0307114026c6d20642335eccb4887a050d.json) |
+| sdxl | checkpoint | Illustrious-XL v0.1 | `e403a8dc...a1bbe9` | 6.46 GiB | civitai-allow-commercial-use | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/e403a8dca595a45a623db78af4f3058a4258ec3a5d28bb2588b643a47aa1bbe9.json) |
+| krea2 | text-encoder | Qwen3-VL 4B bf16 (Krea 2 text encoder) | `e86b7075...d5200d` | 8.27 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/e86b7075b604c4897f7eee276b13a15c2ff5288c64e33168f1229e6bddd5200d.json) |
+| anime lanes | controlnet | LineArt sk_model | `ea14dc68...d9457f` | 0.016 GiB | other | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/ea14dc684028a0699190170dc167bc5032417f51d69236b192d0a009d1d9457f.json) |
+| all lanes (anime tagging, prompt extraction) | controlnet | WD14 SwinV2 Tagger v3 | `edb4d44e...67264b` | 0.365 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/edb4d44ef0a65cf4ff2c713593e83ffdf21a2503daae179a458abc16c667264b.json) |
+| all lanes | controlnet | ControlNet HED | `f7cd56a9...bc905e` | 0.027 GiB | other | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/f7cd56a98f51499bee60c238d72eded40ae2b1be792beda8166dac419dbc905e.json) |
+| sdxl | checkpoint | CyberRealistic XL | `f8547da9...2a85ac` | 12.92 GiB | civitai-allow-commercial-use | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/f8547da9bab83d8db5e9356c6d7c1c4f583d92336ea4eea02edc8e99982a85ac.json) |
+| sdxl | checkpoint | Realism Illustrious By Stable Yogi | `fdb4927c...061516` | 6.46 GiB | civitai-allow-commercial-use | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/fdb4927c4c15241d9276a1290b2aebc7441d3e9f19c8a1674f344164d6061516.json) |
+
+## Calibration Rule
+
+Every new Comfy calibration must declare all files the workflow actually loads, mirror missing official files into the OpenMayhem parts dataset, add them as signed parts, and require them in the workflow policy before admission. A proof that only downloads files manually or bypasses the signed parts policy is not an OpenMayhem proof.

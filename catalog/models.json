@@ -25217,6 +25217,753 @@
         "per_req_au": "0",
         "min_session_au": "0"
       }
+    },
+    {
+      "model_id": "video.heavy.le0_5mpf",
+      "min_app_version": "0.2.115",
+      "model_class": "workflow",
+      "family": "comfy-ltx-av",
+      "params_b": 22,
+      "tier": "dev",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "publisher_key": "huggingface-repo",
+          "repo": "TracNetwork/openmayhem-parts-index",
+          "revision": "023ab52a79182d4027429c0c8a12ea5bf03b81da"
+        },
+        "conversion": [
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:ltx-2.3-22b-dev-fp8.safetensors",
+            "input_sha256": "28606c5b5a06ce56f896d4dfcb20f212739e07a68fbe48e53638188449d26450",
+            "output_sha256": "28606c5b5a06ce56f896d4dfcb20f212739e07a68fbe48e53638188449d26450"
+          },
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:ltx-2.3-22b-distilled-lora-384.safetensors",
+            "input_sha256": "2943ab994f3c9d88052e5a2a34cca14e4a2dfc36b1d8c407931d52d5c25dd72b",
+            "output_sha256": "2943ab994f3c9d88052e5a2a34cca14e4a2dfc36b1d8c407931d52d5c25dd72b"
+          },
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+            "input_sha256": "5f416311fa8172b65af67530758964708d29a317b830d689a51143b7f91913ed",
+            "output_sha256": "5f416311fa8172b65af67530758964708d29a317b830d689a51143b7f91913ed"
+          }
+        ],
+        "license": "ltx-2-community-license-agreement",
+        "license_sha256": "bc8150fb50e9cf8e0a7ec06d2528ca98c3772667755e3adb3ebbc1e3fbbce5ed"
+      },
+      "artifacts": {
+        "workflow-class": {
+          "engine": "comfyui",
+          "source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "TracNetwork/openmayhem-parts-index",
+            "revision": "6869a4abf865143057c2536c3e34561755ad5dde"
+          },
+          "path": "comfy/outcome-classes/v1/video.heavy.le0_5mpf.json",
+          "artifact_root": "9343ccbbe2828225fcb1da06323ba97cae0be8bb1dd4bc8aa9b54079ebd4b7f3",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 666,
+          "source_sha256": "f789ff8ee4b471c2f706bd00a3c3f6074a89683657009939c5a5319e1a7ca8a7",
+          "download_check": false,
+          "notes": "Signed Comfy outcome-class definition for bounded LTX 2.3 audio-video workflow providers; concrete payload bytes are required through the workflow parts inventory."
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": false,
+        "ctx_max": 1,
+        "vision": false,
+        "image": false,
+        "video": true,
+        "audio": true,
+        "output_modality": "video",
+        "output_modalities": [
+          "video",
+          "audio"
+        ],
+        "max_video_width": 768,
+        "max_video_height": 512,
+        "max_video_frames": 192,
+        "max_video_seconds": 8
+      },
+      "requirements": {
+        "min_ram_gb": 96,
+        "min_vram_gb_full_offload": 48,
+        "cpu_flags": [],
+        "backends": [
+          "comfyui"
+        ]
+      },
+      "adapter": {
+        "endpoint_families": [
+          {
+            "family": "mayhem_comfy_workflows",
+            "request_attributes": [
+              "model",
+              "workflow",
+              "runtime_id",
+              "outcome_class",
+              "timeout_ms",
+              "response_format",
+              "user"
+            ],
+            "required_request_attributes": [
+              "model",
+              "workflow"
+            ],
+            "response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "request_attribute_specs": {
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "calibration_values": [
+                  "$MODEL"
+                ]
+              },
+              "outcome_class": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "video.heavy.le0_5mpf"
+                ]
+              },
+              "response_format": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "artifact",
+                "enum_values": [
+                  "artifact",
+                  "json"
+                ],
+                "calibration_values": [
+                  "artifact",
+                  "json"
+                ]
+              },
+              "runtime_id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "comfyui-v0.30.1"
+                ]
+              },
+              "timeout_ms": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 600000,
+                "minimum": 1000,
+                "maximum": 3600000,
+                "calibration_values": [
+                  600000
+                ]
+              },
+              "user": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 512,
+                "calibration_values": [
+                  "mayhem-calibration-user"
+                ]
+              },
+              "workflow": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "1": {
+                      "class_type": "CheckpointLoaderSimple",
+                      "inputs": {
+                        "ckpt_name": "ltx-2.3-22b-dev-fp8.safetensors"
+                      }
+                    },
+                    "2": {
+                      "class_type": "LTXAVTextEncoderLoader",
+                      "inputs": {
+                        "text_encoder": "gemma_3_12B_it_fp4_mixed.safetensors",
+                        "text_encoder_name": "gemma_3_12B_it_fp4_mixed.safetensors",
+                        "ckpt_name": "ltx-2.3-22b-dev-fp8.safetensors",
+                        "device": "default"
+                      }
+                    },
+                    "3": {
+                      "class_type": "LTXVAudioVAELoader",
+                      "inputs": {
+                        "ckpt_name": "LTX23_audio_vae_bf16.safetensors"
+                      }
+                    },
+                    "4": {
+                      "class_type": "LoraLoaderModelOnly",
+                      "inputs": {
+                        "model": [
+                          "1",
+                          0
+                        ],
+                        "lora_name": "ltx-2.3-22b-distilled-lora-384.safetensors",
+                        "strength_model": 0.5
+                      }
+                    },
+                    "5": {
+                      "class_type": "CLIPTextEncode",
+                      "inputs": {
+                        "clip": [
+                          "2",
+                          0
+                        ],
+                        "text": "modern anime action scene, two young male fighters clashing in a city alley, fast camera motion, expressive lip-synced shouted lines, sparks, impact frames, dynamic poses, cinematic lighting"
+                      }
+                    },
+                    "6": {
+                      "class_type": "CLIPTextEncode",
+                      "inputs": {
+                        "clip": [
+                          "2",
+                          0
+                        ],
+                        "text": "low quality, fog, abstract noise, static shot, distorted face, missing eyes, extra limbs, unreadable subtitles, watermark"
+                      }
+                    },
+                    "7": {
+                      "class_type": "LTXVConditioning",
+                      "inputs": {
+                        "positive": [
+                          "5",
+                          0
+                        ],
+                        "negative": [
+                          "6",
+                          0
+                        ],
+                        "frame_rate": 24
+                      }
+                    },
+                    "8": {
+                      "class_type": "EmptyLTXVLatentVideo",
+                      "inputs": {
+                        "width": 512,
+                        "height": 288,
+                        "length": 97,
+                        "batch_size": 1
+                      }
+                    },
+                    "9": {
+                      "class_type": "LTXVEmptyLatentAudio",
+                      "inputs": {
+                        "frames_number": 97,
+                        "frame_rate": 24,
+                        "batch_size": 1,
+                        "audio_vae": [
+                          "3",
+                          0
+                        ]
+                      }
+                    },
+                    "10": {
+                      "class_type": "LTXVConcatAVLatent",
+                      "inputs": {
+                        "video_latent": [
+                          "8",
+                          0
+                        ],
+                        "audio_latent": [
+                          "9",
+                          0
+                        ]
+                      }
+                    },
+                    "11": {
+                      "class_type": "CFGGuider",
+                      "inputs": {
+                        "model": [
+                          "4",
+                          0
+                        ],
+                        "positive": [
+                          "7",
+                          0
+                        ],
+                        "negative": [
+                          "7",
+                          1
+                        ],
+                        "cfg": 1
+                      }
+                    },
+                    "12": {
+                      "class_type": "RandomNoise",
+                      "inputs": {
+                        "noise_seed": 7
+                      }
+                    },
+                    "13": {
+                      "class_type": "KSamplerSelect",
+                      "inputs": {
+                        "sampler_name": "euler_ancestral_cfg_pp"
+                      }
+                    },
+                    "14": {
+                      "class_type": "ManualSigmas",
+                      "inputs": {
+                        "sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+                      }
+                    },
+                    "15": {
+                      "class_type": "SamplerCustomAdvanced",
+                      "inputs": {
+                        "noise": [
+                          "12",
+                          0
+                        ],
+                        "guider": [
+                          "11",
+                          0
+                        ],
+                        "sampler": [
+                          "13",
+                          0
+                        ],
+                        "sigmas": [
+                          "14",
+                          0
+                        ],
+                        "latent_image": [
+                          "10",
+                          0
+                        ]
+                      }
+                    },
+                    "16": {
+                      "class_type": "LTXVCropGuides",
+                      "inputs": {
+                        "latent": [
+                          "15",
+                          0
+                        ]
+                      }
+                    },
+                    "17": {
+                      "class_type": "LatentUpscaleModelLoader",
+                      "inputs": {
+                        "model_name": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+                      }
+                    },
+                    "18": {
+                      "class_type": "LTXVLatentUpsampler",
+                      "inputs": {
+                        "samples": [
+                          "15",
+                          0
+                        ],
+                        "upscale_model": [
+                          "17",
+                          0
+                        ],
+                        "crop_guides": [
+                          "16",
+                          0
+                        ]
+                      }
+                    },
+                    "19": {
+                      "class_type": "CFGGuider",
+                      "inputs": {
+                        "model": [
+                          "4",
+                          0
+                        ],
+                        "positive": [
+                          "7",
+                          0
+                        ],
+                        "negative": [
+                          "7",
+                          1
+                        ],
+                        "cfg": 1
+                      }
+                    },
+                    "20": {
+                      "class_type": "RandomNoise",
+                      "inputs": {
+                        "noise_seed": 8
+                      }
+                    },
+                    "21": {
+                      "class_type": "KSamplerSelect",
+                      "inputs": {
+                        "sampler_name": "euler_ancestral_cfg_pp"
+                      }
+                    },
+                    "22": {
+                      "class_type": "ManualSigmas",
+                      "inputs": {
+                        "sigmas": "0.725, 0.421875, 0.0"
+                      }
+                    },
+                    "23": {
+                      "class_type": "SamplerCustomAdvanced",
+                      "inputs": {
+                        "noise": [
+                          "20",
+                          0
+                        ],
+                        "guider": [
+                          "19",
+                          0
+                        ],
+                        "sampler": [
+                          "21",
+                          0
+                        ],
+                        "sigmas": [
+                          "22",
+                          0
+                        ],
+                        "latent_image": [
+                          "18",
+                          0
+                        ]
+                      }
+                    },
+                    "24": {
+                      "class_type": "LTXVSeparateAVLatent",
+                      "inputs": {
+                        "av_latent": [
+                          "23",
+                          0
+                        ]
+                      }
+                    },
+                    "25": {
+                      "class_type": "VAEDecodeTiled",
+                      "inputs": {
+                        "samples": [
+                          "24",
+                          0
+                        ],
+                        "vae": [
+                          "1",
+                          2
+                        ],
+                        "tile_size": 768,
+                        "overlap": 64,
+                        "temporal_size": 64,
+                        "temporal_overlap": 8
+                      }
+                    },
+                    "26": {
+                      "class_type": "LTXVAudioVAEDecode",
+                      "inputs": {
+                        "samples": [
+                          "24",
+                          1
+                        ],
+                        "audio_vae": [
+                          "3",
+                          0
+                        ]
+                      }
+                    },
+                    "27": {
+                      "class_type": "CreateVideo",
+                      "inputs": {
+                        "images": [
+                          "25",
+                          0
+                        ],
+                        "fps": 24,
+                        "audio": [
+                          "26",
+                          0
+                        ],
+                        "bit_depth": 8
+                      }
+                    },
+                    "28": {
+                      "class_type": "SaveVideo",
+                      "inputs": {
+                        "video": [
+                          "27",
+                          0
+                        ],
+                        "filename_prefix": "mayhem-ltx-av/anime-fight-official",
+                        "format": "mp4",
+                        "codec": {
+                          "codec": "h264",
+                          "encoding": {
+                            "encoding": "auto"
+                          }
+                        }
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "response_attribute_specs": {
+              "artifacts": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 0,
+                "max_items": 1000000,
+                "calibration_values": [
+                  []
+                ]
+              },
+              "id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "mayhem": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "object": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "progress": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 0,
+                "maximum": 18446744073709552000,
+                "calibration_values": [
+                  1
+                ]
+              },
+              "status": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "usage": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              }
+            },
+            "interaction_groups": []
+          }
+        ],
+        "chat_template_id": "generic_chatml",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "preserve",
+        "modality_set": [
+          "video",
+          "audio"
+        ]
+      },
+      "modality_assessment": {
+        "detected": [
+          "video",
+          "audio"
+        ],
+        "evidence": [
+          "Official LTX 2.3 Comfy Text to Video blueprint requires the fp8 checkpoint, Gemma text encoder, distilled LoRA, spatial latent upscaler, and audio VAE signed in parts-index v10."
+        ],
+        "calibrated_fingerprints": {},
+        "resource_profiles": {
+          "workflow-class": {
+            "video": {
+              "unit": "frame",
+              "measurement_source": "ltx_2_3_official_fp8_lora_spatial_upscaler_reference_profile_pending_live_admission",
+              "max_item_bytes": 1073741824,
+              "max_item_units": 192,
+              "measured_item_bytes": 1073741824,
+              "measured_item_units": 192,
+              "measured_working_set_bytes": 34359738368,
+              "calibration_baseline_memory_bytes": 21474836480,
+              "calibration_peak_memory_bytes": 55834574848,
+              "calibration_f13_budget_bytes": 68719476736,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            }
+          }
+        }
+      },
+      "speciality_assessment": {
+        "detected": [],
+        "evidence": [
+          "No endpoint speciality is advertised for the generic bounded LTX AV workflow class."
+        ],
+        "unsupported": {},
+        "calibrated": {}
+      },
+      "sampling": {
+        "temperature": 1,
+        "top_p": 1
+      },
+      "workflow": {
+        "whitelisted_nodes": [
+          "CFGGuider",
+          "CheckpointLoaderSimple",
+          "CLIPTextEncode",
+          "CreateVideo",
+          "EmptyLTXVLatentVideo",
+          "KSamplerSelect",
+          "LatentUpscaleModelLoader",
+          "LoraLoaderModelOnly",
+          "LTXAVTextEncoderLoader",
+          "LTXVAudioVAEDecode",
+          "LTXVAudioVAELoader",
+          "LTXVConcatAVLatent",
+          "LTXVConditioning",
+          "LTXVCropGuides",
+          "LTXVEmptyLatentAudio",
+          "LTXVLatentUpsampler",
+          "LTXVSeparateAVLatent",
+          "ManualSigmas",
+          "RandomNoise",
+          "SamplerCustomAdvanced",
+          "SaveVideo",
+          "VAEDecodeTiled"
+        ],
+        "parts": [
+          {
+            "part_id": "34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2",
+            "name": "ltx-2.3-22b-dev-fp8.safetensors",
+            "type": "video-model",
+            "sha256": "28606c5b5a06ce56f896d4dfcb20f212739e07a68fbe48e53638188449d26450"
+          },
+          {
+            "part_id": "20652c80fc8e88963343b9968722becb2118d507befbbf0272aa8d79e99893cc",
+            "name": "gemma_3_12B_it_fp4_mixed.safetensors",
+            "type": "text-encoder",
+            "sha256": "aaca463d11e6d8d2a4bdb0d6299214c15ef78a3f73e0ef8113d5a9d0219b3f6d"
+          },
+          {
+            "part_id": "988522cff35f19d7c5977472be163f05b49bf381e441963da4182b0a90b1116c",
+            "name": "ltx-2.3-22b-distilled-lora-384.safetensors",
+            "type": "lora",
+            "sha256": "2943ab994f3c9d88052e5a2a34cca14e4a2dfc36b1d8c407931d52d5c25dd72b"
+          },
+          {
+            "part_id": "e0f339c2b5c13fcae1b78cade132ae0307114026c6d20642335eccb4887a050d",
+            "name": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+            "type": "upscaler",
+            "sha256": "5f416311fa8172b65af67530758964708d29a317b830d689a51143b7f91913ed",
+            "scale": 2
+          },
+          {
+            "part_id": "8c108e3ce85d127cef5dbb5747f8c30d2a30c6d92f215278399224e38ffe806c",
+            "name": "LTX23_audio_vae_bf16.safetensors",
+            "type": "vae",
+            "sha256": "5bc10fa4adecf99dda132d916e23048cbd56797702c5fa50eb5d2079048a38c3"
+          }
+        ],
+        "runtime_id": "comfyui-v0.30.1",
+        "outcome_class": "video.heavy.le0_5mpf",
+        "pricing_unit": "megapixel_step",
+        "inventory_root": "f2fae1953b9e327f264120b931a512a417910770a3bb357fae51e74c40933849",
+        "max_nodes": 48,
+        "max_width": 768,
+        "max_height": 512,
+        "max_frames": 192,
+        "max_duration_seconds": 8,
+        "max_steps": 16,
+        "max_artifacts": 1
+      },
+      "canary": {
+        "set_id": "canary-ltx-av-workflow-launch-v1",
+        "match_min": 0.9,
+        "verification_method": "video_av_fingerprint",
+        "verification_tolerance_bps": 1500,
+        "fingerprints": {},
+        "token_prefixes": {},
+        "perceptual_hashes": {},
+        "embedding_vectors": {},
+        "transcripts": {},
+        "audio_fingerprints": {},
+        "video_fingerprints": {
+          "workflow-class": {
+            "ltx-av-anime-fight-seed7": "videoav-v1:7b227769647468223a3531322c22686569676874223a3238382c226672616d655f636f756e74223a39372c226670735f6d696c6c69223a32343030302c22766964656f5f6475726174696f6e5f6d73223a343034322c22617564696f5f6475726174696f6e5f6d73223a343034322c226672616d655f686173686573223a5b2230663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066222c2230663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066225d2c22617564696f5f66696e6765727072696e74223a22617564696f737065632d76313a343034323a3031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031227d"
+          }
+        }
+      },
+      "price_ref_au": {
+        "denom": "au_usd",
+        "ver": 1,
+        "rate_map": [
+          {
+            "unit": "megapixel_step",
+            "per_unit_au": "90000000000000000",
+            "granularity": 1000
+          }
+        ],
+        "per_req_au": "0",
+        "min_session_au": "0"
+      }
     }
   ],
   "schema_version": 1,

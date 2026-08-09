@@ -25,6 +25,13 @@ Before selecting or serving a model, read the canonical
 selector, signed artifact, endpoint and modality surface, supported backend/platform pair, runtime
 pin, resource floor, measured guidance, unsupported combination, and provider start command. Live
 enclave IDs, rooms, routes, and prices must still come from `mayhem models --gateway`.
+For ComfyUI workflows, also read **[`comfy-cheatsheet.md`](comfy-cheatsheet.md)** before
+calibrating, admitting, serving, or using a workflow class. It lists every current outcome class,
+the signed parts index, required part sets, and `/v1/workflows` request shape.
+Every Comfy calibration must enumerate every file the graph actually loads in the signed workflow
+policy `parts` list. If the graph uses a checkpoint, text encoder, VAE, LoRA, ControlNet,
+upscaler, lipsync model, or helper model that is not in the signed parts index, mirror/sign that
+file first; do not prove or serve a workflow with manual out-of-policy downloads.
 
 ComfyUI workflows are not a second app. They use the same gateway, provider, route, voucher,
 receipt, and settlement machinery, with the Mayhem-native endpoint `/v1/workflows` and endpoint
@@ -555,7 +562,8 @@ the immutable ledger enclave tuple with the ledger-pinned signed catalog; provid
 around a genuine mismatch locally.
 
 For Comfy workflow providers, do not serve a workflow class until the parts inventory and admission
-proof both pass. Pull only from a verified parts-index layout:
+proof both pass. Keep **[`comfy-cheatsheet.md`](comfy-cheatsheet.md)** open while doing this.
+Pull only from a verified parts-index layout:
 
 ```bash
 mayhem provider parts pull --layout-dir <parts-index-layout> --part-id <part-id> --require-payload
