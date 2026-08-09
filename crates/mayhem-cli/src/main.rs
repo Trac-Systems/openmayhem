@@ -26911,6 +26911,7 @@ fn admin_comfy_part_source_filename(
 const COMFY_PART_RANGE_DOWNLOAD_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
 const COMFY_PART_RANGE_DOWNLOAD_CHUNK_BYTES: u64 = 1024 * 1024 * 1024;
 const COMFY_PART_DOWNLOAD_BUFFER_BYTES: usize = 1024 * 128;
+const COMFY_PART_SOURCE_REQUEST_TIMEOUT_SECONDS: u64 = 180;
 
 fn admin_comfy_part_download_source(
     source: &mayhem_proto::ComfyPartSource,
@@ -26974,6 +26975,7 @@ fn admin_comfy_part_download_source_blocking(
     let client = reqwest::blocking::Client::builder()
         .user_agent(format!("openmayhem/{}", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::limited(5))
+        .timeout(Duration::from_secs(COMFY_PART_SOURCE_REQUEST_TIMEOUT_SECONDS))
         .build()
         .context("building Comfy part download client")?;
     let written = comfy_part_download_source_to_partial(
@@ -29743,6 +29745,7 @@ fn provider_comfy_part_download_source_blocking(
     let client = reqwest::blocking::Client::builder()
         .user_agent(format!("openmayhem/{}", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::limited(5))
+        .timeout(Duration::from_secs(COMFY_PART_SOURCE_REQUEST_TIMEOUT_SECONDS))
         .build()
         .context("building Comfy part download client")?;
     let written = comfy_part_download_source_to_partial(
@@ -29790,7 +29793,10 @@ fn comfy_part_source_prefers_chunked_ranges(
 ) -> bool {
     size_exact
         && expected_bytes >= COMFY_PART_RANGE_DOWNLOAD_THRESHOLD_BYTES
-        && source.kind.eq_ignore_ascii_case("huggingface")
+        && matches!(
+            source.kind.to_ascii_lowercase().as_str(),
+            "huggingface" | "civitai"
+        )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -96170,6 +96176,33 @@ status: linked
             "{err:#}"
         );
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn large_civitai_parts_use_chunked_range_downloads() {
+        let source = mayhem_proto::ComfyPartSource {
+            kind: "civitai".to_owned(),
+            url: "https://civitai.com/api/download/models/3143864".to_owned(),
+            repository: None,
+            path: None,
+            revision: None,
+        };
+
+        assert!(comfy_part_source_prefers_chunked_ranges(
+            &source,
+            COMFY_PART_RANGE_DOWNLOAD_THRESHOLD_BYTES,
+            true,
+        ));
+        assert!(!comfy_part_source_prefers_chunked_ranges(
+            &source,
+            COMFY_PART_RANGE_DOWNLOAD_THRESHOLD_BYTES,
+            false,
+        ));
+        assert!(!comfy_part_source_prefers_chunked_ranges(
+            &source,
+            COMFY_PART_RANGE_DOWNLOAD_THRESHOLD_BYTES - 1,
+            true,
+        ));
     }
 
     #[test]
