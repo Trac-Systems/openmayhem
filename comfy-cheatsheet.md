@@ -84,6 +84,24 @@ mayhem up --provider \
 
 Only use `--load-plan <plan.json>` when the signed workflow policy permits staged loading. Without a load plan, all required parts must fit together. The `--artifact` value is the local ComfyUI runtime directory; the ledger artifact remains the signed workflow class definition.
 
+## Calibration Acceptance Gate
+
+A Comfy calibration is not complete until all of these gates pass:
+
+- Inventory gate: every file the reference graph actually loads is listed in `workflow.parts`, exists in the signed parts index, and was pulled through `provider parts pull` and advertised through `provider parts add`. Manual downloads, cache leftovers, or unsourced local files are not evidence.
+- Runtime gate: every node class in the graph is available in the blessed ComfyUI runtime or in a separately blessed extension policy. API-service nodes such as `sync.so` are not local OpenMayhem workflow proof unless the catalog explicitly declares that external-service policy.
+- Policy gate: the catalog row embeds the workflow policy, required parts, runtime id, node allowlist, output class, modality set, derivation limits, and reference graph hash. A signed outcome-class definition alone is not a routable provider market.
+- Quality gate: inspect the generated media. A container with the right codec, frame count, or waveform does not pass if the requested subject, motion, speech, or audio quality is missing.
+- Paid route gate: the final proof must go through the Mayhem provider/gateway path with `/v1/workflows`. Direct Comfy runs are useful for debugging only and must be labelled as such.
+
+Run this coverage check whenever the parts index or cheatsheet changes:
+
+```bash
+python3 scripts/verify-comfy-cheatsheet.py \
+  --parts-index <parts-index-layout>/index.json \
+  --outcome-grid catalog/comfy/outcome-classes-v1.json
+```
+
 ## Outcome Classes
 
 | Class | Title | Media | Lane | Pricing unit | Caps |
@@ -121,7 +139,7 @@ and every referenced file must appear in `workflow.parts`.
 | `upscale.conv.le24mp`, `upscale.conv.le512mp` | Class exists. A provider policy must choose one or more signed upscaler parts and prove the exact graph. | Convolutional/restoration upscalers: `121becf8`, `17b705c5`, `23178907`, `34889283`, `522bad49`, `6a1ac0ec`, `6adc20e6`, `776268ba`, `7c3058ae`, `7c985640`, `851b706a`, `8dc290bc`, `96cfc3a4`, `a95240c0`, `b40716b2`, `c21510f4`, `d871ba30`, `dfa6e5df`. Use `e0f339c2` only inside LTX-AV latent-upscale policies. |
 | `upscale.diffusion` | Class exists. SeedVR2 policies need a dedicated proof; do not mix them into a convolutional-upscale admission. | Diffusion/video restoration parts: `9c98aed7` SeedVR2 3B, `ca6bff3f` SeedVR2 7B, `63e69083` SeedVR2 VAE. Optional video preprocessing/interpolation support: `6cc88536` RIFE 4.7, `865582d1` RIFE 4.9. |
 | `video.light.le0_5mpf`, `video.light.le2_2mpf`, `video.heavy.le0_5mpf`, `video.heavy.le2_2mpf` | Official LTX-AV uses `video.heavy.le0_5mpf`. Other video classes need separate signed policy/canary if their caps or lane differ. | Video models: `34dfabbf` official LTX 2.3 fp8, `25055314` LTX GTAnimation low-VRAM candidate. Text encoders: `20652c80` Gemma 3 12B fp4, `720ea5ea` UMT5-XXL fp8 for Wan policies. LTX AV support: `988522cf` distilled LoRA, `e0f339c2` LTX spatial x2 latent upscaler, `8c108e3c` LTX audio VAE, `32b0af06` LTX tiny VAE. Video support: `40dd2b8b` Wan low-noise control, `660c1350` Wan high-noise control, `79f0076a` Wan VAE, `34889283` animevideo x2, `851b706a` animevideo x4, `6cc88536` RIFE 4.7, `865582d1` RIFE 4.9. |
-| `video.lipsync` | Class exists. Lipsync policies must include the exact lipsync model files plus whatever image/video/audio prerequisites their graph loads. | Lipsync parts: `471fb7a0` LatentSync Whisper tiny, `d4330bc7` LatentSync SyncNet, `5cebda44` LatentSync UNet, `20bbd004` InfiniteTalk single, `d8903b87` InfiniteTalk multi. Common companion video parts are the Wan/LTX video support parts above when the graph actually loads them. |
+| `video.lipsync` | Class definition exists. InfiniteTalk has signed weights and a built-in `WanInfiniteTalkToVideo` runtime node, but it is not launch-routable until a signed workflow policy and paid quality proof are published. LatentSync weights are signed, but the LatentSync node pack is not in the blessed runtime, so LatentSync is not routable until that extension is blessed. | Lipsync parts: `471fb7a0` LatentSync Whisper tiny, `d4330bc7` LatentSync SyncNet, `5cebda44` LatentSync UNet, `20bbd004` InfiniteTalk single, `d8903b87` InfiniteTalk multi. Common companion video parts are the Wan/LTX video support parts above when the graph actually loads them. |
 | `audio.tts`, `audio.generation`, `audio.stt` | Classes exist but this parts index has no standalone TTS, audio-generation, or STT model policy ready for public serving. | No standalone audio-class parts are currently signed. `8c108e3c` is only the LTX AV audio VAE, and the lipsync parts are only for `video.lipsync` policies. |
 | `compute.norm` | Class exists for bounded residual workflow compute, not for arbitrary unsigned execution. | No class-ready parts in this index. A workflow must publish its own signed parts and policy before admission. |
 
@@ -173,6 +191,12 @@ This set is useful for exploratory local proofing but is not the official LTX-AV
 ### Lipsync and Talking-Video Parts
 
 These are signed support parts for lipsync/talking-video workflow classes. They are not automatically usable in arbitrary graphs; a workflow class must whitelist the relevant nodes and require the matching parts.
+
+Current runtime status:
+
+- InfiniteTalk: `WanInfiniteTalkToVideo` is present in the blessed `comfyui-v0.30.1` runtime. A routable policy must also require its Wan video model, Wan VAE, Wan text encoder, audio encoder output path, and the exact `InfiniteTalk single` or `InfiniteTalk multi` part used by the graph.
+- LatentSync: the three model files are signed, but the LatentSync node pack is not part of the blessed runtime. Do not admit a LatentSync workflow until that node pack is mirrored, pinned, blessed, and covered by a canary.
+- `sync.so`/HeyGen API nodes: these are remote service nodes. They are not acceptable for local OpenMayhem provider proof unless a future catalog policy explicitly declares an external-service lane and its security/payment rules.
 
 | Selector | Part ID | Type | Purpose |
 |---|---|---|---|
@@ -277,3 +301,5 @@ Use this table to choose fitting parts for a new workflow policy. The exact reco
 ## Calibration Rule
 
 Every new Comfy calibration must declare all files the workflow actually loads, mirror missing official files into the OpenMayhem parts dataset, add them as signed parts, and require them in the workflow policy before admission. A proof that only downloads files manually or bypasses the signed parts policy is not an OpenMayhem proof.
+
+For quality proofs, save the final paid artifacts plus a small review bundle. For images, include the output image and prompt/request JSON. For video or audio, include the media file, `ffprobe` metadata, and a contact sheet or waveform so the content can be inspected quickly before the catalog/canary is accepted.

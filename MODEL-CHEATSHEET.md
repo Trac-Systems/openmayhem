@@ -214,6 +214,12 @@ ControlNets, upscalers, lipsync models, or helper models must be mirrored and
 signed as parts before the proof counts. Manual out-of-policy downloads are not
 OpenMayhem calibration evidence.
 
+The final proof must also pass the Comfy acceptance gate in
+[`comfy-cheatsheet.md`](comfy-cheatsheet.md): signed inventory, blessed runtime
+nodes, embedded workflow policy, human-inspected quality, and a paid
+`/v1/workflows` request. A valid container, frame count, or waveform alone is
+not sufficient if the media does not match the requested task.
+
 ### Rooms, payments, and limits
 
 - `--rooms auto` joins existing canonical rooms. Providers cannot create a
