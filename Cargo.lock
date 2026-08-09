@@ -2366,7 +2366,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mayhem-attestation"
-version = "0.2.110"
+version = "0.2.111"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -2388,7 +2388,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-attestation-verifier"
-version = "0.2.110"
+version = "0.2.111"
 dependencies = [
  "base64 0.22.1",
  "dcap-qvl",
@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-bridge"
-version = "0.2.110"
+version = "0.2.111"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -2426,7 +2426,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-cli"
-version = "0.2.110"
+version = "0.2.111"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2462,7 +2462,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-enclave"
-version = "0.2.110"
+version = "0.2.111"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -2486,7 +2486,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-engine"
-version = "0.2.110"
+version = "0.2.111"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -2505,7 +2505,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-gateway"
-version = "0.2.110"
+version = "0.2.111"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-hwprobe"
-version = "0.2.110"
+version = "0.2.111"
 dependencies = [
  "fs2",
  "serde",
@@ -2554,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-pay"
-version = "0.2.110"
+version = "0.2.111"
 dependencies = [
  "anyhow",
  "clap",
@@ -2564,7 +2564,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-paygate"
-version = "0.2.110"
+version = "0.2.111"
 dependencies = [
  "axum",
  "blake3",
@@ -2587,7 +2587,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-proto"
-version = "0.2.110"
+version = "0.2.111"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -2599,7 +2599,7 @@ dependencies = [
 
 [[package]]
 name = "mayhem-windows-sandbox"
-version = "0.2.110"
+version = "0.2.111"
 dependencies = [
  "thiserror 2.0.18",
  "windows-sys 0.60.2",
@@ -2607,7 +2607,7 @@ dependencies = [
 
 [[package]]
 name = "mayhemd"
-version = "0.2.110"
+version = "0.2.111"
 dependencies = [
  "anyhow",
  "clap",

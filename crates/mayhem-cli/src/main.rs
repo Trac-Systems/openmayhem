@@ -30040,12 +30040,10 @@ fn comfy_part_download_source_to_partial_ranges(
             }
             reqwest::StatusCode::OK => {
                 if written > 0 {
-                    fs::remove_file(part_path).with_context(|| {
-                        format!(
-                            "removing partial {} after source ignored range request",
-                            part_path.display()
-                        )
-                    })?;
+                    bail!(
+                        "ranged Comfy part source ignored resume range for {label}; preserved partial {} for retry",
+                        part_path.display()
+                    );
                 }
                 return comfy_part_download_source_to_partial_single(
                     client,
@@ -96377,6 +96375,73 @@ status: linked
             *captured.lock().unwrap(),
             vec!["5-11".to_owned(), "12-18".to_owned(), "19-21".to_owned()]
         );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn comfy_part_download_preserves_partial_when_resume_range_is_ignored() {
+        let temp = test_temp_dir("mayhem-comfy-part-range-ignore-preserve");
+        fs::create_dir_all(&temp).unwrap();
+        let payload = b"0123456789abcdefghijkl".to_vec();
+        let partial = payload[..5].to_vec();
+        let part_path = temp.join("payload.bin.part");
+        fs::write(&part_path, &partial).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_payload = payload.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                assert!(read > 0, "range mock request ended before headers");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(
+                request.contains("Range: bytes=5-11") || request.contains("range: bytes=5-11"),
+                "expected resume range in request, got {request}"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                server_payload.len()
+            )
+            .unwrap();
+            stream.write_all(&server_payload).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .build()
+            .unwrap();
+        let url = reqwest::Url::parse(&format!("http://{address}/payload.bin")).unwrap();
+        let err = comfy_part_download_source_to_partial_with_chunk_bytes(
+            &client,
+            &url,
+            None,
+            &part_path,
+            payload.len() as u64,
+            true,
+            "range fixture",
+            "range reset",
+            true,
+            7,
+        )
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert!(
+            format!("{err:#}").contains("ignored resume range"),
+            "{err:#}"
+        );
+        assert_eq!(fs::read(&part_path).unwrap(), partial);
         let _ = fs::remove_dir_all(temp);
     }
 
