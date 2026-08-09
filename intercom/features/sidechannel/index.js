@@ -1355,8 +1355,20 @@ class Sidechannel extends Feature {
               }
             }
           } else {
-            // Avoid spamming logs for handshake control messages.
-            if (control === 'auth') return;
+            // Security: sidechannel handshake frames are transport control, never app content.
+            if (control === 'auth' || control === 'welcome') return;
+            if (this._ownerWriteOnly(entry.name)) {
+              const ownerKey = this._getOwnerKey(entry.name);
+              const author = normalizeKeyHex(payload?.from);
+              if (!ownerKey || !author || author !== ownerKey || !this._verifySig(payload, ownerKey)) {
+                if (this.debug) {
+                  console.log(
+                    `[sidechannel:${entry.name}] drop (owner-only content) from ${this._getRemoteKey(connection)}`
+                  );
+                }
+                return;
+              }
+            }
             if (this.onMessage) {
               const handled = this.onMessage(entry.name, payload, connection);
               if (handled && typeof handled.catch === 'function') {
