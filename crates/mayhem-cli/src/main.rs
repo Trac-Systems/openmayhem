@@ -26980,7 +26980,9 @@ fn admin_comfy_part_download_source_blocking(
     let client = reqwest::blocking::Client::builder()
         .user_agent(format!("openmayhem/{}", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::limited(5))
-        .timeout(Duration::from_secs(COMFY_PART_SOURCE_REQUEST_TIMEOUT_SECONDS))
+        .timeout(Duration::from_secs(
+            COMFY_PART_SOURCE_REQUEST_TIMEOUT_SECONDS,
+        ))
         .build()
         .context("building Comfy part download client")?;
     let written = comfy_part_download_source_to_partial(
@@ -28709,10 +28711,17 @@ fn provider_parts_add(args: ProviderPartsPullArgs) -> Result<()> {
             .unwrap_or_else(|| home.join("comfy-parts")),
     )?;
     let now = unix_epoch_seconds()?;
-    let mut inventory = read_provider_comfy_inventory(&home)?.unwrap_or_else(|| {
-        empty_provider_comfy_inventory(report.index_ver, report.anchor_hash.clone())
-            .expect("empty inventory root is valid")
-    });
+    let mut inventory = match read_provider_comfy_inventory(&home)? {
+        Some(existing)
+            if existing.parts.is_empty() && existing.anchor_hash != report.anchor_hash =>
+        {
+            empty_provider_comfy_inventory(report.index_ver, report.anchor_hash.clone())
+                .expect("empty inventory root is valid")
+        }
+        Some(existing) => existing,
+        None => empty_provider_comfy_inventory(report.index_ver, report.anchor_hash.clone())
+            .expect("empty inventory root is valid"),
+    };
     ensure!(
         inventory.anchor_hash == report.anchor_hash,
         "local Comfy inventory is anchored to {}, but --layout-dir is anchored to {}; remove stale parts or use the matching layout",
@@ -29755,7 +29764,9 @@ fn provider_comfy_part_download_source_blocking(
     let client = reqwest::blocking::Client::builder()
         .user_agent(format!("openmayhem/{}", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::limited(5))
-        .timeout(Duration::from_secs(COMFY_PART_SOURCE_REQUEST_TIMEOUT_SECONDS))
+        .timeout(Duration::from_secs(
+            COMFY_PART_SOURCE_REQUEST_TIMEOUT_SECONDS,
+        ))
         .build()
         .context("building Comfy part download client")?;
     let written = comfy_part_download_source_to_partial(
@@ -95679,6 +95690,57 @@ status: linked
                 .part_count,
             0
         );
+
+        let replacement_source_dir = temp.join("replacement-source");
+        let replacement_layout_dir = temp.join("replacement-layout");
+        let replacement_payload_dir = temp.join("replacement-payloads");
+        fs::create_dir_all(&replacement_source_dir).unwrap();
+        fs::create_dir_all(&replacement_payload_dir).unwrap();
+        let replacement_payload_path = replacement_payload_dir.join("replacement.bin");
+        fs::write(
+            &replacement_payload_path,
+            b"openmayhem replacement advertised comfy inventory",
+        )
+        .unwrap();
+        let replacement_record = test_comfy_part_record_for_payload(
+            "replacement inventory part",
+            &replacement_payload_path,
+            8,
+        );
+        let replacement_record_path = replacement_source_dir.join("record.json");
+        write_json_file(&replacement_record_path, &replacement_record).unwrap();
+        admin_parts_build_index(&AdminPartsBuildIndexArgs {
+            records: vec![replacement_record_path],
+            output_dir: replacement_layout_dir.clone(),
+            index_ver: 18,
+            blessed_runtimes: vec!["comfyui-v0.30.1".to_owned()],
+            whitelist_ver: 1,
+            outcome_classes_ver: 1,
+        })
+        .unwrap();
+
+        provider_parts_add(ProviderPartsPullArgs {
+            home: Some(temp.join("home")),
+            layout_dir: replacement_layout_dir,
+            part_ids: vec![replacement_record.part_id.clone()],
+            all: false,
+            payload_dir: Some(replacement_payload_dir),
+            hf_token_file: None,
+            source_token_file: None,
+            cache_dir: Some(cache_dir),
+            disk_reserve: None,
+            offline: true,
+            require_payload: false,
+            chunk_size: 8,
+            json: true,
+        })
+        .unwrap();
+        let replacement_report = provider_parts_inventory_report(&temp.join("home")).unwrap();
+        assert_eq!(replacement_report.part_count, 1);
+        assert_eq!(
+            replacement_report.parts[0].part_id,
+            replacement_record.part_id
+        );
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -96250,8 +96312,9 @@ status: linked
         };
         let hf_source = mayhem_proto::ComfyPartSource {
             kind: "huggingface".to_owned(),
-            url: "https://huggingface.co/TracNetwork/openmayhem-parts/resolve/main/file.safetensors"
-                .to_owned(),
+            url:
+                "https://huggingface.co/TracNetwork/openmayhem-parts/resolve/main/file.safetensors"
+                    .to_owned(),
             repository: Some("TracNetwork/openmayhem-parts".to_owned()),
             path: Some("file.safetensors".to_owned()),
             revision: Some("main".to_owned()),
