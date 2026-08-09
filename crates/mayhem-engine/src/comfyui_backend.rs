@@ -219,11 +219,23 @@ impl EngineBackend for ComfyUiBackend {
     ) -> Result<WorkflowGenerationOutput> {
         request.validate()?;
         let id = Self::next_request_id();
+        let input_files = request
+            .input_files
+            .iter()
+            .map(|file| {
+                json!({
+                    "filename": file.filename,
+                    "content_type": file.content_type,
+                    "data_base64": base64::engine::general_purpose::STANDARD.encode(&file.bytes),
+                })
+            })
+            .collect::<Vec<_>>();
         self.worker()?.send(
             id,
             "run_workflow",
             json!({
                 "workflow": request.workflow,
+                "input_files": input_files,
                 "client_id": request.client_id,
                 "timeout_ms": request.timeout_ms,
             }),

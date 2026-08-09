@@ -72,7 +72,7 @@ use mayhem_engine::{
     GenerateSpecialityTarget, GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest,
     LoadConfig, MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
     SpeechReferenceAudio, SpeechRequest, TokenChunk, ToolSpec, WorkflowGenerationRequest,
-    MTMD_MEDIA_MARKER,
+    WorkflowInputFile, MTMD_MEDIA_MARKER,
 };
 use mayhem_gateway::{
     audio_fingerprint, cancellation_settlement_usage, embedding_vector_fingerprint,
@@ -76991,6 +76991,259 @@ fn validate_provider_chat_video_fps(video: &Value) -> Result<()> {
     Ok(())
 }
 
+fn provider_workflow_input_files(
+    body: &Value,
+) -> Result<(Vec<WorkflowInputFile>, ProviderChatMediaStats)> {
+    let Some(files) = body.get("input_files") else {
+        return Ok((Vec::new(), ProviderChatMediaStats::default()));
+    };
+    let files = files
+        .as_array()
+        .context("workflow input_files must be an array")?;
+    ensure!(
+        files.len()
+            <= usize::try_from(MAX_PROVIDER_MODALITY_ITEMS_PER_REQUEST).unwrap_or(usize::MAX),
+        "workflow input_files exceeds the provider media schema item ceiling"
+    );
+    let mut out = Vec::new();
+    let mut stats = ProviderChatMediaStats::default();
+    for (index, file) in files.iter().enumerate() {
+        let object = file
+            .as_object()
+            .with_context(|| format!("workflow input_files[{index}] must be an object"))?;
+        let filename = object
+            .get("filename")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("workflow input_files[{index}].filename is required"))?;
+        ensure!(
+            provider_workflow_input_filename_is_safe(filename),
+            "workflow input_files[{index}].filename is not a safe relative path"
+        );
+        let content_type = object
+            .get("content_type")
+            .and_then(Value::as_str)
+            .map(provider_normalized_media_content_type)
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("workflow input_files[{index}].content_type is required"))?;
+        let kind = provider_workflow_input_file_kind(
+            object.get("kind").and_then(Value::as_str),
+            content_type.as_str(),
+            filename,
+        )
+        .with_context(|| {
+            format!("workflow input_files[{index}] content type {content_type} is not supported")
+        })?;
+        let encoding = object
+            .get("encoding")
+            .and_then(Value::as_str)
+            .unwrap_or("base64");
+        ensure!(
+            encoding == "base64",
+            "workflow input_files[{index}].encoding must be base64"
+        );
+        let encoded = object
+            .get("data")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("workflow input_files[{index}].data is required"))?;
+        let max_bytes = match kind {
+            "image" | "audio" | "video" => MAX_PROVIDER_MODALITY_ITEM_BYTES,
+            _ => unreachable!("workflow input file kind is closed"),
+        };
+        ensure!(
+            encoded.len()
+                <= usize::try_from(max_bytes)
+                    .unwrap_or(usize::MAX / 4)
+                    .saturating_mul(4)
+                    .div_ceil(3)
+                    .saturating_add(4),
+            "workflow input_files[{index}] exceeds the provider media schema byte ceiling"
+        );
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .with_context(|| {
+                format!("workflow input_files[{index}].data contains invalid base64")
+            })?;
+        ensure!(
+            !bytes.is_empty() && u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= max_bytes,
+            "workflow input_files[{index}] exceeds the provider media schema byte ceiling"
+        );
+        match kind {
+            "image" => {
+                let pixels =
+                    validate_provider_workflow_image_bytes(&bytes, content_type.as_str(), index)?;
+                stats.image_count = stats.image_count.saturating_add(1);
+                stats.image_max_bytes = stats
+                    .image_max_bytes
+                    .max(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                stats.image_max_pixels = stats.image_max_pixels.max(pixels);
+            }
+            "audio" => {
+                let seconds =
+                    validate_provider_workflow_audio_bytes(&bytes, content_type.as_str(), index)?;
+                stats.audio_count = stats.audio_count.saturating_add(1);
+                stats.audio_max_bytes = stats
+                    .audio_max_bytes
+                    .max(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                stats.audio_max_seconds = stats.audio_max_seconds.max(seconds);
+                stats.audio_seconds = stats.audio_seconds.saturating_add(seconds);
+            }
+            "video" => {
+                let frames = object
+                    .get("num_frames")
+                    .and_then(Value::as_u64)
+                    .filter(|frames| *frames > 0)
+                    .with_context(|| {
+                        format!("workflow input_files[{index}].num_frames is required for video")
+                    })?;
+                ensure!(
+                    frames <= MAX_PROVIDER_MODALITY_ITEM_UNITS,
+                    "workflow input_files[{index}] exceeds the provider media schema frame ceiling"
+                );
+                ensure!(
+                    matches!(content_type.as_str(), "video/mp4" | "video/webm" | "video/quicktime"),
+                    "workflow input_files[{index}] video content_type must be video/mp4, video/webm, or video/quicktime"
+                );
+                stats.video_count = stats.video_count.saturating_add(1);
+                stats.video_max_bytes = stats
+                    .video_max_bytes
+                    .max(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                stats.video_max_frames = stats.video_max_frames.max(frames);
+            }
+            _ => unreachable!("workflow input file kind is closed"),
+        }
+        out.push(WorkflowInputFile {
+            filename: filename.to_owned(),
+            content_type,
+            bytes,
+        });
+    }
+    Ok((out, stats))
+}
+
+fn provider_normalized_media_content_type(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn provider_workflow_input_filename_is_safe(filename: &str) -> bool {
+    if filename.is_empty()
+        || filename.len() > 240
+        || filename.starts_with('/')
+        || filename.starts_with('\\')
+        || filename.contains('\\')
+    {
+        return false;
+    }
+    filename.split('/').all(|part| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    })
+}
+
+fn provider_workflow_input_file_kind(
+    declared: Option<&str>,
+    content_type: &str,
+    filename: &str,
+) -> Option<&'static str> {
+    if let Some(kind) = declared {
+        return match kind {
+            "image" => Some("image"),
+            "audio" => Some("audio"),
+            "video" => Some("video"),
+            _ => None,
+        };
+    }
+    if content_type.starts_with("image/") {
+        Some("image")
+    } else if content_type.starts_with("audio/") {
+        Some("audio")
+    } else if content_type.starts_with("video/") {
+        Some("video")
+    } else if filename.ends_with(".png")
+        || filename.ends_with(".jpg")
+        || filename.ends_with(".jpeg")
+        || filename.ends_with(".webp")
+    {
+        Some("image")
+    } else if filename.ends_with(".wav")
+        || filename.ends_with(".flac")
+        || filename.ends_with(".mp3")
+    {
+        Some("audio")
+    } else if filename.ends_with(".mp4")
+        || filename.ends_with(".webm")
+        || filename.ends_with(".mov")
+    {
+        Some("video")
+    } else {
+        None
+    }
+}
+
+fn validate_provider_workflow_image_bytes(
+    bytes: &[u8],
+    content_type: &str,
+    index: usize,
+) -> Result<u64> {
+    ensure!(
+        matches!(content_type, "image/png" | "image/jpeg" | "image/webp"),
+        "workflow input_files[{index}] image content_type must be image/png, image/jpeg, or image/webp"
+    );
+    let (width, height) = ImageReader::new(io::Cursor::new(bytes))
+        .with_guessed_format()
+        .with_context(|| format!("workflow input_files[{index}] image format is invalid"))?
+        .into_dimensions()
+        .with_context(|| format!("workflow input_files[{index}] image cannot be decoded"))?;
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    ensure!(
+        width > 0 && height > 0 && pixels <= MAX_PROVIDER_MODALITY_ITEM_UNITS,
+        "workflow input_files[{index}] exceeds the provider media schema pixel ceiling"
+    );
+    Ok(pixels)
+}
+
+fn validate_provider_workflow_audio_bytes(
+    bytes: &[u8],
+    content_type: &str,
+    index: usize,
+) -> Result<u64> {
+    let metadata = validated_audio_metadata(bytes).with_context(|| {
+        format!(
+            "workflow input_files[{index}] audio must be a valid bounded WAV, FLAC, or MP3 file"
+        )
+    })?;
+    let matches_content_type = match metadata.format {
+        ValidatedAudioFormat::Wav => {
+            matches!(
+                content_type,
+                "audio/wav" | "audio/wave" | "audio/x-wav" | "audio/vnd.wave"
+            )
+        }
+        ValidatedAudioFormat::Flac => matches!(content_type, "audio/flac" | "audio/x-flac"),
+        ValidatedAudioFormat::Mp3 => matches!(content_type, "audio/mpeg" | "audio/mp3"),
+        ValidatedAudioFormat::Opus | ValidatedAudioFormat::Aac => false,
+    };
+    ensure!(
+        matches_content_type,
+        "workflow input_files[{index}] declared content_type {content_type} does not match bounded audio bytes"
+    );
+    ensure!(
+        (1..=MAX_PROVIDER_MODALITY_ITEM_UNITS).contains(&metadata.duration_seconds_ceil),
+        "workflow input_files[{index}] exceeds the provider media schema duration ceiling"
+    );
+    Ok(metadata.duration_seconds_ceil)
+}
+
 fn validate_provider_session_request_modalities(
     active: &ActiveProviderSession,
     terms: &ProviderSessionTerms,
@@ -77129,6 +77382,28 @@ fn provider_video_conditioning_image_load(body: &Value) -> Result<Option<Modalit
         load.max_item_units = load.max_item_units.max(pixels);
     }
     Ok((load.item_count > 0).then_some(load))
+}
+
+fn provider_merge_modality_load(
+    modality_load: &mut BTreeMap<String, ModalityRequestLoad>,
+    modality: &str,
+    item_count: u32,
+    max_item_bytes: u64,
+    max_item_units: u64,
+) {
+    if item_count == 0 {
+        return;
+    }
+    let entry = modality_load
+        .entry(modality.to_owned())
+        .or_insert(ModalityRequestLoad {
+            item_count: 0,
+            max_item_bytes: 0,
+            max_item_units: 0,
+        });
+    entry.item_count = entry.item_count.saturating_add(item_count);
+    entry.max_item_bytes = entry.max_item_bytes.max(max_item_bytes);
+    entry.max_item_units = entry.max_item_units.max(max_item_units);
 }
 
 fn provider_session_modality_load(
@@ -77379,6 +77654,29 @@ fn provider_session_modality_load(
                     },
                 );
             }
+            let (_input_files, input_media) =
+                provider_session_request_result(provider_workflow_input_files(body))?;
+            provider_merge_modality_load(
+                &mut load,
+                "image",
+                input_media.image_count,
+                input_media.image_max_bytes,
+                input_media.image_max_pixels,
+            );
+            provider_merge_modality_load(
+                &mut load,
+                "audio",
+                input_media.audio_count,
+                input_media.audio_max_bytes,
+                input_media.audio_max_seconds,
+            );
+            provider_merge_modality_load(
+                &mut load,
+                "video",
+                input_media.video_count,
+                input_media.video_max_bytes,
+                input_media.video_max_frames,
+            );
             Ok(load)
         }
         other => bail!("unsupported provider request kind {other}"),
@@ -85756,6 +86054,8 @@ fn provider_engine_session_response_with_sampling_bounded(
             .unwrap_or(1)
             .max(1);
         let mut request = WorkflowGenerationRequest::new(workflow_graph);
+        request.input_files =
+            provider_session_request_result(provider_workflow_input_files(request_body))?.0;
         if let Some(timeout_ms) = request_body.get("timeout_ms").and_then(Value::as_u64) {
             request.timeout_ms = timeout_ms;
         }
@@ -90185,6 +90485,7 @@ mod tests {
         video_output: Option<mayhem_engine::MediaGenerationOutput>,
         last_audio_request: Option<EngineMediaGenerationRequest>,
         last_music_request: Option<EngineMediaGenerationRequest>,
+        last_workflow_request: Option<WorkflowGenerationRequest>,
     }
 
     #[derive(Default)]
@@ -90320,6 +90621,7 @@ mod tests {
                 video_output: None,
                 last_audio_request: None,
                 last_music_request: None,
+                last_workflow_request: None,
             }
         }
 
@@ -90570,6 +90872,23 @@ mod tests {
             Ok(output)
         }
 
+        fn run_workflow(
+            &mut self,
+            request: WorkflowGenerationRequest,
+            artifact_sink: &mut dyn mayhem_engine::ArtifactSink,
+            _cancellation: &CancellationToken,
+        ) -> mayhem_engine::Result<mayhem_engine::WorkflowGenerationOutput> {
+            self.last_workflow_request = Some(request);
+            for chunk in self.artifact_chunks.clone() {
+                artifact_sink.on_artifact_chunk(chunk)?;
+            }
+            Ok(mayhem_engine::WorkflowGenerationOutput {
+                prompt_id: "workflow-test".to_owned(),
+                artifact_count: u32::try_from(self.artifact_chunks.len()).unwrap_or(u32::MAX),
+                progress_events: Vec::new(),
+            })
+        }
+
         fn validate_media_generation(
             &mut self,
             request: EngineMediaGenerationRequest,
@@ -90628,14 +90947,18 @@ mod tests {
         bytes
     }
 
-    fn tiny_png_data_url() -> String {
+    fn tiny_png_bytes() -> Vec<u8> {
         let mut bytes = io::Cursor::new(Vec::new());
         image::DynamicImage::new_rgb8(1, 1)
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
+        bytes.into_inner()
+    }
+
+    fn tiny_png_data_url() -> String {
         format!(
             "data:image/png;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())
+            base64::engine::general_purpose::STANDARD.encode(tiny_png_bytes())
         )
     }
 
@@ -108221,6 +108544,109 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let error = validate_provider_session_request_modalities(&active, &terms, &sealed_hostile)
             .expect_err("provider must reject nodes outside the signed workflow policy");
         assert!(error.to_string().contains("ShellExec"));
+    }
+
+    #[test]
+    fn provider_workflow_validator_meters_input_files() {
+        let png = tiny_png_bytes();
+        let wav = tiny_wav_bytes(16_000);
+        let mut body = test_provider_comfy_workflow_request(512);
+        body["input_files"] = json!([
+            {
+                "filename": "refs/hero.png",
+                "kind": "image",
+                "content_type": "image/png",
+                "encoding": "base64",
+                "data": base64::engine::general_purpose::STANDARD.encode(&png)
+            },
+            {
+                "filename": "dialogue/line.wav",
+                "kind": "audio",
+                "content_type": "audio/wav",
+                "encoding": "base64",
+                "data": base64::engine::general_purpose::STANDARD.encode(&wav)
+            }
+        ]);
+        let mut terms = test_provider_comfy_session_terms();
+        terms.served_modalities = vec!["image".to_owned(), "audio".to_owned()];
+        let mut image_capacity = test_heartbeat_modality_capacity("image");
+        image_capacity.max_items_per_request = 3;
+        terms
+            .modality_capacities
+            .insert("image".to_owned(), image_capacity);
+        terms.modality_capacities.insert(
+            "audio".to_owned(),
+            test_heartbeat_modality_capacity("audio"),
+        );
+        let sealed = provider_test_seal_contract_request(&body, &terms.adapter).unwrap();
+        let mut active =
+            test_active_provider_session(&terms, vec!["audio".to_owned(), "image".to_owned()]);
+        active.workflow = Some(provider_comfy_workflow_binding(&body, None).unwrap());
+
+        let measured =
+            validate_provider_session_request_modalities(&active, &terms, &sealed).unwrap();
+
+        assert_eq!(
+            measured,
+            BTreeMap::from([("audio".to_owned(), 1), ("image".to_owned(), 3)])
+        );
+    }
+
+    #[test]
+    fn provider_workflow_dispatch_passes_input_files_to_engine() {
+        let png = tiny_png_bytes();
+        let wav = tiny_wav_bytes(16_000);
+        let mut body = test_provider_comfy_workflow_request(512);
+        body["input_files"] = json!([
+            {
+                "filename": "refs/hero.png",
+                "kind": "image",
+                "content_type": "image/png",
+                "encoding": "base64",
+                "data": base64::engine::general_purpose::STANDARD.encode(&png)
+            },
+            {
+                "filename": "dialogue/line.wav",
+                "kind": "audio",
+                "content_type": "audio/wav",
+                "encoding": "base64",
+                "data": base64::engine::general_purpose::STANDARD.encode(&wav)
+            }
+        ]);
+        let mut backend = FakeEngineBackend::new("").with_artifact_chunks(vec![
+            ArtifactChunk {
+                artifact_id: "workflow-image-1".to_owned(),
+                index: 0,
+                content_type: "image/png".to_owned(),
+                bytes: png.clone(),
+                final_chunk: true,
+            },
+            ArtifactChunk {
+                artifact_id: "workflow-image-2".to_owned(),
+                index: 0,
+                content_type: "image/png".to_owned(),
+                bytes: png.clone(),
+                final_chunk: true,
+            },
+        ]);
+
+        let output = provider_engine_session_response(
+            &mut backend,
+            &test_provider_comfy_session_terms().adapter,
+            &body,
+            None,
+        )
+        .expect("workflow input_files should pass through engine dispatch");
+
+        assert_eq!(output.artifacts.len(), 2);
+        let request = backend.last_workflow_request.expect("workflow request");
+        assert_eq!(request.input_files.len(), 2);
+        assert_eq!(request.input_files[0].filename, "refs/hero.png");
+        assert_eq!(request.input_files[0].content_type, "image/png");
+        assert_eq!(request.input_files[0].bytes, png);
+        assert_eq!(request.input_files[1].filename, "dialogue/line.wav");
+        assert_eq!(request.input_files[1].content_type, "audio/wav");
+        assert_eq!(request.input_files[1].bytes, wav);
     }
 
     #[test]

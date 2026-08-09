@@ -83,6 +83,49 @@ def resolve_output_file(item):
     return None
 
 
+def safe_input_file_path(filename):
+    if not isinstance(filename, str) or not filename:
+        raise ValueError("workflow input file filename is required")
+    if filename.startswith(("/", "\\")) or "\\" in filename or len(filename) > 240:
+        raise ValueError("workflow input file filename must be a safe relative path")
+    parts = filename.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError("workflow input file filename contains an unsafe path component")
+    for part in parts:
+        if not all(ch.isalnum() or ch in "._-" for ch in part):
+            raise ValueError("workflow input file filename contains unsupported characters")
+    root = (base_dir / "input").resolve()
+    candidate = (root / filename).resolve()
+    if not str(candidate).startswith(str(root)):
+        raise ValueError("workflow input file escaped the input root")
+    return candidate
+
+
+@contextlib.contextmanager
+def materialized_input_files(payload):
+    written = []
+    for item in payload.get("input_files") or []:
+        if not isinstance(item, dict):
+            raise ValueError("workflow input_files entries must be objects")
+        filename = item.get("filename")
+        path = safe_input_file_path(filename)
+        encoded = item.get("data_base64")
+        if not isinstance(encoded, str) or not encoded:
+            raise ValueError(f"workflow input file {filename} is missing data_base64")
+        data = base64.b64decode(encoded, validate=True)
+        if not data:
+            raise ValueError(f"workflow input file {filename} is empty")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        written.append(path)
+    try:
+        yield
+    finally:
+        for path in written:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+
+
 def collect_artifacts(prompt_id, history):
     artifacts = []
     total_bytes = 0
@@ -282,88 +325,90 @@ async def load_socket_async(socket_path):
 async def run_workflow(payload):
     if control_mode == "internal_queue":
         return await run_workflow_internal(payload)
-    workflow = payload["workflow"]
-    if not isinstance(workflow, dict):
-        raise ValueError("workflow must be an object")
-    client_id = payload.get("client_id") or "mayhem-comfyui"
-    timeout_ms = int(payload.get("timeout_ms") or 300000)
-    async with session.post(
-        "http://mayhem/prompt",
-        json={"prompt": workflow, "client_id": client_id},
-    ) as response:
-        submitted = await response.json()
-    prompt_id = submitted["prompt_id"]
-    deadline = asyncio.get_event_loop().time() + timeout_ms / 1000.0
-    progress = []
-    history = None
-    while asyncio.get_event_loop().time() < deadline:
-        await asyncio.sleep(POLL_SECONDS)
-        async with session.get(f"http://mayhem/history/{prompt_id}") as response:
-            history_map = await response.json()
-        if prompt_id in history_map:
-            history = history_map[prompt_id]
-            break
-        append_progress(progress, {"kind": "poll", "node": None, "value": {"prompt_id": prompt_id}})
-    if history is None:
-        raise TimeoutError("ComfyUI workflow did not complete before timeout")
-    status = history.get("status", {})
-    if status.get("status_str") != "success":
-        raise RuntimeError(f"ComfyUI workflow failed: {status}")
-    append_history_progress(progress, history, prompt_id)
-    artifacts = collect_artifacts(prompt_id, history)
-    return {
-        "prompt_id": prompt_id,
-        "artifacts": artifacts,
-        "progress_events": progress,
-    }
+    with materialized_input_files(payload):
+        workflow = payload["workflow"]
+        if not isinstance(workflow, dict):
+            raise ValueError("workflow must be an object")
+        client_id = payload.get("client_id") or "mayhem-comfyui"
+        timeout_ms = int(payload.get("timeout_ms") or 300000)
+        async with session.post(
+            "http://mayhem/prompt",
+            json={"prompt": workflow, "client_id": client_id},
+        ) as response:
+            submitted = await response.json()
+        prompt_id = submitted["prompt_id"]
+        deadline = asyncio.get_event_loop().time() + timeout_ms / 1000.0
+        progress = []
+        history = None
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(POLL_SECONDS)
+            async with session.get(f"http://mayhem/history/{prompt_id}") as response:
+                history_map = await response.json()
+            if prompt_id in history_map:
+                history = history_map[prompt_id]
+                break
+            append_progress(progress, {"kind": "poll", "node": None, "value": {"prompt_id": prompt_id}})
+        if history is None:
+            raise TimeoutError("ComfyUI workflow did not complete before timeout")
+        status = history.get("status", {})
+        if status.get("status_str") != "success":
+            raise RuntimeError(f"ComfyUI workflow failed: {status}")
+        append_history_progress(progress, history, prompt_id)
+        artifacts = collect_artifacts(prompt_id, history)
+        return {
+            "prompt_id": prompt_id,
+            "artifacts": artifacts,
+            "progress_events": progress,
+        }
 
 
 async def run_workflow_internal(payload):
     import execution
 
-    workflow = payload["workflow"]
-    if not isinstance(workflow, dict):
-        raise ValueError("workflow must be an object")
-    client_id = payload.get("client_id") or "mayhem-comfyui"
-    timeout_ms = int(payload.get("timeout_ms") or 300000)
-    prompt_id = str(uuid.uuid4())
-    number = prompt_server.number
-    prompt_server.number += 1
-    prompt = prompt_server.trigger_on_prompt({"prompt": workflow, "client_id": client_id})["prompt"]
-    prompt_server.node_replace_manager.apply_replacements(prompt)
-    valid = await execution.validate_prompt(prompt_id, prompt, None)
-    if not valid[0]:
-        raise RuntimeError(f"ComfyUI workflow failed validation: {valid[1]}")
-    extra_data = {"client_id": client_id, "create_time": int(time.time() * 1000)}
-    outputs_to_execute = valid[2]
-    sensitive = {}
-    for sensitive_val in execution.SENSITIVE_EXTRA_DATA_KEYS:
-        if sensitive_val in extra_data:
-            sensitive[sensitive_val] = extra_data.pop(sensitive_val)
-    deadline = loop.time() + timeout_ms / 1000.0
-    progress = []
-    history = None
-    with capture_prompt_server_progress(prompt_id, progress):
-        prompt_server.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive))
-        while loop.time() < deadline:
-            await asyncio.sleep(POLL_SECONDS)
-            history_map = prompt_server.prompt_queue.get_history(prompt_id=prompt_id)
-            if prompt_id in history_map:
-                history = history_map[prompt_id]
-                break
-            append_progress(progress, {"kind": "poll", "node": None, "value": {"prompt_id": prompt_id}})
-    if history is None:
-        raise TimeoutError("ComfyUI workflow did not complete before timeout")
-    status = history.get("status", {})
-    if status.get("status_str") != "success":
-        raise RuntimeError(f"ComfyUI workflow failed: {status}")
-    append_history_progress(progress, history, prompt_id)
-    artifacts = collect_artifacts(prompt_id, history)
-    return {
-        "prompt_id": prompt_id,
-        "artifacts": artifacts,
-        "progress_events": progress,
-    }
+    with materialized_input_files(payload):
+        workflow = payload["workflow"]
+        if not isinstance(workflow, dict):
+            raise ValueError("workflow must be an object")
+        client_id = payload.get("client_id") or "mayhem-comfyui"
+        timeout_ms = int(payload.get("timeout_ms") or 300000)
+        prompt_id = str(uuid.uuid4())
+        number = prompt_server.number
+        prompt_server.number += 1
+        prompt = prompt_server.trigger_on_prompt({"prompt": workflow, "client_id": client_id})["prompt"]
+        prompt_server.node_replace_manager.apply_replacements(prompt)
+        valid = await execution.validate_prompt(prompt_id, prompt, None)
+        if not valid[0]:
+            raise RuntimeError(f"ComfyUI workflow failed validation: {valid[1]}")
+        extra_data = {"client_id": client_id, "create_time": int(time.time() * 1000)}
+        outputs_to_execute = valid[2]
+        sensitive = {}
+        for sensitive_val in execution.SENSITIVE_EXTRA_DATA_KEYS:
+            if sensitive_val in extra_data:
+                sensitive[sensitive_val] = extra_data.pop(sensitive_val)
+        deadline = loop.time() + timeout_ms / 1000.0
+        progress = []
+        history = None
+        with capture_prompt_server_progress(prompt_id, progress):
+            prompt_server.prompt_queue.put((number, prompt_id, prompt, extra_data, outputs_to_execute, sensitive))
+            while loop.time() < deadline:
+                await asyncio.sleep(POLL_SECONDS)
+                history_map = prompt_server.prompt_queue.get_history(prompt_id=prompt_id)
+                if prompt_id in history_map:
+                    history = history_map[prompt_id]
+                    break
+                append_progress(progress, {"kind": "poll", "node": None, "value": {"prompt_id": prompt_id}})
+        if history is None:
+            raise TimeoutError("ComfyUI workflow did not complete before timeout")
+        status = history.get("status", {})
+        if status.get("status_str") != "success":
+            raise RuntimeError(f"ComfyUI workflow failed: {status}")
+        append_history_progress(progress, history, prompt_id)
+        artifacts = collect_artifacts(prompt_id, history)
+        return {
+            "prompt_id": prompt_id,
+            "artifacts": artifacts,
+            "progress_events": progress,
+        }
 
 
 async def shutdown():

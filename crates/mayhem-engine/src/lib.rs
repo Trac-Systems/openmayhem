@@ -1053,8 +1053,17 @@ pub struct ImageGenerationOutput {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WorkflowInputFile {
+    pub filename: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowGenerationRequest {
     pub workflow: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_files: Vec<WorkflowInputFile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
     #[serde(default = "default_workflow_timeout_ms")]
@@ -1066,6 +1075,7 @@ impl WorkflowGenerationRequest {
     pub fn new(workflow: Value) -> Self {
         Self {
             workflow,
+            input_files: Vec::new(),
             client_id: None,
             timeout_ms: default_workflow_timeout_ms(),
         }
@@ -1082,8 +1092,52 @@ impl WorkflowGenerationRequest {
                 "workflow timeout_ms must be greater than zero".to_owned(),
             ));
         }
+        for file in &self.input_files {
+            validate_workflow_input_file(file)?;
+        }
         Ok(())
     }
+}
+
+fn validate_workflow_input_file(file: &WorkflowInputFile) -> Result<()> {
+    if file.bytes.is_empty() {
+        return Err(EngineError::InvalidRequest(format!(
+            "workflow input file {} is empty",
+            file.filename
+        )));
+    }
+    if !workflow_input_filename_is_safe(&file.filename) {
+        return Err(EngineError::InvalidRequest(format!(
+            "workflow input file {} is not a safe relative path",
+            file.filename
+        )));
+    }
+    if file.content_type.trim().is_empty() {
+        return Err(EngineError::InvalidRequest(format!(
+            "workflow input file {} is missing content_type",
+            file.filename
+        )));
+    }
+    Ok(())
+}
+
+fn workflow_input_filename_is_safe(filename: &str) -> bool {
+    if filename.is_empty()
+        || filename.len() > 240
+        || filename.starts_with('/')
+        || filename.starts_with('\\')
+        || filename.contains('\\')
+    {
+        return false;
+    }
+    filename.split('/').all(|part| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

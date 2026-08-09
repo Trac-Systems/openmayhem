@@ -15,13 +15,14 @@ routes, and revisions. Never copy an enclave ID or price from documentation:
 mayhem models --gateway
 ```
 
-## v0.2.115 runtime status
+## v0.2.116 runtime status
 
-The `0.2.115` source release keeps the previous source-install, managed
+The `0.2.116` source release keeps the previous source-install, managed
 runtime, co-resident memory, endpoint-floor, Sulphur, Chatterbox, ACE-Step,
 Needle, and Comfy workflow market fixes, and adds the current Comfy parts
-inventory. The dedicated Comfy provider/user reference is
-[`comfy-cheatsheet.md`](comfy-cheatsheet.md); it lists every outcome class, the
+inventory plus bounded workflow `input_files` for image/audio/video source
+media. The dedicated Comfy provider/user reference is
+[`COMFY-CHEATSHEET.md`](COMFY-CHEATSHEET.md); it lists every outcome class, the
 current signed parts index, required part sets, and `/v1/workflows` usage.
 Ledger-only workflow outcome classes expose endpoint family
 `mayhem_comfy_workflows`, providers can resolve workflow enclaves without a
@@ -33,6 +34,10 @@ normalization of `1.0` to `1` does not break signed workflow vouchers. Signed
 Comfy upscaler parts may declare a scale; Krea+4x workflows must use v0.2.115 or
 newer on both buyer gateways and providers so route requirements, vouchers, and
 receipts meter the upscaled output dimensions.
+Workflows that consume source media, such as lipsync/talking-video policies,
+require v0.2.116 or newer on both buyer gateways and providers so the signed
+request, route load, engine payload, and receipt agree on the input
+image/audio/video media.
 Dedicated-VRAM reservations remain enforced. Needle still has
 exactly two markets: `needle-cpu` across Linux, Windows x86_64, and Apple
 Silicon macOS, and CUDA-only `needle-gpu` on supported Linux aarch64/x86_64 and
@@ -191,7 +196,7 @@ Krea providers must add these signed parts before admission:
 ### Current Comfy parts inventory
 
 The authoritative Comfy workflow reference is
-[`comfy-cheatsheet.md`](comfy-cheatsheet.md). It lists every workflow outcome
+[`COMFY-CHEATSHEET.md`](COMFY-CHEATSHEET.md). It lists every workflow outcome
 class, the class-fit matrix, required Krea/LTX/lipsync part sets, provider
 commands, user API shape, and all 85 signed parts.
 
@@ -215,7 +220,7 @@ signed as parts before the proof counts. Manual out-of-policy downloads are not
 OpenMayhem calibration evidence.
 
 The final proof must also pass the Comfy acceptance gate in
-[`comfy-cheatsheet.md`](comfy-cheatsheet.md): signed inventory, blessed runtime
+[`COMFY-CHEATSHEET.md`](COMFY-CHEATSHEET.md): signed inventory, blessed runtime
 nodes, embedded workflow policy, human-inspected quality, and a paid
 `/v1/workflows` request. A valid container, frame count, or waveform alone is
 not sufficient if the media does not match the requested task.

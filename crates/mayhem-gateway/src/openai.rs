@@ -2360,6 +2360,7 @@ pub struct ArtifactGenerationRequest {
     pub contract_request: Value,
     pub workflow: Option<WorkflowBinding>,
     pub workflow_output: Option<WorkflowOutputBinding>,
+    workflow_input_files: WorkflowInputFileStats,
     pub effective_specialities: BTreeMap<String, String>,
     pub output_modality: String,
     pub transport_kind: String,
@@ -2376,6 +2377,19 @@ pub struct ArtifactGenerationRequest {
     pub input_audio_max_bytes: u64,
     pub input_audio_max_seconds: u64,
     pub response_format: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WorkflowInputFileStats {
+    image_count: u32,
+    image_max_bytes: u64,
+    image_max_pixels: u64,
+    audio_count: u32,
+    audio_max_bytes: u64,
+    audio_max_seconds: u64,
+    video_count: u32,
+    video_max_bytes: u64,
+    video_max_frames: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -10848,6 +10862,17 @@ fn artifact_generation_request_with_workflow_policy(
     })
     .transpose()?
     .unwrap_or(1);
+    let workflow_input_files = if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS {
+        let limits = GatewayMediaLimits::from_env().map_err(|err| {
+            ApiError::bad_request(
+                format!("invalid gateway media limits: {err}"),
+                Some("input_files"),
+            )
+        })?;
+        workflow_input_file_stats(&raw_request, &limits)?
+    } else {
+        WorkflowInputFileStats::default()
+    };
     let response_format = response_format.to_owned();
     Ok(ArtifactGenerationRequest {
         model: model_id.to_owned(),
@@ -10856,6 +10881,7 @@ fn artifact_generation_request_with_workflow_policy(
         contract_request: raw_request,
         workflow,
         workflow_output,
+        workflow_input_files,
         effective_specialities: BTreeMap::new(),
         output_modality: output_modality.to_owned(),
         transport_kind: transport_kind.to_owned(),
@@ -26173,6 +26199,28 @@ fn request_requirements_for_audio_transcription(
     }
 }
 
+fn merge_modality_load(
+    modality_load: &mut BTreeMap<String, ModalityRequestLoad>,
+    modality: &str,
+    item_count: u32,
+    max_item_bytes: u64,
+    max_item_units: u64,
+) {
+    if item_count == 0 {
+        return;
+    }
+    let entry = modality_load
+        .entry(modality.to_owned())
+        .or_insert(ModalityRequestLoad {
+            item_count: 0,
+            max_item_bytes: 0,
+            max_item_units: 0,
+        });
+    entry.item_count = entry.item_count.saturating_add(item_count);
+    entry.max_item_bytes = entry.max_item_bytes.max(max_item_bytes);
+    entry.max_item_units = entry.max_item_units.max(max_item_units);
+}
+
 fn request_requirements_for_artifact_generation(
     state: &GatewayState,
     model: &GatewayModel,
@@ -26197,8 +26245,13 @@ fn request_requirements_for_artifact_generation(
     };
     let output_item_count = u32::try_from(request.artifact_count).unwrap_or(u32::MAX);
     let required_modalities = artifact_generation_required_modalities(model, request);
+    let output_load_modalities = request
+        .workflow_output
+        .as_ref()
+        .map(|workflow_output| workflow_output.output_modalities.clone())
+        .unwrap_or_else(|| required_modalities.clone());
     let mut modality_load = BTreeMap::new();
-    for modality in &required_modalities {
+    for modality in &output_load_modalities {
         let load = if let Some(workflow_output) = request.workflow_output.as_ref() {
             let artifact_count = workflow_output
                 .metrics
@@ -26285,6 +26338,27 @@ fn request_requirements_for_artifact_generation(
         };
         modality_load.insert(modality.clone(), load);
     }
+    merge_modality_load(
+        &mut modality_load,
+        "image",
+        request.workflow_input_files.image_count,
+        request.workflow_input_files.image_max_bytes,
+        request.workflow_input_files.image_max_pixels,
+    );
+    merge_modality_load(
+        &mut modality_load,
+        "audio",
+        request.workflow_input_files.audio_count,
+        request.workflow_input_files.audio_max_bytes,
+        request.workflow_input_files.audio_max_seconds,
+    );
+    merge_modality_load(
+        &mut modality_load,
+        "video",
+        request.workflow_input_files.video_count,
+        request.workflow_input_files.video_max_bytes,
+        request.workflow_input_files.video_max_frames,
+    );
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
         requires_transport_peer: !state.dev_session_shim,
@@ -26326,7 +26400,21 @@ fn artifact_generation_required_modalities(
     request: &ArtifactGenerationRequest,
 ) -> Vec<String> {
     if let Some(workflow_output) = request.workflow_output.as_ref() {
-        return workflow_output.output_modalities.clone();
+        let mut modalities = workflow_output
+            .output_modalities
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if request.workflow_input_files.image_count > 0 {
+            modalities.insert("image".to_owned());
+        }
+        if request.workflow_input_files.audio_count > 0 {
+            modalities.insert("audio".to_owned());
+        }
+        if request.workflow_input_files.video_count > 0 {
+            modalities.insert("video".to_owned());
+        }
+        return modalities.into_iter().collect();
     }
     if request.output_modality == "video" {
         mayhem_proto::video_generation_required_modalities(
@@ -28632,6 +28720,344 @@ fn validate_chat_video_fps(video: &Value) -> Result<(), ApiError> {
             })?;
     }
     Ok(())
+}
+
+fn workflow_input_file_stats(
+    request: &Value,
+    limits: &GatewayMediaLimits,
+) -> Result<WorkflowInputFileStats, ApiError> {
+    let Some(files) = request.get("input_files") else {
+        return Ok(WorkflowInputFileStats::default());
+    };
+    let files = files.as_array().ok_or_else(|| {
+        ApiError::bad_request("workflow input_files must be an array", Some("input_files"))
+    })?;
+    if files.len() > usize::try_from(limits.max_items_per_request).unwrap_or(usize::MAX) {
+        return Err(ApiError::bad_request(
+            format!(
+                "workflow input_files exceeds the {}-item gateway media limit",
+                limits.max_items_per_request
+            ),
+            Some("input_files"),
+        ));
+    }
+    let mut stats = WorkflowInputFileStats::default();
+    for (index, file) in files.iter().enumerate() {
+        let object = file.as_object().ok_or_else(|| {
+            ApiError::bad_request(
+                format!("workflow input_files[{index}] must be an object"),
+                Some("input_files"),
+            )
+        })?;
+        let filename = object
+            .get("filename")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    format!("workflow input_files[{index}].filename is required"),
+                    Some("input_files"),
+                )
+            })?;
+        if !workflow_input_filename_is_safe(filename) {
+            return Err(ApiError::bad_request(
+                format!("workflow input_files[{index}].filename is not a safe relative path"),
+                Some("input_files"),
+            ));
+        }
+        let content_type = object
+            .get("content_type")
+            .and_then(Value::as_str)
+            .map(normalized_media_content_type)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    format!("workflow input_files[{index}].content_type is required"),
+                    Some("input_files"),
+                )
+            })?;
+        let kind = workflow_input_file_kind(
+            object.get("kind").and_then(Value::as_str),
+            content_type.as_str(),
+            filename,
+        )
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                format!(
+                    "workflow input_files[{index}] content type {content_type} is not supported"
+                ),
+                Some("input_files"),
+            )
+        })?;
+        let encoding = object
+            .get("encoding")
+            .and_then(Value::as_str)
+            .unwrap_or("base64");
+        if encoding != "base64" {
+            return Err(ApiError::bad_request(
+                format!("workflow input_files[{index}].encoding must be base64"),
+                Some("input_files"),
+            ));
+        }
+        let encoded = object
+            .get("data")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ApiError::bad_request(
+                    format!("workflow input_files[{index}].data is required"),
+                    Some("input_files"),
+                )
+            })?;
+        let max_bytes = match kind {
+            "image" => limits.max_image_bytes,
+            "audio" => limits.max_audio_bytes,
+            "video" => limits.max_video_bytes,
+            _ => unreachable!("workflow input file kind is closed"),
+        };
+        let encoded_limit = usize::try_from(max_bytes)
+            .unwrap_or(usize::MAX / 4)
+            .saturating_mul(4)
+            .div_ceil(3)
+            .saturating_add(4);
+        if encoded.len() > encoded_limit {
+            return Err(ApiError::bad_request(
+                format!("workflow input_files[{index}] exceeds the {max_bytes}-byte limit"),
+                Some("input_files"),
+            ));
+        }
+        let bytes = BASE64_STANDARD.decode(encoded).map_err(|_| {
+            ApiError::bad_request(
+                format!("workflow input_files[{index}].data contains invalid base64"),
+                Some("input_files"),
+            )
+        })?;
+        if bytes.is_empty() || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+            return Err(ApiError::bad_request(
+                format!("workflow input_files[{index}] must be 1..={max_bytes} decoded bytes"),
+                Some("input_files"),
+            ));
+        }
+        match kind {
+            "image" => {
+                let pixels = validate_workflow_input_image_bytes(
+                    &bytes,
+                    content_type.as_str(),
+                    limits.max_image_pixels,
+                    index,
+                )?;
+                stats.image_count = stats.image_count.saturating_add(1);
+                stats.image_max_bytes = stats
+                    .image_max_bytes
+                    .max(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                stats.image_max_pixels = stats.image_max_pixels.max(pixels);
+            }
+            "audio" => {
+                let seconds = validate_workflow_input_audio_bytes(
+                    &bytes,
+                    content_type.as_str(),
+                    limits.max_audio_seconds,
+                    index,
+                )?;
+                stats.audio_count = stats.audio_count.saturating_add(1);
+                stats.audio_max_bytes = stats
+                    .audio_max_bytes
+                    .max(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                stats.audio_max_seconds = stats.audio_max_seconds.max(seconds);
+            }
+            "video" => {
+                let frames = object
+                    .get("num_frames")
+                    .and_then(Value::as_u64)
+                    .filter(|frames| *frames > 0)
+                    .ok_or_else(|| {
+                        ApiError::bad_request(
+                            format!(
+                                "workflow input_files[{index}].num_frames is required for video"
+                            ),
+                            Some("input_files"),
+                        )
+                    })?;
+                if frames > limits.max_video_frames {
+                    return Err(ApiError::bad_request(
+                        format!(
+                            "workflow input_files[{index}] exceeds the {}-frame limit",
+                            limits.max_video_frames
+                        ),
+                        Some("input_files"),
+                    ));
+                }
+                if !matches!(
+                    content_type.as_str(),
+                    "video/mp4" | "video/webm" | "video/quicktime"
+                ) {
+                    return Err(ApiError::bad_request(
+                        format!(
+                            "workflow input_files[{index}] video content_type must be video/mp4, video/webm, or video/quicktime"
+                        ),
+                        Some("input_files"),
+                    ));
+                }
+                stats.video_count = stats.video_count.saturating_add(1);
+                stats.video_max_bytes = stats
+                    .video_max_bytes
+                    .max(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                stats.video_max_frames = stats.video_max_frames.max(frames);
+            }
+            _ => unreachable!("workflow input file kind is closed"),
+        }
+    }
+    Ok(stats)
+}
+
+fn normalized_media_content_type(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn workflow_input_filename_is_safe(filename: &str) -> bool {
+    if filename.is_empty()
+        || filename.len() > 240
+        || filename.starts_with('/')
+        || filename.starts_with('\\')
+        || filename.contains('\\')
+    {
+        return false;
+    }
+    filename.split('/').all(|part| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    })
+}
+
+fn workflow_input_file_kind(
+    declared: Option<&str>,
+    content_type: &str,
+    filename: &str,
+) -> Option<&'static str> {
+    if let Some(kind) = declared {
+        return match kind {
+            "image" => Some("image"),
+            "audio" => Some("audio"),
+            "video" => Some("video"),
+            _ => None,
+        };
+    }
+    if content_type.starts_with("image/") {
+        Some("image")
+    } else if content_type.starts_with("audio/") {
+        Some("audio")
+    } else if content_type.starts_with("video/") {
+        Some("video")
+    } else if filename.ends_with(".png")
+        || filename.ends_with(".jpg")
+        || filename.ends_with(".jpeg")
+        || filename.ends_with(".webp")
+    {
+        Some("image")
+    } else if filename.ends_with(".wav")
+        || filename.ends_with(".flac")
+        || filename.ends_with(".mp3")
+    {
+        Some("audio")
+    } else if filename.ends_with(".mp4")
+        || filename.ends_with(".webm")
+        || filename.ends_with(".mov")
+    {
+        Some("video")
+    } else {
+        None
+    }
+}
+
+fn validate_workflow_input_image_bytes(
+    bytes: &[u8],
+    content_type: &str,
+    max_pixels: u64,
+    index: usize,
+) -> Result<u64, ApiError> {
+    if !matches!(content_type, "image/png" | "image/jpeg" | "image/webp") {
+        return Err(ApiError::bad_request(
+            format!(
+                "workflow input_files[{index}] image content_type must be image/png, image/jpeg, or image/webp"
+            ),
+            Some("input_files"),
+        ));
+    }
+    let (width, height) = ImageReader::new(io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| {
+            ApiError::bad_request(
+                format!("workflow input_files[{index}] image format is invalid"),
+                Some("input_files"),
+            )
+        })?
+        .into_dimensions()
+        .map_err(|_| {
+            ApiError::bad_request(
+                format!("workflow input_files[{index}] image cannot be decoded"),
+                Some("input_files"),
+            )
+        })?;
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if width == 0 || height == 0 || pixels > max_pixels {
+        return Err(ApiError::bad_request(
+            format!("workflow input_files[{index}] exceeds the {max_pixels}-pixel limit"),
+            Some("input_files"),
+        ));
+    }
+    Ok(pixels)
+}
+
+fn validate_workflow_input_audio_bytes(
+    bytes: &[u8],
+    content_type: &str,
+    max_seconds: u64,
+    index: usize,
+) -> Result<u64, ApiError> {
+    let metadata = validated_audio_metadata(bytes).ok_or_else(|| {
+        ApiError::bad_request(
+            format!(
+                "workflow input_files[{index}] audio must be a valid bounded WAV, FLAC, or MP3 file"
+            ),
+            Some("input_files"),
+        )
+    })?;
+    let content_type_matches = match metadata.format {
+        ValidatedAudioFormat::Wav => {
+            matches!(
+                content_type,
+                "audio/wav" | "audio/wave" | "audio/x-wav" | "audio/vnd.wave"
+            )
+        }
+        ValidatedAudioFormat::Flac => matches!(content_type, "audio/flac" | "audio/x-flac"),
+        ValidatedAudioFormat::Mp3 => matches!(content_type, "audio/mpeg" | "audio/mp3"),
+        ValidatedAudioFormat::Opus | ValidatedAudioFormat::Aac => false,
+    };
+    if !content_type_matches {
+        return Err(ApiError::bad_request(
+            format!(
+                "workflow input_files[{index}] declared content_type {content_type} does not match bounded audio bytes"
+            ),
+            Some("input_files"),
+        ));
+    }
+    let seconds = metadata.duration_seconds_ceil;
+    if seconds == 0 || seconds > max_seconds {
+        return Err(ApiError::bad_request(
+            format!("workflow input_files[{index}] exceeds the {max_seconds}-second limit"),
+            Some("input_files"),
+        ));
+    }
+    Ok(seconds)
 }
 
 fn chat_input_modalities(messages: &[ChatMessage]) -> ChatInputModalities {
@@ -44554,6 +44980,73 @@ mod tests {
     }
 
     #[test]
+    fn comfy_workflow_input_files_drive_gateway_modalities_and_route_load() {
+        let graph = json!({
+            "1": {
+                "class_type": "EmptyLatentImage",
+                "inputs": { "width": 512, "height": 512, "batch_size": 2 }
+            },
+            "2": {
+                "class_type": "SaveImage",
+                "inputs": { "images": ["1", 0] }
+            }
+        });
+        let image_b64 = test_png_data_url()
+            .split_once(',')
+            .expect("data url")
+            .1
+            .to_owned();
+        let audio_b64 = test_wav_b64_with_samples(8_000);
+        let request = artifact_generation_request(
+            "mayhem/comfy-test",
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            json!({
+                "model": "mayhem/comfy-test",
+                "workflow": graph,
+                "runtime_id": "comfyui-v0.30.1",
+                "outcome_class": "image.light.512",
+                "response_format": "artifact",
+                "input_files": [
+                    {
+                        "filename": "refs/hero.png",
+                        "kind": "image",
+                        "content_type": "image/png",
+                        "encoding": "base64",
+                        "data": image_b64
+                    },
+                    {
+                        "filename": "dialogue/line.wav",
+                        "kind": "audio",
+                        "content_type": "audio/wav",
+                        "encoding": "base64",
+                        "data": audio_b64
+                    }
+                ]
+            }),
+            VideoRequestPreparation::default(),
+        )
+        .unwrap();
+
+        let model = test_model();
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let requirements =
+            request_requirements_for_artifact_generation(&state, &model, &request, 1, None, None);
+
+        assert_eq!(
+            requirements.required_modalities,
+            vec!["audio".to_owned(), "image".to_owned()]
+        );
+        let image_load = requirements.modality_load.get("image").unwrap();
+        assert_eq!(image_load.item_count, 3);
+        assert!(image_load.max_item_bytes > 1);
+        assert_eq!(image_load.max_item_units, 512 * 512);
+        let audio_load = requirements.modality_load.get("audio").unwrap();
+        assert_eq!(audio_load.item_count, 1);
+        assert!(audio_load.max_item_bytes > 1);
+        assert_eq!(audio_load.max_item_units, 1);
+    }
+
+    #[test]
     fn comfy_workflow_upscaler_scale_drives_gateway_usage_and_route_load() {
         let graph = json!({
             "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "krea2_turbo_fp8_scaled.safetensors", "weight_dtype": "default"}},
@@ -45802,6 +46295,7 @@ mod tests {
                     contract_request: json!({}),
                     workflow: None,
                     workflow_output: None,
+                    workflow_input_files: WorkflowInputFileStats::default(),
                     effective_specialities: BTreeMap::new(),
                     output_modality: if is_video { "video" } else { "audio" }.to_owned(),
                     transport_kind: if is_video {

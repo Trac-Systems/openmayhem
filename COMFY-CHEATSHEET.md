@@ -43,6 +43,13 @@ Minimal request shape:
 
 The gateway derives required parts, graph hash, runtime id, output class, modalities, and billable usage from the signed workflow policy. Unknown nodes, unsafe paths, missing parts, output dimensions outside caps, or wrong modality sets fail before spend.
 
+Workflow requests that consume user media use bounded `input_files` entries. Each entry must name a
+safe relative filename used by the graph and carry inline base64 bytes plus content type. Providers
+must not rely on files already present in their local Comfy input directory. Image inputs are
+bounded PNG/JPEG; audio inputs are accepted only for formats the gateway and provider can validate
+for duration and content type, currently WAV, FLAC, and MP3 when the workflow-input bridge is
+present. If a workflow needs a format outside that list, add bounded validation first.
+
 ## Provider Path
 
 Verify the local runtime and backend:
@@ -88,9 +95,15 @@ Only use `--load-plan <plan.json>` when the signed workflow policy permits stage
 
 A Comfy calibration is not complete until all of these gates pass:
 
+- Research gate: read the creator card/repo, official Comfy template, extension docs, and node
+  signatures first. Record every user-facing control and default: prompts, negative prompts,
+  dimensions, steps, sampler/scheduler, seed, guidance, LoRA strength, frame count, fps, audio
+  format, voice/speaker/lipsync controls, upscaler choices, and load-plan requirements. The Mayhem
+  policy is the target of the diff, not the source of truth.
 - Inventory gate: every file the reference graph actually loads is listed in `workflow.parts`, exists in the signed parts index, and was pulled through `provider parts pull` and advertised through `provider parts add`. Manual downloads, cache leftovers, or unsourced local files are not evidence.
 - Runtime gate: every node class in the graph is available in the blessed ComfyUI runtime or in a separately blessed extension policy. API-service nodes such as `sync.so` are not local OpenMayhem workflow proof unless the catalog explicitly declares that external-service policy.
-- Policy gate: the catalog row embeds the workflow policy, required parts, runtime id, node allowlist, output class, modality set, derivation limits, and reference graph hash. A signed outcome-class definition alone is not a routable provider market.
+- Policy gate: the catalog row embeds the workflow policy, required parts, runtime id, node allowlist, output class, modality set, derivation limits, media input file schema, permitted content types, user-facing knob ranges/defaults, usage unit, and reference graph hash. A signed outcome-class definition alone is not a routable provider market.
+- Input-media gate: if the graph consumes image/audio/video files, the final proof must send them through `/v1/workflows` request media, not through provider-local files. The graph, provider admission, and paid route proof must reference the same safe filenames.
 - Quality gate: inspect the generated media. A container with the right codec, frame count, or waveform does not pass if the requested subject, motion, speech, or audio quality is missing.
 - Paid route gate: the final proof must go through the Mayhem provider/gateway path with `/v1/workflows`. Direct Comfy runs are useful for debugging only and must be labelled as such.
 
@@ -135,11 +148,11 @@ and every referenced file must appear in `workflow.parts`.
 
 | Classes | Current status | Fitting signed parts |
 |---|---|---|
-| `image.light.le1_2mp`, `image.light.le4_5mp`, `image.light.le17mp`, `image.heavy.le1_2mp`, `image.heavy.le4_5mp`, `image.heavy.le17mp` | Krea base and Krea+4x have class-ready policies. SD15, SDXL, Z-Image, Qwen-Image, RedCraft, and image-control workflows need their own signed policy and canary before serving. | Image checkpoints: `1d439e03` Krea 2 Turbo official, `63352412` Krea 2 Turbo fp8, `dc2b6383` RedCraft Krea 2, `95566dab` CyberRealistic SD1.5, `f8547da9` CyberRealistic XL, `e403a8dc` Illustrious XL, `ca45989f` Nova Anime XL, `9489f2e2` Nova Furry XL, `2321cb8d` PerfectDeliberate, `fdb4927c` Realism Illustrious, `49bf3097` Z-Image Turbo, `53c5bb42` CyberRealistic Z-Image. Image encoders/VAEs: `19d454e5` Qwen3-VL fp8, `e86b7075` Qwen3-VL bf16, `106d81a4` Qwen-Image VAE, `79ffae7f` FLUX/Z-Image VAE. Image control/support: `11a77fd6`, `16a2610c`, `180c156d`, `329dce97`, `3d8ced10`, `43b29ffc`, `5088ec20`, `5db7eae8`, `74bcdf6b`, `873a9610`, `89ca951f`, `92346602`, `8e6b6fb3`, `a213697e`, `b6e3f248`, `b90b785c`, `c3af9ca4`, `c7a89f21`, `cdd1c42c`, `d6dfa562`, `db1e1e32`, `dcf73d0e`, `dda4eb9a`, `ea14dc68`, `edb4d44e`, `f7cd56a9`. |
+| `image.light.le1_2mp`, `image.light.le4_5mp`, `image.light.le17mp`, `image.heavy.le1_2mp`, `image.heavy.le4_5mp`, `image.heavy.le17mp` | Krea base and Krea+4x have class-ready policies. SD15, SDXL, Z-Image, Qwen-Image, RedCraft, and image-control workflows need their own signed policy and canary before serving. | Image checkpoints: `1d439e03` Krea 2 Turbo official, `63352412` Krea 2 Turbo fp8, `dc2b6383` RedCraft Krea 2, `95566dab` CyberRealistic SD1.5, `f8547da9` CyberRealistic XL, `e403a8dc` Illustrious XL, `ca45989f` Nova Anime XL, `9489f2e2` Nova Furry XL, `2321cb8d` PerfectDeliberate, `fdb4927c` Realism Illustrious, `49bf3097` Z-Image Turbo, `53c5bb42` CyberRealistic Z-Image. Image encoders/VAEs: `19d454e5` Qwen3-VL fp8, `e86b7075` Qwen3-VL bf16, `106d81a4` Qwen-Image VAE, `79ffae7f` FLUX/Z-Image VAE. Optional Z-Image TE helper: Z-Image Uncensored TE — Abliterated Huihui Qwen3-4B v2 (Q8 GGUF), Civitai sha `E0C5BAFC...D053F87`. Image control/support: `11a77fd6`, `16a2610c`, `180c156d`, `329dce97`, `3d8ced10`, `43b29ffc`, `5088ec20`, `5db7eae8`, `74bcdf6b`, `873a9610`, `89ca951f`, `92346602`, `8e6b6fb3`, `a213697e`, `b6e3f248`, `b90b785c`, `c3af9ca4`, `c7a89f21`, `cdd1c42c`, `d6dfa562`, `db1e1e32`, `dcf73d0e`, `dda4eb9a`, `ea14dc68`, `edb4d44e`, `f7cd56a9`. |
 | `upscale.conv.le24mp`, `upscale.conv.le512mp` | Class exists. A provider policy must choose one or more signed upscaler parts and prove the exact graph. | Convolutional/restoration upscalers: `121becf8`, `17b705c5`, `23178907`, `34889283`, `522bad49`, `6a1ac0ec`, `6adc20e6`, `776268ba`, `7c3058ae`, `7c985640`, `851b706a`, `8dc290bc`, `96cfc3a4`, `a95240c0`, `b40716b2`, `c21510f4`, `d871ba30`, `dfa6e5df`. Use `e0f339c2` only inside LTX-AV latent-upscale policies. |
 | `upscale.diffusion` | Class exists. SeedVR2 policies need a dedicated proof; do not mix them into a convolutional-upscale admission. | Diffusion/video restoration parts: `9c98aed7` SeedVR2 3B, `ca6bff3f` SeedVR2 7B, `63e69083` SeedVR2 VAE. Optional video preprocessing/interpolation support: `6cc88536` RIFE 4.7, `865582d1` RIFE 4.9. |
 | `video.light.le0_5mpf`, `video.light.le2_2mpf`, `video.heavy.le0_5mpf`, `video.heavy.le2_2mpf` | Official LTX-AV uses `video.heavy.le0_5mpf`. Other video classes need separate signed policy/canary if their caps or lane differ. | Video models: `34dfabbf` official LTX 2.3 fp8, `25055314` LTX GTAnimation low-VRAM candidate. Text encoders: `20652c80` Gemma 3 12B fp4, `720ea5ea` UMT5-XXL fp8 for Wan policies. LTX AV support: `988522cf` distilled LoRA, `e0f339c2` LTX spatial x2 latent upscaler, `8c108e3c` LTX audio VAE, `32b0af06` LTX tiny VAE. Video support: `40dd2b8b` Wan low-noise control, `660c1350` Wan high-noise control, `79f0076a` Wan VAE, `34889283` animevideo x2, `851b706a` animevideo x4, `6cc88536` RIFE 4.7, `865582d1` RIFE 4.9. |
-| `video.lipsync` | Class definition exists. InfiniteTalk has signed weights and a built-in `WanInfiniteTalkToVideo` runtime node, but it is not launch-routable until a signed workflow policy and paid quality proof are published. LatentSync weights are signed, but the LatentSync node pack is not in the blessed runtime, so LatentSync is not routable until that extension is blessed. | Lipsync parts: `471fb7a0` LatentSync Whisper tiny, `d4330bc7` LatentSync SyncNet, `5cebda44` LatentSync UNet, `20bbd004` InfiniteTalk single, `d8903b87` InfiniteTalk multi. Common companion video parts are the Wan/LTX video support parts above when the graph actually loads them. |
+| `video.lipsync` | Class definition exists. InfiniteTalk has signed MeiGen weights and a built-in `WanInfiniteTalkToVideo` runtime node, but it is not launch-routable until the exact template payloads, signed workflow policy, and paid quality proof are published. LatentSync weights are signed, but the LatentSync node pack is not in the blessed runtime, so LatentSync is not routable until that extension is blessed. | Already signed lipsync parts: `471fb7a0` LatentSync Whisper tiny, `d4330bc7` LatentSync SyncNet, `5cebda44` LatentSync UNet, `20bbd004` MeiGen InfiniteTalk single, `d8903b87` MeiGen InfiniteTalk multi. Exact InfiniteTalk template payloads being added for the routable policy: `6a05292d` Wan2.1 I2V 14B 480p fp8, `6294fc7c` Lightx2v I2V rank64 LoRA, `42ed9ac2` wav2vec2 Chinese base fp16, `b36a713b` Comfy-Org InfiniteTalk single fp16, `fd1d93c0` Comfy-Org InfiniteTalk multi fp16. Common signed companions: `720ea5ea` UMT5-XXL fp8 and `79f0076a` Wan 2.1 VAE. |
 | `audio.tts`, `audio.generation`, `audio.stt` | Classes exist but this parts index has no standalone TTS, audio-generation, or STT model policy ready for public serving. | No standalone audio-class parts are currently signed. `8c108e3c` is only the LTX AV audio VAE, and the lipsync parts are only for `video.lipsync` policies. |
 | `compute.norm` | Class exists for bounded residual workflow compute, not for arbitrary unsigned execution. | No class-ready parts in this index. A workflow must publish its own signed parts and policy before admission. |
 
@@ -172,10 +185,10 @@ Class: `video.heavy.le0_5mpf`. Runtime: `comfyui-v0.30.1`. Output modalities: `v
 
 | Selector | Part ID | Type | Purpose |
 |---|---|---|---|
-| `ltx-2.3-22b-dev-fp8.safetensors` | `34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2` | video-model | official fp8 LTX 2.3 checkpoint |
+| `ltx-2.3-22b-dev-fp8.safetensors` | `34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2` | video-model | LTX 2.3 official fp8 audio/video checkpoint |
 | `gemma_3_12B_it_fp4_mixed.safetensors` | `20652c80fc8e88963343b9968722becb2118d507befbbf0272aa8d79e99893cc` | text-encoder | official prompt encoder |
-| `ltx-2.3-22b-distilled-lora-384.safetensors` | `988522cff35f19d7c5977472be163f05b49bf381e441963da4182b0a90b1116c` | lora | official distilled LoRA |
-| `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` | `e0f339c2b5c13fcae1b78cade132ae0307114026c6d20642335eccb4887a050d` | upscaler | official 2x latent upscaler |
+| `ltx-2.3-22b-distilled-lora-384.safetensors` | `988522cff35f19d7c5977472be163f05b49bf381e441963da4182b0a90b1116c` | lora | LTX 2.3 official distilled LoRA 384 |
+| `ltx-2.3-spatial-upscaler-x2-1.1.safetensors` | `e0f339c2b5c13fcae1b78cade132ae0307114026c6d20642335eccb4887a050d` | upscaler | LTX 2.3 official spatial upscaler x2 1.1 |
 | `LTX23_audio_vae_bf16.safetensors` | `8c108e3ce85d127cef5dbb5747f8c30d2a30c6d92f215278399224e38ffe806c` | vae | official audio VAE |
 
 ### Legacy LTX Low-VRAM Candidate
@@ -195,6 +208,10 @@ These are signed support parts for lipsync/talking-video workflow classes. They 
 Current runtime status:
 
 - InfiniteTalk: `WanInfiniteTalkToVideo` is present in the blessed `comfyui-v0.30.1` runtime. A routable policy must also require its Wan video model, Wan VAE, Wan text encoder, audio encoder output path, and the exact `InfiniteTalk single` or `InfiniteTalk multi` part used by the graph.
+- Input media: InfiniteTalk proofs need a source image/video frame and an audio clip carried by
+  `/v1/workflows` `input_files`. WAV, FLAC, and MP3 are acceptable only when the workflow-input
+  bridge validates bounded duration and writes the files into the isolated Comfy input directory
+  for that request. Provider-local seed files are not evidence.
 - LatentSync: the three model files are signed, but the LatentSync node pack is not part of the blessed runtime. Do not admit a LatentSync workflow until that node pack is mirrored, pinned, blessed, and covered by a canary.
 - `sync.so`/HeyGen API nodes: these are remote service nodes. They are not acceptable for local OpenMayhem provider proof unless a future catalog policy explicitly declares an external-service lane and its security/payment rules.
 
@@ -205,6 +222,11 @@ Current runtime status:
 | `LatentSync 1.6 UNet` | `5cebda44e4154eecfa9979a4c91a99e3838b7dac3b1e00ae1479a85c265354f5` | lipsync | generation UNet |
 | `InfiniteTalk single` | `20bbd00447acdd66885255339719b1d0d8ca2ac3c1ff1445e9b258c8d4d7e099` | lipsync | Wan single-speaker lipsync |
 | `InfiniteTalk multi` | `d8903b87934d344be09e38264918c082ba4c33d39aa6f85f36e0d8c2c07fc553` | lipsync | Wan multi-speaker lipsync |
+| `InfiniteTalk single fp16 (Comfy-Org Wan 2.1 patch)` | `b36a713bcec2161d4385f619eae004d1bb71bab86278fd69922749539af6bad5` | lipsync | exact single-speaker patch used by the blessed ComfyUI template family |
+| `InfiniteTalk multi fp16 (Comfy-Org Wan 2.1 patch)` | `fd1d93c0ead8d77bc79d457e45bb391063a21fe3111b0a19ef7dc6a605c3b1fd` | lipsync | exact multi-speaker patch used by the blessed ComfyUI template; preferred for dialogue proof |
+| `Wan2.1 I2V 14B 480p fp8 scaled KJ` | `6a05292de329cdb06923008742e4f17329548239c2e2c3b10234276d790e1ef6` | video-model | exact Wan I2V base for InfiniteTalk template |
+| `Wan2.1 I2V Lightx2v 480p rank64 distill LoRA` | `6294fc7c467c664debaa9a50ea13bfd21959fe7aa29a9759f07541b66562c491` | lora | exact Lightx2v speed/distill LoRA for InfiniteTalk template |
+| `Wav2Vec2 Chinese base fp16 (InfiniteTalk)` | `42ed9ac2d65ac013f5d5a431ff93b1e452371a6f1ba9bf8fdaa5c85b631e4f28` | audio-model | exact audio feature extractor for InfiniteTalk template |
 
 ## All Signed Parts In This Index
 
@@ -230,7 +252,7 @@ Use this table to choose fitting parts for a new workflow policy. The exact reco
 | anime lanes | controlnet | LineArt sk_model2 | `329dce97...d3a3cd` | 0.016 GiB | other | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/329dce97d4adc92e463c9863d266a8b03b68e5a1bdee44474502981487d3a3cd.json) |
 | ltx | vae | taeltx2_3 (LTX 2.3 tiny VAE) | `32b0af06...84be11` | 0.022 GiB | ltx-2-community-license-agreement | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/32b0af063555e81fd65c85b699b858fd9f3b65a72cfe284c10ab5039a984be11.json) |
 | Wan 2.2 / LTX / Sulphur | upscaler | 2x-realesrganv2-animevideo-xsx2 | `34889283...0b6326` | 0.002 GiB | BSD-3-Clause | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/34889283fae69ea3a2dc515fe565251abe768b71d4dfd8c8f54b9b214b0b6326.json) |
-| ltx-av | video-model | ltx-2.3-22b-dev-fp8.safetensors | `34dfabbf...0d3ae2` | 27.14 GiB | ltx-2-community-license-agreement | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2.json) |
+| ltx-av | video-model | LTX 2.3 official fp8 audio/video checkpoint | `34dfabbf...0d3ae2` | 27.14 GiB | ltx-2-community-license-agreement | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2.json) |
 | SDXL lanes | controlnet | IP-Adapter Plus SDXL vit-h | `3633a45c...09a8fe` | 0.789 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/3633a45ca19bd17df627362ef9b330f469082dabc53aa6ed2ca65ac8e109a8fe.json) |
 | Illustrious / NoobAI / Pony | controlnet | NoobAI SDXL ControlNet canny (fp16) | `3d8ced10...bb662d` | 2.33 GiB | other | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/3d8ced100edf3933617400698049858206b10a31f439cae21d1bb74db4bb662d.json) |
 | Wan 2.2 | controlnet | Wan2.2-Fun-A14B-Control LowNoise Q4_K_M | `40dd2b8b...7babe0` | 9.00 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/40dd2b8b47ee8fe3707412c3dc289642726d1e0eade9c7d2abb77add957babe0.json) |
@@ -240,6 +262,7 @@ Use this table to choose fitting parts for a new workflow policy. The exact reco
 | all lanes | controlnet | Depth Anything V2 Small | `5088ec20...8f8131` | 0.092 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/5088ec2033ec4f3cd8d8e22b2671845a80577bc7b93da0115a4a1725bf8f8131.json) |
 | photoreal lanes | upscaler | 4x-Nomos2-hq-dat2 | `522bad49...799714` | 0.130 GiB | CC-BY-4.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/522bad49d5f365a4228f203ede247ec0ed86b8efb924f049719da3437d799714.json) |
 | z-image | checkpoint | CyberRealistic Z-Image Turbo | `53c5bb42...10ef16` | 6.09 GiB | civitai-allow-commercial-use | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/53c5bb42154d15e9a6f1609df3258a52faf979bc16d07994347560424e10ef16.json) |
+| z-image | text-encoder | Z-Image Uncensored TE — Abliterated Huihui Qwen3-4B v2 (Q8 GGUF) | `E0C5BAFC...D053F87` | 3.99 GiB | apache-2.0 | Civitai model 2193783/version 2470137; unzip and hash the inner GGUF before admission |
 | shared | lipsync | LatentSync 1.6 UNet | `5cebda44...5354f5` | 4.72 GiB | openrail++ | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/5cebda44e4154eecfa9979a4c91a99e3838b7dac3b1e00ae1479a85c265354f5.json) |
 | SDXL / Illustrious / Pony | controlnet | TTPlanet SDXL ControlNet Tile Realistic | `5db7eae8...090a1f` | 2.33 GiB | openrail | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/5db7eae8b1d1f22c82392579c97d50b2447ffc90caaf7d8829503aea6c090a1f.json) |
 | krea2 | checkpoint | krea2_turbo_fp8_scaled.safetensors | `63352412...36bdae` | 12.24 GiB | krea-2-community-license | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae.json) |
@@ -266,7 +289,7 @@ Use this table to choose fitting parts for a new workflow policy. The exact reco
 | sdxl | checkpoint | Nova Furry XL | `9489f2e2...e3c57c` | 6.46 GiB | civitai-allow-commercial-use | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/9489f2e2aeeac3e51eace20254c3ce693a69aa69c355ea8ac33630bc3fe3c57c.json) |
 | sd15 | checkpoint | CyberRealistic (SD 1.5) | `95566dab...cae879` | 3.97 GiB | civitai-allow-commercial-use | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/95566dab1bbd4b97341d45e54e5f3a16ad8449a3fd2e5b7fd0853be822cae879.json) |
 | pre/post step, all lanes | upscaler | 1x-DeNoise-realplksr-otf | `96cfc3a4...c2de3a` | 0.027 GiB | CC-BY-4.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/96cfc3a48479f4d964ddb43663265c06e6a454bcc3bc98484f202a079dc2de3a.json) |
-| ltx-av | lora | ltx-2.3-22b-distilled-lora-384.safetensors | `988522cf...b1116c` | 7.08 GiB | ltx-2-community-license-agreement | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/988522cff35f19d7c5977472be163f05b49bf381e441963da4182b0a90b1116c.json) |
+| ltx-av | lora | LTX 2.3 official distilled LoRA 384 | `988522cf...b1116c` | 7.08 GiB | ltx-2-community-license-agreement | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/988522cff35f19d7c5977472be163f05b49bf381e441963da4182b0a90b1116c.json) |
 | Wan 2.2 / LTX / Sulphur output | upscaler | SeedVR2 3B fp8_e4m3fn | `9c98aed7...015e78` | 3.16 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/9c98aed7d7de8a9d48ad72af7d2606ce4ae3ede88030f470a39cc02fa4015e78.json) |
 | Illustrious / NoobAI / Pony | controlnet | NoobAI SDXL ControlNet lineart_anime (fp16) | `a213697e...5f03e3` | 2.33 GiB | other | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/a213697ec466f2613588d0c0849a0f144dfaca79cc77243b9fdda6cc375f03e3.json) |
 | all lanes | controlnet | Swin2SR_RealworldSR_X4_64_BSRGAN_PSNR | `a95240c0...6b4cd6` | 0.064 GiB | Apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/a95240c005bb8344d6ec5f3e1ed3306e30f6f2fb2f244f8d063d1120366b4cd6.json) |
@@ -289,7 +312,7 @@ Use this table to choose fitting parts for a new workflow policy. The exact reco
 | all lanes | controlnet | MiDaS dpt_hybrid | `dda4eb9a...f9ad27` | 0.459 GiB | other | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/dda4eb9a127c8ebadfc774bb900e49621a3621e90140deb9ab343c2699f9ad27.json) |
 | Illustrious/Pony/Anima | controlnet | 4x_NMKD-YandereNeoXL_200k | `df5c42cf...ddbced` | 0.062 GiB | WTFPL | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/df5c42cfcd3fdefbe5a3f45cfe30bc48db4c8c86cd364bfd2b54b8ae05ddbced.json) |
 | anime lanes | upscaler | 2x-ModernSpanimationV1 | `dfa6e5df...afb435` | 0.015 GiB | MIT | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/dfa6e5df632624c4c08e81e4f5bc8eb09e609087bd86ad2eaaeef90d75afb435.json) |
-| ltx-av | upscaler | ltx-2.3-spatial-upscaler-x2-1.1.safetensors | `e0f339c2...7a050d` | 0.927 GiB | ltx-2-community-license-agreement | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/e0f339c2b5c13fcae1b78cade132ae0307114026c6d20642335eccb4887a050d.json) |
+| ltx-av | upscaler | LTX 2.3 official spatial upscaler x2 1.1 | `e0f339c2...7a050d` | 0.927 GiB | ltx-2-community-license-agreement | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/e0f339c2b5c13fcae1b78cade132ae0307114026c6d20642335eccb4887a050d.json) |
 | sdxl | checkpoint | Illustrious-XL v0.1 | `e403a8dc...a1bbe9` | 6.46 GiB | civitai-allow-commercial-use | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/e403a8dca595a45a623db78af4f3058a4258ec3a5d28bb2588b643a47aa1bbe9.json) |
 | krea2 | text-encoder | Qwen3-VL 4B bf16 (Krea 2 text encoder) | `e86b7075...d5200d` | 8.27 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/e86b7075b604c4897f7eee276b13a15c2ff5288c64e33168f1229e6bddd5200d.json) |
 | anime lanes | controlnet | LineArt sk_model | `ea14dc68...d9457f` | 0.016 GiB | other | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/ea14dc684028a0699190170dc167bc5032417f51d69236b192d0a009d1d9457f.json) |
@@ -303,3 +326,94 @@ Use this table to choose fitting parts for a new workflow policy. The exact reco
 Every new Comfy calibration must declare all files the workflow actually loads, mirror missing official files into the OpenMayhem parts dataset, add them as signed parts, and require them in the workflow policy before admission. A proof that only downloads files manually or bypasses the signed parts policy is not an OpenMayhem proof.
 
 For quality proofs, save the final paid artifacts plus a small review bundle. For images, include the output image and prompt/request JSON. For video or audio, include the media file, `ffprobe` metadata, and a contact sheet or waveform so the content can be inspected quickly before the catalog/canary is accepted.
+
+## Publishing New Parts And Workflow Policies
+
+Every new workflow calibration starts from the graph, not from whatever files
+happen to be cached on the test machine. List every checkpoint, text encoder,
+VAE, LoRA, ControlNet, upscaler, audio model, lipsync patch, and helper model
+the graph loads. If a loaded file is not in the active parts index, add it to
+the Comfy inventory and mirror it through the signed parts path before the
+workflow policy or provider admission is allowed to pass.
+
+Use the validator to derive canonical part IDs. Do not hand-write part IDs:
+
+```bash
+mayhem admin parts validate-yaml \
+  --input docs/comfy/ImageVideoGenModelsListOpenmayhem.yaml \
+  --include-drafts > validator.json
+```
+
+Mirror and verify the payload on the mirror host, not on a slow local network:
+
+```bash
+python3 scripts/comfy-mirror-from-validator.py \
+  --manifest validator.json \
+  --output-dir mirror-staging \
+  --only-part-id <part-id> \
+  --hf-token-file <hf-token-file>
+```
+
+Finalize each record with immutable license evidence and exact payload canary
+hashing for weight files:
+
+```bash
+mayhem admin parts onboard \
+  --input docs/comfy/ImageVideoGenModelsListOpenmayhem.yaml \
+  --row-index <row> \
+  --payload <verified-payload> \
+  --output records/<part-id>.json \
+  --min-runtime comfyui-v0.30.1 \
+  --license-doc-hash <64-hex-license-doc-hash> \
+  --license-ref <immutable-license-evidence-ref> \
+  --license-captured-at <RFC3339-time> \
+  --canary-graph-hash <64-hex-probe-graph-hash> \
+  --canary-output-ref <immutable-payload-or-canary-ref> \
+  --canary-tolerance-method sha256 \
+  --canary-max-distance-bps 0 \
+  --json
+```
+
+Upload mirrored payloads into the OpenMayhem parts dataset using the existing
+`payloads/w23/sha256/<prefix>/<sha>.<ext>` layout, then add that immutable HF
+mirror to each finalized record:
+
+```bash
+mayhem admin parts add-mirror \
+  --record records/<part-id>.json \
+  --payload <verified-payload> \
+  --output records/<part-id>.json \
+  --mirror-url https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/<revision>/payloads/w23/sha256/<prefix>/<sha>.<ext> \
+  --mirror-kind huggingface \
+  --mirror-repository TracNetwork/openmayhem-parts-index \
+  --mirror-path payloads/w23/sha256/<prefix>/<sha>.<ext> \
+  --mirror-revision <revision> \
+  --force \
+  --json
+```
+
+Build the next complete index from every existing finalized record plus the new
+records. Never publish a partial replacement index:
+
+```bash
+mayhem admin parts build-index \
+  --record <existing-record.json> \
+  --record records/<new-part-id>.json \
+  --output-dir layout-v<next> \
+  --index-ver <next> \
+  --blessed-runtime comfyui-v0.30.1 \
+  --whitelist-ver <current-whitelist-version> \
+  --outcome-classes-ver <current-outcome-classes-version>
+
+mayhem admin parts upload-plan \
+  --layout-dir layout-v<next> \
+  --repo TracNetwork/openmayhem-parts-index \
+  --repo-type dataset \
+  --commit-message "Mayhem Comfy parts index" \
+  --hf-token-file <hf-token-file>
+```
+
+The catalog workflow row must reference the new parts index/anchor, embed the
+workflow policy, required part IDs, runtime id, node allowlist, output class,
+modality set, caps, and reference graph hash. A class in
+`catalog/comfy/outcome-classes-v1.json` alone is not a usable market.

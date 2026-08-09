@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 
@@ -21,9 +22,58 @@ def load_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def strip_scalar(value: str) -> str:
+    value = value.strip()
+    if value.startswith(("'", '"')) and value.endswith(("'", '"')) and len(value) >= 2:
+        return value[1:-1]
+    return value
+
+
+def load_parts(path: Path):
+    text = path.read_text(encoding="utf-8")
+    try:
+        data = json.loads(text)
+        parts = data.get("parts", [])
+        return {
+            "kind": "json",
+            "parts": parts,
+            "missing": lambda part, cheatsheet: part["part_id"] not in cheatsheet,
+            "label": lambda part: part["part_id"],
+        }
+    except json.JSONDecodeError:
+        pass
+
+    rows = []
+    current = None
+    for raw_line in text.splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        match = re.match(r"^-\s+name:\s*(.+?)\s*$", raw_line)
+        if match:
+            if current:
+                rows.append(current)
+            current = {"name": strip_scalar(match.group(1))}
+            continue
+        if current is None:
+            continue
+        match = re.match(r"^\s+([A-Za-z0-9_-]+):\s*(.*?)\s*$", raw_line)
+        if match:
+            current[match.group(1)] = strip_scalar(match.group(2))
+    if current:
+        rows.append(current)
+
+    parts = [row for row in rows if row.get("status") == "linked" and row.get("name")]
+    return {
+        "kind": "yaml",
+        "parts": parts,
+        "missing": lambda part, cheatsheet: part["name"] not in cheatsheet,
+        "label": lambda part: part["name"],
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cheatsheet", default="comfy-cheatsheet.md")
+    parser.add_argument("--cheatsheet", default="COMFY-CHEATSHEET.md")
     parser.add_argument("--parts-index", required=True)
     parser.add_argument("--outcome-grid", default="catalog/comfy/outcome-classes-v1.json")
     args = parser.parse_args()
@@ -34,8 +84,12 @@ def main() -> int:
     text = cheatsheet.read_text(encoding="utf-8")
 
     missing_sections = [section for section in REQUIRED_SECTIONS if section not in text]
-    index = load_json(parts_index)
-    missing_parts = [part["part_id"] for part in index.get("parts", []) if part["part_id"] not in text]
+    index = load_parts(parts_index)
+    missing_parts = [
+        index["label"](part)
+        for part in index["parts"]
+        if index["missing"](part, text)
+    ]
 
     grid = load_json(outcome_grid)
     rows = grid.get("classes") or grid.get("outcome_classes") or []
@@ -56,7 +110,7 @@ def main() -> int:
 
     print(
         "Comfy cheatsheet coverage ok: "
-        f"{len(index.get('parts', []))} signed parts, {len(rows)} outcome classes"
+        f"{len(index['parts'])} {index['kind']} signed parts, {len(rows)} outcome classes"
     )
     return 0
 

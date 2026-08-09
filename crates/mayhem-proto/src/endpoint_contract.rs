@@ -637,6 +637,7 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
             &[
                 "model",
                 "workflow",
+                "input_files",
                 "runtime_id",
                 "outcome_class",
                 "timeout_ms",
@@ -1126,6 +1127,17 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
         "input_reference" => union_spec(
             &[EndpointValueType::String, EndpointValueType::Object],
             &[json!("$IMAGE_FILE"), json!({"image_url":"$IMAGE_DATA_URL"})],
+        ),
+        "input_files" if family == ENDPOINT_MAYHEM_COMFY_WORKFLOWS => array_spec(
+            0,
+            16,
+            json!([{
+                "filename": "mayhem/source.png",
+                "kind": "image",
+                "content_type": "image/png",
+                "encoding": "base64",
+                "data": "$IMAGE_BASE64"
+            }]),
         ),
         "conditions" | "parameters.conditions" => array_spec(
             0,
