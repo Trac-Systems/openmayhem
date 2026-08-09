@@ -26956,6 +26956,11 @@ fn admin_comfy_part_download_source_blocking(
         parsed.scheme() == "https",
         "Comfy part source URLs must be HTTPS"
     );
+    ensure!(
+        comfy_part_source_url_can_download_payload(source, &parsed),
+        "Comfy part source {} is not a payload download URL",
+        source.url
+    );
     if admin_comfy_part_payload_matches(destination, draft)? {
         return Ok(());
     }
@@ -29734,6 +29739,11 @@ fn provider_comfy_part_download_source_blocking(
         parsed.scheme() == "https",
         "Comfy part source URLs must be HTTPS"
     );
+    ensure!(
+        comfy_part_source_url_can_download_payload(source, &parsed),
+        "Comfy part source {} is not a payload download URL",
+        source.url
+    );
     let token =
         provider_comfy_part_source_token(source, require_auth, hf_token_file, source_token_file)?;
     provider_comfy_part_disk_preflight(cache_path, record.size_bytes, disk_reserve)?;
@@ -29797,6 +29807,20 @@ fn comfy_part_source_prefers_chunked_ranges(
             source.kind.to_ascii_lowercase().as_str(),
             "huggingface" | "civitai"
         )
+}
+
+fn comfy_part_source_url_can_download_payload(
+    source: &mayhem_proto::ComfyPartSource,
+    parsed: &reqwest::Url,
+) -> bool {
+    if source.kind.eq_ignore_ascii_case("civitai") {
+        return parsed
+            .host_str()
+            .map(|host| host.eq_ignore_ascii_case("civitai.com"))
+            .unwrap_or(false)
+            && parsed.path().starts_with("/api/download/");
+    }
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -96155,16 +96179,11 @@ status: linked
         let mut record = test_comfy_part_record_for_payload("hf gated part", &payload_path, 8);
         record.sources.require_auth = true;
         record.sources.mirrors[0].kind = "civitai".to_owned();
-        record.sources.mirrors[0].url = "https://127.0.0.1:1/provider.bin".to_owned();
-        let cache_path = provider_comfy_part_cache_path(&temp.join("cache"), &record);
+        record.sources.mirrors[0].url = "https://civitai.com/api/download/models/1".to_owned();
 
-        let err = provider_comfy_part_download_source(
+        let err = provider_comfy_part_source_token(
             &record.sources.mirrors[0],
             record.sources.require_auth,
-            &cache_path,
-            &record,
-            8,
-            None,
             None,
             None,
         )
@@ -96175,21 +96194,14 @@ status: linked
                 .contains("requires Civitai auth; pass --source-token-file"),
             "{err:#}"
         );
-        let err = provider_comfy_part_download_source(
+        let token = provider_comfy_part_source_token(
             &record.sources.mirrors[0],
             record.sources.require_auth,
-            &cache_path,
-            &record,
-            8,
             None,
             Some(&token_path),
-            None,
         )
-        .unwrap_err();
-        assert!(
-            format!("{err:#}").contains("downloading Comfy part source"),
-            "{err:#}"
-        );
+        .unwrap();
+        assert_eq!(token.as_deref(), Some("test-civitai-token"));
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -96217,6 +96229,45 @@ status: linked
             &source,
             COMFY_PART_RANGE_DOWNLOAD_THRESHOLD_BYTES - 1,
             true,
+        ));
+    }
+
+    #[test]
+    fn civitai_model_pages_are_not_payload_download_sources() {
+        let download_source = mayhem_proto::ComfyPartSource {
+            kind: "civitai".to_owned(),
+            url: "https://civitai.com/api/download/models/3143864".to_owned(),
+            repository: None,
+            path: None,
+            revision: None,
+        };
+        let page_source = mayhem_proto::ComfyPartSource {
+            kind: "civitai".to_owned(),
+            url: "https://civitai.com/models/1295569".to_owned(),
+            repository: None,
+            path: None,
+            revision: Some("3143864".to_owned()),
+        };
+        let hf_source = mayhem_proto::ComfyPartSource {
+            kind: "huggingface".to_owned(),
+            url: "https://huggingface.co/TracNetwork/openmayhem-parts/resolve/main/file.safetensors"
+                .to_owned(),
+            repository: Some("TracNetwork/openmayhem-parts".to_owned()),
+            path: Some("file.safetensors".to_owned()),
+            revision: Some("main".to_owned()),
+        };
+
+        assert!(comfy_part_source_url_can_download_payload(
+            &download_source,
+            &reqwest::Url::parse(&download_source.url).unwrap()
+        ));
+        assert!(!comfy_part_source_url_can_download_payload(
+            &page_source,
+            &reqwest::Url::parse(&page_source.url).unwrap()
+        ));
+        assert!(comfy_part_source_url_can_download_payload(
+            &hf_source,
+            &reqwest::Url::parse(&hf_source.url).unwrap()
         ));
     }
 
