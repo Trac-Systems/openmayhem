@@ -141,27 +141,27 @@ public capacity.
 | `image.heavy.le1_2mp` | Krea 2 Turbo base image generation up to 1024x1024 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70` | `comfyui-v0.30.1` | Signed dev policy and workflow-class fingerprint exist; paid quality proof still required before public serving. |
 | `image.heavy.le17mp` | Krea 2 Turbo plus 4x upscale up to 4096x4096 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70`; 4x-spanx4 `d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a` | `comfyui-v0.30.1` | Signed dev policy and workflow-class fingerprint exist; paid quality proof still required before public serving. |
 | `video.heavy.le0_5mpf` | LTX 2.3 native audio/video generation up to 768x512, 8s, 192 frames | LTX 2.3 fp8 AV checkpoint `34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2`; Gemma 3 12B fp4 text encoder `20652c80fc8e88963343b9968722becb2118d507befbbf0272aa8d79e99893cc`; LTX distilled LoRA 384 `988522cff35f19d7c5977472be163f05b49bf381e441963da4182b0a90b1116c`; LTX spatial upscaler `e0f339c2b5c13fcae1b78cade132ae0307114026c6d20642335eccb4887a050d`; LTX audio VAE `8c108e3ce85d127cef5dbb5747f8c30d2a30c6d92f215278399224e38ffe806c` | `comfyui-v0.30.1` | Signed dev policy and workflow-class fingerprint exist; paid quality proof still required before public serving. |
+| `video.minimax_h3.t2v_i2v` | MiniMax H3 text/image-to-video with native stereo audio up to 1344x768, 15s, 362 frames | FL2VA diffusion `4c371bcbf8e7a577457d7b0ace66345fa85c88a591ca0724a5da6e9642371f72`; Qwen3VL 32B NVFP4 text encoder `32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab`; H3 video VAE `3abef9354f37bb10b413e7034d373e95193511cd80ffa5aea315d1d822032ce7`; H3 audio VAE `6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2` | `comfyui-v0.30.1` | Parts mirrored in parts-index v12, signed catalog metadata published, enclave/price/room live on mainnet; paid provider quality proof still required before public serving. |
 | `video.lipsync` | Wan/InfiniteTalk lipsync/talking-video workflow up to 832x480, 4s, 81 frames | Wan2.1 I2V 14B fp8 `6a05292de329cdb06923008742e4f17329548239c2e2c3b10234276d790e1ef6`; UMT5-XXL fp8 `720ea5ea7b9de57ca87b403856b0a7e42c96d1f1176ff886726ab602b6923709`; Wan 2.1 VAE `79f0076a485bca72333bfa34c767006606b4ff351e5d8abc2045865e12c8a664`; Lightx2v I2V LoRA `6294fc7c467c664debaa9a50ea13bfd21959fe7aa29a9759f07541b66562c491`; InfiniteTalk multi fp16 `fd1d93c0ead8d77bc79d457e45bb391063a21fe3111b0a19ef7dc6a605c3b1fd`; Wav2Vec2 Chinese base fp16 `42ed9ac2d65ac013f5d5a431ff93b1e452371a6f1ba9bf8fdaa5c85b631e4f28` | `comfyui-2a68ce33b4c9` | Signed dev policy and technical canary exist; product proof failed quality review. It is not accepted for general anime action video with voice; keep it scoped to lipsync/talking-head until a better-fit policy proves action, speech, and sync. |
 
 ### Planned Or Missing Workflow Policies
 
 | Candidate policy | Purpose | Parts needed | Missing work before serving |
 |---|---|---|---|
-| `video.minimax_h3.t2v_i2v` (blocked) | MiniMax H3 text/image-to-video with native stereo audio | FL2VA diffusion `4c371bcbf8e7a577457d7b0ace66345fa85c88a591ca0724a5da6e9642371f72`; Qwen3VL 32B NVFP4 text encoder `32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab`; H3 video VAE `3abef9354f37bb10b413e7034d373e95193511cd80ffa5aea315d1d822032ce7`; H3 audio VAE `6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2` | License blocker: do not mirror payloads, publish parts, create a public policy, or run a paid OpenMayhem proof until OpenMayhem has rights for its served territories. |
-| `video.minimax_h3.r2v` (blocked) | MiniMax H3 reference-to-video / reference-media workflow | All T2V/I2V H3 parts plus REF2VA diffusion `b5f18df20fb79f5ae577ed27d16182251712d9a1f30a29af3ffbd6526356b87b` | Same MiniMax H3 license blocker; after rights are cleared, prove base T2V/I2V first. |
-| `video.minimax_h3.spectrum` (blocked) | H3 audio-quality/smoothing extension | H3 base parts plus Spectrum H3 extension payload if accepted | Blocked by the base H3 license; Spectrum itself is GPL-3.0 and needs a separate product/license decision. |
+| `video.minimax_h3.r2v` | MiniMax H3 reference-to-video / reference-media workflow | All T2V/I2V H3 parts plus REF2VA diffusion `b5f18df20fb79f5ae577ed27d16182251712d9a1f30a29af3ffbd6526356b87b` | Prove base T2V/I2V first, then add REF2VA with a separate reference-video proof. |
+| `video.minimax_h3.spectrum` | H3 audio-quality/smoothing extension | H3 base parts plus Spectrum H3 extension payload if accepted | Candidate quality extension. Spectrum is GPL-3.0 and still needs separate product/license acceptance before blessing. |
 
-MiniMax H3 is not approved for public OpenMayhem serving as of 2026-08-10. The immutable
-MiniMaxAI license at revision `9ac0dd7aabc2c651fcf0ace4c00b2bffd9c8c8a6` grants rights only
-inside its "Applicable Territory" and defines that territory as worldwide excluding the European
-Union, the United Kingdom, the Republic of Korea, and the United States of America. It also
-explicitly covers hosted services. That conflicts with OpenMayhem's public provider market and user
-base, so H3 weights must remain research-only until a separate license or replacement model clears
-those territories. Do not upload H3 payloads into `TracNetwork/openmayhem-parts-index` or advertise
-an H3 workflow policy without updating this section with the new rights evidence.
+MiniMax H3 is owner-approved for OpenMayhem calibration as of 2026-08-10. The four
+base T2V/I2V payloads are mirrored and signed in the OpenMayhem Hugging Face
+parts index at revision `866c3b60b4804f34c1e84dff58a600cfbd465c73`. The signed
+mainnet catalog points to revision `4ee78a21941efe4af2fd3c8878915c39cca0f521`,
+and the ledger has the H3 enclave, price, and canonical room open. Do not call
+H3 product-accepted until a real provider completes `parts pull`/`parts add`/
+`parts admit --write`, serves the class through `/v1/workflows`, and the retained
+paid media passes quality inspection. No local cache bypasses or unanchored
+Comfy payloads are acceptable for H3 proof.
 
-The technical H3 research remains useful if the license is cleared later. Use the official Comfy page
-and `Comfy-Org/MiniMax-H3` as sources. Prefer `int8_convrot` diffusion weights on PyTorch/CUDA 13 and
+Use the official Comfy page and `Comfy-Org/MiniMax-H3` as sources. Prefer `int8_convrot` diffusion weights on PyTorch/CUDA 13 and
 the `qwen3vl_32b_minimax_h3_nvfp4_awq` text encoder; the Comfy-Org README states that text-encoder
 NVFP4 does not require Blackwell. Calibrate T2V first, then I2V/R2V only after the base lane is proven.
 Required proof coverage is one clean CUDA lane, either Windows CUDA or Spark CUDA, whichever fits
@@ -183,11 +183,12 @@ H3 reference workflow inputs:
   It has no declared third-party Python dependency, but it is GPL-3.0; treat it as a
   separately pinned custom-node/runtime part pending explicit license/product acceptance.
 
-Current H3 research state: official Comfy page plus `Comfy-Org/MiniMax-H3` prove native source
+Current H3 state: official Comfy page plus `Comfy-Org/MiniMax-H3` prove native source
 weights and official template availability. `ComfyUI-MiniMaxH3-Easy` is adoption evidence for a
-compact H3 workflow surface, not sufficient alone to bless Mayhem policy. Spectrum H3 is candidate
-quality evidence for the audio path, not acceptance proof. The H3 class still needs an intended
-OpenMayhem `/v1/workflows` paid proof with retained media inspection before public serving.
+compact H3 workflow surface, not permission to admit arbitrary optimizer/API nodes. Spectrum H3 is
+candidate quality evidence for the audio path, not acceptance proof. The H3 T2V/I2V class now has
+signed metadata and mainnet rows; it still needs an intended OpenMayhem `/v1/workflows` paid proof
+with retained media inspection before public serving.
 
 Validated H3 source manifest candidates, all from `Comfy-Org/MiniMax-H3` revision
 `014cd40f7e177756c6b2473c0d93b1c89a790dd2`:
@@ -289,7 +290,7 @@ upscaled output dimensions. The signed request timeout default/calibration is
 
 Class: `video.heavy.le0_5mpf`. Runtime: `comfyui-v0.30.1`. Output modalities: `video,audio`. Required inventory root: `f2fae1953b9e327f264120b931a512a417910770a3bb357fae51e74c40933849`.
 
-Paid proof: on 2026-08-10, `.70` served a paid `/v1/workflows` request for the anime fight prompt through the OpenMayhem gateway. The artifact was copied to `/Users/muffin/Downloads/openmayhem-paid-ltx-anime-fight-v0.2.118.mp4`; session `d7928582c135275086a9dccc48371b1628c9d2b884bc3a23c837463a08ccb3f5`; artifact BLAKE3 `0e218f46058a57d9f2a5799a70ee687e69f2554cee00107758b96f759ebd39be`; media `1536x832`, `24` fps, `121` frames, `5.041667s`, AAC stereo audio. A second paid dialogue-heavy anime fight proof was copied to `/Users/muffin/Downloads/openmayhem-paid-ltx-anime-dialogue-v0.2.118.mp4`; artifact BLAKE3 `cf92c746bdb9669857c0124295ccb9a4eb99d5f04d7c89a25d53af127c5ac2b4`; media `1536x832`, `24` fps, `121` frames, `5.041667s`, AAC stereo audio. These prove the LTX A/V lane only. Intelligible speech and lip synchronization require the separate `video.lipsync` lane.
+Paid proof: on 2026-08-10, `.70` served a paid `/v1/workflows` request for the anime fight prompt through the OpenMayhem gateway. The first retained review artifact was `openmayhem-paid-ltx-anime-fight-v0.2.118.mp4`; session `d7928582c135275086a9dccc48371b1628c9d2b884bc3a23c837463a08ccb3f5`; artifact BLAKE3 `0e218f46058a57d9f2a5799a70ee687e69f2554cee00107758b96f759ebd39be`; media `1536x832`, `24` fps, `121` frames, `5.041667s`, AAC stereo audio. A second paid dialogue-heavy anime fight review artifact was `openmayhem-paid-ltx-anime-dialogue-v0.2.118.mp4`; artifact BLAKE3 `cf92c746bdb9669857c0124295ccb9a4eb99d5f04d7c89a25d53af127c5ac2b4`; media `1536x832`, `24` fps, `121` frames, `5.041667s`, AAC stereo audio. These prove the LTX A/V lane only. Intelligible speech and lip synchronization require the separate `video.lipsync` lane.
 
 | Selector | Part ID | Type | Purpose |
 |---|---|---|---|
@@ -360,6 +361,7 @@ Use this table to choose fitting parts for a new workflow policy. The exact reco
 | anime lanes | controlnet | LineArt sk_model2 | `329dce97...d3a3cd` | 0.016 GiB | other | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/329dce97d4adc92e463c9863d266a8b03b68e5a1bdee44474502981487d3a3cd.json) |
 | ltx | vae | taeltx2_3 (LTX 2.3 tiny VAE) | `32b0af06...84be11` | 0.022 GiB | ltx-2-community-license-agreement | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/32b0af063555e81fd65c85b699b858fd9f3b65a72cfe284c10ab5039a984be11.json) |
 | Wan 2.2 / LTX / Sulphur | upscaler | 2x-realesrganv2-animevideo-xsx2 | `34889283...0b6326` | 0.002 GiB | BSD-3-Clause | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/34889283fae69ea3a2dc515fe565251abe768b71d4dfd8c8f54b9b214b0b6326.json) |
+| Wan 2.2 / LTX / Sulphur | upscaler | 2x-realesrganv2-animevideo-xsx2 | `e3e7959a...e8da6d7` | 0.002 GiB | BSD-3-Clause | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/866c3b60b4804f34c1e84dff58a600cfbd465c73/records/e3e7959a2aa0cad5eacae5673d2790c29f9239eb076543739273c6c1ce8da6d7.json) |
 | ltx-av | video-model | LTX 2.3 official fp8 audio/video checkpoint | `34dfabbf...0d3ae2` | 27.14 GiB | ltx-2-community-license-agreement | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2.json) |
 | SDXL lanes | controlnet | IP-Adapter Plus SDXL vit-h | `3633a45c...09a8fe` | 0.789 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/3633a45ca19bd17df627362ef9b330f469082dabc53aa6ed2ca65ac8e109a8fe.json) |
 | Illustrious / NoobAI / Pony | controlnet | NoobAI SDXL ControlNet canny (fp16) | `3d8ced10...bb662d` | 2.33 GiB | other | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/3d8ced100edf3933617400698049858206b10a31f439cae21d1bb74db4bb662d.json) |

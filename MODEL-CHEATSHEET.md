@@ -299,7 +299,7 @@ executable version is not release-pinned, so this document does not invent one.
 | Exact model ID | Class | Canonical backend/artifact | Tier floor/fallback | Catalog RAM | Full-offload guidance | Download |
 |---|---|---|---|---:|---:|---:|
 | `hauhaucs/qwen3.6-35b-a3b-uncensored` | Text generation | vLLM / NVFP4 | Tier 1; use highest proved tier | 48 GiB | 24 GiB NVIDIA | 23,374,279,873 B (21.77 GiB) |
-| `google/gemma-4-E4B-it` | Text generation | llama.cpp / Q4_K_M GGUF | Tier 1; use highest proved tier | 12 GiB | 8 GiB | 6,326,841,504 B (5.89 GiB) |
+| `google/gemma-4-E4B-it` | Text generation | llama.cpp / Q4_K_M GGUF | Tier 1; use highest proved tier; cataloged, not owned-fleet served | 12 GiB | 8 GiB | 6,326,841,504 B (5.89 GiB) |
 | `tongyi/z-image-turbo` | Image generation | stable-diffusion.cpp / Q4_K GGUF | Tier 1; use highest proved tier | 16 GiB | 8 GiB | 6,696,835,812 B (6.24 GiB) |
 | `nvidia/parakeet-tdt-0.6b-v3` | Speech to text | Transformers safetensors | Tier 1; use highest proved tier | 8 GiB | 4 GiB | 2,509,473,204 B (2.34 GiB) |
 | `acestep/ace-step-1.5` | Music generation | ACE-Step safetensors composite | Tier 1; use highest proved tier | 16 GiB | 20 GiB | 10,092,101,191 B (9.40 GiB) |
@@ -308,6 +308,7 @@ executable version is not release-pinned, so this document does not invent one.
 | `ResembleAI/chatterbox` | Text to speech | PyTorch safetensors | Tier 1; use highest proved tier | 8 GiB | 6 GiB | 3,191,966,992 B (2.97 GiB) |
 | `huihui-ai/Huihui-Agents-A1-abliterated` | Text generation | llama.cpp Q4_K GGUF | Tier 1; use highest proved tier | 32 GiB | 32 GiB | 22,069,579,360 B (20.55 GiB) |
 | `Cactus-Compute/needle` | Deterministic tool selection | `needle-cpu` or CUDA-only `needle-gpu` | Tier 1; use highest proved tier | Managed preflight | See measured guidance | 30.4M parameters |
+| `video.minimax_h3.t2v_i2v` | Comfy workflow video+audio | ComfyUI / signed MiniMax H3 parts | Tier 1; provider proof pending | 96 GiB | 48 GiB | Four signed base parts, 42.29 GiB total |
 
 The RAM and full-offload columns are catalog admission/guidance fields. Model
 weights, runtime environments, caches, outputs, and build artifacts require
@@ -364,6 +365,9 @@ mayhem up --provider --provider-enclave hauhaucs/qwen3.6-35b-a3b-uncensored --ye
 Do not substitute another Qwen checkpoint, quantization, or CPU fallback.
 
 ## Gemma 4 E4B IT
+
+Owned-fleet status: cataloged only. Do not count Gemma as an owned live route
+unless a provider is explicitly running it.
 
 **Selector and source**
 

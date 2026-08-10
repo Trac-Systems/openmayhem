@@ -762,6 +762,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
+| `video.minimax_h3.t2v_i2v` | Comfy workflow, MiniMax H3 text/image-to-video with native audio | D | cataloged — provider proof pending |
 | `huihui-ai/Huihui-Agents-A1-abliterated` | Multimodal LLM, vision/video input, tools, uncensored, 262K ctx | C | **live** |
 | `ResembleAI/chatterbox` | TTS + zero-shot voice cloning | A/B | **live** |
 | `SulphurAI/Sulphur-2-base` | Video with synchronized audio, uncensored | C/D | **live** |
@@ -769,7 +770,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 | `ACE-Step/Ace-Step1.5` | Music generation | B/C | **live** |
 | `nvidia/parakeet-tdt-0.6b-v3` | ASR | A | **live** |
 | `Tongyi-MAI/Z-Image-Turbo` | Image | B/C | **live** |
-| `google/gemma-4-E4B-it` | LLM, small + vision, laptop/CPU-friendly | A/B | **live** |
+| `google/gemma-4-E4B-it` | LLM, small + vision, laptop/CPU-friendly | A/B | cataloged — not served by the owned fleet |
 | `HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive` (`@nvfp4`) | LLM, uncensored, 262K ctx | C | **live** |
 | `Cactus-Compute/needle` | Deterministic tools-only specialist, 30.4M, CPU/CUDA | A | **live** |
 | `microsoft/Mage-Flow-Edit-Turbo` | Image editing from a reference image + instruction, 512–2048 native | B | onboarding — **next (⑩)** |
@@ -974,6 +975,12 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 `mayhem down` deliberately drains and leaves those registrations.
 
 ## Development
+
+The current signed catalog adds `video.minimax_h3.t2v_i2v` as a Comfy
+workflow-class market with mirrored MiniMax H3 base parts, a signed
+workflow-class definition, active enclave/price/room rows, and native
+video+audio caps. It is not counted as public serving capacity until a provider
+completes admission and a paid `/v1/workflows` media proof passes review.
 
 The `0.2.123` source release adds metadata-only Comfy workflow-class policy
 calibration, signs workflow-class modality fingerprints for Krea base,
