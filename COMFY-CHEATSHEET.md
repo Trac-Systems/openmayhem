@@ -148,8 +148,8 @@ public capacity.
 
 | Candidate policy | Purpose | Parts needed | Missing work before serving |
 |---|---|---|---|
-| `video.minimax_h3.t2v_i2v` (name pending) | MiniMax H3 text/image-to-video with native stereo audio | FL2VA diffusion `c255309b14125341d1dc7bd1b8908cb544a0be44abf76bd700bf161a5bab1d3e`; Qwen3VL 32B NVFP4 text encoder `cb675f08e298d664d6507a97135321f7f509a82305dc86992b18a7c10852b322`; H3 video VAE `fe3fa062f56a28ec5d90ed6b4763a7f2fd88d147ebbcd19870f2a5ba02f4cd7d`; H3 audio VAE `00cd0d1524123a210b206c6e09ea81c6af63a9cb70f38e3efc4900f30d931379` | Mirror payloads into `TracNetwork/openmayhem-parts-index`; finalize records; publish next parts index; create signed workflow policy from official Comfy/H3 Easy graph evidence; run paid `/v1/workflows` quality proof. |
-| `video.minimax_h3.r2v` (name pending) | MiniMax H3 reference-to-video / reference-media workflow | All T2V/I2V H3 parts plus REF2VA diffusion `f581b4f18e1f08896fdb197011f07019650f52c82978799e7a6c2051d52c3a86` | Prove base H3 lane first; then research/refine R2V graph, input media bounds, policy, canary, and paid quality proof. |
+| `video.minimax_h3.t2v_i2v` (name pending) | MiniMax H3 text/image-to-video with native stereo audio | FL2VA diffusion `4c371bcbf8e7a577457d7b0ace66345fa85c88a591ca0724a5da6e9642371f72`; Qwen3VL 32B NVFP4 text encoder `32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab`; H3 video VAE `3abef9354f37bb10b413e7034d373e95193511cd80ffa5aea315d1d822032ce7`; H3 audio VAE `6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2` | Mirror payloads into `TracNetwork/openmayhem-parts-index`; finalize records; publish next parts index; create signed workflow policy from official Comfy/H3 Easy graph evidence; run paid `/v1/workflows` quality proof. |
+| `video.minimax_h3.r2v` (name pending) | MiniMax H3 reference-to-video / reference-media workflow | All T2V/I2V H3 parts plus REF2VA diffusion `b5f18df20fb79f5ae577ed27d16182251712d9a1f30a29af3ffbd6526356b87b` | Prove base H3 lane first; then research/refine R2V graph, input media bounds, policy, canary, and paid quality proof. |
 | `video.minimax_h3.spectrum` (optional, name pending) | H3 audio-quality/smoothing extension | H3 base parts plus Spectrum H3 extension payload if accepted | GPL-3.0 license/product acceptance, extension packaging as a signed runtime/custom-node part, graph policy, and quality proof. |
 
 MiniMax H3 is queued after the current calibration. Owner reviewed and approved the license path on
@@ -187,15 +187,17 @@ Validated H3 source manifest candidates, all from `Comfy-Org/MiniMax-H3` revisio
 
 | Role | File | Part ID | Size |
 |---|---|---:|---:|
-| FL2VA diffusion | `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors` | `c255309b14125341d1dc7bd1b8908cb544a0be44abf76bd700bf161a5bab1d3e` | 20,970,379,616 bytes |
-| Text encoder | `text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `cb675f08e298d664d6507a97135321f7f509a82305dc86992b18a7c10852b322` | 15,687,142,551 bytes |
-| Video VAE | `vae/minimax_h3_video_vae_fp16.safetensors` | `fe3fa062f56a28ec5d90ed6b4763a7f2fd88d147ebbcd19870f2a5ba02f4cd7d` | 5,207,808,496 bytes |
-| Audio VAE | `vae/minimax_h3_audio_vae_fp32.safetensors` | `00cd0d1524123a210b206c6e09ea81c6af63a9cb70f38e3efc4900f30d931379` | 605,254,808 bytes |
-| REF2VA diffusion | `diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors` | `f581b4f18e1f08896fdb197011f07019650f52c82978799e7a6c2051d52c3a86` | 20,970,379,616 bytes |
+| FL2VA diffusion | `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors` | `4c371bcbf8e7a577457d7b0ace66345fa85c88a591ca0724a5da6e9642371f72` | 20,970,379,616 bytes |
+| Text encoder | `text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab` | 15,687,142,551 bytes |
+| Video VAE | `vae/minimax_h3_video_vae_fp16.safetensors` | `3abef9354f37bb10b413e7034d373e95193511cd80ffa5aea315d1d822032ce7` | 5,207,808,496 bytes |
+| Audio VAE | `vae/minimax_h3_audio_vae_fp32.safetensors` | `6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2` | 605,254,808 bytes |
+| REF2VA diffusion | `diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors` | `b5f18df20fb79f5ae577ed27d16182251712d9a1f30a29af3ffbd6526356b87b` | 20,970,379,616 bytes |
 
 The initial H3 T2V/I2V policy should require the first four rows only. Add the
 REF2VA row when the R2V/reference-video class is separately proven. Do not rely
-on `resolve/main`; the validator must emit the immutable HF revision above. The
+on `resolve/main` or HF `ETag`; the validator must emit the immutable HF revision
+above and the SHA-256 must come from Hugging Face blob/LFS metadata or a verified
+payload hash. The
 community `ComfyUI-MiniMaxH3-Easy` and Spectrum H3 repos are research inputs,
 not permission to admit arbitrary optimizer/API nodes or GPL payloads into a
 public policy.

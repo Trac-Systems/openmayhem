@@ -975,6 +975,12 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
+The `0.2.122` source release corrects the MiniMax H3 Comfy parts manifest to use
+Hugging Face blob/LFS SHA-256 values instead of xet/cache `ETag` values. The H3
+part IDs in the Comfy policy-to-parts matrix are therefore regenerated from
+verified payload hashes; the smallest H3 base part was mirrored and SHA-checked
+through the intended parts path on the mirror host.
+
 The `0.2.121` source release makes Comfy parts YAML imports preserve explicit
 Hugging Face revisions when deriving `file_path` origins, so new workflow parts
 can be mirrored from immutable `/resolve/<40-hex>/...` sources instead of mutable
