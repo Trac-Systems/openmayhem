@@ -975,6 +975,13 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
+The `0.2.120` source release teaches catalog calibration to derive Comfy workflow
+canary requests from the signed workflow policy, including bounded `input_files`,
+and adds the InfiniteTalk `video.lipsync` dev reference row. Remaining workflow
+calibration lanes are Krea base, Krea+4x, and LTX A/V workflow-class fingerprints;
+MiniMax H3 is now the owner-priority next workflow calibration target using the
+official Comfy-Org source weights and reference workflows.
+
 The `0.2.118` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the
 local ComfyUI runtime directory, canonicalizes integer-valued workflow JSON

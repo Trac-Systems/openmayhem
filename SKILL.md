@@ -31,7 +31,9 @@ the signed parts index, required part sets, and `/v1/workflows` request shape.
 Every Comfy calibration must enumerate every file the graph actually loads in the signed workflow
 policy `parts` list. If the graph uses a checkpoint, text encoder, VAE, LoRA, ControlNet,
 upscaler, lipsync model, or helper model that is not in the signed parts index, mirror/sign that
-file first; do not prove or serve a workflow with manual out-of-policy downloads.
+file first; do not prove or serve a workflow with manual out-of-policy downloads. Accepted workflow
+canary rows must carry the complete signed-policy request shape, including `input_files` for media
+loaders; do not widen a whitelist or use placeholder graphs to make calibration pass.
 
 ComfyUI workflows are not a second app. They use the same gateway, provider, route, voucher,
 receipt, and settlement machinery, with the Mayhem-native endpoint `/v1/workflows` and endpoint
@@ -128,7 +130,8 @@ binary before succeeding. Managed Python backends need no system Python, `venv`,
 `pip`: Mayhem downloads the exact hash-pinned standalone `uv` for the host and atomically creates
 the frozen runtime under `~/.mayhem`.
 **ComfyUI workflows:** verify the blessed ComfyUI runtime checkout, currently
-`comfyui-v0.30.1`, and the Python executable that belongs to it. Use `python3` only when it is the
+`comfyui-v0.30.1` for Krea/LTX lanes or `comfyui-2a68ce33b4c9` for the InfiniteTalk lipsync
+reference lane, and the Python executable that belongs to it. Use `python3` only when it is the
 runtime environment's interpreter; otherwise set `MAYHEM_COMFYUI_PYTHON` to the exact executable.
 Workflow parts still come only from the signed parts index and require `mayhem provider parts pull`,
 `mayhem provider parts add`, and `mayhem provider parts admit --write` before serving. Workflow

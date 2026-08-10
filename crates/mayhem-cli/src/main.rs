@@ -16660,6 +16660,7 @@ fn calibration_token_prefixes(
 struct CatalogEndpointCalibrationFixtures {
     audio: Option<Vec<u8>>,
     audio_by_content_type: BTreeMap<&'static str, &'static [u8]>,
+    workflow_input_files: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -17185,6 +17186,7 @@ fn catalog_endpoint_calibration_fixtures(
     let mut substitutions = BTreeMap::from([("$MODEL".to_owned(), json!(model.model_id))]);
     let mut fixtures = CatalogEndpointCalibrationFixtures {
         audio: None,
+        workflow_input_files: None,
         audio_by_content_type: BTreeMap::from([
             ("audio/aac", CALIBRATION_AUDIO_AAC),
             ("audio/flac", CALIBRATION_AUDIO_FLAC),
@@ -17237,6 +17239,11 @@ fn catalog_endpoint_calibration_fixtures(
             &Value::Object(prompt.endpoint_attributes.clone().into_iter().collect()),
             &mut substitutions,
         );
+        if fixtures.workflow_input_files.is_none() {
+            if let Some(input_files) = prompt.endpoint_attributes.get("input_files") {
+                fixtures.workflow_input_files = Some(input_files.clone());
+            }
+        }
     }
     (substitutions, fixtures)
 }
@@ -17247,6 +17254,9 @@ fn catalog_endpoint_calibration_materialize_request(
     mut request: Value,
     fixtures: &CatalogEndpointCalibrationFixtures,
 ) -> Result<Value> {
+    if contract.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS {
+        return catalog_endpoint_calibration_materialize_workflow_request(case, request, fixtures);
+    }
     if contract.family != mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
         return Ok(request);
     }
@@ -17348,6 +17358,25 @@ fn catalog_endpoint_calibration_materialize_request(
             json!(base64::engine::general_purpose::STANDARD.encode(bytes)),
         );
     }
+    Ok(request)
+}
+
+fn catalog_endpoint_calibration_materialize_workflow_request(
+    case: &mayhem_proto::EndpointCalibrationCase,
+    mut request: Value,
+    fixtures: &CatalogEndpointCalibrationFixtures,
+) -> Result<Value> {
+    if !case.expect_accept || request.get("workflow").is_none() {
+        return Ok(request);
+    }
+    if mayhem_proto::validate_comfy_workflow_media_input_file_bindings(&request).is_ok() {
+        return Ok(request);
+    }
+    let input_files = fixtures
+        .workflow_input_files
+        .clone()
+        .context("workflow calibration accepted case has no complete input_files fixture")?;
+    request["input_files"] = input_files;
     Ok(request)
 }
 
@@ -17831,6 +17860,29 @@ fn catalog_endpoint_calibration_translation(
         | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => serde_json::to_value(
             provider_media_generation_request_from_body(&contract.family, request)?,
         )?,
+        mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS => {
+            let workflow = provider_comfy_workflow_binding(request, model.workflow.as_ref())?;
+            let workflow_output =
+                provider_session_workflow_output(request, model.workflow.as_ref())?;
+            let (_, input_media) = provider_workflow_input_files(request)?;
+            json!({
+                "kind": "workflow_generation",
+                "workflow": workflow,
+                "workflow_output": workflow_output,
+                "input_media": {
+                    "image_count": input_media.image_count,
+                    "image_max_bytes": input_media.image_max_bytes,
+                    "image_max_pixels": input_media.image_max_pixels,
+                    "audio_count": input_media.audio_count,
+                    "audio_max_bytes": input_media.audio_max_bytes,
+                    "audio_max_seconds": input_media.audio_max_seconds,
+                    "audio_seconds": input_media.audio_seconds,
+                    "video_count": input_media.video_count,
+                    "video_max_bytes": input_media.video_max_bytes,
+                    "video_max_frames": input_media.video_max_frames,
+                },
+            })
+        }
         other => bail!("endpoint family {other} has no provider calibration translation"),
     };
     let handled = contract
@@ -18045,6 +18097,7 @@ fn calibration_endpoint_attribute_is_handled(
         | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
         | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
         | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
+        | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
         | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => true,
         _ => false,
     }
@@ -22734,7 +22787,7 @@ fn canary_set_matrix_check(
                 .iter()
                 .find(|contract| contract.family == family)
                 .expect("selected endpoint family belongs to the signed adapter");
-            provider_video_canary_fixed_shape(contract, &body)
+            provider_video_canary_fixed_shape(contract, &body, model.workflow.as_ref())
                 .map_err(|error| format!("video canary prompt {}: {error:#}", prompt.id))?;
             let sealed =
                 provider_seal_local_contract_request(&body, &model.adapter, &model.model_id)
@@ -24198,8 +24251,8 @@ fn calibrate_video_av_fingerprint_prompt_with_speciality(
     )>,
 ) -> Result<CanaryCalibrationPromptReport> {
     ensure!(
-        model.model_class == MODEL_CLASS_VIDEO_GENERATION,
-        "video_av_fingerprint calibration is only valid for video-generation models"
+        model_supports_video_av_fingerprint_calibration(model),
+        "video_av_fingerprint calibration is only valid for video-generation or video workflow models"
     );
     ensure!(
         prompt.seed.is_some(),
@@ -24238,7 +24291,8 @@ fn calibrate_video_av_fingerprint_prompt_with_speciality(
         );
         apply_speciality_calibration_request(&mut body, contract, descriptor, level, mapping)?;
     }
-    let (fixed_frames, _fixed_fps) = provider_video_canary_fixed_shape(contract, &body)?;
+    let (fixed_frames, _fixed_fps) =
+        provider_video_canary_fixed_shape(contract, &body, model.workflow.as_ref())?;
     let sealed = provider_seal_local_contract_request(&body, &model.adapter, &model.model_id)
         .with_context(|| {
             format!(
@@ -24251,34 +24305,89 @@ fn calibrate_video_av_fingerprint_prompt_with_speciality(
     ensure!(
         matches!(
             verified.family,
-            mayhem_proto::ENDPOINT_OPENAI_VIDEOS | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS
+                | mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO
+                | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
         ),
         "video canary prompt {} resolved non-video endpoint {}",
         prompt.id,
         verified.family
     );
-    let conditioning_image = provider_video_canary_conditioning_image(contract, verified.request)?;
-    let request = provider_media_generation_request_from_body(&verified.family, &verified.request)?;
     let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
-    let output = backend
-        .generate_video(
-            request,
-            &mut |chunk: ArtifactChunk| artifact_chunks.push(chunk),
-            &CancellationToken::new(),
-        )
-        .with_context(|| format!("generating video canary prompt {}", prompt.id))?;
-    ensure!(
-        output.duration_seconds > 0 && output.frame_count > 0,
-        "video canary prompt {} returned zero duration or frames",
-        prompt.id
-    );
-    ensure!(
-        output.frame_count == fixed_frames,
-        "video canary prompt {} returned {} frames, expected fixed num_frames {}",
-        prompt.id,
-        output.frame_count,
-        fixed_frames
-    );
+    let (conditioning_image, output_duration_seconds, output_frame_count, usage) =
+        if verified.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS {
+            let workflow_output =
+                provider_session_workflow_output(verified.request, model.workflow.as_ref())?;
+            let workflow =
+                provider_comfy_workflow_binding(verified.request, model.workflow.as_ref())?;
+            let mut request = WorkflowGenerationRequest::new(
+                verified
+                    .request
+                    .get("workflow")
+                    .cloned()
+                    .context("workflow video canary missing workflow graph")?,
+            );
+            request.input_files = provider_workflow_input_files(verified.request)?.0;
+            if let Some(timeout_ms) = verified.request.get("timeout_ms").and_then(Value::as_u64) {
+                request.timeout_ms = timeout_ms;
+            }
+            let output = backend
+                .run_workflow(
+                    request,
+                    &mut |chunk: ArtifactChunk| artifact_chunks.push(chunk),
+                    &CancellationToken::new(),
+                )
+                .with_context(|| format!("running workflow video canary prompt {}", prompt.id))?;
+            let expected_artifacts = workflow_output
+                .metrics
+                .get("artifact_count")
+                .copied()
+                .unwrap_or(1)
+                .max(1);
+            ensure!(
+            u64::from(output.artifact_count) == expected_artifacts,
+            "workflow video canary prompt {} returned {} artifacts, expected {expected_artifacts}",
+            prompt.id,
+            output.artifact_count
+        );
+            let duration = workflow_output
+                .metrics
+                .get("duration_second")
+                .copied()
+                .unwrap_or(1)
+                .max(1);
+            (None, duration, fixed_frames, workflow.quoted_usage)
+        } else {
+            let conditioning_image =
+                provider_video_canary_conditioning_image(contract, verified.request)?;
+            let request =
+                provider_media_generation_request_from_body(&verified.family, &verified.request)?;
+            let output = backend
+                .generate_video(
+                    request,
+                    &mut |chunk: ArtifactChunk| artifact_chunks.push(chunk),
+                    &CancellationToken::new(),
+                )
+                .with_context(|| format!("generating video canary prompt {}", prompt.id))?;
+            ensure!(
+                output.duration_seconds > 0 && output.frame_count > 0,
+                "video canary prompt {} returned zero duration or frames",
+                prompt.id
+            );
+            ensure!(
+                output.frame_count == fixed_frames,
+                "video canary prompt {} returned {} frames, expected fixed num_frames {}",
+                prompt.id,
+                output.frame_count,
+                fixed_frames
+            );
+            (
+                conditioning_image,
+                output.duration_seconds,
+                output.frame_count,
+                provider_video_generation_usage(output.duration_seconds, output.frame_count),
+            )
+        };
     let artifacts = artifact_chunks.finish()?;
     ensure!(
         artifacts.len() == 1,
@@ -24316,7 +24425,7 @@ fn calibrate_video_av_fingerprint_prompt_with_speciality(
                 unit: "frame".to_owned(),
                 item_count: 1,
                 item_bytes: artifact_bytes,
-                item_units: output.frame_count,
+                item_units: output_frame_count,
             },
         ),
         (
@@ -24325,7 +24434,7 @@ fn calibrate_video_av_fingerprint_prompt_with_speciality(
                 unit: "second".to_owned(),
                 item_count: 1,
                 item_bytes: artifact_bytes,
-                item_units: output.duration_seconds,
+                item_units: output_duration_seconds,
             },
         ),
     ]);
@@ -24340,7 +24449,6 @@ fn calibrate_video_av_fingerprint_prompt_with_speciality(
             },
         );
     }
-    let usage = provider_video_generation_usage(output.duration_seconds, output.frame_count);
     let behavioral_witness = ProviderSessionOutput {
         content: String::new(),
         reasoning_evidence: String::new(),
@@ -24928,7 +25036,7 @@ fn aggregate_calibrated_modality_resource_profiles(
             model.canary.set_id
         );
         for (report, resource) in &candidates {
-            let paired_video_output = model.model_class == MODEL_CLASS_VIDEO_GENERATION
+            let paired_video_output = model_supports_video_av_fingerprint_calibration(model)
                 && matches!(report.resource_items.len(), 2 | 3)
                 && report.resource_items.contains_key("video")
                 && report.resource_items.contains_key("audio")
@@ -26654,6 +26762,17 @@ fn comfy_part_record_reference_model_path(
         .and_then(Value::as_str)
     {
         return safe_relative_comfy_model_path(path);
+    }
+    if let Some(path) = record
+        .adapter
+        .get("file_path")
+        .or_else(|| record.adapter.get("file"))
+        .and_then(Value::as_str)
+    {
+        let source_path = safe_relative_comfy_model_path(path)?;
+        if let Some(name) = source_path.file_name().and_then(|value| value.to_str()) {
+            return safe_relative_comfy_model_path(name);
+        }
     }
     let mut name = safe_path_component(record.name.trim());
     ensure!(
@@ -81576,6 +81695,12 @@ fn provider_workflow_output_modalities(model: &catalog::CatalogModel) -> BTreeSe
     modalities
 }
 
+fn model_supports_video_av_fingerprint_calibration(model: &catalog::CatalogModel) -> bool {
+    model.model_class == MODEL_CLASS_VIDEO_GENERATION
+        || (model.model_class == MODEL_CLASS_WORKFLOW
+            && provider_workflow_output_modalities(model).contains("video"))
+}
+
 fn provider_canary_self_test_body(
     model: &catalog::CatalogModel,
     prompt: &CanaryPrompt,
@@ -82228,7 +82353,11 @@ fn provider_video_canary_attribute<'a>(
 fn provider_video_canary_fixed_shape(
     contract: &mayhem_proto::EndpointFamilyContract,
     request: &Value,
+    workflow_policy: Option<&mayhem_proto::ComfyWorkflowCatalogPolicy>,
 ) -> Result<(u64, f64)> {
+    if contract.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS {
+        return provider_workflow_video_canary_fixed_shape(request, workflow_policy);
+    }
     let frames = provider_video_canary_attribute(contract, request, VIDEO_CANARY_FRAME_ATTRIBUTES)
         .and_then(Value::as_u64)
         .filter(|frames| *frames > 0)
@@ -82238,6 +82367,62 @@ fn provider_video_canary_fixed_shape(
         .filter(|fps| fps.is_finite() && *fps > 0.0 && *fps <= 240.0)
         .context("video canary must resolve a fixed fps through its signed endpoint family")?;
     Ok((frames, fps))
+}
+
+fn provider_workflow_video_canary_fixed_shape(
+    request: &Value,
+    workflow_policy: Option<&mayhem_proto::ComfyWorkflowCatalogPolicy>,
+) -> Result<(u64, f64)> {
+    let output = provider_session_workflow_output(request, workflow_policy)?;
+    ensure!(
+        output
+            .output_modalities
+            .iter()
+            .any(|value| value == "video"),
+        "workflow video canary must derive a video output modality"
+    );
+    let frames = output
+        .metrics
+        .get("frame")
+        .copied()
+        .filter(|frames| *frames > 0)
+        .context("workflow video canary must derive a fixed positive frame count")?;
+    let workflow = request
+        .get("workflow")
+        .context("workflow video canary missing workflow graph")?;
+    let fps = provider_workflow_numeric_metric(workflow, &["fps", "frame_rate"])
+        .map(|fps| fps as f64)
+        .or_else(|| {
+            output
+                .metrics
+                .get("duration_second")
+                .copied()
+                .filter(|duration| *duration > 0)
+                .map(|duration| frames as f64 / duration as f64)
+        })
+        .filter(|fps| fps.is_finite() && *fps > 0.0 && *fps <= 240.0)
+        .context("workflow video canary must derive a fixed fps")?;
+    Ok((frames, fps))
+}
+
+fn provider_workflow_numeric_metric(value: &Value, aliases: &[&str]) -> Option<u64> {
+    match value {
+        Value::Object(object) => {
+            let mut best = None;
+            for (key, child) in object {
+                if aliases.contains(&key.to_ascii_lowercase().as_str()) {
+                    best = best.max(child.as_u64().filter(|value| *value > 0));
+                }
+                best = best.max(provider_workflow_numeric_metric(child, aliases));
+            }
+            best
+        }
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|child| provider_workflow_numeric_metric(child, aliases))
+            .max(),
+        _ => None,
+    }
 }
 
 fn provider_video_canary_conditioning_image(
@@ -95990,6 +96175,15 @@ status: linked
         );
 
         record.adapter.insert(
+            "file_path".to_owned(),
+            Value::from("split_files/upscale_models/real-upscaler.pth"),
+        );
+        assert_eq!(
+            comfy_part_record_reference_model_path(&record).unwrap(),
+            PathBuf::from("real-upscaler.pth")
+        );
+
+        record.adapter.insert(
             "comfy_model_path".to_owned(),
             Value::from("custom/FancyUpscaler.safetensors"),
         );
@@ -108779,6 +108973,66 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn comfy_workflow_calibration_translation_derives_video_policy_terms() {
+        let mut model = test_catalog(&"aa".repeat(32)).models[0].clone();
+        model.model_id = "test/video-workflow".to_owned();
+        model.model_class = MODEL_CLASS_WORKFLOW.to_owned();
+        model.caps.output_modality = Some("video".to_owned());
+        model.caps.output_modalities = vec!["video".to_owned(), "audio".to_owned()];
+        model.adapter.modality_set = vec!["video".to_owned(), "audio".to_owned()];
+        model.workflow = Some(test_provider_comfy_video_workflow_policy());
+        let contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+        )
+        .expect("workflow endpoint contract template");
+        model.adapter.endpoint_families = vec![contract.clone()];
+        let request = test_provider_comfy_video_workflow_request();
+
+        let (translation, handled) =
+            catalog_endpoint_calibration_translation(&model, &contract, &request, &json!({}))
+                .expect("workflow calibration translation should be data-driven");
+        let (frames, fps) =
+            provider_video_canary_fixed_shape(&contract, &request, model.workflow.as_ref())
+                .expect("workflow video shape should be derived from the signed graph");
+
+        assert_eq!(translation["kind"], json!("workflow_generation"));
+        assert_eq!(
+            translation["workflow"]["endpoint_family"],
+            json!(mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS)
+        );
+        assert_eq!(
+            translation["workflow"]["runtime_id"],
+            json!("comfyui-v0.31.0")
+        );
+        assert_eq!(
+            translation["workflow"]["outcome_class"],
+            json!("video.test.av")
+        );
+        assert_eq!(
+            translation["workflow"]["quoted_usage"][USAGE_FRAME],
+            json!(96)
+        );
+        assert_eq!(
+            translation["workflow_output"]["output_modalities"],
+            json!(["audio", "video"])
+        );
+        assert_eq!(
+            translation["workflow_output"]["metrics"]["frame"],
+            json!(96)
+        );
+        assert_eq!(
+            translation["workflow_output"]["metrics"]["duration_second"],
+            json!(4)
+        );
+        assert_eq!((frames, fps), (96, 24.0));
+        assert!(handled.contains("model"));
+        assert!(handled.contains("workflow"));
+        assert!(handled.contains("runtime_id"));
+        assert!(handled.contains("outcome_class"));
+        assert!(handled.contains("response_format"));
+    }
+
+    #[test]
     fn provider_rejects_remote_or_malformed_media_before_engine_dispatch() {
         let mut terms = test_provider_session_terms();
         terms.served_modalities = vec!["text".to_owned(), "image".to_owned()];
@@ -115792,7 +116046,7 @@ State initialization...
 
         assert_eq!(verified.family, mayhem_proto::ENDPOINT_HF_TEXT_TO_VIDEO);
         assert_eq!(
-            provider_video_canary_fixed_shape(contract, verified.request).unwrap(),
+            provider_video_canary_fixed_shape(contract, verified.request, None).unwrap(),
             (9, 8.0)
         );
         assert!(
@@ -122323,6 +122577,20 @@ State initialization...
         }
     }
 
+    fn test_provider_comfy_video_workflow_policy() -> mayhem_proto::ComfyWorkflowCatalogPolicy {
+        mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["VHS_VideoCombine".to_owned(), "SaveAudio".to_owned()],
+            runtime_id: Some("comfyui-v0.31.0".to_owned()),
+            outcome_class: Some("video.test.av".to_owned()),
+            max_width: Some(768),
+            max_height: Some(512),
+            max_frames: Some(128),
+            max_duration_seconds: Some(12),
+            max_artifacts: Some(2),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        }
+    }
+
     fn test_provider_comfy_workflow_request(width: u64) -> Value {
         json!({
             "endpoint_family": mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
@@ -122339,6 +122607,35 @@ State initialization...
             },
             "runtime_id": "comfyui-v0.30.1",
             "outcome_class": "image.light.512",
+            "response_format": "artifact"
+        })
+    }
+
+    fn test_provider_comfy_video_workflow_request() -> Value {
+        json!({
+            "endpoint_family": mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            "model": "test/video-workflow",
+            "workflow": {
+                "1": {
+                    "class_type": "VHS_VideoCombine",
+                    "inputs": {
+                        "images": ["0", 0],
+                        "width": 768,
+                        "height": 512,
+                        "frame_rate": 24,
+                        "length": 96
+                    }
+                },
+                "2": {
+                    "class_type": "SaveAudio",
+                    "inputs": {
+                        "audio": ["0", 1],
+                        "duration_seconds": 4
+                    }
+                }
+            },
+            "runtime_id": "comfyui-v0.31.0",
+            "outcome_class": "video.test.av",
             "response_format": "artifact"
         })
     }

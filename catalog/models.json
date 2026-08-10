@@ -24482,22 +24482,101 @@
                 "calibration_values": [
                   {
                     "1": {
-                      "class_type": "EmptyImage",
+                      "class_type": "UNETLoader",
                       "inputs": {
-                        "width": 64,
-                        "height": 64,
-                        "batch_size": 1,
-                        "color": 0
+                        "unet_name": "krea2_turbo_fp8_scaled.safetensors",
+                        "weight_dtype": "default"
                       }
                     },
                     "2": {
-                      "class_type": "SaveImage",
+                      "class_type": "CLIPLoader",
                       "inputs": {
-                        "images": [
+                        "clip_name": "qwen3vl_4b_fp8_scaled.safetensors",
+                        "type": "krea2",
+                        "device": "default"
+                      }
+                    },
+                    "3": {
+                      "class_type": "VAELoader",
+                      "inputs": {
+                        "vae_name": "qwen_image_vae.safetensors"
+                      }
+                    },
+                    "4": {
+                      "class_type": "CLIPTextEncode",
+                      "inputs": {
+                        "clip": [
+                          "2",
+                          0
+                        ],
+                        "text": "A crisp cinematic product photo of a red espresso machine on a bright kitchen counter, natural morning light, sharp focus, tasteful commercial styling"
+                      }
+                    },
+                    "5": {
+                      "class_type": "ConditioningZeroOut",
+                      "inputs": {
+                        "conditioning": [
+                          "4",
+                          0
+                        ]
+                      }
+                    },
+                    "6": {
+                      "class_type": "EmptyLatentImage",
+                      "inputs": {
+                        "width": 1024,
+                        "height": 1024,
+                        "batch_size": 1
+                      }
+                    },
+                    "7": {
+                      "class_type": "KSampler",
+                      "inputs": {
+                        "seed": 87345219,
+                        "steps": 8,
+                        "cfg": 1.0,
+                        "sampler_name": "euler",
+                        "scheduler": "simple",
+                        "denoise": 1.0,
+                        "model": [
                           "1",
                           0
                         ],
-                        "filename_prefix": "mayhem-comfy-smoke"
+                        "positive": [
+                          "4",
+                          0
+                        ],
+                        "negative": [
+                          "5",
+                          0
+                        ],
+                        "latent_image": [
+                          "6",
+                          0
+                        ]
+                      }
+                    },
+                    "8": {
+                      "class_type": "VAEDecode",
+                      "inputs": {
+                        "samples": [
+                          "7",
+                          0
+                        ],
+                        "vae": [
+                          "3",
+                          0
+                        ]
+                      }
+                    },
+                    "9": {
+                      "class_type": "SaveImage",
+                      "inputs": {
+                        "filename_prefix": "mayhem-krea2-turbo",
+                        "images": [
+                          "8",
+                          0
+                        ]
                       }
                     }
                   }
@@ -25998,6 +26077,788 @@
             "unit": "megapixel_step",
             "per_unit_au": "90000000000000000",
             "granularity": 1000
+          }
+        ],
+        "per_req_au": "0",
+        "min_session_au": "0"
+      }
+    },
+    {
+      "model_id": "video.lipsync",
+      "min_app_version": "0.2.119",
+      "model_class": "workflow",
+      "family": "comfy-wan-infinitetalk",
+      "params_b": 14,
+      "tier": "dev",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "publisher_key": "huggingface-repo",
+          "repo": "TracNetwork/openmayhem-parts-index",
+          "revision": "3bc368034c7c1df8a4f6c46eb61dc5d9ccead56a"
+        },
+        "conversion": [
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:Wan2_1-I2V-14B-480p_fp8_e4m3fn_scaled_KJ.safetensors",
+            "input_sha256": "2ff922282cd84589702e6e8c26e083d1160bfc2b217dd44e1ae2688441dc495d",
+            "output_sha256": "2ff922282cd84589702e6e8c26e083d1160bfc2b217dd44e1ae2688441dc495d"
+          },
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors",
+            "input_sha256": "85c4a61c30e0497aa44b91d93a893b624708461a56fe5485183b28fa07e2dfb3",
+            "output_sha256": "85c4a61c30e0497aa44b91d93a893b624708461a56fe5485183b28fa07e2dfb3"
+          },
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:wan2.1_infiniteTalk_multi_fp16.safetensors",
+            "input_sha256": "4c2486cdfb6ff9a9f27408e98e11e20619136933b20411e0c365b1e84075d195",
+            "output_sha256": "4c2486cdfb6ff9a9f27408e98e11e20619136933b20411e0c365b1e84075d195"
+          },
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:wav2vec2-chinese-base_fp16.safetensors",
+            "input_sha256": "000813e441020f18cff844c969d2d5d4adc2a5ce46b2db1f23950b05d88805b4",
+            "output_sha256": "000813e441020f18cff844c969d2d5d4adc2a5ce46b2db1f23950b05d88805b4"
+          }
+        ],
+        "license": "apache-2.0-and-mit",
+        "license_sha256": "81cb083950350216d593dc8fda53105b7ae4a061b0e5f8b964414b406f1b89ad"
+      },
+      "artifacts": {
+        "workflow-class": {
+          "engine": "comfyui",
+          "source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "TracNetwork/openmayhem-parts-index",
+            "revision": "3bc368034c7c1df8a4f6c46eb61dc5d9ccead56a"
+          },
+          "path": "comfy/outcome-classes/v1/video.lipsync.json",
+          "artifact_root": "4720551bfe13ef91be6699c68f7fcf370033bccffc917ff91db1642ea05113c1",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 582,
+          "source_sha256": "d865aec5f8d038458f60b58ee6596eb47c7b712a95641110d95f05cb9e214790",
+          "download_check": false,
+          "notes": "Signed Comfy outcome-class definition for bounded InfiniteTalk lipsync workflow providers; concrete Wan/InfiniteTalk/Wav2Vec2 payload bytes are required through the workflow parts inventory."
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": false,
+        "ctx_max": 1,
+        "vision": false,
+        "image": false,
+        "video": true,
+        "audio": true,
+        "output_modality": "video",
+        "output_modalities": [
+          "video",
+          "audio"
+        ],
+        "max_video_width": 832,
+        "max_video_height": 480,
+        "max_video_frames": 81,
+        "max_video_seconds": 4
+      },
+      "requirements": {
+        "min_ram_gb": 96,
+        "min_vram_gb_full_offload": 48,
+        "cpu_flags": [],
+        "backends": [
+          "comfyui"
+        ]
+      },
+      "adapter": {
+        "endpoint_families": [
+          {
+            "family": "mayhem_comfy_workflows",
+            "request_attributes": [
+              "model",
+              "workflow",
+              "input_files",
+              "runtime_id",
+              "outcome_class",
+              "timeout_ms",
+              "response_format",
+              "user"
+            ],
+            "required_request_attributes": [
+              "model",
+              "workflow"
+            ],
+            "response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "request_attribute_specs": {
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "calibration_values": [
+                  "$MODEL"
+                ]
+              },
+              "workflow": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "1": {
+                      "class_type": "UNETLoader",
+                      "inputs": {
+                        "unet_name": "Wan2_1-I2V-14B-480p_fp8_e4m3fn_scaled_KJ.safetensors",
+                        "weight_dtype": "default"
+                      }
+                    },
+                    "2": {
+                      "class_type": "CLIPLoader",
+                      "inputs": {
+                        "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+                        "type": "wan",
+                        "device": "default"
+                      }
+                    },
+                    "3": {
+                      "class_type": "VAELoader",
+                      "inputs": {
+                        "vae_name": "wan_2.1_vae.safetensors"
+                      }
+                    },
+                    "4": {
+                      "class_type": "LoraLoaderModelOnly",
+                      "inputs": {
+                        "model": [
+                          "1",
+                          0
+                        ],
+                        "lora_name": "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors",
+                        "strength_model": 1.0
+                      }
+                    },
+                    "5": {
+                      "class_type": "ModelPatchLoader",
+                      "inputs": {
+                        "name": "wan2.1_infiniteTalk_multi_fp16.safetensors"
+                      }
+                    },
+                    "6": {
+                      "class_type": "AudioEncoderLoader",
+                      "inputs": {
+                        "audio_encoder_name": "wav2vec2-chinese-base_fp16.safetensors"
+                      }
+                    },
+                    "7": {
+                      "class_type": "LoadAudio",
+                      "inputs": {
+                        "audio": "fighter-a.wav"
+                      }
+                    },
+                    "8": {
+                      "class_type": "LoadAudio",
+                      "inputs": {
+                        "audio": "fighter-b.wav"
+                      }
+                    },
+                    "9": {
+                      "class_type": "LoadImage",
+                      "inputs": {
+                        "image": "anime-fight-reference.png"
+                      }
+                    },
+                    "10": {
+                      "class_type": "LoadImage",
+                      "inputs": {
+                        "image": "mask-left.png"
+                      }
+                    },
+                    "11": {
+                      "class_type": "LoadImage",
+                      "inputs": {
+                        "image": "mask-right.png"
+                      }
+                    },
+                    "12": {
+                      "class_type": "AudioEncoderEncode",
+                      "inputs": {
+                        "audio_encoder": [
+                          "6",
+                          0
+                        ],
+                        "audio": [
+                          "7",
+                          0
+                        ]
+                      }
+                    },
+                    "13": {
+                      "class_type": "AudioEncoderEncode",
+                      "inputs": {
+                        "audio_encoder": [
+                          "6",
+                          0
+                        ],
+                        "audio": [
+                          "8",
+                          0
+                        ]
+                      }
+                    },
+                    "14": {
+                      "class_type": "CLIPTextEncode",
+                      "inputs": {
+                        "clip": [
+                          "2",
+                          0
+                        ],
+                        "text": "modern anime action scene, two male fighters dueling at night on a neon rooftop, fast punches, sparks, dramatic camera, clear faces, synchronized dialogue, cinematic lighting, sharp line art"
+                      }
+                    },
+                    "15": {
+                      "class_type": "ConditioningZeroOut",
+                      "inputs": {
+                        "conditioning": [
+                          "14",
+                          0
+                        ]
+                      }
+                    },
+                    "16": {
+                      "class_type": "WanInfiniteTalkToVideo",
+                      "inputs": {
+                        "mode": "two_speakers",
+                        "model": [
+                          "4",
+                          0
+                        ],
+                        "model_patch": [
+                          "5",
+                          0
+                        ],
+                        "positive": [
+                          "14",
+                          0
+                        ],
+                        "negative": [
+                          "15",
+                          0
+                        ],
+                        "vae": [
+                          "3",
+                          0
+                        ],
+                        "width": 832,
+                        "height": 480,
+                        "length": 81,
+                        "audio_encoder_output_1": [
+                          "12",
+                          0
+                        ],
+                        "motion_frame_count": 9,
+                        "audio_scale": 1.0,
+                        "start_image": [
+                          "9",
+                          0
+                        ],
+                        "mode.audio_encoder_output_2": [
+                          "13",
+                          0
+                        ],
+                        "mode.mask_1": [
+                          "26",
+                          0
+                        ],
+                        "mode.mask_2": [
+                          "27",
+                          0
+                        ]
+                      }
+                    },
+                    "17": {
+                      "class_type": "RandomNoise",
+                      "inputs": {
+                        "noise_seed": 17
+                      }
+                    },
+                    "18": {
+                      "class_type": "KSamplerSelect",
+                      "inputs": {
+                        "sampler_name": "euler"
+                      }
+                    },
+                    "19": {
+                      "class_type": "BasicScheduler",
+                      "inputs": {
+                        "model": [
+                          "16",
+                          0
+                        ],
+                        "scheduler": "normal",
+                        "steps": 4,
+                        "denoise": 1.0
+                      }
+                    },
+                    "20": {
+                      "class_type": "CFGGuider",
+                      "inputs": {
+                        "model": [
+                          "16",
+                          0
+                        ],
+                        "positive": [
+                          "16",
+                          1
+                        ],
+                        "negative": [
+                          "16",
+                          2
+                        ],
+                        "cfg": 1.0
+                      }
+                    },
+                    "21": {
+                      "class_type": "SamplerCustomAdvanced",
+                      "inputs": {
+                        "noise": [
+                          "17",
+                          0
+                        ],
+                        "guider": [
+                          "20",
+                          0
+                        ],
+                        "sampler": [
+                          "18",
+                          0
+                        ],
+                        "sigmas": [
+                          "19",
+                          0
+                        ],
+                        "latent_image": [
+                          "16",
+                          3
+                        ]
+                      }
+                    },
+                    "22": {
+                      "class_type": "VAEDecode",
+                      "inputs": {
+                        "samples": [
+                          "21",
+                          0
+                        ],
+                        "vae": [
+                          "3",
+                          0
+                        ]
+                      }
+                    },
+                    "23": {
+                      "class_type": "AudioConcat",
+                      "inputs": {
+                        "audio1": [
+                          "7",
+                          0
+                        ],
+                        "audio2": [
+                          "8",
+                          0
+                        ],
+                        "direction": "after"
+                      }
+                    },
+                    "24": {
+                      "class_type": "CreateVideo",
+                      "inputs": {
+                        "images": [
+                          "22",
+                          0
+                        ],
+                        "fps": 25,
+                        "audio": [
+                          "23",
+                          0
+                        ],
+                        "bit_depth": 8
+                      }
+                    },
+                    "25": {
+                      "class_type": "SaveVideo",
+                      "inputs": {
+                        "video": [
+                          "24",
+                          0
+                        ],
+                        "filename_prefix": "mayhem-infinitetalk/anime-fight-lipsync",
+                        "format": "mp4",
+                        "codec": "auto"
+                      }
+                    },
+                    "26": {
+                      "class_type": "ImageToMask",
+                      "inputs": {
+                        "image": [
+                          "10",
+                          0
+                        ],
+                        "channel": "red"
+                      }
+                    },
+                    "27": {
+                      "class_type": "ImageToMask",
+                      "inputs": {
+                        "image": [
+                          "11",
+                          0
+                        ],
+                        "channel": "red"
+                      }
+                    }
+                  }
+                ]
+              },
+              "input_files": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 0,
+                "max_items": 16,
+                "calibration_values": [
+                  [
+                    {
+                      "filename": "mayhem/source.png",
+                      "kind": "image",
+                      "content_type": "image/png",
+                      "encoding": "base64",
+                      "data": "$IMAGE_BASE64"
+                    }
+                  ]
+                ]
+              },
+              "runtime_id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "comfyui-2a68ce33b4c9"
+                ]
+              },
+              "outcome_class": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "video.lipsync"
+                ]
+              },
+              "timeout_ms": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 900000,
+                "minimum": 1000,
+                "maximum": 3600000,
+                "calibration_values": [
+                  900000
+                ]
+              },
+              "response_format": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "artifact",
+                "enum_values": [
+                  "artifact",
+                  "json"
+                ],
+                "calibration_values": [
+                  "artifact",
+                  "json"
+                ]
+              },
+              "user": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 512,
+                "calibration_values": [
+                  "mayhem-calibration-user"
+                ]
+              }
+            },
+            "response_attribute_specs": {
+              "artifacts": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 0,
+                "max_items": 1000000,
+                "calibration_values": [
+                  []
+                ]
+              },
+              "id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "mayhem": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "object": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "progress": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 0,
+                "maximum": 18446744073709552000,
+                "calibration_values": [
+                  1
+                ]
+              },
+              "status": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "usage": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              }
+            },
+            "interaction_groups": []
+          }
+        ],
+        "chat_template_id": "generic_chatml",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "preserve",
+        "modality_set": [
+          "video",
+          "audio"
+        ]
+      },
+      "modality_assessment": {
+        "detected": [
+          "video",
+          "audio"
+        ],
+        "evidence": [
+          "Wan InfiniteTalk two-speaker Comfy workflow class uses request-supplied reference image, masks, and audio files; signed parts-index v11; paid quality proof pending."
+        ],
+        "calibrated_fingerprints": {
+          "workflow-class": {
+            "audio": "48609e4a6509b4ddbd3de02e776ea424ffea0e7a1e0109bf210f55ce2378e792",
+            "video": "48609e4a6509b4ddbd3de02e776ea424ffea0e7a1e0109bf210f55ce2378e792"
+          }
+        },
+        "resource_profiles": {
+          "workflow-class": {
+            "video": {
+              "unit": "frame",
+              "measurement_source": "infinitetalk_lipsync_reference_profile_pending_live_admission",
+              "max_item_bytes": 536870912,
+              "max_item_units": 81,
+              "measured_item_bytes": 536870912,
+              "measured_item_units": 81,
+              "measured_working_set_bytes": 32212254720,
+              "calibration_baseline_memory_bytes": 85899345920,
+              "calibration_peak_memory_bytes": 118111600640,
+              "calibration_f13_budget_bytes": 128849018880,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            },
+            "audio": {
+              "unit": "second",
+              "measurement_source": "request_supplied_dialogue_wav_bound_by_video_duration",
+              "max_item_bytes": 16777216,
+              "max_item_units": 4,
+              "measured_item_bytes": 16777216,
+              "measured_item_units": 4,
+              "measured_working_set_bytes": 32212254720,
+              "calibration_baseline_memory_bytes": 85899345920,
+              "calibration_peak_memory_bytes": 118111600640,
+              "calibration_f13_budget_bytes": 128849018880,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            }
+          }
+        }
+      },
+      "speciality_assessment": {
+        "detected": [],
+        "evidence": [
+          "No endpoint speciality is advertised for InfiniteTalk lipsync beyond the signed workflow policy and request-carried media inputs."
+        ],
+        "unsupported": {},
+        "calibrated": {}
+      },
+      "sampling": {
+        "temperature": 1,
+        "top_p": 1
+      },
+      "workflow": {
+        "whitelisted_nodes": [
+          "AudioConcat",
+          "AudioEncoderEncode",
+          "AudioEncoderLoader",
+          "BasicScheduler",
+          "CFGGuider",
+          "CLIPLoader",
+          "CLIPTextEncode",
+          "ConditioningZeroOut",
+          "CreateVideo",
+          "KSamplerSelect",
+          "LoadAudio",
+          "LoadImage",
+          "LoraLoaderModelOnly",
+          "ModelPatchLoader",
+          "RandomNoise",
+          "SamplerCustomAdvanced",
+          "SaveVideo",
+          "UNETLoader",
+          "VAEDecode",
+          "VAELoader",
+          "WanInfiniteTalkToVideo",
+          "ImageToMask"
+        ],
+        "parts": [
+          {
+            "part_id": "6a05292de329cdb06923008742e4f17329548239c2e2c3b10234276d790e1ef6",
+            "name": "Wan2_1-I2V-14B-480p_fp8_e4m3fn_scaled_KJ.safetensors",
+            "type": "video-model",
+            "sha256": "2ff922282cd84589702e6e8c26e083d1160bfc2b217dd44e1ae2688441dc495d"
+          },
+          {
+            "part_id": "720ea5ea7b9de57ca87b403856b0a7e42c96d1f1176ff886726ab602b6923709",
+            "name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+            "type": "text-encoder",
+            "sha256": "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68"
+          },
+          {
+            "part_id": "79f0076a485bca72333bfa34c767006606b4ff351e5d8abc2045865e12c8a664",
+            "name": "wan_2.1_vae.safetensors",
+            "type": "vae",
+            "sha256": "2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b"
+          },
+          {
+            "part_id": "6294fc7c467c664debaa9a50ea13bfd21959fe7aa29a9759f07541b66562c491",
+            "name": "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors",
+            "type": "lora",
+            "sha256": "85c4a61c30e0497aa44b91d93a893b624708461a56fe5485183b28fa07e2dfb3"
+          },
+          {
+            "part_id": "fd1d93c0ead8d77bc79d457e45bb391063a21fe3111b0a19ef7dc6a605c3b1fd",
+            "name": "wan2.1_infiniteTalk_multi_fp16.safetensors",
+            "type": "lipsync",
+            "sha256": "4c2486cdfb6ff9a9f27408e98e11e20619136933b20411e0c365b1e84075d195"
+          },
+          {
+            "part_id": "42ed9ac2d65ac013f5d5a431ff93b1e452371a6f1ba9bf8fdaa5c85b631e4f28",
+            "name": "wav2vec2-chinese-base_fp16.safetensors",
+            "type": "audio-model",
+            "sha256": "000813e441020f18cff844c969d2d5d4adc2a5ce46b2db1f23950b05d88805b4"
+          }
+        ],
+        "runtime_id": "comfyui-2a68ce33b4c9",
+        "outcome_class": "video.lipsync",
+        "pricing_unit": "frame",
+        "inventory_root": "1177b408d2ca9d5a8cabfbfb60c23716827a61e9982149c029442b71a9b210cd",
+        "max_nodes": 40,
+        "max_width": 832,
+        "max_height": 480,
+        "max_frames": 81,
+        "max_duration_seconds": 4,
+        "max_steps": 8,
+        "max_artifacts": 1
+      },
+      "canary": {
+        "set_id": "canary-infinitetalk-lipsync-workflow-launch-v1",
+        "match_min": 0.9,
+        "verification_method": "video_av_fingerprint",
+        "verification_tolerance_bps": 1500,
+        "fingerprints": {},
+        "token_prefixes": {},
+        "perceptual_hashes": {},
+        "embedding_vectors": {},
+        "transcripts": {},
+        "audio_fingerprints": {},
+        "video_fingerprints": {
+          "workflow-class": {
+            "infinitetalk-anime-fight-two-speaker-seed7": "videoav-v1:7b227769647468223a3833322c22686569676874223a3438302c226672616d655f636f756e74223a38312c226670735f6d696c6c69223a32353030302c22766964656f5f6475726174696f6e5f6d73223a333234302c22617564696f5f6475726174696f6e5f6d73223a333234302c226672616d655f686173686573223a5b2230633030346530323965303438653331656333306561373465333831653363316462633038393438633366336330623338336531383363333331383333303037222c2238633030646530323965303461653330636333306561643463336331653363316364383034646530633366336330623338336530383363313931383333383066222c2238343030636530303865323438653330656333386665356166663033633730333866653030366532303166326330383338306530383363313830383332303037222c2230613030396661303866666331666634636665306566633065666330366638313037633030336330303163326330383038303830383063313030383330303031222c2239363430386638303866653064666230646666306666633066666330366630313166633030376330303763326338303039303830383038313030383132303063222c2238383030666330316665303465656230666333306638353165333035653130316439653230386632633566326330383338316530383363313130383333303066222c2238633030396330333965303461653330656333306538373063333831663363316466633038393533633166336330623338336531383363333331383333303066222c2238383030386330313965303638653230656333306561373465333831653363316462633038396331633366336330623338336531383363333331383733303066222c2238303030386330313965303638653330656333306561373465333831653363316462633063643430633366336330623338336531383363333131383733303066222c2238633030396330323965303638653334636333346561353465336331653363316331383036646530343566336330623338336530383363333931383733303066222c2238633030396530323965323661653330636333346538643463313031363130333831653034376530343766326330393338336530383363333931383333303066222c2238303030386530323965303438653336653632346661383366383833633330333031653130336333343766336330383363316531383363333831383362303066222c2238303030386530333865303439363336653633346636363366656333653634313031613030316633303566336330393363316531383363333830383762303066222c2238303030386530333965303461653236656533306634363366623831653365396331633030326330303766326330393363316531383363333030383733303066225d2c22617564696f5f66696e6765727072696e74223a22617564696f737065632d76313a333330303a6565303231393432323632383230316430393033303366376533646165336366643965326636333533373065326132353137313430616665653765326464636665306563313233653237323531653231313730656564653164646463653066316637323933333266326632393163316130373031656166336439643764306365303433303138313232623133666465656530646163666432636663656365636565316538303233323038313630343135323031353038663865666465643263656534656330623337323731363138313230366663663966396637656465616665646565653134336431383163306531393230306530376637656464626431636565383164333334333234323431313232313531353061303165626535643563656635326632393366323831373038313030653062656364336431643363656365646565626665336232643061313132303133316130616633656166626633663165616638323533643235323931633232306666316532666366616632663265623030333132663139323832323134323031366631646266336637646564306365643664646630666465386532646365366633663465656366636663666365636565336566303333373164313131323136323031353039666165666531643364346534656330633362323032343066316432313230303765656635653364306365227d"
+          }
+        }
+      },
+      "price_ref_au": {
+        "denom": "au_usd",
+        "ver": 1,
+        "rate_map": [
+          {
+            "unit": "frame",
+            "per_unit_au": "200000000000000",
+            "granularity": 1
           }
         ],
         "per_req_au": "0",

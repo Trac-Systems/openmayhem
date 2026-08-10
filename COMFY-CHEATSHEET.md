@@ -5,13 +5,14 @@ This is the operational guide for ComfyUI workflow providers and users. It is in
 ## Current Signed Parts Index
 
 - Dataset: `TracNetwork/openmayhem-parts-index`
-- Revision: `023ab52a79182d4027429c0c8a12ea5bf03b81da`
-- Index root: `8599b956d3e004ffe073601b2cc1a8fbf34f5b9a0f90550b08b2ed353d60b465`
-- Anchor hash: `a964aff2dd609d8672dd2e438a36d5b07aa74cd5e84ace87ee14124596ebe5c1`
-- Index version: `10`
-- Parts: `85` (12 checkpoint, 1 clip-vision, 35 controlnet, 5 lipsync, 1 lora, 4 text-encoder, 19 upscaler, 6 vae, 2 video-model)
-- Index URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/023ab52a79182d4027429c0c8a12ea5bf03b81da/index.json
-- Anchor URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/023ab52a79182d4027429c0c8a12ea5bf03b81da/anchor.json
+- Revision: `3bc368034c7c1df8a4f6c46eb61dc5d9ccead56a`
+- Index root: `1177b408d2ca9d5a8cabfbfb60c23716827a61e9982149c029442b71a9b210cd`
+- Anchor hash: `af80d20c42f1c28ed1894dd07831913021ec8ba3b04a66dbe8e8b2cce2fc21d0`
+- Index version: `11`
+- Blessed runtimes: `comfyui-v0.30.1`, `comfyui-2a68ce33b4c9`
+- Parts: `90` (12 checkpoint, 1 clip-vision, 35 controlnet, 7 lipsync, 2 lora, 4 text-encoder, 19 upscaler, 6 vae, 3 video-model)
+- Index URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/3bc368034c7c1df8a4f6c46eb61dc5d9ccead56a/index.json
+- Anchor URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/3bc368034c7c1df8a4f6c46eb61dc5d9ccead56a/anchor.json
 
 ## User API
 
@@ -102,13 +103,60 @@ A Comfy calibration is not complete until all of these gates pass:
   signatures first. Record every user-facing control and default: prompts, negative prompts,
   dimensions, steps, sampler/scheduler, seed, guidance, LoRA strength, frame count, fps, audio
   format, voice/speaker/lipsync controls, upscaler choices, and load-plan requirements. The Mayhem
-  policy is the target of the diff, not the source of truth.
+  policy is the target of the diff, not the source of truth. Also record why the selected workflow
+  and parts are representative of real Comfy usage, using official templates, model-owner examples,
+  or high-signal community workflows/extensions with current adoption evidence. Do not bless a
+  workflow class just because one local graph happened to run.
 - Inventory gate: every file the reference graph actually loads is listed in `workflow.parts`, exists in the signed parts index, and was pulled through `provider parts pull` and advertised through `provider parts add`. Manual downloads, cache leftovers, or unsourced local files are not evidence.
 - Runtime gate: every node class in the graph is available in the blessed ComfyUI runtime or in a separately blessed extension policy. API-service nodes such as `sync.so` are not local OpenMayhem workflow proof unless the catalog explicitly declares that external-service policy.
 - Policy gate: the catalog row embeds the workflow policy, required parts, runtime id, node allowlist, output class, modality set, derivation limits, media input file schema, permitted content types, user-facing knob ranges/defaults, usage unit, and reference graph hash. A signed outcome-class definition alone is not a routable provider market.
 - Input-media gate: if the graph consumes image/audio/video files, the final proof must send them through `/v1/workflows` request media, not through provider-local files. The graph, provider admission, and paid route proof must reference the same safe filenames.
 - Quality gate: inspect the generated media. A container with the right codec, frame count, or waveform does not pass if the requested subject, motion, speech, or audio quality is missing.
 - Paid route gate: the final proof must go through the Mayhem provider/gateway path with `/v1/workflows`. Direct Comfy runs are useful for debugging only and must be labelled as such.
+- Canary-data gate: accepted workflow canary rows must carry the complete signed-policy request shape, including every bounded `input_files` entry used by loader nodes. Do not make a placeholder graph pass by expanding the whitelist; replace placeholders with the real reference workflow and keep provider validation strict.
+
+## Active Workflow Calibration Queue
+
+The signed catalog currently exposes four dev workflow rows. `video.lipsync` now has a catalog row,
+signed InfiniteTalk canary, and workflow-class modality fingerprint using runtime
+`comfyui-2a68ce33b4c9`, but the retained reference clip is not product-accepted: voice quality is
+robotic, lip sync is not convincing, and there is no useful background sound. Treat it as a
+technical graph/reference proof only, not a quality pass. The remaining workflow-class calibration
+gaps are:
+
+1. `video.heavy.le0_5mpf` — LTX A/V workflow-class modality fingerprint is the next video lane.
+2. `image.heavy.le1_2mp` — Krea 2 Turbo base image workflow-class modality fingerprint.
+3. `image.heavy.le17mp` — Krea 2 Turbo + 4x upscaler workflow-class modality fingerprint.
+
+MiniMax H3 is queued after the current calibration. Owner reviewed and approved the license path on
+2026-08-10. Use the official Comfy page and `Comfy-Org/MiniMax-H3` as sources. Prefer
+`int8_convrot` diffusion weights on PyTorch/CUDA 13 and the `qwen3vl_32b_minimax_h3_nvfp4_awq`
+text encoder; the Comfy-Org README states that text-encoder NVFP4 does not require Blackwell.
+Calibrate T2V first, then I2V/R2V only after the base lane is proven. Required proof coverage is one
+clean CUDA lane, either Windows CUDA or Spark CUDA, whichever fits fastest and safest. Add the second
+platform only if the first exposes platform-specific behavior.
+
+H3 reference workflow inputs:
+
+- `nkxx188/ComfyUI-MiniMaxH3-Easy` at commit
+  `80ebae8e3847358bfb1484da3db25bf6454c3333` is a MIT custom-node/reference-workflow
+  source for compact H3 T2V/I2V/first-last/reference-video graphs. Use it to understand
+  working graph shape and request controls, but do not bless its prompt optimizer path:
+  that path can call OpenAI/Gemini and stores API keys in plaintext JSON. Mayhem H3
+  policies must keep user media, prompt, seed, dialogue, duration, and reference choices
+  flexible inside the signed graph envelope, while excluding provider-side network/API
+  prompt optimization.
+- `xmarre/ComfyUI-Spectrum-MiniMax-H3` `v0.2.1` is an audio-quality/acceleration
+  candidate for H3. Its release makes `offline_smoothing_replay=true` the default to
+  avoid the reproduced single-pass speech/stutter defect, with `audio_blend_weight=0`.
+  It has no declared third-party Python dependency, but it is GPL-3.0; treat it as a
+  separately pinned custom-node/runtime part pending explicit license/product acceptance.
+
+Current H3 research state: official Comfy page plus `Comfy-Org/MiniMax-H3` prove native source
+weights and official template availability. `ComfyUI-MiniMaxH3-Easy` is adoption evidence for a
+compact H3 workflow surface, not sufficient alone to bless Mayhem policy. Spectrum H3 is candidate
+quality evidence for the audio path, not acceptance proof. The H3 class still needs an intended
+OpenMayhem `/v1/workflows` paid proof with retained media inspection before public serving.
 
 Run this coverage check whenever the parts index or cheatsheet changes:
 
@@ -155,7 +203,7 @@ and every referenced file must appear in `workflow.parts`.
 | `upscale.conv.le24mp`, `upscale.conv.le512mp` | Class exists. A provider policy must choose one or more signed upscaler parts and prove the exact graph. | Convolutional/restoration upscalers: `121becf8`, `17b705c5`, `23178907`, `34889283`, `522bad49`, `6a1ac0ec`, `6adc20e6`, `776268ba`, `7c3058ae`, `7c985640`, `851b706a`, `8dc290bc`, `96cfc3a4`, `a95240c0`, `b40716b2`, `c21510f4`, `d871ba30`, `dfa6e5df`. Use `e0f339c2` only inside LTX-AV latent-upscale policies. |
 | `upscale.diffusion` | Class exists. SeedVR2 policies need a dedicated proof; do not mix them into a convolutional-upscale admission. | Diffusion/video restoration parts: `9c98aed7` SeedVR2 3B, `ca6bff3f` SeedVR2 7B, `63e69083` SeedVR2 VAE. Optional video preprocessing/interpolation support: `6cc88536` RIFE 4.7, `865582d1` RIFE 4.9. |
 | `video.light.le0_5mpf`, `video.light.le2_2mpf`, `video.heavy.le0_5mpf`, `video.heavy.le2_2mpf` | Official LTX-AV uses `video.heavy.le0_5mpf` and has a paid mainnet proof for bounded anime fighting video with a real audio track. That proof is A/V evidence, not lipsync evidence. Other video classes need separate signed policy/canary if their caps or lane differ. | Video models: `34dfabbf` official LTX 2.3 fp8, `25055314` LTX GTAnimation low-VRAM candidate. Text encoders: `20652c80` Gemma 3 12B fp4, `720ea5ea` UMT5-XXL fp8 for Wan policies. LTX AV support: `988522cf` distilled LoRA, `e0f339c2` LTX spatial x2 latent upscaler, `8c108e3c` LTX audio VAE, `32b0af06` LTX tiny VAE. Video support: `40dd2b8b` Wan low-noise control, `660c1350` Wan high-noise control, `79f0076a` Wan VAE, `34889283` animevideo x2, `851b706a` animevideo x4, `6cc88536` RIFE 4.7, `865582d1` RIFE 4.9. |
-| `video.lipsync` | Class definition exists, but there is no launch-routable model row yet. The blessed `.70` `comfyui-v0.30.1` checkout verified on 2026-08-10 does not expose `WanInfiniteTalkToVideo`, and LatentSync's node pack is also not blessed. A real lipsync lane needs a blessed runtime or extension policy that exposes the node, exact template payloads, signed workflow policy, canary, and paid quality proof with request-carried speech media. | Already signed lipsync parts: `471fb7a0` LatentSync Whisper tiny, `d4330bc7` LatentSync SyncNet, `5cebda44` LatentSync UNet, `20bbd004` MeiGen InfiniteTalk single, `d8903b87` MeiGen InfiniteTalk multi. Candidate InfiniteTalk template payloads under review: `6a05292d` Wan2.1 I2V 14B 480p fp8, `6294fc7c` Lightx2v I2V rank64 LoRA, `42ed9ac2` wav2vec2 Chinese base fp16, `b36a713b` Comfy-Org InfiniteTalk single fp16, `fd1d93c0` Comfy-Org InfiniteTalk multi fp16. Common signed companions: `720ea5ea` UMT5-XXL fp8 and `79f0076a` Wan 2.1 VAE. |
+| `video.lipsync` | Dev catalog row exists for InfiniteTalk, with runtime `comfyui-2a68ce33b4c9`, signed workflow policy, request-carried image/audio `input_files`, and workflow-class canary fingerprint. The retained reference clip is a technical graph proof only and fails quality acceptance: robotic voice, weak/absent lip sync, and no useful background sound. Public paid-route proof is still a separate gate: start a provider only after `parts pull`/`parts add`/`parts admit --write` against the same policy and then run a paid `/v1/workflows` request with acceptable speech/lipsync quality. LatentSync remains unblessed. | Signed lipsync parts: `471fb7a0` LatentSync Whisper tiny, `d4330bc7` LatentSync SyncNet, `5cebda44` LatentSync UNet, `20bbd004` MeiGen InfiniteTalk single, `d8903b87` MeiGen InfiniteTalk multi, `b36a713b` Comfy-Org InfiniteTalk single fp16, `fd1d93c0` Comfy-Org InfiniteTalk multi fp16, `6a05292d` Wan2.1 I2V 14B 480p fp8, `6294fc7c` Lightx2v I2V rank64 LoRA, `42ed9ac2` wav2vec2 Chinese base fp16. Common signed companions: `720ea5ea` UMT5-XXL fp8 and `79f0076a` Wan 2.1 VAE. |
 | `audio.tts`, `audio.generation`, `audio.stt` | Classes exist but this parts index has no standalone TTS, audio-generation, or STT model policy ready for public serving. | No standalone audio-class parts are currently signed. `8c108e3c` is only the LTX AV audio VAE, and the lipsync parts are only for `video.lipsync` policies. |
 | `compute.norm` | Class exists for bounded residual workflow compute, not for arbitrary unsigned execution. | No class-ready parts in this index. A workflow must publish its own signed parts and policy before admission. |
 
@@ -216,7 +264,7 @@ These are signed support parts for lipsync/talking-video workflow classes. They 
 
 Current runtime status:
 
-- InfiniteTalk: the signed MeiGen/Comfy-Org weights are inventory candidates, but the verified `.70` blessed `comfyui-v0.30.1` checkout at commit `0764232429b8cfb10b79b6f186c8cb23e0b22897` does not currently expose `WanInfiniteTalkToVideo` in `nodes.NODE_CLASS_MAPPINGS`. Do not publish or admit an InfiniteTalk workflow until the runtime/extension that exposes the node is blessed and the exact graph is proven.
+- InfiniteTalk: the dev calibration runtime is `comfyui-2a68ce33b4c9`. The retained reference output is `openmayhem-infinitetalk-anime-fight-louder-reference-v0.2.119.mp4` in Downloads and proves only that a bounded two-speaker anime fight graph can run with request-carried image/audio media. It does not pass quality acceptance; do not advertise it as successful lipsync.
 - Input media: InfiniteTalk proofs need a source image/video frame and an audio clip carried by
   `/v1/workflows` `input_files`. WAV, FLAC, and MP3 are acceptable only when the workflow-input
   bridge validates bounded duration and writes the files into the isolated Comfy input directory
