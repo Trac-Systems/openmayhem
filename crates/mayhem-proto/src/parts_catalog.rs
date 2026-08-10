@@ -744,6 +744,12 @@ fn yaml_sources(
     object: &serde_json::Map<String, Value>,
 ) -> Result<ComfyPartSources, ComfyPartsCatalogError> {
     let mut origins = Vec::new();
+    let source_revision = object
+        .get("revision")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|revision| !revision.is_empty())
+        .map(str::to_owned);
     let source_path = object
         .get("file")
         .or_else(|| object.get("file_path"))
@@ -767,12 +773,13 @@ fn yaml_sources(
         if origins.is_empty() && source_kind == "huggingface" {
             if let Some(path) = source_path.as_deref() {
                 let repository = source.trim().trim_end_matches('/').to_owned();
+                let revision = source_revision.clone().unwrap_or_else(|| "main".to_owned());
                 origins.push(ComfyPartSource {
                     kind: "huggingface".to_owned(),
-                    url: format!("{repository}/resolve/main/{path}"),
+                    url: format!("{repository}/resolve/{revision}/{path}"),
                     repository: Some(repository),
                     path: Some(path.to_owned()),
-                    revision: None,
+                    revision: source_revision,
                 });
                 return Ok(ComfyPartSources {
                     mirrors: Vec::new(),
@@ -1293,6 +1300,31 @@ mod tests {
             draft.sources.origins[0].path.as_deref(),
             Some("split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors")
         );
+    }
+
+    #[test]
+    fn yaml_import_resolves_huggingface_file_path_sources_with_revision() {
+        let revision = "014cd40f7e177756c6b2473c0d93b1c89a790dd2";
+        let row = serde_json::json!({
+            "name": "MiniMax H3 audio VAE fp32",
+            "type": "vae",
+            "lane": "minimax-h3",
+            "source": "https://huggingface.co/Comfy-Org/MiniMax-H3",
+            "file_path": "vae/minimax_h3_audio_vae_fp32.safetensors",
+            "revision": revision,
+            "sha256": "d132ce0297fda95139762b689c22de3507581b897c03f766964a9edfee8c8d3c",
+            "size_bytes": 605_254_808_u64,
+            "license": "other",
+            "status": "linked",
+        });
+        let draft = ComfyPartDraft::from_yaml_value(&row).unwrap();
+        assert_eq!(
+            draft.sources.origins[0].url,
+            format!(
+                "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/{revision}/vae/minimax_h3_audio_vae_fp32.safetensors"
+            )
+        );
+        assert_eq!(draft.sources.origins[0].revision.as_deref(), Some(revision));
     }
 
     #[test]

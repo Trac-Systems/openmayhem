@@ -128,6 +128,30 @@ gaps are:
 2. `image.heavy.le1_2mp` — Krea 2 Turbo base image workflow-class modality fingerprint.
 3. `image.heavy.le17mp` — Krea 2 Turbo + 4x upscaler workflow-class modality fingerprint.
 
+## Workflow Policy To Parts Matrix
+
+This is the authoritative short table for which signed parts belong to which
+workflow policy. A policy may exist in the dev catalog before it is
+product-accepted; check the `Acceptance state` column before treating it as live
+public capacity.
+
+### Current Signed Workflow Policies
+
+| Policy / model ID | Purpose | Required parts | Runtime | Acceptance state |
+|---|---|---|---|---|
+| `image.heavy.le1_2mp` | Krea 2 Turbo base image generation up to 1024x1024 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70` | `comfyui-v0.30.1` | Signed dev policy exists; workflow-class fingerprint and paid quality proof still required before public serving. |
+| `image.heavy.le17mp` | Krea 2 Turbo plus 4x upscale up to 4096x4096 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70`; 4x-spanx4 `d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a` | `comfyui-v0.30.1` | Signed dev policy exists; workflow-class fingerprint and paid quality proof still required before public serving. |
+| `video.heavy.le0_5mpf` | LTX 2.3 native audio/video generation up to 768x512, 8s, 192 frames | LTX 2.3 fp8 AV checkpoint `34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2`; Gemma 3 12B fp4 text encoder `20652c80fc8e88963343b9968722becb2118d507befbbf0272aa8d79e99893cc`; LTX distilled LoRA 384 `988522cff35f19d7c5977472be163f05b49bf381e441963da4182b0a90b1116c`; LTX spatial upscaler `e0f339c2b5c13fcae1b78cade132ae0307114026c6d20642335eccb4887a050d`; LTX audio VAE `8c108e3ce85d127cef5dbb5747f8c30d2a30c6d92f215278399224e38ffe806c` | `comfyui-v0.30.1` | Signed dev policy exists; workflow-class fingerprint and paid quality proof still required before public serving. |
+| `video.lipsync` | Wan/InfiniteTalk lipsync/talking-video workflow up to 832x480, 4s, 81 frames | Wan2.1 I2V 14B fp8 `6a05292de329cdb06923008742e4f17329548239c2e2c3b10234276d790e1ef6`; UMT5-XXL fp8 `720ea5ea7b9de57ca87b403856b0a7e42c96d1f1176ff886726ab602b6923709`; Wan 2.1 VAE `79f0076a485bca72333bfa34c767006606b4ff351e5d8abc2045865e12c8a664`; Lightx2v I2V LoRA `6294fc7c467c664debaa9a50ea13bfd21959fe7aa29a9759f07541b66562c491`; InfiniteTalk multi fp16 `fd1d93c0ead8d77bc79d457e45bb391063a21fe3111b0a19ef7dc6a605c3b1fd`; Wav2Vec2 Chinese base fp16 `42ed9ac2d65ac013f5d5a431ff93b1e452371a6f1ba9bf8fdaa5c85b631e4f28` | `comfyui-2a68ce33b4c9` | Signed dev policy and technical canary exist; product proof failed quality review, so do not call it accepted public capacity yet. |
+
+### Planned Or Missing Workflow Policies
+
+| Candidate policy | Purpose | Parts needed | Missing work before serving |
+|---|---|---|---|
+| `video.minimax_h3.t2v_i2v` (name pending) | MiniMax H3 text/image-to-video with native stereo audio | FL2VA diffusion `c255309b14125341d1dc7bd1b8908cb544a0be44abf76bd700bf161a5bab1d3e`; Qwen3VL 32B NVFP4 text encoder `cb675f08e298d664d6507a97135321f7f509a82305dc86992b18a7c10852b322`; H3 video VAE `fe3fa062f56a28ec5d90ed6b4763a7f2fd88d147ebbcd19870f2a5ba02f4cd7d`; H3 audio VAE `00cd0d1524123a210b206c6e09ea81c6af63a9cb70f38e3efc4900f30d931379` | Mirror payloads into `TracNetwork/openmayhem-parts-index`; finalize records; publish next parts index; create signed workflow policy from official Comfy/H3 Easy graph evidence; run paid `/v1/workflows` quality proof. |
+| `video.minimax_h3.r2v` (name pending) | MiniMax H3 reference-to-video / reference-media workflow | All T2V/I2V H3 parts plus REF2VA diffusion `f581b4f18e1f08896fdb197011f07019650f52c82978799e7a6c2051d52c3a86` | Prove base H3 lane first; then research/refine R2V graph, input media bounds, policy, canary, and paid quality proof. |
+| `video.minimax_h3.spectrum` (optional, name pending) | H3 audio-quality/smoothing extension | H3 base parts plus Spectrum H3 extension payload if accepted | GPL-3.0 license/product acceptance, extension packaging as a signed runtime/custom-node part, graph policy, and quality proof. |
+
 MiniMax H3 is queued after the current calibration. Owner reviewed and approved the license path on
 2026-08-10. Use the official Comfy page and `Comfy-Org/MiniMax-H3` as sources. Prefer
 `int8_convrot` diffusion weights on PyTorch/CUDA 13 and the `qwen3vl_32b_minimax_h3_nvfp4_awq`
@@ -157,6 +181,24 @@ weights and official template availability. `ComfyUI-MiniMaxH3-Easy` is adoption
 compact H3 workflow surface, not sufficient alone to bless Mayhem policy. Spectrum H3 is candidate
 quality evidence for the audio path, not acceptance proof. The H3 class still needs an intended
 OpenMayhem `/v1/workflows` paid proof with retained media inspection before public serving.
+
+Validated H3 source manifest candidates, all from `Comfy-Org/MiniMax-H3` revision
+`014cd40f7e177756c6b2473c0d93b1c89a790dd2`:
+
+| Role | File | Part ID | Size |
+|---|---|---:|---:|
+| FL2VA diffusion | `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors` | `c255309b14125341d1dc7bd1b8908cb544a0be44abf76bd700bf161a5bab1d3e` | 20,970,379,616 bytes |
+| Text encoder | `text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `cb675f08e298d664d6507a97135321f7f509a82305dc86992b18a7c10852b322` | 15,687,142,551 bytes |
+| Video VAE | `vae/minimax_h3_video_vae_fp16.safetensors` | `fe3fa062f56a28ec5d90ed6b4763a7f2fd88d147ebbcd19870f2a5ba02f4cd7d` | 5,207,808,496 bytes |
+| Audio VAE | `vae/minimax_h3_audio_vae_fp32.safetensors` | `00cd0d1524123a210b206c6e09ea81c6af63a9cb70f38e3efc4900f30d931379` | 605,254,808 bytes |
+| REF2VA diffusion | `diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors` | `f581b4f18e1f08896fdb197011f07019650f52c82978799e7a6c2051d52c3a86` | 20,970,379,616 bytes |
+
+The initial H3 T2V/I2V policy should require the first four rows only. Add the
+REF2VA row when the R2V/reference-video class is separately proven. Do not rely
+on `resolve/main`; the validator must emit the immutable HF revision above. The
+community `ComfyUI-MiniMaxH3-Easy` and Spectrum H3 repos are research inputs,
+not permission to admit arbitrary optimizer/API nodes or GPL payloads into a
+public policy.
 
 Run this coverage check whenever the parts index or cheatsheet changes:
 

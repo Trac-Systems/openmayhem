@@ -975,6 +975,13 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
+The `0.2.121` source release makes Comfy parts YAML imports preserve explicit
+Hugging Face revisions when deriving `file_path` origins, so new workflow parts
+can be mirrored from immutable `/resolve/<40-hex>/...` sources instead of mutable
+`main`. It also records the validated MiniMax H3 source manifest in the Comfy
+cheatsheet; H3 still requires parts mirroring, workflow policy publication, and
+a paid `/v1/workflows` quality proof before public serving.
+
 The `0.2.120` source release teaches catalog calibration to derive Comfy workflow
 canary requests from the signed workflow policy, including bounded `input_files`,
 and adds the InfiniteTalk `video.lipsync` dev reference row. Remaining workflow
