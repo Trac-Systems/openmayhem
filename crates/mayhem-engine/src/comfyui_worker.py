@@ -336,6 +336,9 @@ async def run_workflow(payload):
             json={"prompt": workflow, "client_id": client_id},
         ) as response:
             submitted = await response.json()
+        if "prompt_id" not in submitted:
+            detail = json.dumps(submitted, sort_keys=True, separators=(",", ":"))[:4096]
+            raise RuntimeError(f"ComfyUI prompt submission failed: {detail}")
         prompt_id = submitted["prompt_id"]
         deadline = asyncio.get_event_loop().time() + timeout_ms / 1000.0
         progress = []

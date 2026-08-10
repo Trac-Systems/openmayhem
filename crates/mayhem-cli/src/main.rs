@@ -82330,30 +82330,48 @@ fn validate_provider_workflow_canary_output(
     for modality in modalities {
         match modality.as_str() {
             "image" => ensure!(
-                output
-                    .artifacts
-                    .iter()
-                    .any(|artifact| artifact.content_type.starts_with("image/")),
+                provider_workflow_output_has_modality(output, "image"),
                 "workflow image canary produced no image artifact"
             ),
             "video" => ensure!(
-                output
-                    .artifacts
-                    .iter()
-                    .any(|artifact| artifact.content_type.starts_with("video/")),
+                provider_workflow_output_has_modality(output, "video"),
                 "workflow video canary produced no video artifact"
             ),
             "audio" => ensure!(
-                output
-                    .artifacts
-                    .iter()
-                    .any(|artifact| artifact.content_type.starts_with("audio/")),
+                provider_workflow_output_has_modality(output, "audio"),
                 "workflow audio canary produced no audio artifact"
             ),
             other => bail!("workflow modality canary validation is not wired for {other}"),
         }
     }
     Ok(())
+}
+
+fn provider_workflow_output_has_modality(output: &ProviderSessionOutput, modality: &str) -> bool {
+    match modality {
+        "image" => output
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.content_type.starts_with("image/")),
+        "video" => output
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.content_type.starts_with("video/")),
+        "audio" => output
+            .artifacts
+            .iter()
+            .any(provider_workflow_artifact_covers_audio),
+        _ => false,
+    }
+}
+
+fn provider_workflow_artifact_covers_audio(artifact: &ProviderSessionArtifact) -> bool {
+    if artifact.content_type.starts_with("audio/") {
+        return true;
+    }
+    // Some Comfy A/V workflows return one muxed MP4 instead of a separate audio file.
+    // Only accept that for audio coverage when the canary decoder finds non-silent audio.
+    artifact.content_type == "video/mp4" && video_av_fingerprint(&artifact.bytes).is_ok()
 }
 
 fn provider_engine_load_config(
@@ -90960,6 +90978,49 @@ mod tests {
             "data:image/png;base64,{}",
             base64::engine::general_purpose::STANDARD.encode(tiny_png_bytes())
         )
+    }
+
+    fn test_provider_output_with_artifacts(
+        artifacts: Vec<ProviderSessionArtifact>,
+    ) -> ProviderSessionOutput {
+        ProviderSessionOutput {
+            content: String::new(),
+            reasoning_evidence: String::new(),
+            tools: Vec::new(),
+            embeddings: None,
+            transcription: None,
+            artifacts,
+            finish_reason: "stop".to_owned(),
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            token_ids: Vec::new(),
+            usage: ReceiptUsage::default(),
+            usage_attribution: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn workflow_audio_modality_accepts_audio_artifacts_but_not_invalid_muxed_video() {
+        let audio = test_provider_output_with_artifacts(vec![ProviderSessionArtifact {
+            id: "audio-1".to_owned(),
+            content_type: "audio/wav".to_owned(),
+            bytes: tiny_wav_bytes(16_000),
+        }]);
+        assert!(provider_workflow_output_has_modality(&audio, "audio"));
+
+        let invalid_video = test_provider_output_with_artifacts(vec![ProviderSessionArtifact {
+            id: "video-1".to_owned(),
+            content_type: "video/mp4".to_owned(),
+            bytes: b"not a decodable mp4".to_vec(),
+        }]);
+        assert!(provider_workflow_output_has_modality(
+            &invalid_video,
+            "video"
+        ));
+        assert!(!provider_workflow_output_has_modality(
+            &invalid_video,
+            "audio"
+        ));
     }
 
     #[test]

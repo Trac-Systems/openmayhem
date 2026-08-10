@@ -975,7 +975,7 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
-The `0.2.116` source release documents the current Comfy parts inventory,
+The `0.2.117` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the
 local ComfyUI runtime directory, canonicalizes integer-valued workflow JSON
 floats before graph hashing, and derives Comfy upscaler output dimensions from
@@ -983,7 +983,8 @@ the signed upscaler part scale. A 1024x1024 Krea graph followed by a signed 4x
 upscaler is therefore routed and billed as a 4096x4096 workflow, not as the
 base image. It also carries bounded workflow `input_files` for image/audio/video
 source media, which lipsync and talking-video policies use through the normal
-paid `/v1/workflows` path. The dedicated Comfy reference is
+paid `/v1/workflows` path, and validates muxed A/V workflow canaries whose audio
+track is embedded in the returned MP4. The dedicated Comfy reference is
 **[COMFY-CHEATSHEET.md](COMFY-CHEATSHEET.md)**.
 
 The `0.2.104` source release makes local builds self-consistent across macOS,

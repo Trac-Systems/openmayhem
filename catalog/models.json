@@ -25262,7 +25262,7 @@
             "kind": "huggingface",
             "publisher_key": "huggingface-repo",
             "repo": "TracNetwork/openmayhem-parts-index",
-            "revision": "6869a4abf865143057c2536c3e34561755ad5dde"
+            "revision": "2539e9a49409ece931c115dab81e0873f57ae12d"
           },
           "path": "comfy/outcome-classes/v1/video.heavy.le0_5mpf.json",
           "artifact_root": "9343ccbbe2828225fcb1da06323ba97cae0be8bb1dd4bc8aa9b54079ebd4b7f3",
@@ -25445,7 +25445,7 @@
                           "2",
                           0
                         ],
-                        "text": "modern anime action scene, two young male fighters clashing in a city alley, fast camera motion, expressive lip-synced shouted lines, sparks, impact frames, dynamic poses, cinematic lighting"
+                        "text": "high quality modern anime fight scene, two rival young men in dramatic combat on a neon city rooftop at night, one shouts I will stop you and the other shouts not today, visible mouth movement, energetic voices, fast punches and kicks, impact frames, sparks, cloth motion, cinematic camera, clean faces, full bodies, sharp anime line art, dynamic action"
                       }
                     },
                     "6": {
@@ -25455,7 +25455,7 @@
                           "2",
                           0
                         ],
-                        "text": "low quality, fog, abstract noise, static shot, distorted face, missing eyes, extra limbs, unreadable subtitles, watermark"
+                        "text": "low quality, fog, abstract noise, still image, slow motion only, distorted face, missing eye, extra limbs, deformed hands, unreadable subtitles, watermark, blurry, psychedelic artifacts, no characters, no voice, silent"
                       }
                     },
                     "7": {
@@ -25475,16 +25475,16 @@
                     "8": {
                       "class_type": "EmptyLTXVLatentVideo",
                       "inputs": {
-                        "width": 512,
-                        "height": 288,
-                        "length": 97,
+                        "width": 768,
+                        "height": 432,
+                        "length": 121,
                         "batch_size": 1
                       }
                     },
                     "9": {
                       "class_type": "LTXVEmptyLatentAudio",
                       "inputs": {
-                        "frames_number": 97,
+                        "frames_number": 121,
                         "frame_rate": 24,
                         "batch_size": 1,
                         "audio_vae": [
@@ -25527,7 +25527,7 @@
                     "12": {
                       "class_type": "RandomNoise",
                       "inputs": {
-                        "noise_seed": 7
+                        "noise_seed": 11
                       }
                     },
                     "13": {
@@ -25571,8 +25571,16 @@
                       "class_type": "LTXVCropGuides",
                       "inputs": {
                         "latent": [
-                          "15",
+                          "29",
                           0
+                        ],
+                        "positive": [
+                          "7",
+                          0
+                        ],
+                        "negative": [
+                          "7",
+                          1
                         ]
                       }
                     },
@@ -25586,16 +25594,16 @@
                       "class_type": "LTXVLatentUpsampler",
                       "inputs": {
                         "samples": [
-                          "15",
+                          "29",
                           0
                         ],
                         "upscale_model": [
                           "17",
                           0
                         ],
-                        "crop_guides": [
-                          "16",
-                          0
+                        "vae": [
+                          "1",
+                          2
                         ]
                       }
                     },
@@ -25620,7 +25628,7 @@
                     "20": {
                       "class_type": "RandomNoise",
                       "inputs": {
-                        "noise_seed": 8
+                        "noise_seed": 12
                       }
                     },
                     "21": {
@@ -25655,7 +25663,7 @@
                           0
                         ],
                         "latent_image": [
-                          "18",
+                          "30",
                           0
                         ]
                       }
@@ -25721,14 +25729,31 @@
                           "27",
                           0
                         ],
-                        "filename_prefix": "mayhem-ltx-av/anime-fight-official",
+                        "filename_prefix": "mayhem-ltx-av/anime-fight-quality-768x432",
                         "format": "mp4",
-                        "codec": {
-                          "codec": "h264",
-                          "encoding": {
-                            "encoding": "auto"
-                          }
-                        }
+                        "codec": "auto"
+                      }
+                    },
+                    "29": {
+                      "class_type": "LTXVSeparateAVLatent",
+                      "inputs": {
+                        "av_latent": [
+                          "15",
+                          0
+                        ]
+                      }
+                    },
+                    "30": {
+                      "class_type": "LTXVConcatAVLatent",
+                      "inputs": {
+                        "video_latent": [
+                          "18",
+                          0
+                        ],
+                        "audio_latent": [
+                          "29",
+                          1
+                        ]
                       }
                     }
                   }
@@ -25835,17 +25860,31 @@
         "calibrated_fingerprints": {},
         "resource_profiles": {
           "workflow-class": {
+            "audio": {
+              "unit": "second",
+              "measurement_source": "ltx_2_3_official_fp8_lora_spatial_upscaler_reference_profile_pending_live_admission_audio_incremental_floor",
+              "max_item_bytes": 1536000,
+              "max_item_units": 8,
+              "measured_item_bytes": 1536000,
+              "measured_item_units": 8,
+              "measured_working_set_bytes": 1536000,
+              "calibration_baseline_memory_bytes": 21474836480,
+              "calibration_peak_memory_bytes": 21476372480,
+              "calibration_f13_budget_bytes": 68719476736,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            },
             "video": {
               "unit": "frame",
-              "measurement_source": "ltx_2_3_official_fp8_lora_spatial_upscaler_reference_profile_pending_live_admission",
+              "measurement_source": "ltx_2_3_official_fp8_lora_spatial_upscaler_reference_profile_live_admission_2026-08-10",
               "max_item_bytes": 1073741824,
               "max_item_units": 192,
               "measured_item_bytes": 1073741824,
               "measured_item_units": 192,
-              "measured_working_set_bytes": 34359738368,
-              "calibration_baseline_memory_bytes": 21474836480,
-              "calibration_peak_memory_bytes": 55834574848,
-              "calibration_f13_budget_bytes": 68719476736,
+              "measured_working_set_bytes": 12884901888,
+              "calibration_baseline_memory_bytes": 47559239388,
+              "calibration_peak_memory_bytes": 60444141276,
+              "calibration_f13_budget_bytes": 66488555404,
               "default_max_inflight_items": 1,
               "default_max_items_per_request": 1
             }

@@ -15,9 +15,9 @@ routes, and revisions. Never copy an enclave ID or price from documentation:
 mayhem models --gateway
 ```
 
-## v0.2.116 runtime status
+## v0.2.117 runtime status
 
-The `0.2.116` source release keeps the previous source-install, managed
+The `0.2.117` source release keeps the previous source-install, managed
 runtime, co-resident memory, endpoint-floor, Sulphur, Chatterbox, ACE-Step,
 Needle, and Comfy workflow market fixes, and adds the current Comfy parts
 inventory plus bounded workflow `input_files` for image/audio/video source
@@ -37,7 +37,10 @@ receipts meter the upscaled output dimensions.
 Workflows that consume source media, such as lipsync/talking-video policies,
 require v0.2.116 or newer on both buyer gateways and providers so the signed
 request, route load, engine payload, and receipt agree on the input
-image/audio/video media.
+image/audio/video media. Workflows that produce one MP4 containing both video
+and audio require v0.2.117 or newer for provider startup canaries; the provider
+accepts the muxed audio modality only after the A/V canary decoder extracts a
+non-silent audio track.
 Dedicated-VRAM reservations remain enforced. Needle still has
 exactly two markets: `needle-cpu` across Linux, Windows x86_64, and Apple
 Silicon macOS, and CUDA-only `needle-gpu` on supported Linux aarch64/x86_64 and
