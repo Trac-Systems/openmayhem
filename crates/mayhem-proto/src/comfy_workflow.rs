@@ -347,6 +347,84 @@ pub fn derive_comfy_workflow(
     })
 }
 
+pub fn validate_comfy_workflow_media_input_file_bindings(
+    request: &Value,
+) -> Result<(), ComfyWorkflowDerivationError> {
+    let Some(graph) = request.get("workflow") else {
+        return Ok(());
+    };
+    let nodes = graph.as_object().ok_or_else(|| {
+        ComfyWorkflowDerivationError::InvalidGraph("graph must be a JSON object".to_owned())
+    })?;
+    let mut input_files = BTreeSet::new();
+    if let Some(files) = request.get("input_files") {
+        let files = files.as_array().ok_or_else(|| {
+            ComfyWorkflowDerivationError::InvalidGraph(
+                "workflow input_files must be an array".to_owned(),
+            )
+        })?;
+        for (index, file) in files.iter().enumerate() {
+            let filename = file
+                .as_object()
+                .and_then(|object| object.get("filename"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ComfyWorkflowDerivationError::InvalidGraph(format!(
+                        "workflow input_files[{index}].filename is required"
+                    ))
+                })?;
+            if !comfy_workflow_input_filename_is_safe(filename) {
+                return Err(ComfyWorkflowDerivationError::InvalidGraph(format!(
+                    "workflow input_files[{index}].filename is not a safe relative path"
+                )));
+            }
+            if !input_files.insert(filename.to_owned()) {
+                return Err(ComfyWorkflowDerivationError::InvalidGraph(format!(
+                    "duplicate workflow input_files filename {filename}"
+                )));
+            }
+        }
+    }
+    for (node_id, node) in nodes {
+        let Some(node_object) = node.as_object() else {
+            continue;
+        };
+        let Some(class_type) = node_object.get("class_type").and_then(Value::as_str) else {
+            continue;
+        };
+        if !comfy_node_can_load_request_media(class_type) {
+            continue;
+        }
+        let Some(inputs) = node_object.get("inputs").and_then(Value::as_object) else {
+            continue;
+        };
+        for key in [
+            "image",
+            "audio",
+            "video",
+            "video_path",
+            "file",
+            "filename",
+            "path",
+        ] {
+            let Some(filename) = inputs.get(key).and_then(Value::as_str) else {
+                continue;
+            };
+            if !comfy_workflow_input_filename_is_safe(filename) {
+                return Err(ComfyWorkflowDerivationError::InvalidGraph(format!(
+                    "node {node_id} {class_type}.{key} references unsafe media input filename {filename}"
+                )));
+            }
+            if !input_files.contains(filename) {
+                return Err(ComfyWorkflowDerivationError::InvalidGraph(format!(
+                    "node {node_id} {class_type}.{key} references media input {filename} but it is not supplied in input_files"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn graph_hash(graph: &Value) -> Result<String, ComfyWorkflowDerivationError> {
     let graph = comfy_graph_hash_value(graph);
     let graph_bytes = stable_json_bytes(&graph)
@@ -356,6 +434,33 @@ fn graph_hash(graph: &Value) -> Result<String, ComfyWorkflowDerivationError> {
     hasher.update(&(graph_bytes.len() as u64).to_le_bytes());
     hasher.update(&graph_bytes);
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn comfy_node_can_load_request_media(class_type: &str) -> bool {
+    let class_type = class_type.to_ascii_lowercase();
+    class_type.contains("load")
+        && (class_type.contains("image")
+            || class_type.contains("audio")
+            || class_type.contains("video"))
+}
+
+fn comfy_workflow_input_filename_is_safe(filename: &str) -> bool {
+    if filename.is_empty()
+        || filename.len() > 240
+        || filename.starts_with('/')
+        || filename.starts_with('\\')
+        || filename.contains('\\')
+    {
+        return false;
+    }
+    filename.split('/').all(|part| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    })
 }
 
 fn comfy_graph_hash_value(value: &Value) -> Value {
@@ -948,6 +1053,47 @@ mod tests {
             "8": {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0], "vae": ["4", 2]}},
             "9": {"class_type": "SaveImage", "inputs": {"images": ["8", 0]}}
         })
+    }
+
+    #[test]
+    fn media_loader_filenames_must_come_from_input_files() {
+        let request = json!({
+            "workflow": {
+                "1": {"class_type": "LoadImage", "inputs": {"image": "refs/hero.png"}},
+                "2": {"class_type": "LoadAudio", "inputs": {"audio": "dialogue/line.wav"}}
+            },
+            "input_files": [
+                {"filename": "refs/hero.png"},
+                {"filename": "dialogue/line.wav"}
+            ]
+        });
+        validate_comfy_workflow_media_input_file_bindings(&request).unwrap();
+
+        let mut missing = request.clone();
+        missing["input_files"] = json!([{"filename": "refs/hero.png"}]);
+        let err = validate_comfy_workflow_media_input_file_bindings(&missing)
+            .expect_err("audio loader must not use provider-local media");
+        assert!(err
+            .to_string()
+            .contains("dialogue/line.wav but it is not supplied"));
+
+        let unsafe_ref = json!({
+            "workflow": {
+                "1": {"class_type": "LoadImage", "inputs": {"image": "../secret.png"}}
+            }
+        });
+        let err = validate_comfy_workflow_media_input_file_bindings(&unsafe_ref)
+            .expect_err("unsafe media loader filenames must be rejected");
+        assert!(err.to_string().contains("unsafe media input filename"));
+
+        let extensionless = json!({
+            "workflow": {
+                "1": {"class_type": "LoadImage", "inputs": {"image": "refs/hero"}}
+            }
+        });
+        let err = validate_comfy_workflow_media_input_file_bindings(&extensionless)
+            .expect_err("extensionless media loader filenames must still be request-bound");
+        assert!(err.to_string().contains("refs/hero but it is not supplied"));
     }
 
     fn part(name: &str, part_type: &str, byte: &str) -> ComfyWorkflowPartRef {

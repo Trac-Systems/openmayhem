@@ -76994,6 +76994,7 @@ fn validate_provider_chat_video_fps(video: &Value) -> Result<()> {
 fn provider_workflow_input_files(
     body: &Value,
 ) -> Result<(Vec<WorkflowInputFile>, ProviderChatMediaStats)> {
+    mayhem_proto::validate_comfy_workflow_media_input_file_bindings(body)?;
     let Some(files) = body.get("input_files") else {
         return Ok((Vec::new(), ProviderChatMediaStats::default()));
     };
@@ -108651,6 +108652,22 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             measured,
             BTreeMap::from([("audio".to_owned(), 1), ("image".to_owned(), 3)])
         );
+    }
+
+    #[test]
+    fn provider_workflow_validator_rejects_provider_local_media_loader() {
+        let mut body = test_provider_comfy_workflow_request(512);
+        body["workflow"]["3"] = json!({
+            "class_type": "LoadAudio",
+            "inputs": { "audio": "dialogue/line.wav" }
+        });
+
+        let err = provider_workflow_input_files(&body)
+            .expect_err("provider must reject media loaders without matching input_files");
+
+        assert!(err
+            .to_string()
+            .contains("dialogue/line.wav but it is not supplied"));
     }
 
     #[test]

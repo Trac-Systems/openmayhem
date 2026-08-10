@@ -28726,6 +28726,8 @@ fn workflow_input_file_stats(
     request: &Value,
     limits: &GatewayMediaLimits,
 ) -> Result<WorkflowInputFileStats, ApiError> {
+    mayhem_proto::validate_comfy_workflow_media_input_file_bindings(request)
+        .map_err(|err| ApiError::bad_request(err.to_string(), Some("input_files")))?;
     let Some(files) = request.get("input_files") else {
         return Ok(WorkflowInputFileStats::default());
     };
@@ -45044,6 +45046,45 @@ mod tests {
         assert_eq!(audio_load.item_count, 1);
         assert!(audio_load.max_item_bytes > 1);
         assert_eq!(audio_load.max_item_units, 1);
+    }
+
+    #[test]
+    fn comfy_workflow_media_loader_requires_matching_input_file() {
+        let policy = mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["LoadAudio".to_owned(), "SaveAudio".to_owned()],
+            max_artifacts: Some(1),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        };
+        let err = artifact_generation_request_with_workflow_policy(
+            "mayhem/comfy-test",
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            json!({
+                "model": "mayhem/comfy-test",
+                "workflow": {
+                    "1": {
+                        "class_type": "LoadAudio",
+                        "inputs": { "audio": "dialogue/line.wav" }
+                    },
+                    "2": {
+                        "class_type": "SaveAudio",
+                        "inputs": { "audio": ["1", 0] }
+                    }
+                },
+                "runtime_id": "comfyui-v0.30.1",
+                "outcome_class": "video.lipsync",
+                "response_format": "artifact"
+            }),
+            VideoRequestPreparation::default(),
+            Some(&policy),
+        )
+        .expect_err("gateway must reject provider-local media loader references");
+
+        assert!(
+            err.message
+                .contains("dialogue/line.wav but it is not supplied"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
