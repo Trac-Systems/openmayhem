@@ -201,20 +201,20 @@ Krea providers must add these signed parts before admission:
 The authoritative Comfy workflow reference is
 [`COMFY-CHEATSHEET.md`](COMFY-CHEATSHEET.md). It lists every workflow outcome
 class, the class-fit matrix, required Krea/LTX/lipsync part sets, provider
-commands, user API shape, and all 85 signed parts.
+commands, user API shape, and all 95 signed parts.
 
 Current signed parts anchor:
 
 - Dataset: `TracNetwork/openmayhem-parts-index`
-- Revision: `023ab52a79182d4027429c0c8a12ea5bf03b81da`
-- Index root: `8599b956d3e004ffe073601b2cc1a8fbf34f5b9a0f90550b08b2ed353d60b465`
-- Anchor hash: `a964aff2dd609d8672dd2e438a36d5b07aa74cd5e84ace87ee14124596ebe5c1`
-- Index version: `10`
-- Inventory: 85 parts: 12 checkpoint, 2 video-model, 4 text-encoder, 6 VAE,
-  1 CLIP-vision, 1 LoRA, 5 lipsync, 35 ControlNet/control helper, and 19
-  upscaler/restoration parts.
-- Index URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/023ab52a79182d4027429c0c8a12ea5bf03b81da/index.json
-- Anchor URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/023ab52a79182d4027429c0c8a12ea5bf03b81da/anchor.json
+- Revision: `866c3b60b4804f34c1e84dff58a600cfbd465c73`
+- Index root: `db67a3b6df1fc6407a0f1bf8c9037f30bf5221332e800615980dedefc2fad25b`
+- Anchor hash: `2316c96d408a3b450140227c844291f61c104666f2539c598c5864adcd8f270e`
+- Index version: `12`
+- Inventory: 95 parts: 1 audio-model, 12 checkpoint, 4 video-model, 5 text-encoder,
+  8 VAE, 1 CLIP-vision, 2 LoRA, 7 lipsync, 35 ControlNet/control helper, and
+  20 upscaler/restoration parts.
+- Index URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/866c3b60b4804f34c1e84dff58a600cfbd465c73/index.json
+- Anchor URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/866c3b60b4804f34c1e84dff58a600cfbd465c73/anchor.json
 
 Every Comfy calibration must list every file loaded by the reference graph in
 the signed workflow policy. Missing checkpoints, encoders, VAEs, LoRAs,
@@ -308,7 +308,7 @@ executable version is not release-pinned, so this document does not invent one.
 | `ResembleAI/chatterbox` | Text to speech | PyTorch safetensors | Tier 1; use highest proved tier | 8 GiB | 6 GiB | 3,191,966,992 B (2.97 GiB) |
 | `huihui-ai/Huihui-Agents-A1-abliterated` | Text generation | llama.cpp Q4_K GGUF | Tier 1; use highest proved tier | 32 GiB | 32 GiB | 22,069,579,360 B (20.55 GiB) |
 | `Cactus-Compute/needle` | Deterministic tool selection | `needle-cpu` or CUDA-only `needle-gpu` | Tier 1; use highest proved tier | Managed preflight | See measured guidance | 30.4M parameters |
-| `video.minimax_h3.t2v_i2v` | Comfy workflow video+audio | ComfyUI / signed MiniMax H3 parts | Tier 1; provider proof pending | 96 GiB | 48 GiB | Four signed base parts, 42.29 GiB total |
+| `video.minimax_h3.t2v_i2v` | Comfy workflow video+audio | ComfyUI / signed MiniMax H3 parts | Tier 1; live `.70` CUDA proof | 96 GiB | 48 GiB | Four signed base parts, 42.29 GiB total |
 
 The RAM and full-offload columns are catalog admission/guidance fields. Model
 weights, runtime environments, caches, outputs, and build artifacts require

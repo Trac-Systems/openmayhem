@@ -762,7 +762,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
-| `video.minimax_h3.t2v_i2v` | Comfy workflow, MiniMax H3 text/image-to-video with native audio | D | cataloged — provider proof pending |
+| `video.minimax_h3.t2v_i2v` | Comfy workflow, MiniMax H3 text/image-to-video with native audio | D | **live** |
 | `huihui-ai/Huihui-Agents-A1-abliterated` | Multimodal LLM, vision/video input, tools, uncensored, 262K ctx | C | **live** |
 | `ResembleAI/chatterbox` | TTS + zero-shot voice cloning | A/B | **live** |
 | `SulphurAI/Sulphur-2-base` | Video with synchronized audio, uncensored | C/D | **live** |
@@ -979,8 +979,9 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 The current signed catalog adds `video.minimax_h3.t2v_i2v` as a Comfy
 workflow-class market with mirrored MiniMax H3 base parts, a signed
 workflow-class definition, active enclave/price/room rows, and native
-video+audio caps. It is not counted as public serving capacity until a provider
-completes admission and a paid `/v1/workflows` media proof passes review.
+video+audio caps. `.70` completed admission and a paid TNK `/v1/workflows`
+media proof; the retained review artifact is kept in the operator proof set and
+must not be replaced by a direct Comfy run.
 
 The `0.2.123` source release adds metadata-only Comfy workflow-class policy
 calibration, signs workflow-class modality fingerprints for Krea base,

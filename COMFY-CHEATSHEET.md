@@ -5,14 +5,14 @@ This is the operational guide for ComfyUI workflow providers and users. It is in
 ## Current Signed Parts Index
 
 - Dataset: `TracNetwork/openmayhem-parts-index`
-- Revision: `3bc368034c7c1df8a4f6c46eb61dc5d9ccead56a`
-- Index root: `1177b408d2ca9d5a8cabfbfb60c23716827a61e9982149c029442b71a9b210cd`
-- Anchor hash: `af80d20c42f1c28ed1894dd07831913021ec8ba3b04a66dbe8e8b2cce2fc21d0`
-- Index version: `11`
+- Revision: `866c3b60b4804f34c1e84dff58a600cfbd465c73`
+- Index root: `db67a3b6df1fc6407a0f1bf8c9037f30bf5221332e800615980dedefc2fad25b`
+- Anchor hash: `2316c96d408a3b450140227c844291f61c104666f2539c598c5864adcd8f270e`
+- Index version: `12`
 - Blessed runtimes: `comfyui-v0.30.1`, `comfyui-2a68ce33b4c9`
-- Parts: `90` (12 checkpoint, 1 clip-vision, 35 controlnet, 7 lipsync, 2 lora, 4 text-encoder, 19 upscaler, 6 vae, 3 video-model)
-- Index URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/3bc368034c7c1df8a4f6c46eb61dc5d9ccead56a/index.json
-- Anchor URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/3bc368034c7c1df8a4f6c46eb61dc5d9ccead56a/anchor.json
+- Parts: `95` (1 audio-model, 12 checkpoint, 1 clip-vision, 35 controlnet, 7 lipsync, 2 lora, 5 text-encoder, 20 upscaler, 8 vae, 4 video-model)
+- Index URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/866c3b60b4804f34c1e84dff58a600cfbd465c73/index.json
+- Anchor URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/866c3b60b4804f34c1e84dff58a600cfbd465c73/anchor.json
 
 ## User API
 
@@ -118,14 +118,25 @@ A Comfy calibration is not complete until all of these gates pass:
 
 ## Active Workflow Calibration Queue
 
-The signed catalog currently exposes four dev workflow rows. `image.heavy.le1_2mp`,
-`image.heavy.le17mp`, and `video.heavy.le0_5mpf` now carry signed workflow-class
-modality fingerprints. `video.lipsync` has a catalog row, signed InfiniteTalk
-canary, and workflow-class modality fingerprint using runtime
-`comfyui-2a68ce33b4c9`, but the retained reference clip is not product-accepted:
-voice quality is robotic, lip sync is not convincing, and there is no useful
-background sound. Treat metadata fingerprints as policy evidence only; product
-acceptance still needs a paid `/v1/workflows` proof with inspected output quality.
+The signed catalog currently exposes four public workflow rows plus the dev
+`video.lipsync` row. Current acceptance state:
+
+- `video.minimax_h3.t2v_i2v`: accepted for the base H3 T2V/I2V lane after
+  `.70` admission and a paid TNK `/v1/workflows` proof with inspected anime
+  fighting video plus native audio.
+- `video.heavy.le0_5mpf`: accepted as an LTX A/V video lane after the paid
+  `.70` gateway proofs listed below. This is not lipsync evidence.
+- `image.heavy.le17mp`: `.70` admission passed and a retained Krea+4x
+  Mercedes-sales quality artifact exists; paid receipt/session evidence was not
+  found, so rerun or attach a paid proof before treating it as accepted public
+  capacity.
+- `image.heavy.le1_2mp`: `.70` admission passed and the Krea base quality image
+  is visually acceptable; run or attach a paid `/v1/workflows` proof before
+  treating the base-only lane as accepted public capacity.
+- `video.lipsync`: catalog row, signed InfiniteTalk canary, and workflow-class
+  modality fingerprint exist using runtime `comfyui-2a68ce33b4c9`, but the
+  retained reference clip is not product-accepted: voice quality is robotic, lip
+  sync is not convincing, and there is no useful background sound.
 
 ## Workflow Policy To Parts Matrix
 
@@ -138,10 +149,10 @@ public capacity.
 
 | Policy / model ID | Purpose | Required parts | Runtime | Acceptance state |
 |---|---|---|---|---|
-| `image.heavy.le1_2mp` | Krea 2 Turbo base image generation up to 1024x1024 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70` | `comfyui-v0.30.1` | Signed dev policy and workflow-class fingerprint exist; paid quality proof still required before public serving. |
-| `image.heavy.le17mp` | Krea 2 Turbo plus 4x upscale up to 4096x4096 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70`; 4x-spanx4 `d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a` | `comfyui-v0.30.1` | Signed dev policy and workflow-class fingerprint exist; paid quality proof still required before public serving. |
-| `video.heavy.le0_5mpf` | LTX 2.3 native audio/video generation up to 768x512, 8s, 192 frames | LTX 2.3 fp8 AV checkpoint `34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2`; Gemma 3 12B fp4 text encoder `20652c80fc8e88963343b9968722becb2118d507befbbf0272aa8d79e99893cc`; LTX distilled LoRA 384 `988522cff35f19d7c5977472be163f05b49bf381e441963da4182b0a90b1116c`; LTX spatial upscaler `e0f339c2b5c13fcae1b78cade132ae0307114026c6d20642335eccb4887a050d`; LTX audio VAE `8c108e3ce85d127cef5dbb5747f8c30d2a30c6d92f215278399224e38ffe806c` | `comfyui-v0.30.1` | Signed dev policy and workflow-class fingerprint exist; paid quality proof still required before public serving. |
-| `video.minimax_h3.t2v_i2v` | MiniMax H3 text/image-to-video with native stereo audio up to 1344x768, 15s, 362 frames | FL2VA diffusion `4c371bcbf8e7a577457d7b0ace66345fa85c88a591ca0724a5da6e9642371f72`; Qwen3VL 32B NVFP4 text encoder `32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab`; H3 video VAE `3abef9354f37bb10b413e7034d373e95193511cd80ffa5aea315d1d822032ce7`; H3 audio VAE `6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2` | `comfyui-v0.30.1` | Parts mirrored in parts-index v12, signed catalog metadata published, enclave/price/room live on mainnet; paid provider quality proof still required before public serving. |
+| `image.heavy.le1_2mp` | Krea 2 Turbo base image generation up to 1024x1024 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70` | `comfyui-v0.30.1` | `.70` admission passed and retained 1024x1024 Mercedes-sales quality output is acceptable; paid receipt/session evidence still needs to be attached or rerun before public acceptance. |
+| `image.heavy.le17mp` | Krea 2 Turbo plus 4x upscale up to 4096x4096 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70`; 4x-spanx4 `d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a` | `comfyui-v0.30.1` | `.70` admission passed and retained 4096x4096 Mercedes-sales quality output is acceptable; paid receipt/session evidence is missing and must be rerun or attached before public acceptance. |
+| `video.heavy.le0_5mpf` | LTX 2.3 native audio/video generation up to 768x512, 8s, 192 frames | LTX 2.3 fp8 AV checkpoint `34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2`; Gemma 3 12B fp4 text encoder `20652c80fc8e88963343b9968722becb2118d507befbbf0272aa8d79e99893cc`; LTX distilled LoRA 384 `988522cff35f19d7c5977472be163f05b49bf381e441963da4182b0a90b1116c`; LTX spatial upscaler `e0f339c2b5c13fcae1b78cade132ae0307114026c6d20642335eccb4887a050d`; LTX audio VAE `8c108e3ce85d127cef5dbb5747f8c30d2a30c6d92f215278399224e38ffe806c` | `comfyui-v0.30.1` | Product-accepted for A/V generation after paid `.70` `/v1/workflows` proofs with retained video+audio artifacts. |
+| `video.minimax_h3.t2v_i2v` | MiniMax H3 text/image-to-video with native stereo audio up to 1344x768, 15s, 362 frames | FL2VA diffusion `4c371bcbf8e7a577457d7b0ace66345fa85c88a591ca0724a5da6e9642371f72`; Qwen3VL 32B NVFP4 text encoder `32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab`; H3 video VAE `3abef9354f37bb10b413e7034d373e95193511cd80ffa5aea315d1d822032ce7`; H3 audio VAE `6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2` | `comfyui-v0.30.1` | Product-accepted for the base T2V/I2V lane: parts mirrored in parts-index v12, signed catalog metadata published, enclave/price/room live on mainnet, `.70` admission passed, and a retained paid TNK `/v1/workflows` proof passed quality review. |
 | `video.lipsync` | Wan/InfiniteTalk lipsync/talking-video workflow up to 832x480, 4s, 81 frames | Wan2.1 I2V 14B fp8 `6a05292de329cdb06923008742e4f17329548239c2e2c3b10234276d790e1ef6`; UMT5-XXL fp8 `720ea5ea7b9de57ca87b403856b0a7e42c96d1f1176ff886726ab602b6923709`; Wan 2.1 VAE `79f0076a485bca72333bfa34c767006606b4ff351e5d8abc2045865e12c8a664`; Lightx2v I2V LoRA `6294fc7c467c664debaa9a50ea13bfd21959fe7aa29a9759f07541b66562c491`; InfiniteTalk multi fp16 `fd1d93c0ead8d77bc79d457e45bb391063a21fe3111b0a19ef7dc6a605c3b1fd`; Wav2Vec2 Chinese base fp16 `42ed9ac2d65ac013f5d5a431ff93b1e452371a6f1ba9bf8fdaa5c85b631e4f28` | `comfyui-2a68ce33b4c9` | Signed dev policy and technical canary exist; product proof failed quality review. It is not accepted for general anime action video with voice; keep it scoped to lipsync/talking-head until a better-fit policy proves action, speech, and sync. |
 
 ### Planned Or Missing Workflow Policies
@@ -155,11 +166,11 @@ MiniMax H3 is owner-approved for OpenMayhem calibration as of 2026-08-10. The fo
 base T2V/I2V payloads are mirrored and signed in the OpenMayhem Hugging Face
 parts index at revision `866c3b60b4804f34c1e84dff58a600cfbd465c73`. The signed
 mainnet catalog points to revision `4ee78a21941efe4af2fd3c8878915c39cca0f521`,
-and the ledger has the H3 enclave, price, and canonical room open. Do not call
-H3 product-accepted until a real provider completes `parts pull`/`parts add`/
-`parts admit --write`, serves the class through `/v1/workflows`, and the retained
-paid media passes quality inspection. No local cache bypasses or unanchored
-Comfy payloads are acceptable for H3 proof.
+and the ledger has the H3 enclave, price, and canonical room open. H3 became
+product-accepted for the base T2V/I2V lane after `.70` completed `parts pull`/
+`parts add`/`parts admit --write`, served the class through `/v1/workflows`, and
+the retained paid TNK media proof passed quality inspection. No local cache
+bypasses or unanchored Comfy payloads are acceptable for future H3 proofs.
 
 Use the official Comfy page and `Comfy-Org/MiniMax-H3` as sources. Prefer `int8_convrot` diffusion weights on PyTorch/CUDA 13 and
 the `qwen3vl_32b_minimax_h3_nvfp4_awq` text encoder; the Comfy-Org README states that text-encoder
@@ -186,9 +197,10 @@ H3 reference workflow inputs:
 Current H3 state: official Comfy page plus `Comfy-Org/MiniMax-H3` prove native source
 weights and official template availability. `ComfyUI-MiniMaxH3-Easy` is adoption evidence for a
 compact H3 workflow surface, not permission to admit arbitrary optimizer/API nodes. Spectrum H3 is
-candidate quality evidence for the audio path, not acceptance proof. The H3 T2V/I2V class now has
-signed metadata and mainnet rows; it still needs an intended OpenMayhem `/v1/workflows` paid proof
-with retained media inspection before public serving.
+candidate quality evidence for the audio path, not acceptance proof. The H3 T2V/I2V class has
+signed metadata and mainnet rows, a live `.70` CUDA provider, and a retained paid TNK
+`/v1/workflows` quality proof in the operator proof set. Do not replace that proof with a direct
+Comfy run.
 
 Validated H3 source manifest candidates, all from `Comfy-Org/MiniMax-H3` revision
 `014cd40f7e177756c6b2473c0d93b1c89a790dd2`:
