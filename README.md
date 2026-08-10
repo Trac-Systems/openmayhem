@@ -975,6 +975,11 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 
 ## Development
 
+The `0.2.123` source release adds metadata-only Comfy workflow-class policy
+calibration, signs workflow-class modality fingerprints for Krea base,
+Krea+4x, and LTX A/V rows, and keeps backend media quality proof as a separate
+paid-route acceptance gate.
+
 The `0.2.122` source release corrects the MiniMax H3 Comfy parts manifest to use
 Hugging Face blob/LFS SHA-256 values instead of xet/cache `ETag` values. The H3
 part IDs in the Comfy policy-to-parts matrix are therefore regenerated from

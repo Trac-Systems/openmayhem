@@ -24678,7 +24678,11 @@
         "evidence": [
           "official Comfy-Org Krea 2 Turbo workflow template; signed parts-index v5; local workflow admission proof pending"
         ],
-        "calibrated_fingerprints": {},
+        "calibrated_fingerprints": {
+          "workflow-class": {
+            "image": "914844a12b379a4e2c71a2146c8b647154d7e5d055107a4c60db7311dcc3a4b2"
+          }
+        },
         "resource_profiles": {
           "workflow-class": {
             "image": {
@@ -25181,7 +25185,11 @@
         "evidence": [
           "official Comfy-Org Krea 2 Turbo workflow template plus signed 4x-spanx4 upscaler; signed parts-index v5; 4x voucher metering requires v0.2.107"
         ],
-        "calibrated_fingerprints": {},
+        "calibrated_fingerprints": {
+          "workflow-class": {
+            "image": "824dd2666ea8666e4c0293f0f3a57d4bdf0a8fc1778e03c0175cccb7b5bfed12"
+          }
+        },
         "resource_profiles": {
           "workflow-class": {
             "image": {
@@ -25936,7 +25944,12 @@
         "evidence": [
           "Official LTX 2.3 Comfy Text to Video blueprint requires the fp8 checkpoint, Gemma text encoder, distilled LoRA, spatial latent upscaler, and audio VAE signed in parts-index v10."
         ],
-        "calibrated_fingerprints": {},
+        "calibrated_fingerprints": {
+          "workflow-class": {
+            "audio": "15b5f5b699f2e798fd37ff7a90b5120554237a842c31f4834084c8a73544a8b1",
+            "video": "ecbffe546dffacb23ae33eeea40b2904ffef48a69f00f9e243b2bb74d6f7870a"
+          }
+        },
         "resource_profiles": {
           "workflow-class": {
             "audio": {

@@ -32,6 +32,7 @@ pub(crate) struct EndpointCalibrationStageReport {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum EndpointCalibrationBackendProofKind {
     FullInference,
+    PolicyValidation,
     WorkerSemanticValidation,
 }
 
@@ -619,6 +620,10 @@ fn validate_case_stages(
         match case.backend_proof.as_ref() {
             Some(EndpointCalibrationBackendProof {
                 kind: EndpointCalibrationBackendProofKind::FullInference,
+                behavioral_witness_fingerprint: None,
+            }) => {}
+            Some(EndpointCalibrationBackendProof {
+                kind: EndpointCalibrationBackendProofKind::PolicyValidation,
                 behavioral_witness_fingerprint: None,
             }) => {}
             Some(EndpointCalibrationBackendProof {

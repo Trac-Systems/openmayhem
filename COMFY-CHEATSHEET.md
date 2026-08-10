@@ -118,16 +118,14 @@ A Comfy calibration is not complete until all of these gates pass:
 
 ## Active Workflow Calibration Queue
 
-The signed catalog currently exposes four dev workflow rows. `video.lipsync` now has a catalog row,
-signed InfiniteTalk canary, and workflow-class modality fingerprint using runtime
-`comfyui-2a68ce33b4c9`, but the retained reference clip is not product-accepted: voice quality is
-robotic, lip sync is not convincing, and there is no useful background sound. Treat it as a
-technical graph/reference proof only, not a quality pass. The remaining workflow-class calibration
-gaps are:
-
-1. `video.heavy.le0_5mpf` — LTX A/V workflow-class modality fingerprint is the next video lane.
-2. `image.heavy.le1_2mp` — Krea 2 Turbo base image workflow-class modality fingerprint.
-3. `image.heavy.le17mp` — Krea 2 Turbo + 4x upscaler workflow-class modality fingerprint.
+The signed catalog currently exposes four dev workflow rows. `image.heavy.le1_2mp`,
+`image.heavy.le17mp`, and `video.heavy.le0_5mpf` now carry signed workflow-class
+modality fingerprints. `video.lipsync` has a catalog row, signed InfiniteTalk
+canary, and workflow-class modality fingerprint using runtime
+`comfyui-2a68ce33b4c9`, but the retained reference clip is not product-accepted:
+voice quality is robotic, lip sync is not convincing, and there is no useful
+background sound. Treat metadata fingerprints as policy evidence only; product
+acceptance still needs a paid `/v1/workflows` proof with inspected output quality.
 
 ## Workflow Policy To Parts Matrix
 
@@ -140,9 +138,9 @@ public capacity.
 
 | Policy / model ID | Purpose | Required parts | Runtime | Acceptance state |
 |---|---|---|---|---|
-| `image.heavy.le1_2mp` | Krea 2 Turbo base image generation up to 1024x1024 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70` | `comfyui-v0.30.1` | Signed dev policy exists; workflow-class fingerprint and paid quality proof still required before public serving. |
-| `image.heavy.le17mp` | Krea 2 Turbo plus 4x upscale up to 4096x4096 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70`; 4x-spanx4 `d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a` | `comfyui-v0.30.1` | Signed dev policy exists; workflow-class fingerprint and paid quality proof still required before public serving. |
-| `video.heavy.le0_5mpf` | LTX 2.3 native audio/video generation up to 768x512, 8s, 192 frames | LTX 2.3 fp8 AV checkpoint `34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2`; Gemma 3 12B fp4 text encoder `20652c80fc8e88963343b9968722becb2118d507befbbf0272aa8d79e99893cc`; LTX distilled LoRA 384 `988522cff35f19d7c5977472be163f05b49bf381e441963da4182b0a90b1116c`; LTX spatial upscaler `e0f339c2b5c13fcae1b78cade132ae0307114026c6d20642335eccb4887a050d`; LTX audio VAE `8c108e3ce85d127cef5dbb5747f8c30d2a30c6d92f215278399224e38ffe806c` | `comfyui-v0.30.1` | Signed dev policy exists; workflow-class fingerprint and paid quality proof still required before public serving. |
+| `image.heavy.le1_2mp` | Krea 2 Turbo base image generation up to 1024x1024 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70` | `comfyui-v0.30.1` | Signed dev policy and workflow-class fingerprint exist; paid quality proof still required before public serving. |
+| `image.heavy.le17mp` | Krea 2 Turbo plus 4x upscale up to 4096x4096 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70`; 4x-spanx4 `d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a` | `comfyui-v0.30.1` | Signed dev policy and workflow-class fingerprint exist; paid quality proof still required before public serving. |
+| `video.heavy.le0_5mpf` | LTX 2.3 native audio/video generation up to 768x512, 8s, 192 frames | LTX 2.3 fp8 AV checkpoint `34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2`; Gemma 3 12B fp4 text encoder `20652c80fc8e88963343b9968722becb2118d507befbbf0272aa8d79e99893cc`; LTX distilled LoRA 384 `988522cff35f19d7c5977472be163f05b49bf381e441963da4182b0a90b1116c`; LTX spatial upscaler `e0f339c2b5c13fcae1b78cade132ae0307114026c6d20642335eccb4887a050d`; LTX audio VAE `8c108e3ce85d127cef5dbb5747f8c30d2a30c6d92f215278399224e38ffe806c` | `comfyui-v0.30.1` | Signed dev policy and workflow-class fingerprint exist; paid quality proof still required before public serving. |
 | `video.lipsync` | Wan/InfiniteTalk lipsync/talking-video workflow up to 832x480, 4s, 81 frames | Wan2.1 I2V 14B fp8 `6a05292de329cdb06923008742e4f17329548239c2e2c3b10234276d790e1ef6`; UMT5-XXL fp8 `720ea5ea7b9de57ca87b403856b0a7e42c96d1f1176ff886726ab602b6923709`; Wan 2.1 VAE `79f0076a485bca72333bfa34c767006606b4ff351e5d8abc2045865e12c8a664`; Lightx2v I2V LoRA `6294fc7c467c664debaa9a50ea13bfd21959fe7aa29a9759f07541b66562c491`; InfiniteTalk multi fp16 `fd1d93c0ead8d77bc79d457e45bb391063a21fe3111b0a19ef7dc6a605c3b1fd`; Wav2Vec2 Chinese base fp16 `42ed9ac2d65ac013f5d5a431ff93b1e452371a6f1ba9bf8fdaa5c85b631e4f28` | `comfyui-2a68ce33b4c9` | Signed dev policy and technical canary exist; product proof failed quality review. It is not accepted for general anime action video with voice; keep it scoped to lipsync/talking-head until a better-fit policy proves action, speech, and sync. |
 
 ### Planned Or Missing Workflow Policies

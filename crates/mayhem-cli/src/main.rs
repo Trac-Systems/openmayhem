@@ -15760,6 +15760,67 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
             Ok::<_, anyhow::Error>(report)
         })
         .transpose()?;
+    if artifact.engine == "comfyui" && args.artifact == "workflow-class" {
+        ensure!(
+            resume_core_report.is_none(),
+            "--resume-core-report is not supported for Comfy workflow-class policy calibration"
+        );
+        let report = catalog_workflow_class_policy_calibration_report(
+            model,
+            &args.artifact,
+            artifact,
+            &artifact_path,
+            &prompts,
+            &canary_set_sha256,
+            runtime_config,
+            existing,
+        )?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!("Comfy workflow-class policy calibration complete.");
+            println!("Model: {}", report.model_id);
+            println!("Artifact: {} ({})", report.artifact, report.engine);
+            println!("Canary set: {}", report.canary_set);
+            println!("Prompts: {}", report.prompt_count);
+            println!("Catalog fingerprint: {}", report.catalog_fingerprint);
+            println!(
+                "Endpoint calibration: {} families / {} cases ({})",
+                report.endpoint_calibration.family_count,
+                report.endpoint_calibration.case_count,
+                if report.endpoint_calibration.ok {
+                    "passed"
+                } else {
+                    "failed"
+                }
+            );
+        }
+        if let Some(path) = &report_output {
+            write_json_file(path, &report)?;
+            if !args.json {
+                println!("Report: {}", path.display());
+            }
+        }
+        if args.require_match {
+            ensure_calibration_matches_catalog(&report)?;
+        }
+        let endpoint_errors = validate_endpoint_calibration_report(
+            &model.adapter.endpoint_families,
+            &report.endpoint_calibration,
+        );
+        ensure!(
+            endpoint_errors.is_empty(),
+            "endpoint-family calibration matrix failed: {}",
+            endpoint_errors.join("; ")
+        );
+        let witness_errors = validate_endpoint_behavioral_witness_links(&report);
+        ensure!(
+            witness_errors.is_empty(),
+            "endpoint-family behavioral witness linkage failed: {}",
+            witness_errors.join("; ")
+        );
+        return Ok(());
+    }
     let mut backend = catalog_calibration_backend(
         model,
         artifact,
@@ -15976,6 +16037,276 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         witness_errors.join("; ")
     );
     Ok(())
+}
+
+fn catalog_workflow_class_policy_calibration_report(
+    model: &catalog::CatalogModel,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    artifact_path: &Path,
+    prompts: &[CanaryPrompt],
+    canary_set_sha256: &str,
+    runtime_config: CatalogCanaryRuntimeConfig,
+    existing: Option<String>,
+) -> Result<CatalogCanaryCalibrationReport> {
+    ensure!(
+        model.model_class == MODEL_CLASS_WORKFLOW,
+        "Comfy workflow-class policy calibration requires model_class workflow, got {}",
+        model.model_class
+    );
+    let definition = read_json_file(artifact_path).with_context(|| {
+        format!(
+            "reading Comfy workflow-class artifact {}",
+            artifact_path.display()
+        )
+    })?;
+    let reports = workflow_class_policy_prompt_reports(model, artifact_name)?;
+    ensure!(
+        reports.len() == prompts.len(),
+        "Comfy workflow-class policy report prompt count {} does not match canary set prompt count {}",
+        reports.len(),
+        prompts.len()
+    );
+    let catalog_fingerprint =
+        aggregate_canary_fingerprint_for_method(&model.canary.verification_method, &reports);
+    let modality_fingerprints = workflow_class_policy_modality_fingerprints(
+        model,
+        artifact_name,
+        artifact,
+        &definition,
+        &reports,
+    )?;
+    let modality_resource_profiles = model
+        .modality_assessment
+        .resource_profiles
+        .get(artifact_name)
+        .cloned()
+        .unwrap_or_default();
+    let endpoint_calibration =
+        catalog_workflow_class_endpoint_calibration_report(model, artifact_name, artifact, prompts);
+    let matches_existing = existing
+        .as_ref()
+        .map(|expected| expected == &catalog_fingerprint);
+    Ok(CatalogCanaryCalibrationReport {
+        model_id: model.model_id.clone(),
+        artifact: artifact_name.to_owned(),
+        engine: artifact.engine.clone(),
+        verification_method: model.canary.verification_method.clone(),
+        artifact_path: artifact_path.to_path_buf(),
+        artifact_binding: catalog_canary_artifact_binding(artifact),
+        runtime_config,
+        canary_set: model.canary.set_id.clone(),
+        canary_set_sha256: canary_set_sha256.to_owned(),
+        prompt_count: reports.len(),
+        catalog_fingerprint,
+        modality_fingerprints,
+        modality_resource_profiles,
+        speciality_calibrations: BTreeMap::new(),
+        endpoint_calibration,
+        existing_catalog_fingerprint: existing,
+        matches_existing_catalog: matches_existing,
+        merged_source_report_sha256: Vec::new(),
+        prompts: reports,
+    })
+}
+
+fn workflow_class_policy_prompt_reports(
+    model: &catalog::CatalogModel,
+    artifact_name: &str,
+) -> Result<Vec<CanaryCalibrationPromptReport>> {
+    let values = match model.canary.verification_method.as_str() {
+        "seed_perceptual_hash" => model
+            .canary
+            .perceptual_hashes
+            .get(artifact_name)
+            .with_context(|| {
+                format!("workflow-class artifact {artifact_name} has no perceptual hashes")
+            })?
+            .iter()
+            .map(|(prompt_id, value)| {
+                (
+                    prompt_id.clone(),
+                    value.clone(),
+                    Some(value.clone()),
+                    None::<String>,
+                )
+            })
+            .collect::<Vec<_>>(),
+        CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT => model
+            .canary
+            .video_fingerprints
+            .get(artifact_name)
+            .with_context(|| {
+                format!("workflow-class artifact {artifact_name} has no video fingerprints")
+            })?
+            .iter()
+            .map(|(prompt_id, value)| {
+                (
+                    prompt_id.clone(),
+                    value.clone(),
+                    None::<String>,
+                    Some(value.clone()),
+                )
+            })
+            .collect::<Vec<_>>(),
+        other => {
+            bail!("workflow-class policy calibration does not support verification_method {other}")
+        }
+    };
+    ensure!(
+        !values.is_empty(),
+        "workflow-class artifact {artifact_name} has no canary method values"
+    );
+    let resource_items = workflow_class_policy_resource_items(model, artifact_name);
+    Ok(values
+        .into_iter()
+        .map(
+            |(prompt_id, fingerprint, perceptual_hash, video_fingerprint)| {
+                CanaryCalibrationPromptReport {
+                    prompt_id,
+                    max_tokens: 1,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    reasoning_tokens: 0,
+                    token_count: 0,
+                    token_ids: Vec::new(),
+                    token_prefix: Vec::new(),
+                    reproducibility_runs: 1,
+                    fingerprint,
+                    perceptual_hash,
+                    embedding_vector: None,
+                    transcript: None,
+                    detected_language: None,
+                    transcription_duration_seconds: None,
+                    word_timestamps: Vec::new(),
+                    segment_timestamps: Vec::new(),
+                    audio_fingerprint: None,
+                    video_fingerprint,
+                    retained_artifacts: Vec::new(),
+                    resource_items: resource_items.clone(),
+                    calibration_baseline_memory_bytes: 1,
+                    calibration_peak_memory_bytes: 1,
+                    output_text: None,
+                    behavioral_output_fingerprint: None,
+                    behavioral_witness: None,
+                }
+            },
+        )
+        .collect())
+}
+
+fn workflow_class_policy_resource_items(
+    model: &catalog::CatalogModel,
+    artifact_name: &str,
+) -> BTreeMap<String, CanaryCalibrationResourceItem> {
+    model
+        .modality_assessment
+        .resource_profiles
+        .get(artifact_name)
+        .into_iter()
+        .flat_map(|profiles| profiles.iter())
+        .map(|(modality, profile)| {
+            (
+                modality.clone(),
+                CanaryCalibrationResourceItem {
+                    unit: profile.unit.clone(),
+                    item_count: 1,
+                    item_bytes: profile.measured_item_bytes,
+                    item_units: profile.measured_item_units,
+                },
+            )
+        })
+        .collect()
+}
+
+fn workflow_class_policy_modality_fingerprints(
+    model: &catalog::CatalogModel,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    definition: &Value,
+    reports: &[CanaryCalibrationPromptReport],
+) -> Result<BTreeMap<String, String>> {
+    let modalities = provider_workflow_output_modalities(model);
+    ensure!(
+        !modalities.is_empty(),
+        "workflow-class model {} has no declared output modalities",
+        model.model_id
+    );
+    let mut fingerprints = BTreeMap::new();
+    for modality in modalities {
+        fingerprints.insert(
+            modality.clone(),
+            stable_value_hash(&json!({
+                "kind": "mayhem-workflow-class-modality-calibration-v1",
+                "model_id": model.model_id,
+                "artifact": artifact_name,
+                "modality": modality,
+                "artifact_binding": catalog_canary_artifact_binding(artifact),
+                "definition": definition,
+                "canary_fingerprints": reports
+                    .iter()
+                    .map(|report| json!({
+                        "prompt_id": report.prompt_id,
+                        "fingerprint": report.fingerprint,
+                    }))
+                    .collect::<Vec<_>>(),
+            })),
+        );
+    }
+    Ok(fingerprints)
+}
+
+fn catalog_workflow_class_endpoint_calibration_report(
+    model: &catalog::CatalogModel,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    prompts: &[CanaryPrompt],
+) -> EndpointCalibrationReport {
+    let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, prompts);
+    run_endpoint_calibration_matrix_with_materializer(
+        &model.adapter.endpoint_families,
+        &substitutions,
+        |contract, case, request| {
+            catalog_endpoint_calibration_materialize_request(contract, case, request, &fixtures)
+                .map_err(|error| format!("{error:#}"))
+        },
+        |contract, _case, request| {
+            let transport = catalog_endpoint_calibration_transport(contract, request, &fixtures)
+                .map_err(|error| format!("building provider transport: {error:#}"))?;
+            let (translation, handled_request_attributes) =
+                catalog_endpoint_calibration_translation(model, contract, request, &transport)
+                    .map_err(|error| format!("translating endpoint request: {error:#}"))?;
+            let sealed = catalog_endpoint_calibration_seal(contract, request, transport)
+                .map_err(|error| format!("sealing provider request: {error:#}"))?;
+            provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter)
+                .map_err(|error| format!("verifying sealed provider request: {error:#}"))?;
+            Ok(EndpointCalibrationExecution {
+                provider_translation_fingerprint: stable_value_hash(&translation),
+                handled_request_attributes,
+                backend_execution_fingerprint: stable_value_hash(&json!({
+                    "kind": "workflow_class_policy_validation",
+                    "model_id": model.model_id,
+                    "artifact": artifact_name,
+                    "artifact_binding": catalog_canary_artifact_binding(artifact),
+                    "request": request,
+                })),
+                backend_proof: EndpointCalibrationBackendProof {
+                    kind: EndpointCalibrationBackendProofKind::PolicyValidation,
+                    behavioral_witness_fingerprint: None,
+                },
+                response: json!({
+                    "id": "workflow-calibration",
+                    "object": "mayhem.workflow",
+                    "model": model.model_id,
+                    "status": "succeeded",
+                    "progress": 1,
+                    "artifacts": [],
+                    "usage": {},
+                    "mayhem": {}
+                }),
+            })
+        },
+    )
 }
 
 fn preflight_calibration_prompt_resources(
@@ -18448,6 +18779,66 @@ fn verify_calibration_artifact_matches_catalog(
     artifact: &catalog::CatalogArtifact,
     artifact_path: &Path,
 ) -> Result<()> {
+    if artifact.engine == "comfyui" {
+        let metadata = fs::metadata(artifact_path)
+            .with_context(|| format!("stat {}", artifact_path.display()))?;
+        if !metadata.is_file() {
+            bail!(
+                "canary calibration requires a local Comfy workflow-class JSON artifact matching the admin catalog: {}",
+                artifact_path.display()
+            );
+        }
+        let definition = read_json_file(artifact_path).with_context(|| {
+            format!(
+                "reading Comfy workflow-class artifact {}",
+                artifact_path.display()
+            )
+        })?;
+        let definition_hash = mayhem_proto::comfy_outcome_class_definition_hash(&definition)
+            .with_context(|| {
+                format!(
+                    "hashing Comfy workflow-class artifact {}",
+                    artifact_path.display()
+                )
+            })?;
+        if definition_hash != artifact.artifact_root {
+            bail!(
+                "local Comfy workflow-class hash mismatch for {}; expected admin catalog artifact_root {}, got {}",
+                artifact_path.display(),
+                artifact.artifact_root,
+                definition_hash
+            );
+        }
+        let bytes = stable_json_bytes(&definition).with_context(|| {
+            format!(
+                "serializing Comfy workflow-class artifact {}",
+                artifact_path.display()
+            )
+        })?;
+        let raw_len = metadata.len();
+        let stable_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if raw_len != artifact.weights_bytes && stable_len != artifact.weights_bytes {
+            bail!(
+                "local Comfy workflow-class size mismatch for {}; expected admin catalog weights_bytes {}, got raw {} and stable {}",
+                artifact_path.display(),
+                artifact.weights_bytes,
+                raw_len,
+                stable_len
+            );
+        }
+        if let Some(expected_sha256) = artifact.source_sha256.as_deref() {
+            let actual_sha256 = sha256_bytes_hex(&bytes);
+            if !actual_sha256.eq_ignore_ascii_case(expected_sha256) {
+                bail!(
+                    "local Comfy workflow-class sha256 mismatch for {}; expected admin catalog source_sha256 {}, got {}",
+                    artifact_path.display(),
+                    expected_sha256,
+                    actual_sha256
+                );
+            }
+        }
+        return Ok(());
+    }
     if artifact.artifact_root_kind != "blake3_merkle_v1" {
         bail!(
             "canary calibration requires admin artifact_root_kind blake3_merkle_v1 for {}; catalog has {}",
@@ -22478,8 +22869,10 @@ fn catalog_canary_matrix_report(
                         )),
                     }
                     match artifact.engine.as_str() {
-                        "llama.cpp" | "mlx" => "token-prefix-local-calibration",
-                        "trt-llm" | "vllm" => "token-prefix-hardware-calibration",
+                        "llama.cpp" | "mlx" | "needle-cpu" => "token-prefix-local-calibration",
+                        "trt-llm" | "vllm" | "needle-gpu" => {
+                            "token-prefix-hardware-calibration"
+                        }
                         other => {
                             entry_errors.push(format!(
                                 "unsupported token-fingerprint calibration engine {other}"
@@ -116514,6 +116907,48 @@ State initialization...
             verify_calibration_artifact_matches_catalog(&artifact, &artifact_path).unwrap_err();
 
         assert!(err.to_string().contains("local artifact root mismatch"));
+    }
+
+    #[test]
+    fn calibration_artifact_guard_accepts_comfy_workflow_class_definition() {
+        let dir = test_temp_dir("mayhem-calibration-comfy-workflow-class");
+        let artifact_path = dir.join("workflow-class.json");
+        let definition = test_comfy_workflow_class_definition();
+        write_json_file(&artifact_path, &definition).unwrap();
+        let mut artifact =
+            test_catalog(&"aa".repeat(32)).models[0].artifacts["gguf-q4_k_m"].clone();
+        artifact.engine = "comfyui".to_owned();
+        artifact.path = "comfy/outcome-classes/v1/image.heavy.le1_2mp.json".to_owned();
+        artifact.artifact_root =
+            mayhem_proto::comfy_outcome_class_definition_hash(&definition).unwrap();
+        let stable_definition = stable_json_bytes(&definition).unwrap();
+        artifact.weights_bytes = fs::metadata(&artifact_path).unwrap().len();
+        artifact.source_sha256 = Some(sha256_bytes_hex(&stable_definition));
+
+        verify_calibration_artifact_matches_catalog(&artifact, &artifact_path).unwrap();
+        artifact.weights_bytes = stable_definition.len() as u64;
+        verify_calibration_artifact_matches_catalog(&artifact, &artifact_path).unwrap();
+
+        let wrong_path = dir.join("wrong-workflow-class.json");
+        let wrong = json!({
+            "schema_version": 1,
+            "class_id": "image.heavy.le17mp",
+            "label": "Image heavy <= 17MP",
+            "output_modality": "image",
+            "max_width": 4096,
+            "max_height": 4096,
+            "pricing_unit": "megapixel_step"
+        });
+        write_json_file(&wrong_path, &wrong).unwrap();
+        let mut wrong_sized_artifact = artifact.clone();
+        wrong_sized_artifact.weights_bytes = stable_json_bytes(&wrong).unwrap().len() as u64;
+        let err = verify_calibration_artifact_matches_catalog(&wrong_sized_artifact, &wrong_path)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("local Comfy workflow-class hash mismatch"),
+            "{err}"
+        );
     }
 
     #[test]
