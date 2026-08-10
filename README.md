@@ -16,6 +16,8 @@ Models: **[huggingface.co/TracNetwork](https://huggingface.co/TracNetwork)** —
 
 Model cheatsheet: **[MODEL-CHEATSHEET.md](MODEL-CHEATSHEET.md)** — exact canonical model IDs, artifacts, endpoints, platform/backend support, runtime pins, resource guidance, controls, and provider commands.
 
+Calibration gates: **[CALIBRATION.md](CALIBRATION.md)** — proof requirements before a model or workflow can be treated as product-ready.
+
 Comfy cheatsheet: **[COMFY-CHEATSHEET.md](COMFY-CHEATSHEET.md)** — workflow classes, signed parts, provider admission, and `/v1/workflows` usage.
 
 ```text

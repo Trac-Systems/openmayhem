@@ -25,6 +25,8 @@ Before selecting or serving a model, read the canonical
 selector, signed artifact, endpoint and modality surface, supported backend/platform pair, runtime
 pin, resource floor, measured guidance, unsupported combination, and provider start command. Live
 enclave IDs, rooms, routes, and prices must still come from `mayhem models --gateway`.
+Before declaring a new model or workflow done, read
+**[`CALIBRATION.md`](CALIBRATION.md)** and verify the relevant proof gates.
 For ComfyUI workflows, also read **[`COMFY-CHEATSHEET.md`](COMFY-CHEATSHEET.md)** before
 calibrating, admitting, serving, or using a workflow class. It lists every current outcome class,
 the signed parts index, required part sets, and `/v1/workflows` request shape.
