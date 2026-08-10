@@ -149,17 +149,25 @@ public capacity.
 
 | Candidate policy | Purpose | Parts needed | Missing work before serving |
 |---|---|---|---|
-| `video.minimax_h3.t2v_i2v` (name pending) | MiniMax H3 text/image-to-video with native stereo audio | FL2VA diffusion `4c371bcbf8e7a577457d7b0ace66345fa85c88a591ca0724a5da6e9642371f72`; Qwen3VL 32B NVFP4 text encoder `32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab`; H3 video VAE `3abef9354f37bb10b413e7034d373e95193511cd80ffa5aea315d1d822032ce7`; H3 audio VAE `6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2` | Mirror payloads into `TracNetwork/openmayhem-parts-index`; finalize records; publish next parts index; create signed workflow policy from official Comfy/H3 Easy graph evidence; run paid `/v1/workflows` quality proof. |
-| `video.minimax_h3.r2v` (name pending) | MiniMax H3 reference-to-video / reference-media workflow | All T2V/I2V H3 parts plus REF2VA diffusion `b5f18df20fb79f5ae577ed27d16182251712d9a1f30a29af3ffbd6526356b87b` | Prove base H3 lane first; then research/refine R2V graph, input media bounds, policy, canary, and paid quality proof. |
-| `video.minimax_h3.spectrum` (optional, name pending) | H3 audio-quality/smoothing extension | H3 base parts plus Spectrum H3 extension payload if accepted | GPL-3.0 license/product acceptance, extension packaging as a signed runtime/custom-node part, graph policy, and quality proof. |
+| `video.minimax_h3.t2v_i2v` (blocked) | MiniMax H3 text/image-to-video with native stereo audio | FL2VA diffusion `4c371bcbf8e7a577457d7b0ace66345fa85c88a591ca0724a5da6e9642371f72`; Qwen3VL 32B NVFP4 text encoder `32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab`; H3 video VAE `3abef9354f37bb10b413e7034d373e95193511cd80ffa5aea315d1d822032ce7`; H3 audio VAE `6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2` | License blocker: do not mirror payloads, publish parts, create a public policy, or run a paid OpenMayhem proof until OpenMayhem has rights for its served territories. |
+| `video.minimax_h3.r2v` (blocked) | MiniMax H3 reference-to-video / reference-media workflow | All T2V/I2V H3 parts plus REF2VA diffusion `b5f18df20fb79f5ae577ed27d16182251712d9a1f30a29af3ffbd6526356b87b` | Same MiniMax H3 license blocker; after rights are cleared, prove base T2V/I2V first. |
+| `video.minimax_h3.spectrum` (blocked) | H3 audio-quality/smoothing extension | H3 base parts plus Spectrum H3 extension payload if accepted | Blocked by the base H3 license; Spectrum itself is GPL-3.0 and needs a separate product/license decision. |
 
-MiniMax H3 is queued after the current calibration. Owner reviewed and approved the license path on
-2026-08-10. Use the official Comfy page and `Comfy-Org/MiniMax-H3` as sources. Prefer
-`int8_convrot` diffusion weights on PyTorch/CUDA 13 and the `qwen3vl_32b_minimax_h3_nvfp4_awq`
-text encoder; the Comfy-Org README states that text-encoder NVFP4 does not require Blackwell.
-Calibrate T2V first, then I2V/R2V only after the base lane is proven. Required proof coverage is one
-clean CUDA lane, either Windows CUDA or Spark CUDA, whichever fits fastest and safest. Add the second
-platform only if the first exposes platform-specific behavior.
+MiniMax H3 is not approved for public OpenMayhem serving as of 2026-08-10. The immutable
+MiniMaxAI license at revision `9ac0dd7aabc2c651fcf0ace4c00b2bffd9c8c8a6` grants rights only
+inside its "Applicable Territory" and defines that territory as worldwide excluding the European
+Union, the United Kingdom, the Republic of Korea, and the United States of America. It also
+explicitly covers hosted services. That conflicts with OpenMayhem's public provider market and user
+base, so H3 weights must remain research-only until a separate license or replacement model clears
+those territories. Do not upload H3 payloads into `TracNetwork/openmayhem-parts-index` or advertise
+an H3 workflow policy without updating this section with the new rights evidence.
+
+The technical H3 research remains useful if the license is cleared later. Use the official Comfy page
+and `Comfy-Org/MiniMax-H3` as sources. Prefer `int8_convrot` diffusion weights on PyTorch/CUDA 13 and
+the `qwen3vl_32b_minimax_h3_nvfp4_awq` text encoder; the Comfy-Org README states that text-encoder
+NVFP4 does not require Blackwell. Calibrate T2V first, then I2V/R2V only after the base lane is proven.
+Required proof coverage is one clean CUDA lane, either Windows CUDA or Spark CUDA, whichever fits
+fastest and safest. Add the second platform only if the first exposes platform-specific behavior.
 
 H3 reference workflow inputs:
 
