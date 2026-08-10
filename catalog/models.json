@@ -24863,11 +24863,11 @@
                 "value_types": [
                   "integer"
                 ],
-                "default": 120000,
+                "default": 900000,
                 "minimum": 1000,
                 "maximum": 3600000,
                 "calibration_values": [
-                  120000
+                  900000
                 ]
               },
               "user": {
@@ -25178,7 +25178,7 @@
         "runtime_id": "comfyui-v0.30.1",
         "outcome_class": "image.heavy.le17mp",
         "pricing_unit": "megapixel_step",
-        "inventory_root": "ed99758a107c3159b466f6970152a386619f1c9e62f9a6dabb1400b244ee427e",
+        "inventory_root": "f58f46401fcec0a446d366daf43ce9a1318bbc4a1e00c1ace78a4a441bafe34a",
         "max_nodes": 32,
         "max_width": 4096,
         "max_height": 4096,

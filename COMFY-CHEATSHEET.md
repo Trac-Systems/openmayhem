@@ -58,7 +58,10 @@ Verify the local runtime and backend:
 mayhem doctor --provider-backend comfyui
 ```
 
-Use a real ComfyUI `v0.30.1` runtime checkout. Set `MAYHEM_COMFYUI_PYTHON` when `python3` is not the interpreter from that runtime.
+Use a real ComfyUI `v0.30.1` runtime checkout. Set `MAYHEM_COMFYUI_PYTHON` when
+`python3` is not the interpreter from that runtime. On CUDA hosts, set
+`MAYHEM_COMFYUI_DEVICE=cuda`; otherwise the Comfy backend intentionally defaults
+to CPU and heavy canaries can take far too long.
 
 Pull and advertise every required part for the workflow class:
 
@@ -170,7 +173,11 @@ Class: `image.heavy.le1_2mp`. Runtime: `comfyui-v0.30.1`. Output: image.
 
 ### Krea 2 Turbo + 4x Upscale
 
-Class: `image.heavy.le17mp`. Runtime: `comfyui-v0.30.1`. Output: image. The upscaler is part of the same workflow request and is priced/routed by the upscaled output dimensions.
+Class: `image.heavy.le17mp`. Runtime: `comfyui-v0.30.1`. Output: image.
+Required inventory root: `f58f46401fcec0a446d366daf43ce9a1318bbc4a1e00c1ace78a4a441bafe34a`.
+The upscaler is part of the same workflow request and is priced/routed by the
+upscaled output dimensions. The signed request timeout default/calibration is
+`900000` ms because the 4x stage is part of launch canary and paid-route proof.
 
 | Selector | Part ID | Type | Purpose |
 |---|---|---|---|
