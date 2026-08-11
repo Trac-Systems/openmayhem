@@ -1012,8 +1012,10 @@ The `0.2.127` source release adds standalone convolutional 4x upscaling
 `d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a`,
 embeds the outcome-class definition in the catalog, and carries a request-bound
 image `input_files` canary. Local reference admission passed with retained
-artifact `openmayhem-upscale-conv-le24mp-reference-v0.2.127.png`; paid-route
-acceptance is still pending.
+artifact `openmayhem-upscale-conv-le24mp-reference-v0.2.127.png`. The `0.2.128`
+source release fixes Comfy workflow input-file capacity accounting so one
+request-bound input plus one output artifact does not hide an otherwise eligible
+workflow route during dispatch; paid-route acceptance remains the next gate.
 
 The `0.2.123` source release adds metadata-only Comfy workflow-class policy
 calibration, signs workflow-class modality fingerprints for Krea base,

@@ -177,11 +177,11 @@ public capacity.
 | `video.minimax_h3.r2v` | MiniMax H3 reference-to-video / reference-media workflow | REF2VA diffusion `b5f18df20fb79f5ae577ed27d16182251712d9a1f30a29af3ffbd6526356b87b`; Qwen3VL 32B NVFP4 text encoder `32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab`; H3 video VAE `3abef9354f37bb10b413e7034d373e95193511cd80ffa5aea315d1d822032ce7`; H3 audio VAE `6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2` | `comfyui-v0.30.1` | Product-accepted after signed v13 parts, `.70` admission, live route, and a paid fiat `/v1/workflows` proof through the `.31` sponsored gateway; retained artifact `openmayhem-minimax-h3-r2v-paid-proof-v0.2.126.mp4`, session `a938e5efd7ddba9a610dbf16723d7a6da62c6e6f8c9dfe924f4765c0111ba81c`, BLAKE3 `19f92129c62ef352a2460a1a3d8654d957672fa1ae4cf0c138b3fdaea468cbfd`. |
 | `video.lipsync` | Wan/InfiniteTalk lipsync/talking-video workflow up to 832x480, 4s, 81 frames | Wan2.1 I2V 14B fp8 `6a05292de329cdb06923008742e4f17329548239c2e2c3b10234276d790e1ef6`; UMT5-XXL fp8 `720ea5ea7b9de57ca87b403856b0a7e42c96d1f1176ff886726ab602b6923709`; Wan 2.1 VAE `79f0076a485bca72333bfa34c767006606b4ff351e5d8abc2045865e12c8a664`; Lightx2v I2V LoRA `6294fc7c467c664debaa9a50ea13bfd21959fe7aa29a9759f07541b66562c491`; InfiniteTalk multi fp16 `fd1d93c0ead8d77bc79d457e45bb391063a21fe3111b0a19ef7dc6a605c3b1fd`; Wav2Vec2 Chinese base fp16 `42ed9ac2d65ac013f5d5a431ff93b1e452371a6f1ba9bf8fdaa5c85b631e4f28` | `comfyui-2a68ce33b4c9` | Signed dev policy and technical canary exist; product proof failed quality review. It is not accepted for general anime action video with voice; keep it scoped to lipsync/talking-head until a better-fit policy proves action, speech, and sync. |
 
-### Planned Or Missing Workflow Policies
+### Accepted Calibration Targets Still Missing Public Proof
 
-| Candidate policy | Purpose | Parts needed | Missing work before serving |
+| Target policy | Purpose | Parts needed | Missing work before serving |
 |---|---|---|---|
-| `video.minimax_h3.spectrum` | H3 audio-quality/smoothing extension | H3 base parts plus Spectrum H3 extension payload if accepted | Candidate quality extension. Spectrum is GPL-3.0 and still needs separate product/license acceptance before blessing. |
+| `video.minimax_h3.spectrum` | H3 audio-quality/smoothing extension | H3 base parts plus Spectrum H3 extension payload | Owner-approved calibration target as of 2026-08-11. Mirror and sign the Spectrum payload as a normal Comfy part, publish a bounded workflow policy, run admission, and retain a paid `/v1/workflows` proof showing an audible quality improvement without changing the already accepted base H3 lane. |
 
 MiniMax H3 is owner-approved for OpenMayhem calibration as of 2026-08-10. The
 five H3 payloads are mirrored and signed in the OpenMayhem Hugging Face parts
@@ -223,16 +223,19 @@ H3 reference workflow inputs:
   policies must keep user media, prompt, seed, dialogue, duration, and reference choices
   flexible inside the signed graph envelope, while excluding provider-side network/API
   prompt optimization.
-- `xmarre/ComfyUI-Spectrum-MiniMax-H3` `v0.2.1` is an audio-quality/acceleration
-  candidate for H3. Its release makes `offline_smoothing_replay=true` the default to
-  avoid the reproduced single-pass speech/stutter defect, with `audio_blend_weight=0`.
-  It has no declared third-party Python dependency, but it is GPL-3.0; treat it as a
-  separately pinned custom-node/runtime part pending explicit license/product acceptance.
+- `xmarre/ComfyUI-Spectrum-MiniMax-H3` `v0.2.1` is an owner-approved
+  audio-quality/acceleration calibration target for H3. Its release makes
+  `offline_smoothing_replay=true` the default to avoid the reproduced
+  single-pass speech/stutter defect, with `audio_blend_weight=0`. It has no
+  declared third-party Python dependency. Treat it as a separately pinned
+  custom-node/runtime part and prove it through a distinct paid workflow lane
+  before marking it product-accepted.
 
 Current H3 state: official Comfy page plus `Comfy-Org/MiniMax-H3` prove native source
 weights and official template availability. `ComfyUI-MiniMaxH3-Easy` is adoption evidence for a
 compact H3 workflow surface, not permission to admit arbitrary optimizer/API nodes. Spectrum H3 is
-candidate quality evidence for the audio path, not acceptance proof. The H3 T2V/I2V class has
+now in scope as a distinct audio-quality lane, but it still needs mirrored parts,
+signed policy, admission, and paid quality proof. The H3 T2V/I2V class has
 signed metadata and mainnet rows, a live `.70` CUDA provider, and a retained paid TNK
 `/v1/workflows` quality proof in the operator proof set. Do not replace that proof with a direct
 Comfy run.

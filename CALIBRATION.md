@@ -98,6 +98,11 @@ A Comfy workflow is calibrated only after all gates below pass:
   `896x512`, `124` frames at `24` fps with AAC audio, session
   `a938e5efd7ddba9a610dbf16723d7a6da62c6e6f8c9dfe924f4765c0111ba81c`, BLAKE3
   `19f92129c62ef352a2460a1a3d8654d957672fa1ae4cf0c138b3fdaea468cbfd`.
+- `video.minimax_h3.spectrum`: owner-approved calibration target as of
+  2026-08-11. It must be handled as a distinct H3 audio-quality workflow lane:
+  mirror and sign the Spectrum custom-node/runtime payload, publish a bounded
+  policy, run admission, and retain a paid `/v1/workflows` proof that shows
+  audible improvement without replacing the accepted base H3 and R2V lanes.
 - `video.heavy.le0_5mpf`: product-accepted for LTX A/V generation after paid
   `/v1/workflows` proofs with video and audio. It is not lipsync evidence.
 - `image.heavy.le1_2mp`: product-accepted for Krea base image generation after

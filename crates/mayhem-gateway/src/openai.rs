@@ -26216,7 +26216,7 @@ fn merge_modality_load(
             max_item_bytes: 0,
             max_item_units: 0,
         });
-    entry.item_count = entry.item_count.saturating_add(item_count);
+    entry.item_count = entry.item_count.max(item_count);
     entry.max_item_bytes = entry.max_item_bytes.max(max_item_bytes);
     entry.max_item_units = entry.max_item_units.max(max_item_units);
 }
@@ -45039,7 +45039,7 @@ mod tests {
             vec!["audio".to_owned(), "image".to_owned()]
         );
         let image_load = requirements.modality_load.get("image").unwrap();
-        assert_eq!(image_load.item_count, 3);
+        assert_eq!(image_load.item_count, 2);
         assert!(image_load.max_item_bytes > 1);
         assert_eq!(image_load.max_item_units, 512 * 512);
         let audio_load = requirements.modality_load.get("audio").unwrap();

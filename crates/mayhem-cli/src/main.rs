@@ -77914,7 +77914,7 @@ fn provider_merge_modality_load(
             max_item_bytes: 0,
             max_item_units: 0,
         });
-    entry.item_count = entry.item_count.saturating_add(item_count);
+    entry.item_count = entry.item_count.max(item_count);
     entry.max_item_bytes = entry.max_item_bytes.max(max_item_bytes);
     entry.max_item_units = entry.max_item_units.max(max_item_units);
 }
@@ -109257,7 +109257,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let mut terms = test_provider_comfy_session_terms();
         terms.served_modalities = vec!["image".to_owned(), "audio".to_owned()];
         let mut image_capacity = test_heartbeat_modality_capacity("image");
-        image_capacity.max_items_per_request = 3;
+        image_capacity.max_items_per_request = 2;
         terms
             .modality_capacities
             .insert("image".to_owned(), image_capacity);
@@ -109275,7 +109275,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
         assert_eq!(
             measured,
-            BTreeMap::from([("audio".to_owned(), 1), ("image".to_owned(), 3)])
+            BTreeMap::from([("audio".to_owned(), 1), ("image".to_owned(), 2)])
         );
     }
 
