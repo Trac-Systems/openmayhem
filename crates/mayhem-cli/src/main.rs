@@ -27205,6 +27205,7 @@ fn comfy_part_record_custom_node_dir(record: &mayhem_proto::ComfyPartRecord) -> 
     comfy_part_custom_node_dir(&record.name, &record.adapter)
 }
 
+#[cfg(any(feature = "comfyui", test))]
 fn comfy_part_draft_custom_node_dir(draft: &mayhem_proto::ComfyPartDraft) -> Result<PathBuf> {
     comfy_part_custom_node_archive_format(&draft.file_format)?;
     comfy_part_custom_node_dir(&draft.name, &draft.adapter)
