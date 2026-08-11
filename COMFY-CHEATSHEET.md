@@ -185,7 +185,7 @@ public capacity.
 
 | Target policy | Purpose | Parts needed | Missing work before serving |
 |---|---|---|---|
-| `video.minimax_h3.spectrum` | H3 audio-quality/smoothing extension | H3 base parts plus Spectrum H3 extension payload | Owner-approved calibration target as of 2026-08-11. Mirror and sign the Spectrum payload as a normal Comfy part, publish a bounded workflow policy, run admission, and retain a paid `/v1/workflows` proof showing an audible quality improvement without changing the already accepted base H3 lane. |
+| `video.minimax_h3.spectrum` | Optional H3 audio-quality/smoothing enhancer lane | H3 base parts plus Spectrum H3 extension payload | Owner-approved optional calibration target as of 2026-08-11. Mirror and sign the Spectrum payload as a normal Comfy part, publish a bounded workflow policy, run admission, and retain a paid `/v1/workflows` proof showing an audible quality improvement without changing or re-proving the already accepted base H3 and R2V lanes. |
 
 MiniMax H3 is owner-approved for OpenMayhem calibration as of 2026-08-10. The
 five H3 payloads are mirrored and signed in the OpenMayhem Hugging Face parts
