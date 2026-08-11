@@ -82,10 +82,12 @@ A Comfy workflow is calibrated only after all gates below pass:
   TNK `/v1/workflows` anime fight proof.
 - `video.heavy.le0_5mpf`: product-accepted for LTX A/V generation after paid
   `/v1/workflows` proofs with video and audio. It is not lipsync evidence.
-- `image.heavy.le1_2mp`: Krea base admission and quality output exist; paid
-  route evidence must be attached or rerun before public acceptance.
-- `image.heavy.le17mp`: Krea plus 4x admission and quality output exist; paid
-  route evidence must be attached or rerun before public acceptance.
+- `image.heavy.le1_2mp`: product-accepted for Krea base image generation after
+  `.42` admission and a paid fiat `/v1/workflows` proof through the `.31`
+  sponsored gateway.
+- `image.heavy.le17mp`: product-accepted for Krea plus signed 4x upscaling
+  after `.42` admission and a paid fiat `/v1/workflows` proof through the
+  `.31` sponsored gateway.
 - `video.lipsync`: technical InfiniteTalk proof exists but product quality is
   not accepted. Do not present it as the solution for anime action video with
   voice.

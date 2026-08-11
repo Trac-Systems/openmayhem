@@ -162,8 +162,9 @@ Current proven Krea 2 Turbo workflow lane:
 | Runtime | `comfyui-v0.30.1` |
 | Pricing unit | `megapixel_step` |
 | 1024x1024, 8-step usage | `16` `megapixel_step` |
+| Paid proof | `.42` provider through `.31` sponsored fiat gateway; session `36e05888bdeb8dce7a0fbb21a7bf4ad65efaa58e10043e1e057ab76b66524448`; artifact `openmayhem-krea-base-mercedes-salespitch-paid-v0.2.123.png`; BLAKE3 `a6ab8dec551c1d0e86256b50ee2a95534b2186cadb298381f8b39162650e5c1e` |
 
-Prepared Krea 2 Turbo + 4x upscaler workflow lane:
+Current proven Krea 2 Turbo + 4x upscaler workflow lane:
 
 | Field | Value |
 |---|---|
@@ -171,13 +172,14 @@ Prepared Krea 2 Turbo + 4x upscaler workflow lane:
 | Endpoint family | `mayhem_comfy_workflows` |
 | Endpoint | `POST /v1/workflows` |
 | Enclave ID | `997a76256af8236e32c06ccc2d615c625b208ee435c798e73de0d738334e41f2` |
-| Room nonce | `comfy-grid-v1-image-heavy-le17mp` |
+| Canonical room | `5a5961a6ef3fa0c67db5b4e75c8e0566` |
 | Workflow class artifact root | `13b11b153e7cdadf973e2efbe7f3269f43656b375917005875f130f089ec2aea` |
 | Workflow class source SHA-256 | `58db2ca0a564c200ebf6635544c57d6f1d9970df9e759b05d2b9c49ce14fb4d1` |
-| Required inventory root | `ed99758a107c3159b466f6970152a386619f1c9e62f9a6dabb1400b244ee427e` |
+| Required inventory root | `f58f46401fcec0a446d366daf43ce9a1318bbc4a1e00c1ace78a4a441bafe34a` |
 | Runtime | `comfyui-v0.30.1` |
 | Pricing unit | `megapixel_step` |
 | 1024x1024, 8-step, 4x output usage | `136` `megapixel_step` |
+| Paid proof | `.42` provider through `.31` sponsored fiat gateway; session `36c5476892db7056be5ddf36dcc09436ee7a44a036ed9b4b70a2877276f7e2b9`; artifact `openmayhem-krea-4x-mercedes-salespitch-paid-v0.2.123.png`; BLAKE3 `ec80feb418f369aa509020ecad96cd6886fb8b6af6fde617a2b367a2177b872a` |
 
 Krea 2 Turbo itself is the base image generator. A true 4x result is a single
 Comfy workflow graph that runs Krea and then an approved upscaler node. That is

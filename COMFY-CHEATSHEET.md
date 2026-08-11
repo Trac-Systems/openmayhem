@@ -126,13 +126,12 @@ The signed catalog currently exposes four public workflow rows plus the dev
   fighting video plus native audio.
 - `video.heavy.le0_5mpf`: accepted as an LTX A/V video lane after the paid
   `.70` gateway proofs listed below. This is not lipsync evidence.
-- `image.heavy.le17mp`: `.70` admission passed and a retained Krea+4x
-  Mercedes-sales quality artifact exists; paid receipt/session evidence was not
-  found, so rerun or attach a paid proof before treating it as accepted public
-  capacity.
-- `image.heavy.le1_2mp`: `.70` admission passed and the Krea base quality image
-  is visually acceptable; run or attach a paid `/v1/workflows` proof before
-  treating the base-only lane as accepted public capacity.
+- `image.heavy.le17mp`: accepted after `.42` admission and a paid fiat
+  `/v1/workflows` proof through the `.31` sponsored gateway. Retained review
+  artifact: `openmayhem-krea-4x-mercedes-salespitch-paid-v0.2.123.png`.
+- `image.heavy.le1_2mp`: accepted after `.42` admission and a paid fiat
+  `/v1/workflows` proof through the `.31` sponsored gateway. Retained review
+  artifact: `openmayhem-krea-base-mercedes-salespitch-paid-v0.2.123.png`.
 - `video.lipsync`: catalog row, signed InfiniteTalk canary, and workflow-class
   modality fingerprint exist using runtime `comfyui-2a68ce33b4c9`, but the
   retained reference clip is not product-accepted: voice quality is robotic, lip
@@ -149,8 +148,8 @@ public capacity.
 
 | Policy / model ID | Purpose | Required parts | Runtime | Acceptance state |
 |---|---|---|---|---|
-| `image.heavy.le1_2mp` | Krea 2 Turbo base image generation up to 1024x1024 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70` | `comfyui-v0.30.1` | `.70` admission passed and retained 1024x1024 Mercedes-sales quality output is acceptable; paid receipt/session evidence still needs to be attached or rerun before public acceptance. |
-| `image.heavy.le17mp` | Krea 2 Turbo plus 4x upscale up to 4096x4096 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70`; 4x-spanx4 `d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a` | `comfyui-v0.30.1` | `.70` admission passed and retained 4096x4096 Mercedes-sales quality output is acceptable; paid receipt/session evidence is missing and must be rerun or attached before public acceptance. |
+| `image.heavy.le1_2mp` | Krea 2 Turbo base image generation up to 1024x1024 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70` | `comfyui-v0.30.1` | Product-accepted after `.42` admission and a paid fiat `/v1/workflows` proof through the `.31` sponsored gateway; retained 1024x1024 Mercedes-sales artifact `openmayhem-krea-base-mercedes-salespitch-paid-v0.2.123.png`, session `36e05888bdeb8dce7a0fbb21a7bf4ad65efaa58e10043e1e057ab76b66524448`, BLAKE3 `a6ab8dec551c1d0e86256b50ee2a95534b2186cadb298381f8b39162650e5c1e`. |
+| `image.heavy.le17mp` | Krea 2 Turbo plus 4x upscale up to 4096x4096 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70`; 4x-spanx4 `d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a` | `comfyui-v0.30.1` | Product-accepted after `.42` admission and a paid fiat `/v1/workflows` proof through the `.31` sponsored gateway; retained 4096x4096 Mercedes-sales artifact `openmayhem-krea-4x-mercedes-salespitch-paid-v0.2.123.png`, session `36c5476892db7056be5ddf36dcc09436ee7a44a036ed9b4b70a2877276f7e2b9`, BLAKE3 `ec80feb418f369aa509020ecad96cd6886fb8b6af6fde617a2b367a2177b872a`. |
 | `video.heavy.le0_5mpf` | LTX 2.3 native audio/video generation up to 768x512, 8s, 192 frames | LTX 2.3 fp8 AV checkpoint `34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2`; Gemma 3 12B fp4 text encoder `20652c80fc8e88963343b9968722becb2118d507befbbf0272aa8d79e99893cc`; LTX distilled LoRA 384 `988522cff35f19d7c5977472be163f05b49bf381e441963da4182b0a90b1116c`; LTX spatial upscaler `e0f339c2b5c13fcae1b78cade132ae0307114026c6d20642335eccb4887a050d`; LTX audio VAE `8c108e3ce85d127cef5dbb5747f8c30d2a30c6d92f215278399224e38ffe806c` | `comfyui-v0.30.1` | Product-accepted for A/V generation after paid `.70` `/v1/workflows` proofs with retained video+audio artifacts. |
 | `video.minimax_h3.t2v_i2v` | MiniMax H3 text/image-to-video with native stereo audio up to 1344x768, 15s, 362 frames | FL2VA diffusion `4c371bcbf8e7a577457d7b0ace66345fa85c88a591ca0724a5da6e9642371f72`; Qwen3VL 32B NVFP4 text encoder `32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab`; H3 video VAE `3abef9354f37bb10b413e7034d373e95193511cd80ffa5aea315d1d822032ce7`; H3 audio VAE `6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2` | `comfyui-v0.30.1` | Product-accepted for the base T2V/I2V lane: parts mirrored in parts-index v12, signed catalog metadata published, enclave/price/room live on mainnet, `.70` admission passed, and a retained paid TNK `/v1/workflows` proof passed quality review. |
 | `video.lipsync` | Wan/InfiniteTalk lipsync/talking-video workflow up to 832x480, 4s, 81 frames | Wan2.1 I2V 14B fp8 `6a05292de329cdb06923008742e4f17329548239c2e2c3b10234276d790e1ef6`; UMT5-XXL fp8 `720ea5ea7b9de57ca87b403856b0a7e42c96d1f1176ff886726ab602b6923709`; Wan 2.1 VAE `79f0076a485bca72333bfa34c767006606b4ff351e5d8abc2045865e12c8a664`; Lightx2v I2V LoRA `6294fc7c467c664debaa9a50ea13bfd21959fe7aa29a9759f07541b66562c491`; InfiniteTalk multi fp16 `fd1d93c0ead8d77bc79d457e45bb391063a21fe3111b0a19ef7dc6a605c3b1fd`; Wav2Vec2 Chinese base fp16 `42ed9ac2d65ac013f5d5a431ff93b1e452371a6f1ba9bf8fdaa5c85b631e4f28` | `comfyui-2a68ce33b4c9` | Signed dev policy and technical canary exist; product proof failed quality review. It is not accepted for general anime action video with voice; keep it scoped to lipsync/talking-head until a better-fit policy proves action, speech, and sync. |
@@ -277,6 +276,13 @@ and every referenced file must appear in `workflow.parts`.
 
 Class: `image.heavy.le1_2mp`. Runtime: `comfyui-v0.30.1`. Output: image.
 
+Paid proof: on 2026-08-11, `.42` served a paid fiat `/v1/workflows` request
+through the `.31` sponsored gateway. Retained review artifact:
+`openmayhem-krea-base-mercedes-salespitch-paid-v0.2.123.png`; session
+`36e05888bdeb8dce7a0fbb21a7bf4ad65efaa58e10043e1e057ab76b66524448`;
+artifact BLAKE3 `a6ab8dec551c1d0e86256b50ee2a95534b2186cadb298381f8b39162650e5c1e`;
+usage `16` `megapixel_step`; response completed in `16.204` seconds.
+
 | Selector | Part ID | Type | Purpose |
 |---|---|---|---|
 | `krea2_turbo_fp8_scaled.safetensors` | `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae` | checkpoint | base generator |
@@ -290,6 +296,13 @@ Required inventory root: `f58f46401fcec0a446d366daf43ce9a1318bbc4a1e00c1ace78a4a
 The upscaler is part of the same workflow request and is priced/routed by the
 upscaled output dimensions. The signed request timeout default/calibration is
 `900000` ms because the 4x stage is part of launch canary and paid-route proof.
+
+Paid proof: on 2026-08-11, `.42` served a paid fiat `/v1/workflows` request
+through the `.31` sponsored gateway. Retained review artifact:
+`openmayhem-krea-4x-mercedes-salespitch-paid-v0.2.123.png`; session
+`36c5476892db7056be5ddf36dcc09436ee7a44a036ed9b4b70a2877276f7e2b9`;
+artifact BLAKE3 `ec80feb418f369aa509020ecad96cd6886fb8b6af6fde617a2b367a2177b872a`;
+usage `136` `megapixel_step`; response completed in `36.306` seconds.
 
 | Selector | Part ID | Type | Purpose |
 |---|---|---|---|

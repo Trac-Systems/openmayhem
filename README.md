@@ -985,10 +985,18 @@ video+audio caps. `.70` completed admission and a paid TNK `/v1/workflows`
 media proof; the retained review artifact is kept in the operator proof set and
 must not be replaced by a direct Comfy run.
 
+Krea 2 Turbo base image generation (`image.heavy.le1_2mp`) and Krea 2 Turbo
+with signed 4x upscaling (`image.heavy.le17mp`) are product-accepted after
+`.42` admission and paid fiat `/v1/workflows` proofs through the `.31`
+sponsored gateway. Retained review artifacts are
+`openmayhem-krea-base-mercedes-salespitch-paid-v0.2.123.png` and
+`openmayhem-krea-4x-mercedes-salespitch-paid-v0.2.123.png`.
+
 The `0.2.123` source release adds metadata-only Comfy workflow-class policy
 calibration, signs workflow-class modality fingerprints for Krea base,
 Krea+4x, and LTX A/V rows, and keeps backend media quality proof as a separate
-paid-route acceptance gate.
+paid-route acceptance gate. Krea base and Krea+4x later passed paid fiat
+acceptance proofs on 2026-08-11.
 
 The `0.2.122` source release corrects the MiniMax H3 Comfy parts manifest to use
 Hugging Face blob/LFS SHA-256 values instead of xet/cache `ETag` values. The H3
@@ -1005,10 +1013,10 @@ a paid `/v1/workflows` quality proof before public serving.
 
 The `0.2.120` source release teaches catalog calibration to derive Comfy workflow
 canary requests from the signed workflow policy, including bounded `input_files`,
-and adds the InfiniteTalk `video.lipsync` dev reference row. Remaining workflow
-calibration lanes are Krea base, Krea+4x, and LTX A/V workflow-class fingerprints;
-MiniMax H3 is now the owner-priority next workflow calibration target using the
-official Comfy-Org source weights and reference workflows.
+and adds the InfiniteTalk `video.lipsync` dev reference row. Krea base, Krea+4x,
+LTX A/V, and MiniMax H3 now have paid-route acceptance evidence; remaining
+workflow work should focus on missing product-fit classes rather than rerunning
+those accepted lanes.
 
 The `0.2.118` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the
