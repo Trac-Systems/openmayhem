@@ -1041,12 +1041,12 @@ can be mirrored from immutable `/resolve/<40-hex>/...` sources instead of mutabl
 cheatsheet; H3 still requires parts mirroring, workflow policy publication, and
 a paid `/v1/workflows` quality proof before public serving.
 
-The `0.2.120` source release teaches catalog calibration to derive Comfy workflow
-canary requests from the signed workflow policy, including bounded `input_files`,
-and adds the InfiniteTalk `video.lipsync` dev reference row. Krea base, Krea+4x,
-LTX A/V, and MiniMax H3 now have paid-route acceptance evidence; remaining
-workflow work should focus on missing product-fit classes rather than rerunning
-those accepted lanes.
+The `0.2.131` source release adds LongCat Avatar 1.5 as the active
+`video.lipsync` dev row with signed v17 parts, request-carried image/audio
+`input_files`, and a workflow-class `video_av_fingerprint` canary from retained
+reference media. Krea base, Krea+4x, LTX A/V, MiniMax H3, and standalone
+upscale have paid-route acceptance evidence; LongCat still needs the paid
+`/v1/workflows` product proof before being treated as accepted public capacity.
 
 The `0.2.118` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the

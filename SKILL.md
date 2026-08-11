@@ -132,9 +132,12 @@ binary before succeeding. Managed Python backends need no system Python, `venv`,
 `pip`: Mayhem downloads the exact hash-pinned standalone `uv` for the host and atomically creates
 the frozen runtime under `~/.mayhem`.
 **ComfyUI workflows:** verify the blessed ComfyUI runtime checkout, currently
-`comfyui-v0.30.1` for Krea/LTX lanes or `comfyui-2a68ce33b4c9` for the InfiniteTalk lipsync
-reference lane, and the Python executable that belongs to it. Use `python3` only when it is the
-runtime environment's interpreter; otherwise set `MAYHEM_COMFYUI_PYTHON` to the exact executable.
+`comfyui-v0.30.1` for Krea/LTX/MiniMax H3/upscale lanes,
+`comfyui-longcat-avatar-v0.30.1` for the LongCat `video.lipsync` dev lane, or
+`comfyui-2a68ce33b4c9` only for the rejected InfiniteTalk reference lane. Use
+the Python executable that belongs to that runtime; use `python3` only when it
+is the runtime environment's interpreter, otherwise set `MAYHEM_COMFYUI_PYTHON`
+to the exact executable.
 Workflow parts still come only from the signed parts index and require `mayhem provider parts pull`,
 `mayhem provider parts add`, and `mayhem provider parts admit --write` before serving. Workflow
 provider start must pass `--artifact <comfy-runtime-dir>`; that path is the local ComfyUI runtime
@@ -150,7 +153,7 @@ requires the v0.2.107 upscaler-scale derivation on both gateway and provider so 
 route the 4096x4096 output instead of the base image.
 Standalone upscaling is a separate workflow market: `upscale.conv.le24mp` uses
 only the signed `4x-spanx4-ch48.safetensors` part, requires an `input_files`
-image, and remains reference-admitted until a paid route proof is captured.
+image, and has paid-route acceptance evidence.
 **Tier 2:** install `tpm2-tools`; the provider uses `/dev/tpmrm0` unprivileged. If the distro owns
 that device as `root:tss`, add the login to the existing group with
 `sudo usermod -aG tss "$USER"`, then start a new login. Mayhem never creates users/groups or changes

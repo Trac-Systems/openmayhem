@@ -132,7 +132,7 @@ A Comfy calibration is not complete until all of these gates pass:
 
 ## Active Workflow Calibration Queue
 
-The signed catalog currently exposes six public workflow rows. Optional
+The signed catalog currently exposes seven public/dev workflow rows. Optional
 workflow lanes are tracked separately so they do not block already accepted
 lanes, but once selected they must pass the same research, signed-parts,
 policy, admission, paid-route, and retained media proof gates. The dev
@@ -168,12 +168,13 @@ policy, admission, paid-route, and retained media proof gates. The dev
   `04a42dc2aa5159d317be3c0e80924421d1163021e91d8b41352d72ba96b940fe`,
   BLAKE3 `1d47264316354f7f0aa787da4637711e38a0b8e78a715682cb241a937e8f9699`.
 - `video.lipsync`: InfiniteTalk remains rejected for product quality. LongCat
-  Video Avatar 1.5 now has signed v17 parts and `.42` reference admission under
-  `comfyui-longcat-avatar-v0.30.1` with retained media
+  Video Avatar 1.5 now has a `video.lipsync` dev catalog row, signed v17 parts,
+  a distinct `comfyui-longcat-avatar-v0.30.1` runtime/custom-node profile, and
+  `.42` reference admission with retained media
   `openmayhem-longcat-avatar-anime-fight-dialogue-reference-v0.2.129.mp4`.
   This is technical lipsync/talking-video evidence only: the clip is stable and
   has visible mouth changes, but it is not full anime fight choreography and it
-  still needs a paid `/v1/workflows` proof before public acceptance.
+  still needs a paid `/v1/workflows` proof before product acceptance.
 
 ## Workflow Policy To Parts Matrix
 
@@ -336,7 +337,7 @@ and every referenced file must appear in `workflow.parts`.
 | `upscale.conv.le512mp` | Class exists. A provider policy must choose one or more signed upscaler parts and prove the exact graph. The `le24mp` SPANx4 lane is now a current signed workflow row; larger/restoration variants remain separate policy work. | Convolutional/restoration upscalers: `121becf8`, `17b705c5`, `23178907`, `34889283`, `522bad49`, `6a1ac0ec`, `6adc20e6`, `776268ba`, `7c3058ae`, `7c985640`, `851b706a`, `8dc290bc`, `96cfc3a4`, `a95240c0`, `b40716b2`, `c21510f4`, `dfa6e5df`. Use `e0f339c2` only inside LTX-AV latent-upscale policies. |
 | `upscale.diffusion` | Class exists. SeedVR2 policies need a dedicated proof; do not mix them into a convolutional-upscale admission. | Diffusion/video restoration parts: `9c98aed7` SeedVR2 3B, `ca6bff3f` SeedVR2 7B, `63e69083` SeedVR2 VAE. Optional video preprocessing/interpolation support: `6cc88536` RIFE 4.7, `865582d1` RIFE 4.9. |
 | `video.light.le0_5mpf`, `video.light.le2_2mpf`, `video.heavy.le0_5mpf`, `video.heavy.le2_2mpf` | Official LTX-AV uses `video.heavy.le0_5mpf` and has a paid mainnet proof for bounded anime fighting video with a real audio track. That proof is A/V evidence, not lipsync evidence. Other video classes need separate signed policy/canary if their caps or lane differ. | Video models: `34dfabbf` official LTX 2.3 fp8, `25055314` LTX GTAnimation low-VRAM candidate. Text encoders: `20652c80` Gemma 3 12B fp4, `720ea5ea` UMT5-XXL fp8 for Wan policies. LTX AV support: `988522cf` distilled LoRA, `e0f339c2` LTX spatial x2 latent upscaler, `8c108e3c` LTX audio VAE, `32b0af06` LTX tiny VAE. Video support: `40dd2b8b` Wan low-noise control, `660c1350` Wan high-noise control, `79f0076a` Wan VAE, `34889283` animevideo x2, `851b706a` animevideo x4, `6cc88536` RIFE 4.7, `865582d1` RIFE 4.9. |
-| `video.lipsync` | InfiniteTalk has runtime `comfyui-2a68ce33b4c9`, signed canary/policy evidence, request-carried image/audio `input_files`, and workflow-class canary fingerprint, but no current public `models.json` row. The retained reference clip is a technical graph proof only and fails quality acceptance: robotic voice, weak/absent lip sync, and no useful background sound. LongCat Video Avatar 1.5 is the preferred next candidate for anime/stylized dialogue, but current OpenMayhem runtime coverage is missing its avatar/Whisper nodes and signed model/audio parts. Public paid-route proof still requires a better accepted policy, provider `parts pull`/`parts add`/`parts admit --write`, live route, and a paid `/v1/workflows` request with acceptable speech/lipsync quality. LatentSync remains unblessed. | Signed lipsync parts: `471fb7a0` LatentSync Whisper tiny, `d4330bc7` LatentSync SyncNet, `5cebda44` LatentSync UNet, `20bbd004` MeiGen InfiniteTalk single, `d8903b87` MeiGen InfiniteTalk multi, `b36a713b` Comfy-Org InfiniteTalk single fp16, `fd1d93c0` Comfy-Org InfiniteTalk multi fp16, `6a05292d` Wan2.1 I2V 14B 480p fp8, `6294fc7c` Lightx2v I2V rank64 LoRA, `42ed9ac2` wav2vec2 Chinese base fp16. Common signed companions: `720ea5ea` UMT5-XXL fp8 and `79f0076a` Wan 2.1 VAE. Missing candidate parts before LongCat admission: LongCat Avatar 1.5 model payload, Whisper-large-v3, any vocal separator, any distilled LoRA/companion VAE/text encoder required by the exact graph, and the custom-node/runtime payload providing `LongCatAvatarWhisperEmbeds` plus `WanVideoLongCatAvatarExtendEmbeds`. |
+| `video.lipsync` | LongCat Avatar 1.5 is the active dev catalog row for anime/stylized talking-video lipsync. It has signed v17 parts, a distinct `comfyui-longcat-avatar-v0.30.1` runtime/custom-node profile, request-carried image/audio `input_files`, and a workflow-class `video_av_fingerprint` canary from retained reference media. Public product acceptance still requires a paid `/v1/workflows` proof with acceptable speech/lipsync quality. InfiniteTalk remains rejected for product quality: robotic voice, weak/absent lip sync, and no useful background sound. LatentSync remains unblessed. | Active LongCat parts: `03aec730`, `96024250`, `28e2da04`, `1d5b361c` Avatar INT8 shards; `94477286`, `de863798`, `4c9359ce` index/config; `421eaeb5` DMD LoRA; `6b437f1e` VAE; `720ea5ea` UMT5 fp8; `009d64bc` Whisper-large-v3; `29b4d476` custom node. Older signed lipsync candidates kept for future policies: `471fb7a0` LatentSync Whisper tiny, `d4330bc7` LatentSync SyncNet, `5cebda44` LatentSync UNet, `20bbd004` MeiGen InfiniteTalk single, `d8903b87` MeiGen InfiniteTalk multi, `b36a713b` Comfy-Org InfiniteTalk single fp16, `fd1d93c0` Comfy-Org InfiniteTalk multi fp16, `6a05292d` Wan2.1 I2V 14B 480p fp8, `6294fc7c` Lightx2v I2V rank64 LoRA, `42ed9ac2` wav2vec2 Chinese base fp16, and common Wan companions `720ea5ea` UMT5-XXL fp8 plus `79f0076a` Wan 2.1 VAE. |
 | `audio.tts`, `audio.generation`, `audio.stt` | Classes exist but this parts index has no standalone TTS, audio-generation, or STT model policy ready for public serving. | No standalone audio-class parts are currently signed. `8c108e3c` is only the LTX AV audio VAE, and the lipsync parts are only for `video.lipsync` policies. |
 | `compute.norm` | Class exists for bounded residual workflow compute, not for arbitrary unsigned execution. | No class-ready parts in this index. A workflow must publish its own signed parts and policy before admission. |
 
@@ -412,9 +413,10 @@ These are signed support parts for lipsync/talking-video workflow classes. They 
 Current runtime status:
 
 - InfiniteTalk: the dev calibration runtime is `comfyui-2a68ce33b4c9`. The retained reference output is `openmayhem-infinitetalk-anime-fight-louder-reference-v0.2.119.mp4` in Downloads and proves only that a bounded two-speaker anime fight graph can run with request-carried image/audio media. It does not pass quality acceptance; do not advertise it as successful lipsync.
-- LongCat Video Avatar 1.5: preferred candidate for anime/stylized dialogue
-  lipsync. It is now reference-admitted on `.42` with signed v17 parts and
-  runtime `comfyui-longcat-avatar-v0.30.1`. The selected implementation is
+- LongCat Video Avatar 1.5: active dev policy for anime/stylized dialogue
+  lipsync. It is reference-admitted on `.42` with signed v17 parts, a
+  `video.lipsync` catalog row, and runtime `comfyui-longcat-avatar-v0.30.1`.
+  The selected implementation is
   `rookiestar28/ComfyUI-LongCat-Avatar@08b4daedfaed69abaf467097f8665615b2137331`
   (MIT), whose nodes cover model load, text encode, Whisper audio, audio
   window/encode, sampler, and optional vocal extraction. The distinct runtime
@@ -429,7 +431,7 @@ Current runtime status:
 - LatentSync: the three model files are signed, but the LatentSync node pack is not part of the blessed runtime. Do not admit a LatentSync workflow until that node pack is mirrored, pinned, blessed, and covered by a canary.
 - `sync.so`/HeyGen API nodes: these are remote service nodes. They are not acceptable for local OpenMayhem provider proof unless a future catalog policy explicitly declares an external-service lane and its security/payment rules.
 
-LongCat candidate requirements before any public `video.lipsync` row:
+LongCat policy requirements for `video.lipsync`:
 
 - Runtime/custom-node part: pin
   `rookiestar28/ComfyUI-LongCat-Avatar@08b4daedfaed69abaf467097f8665615b2137331`,
@@ -437,15 +439,15 @@ LongCat candidate requirements before any public `video.lipsync` row:
   `adapter.comfy_custom_node_dir`, and start Comfy with only the signed
   whitelist enabled. The runtime must include the package dependencies; do not
   install them into an already-serving H3/Krea runtime.
-- Model/audio parts: prefer the official Avatar 1.5 INT8 sharded DiT layout from
+- Model/audio parts: use the official Avatar 1.5 INT8 sharded DiT layout from
   `meituan-longcat/LongCat-Video-Avatar-1.5@92016c71d5d318d0f5d84e4db30015a571484ab6`
   (`base_model_int8/` config, quantization config, index, and four shards), the
   same repo's `lora/dmd_lora.safetensors`, Whisper-large-v3
   `model.safetensors`, and `meituan-longcat/LongCat-Video@03b55529b1d1d4045f5fbe14d65c8c6e8116b278`
   `vae/diffusion_pytorch_model.safetensors`. The first public policy should use
   the already signed UMT5 fallback path rather than the much larger native
-  official LongCat text encoder. `Kim_Vocal_2.onnx` is optional; include it only
-  for policies that actually expose vocal separation.
+  official LongCat text encoder. `Kim_Vocal_2.onnx` remains optional; include it
+  only for policies that actually expose vocal separation.
 - Graph rule: OpenMayhem policies must set LongCat runtime auto-download toggles
   to `false`; all required files must come from signed parts. The public graph
   should default to `official_int8_sharded`, 480p, 25 fps, DMD 8-step inference,
