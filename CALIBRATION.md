@@ -55,6 +55,10 @@ A Comfy workflow is calibrated only after all gates below pass:
 - Admission gate: the provider advertises parts only through
   `mayhem provider parts add`, then persists a successful
   `mayhem provider parts admit --write` envelope for the exact outcome class.
+  A provider home has one Comfy inventory root; do not add disjoint workflow
+  inventories into a home already serving another Comfy class unless both
+  signed policies require the same root. Use separate provider homes for
+  disjoint inventory roots.
 - Runtime gate: every node is available in the blessed ComfyUI runtime or in a
   separately blessed extension policy. External API nodes are not local proof
   unless the catalog explicitly declares that external-service lane.

@@ -93,6 +93,12 @@ mayhem up --provider \
   --yes
 ```
 
+One provider home has one advertised Comfy inventory root. Do not add parts for
+an unrelated workflow class into a home that is already serving another Comfy
+class unless both classes are signed against the same inventory root. Use a
+separate provider home for disjoint workflow inventories; otherwise the next
+provider start correctly refuses with an inventory-root mismatch.
+
 Only use `--load-plan <plan.json>` when the signed workflow policy permits staged loading. Without a load plan, all required parts must fit together. The `--artifact` value is the local ComfyUI runtime directory; the ledger artifact remains the signed workflow class definition.
 
 ## Calibration Acceptance Gate

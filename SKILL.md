@@ -139,7 +139,9 @@ Workflow parts still come only from the signed parts index and require `mayhem p
 `mayhem provider parts add`, and `mayhem provider parts admit --write` before serving. Workflow
 provider start must pass `--artifact <comfy-runtime-dir>`; that path is the local ComfyUI runtime
 checkout, while the ledger artifact is the workflow class definition. On CUDA hosts set
-`MAYHEM_COMFYUI_DEVICE=cuda`; the backend defaults to CPU when the device is omitted. Krea base generation is a
+`MAYHEM_COMFYUI_DEVICE=cuda`; the backend defaults to CPU when the device is omitted. A Comfy
+provider home has one advertised inventory root; use separate provider homes for disjoint workflow
+inventories unless the signed policies require the same root. Krea base generation is a
 1024x1024 workflow lane. A Krea+4x lane is one workflow graph with a signed upscaler part, but it
 requires the v0.2.107 upscaler-scale derivation on both gateway and provider so vouchers bill and
 route the 4096x4096 output instead of the base image.
