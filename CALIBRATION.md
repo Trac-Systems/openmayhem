@@ -98,6 +98,14 @@ A Comfy workflow is calibrated only after all gates below pass:
 - `image.heavy.le17mp`: product-accepted for Krea plus signed 4x upscaling
   after `.42` admission and a paid fiat `/v1/workflows` proof through the
   `.31` sponsored gateway.
+- `upscale.conv.le24mp`: signed standalone 4x convolutional upscaler policy is
+  catalog-admitted with the SPANx4 part
+  `d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a`.
+  Local reference admission proof produced
+  `openmayhem-upscale-conv-le24mp-reference-v0.2.127.png`, output SHA-256
+  `3b78c0ecd45cfa63c75d2eea18c7056c417015908c7ec7c8dddc327949e4f8fc`.
+  A paid route proof is still required before calling live marketplace capacity
+  product-accepted.
 - `video.lipsync`: technical InfiniteTalk proof exists but product quality is
   not accepted. Do not present it as the solution for anime action video with
   voice.

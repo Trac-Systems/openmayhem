@@ -1,0 +1,62 @@
+{
+  "set_id": "canary-upscale-conv-workflow-launch-v1",
+  "description": "Launch canary for standalone signed convolutional Comfy upscaler workflow providers.",
+  "prompts": [
+    {
+      "id": "upscale-spanx4-tiny-source-seed7",
+      "endpoint_family": "mayhem_comfy_workflows",
+      "model": "upscale.conv.le24mp",
+      "runtime_id": "comfyui-v0.30.1",
+      "outcome_class": "upscale.conv.le24mp",
+      "timeout_ms": 120000,
+      "response_format": "artifact",
+      "seed": 7,
+      "workflow": {
+        "1": {
+          "class_type": "LoadImage",
+          "inputs": {
+            "image": "inputs/upscale-source.png"
+          }
+        },
+        "2": {
+          "class_type": "UpscaleModelLoader",
+          "inputs": {
+            "model_name": "4x-spanx4-ch48.safetensors"
+          }
+        },
+        "3": {
+          "class_type": "ImageUpscaleWithModel",
+          "inputs": {
+            "upscale_model": [
+              "2",
+              0
+            ],
+            "image": [
+              "1",
+              0
+            ]
+          }
+        },
+        "4": {
+          "class_type": "SaveImage",
+          "inputs": {
+            "filename_prefix": "mayhem-upscale-spanx4",
+            "images": [
+              "3",
+              0
+            ]
+          }
+        }
+      },
+      "input_files": [
+        {
+          "filename": "inputs/upscale-source.png",
+          "kind": "image",
+          "content_type": "image/png",
+          "encoding": "base64",
+          "data": "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAQKADAAQAAAABAAAAQAAAAABGUUKwAAACOElEQVRoBdWavVEDMRBGzwwlXO7EFUDigIgK6ISEMiiGCogIiKjAiYkdkDjnmxEj5D39rKTVeVczHks63eo9aQ9kjzfn889ks2y3O4Df2ISfHL1VAU9vUiCktydA6I/Hg6VnYElvaQei9GYEUvQQuMUrWu6fv6P963ee3h7DSZH3YVP7M5Cnh4lqgSK9agEOvV4BQj8/vYd5H9Y1phCfXuMOVNGrE6il1yXQQK9IoI1+DYHP0wumyZdmeoRNHiXyU+avEuiwuZ9fyb099PICISsBdU03wGt00iOm5P+BIr1XciP76SUF+PROQ4ReTKCWfvfx5XcDlcxJIRwWrQuk0BXpoSQgEF2YVCdZ+8PDXWoks79XoGr5o/RVEZZWvQLLiKmeKH1qML9/JYFB9PBcQ2Acfa8AJ3059Jw4qaTq2gF/IkhF59Dj3mKcVHz0dwlk4uISkz4fpHh1lMA69NAbIrAavYDAMn1r6ZcRimkTDhDegVr6EKWtLiDgl7CB3t/bRo+7BAQQBRxXoRcTIJ9OOGfM/rV3myawA1ekh0PvtxKEHp+t9tOUORpILbxb/l6BJb2LG1JCJmz6iaUq7SmUoidkQ+kxV6MAk57IjGi2COihb9kBVfTVAtro6wQU0lcI6KTnCqilZwlopi8LKKcvCOinzwmYoE8KkN/n9Hx/jzmGlshxmtCT3+cMpWkITs9CtughfCFgjv5CwCL9v4BR+j8Bu/QQ2MzzjDdflP/N8Zy+cvEQm6OHxi9ag+6VHvlgmwAAAABJRU5ErkJggg=="
+        }
+      ]
+    }
+  ]
+}

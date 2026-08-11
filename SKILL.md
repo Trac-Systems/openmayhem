@@ -143,6 +143,9 @@ checkout, while the ledger artifact is the workflow class definition. On CUDA ho
 1024x1024 workflow lane. A Krea+4x lane is one workflow graph with a signed upscaler part, but it
 requires the v0.2.107 upscaler-scale derivation on both gateway and provider so vouchers bill and
 route the 4096x4096 output instead of the base image.
+Standalone upscaling is a separate workflow market: `upscale.conv.le24mp` uses
+only the signed `4x-spanx4-ch48.safetensors` part, requires an `input_files`
+image, and remains reference-admitted until a paid route proof is captured.
 **Tier 2:** install `tpm2-tools`; the provider uses `/dev/tpmrm0` unprivileged. If the distro owns
 that device as `root:tss`, add the login to the existing group with
 `sudo usermod -aG tss "$USER"`, then start a new login. Mayhem never creates users/groups or changes

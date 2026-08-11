@@ -1,6 +1,6 @@
 {
   "catalog_id": "openmayhem-mainnet",
-  "generated_at": "2026-07-24T10:28:10.609Z",
+  "generated_at": "2026-08-11T06:45:59.902Z",
   "models": [
     {
       "model_id": "Cactus-Compute/needle",
@@ -25217,6 +25217,452 @@
         ]
       },
       "tier": "launch"
+    },
+    {
+      "model_id": "upscale.conv.le24mp",
+      "min_app_version": "0.2.126",
+      "model_class": "workflow",
+      "family": "comfy-upscale",
+      "params_b": 0.003,
+      "tier": "dev",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "publisher_key": "huggingface-repo",
+          "repo": "TracNetwork/openmayhem-parts-index",
+          "revision": "b832d4527a8f3717af4c0dd5b03f90d2a298483b"
+        },
+        "conversion": [
+          {
+            "tool": "comfy-parts-index",
+            "method": "signed-spanx4-standalone-upscale-policy",
+            "input_sha256": "c79e716b8eb24182c1d7fcc74fa10ae074bdb34fee7c6e67c73053ff5498c667",
+            "output_sha256": "7889cc7180154767f581ca3dda031b2dfec268744880f5427255e88b34f9af07"
+          }
+        ],
+        "license": "Apache-2.0",
+        "license_sha256": "e83df07b2b0de355eeaa3b0014184ae9153beda3430caa86901b95b3e95719f9"
+      },
+      "artifacts": {
+        "workflow-class": {
+          "engine": "comfyui",
+          "source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "TracNetwork/openmayhem-parts-index",
+            "revision": "3c04c5b87d833b858288c1a12ea6f2fc925ab030"
+          },
+          "path": "comfy/outcome-classes/v1/upscale.conv.le24mp.json",
+          "artifact_root": "21548409983411023a80bd58beec92c2b6c2b43095576e1db64f61e61098d466",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 488,
+          "source_sha256": "95010acb441fee196d7c617a9f07a360074cfe0e6c0e1e329861e981afbe5291",
+          "download_check": false,
+          "notes": "Signed Comfy outcome-class definition for standalone convolutional 4x upscaler providers; concrete payload bytes are required through the workflow parts inventory."
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": false,
+        "ctx_max": 1,
+        "vision": false,
+        "image": true,
+        "video": false,
+        "audio": false,
+        "output_modality": "image",
+        "output_modalities": [
+          "image"
+        ],
+        "max_image_width": 4096,
+        "max_image_height": 4096,
+        "max_image_steps": 1
+      },
+      "requirements": {
+        "min_ram_gb": 16,
+        "min_vram_gb_full_offload": 4,
+        "cpu_flags": [],
+        "backends": [
+          "comfyui"
+        ]
+      },
+      "adapter": {
+        "endpoint_families": [
+          {
+            "family": "mayhem_comfy_workflows",
+            "request_attributes": [
+              "model",
+              "workflow",
+              "runtime_id",
+              "outcome_class",
+              "timeout_ms",
+              "response_format",
+              "input_files",
+              "user"
+            ],
+            "required_request_attributes": [
+              "model",
+              "workflow",
+              "input_files"
+            ],
+            "response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "request_attribute_specs": {
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "calibration_values": [
+                  "$MODEL"
+                ]
+              },
+              "outcome_class": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "upscale.conv.le24mp"
+                ]
+              },
+              "response_format": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "artifact",
+                "enum_values": [
+                  "artifact",
+                  "json"
+                ],
+                "calibration_values": [
+                  "artifact",
+                  "json"
+                ]
+              },
+              "runtime_id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "comfyui-v0.30.1"
+                ]
+              },
+              "timeout_ms": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 120000,
+                "minimum": 1000,
+                "maximum": 900000,
+                "calibration_values": [
+                  120000
+                ]
+              },
+              "user": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 512,
+                "calibration_values": [
+                  "mayhem-calibration-user"
+                ]
+              },
+              "workflow": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "1": {
+                      "class_type": "LoadImage",
+                      "inputs": {
+                        "image": "inputs/upscale-source.png"
+                      }
+                    },
+                    "2": {
+                      "class_type": "UpscaleModelLoader",
+                      "inputs": {
+                        "model_name": "4x-spanx4-ch48.safetensors"
+                      }
+                    },
+                    "3": {
+                      "class_type": "ImageUpscaleWithModel",
+                      "inputs": {
+                        "upscale_model": [
+                          "2",
+                          0
+                        ],
+                        "image": [
+                          "1",
+                          0
+                        ]
+                      }
+                    },
+                    "4": {
+                      "class_type": "SaveImage",
+                      "inputs": {
+                        "filename_prefix": "mayhem-upscale-spanx4",
+                        "images": [
+                          "3",
+                          0
+                        ]
+                      }
+                    }
+                  }
+                ]
+              },
+              "input_files": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 1,
+                "max_items": 4,
+                "calibration_values": [
+                  [
+                    {
+                      "filename": "inputs/upscale-source.png",
+                      "kind": "image",
+                      "content_type": "image/png",
+                      "encoding": "base64",
+                      "data": "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAQKADAAQAAAABAAAAQAAAAABGUUKwAAACOElEQVRoBdWavVEDMRBGzwwlXO7EFUDigIgK6ISEMiiGCogIiKjAiYkdkDjnmxEj5D39rKTVeVczHks63eo9aQ9kjzfn889ks2y3O4Df2ISfHL1VAU9vUiCktydA6I/Hg6VnYElvaQei9GYEUvQQuMUrWu6fv6P963ee3h7DSZH3YVP7M5Cnh4lqgSK9agEOvV4BQj8/vYd5H9Y1phCfXuMOVNGrE6il1yXQQK9IoI1+DYHP0wumyZdmeoRNHiXyU+avEuiwuZ9fyb099PICISsBdU03wGt00iOm5P+BIr1XciP76SUF+PROQ4ReTKCWfvfx5XcDlcxJIRwWrQuk0BXpoSQgEF2YVCdZ+8PDXWoks79XoGr5o/RVEZZWvQLLiKmeKH1qML9/JYFB9PBcQ2Acfa8AJ3059Jw4qaTq2gF/IkhF59Dj3mKcVHz0dwlk4uISkz4fpHh1lMA69NAbIrAavYDAMn1r6ZcRimkTDhDegVr6EKWtLiDgl7CB3t/bRo+7BAQQBRxXoRcTIJ9OOGfM/rV3myawA1ekh0PvtxKEHp+t9tOUORpILbxb/l6BJb2LG1JCJmz6iaUq7SmUoidkQ+kxV6MAk57IjGi2COihb9kBVfTVAtro6wQU0lcI6KTnCqilZwlopi8LKKcvCOinzwmYoE8KkN/n9Hx/jzmGlshxmtCT3+cMpWkITs9CtughfCFgjv5CwCL9v4BR+j8Bu/QQ2MzzjDdflP/N8Zy+cvEQm6OHxi9ag+6VHvlgmwAAAABJRU5ErkJggg=="
+                    }
+                  ]
+                ]
+              }
+            },
+            "response_attribute_specs": {
+              "artifacts": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 0,
+                "max_items": 1000000,
+                "calibration_values": [
+                  []
+                ]
+              },
+              "id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "mayhem": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "object": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "progress": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 0,
+                "maximum": 18446744073709552000,
+                "calibration_values": [
+                  1
+                ]
+              },
+              "status": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "usage": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              }
+            },
+            "interaction_groups": []
+          }
+        ],
+        "chat_template_id": "generic_chatml",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "preserve",
+        "modality_set": [
+          "image"
+        ]
+      },
+      "modality_assessment": {
+        "detected": [
+          "image"
+        ],
+        "evidence": [
+          "Signed 4x-spanx4-ch48 SPAN upscaler part from the OpenMayhem parts index; standalone workflow uses request-bound image input_files and official ComfyUI upscaler nodes."
+        ],
+        "calibrated_fingerprints": {},
+        "resource_profiles": {
+          "workflow-class": {
+            "image": {
+              "unit": "pixel",
+              "measurement_source": "spanx4_standalone_upscale_policy_pending_live_admission",
+              "max_item_bytes": 268435456,
+              "max_item_units": 16777216,
+              "measured_item_bytes": 268435456,
+              "measured_item_units": 16777216,
+              "measured_working_set_bytes": 4294967296,
+              "calibration_baseline_memory_bytes": 2147483648,
+              "calibration_peak_memory_bytes": 6442450944,
+              "calibration_f13_budget_bytes": 8589934592,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            }
+          }
+        }
+      },
+      "speciality_assessment": {
+        "detected": [],
+        "evidence": [
+          "No endpoint speciality is advertised for the standalone signed convolutional upscaler workflow class."
+        ],
+        "unsupported": {},
+        "calibrated": {}
+      },
+      "sampling": {
+        "temperature": 1,
+        "top_p": 1
+      },
+      "workflow": {
+        "whitelisted_nodes": [
+          "LoadImage",
+          "UpscaleModelLoader",
+          "ImageUpscaleWithModel",
+          "SaveImage"
+        ],
+        "parts": [
+          {
+            "part_id": "d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a",
+            "name": "4x-spanx4-ch48.safetensors",
+            "type": "upscaler",
+            "sha256": "7889cc7180154767f581ca3dda031b2dfec268744880f5427255e88b34f9af07",
+            "scale": 4
+          }
+        ],
+        "runtime_id": "comfyui-v0.30.1",
+        "outcome_class": "upscale.conv.le24mp",
+        "outcome_class_definition": {
+          "schema": "openmayhem.comfy.outcome-class-grid.v1",
+          "grid_version": 1,
+          "source": "docs/comfy/PRICING-GRID-2026-08-04.md",
+          "class_id": "upscale.conv.le24mp",
+          "title": "Convolutional upscale/restore <=24MP",
+          "media": "image",
+          "lane": "upscale-conv",
+          "pricing_unit": "megapixel",
+          "rate_map": [
+            {
+              "unit": "megapixel",
+              "per_unit_au": "300000000000000",
+              "granularity": 1
+            }
+          ],
+          "per_req_au": "0",
+          "min_session_au": "0",
+          "caps": {
+            "max_output_megapixels": "24",
+            "priority_scalars": {
+              "economy": "0.5",
+              "standard": "1",
+              "priority": "2"
+            }
+          }
+        },
+        "pricing_unit": "megapixel",
+        "inventory_root": "e3939d8c9af52b8772faaa0c2570e27d3cb3f963001c09b8efe42f6e48f42c98",
+        "max_nodes": 8,
+        "max_width": 4096,
+        "max_height": 4096,
+        "max_frames": 1,
+        "max_duration_seconds": 1,
+        "max_steps": 1,
+        "max_artifacts": 1
+      },
+      "canary": {
+        "set_id": "canary-upscale-conv-workflow-launch-v1",
+        "match_min": 0.9,
+        "verification_method": "seed_perceptual_hash",
+        "verification_tolerance_bps": 500,
+        "fingerprints": {},
+        "token_prefixes": {},
+        "perceptual_hashes": {
+          "workflow-class": {
+            "upscale-spanx4-tiny-source-seed7": "aaaaaaaaaaaaaaaa"
+          }
+        },
+        "embedding_vectors": {},
+        "transcripts": {},
+        "audio_fingerprints": {},
+        "video_fingerprints": {}
+      },
+      "price_ref_au": {
+        "denom": "au_usd",
+        "ver": 1,
+        "rate_map": [
+          {
+            "unit": "megapixel",
+            "per_unit_au": "300000000000000",
+            "granularity": 1
+          }
+        ],
+        "per_req_au": "0",
+        "min_session_au": "0"
+      }
     },
     {
       "model_id": "video.heavy.le0_5mpf",

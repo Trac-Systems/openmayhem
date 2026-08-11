@@ -189,6 +189,21 @@ signed workflow policy, and add a signed upscaler part with `scale: 4`.
 Recommended first upscaler is `4x-spanx4-ch48.safetensors` because it is small,
 Apache-2.0, and signed for all lanes.
 
+Current standalone 4x upscaler workflow lane:
+
+| Field | Value |
+|---|---|
+| Outcome class / model | `upscale.conv.le24mp` |
+| Endpoint family | `mayhem_comfy_workflows` |
+| Endpoint | `POST /v1/workflows` |
+| Workflow class artifact root | `21548409983411023a80bd58beec92c2b6c2b43095576e1db64f61e61098d466` |
+| Workflow class source SHA-256 | `95010acb441fee196d7c617a9f07a360074cfe0e6c0e1e329861e981afbe5291` |
+| Required inventory root | `e3939d8c9af52b8772faaa0c2570e27d3cb3f963001c09b8efe42f6e48f42c98` |
+| Runtime | `comfyui-v0.30.1` |
+| Pricing unit | `megapixel` |
+| Required part | `4x-spanx4-ch48.safetensors` / `d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a` |
+| Reference proof | Local admission proof passed with graph SHA-256 `9a24896bfe8a78bcac41f7895126ad02593bde5bcabb9aec70229c7940d2f2a2`; output `openmayhem-upscale-conv-le24mp-reference-v0.2.127.png`; SHA-256 `3b78c0ecd45cfa63c75d2eea18c7056c417015908c7ec7c8dddc327949e4f8fc` |
+
 Krea providers must add these signed parts before admission:
 
 | Part | Part ID | Purpose |
@@ -311,7 +326,8 @@ executable version is not release-pinned, so this document does not invent one.
 | `huihui-ai/Huihui-Agents-A1-abliterated` | Text generation | llama.cpp Q4_K GGUF | Tier 1; use highest proved tier | 32 GiB | 32 GiB | 22,069,579,360 B (20.55 GiB) |
 | `Cactus-Compute/needle` | Deterministic tool selection | `needle-cpu` or CUDA-only `needle-gpu` | Tier 1; use highest proved tier | Managed preflight | See measured guidance | 30.4M parameters |
 | `video.minimax_h3.t2v_i2v` | Comfy workflow video+audio | ComfyUI / signed MiniMax H3 parts | Tier 1; live `.70` CUDA proof; paid dialogue-fight artifact `openmayhem-minimax-h3-anime-dialogue-fight-paid-v0.2.123.mp4` | 96 GiB | 48 GiB | Four signed base parts, 42.29 GiB total |
-| `video.minimax_h3.r2v` | Comfy workflow reference-media video+audio | ComfyUI / signed MiniMax H3 REF2VA parts | Calibration in progress; not product-accepted until paid route proof passes | 96 GiB | 48 GiB | Four signed R2V parts, 39.55 GiB payload |
+| `video.minimax_h3.r2v` | Comfy workflow reference-media video+audio | ComfyUI / signed MiniMax H3 REF2VA parts | Tier 1; live `.70` admission and paid fiat proof `openmayhem-minimax-h3-r2v-paid-proof-v0.2.126.mp4` | 96 GiB | 48 GiB | Four signed R2V parts, 39.55 GiB payload |
+| `upscale.conv.le24mp` | Comfy workflow standalone 4x image upscale | ComfyUI / signed SPANx4 upscaler | Reference admission passed; paid route proof pending | 16 GiB | 4 GiB | One signed upscaler part, 8.6 MiB |
 
 The RAM and full-offload columns are catalog admission/guidance fields. Model
 weights, runtime environments, caches, outputs, and build artifacts require
