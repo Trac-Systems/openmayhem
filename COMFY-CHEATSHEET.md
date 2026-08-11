@@ -5,14 +5,14 @@ This is the operational guide for ComfyUI workflow providers and users. It is in
 ## Current Signed Parts Index
 
 - Dataset: `TracNetwork/openmayhem-parts-index`
-- Revision: `36a1ce2720ff963f2f58555a2998d8035138932f`
-- Index root: `7cd414ac0fb297bb325f8db51324ae4b58b242ed8289d160eeb1313f395f3a13`
-- Anchor hash: `be3dab174f63c21b36dfded85ce9525d56e675c5dc6399237e845241deec2236`
-- Index version: `13`
+- Revision: `d287a50f4dedb9621f1d78c177e0b694d25c1f8e`
+- Index root: `5087dd978940618802643a4e43ae1492324b5e1105700efe79c6a70f828cd166`
+- Anchor hash: `498f29d4615d07827050b4de5eae907b6e1f6383302ccb1996a89b29178575af`
+- Index version: `14`
 - Blessed runtimes: `comfyui-v0.30.1`, `comfyui-2a68ce33b4c9`
-- Parts: `96` (1 audio-model, 12 checkpoint, 1 clip-vision, 35 controlnet, 7 lipsync, 2 lora, 5 text-encoder, 20 upscaler, 8 vae, 5 video-model)
-- Index URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/36a1ce2720ff963f2f58555a2998d8035138932f/index.json
-- Anchor URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/36a1ce2720ff963f2f58555a2998d8035138932f/anchor.json
+- Parts: `97` (1 audio-model, 12 checkpoint, 1 clip-vision, 35 controlnet, 1 custom-node, 7 lipsync, 2 lora, 5 text-encoder, 20 upscaler, 8 vae, 5 video-model)
+- Index URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/d287a50f4dedb9621f1d78c177e0b694d25c1f8e/index.json
+- Anchor URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/d287a50f4dedb9621f1d78c177e0b694d25c1f8e/anchor.json
 
 ## User API
 
@@ -196,7 +196,7 @@ public capacity.
 
 | Target policy | Purpose | Parts needed | Missing work before serving |
 |---|---|---|---|
-| `video.minimax_h3.spectrum` | Optional H3 audio-quality/smoothing enhancer lane | H3 base parts plus Spectrum H3 extension payload | Owner-approved optional calibration target as of 2026-08-11. Signed parts index v14 contains the Spectrum `custom-node` part, and `.70` verified the five-part inventory root `0d2750e48d9b6d087233b85c0298d50323a9debc507a26cfafff99f951692864`; dry admission passed at `57.06GiB` required with 20% headroom. The intended 124-frame reference graph now also passes `.70` admission with graph SHA-256 `6a2ffd3580201483c1fa34deedb79e022235d817b7185e8615159b61d874bf71` and output SHA-256 `713429ed1163b91b68116390185a3f8ec9d46f879fc95438ae59714cd8dd0887`; retained artifact `openmayhem-minimax-h3-spectrum-reference-v0.2.129.mp4` is copied to the owner's Downloads folder for review. This lane remains unserved and unpublished until a paid `/v1/workflows` proof shows a measurable speed/quality win over base H3. |
+| `video.minimax_h3.spectrum` | Optional H3 audio-quality/smoothing enhancer lane | H3 base parts plus Spectrum H3 extension payload `d9a5deca829e775cf5750c203d00499d5528bcc276fb9a84a4722ca133a9f52f` | Owner-approved optional calibration target as of 2026-08-11. Signed parts index v14 contains the Spectrum `custom-node` part, and `.70` verified the five-part inventory root `0d2750e48d9b6d087233b85c0298d50323a9debc507a26cfafff99f951692864`; dry admission passed at `57.06GiB` required with 20% headroom. The intended 124-frame reference graph now also passes `.70` admission with graph SHA-256 `6a2ffd3580201483c1fa34deedb79e022235d817b7185e8615159b61d874bf71` and output SHA-256 `713429ed1163b91b68116390185a3f8ec9d46f879fc95438ae59714cd8dd0887`; retained artifact `openmayhem-minimax-h3-spectrum-reference-v0.2.129.mp4` is copied to the owner's Downloads folder for review. This lane remains unserved and unpublished until a paid `/v1/workflows` proof shows a measurable speed/quality win over base H3. |
 
 Optional targets remain first-class backlog items. Do not drop them from the
 coverage table during releases, and do not count them as product-ready until the
@@ -276,6 +276,7 @@ Validated H3 source manifest candidates, all from `Comfy-Org/MiniMax-H3` revisio
 | Text encoder | `text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` | `32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab` | 15,687,142,551 bytes |
 | Video VAE | `vae/minimax_h3_video_vae_fp16.safetensors` | `3abef9354f37bb10b413e7034d373e95193511cd80ffa5aea315d1d822032ce7` | 5,207,808,496 bytes |
 | Audio VAE | `vae/minimax_h3_audio_vae_fp32.safetensors` | `6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2` | 605,254,808 bytes |
+| Spectrum H3 custom node | `custom_nodes/ComfyUI-Spectrum-MiniMax-H3.tar.gz` | `d9a5deca829e775cf5750c203d00499d5528bcc276fb9a84a4722ca133a9f52f` | 67,431 bytes |
 | REF2VA diffusion | `diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors` | `b5f18df20fb79f5ae577ed27d16182251712d9a1f30a29af3ffbd6526356b87b` | 20,970,379,616 bytes |
 
 The initial H3 T2V/I2V policy requires FL2VA plus the shared encoder/VAEs. The
@@ -333,7 +334,7 @@ and every referenced file must appear in `workflow.parts`.
 | `upscale.conv.le512mp` | Class exists. A provider policy must choose one or more signed upscaler parts and prove the exact graph. The `le24mp` SPANx4 lane is now a current signed workflow row; larger/restoration variants remain separate policy work. | Convolutional/restoration upscalers: `121becf8`, `17b705c5`, `23178907`, `34889283`, `522bad49`, `6a1ac0ec`, `6adc20e6`, `776268ba`, `7c3058ae`, `7c985640`, `851b706a`, `8dc290bc`, `96cfc3a4`, `a95240c0`, `b40716b2`, `c21510f4`, `dfa6e5df`. Use `e0f339c2` only inside LTX-AV latent-upscale policies. |
 | `upscale.diffusion` | Class exists. SeedVR2 policies need a dedicated proof; do not mix them into a convolutional-upscale admission. | Diffusion/video restoration parts: `9c98aed7` SeedVR2 3B, `ca6bff3f` SeedVR2 7B, `63e69083` SeedVR2 VAE. Optional video preprocessing/interpolation support: `6cc88536` RIFE 4.7, `865582d1` RIFE 4.9. |
 | `video.light.le0_5mpf`, `video.light.le2_2mpf`, `video.heavy.le0_5mpf`, `video.heavy.le2_2mpf` | Official LTX-AV uses `video.heavy.le0_5mpf` and has a paid mainnet proof for bounded anime fighting video with a real audio track. That proof is A/V evidence, not lipsync evidence. Other video classes need separate signed policy/canary if their caps or lane differ. | Video models: `34dfabbf` official LTX 2.3 fp8, `25055314` LTX GTAnimation low-VRAM candidate. Text encoders: `20652c80` Gemma 3 12B fp4, `720ea5ea` UMT5-XXL fp8 for Wan policies. LTX AV support: `988522cf` distilled LoRA, `e0f339c2` LTX spatial x2 latent upscaler, `8c108e3c` LTX audio VAE, `32b0af06` LTX tiny VAE. Video support: `40dd2b8b` Wan low-noise control, `660c1350` Wan high-noise control, `79f0076a` Wan VAE, `34889283` animevideo x2, `851b706a` animevideo x4, `6cc88536` RIFE 4.7, `865582d1` RIFE 4.9. |
-| `video.lipsync` | InfiniteTalk has runtime `comfyui-2a68ce33b4c9`, signed canary/policy evidence, request-carried image/audio `input_files`, and workflow-class canary fingerprint, but no current public `models.json` row. The retained reference clip is a technical graph proof only and fails quality acceptance: robotic voice, weak/absent lip sync, and no useful background sound. Public paid-route proof still requires a better accepted policy, provider `parts pull`/`parts add`/`parts admit --write`, live route, and a paid `/v1/workflows` request with acceptable speech/lipsync quality. LatentSync remains unblessed. | Signed lipsync parts: `471fb7a0` LatentSync Whisper tiny, `d4330bc7` LatentSync SyncNet, `5cebda44` LatentSync UNet, `20bbd004` MeiGen InfiniteTalk single, `d8903b87` MeiGen InfiniteTalk multi, `b36a713b` Comfy-Org InfiniteTalk single fp16, `fd1d93c0` Comfy-Org InfiniteTalk multi fp16, `6a05292d` Wan2.1 I2V 14B 480p fp8, `6294fc7c` Lightx2v I2V rank64 LoRA, `42ed9ac2` wav2vec2 Chinese base fp16. Common signed companions: `720ea5ea` UMT5-XXL fp8 and `79f0076a` Wan 2.1 VAE. |
+| `video.lipsync` | InfiniteTalk has runtime `comfyui-2a68ce33b4c9`, signed canary/policy evidence, request-carried image/audio `input_files`, and workflow-class canary fingerprint, but no current public `models.json` row. The retained reference clip is a technical graph proof only and fails quality acceptance: robotic voice, weak/absent lip sync, and no useful background sound. LongCat Video Avatar 1.5 is the preferred next candidate for anime/stylized dialogue, but current OpenMayhem runtime coverage is missing its avatar/Whisper nodes and signed model/audio parts. Public paid-route proof still requires a better accepted policy, provider `parts pull`/`parts add`/`parts admit --write`, live route, and a paid `/v1/workflows` request with acceptable speech/lipsync quality. LatentSync remains unblessed. | Signed lipsync parts: `471fb7a0` LatentSync Whisper tiny, `d4330bc7` LatentSync SyncNet, `5cebda44` LatentSync UNet, `20bbd004` MeiGen InfiniteTalk single, `d8903b87` MeiGen InfiniteTalk multi, `b36a713b` Comfy-Org InfiniteTalk single fp16, `fd1d93c0` Comfy-Org InfiniteTalk multi fp16, `6a05292d` Wan2.1 I2V 14B 480p fp8, `6294fc7c` Lightx2v I2V rank64 LoRA, `42ed9ac2` wav2vec2 Chinese base fp16. Common signed companions: `720ea5ea` UMT5-XXL fp8 and `79f0076a` Wan 2.1 VAE. Missing candidate parts before LongCat admission: LongCat Avatar 1.5 model payload, Whisper-large-v3, any vocal separator, any distilled LoRA/companion VAE/text encoder required by the exact graph, and the custom-node/runtime payload providing `LongCatAvatarWhisperEmbeds` plus `WanVideoLongCatAvatarExtendEmbeds`. |
 | `audio.tts`, `audio.generation`, `audio.stt` | Classes exist but this parts index has no standalone TTS, audio-generation, or STT model policy ready for public serving. | No standalone audio-class parts are currently signed. `8c108e3c` is only the LTX AV audio VAE, and the lipsync parts are only for `video.lipsync` policies. |
 | `compute.norm` | Class exists for bounded residual workflow compute, not for arbitrary unsigned execution. | No class-ready parts in this index. A workflow must publish its own signed parts and policy before admission. |
 
@@ -409,12 +410,39 @@ These are signed support parts for lipsync/talking-video workflow classes. They 
 Current runtime status:
 
 - InfiniteTalk: the dev calibration runtime is `comfyui-2a68ce33b4c9`. The retained reference output is `openmayhem-infinitetalk-anime-fight-louder-reference-v0.2.119.mp4` in Downloads and proves only that a bounded two-speaker anime fight graph can run with request-carried image/audio media. It does not pass quality acceptance; do not advertise it as successful lipsync.
+- LongCat Video Avatar 1.5: preferred next candidate for anime/stylized
+  dialogue lipsync, but not yet admitted. The current `.70` Comfy v0.30.1 tree
+  only exposes LongCat image/edit support; it does not contain the avatar
+  lipsync nodes `LongCatAvatarWhisperEmbeds` and
+  `WanVideoLongCatAvatarExtendEmbeds`. Do not claim LongCat lipsync support
+  until an exact runtime/custom-node payload is mirrored and signed, all
+  LongCat/Whisper/audio parts are signed, and a paid `/v1/workflows` proof
+  shows intelligible speech, mouth sync, and action motion.
 - Input media: InfiniteTalk proofs need a source image/video frame and an audio clip carried by
   `/v1/workflows` `input_files`. WAV, FLAC, and MP3 are acceptable only when the workflow-input
   bridge validates bounded duration and writes the files into the isolated Comfy input directory
   for that request. Provider-local seed files are not evidence.
 - LatentSync: the three model files are signed, but the LatentSync node pack is not part of the blessed runtime. Do not admit a LatentSync workflow until that node pack is mirrored, pinned, blessed, and covered by a canary.
 - `sync.so`/HeyGen API nodes: these are remote service nodes. They are not acceptable for local OpenMayhem provider proof unless a future catalog policy explicitly declares an external-service lane and its security/payment rules.
+
+LongCat candidate requirements before any public `video.lipsync` row:
+
+- Runtime/custom-node part: pin the exact implementation that provides
+  `LongCatAvatarWhisperEmbeds` and `WanVideoLongCatAvatarExtendEmbeds`, package
+  it as a rootless `custom-node` `tar.gz`, set
+  `adapter.comfy_custom_node_dir`, and start Comfy with only the signed
+  whitelist enabled.
+- Model/audio parts: mirror and sign the LongCat Avatar 1.5 model payload used
+  by the graph, Whisper-large-v3 files, any vocal-separator payload, and any
+  distilled LoRA or companion VAE/text-encoder files the graph actually loads.
+- Policy proof: the signed policy must bound frame count, duration, resolution,
+  audio duration, speaker count, accepted audio/image content types, and node
+  allowlist. The proof must use request-carried media through `/v1/workflows`;
+  provider-local seed files do not count.
+- Quality gate: retain the output artifact, contact sheet, audio metadata, paid
+  session id, graph hash, parts inventory root, and hashes. Acceptance requires
+  understandable speech, visible lip sync, and coherent action, not merely a
+  non-crashing render.
 
 | Selector | Part ID | Type | Purpose |
 |---|---|---|---|
@@ -508,6 +536,7 @@ Use this table to choose fitting parts for a new workflow policy. The exact reco
 | SDXL lanes | controlnet | Fooocus LaMa (object removal) | `d6dfa562...3e09bf` | 0.095 GiB | openrail | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/d6dfa562d4f6f3e82eb80ca8dbc96b883db68e246e0d09b317bb7b06df3e09bf.json) |
 | all lanes | upscaler | 4x-spanx4-ch48 | `d871ba30...965e0a` | 0.008 GiB | Apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a.json) |
 | wan | lipsync | InfiniteTalk multi (ComfyUI build) | `d8903b87...7fc553` | 2.53 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/d8903b87934d344be09e38264918c082ba4c33d39aa6f85f36e0d8c2c07fc553.json) |
+| minimax-h3 | custom-node | ComfyUI-Spectrum-MiniMax-H3 v0.2.1 | `d9a5deca...9f52f` | 0.000064 GiB | gpl-3.0-or-later | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/d287a50f4dedb9621f1d78c177e0b694d25c1f8e/records/d9a5deca829e775cf5750c203d00499d5528bcc276fb9a84a4722ca133a9f52f.json) |
 | all lanes | controlnet | Florence-2 base | `db1e1e32...c6ecc9` | 0.431 GiB | mit | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/db1e1e32dfa3b46913289452054af88f9ac971b04ab736c061bec324a2c6ecc9.json) |
 | krea2 | checkpoint | RedCraft 赤佬3 (Krea 2) | `dc2b6383...4417f3` | 12.24 GiB | civitai-allow-commercial-use | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/dc2b6383126b39fbeb0948145e31174996e2442f3498206b2e5883ff6d4417f3.json) |
 | all lanes | controlnet | SAM 2.1 hiera large | `dcf73d0e...9a994a` | 0.836 GiB | apache-2.0 | [record](https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/blob/023ab52a79182d4027429c0c8a12ea5bf03b81da/records/dcf73d0e3d615c7923fd5db17d91d6585ad9529605d6f330c5ab3862de9a994a.json) |

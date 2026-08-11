@@ -146,7 +146,12 @@ A Comfy workflow is calibrated only after all gates below pass:
   `1d47264316354f7f0aa787da4637711e38a0b8e78a715682cb241a937e8f9699`.
 - `video.lipsync`: technical InfiniteTalk proof exists but product quality is
   not accepted. Do not present it as the solution for anime action video with
-  voice.
+  voice. The next accepted candidate is LongCat Video Avatar 1.5 or a better
+  equivalent, because it targets anime/stylized lipsync with Whisper-large-v3
+  audio features. It is not product-ready in OpenMayhem until the runtime
+  custom nodes and all model/audio parts are mirrored, signed, admitted, and
+  proven through paid `/v1/workflows` with intelligible speech, visible mouth
+  sync, and fighting/action motion.
 
 Use `scripts/verify-comfy-cheatsheet.py` whenever the signed parts index or
 Comfy cheatsheet changes:
