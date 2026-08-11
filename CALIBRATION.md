@@ -104,7 +104,10 @@ A Comfy workflow is calibrated only after all gates below pass:
   `custom-node` `tar.gz` part with `adapter.comfy_custom_node_dir`, publish a
   bounded policy, run admission, and retain a paid `/v1/workflows` proof that
   shows audible improvement without replacing or re-proving the accepted base
-  H3 and R2V lanes.
+  H3 and R2V lanes. This optional lane stays in the calibration backlog until
+  it is proven or explicitly removed; optional does not mean exempt from the
+  normal research, signed-parts, policy, admission, paid-route, and retained
+  media proof gates.
 - `video.heavy.le0_5mpf`: product-accepted for LTX A/V generation after paid
   `/v1/workflows` proofs with video and audio. It is not lipsync evidence.
 - `image.heavy.le1_2mp`: product-accepted for Krea base image generation after
