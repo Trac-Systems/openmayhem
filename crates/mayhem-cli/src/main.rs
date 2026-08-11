@@ -82057,9 +82057,47 @@ fn provider_canary_prompt_modalities(
         }
         "stt" => BTreeSet::from(["audio".to_owned(), "text".to_owned()]),
         "tts" | "audio-generation" | "music-generation" => BTreeSet::from(["audio".to_owned()]),
-        MODEL_CLASS_WORKFLOW => provider_workflow_output_modalities(model),
+        MODEL_CLASS_WORKFLOW => provider_workflow_canary_prompt_modalities(model, prompt),
         _ => BTreeSet::new(),
     }
+}
+
+fn provider_workflow_canary_prompt_modalities(
+    model: &catalog::CatalogModel,
+    prompt: &CanaryPrompt,
+) -> BTreeSet<String> {
+    let mut modalities = provider_workflow_output_modalities(model);
+    let Some(files) = prompt
+        .endpoint_attributes
+        .get("input_files")
+        .and_then(Value::as_array)
+    else {
+        return modalities;
+    };
+
+    for file in files {
+        let Some(object) = file.as_object() else {
+            continue;
+        };
+        let content_type = object
+            .get("content_type")
+            .and_then(Value::as_str)
+            .map(provider_normalized_media_content_type)
+            .unwrap_or_default();
+        let filename = object
+            .get("filename")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if let Some(kind) = provider_workflow_input_file_kind(
+            object.get("kind").and_then(Value::as_str),
+            content_type.as_str(),
+            filename,
+        ) {
+            modalities.insert(kind.to_owned());
+        }
+    }
+
+    modalities
 }
 
 fn provider_workflow_output_modalities(model: &catalog::CatalogModel) -> BTreeSet<String> {
@@ -109345,6 +109383,31 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         model.caps.output_modalities = vec!["image".to_owned()];
         let modalities = provider_canary_prompt_modalities(&model, &prompt);
         assert_eq!(modalities, BTreeSet::from(["image".to_owned()]));
+        let media_prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "comfy-workflow-media-smoke",
+            "prompt": "unused for workflow self-test",
+            "input_files": [
+                {
+                    "filename": "refs/hero.png",
+                    "kind": "image",
+                    "content_type": "image/png",
+                    "encoding": "base64",
+                    "data": "not decoded for modality selection"
+                },
+                {
+                    "filename": "dialogue/line.wav",
+                    "content_type": "audio/wav",
+                    "encoding": "base64",
+                    "data": "not decoded for modality selection"
+                }
+            ]
+        }))
+        .unwrap();
+        let modalities = provider_canary_prompt_modalities(&model, &media_prompt);
+        assert_eq!(
+            modalities,
+            BTreeSet::from(["audio".to_owned(), "image".to_owned()])
+        );
         let workflow_body = provider_canary_self_test_body(&model, &prompt).unwrap();
         assert_eq!(workflow_body["kind"], json!("workflow_generation"));
 

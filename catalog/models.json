@@ -26651,7 +26651,7 @@
         "json": false,
         "ctx_max": 1,
         "vision": false,
-        "image": false,
+        "image": true,
         "video": true,
         "audio": true,
         "output_modality": "video",
@@ -27063,12 +27063,14 @@
         "tool_call_strategy": "none",
         "reasoning_passthrough": "preserve",
         "modality_set": [
+          "image",
           "video",
           "audio"
         ]
       },
       "modality_assessment": {
         "detected": [
+          "image",
           "video",
           "audio"
         ],
@@ -27078,6 +27080,20 @@
         "calibrated_fingerprints": {},
         "resource_profiles": {
           "workflow-class": {
+            "image": {
+              "unit": "pixel",
+              "measurement_source": "minimax_h3_r2v_reference_input_profile_pending_paid_admission",
+              "max_item_bytes": 16777216,
+              "max_item_units": 1032192,
+              "measured_item_bytes": 16777216,
+              "measured_item_units": 1032192,
+              "measured_working_set_bytes": 16777216,
+              "calibration_baseline_memory_bytes": 21474836480,
+              "calibration_peak_memory_bytes": 21491613696,
+              "calibration_f13_budget_bytes": 103079215104,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            },
             "video": {
               "unit": "frame",
               "measurement_source": "minimax_h3_r2v_reference_profile_pending_paid_admission",
