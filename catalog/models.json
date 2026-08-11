@@ -26006,7 +26006,7 @@
     },
     {
       "model_id": "video.minimax_h3.t2v_i2v",
-      "min_app_version": "0.2.123",
+      "min_app_version": "0.2.124",
       "model_class": "workflow",
       "family": "comfy-minimax-h3",
       "params_b": 33,
