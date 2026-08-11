@@ -107,7 +107,12 @@ A Comfy workflow is calibrated only after all gates below pass:
   H3 and R2V lanes. This optional lane stays in the calibration backlog until
   it is proven or explicitly removed; optional does not mean exempt from the
   normal research, signed-parts, policy, admission, paid-route, and retained
-  media proof gates.
+  media proof gates. Current evidence: the Spectrum `custom-node` part is in
+  signed parts index v14 and `.70` verified a five-part inventory root
+  `0d2750e48d9b6d087233b85c0298d50323a9debc507a26cfafff99f951692864`; dry
+  admission passed at `57.06GiB` required with 20% headroom, but the reference
+  graph timed out before producing a proof artifact. Do not publish or serve
+  this lane until a revised policy/defaults pass reference and paid proof.
 - `video.heavy.le0_5mpf`: product-accepted for LTX A/V generation after paid
   `/v1/workflows` proofs with video and audio. It is not lipsync evidence.
 - `image.heavy.le1_2mp`: product-accepted for Krea base image generation after

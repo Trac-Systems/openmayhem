@@ -196,7 +196,7 @@ public capacity.
 
 | Target policy | Purpose | Parts needed | Missing work before serving |
 |---|---|---|---|
-| `video.minimax_h3.spectrum` | Optional H3 audio-quality/smoothing enhancer lane | H3 base parts plus Spectrum H3 extension payload | Owner-approved optional calibration target as of 2026-08-11. Mirror and sign the Spectrum payload as a normal Comfy part, publish a bounded workflow policy, run admission, and retain a paid `/v1/workflows` proof showing an audible quality improvement without changing or re-proving the already accepted base H3 and R2V lanes. |
+| `video.minimax_h3.spectrum` | Optional H3 audio-quality/smoothing enhancer lane | H3 base parts plus Spectrum H3 extension payload | Owner-approved optional calibration target as of 2026-08-11. Signed parts index v14 contains the Spectrum `custom-node` part, and `.70` verified the five-part inventory root `0d2750e48d9b6d087233b85c0298d50323a9debc507a26cfafff99f951692864`; dry admission passed at `57.06GiB` required with 20% headroom. The current reference graph then timed out before producing a proof artifact, so this lane remains unserved and unpublished. Revise policy/defaults and prove audible improvement through paid `/v1/workflows` before acceptance. |
 
 Optional targets remain first-class backlog items. Do not drop them from the
 coverage table during releases, and do not count them as product-ready until the
