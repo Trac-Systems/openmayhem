@@ -98,6 +98,12 @@ A Comfy workflow is calibrated only after all gates below pass:
   `896x512`, `124` frames at `24` fps with AAC audio, session
   `a938e5efd7ddba9a610dbf16723d7a6da62c6e6f8c9dfe924f4765c0111ba81c`, BLAKE3
   `19f92129c62ef352a2460a1a3d8654d957672fa1ae4cf0c138b3fdaea468cbfd`.
+- H3 providers on GB10/Spark-class unified-memory hosts must be started
+  sequentially with explicit reserve settings. The accepted `.70` T2V provider
+  uses `--memory-reserve 15GB`; the default percentage reserve can falsely
+  reject the same enclave by less than 1 GiB. Do not overlap base H3, R2V, and
+  Spectrum reference/admission runs unless the combined resident set has fresh
+  headroom evidence.
 - `video.minimax_h3.spectrum`: owner-approved optional calibration target as
   of 2026-08-11. It must be handled as a distinct H3 audio-quality enhancer
   lane: mirror and sign the Spectrum custom-node/runtime payload as a rootless
@@ -110,9 +116,14 @@ A Comfy workflow is calibrated only after all gates below pass:
   media proof gates. Current evidence: the Spectrum `custom-node` part is in
   signed parts index v14 and `.70` verified a five-part inventory root
   `0d2750e48d9b6d087233b85c0298d50323a9debc507a26cfafff99f951692864`; dry
-  admission passed at `57.06GiB` required with 20% headroom, but the reference
-  graph timed out before producing a proof artifact. Do not publish or serve
-  this lane until a revised policy/defaults pass reference and paid proof.
+  admission passed at `57.06GiB` required with 20% headroom, and the intended
+  124-frame reference graph later passed `.70` admission with graph SHA-256
+  `6a2ffd3580201483c1fa34deedb79e022235d817b7185e8615159b61d874bf71`,
+  output SHA-256
+  `713429ed1163b91b68116390185a3f8ec9d46f879fc95438ae59714cd8dd0887`, and
+  retained artifact `openmayhem-minimax-h3-spectrum-reference-v0.2.129.mp4`.
+  Do not publish or serve this lane until a paid `/v1/workflows` proof shows a
+  measurable speed/quality win over the accepted base H3 lane.
 - `video.heavy.le0_5mpf`: product-accepted for LTX A/V generation after paid
   `/v1/workflows` proofs with video and audio. It is not lipsync evidence.
 - `image.heavy.le1_2mp`: product-accepted for Krea base image generation after

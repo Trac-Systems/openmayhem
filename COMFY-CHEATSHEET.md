@@ -196,7 +196,7 @@ public capacity.
 
 | Target policy | Purpose | Parts needed | Missing work before serving |
 |---|---|---|---|
-| `video.minimax_h3.spectrum` | Optional H3 audio-quality/smoothing enhancer lane | H3 base parts plus Spectrum H3 extension payload | Owner-approved optional calibration target as of 2026-08-11. Signed parts index v14 contains the Spectrum `custom-node` part, and `.70` verified the five-part inventory root `0d2750e48d9b6d087233b85c0298d50323a9debc507a26cfafff99f951692864`; dry admission passed at `57.06GiB` required with 20% headroom. The current reference graph then timed out before producing a proof artifact, so this lane remains unserved and unpublished. Revise policy/defaults and prove audible improvement through paid `/v1/workflows` before acceptance. |
+| `video.minimax_h3.spectrum` | Optional H3 audio-quality/smoothing enhancer lane | H3 base parts plus Spectrum H3 extension payload | Owner-approved optional calibration target as of 2026-08-11. Signed parts index v14 contains the Spectrum `custom-node` part, and `.70` verified the five-part inventory root `0d2750e48d9b6d087233b85c0298d50323a9debc507a26cfafff99f951692864`; dry admission passed at `57.06GiB` required with 20% headroom. The intended 124-frame reference graph now also passes `.70` admission with graph SHA-256 `6a2ffd3580201483c1fa34deedb79e022235d817b7185e8615159b61d874bf71` and output SHA-256 `713429ed1163b91b68116390185a3f8ec9d46f879fc95438ae59714cd8dd0887`; retained artifact `openmayhem-minimax-h3-spectrum-reference-v0.2.129.mp4` is copied to the owner's Downloads folder for review. This lane remains unserved and unpublished until a paid `/v1/workflows` proof shows a measurable speed/quality win over base H3. |
 
 Optional targets remain first-class backlog items. Do not drop them from the
 coverage table during releases, and do not count them as product-ready until the
@@ -225,6 +225,14 @@ v0.2.126 with retained artifact
 artifact BLAKE3 `19f92129c62ef352a2460a1a3d8654d957672fa1ae4cf0c138b3fdaea468cbfd`.
 No local cache bypasses or unanchored Comfy payloads are acceptable for future
 H3 proofs.
+
+On GB10/Spark-class unified-memory hosts, start H3 providers sequentially and
+keep the memory reserve explicit. The accepted `.70` H3 T2V service publishes
+heartbeats with `--memory-reserve 15GB`; the default percentage reserve can
+reject the same enclave by less than 1 GiB even when the model is otherwise
+proven to fit. Do not run base H3, R2V, and experimental Spectrum admission at
+the same time unless a fresh admission calculation proves the combined resident
+set fits with headroom.
 
 Use the official Comfy page and `Comfy-Org/MiniMax-H3` as sources. Prefer `int8_convrot` diffusion weights on PyTorch/CUDA 13 and
 the `qwen3vl_32b_minimax_h3_nvfp4_awq` text encoder; the Comfy-Org README states that text-encoder
