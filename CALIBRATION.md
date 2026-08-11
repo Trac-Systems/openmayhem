@@ -79,7 +79,10 @@ A Comfy workflow is calibrated only after all gates below pass:
 
 - `video.minimax_h3.t2v_i2v`: product-accepted for the base H3 T2V/I2V lane
   after signed v12 parts, admission, live provider route, and a retained paid
-  TNK `/v1/workflows` anime fight proof.
+  TNK `/v1/workflows` anime fight proof. The stronger dialogue-oriented
+  proof `openmayhem-minimax-h3-anime-dialogue-fight-paid-v0.2.123.mp4`
+  shows anime fighting action with native audio; it is still not lipsync
+  evidence.
 - `video.heavy.le0_5mpf`: product-accepted for LTX A/V generation after paid
   `/v1/workflows` proofs with video and audio. It is not lipsync evidence.
 - `image.heavy.le1_2mp`: product-accepted for Krea base image generation after

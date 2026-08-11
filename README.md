@@ -981,9 +981,12 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 The current signed catalog adds `video.minimax_h3.t2v_i2v` as a Comfy
 workflow-class market with mirrored MiniMax H3 base parts, a signed
 workflow-class definition, active enclave/price/room rows, and native
-video+audio caps. `.70` completed admission and a paid TNK `/v1/workflows`
-media proof; the retained review artifact is kept in the operator proof set and
-must not be replaced by a direct Comfy run.
+video+audio caps. `.70` completed admission and paid TNK `/v1/workflows`
+media proofs; the stronger retained review artifact is
+`openmayhem-minimax-h3-anime-dialogue-fight-paid-v0.2.123.mp4`, session
+`286e0bf679ae7dc44c34f4979a4b53affd6c209a8ecfe774eef9380dffada1b8`, BLAKE3
+`431caae7624d36a15917a1f7ee60fdd47118b35c5e025f2efc4c41aca372aae1`. These
+proofs must not be replaced by a direct Comfy run.
 
 Krea 2 Turbo base image generation (`image.heavy.le1_2mp`) and Krea 2 Turbo
 with signed 4x upscaling (`image.heavy.le17mp`) are product-accepted after

@@ -310,7 +310,7 @@ executable version is not release-pinned, so this document does not invent one.
 | `ResembleAI/chatterbox` | Text to speech | PyTorch safetensors | Tier 1; use highest proved tier | 8 GiB | 6 GiB | 3,191,966,992 B (2.97 GiB) |
 | `huihui-ai/Huihui-Agents-A1-abliterated` | Text generation | llama.cpp Q4_K GGUF | Tier 1; use highest proved tier | 32 GiB | 32 GiB | 22,069,579,360 B (20.55 GiB) |
 | `Cactus-Compute/needle` | Deterministic tool selection | `needle-cpu` or CUDA-only `needle-gpu` | Tier 1; use highest proved tier | Managed preflight | See measured guidance | 30.4M parameters |
-| `video.minimax_h3.t2v_i2v` | Comfy workflow video+audio | ComfyUI / signed MiniMax H3 parts | Tier 1; live `.70` CUDA proof | 96 GiB | 48 GiB | Four signed base parts, 42.29 GiB total |
+| `video.minimax_h3.t2v_i2v` | Comfy workflow video+audio | ComfyUI / signed MiniMax H3 parts | Tier 1; live `.70` CUDA proof; paid dialogue-fight artifact `openmayhem-minimax-h3-anime-dialogue-fight-paid-v0.2.123.mp4` | 96 GiB | 48 GiB | Four signed base parts, 42.29 GiB total |
 
 The RAM and full-offload columns are catalog admission/guidance fields. Model
 weights, runtime environments, caches, outputs, and build artifacts require
