@@ -5,14 +5,14 @@ This is the operational guide for ComfyUI workflow providers and users. It is in
 ## Current Signed Parts Index
 
 - Dataset: `TracNetwork/openmayhem-parts-index`
-- Revision: `866c3b60b4804f34c1e84dff58a600cfbd465c73`
-- Index root: `db67a3b6df1fc6407a0f1bf8c9037f30bf5221332e800615980dedefc2fad25b`
-- Anchor hash: `2316c96d408a3b450140227c844291f61c104666f2539c598c5864adcd8f270e`
-- Index version: `12`
+- Revision: `36a1ce2720ff963f2f58555a2998d8035138932f`
+- Index root: `7cd414ac0fb297bb325f8db51324ae4b58b242ed8289d160eeb1313f395f3a13`
+- Anchor hash: `be3dab174f63c21b36dfded85ce9525d56e675c5dc6399237e845241deec2236`
+- Index version: `13`
 - Blessed runtimes: `comfyui-v0.30.1`, `comfyui-2a68ce33b4c9`
-- Parts: `95` (1 audio-model, 12 checkpoint, 1 clip-vision, 35 controlnet, 7 lipsync, 2 lora, 5 text-encoder, 20 upscaler, 8 vae, 4 video-model)
-- Index URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/866c3b60b4804f34c1e84dff58a600cfbd465c73/index.json
-- Anchor URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/866c3b60b4804f34c1e84dff58a600cfbd465c73/anchor.json
+- Parts: `96` (1 audio-model, 12 checkpoint, 1 clip-vision, 35 controlnet, 7 lipsync, 2 lora, 5 text-encoder, 20 upscaler, 8 vae, 5 video-model)
+- Index URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/36a1ce2720ff963f2f58555a2998d8035138932f/index.json
+- Anchor URL: https://huggingface.co/datasets/TracNetwork/openmayhem-parts-index/resolve/36a1ce2720ff963f2f58555a2998d8035138932f/anchor.json
 
 ## User API
 
@@ -125,6 +125,10 @@ The signed catalog currently exposes four public workflow rows plus the dev
   `.70` admission and paid TNK `/v1/workflows` proofs with inspected anime
   fighting video plus native audio. The retained dialogue-oriented proof is
   `openmayhem-minimax-h3-anime-dialogue-fight-paid-v0.2.123.mp4`.
+- `video.minimax_h3.r2v`: calibration in progress for the REF2VA/reference-media
+  lane. REF2VA is mirrored in parts-index v13 and the workflow policy requires
+  request-bound `input_files`; paid route proof and final canary fingerprint are
+  still required before product acceptance.
 - `video.heavy.le0_5mpf`: accepted as an LTX A/V video lane after the paid
   `.70` gateway proofs listed below. This is not lipsync evidence.
 - `image.heavy.le17mp`: accepted after `.42` admission and a paid fiat
@@ -153,23 +157,24 @@ public capacity.
 | `image.heavy.le17mp` | Krea 2 Turbo plus 4x upscale up to 4096x4096 | Krea 2 Turbo `6335241281bfe4537bda70cab1aca27211a9afb14197740c16778a253836bdae`; Qwen3-VL 4B text encoder `19d454e5e0516af43d0a6aee3aefd468897851bd879add036fe1b9350b66825c`; Qwen Image VAE `106d81a4897fa125d63b62fbcf2d7d1e88dc66f1b89e6f793f7142f928c7aa70`; 4x-spanx4 `d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a` | `comfyui-v0.30.1` | Product-accepted after `.42` admission and a paid fiat `/v1/workflows` proof through the `.31` sponsored gateway; retained 4096x4096 Mercedes-sales artifact `openmayhem-krea-4x-mercedes-salespitch-paid-v0.2.123.png`, session `36c5476892db7056be5ddf36dcc09436ee7a44a036ed9b4b70a2877276f7e2b9`, BLAKE3 `ec80feb418f369aa509020ecad96cd6886fb8b6af6fde617a2b367a2177b872a`. |
 | `video.heavy.le0_5mpf` | LTX 2.3 native audio/video generation up to 768x512, 8s, 192 frames | LTX 2.3 fp8 AV checkpoint `34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2`; Gemma 3 12B fp4 text encoder `20652c80fc8e88963343b9968722becb2118d507befbbf0272aa8d79e99893cc`; LTX distilled LoRA 384 `988522cff35f19d7c5977472be163f05b49bf381e441963da4182b0a90b1116c`; LTX spatial upscaler `e0f339c2b5c13fcae1b78cade132ae0307114026c6d20642335eccb4887a050d`; LTX audio VAE `8c108e3ce85d127cef5dbb5747f8c30d2a30c6d92f215278399224e38ffe806c` | `comfyui-v0.30.1` | Product-accepted for A/V generation after paid `.70` `/v1/workflows` proofs with retained video+audio artifacts. |
 | `video.minimax_h3.t2v_i2v` | MiniMax H3 text/image-to-video with native stereo audio up to 1344x768, 15s, 362 frames | FL2VA diffusion `4c371bcbf8e7a577457d7b0ace66345fa85c88a591ca0724a5da6e9642371f72`; Qwen3VL 32B NVFP4 text encoder `32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab`; H3 video VAE `3abef9354f37bb10b413e7034d373e95193511cd80ffa5aea315d1d822032ce7`; H3 audio VAE `6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2` | `comfyui-v0.30.1` | Product-accepted for the base T2V/I2V lane: parts mirrored in parts-index v12, signed catalog metadata published, enclave/price/room live on mainnet, `.70` admission passed, and retained paid TNK `/v1/workflows` proofs passed quality review. Stronger dialogue-oriented artifact: `openmayhem-minimax-h3-anime-dialogue-fight-paid-v0.2.123.mp4`, session `286e0bf679ae7dc44c34f4979a4b53affd6c209a8ecfe774eef9380dffada1b8`, BLAKE3 `431caae7624d36a15917a1f7ee60fdd47118b35c5e025f2efc4c41aca372aae1`. |
+| `video.minimax_h3.r2v` | MiniMax H3 reference-to-video / reference-media workflow | REF2VA diffusion `b5f18df20fb79f5ae577ed27d16182251712d9a1f30a29af3ffbd6526356b87b`; Qwen3VL 32B NVFP4 text encoder `32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab`; H3 video VAE `3abef9354f37bb10b413e7034d373e95193511cd80ffa5aea315d1d822032ce7`; H3 audio VAE `6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2` | `comfyui-v0.30.1` | Calibration in progress. The policy must use bounded `/v1/workflows` `input_files` for every reference image/audio/video loader and still needs paid route proof before product acceptance. |
 | `video.lipsync` | Wan/InfiniteTalk lipsync/talking-video workflow up to 832x480, 4s, 81 frames | Wan2.1 I2V 14B fp8 `6a05292de329cdb06923008742e4f17329548239c2e2c3b10234276d790e1ef6`; UMT5-XXL fp8 `720ea5ea7b9de57ca87b403856b0a7e42c96d1f1176ff886726ab602b6923709`; Wan 2.1 VAE `79f0076a485bca72333bfa34c767006606b4ff351e5d8abc2045865e12c8a664`; Lightx2v I2V LoRA `6294fc7c467c664debaa9a50ea13bfd21959fe7aa29a9759f07541b66562c491`; InfiniteTalk multi fp16 `fd1d93c0ead8d77bc79d457e45bb391063a21fe3111b0a19ef7dc6a605c3b1fd`; Wav2Vec2 Chinese base fp16 `42ed9ac2d65ac013f5d5a431ff93b1e452371a6f1ba9bf8fdaa5c85b631e4f28` | `comfyui-2a68ce33b4c9` | Signed dev policy and technical canary exist; product proof failed quality review. It is not accepted for general anime action video with voice; keep it scoped to lipsync/talking-head until a better-fit policy proves action, speech, and sync. |
 
 ### Planned Or Missing Workflow Policies
 
 | Candidate policy | Purpose | Parts needed | Missing work before serving |
 |---|---|---|---|
-| `video.minimax_h3.r2v` | MiniMax H3 reference-to-video / reference-media workflow | All T2V/I2V H3 parts plus REF2VA diffusion `b5f18df20fb79f5ae577ed27d16182251712d9a1f30a29af3ffbd6526356b87b` | Prove base T2V/I2V first, then add REF2VA with a separate reference-video proof. |
 | `video.minimax_h3.spectrum` | H3 audio-quality/smoothing extension | H3 base parts plus Spectrum H3 extension payload if accepted | Candidate quality extension. Spectrum is GPL-3.0 and still needs separate product/license acceptance before blessing. |
 
-MiniMax H3 is owner-approved for OpenMayhem calibration as of 2026-08-10. The four
-base T2V/I2V payloads are mirrored and signed in the OpenMayhem Hugging Face
-parts index at revision `866c3b60b4804f34c1e84dff58a600cfbd465c73`. The signed
+MiniMax H3 is owner-approved for OpenMayhem calibration as of 2026-08-10. The
+five H3 payloads are mirrored and signed in the OpenMayhem Hugging Face parts
+index at revision `36a1ce2720ff963f2f58555a2998d8035138932f`; base T2V/I2V
+requires the first four rows, while R2V additionally requires REF2VA. The signed
 mainnet catalog points to revision `4ee78a21941efe4af2fd3c8878915c39cca0f521`,
-and the ledger has the H3 enclave, price, and canonical room open. H3 became
-product-accepted for the base T2V/I2V lane after `.70` completed `parts pull`/
-`parts add`/`parts admit --write`, served the class through `/v1/workflows`, and
-retained paid TNK media proofs passed quality inspection. The stronger
+and the ledger has the base H3 enclave, price, and canonical room open. H3
+became product-accepted for the base T2V/I2V lane after `.70` completed
+`parts pull`/`parts add`/`parts admit --write`, served the class through
+`/v1/workflows`, and retained paid TNK media proofs passed quality inspection. The stronger
 dialogue-oriented proof completed through the `.31` sponsored gateway in
 `327.824` seconds, returned `896x512` H.264 video, `124` frames at `24` fps,
 AAC audio, usage `124` `megapixel_step`, session
@@ -219,8 +224,9 @@ Validated H3 source manifest candidates, all from `Comfy-Org/MiniMax-H3` revisio
 | Audio VAE | `vae/minimax_h3_audio_vae_fp32.safetensors` | `6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2` | 605,254,808 bytes |
 | REF2VA diffusion | `diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors` | `b5f18df20fb79f5ae577ed27d16182251712d9a1f30a29af3ffbd6526356b87b` | 20,970,379,616 bytes |
 
-The initial H3 T2V/I2V policy should require the first four rows only. Add the
-REF2VA row when the R2V/reference-video class is separately proven. Do not rely
+The initial H3 T2V/I2V policy requires FL2VA plus the shared encoder/VAEs. The
+R2V policy requires REF2VA plus the same shared encoder/VAEs and must prove
+reference-media behavior separately. Do not rely
 on `resolve/main` or HF `ETag`; the validator must emit the immutable HF revision
 above and the SHA-256 must come from Hugging Face blob/LFS metadata or a verified
 payload hash. The

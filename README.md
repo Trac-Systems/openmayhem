@@ -764,6 +764,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
+| `video.minimax_h3.r2v` | Comfy workflow, MiniMax H3 reference-media video with native audio | D | calibrating |
 | `video.minimax_h3.t2v_i2v` | Comfy workflow, MiniMax H3 text/image-to-video with native audio | D | **live** |
 | `huihui-ai/Huihui-Agents-A1-abliterated` | Multimodal LLM, vision/video input, tools, uncensored, 262K ctx | C | **live** |
 | `ResembleAI/chatterbox` | TTS + zero-shot voice cloning | A/B | **live** |
@@ -987,6 +988,11 @@ media proofs; the stronger retained review artifact is
 `286e0bf679ae7dc44c34f4979a4b53affd6c209a8ecfe774eef9380dffada1b8`, BLAKE3
 `431caae7624d36a15917a1f7ee60fdd47118b35c5e025f2efc4c41aca372aae1`. These
 proofs must not be replaced by a direct Comfy run.
+
+MiniMax H3 REF2VA/reference-media video (`video.minimax_h3.r2v`) is in
+calibration against parts-index v13. Its policy requires request-carried
+reference media through bounded `/v1/workflows` `input_files` and must pass
+live admission plus paid route proof before it is marked product-accepted.
 
 Krea 2 Turbo base image generation (`image.heavy.le1_2mp`) and Krea 2 Turbo
 with signed 4x upscaling (`image.heavy.le17mp`) are product-accepted after

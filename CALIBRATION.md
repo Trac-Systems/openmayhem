@@ -83,6 +83,11 @@ A Comfy workflow is calibrated only after all gates below pass:
   proof `openmayhem-minimax-h3-anime-dialogue-fight-paid-v0.2.123.mp4`
   shows anime fighting action with native audio; it is still not lipsync
   evidence.
+- `video.minimax_h3.r2v`: calibration in progress for the MiniMax H3 REF2VA
+  reference-media lane. REF2VA is mirrored in parts-index v13 and the policy
+  requires request-carried reference media through bounded `/v1/workflows`
+  `input_files`; product acceptance still needs live admission and paid route
+  proof.
 - `video.heavy.le0_5mpf`: product-accepted for LTX A/V generation after paid
   `/v1/workflows` proofs with video and audio. It is not lipsync evidence.
 - `image.heavy.le1_2mp`: product-accepted for Krea base image generation after
