@@ -652,14 +652,20 @@ fn comfy_part_name_for_key<'a>(
             | "checkpoint_name"
             | "model_name"
             | "unet_name"
+            | "vae"
             | "vae_name"
             | "clip_name"
             | "clip_vision_name"
+            | "lora"
             | "lora_name"
             | "control_net_name"
             | "controlnet_name"
             | "upscale_model"
             | "upscale_model_name"
+            | "audio_encoder"
+            | "audio_encoder_name"
+            | "audio_encoder_vocal"
+            | "audio_encoder_vocal_name"
             | "audio_model"
             | "audio_model_name"
             | "video_model"
@@ -1262,6 +1268,93 @@ mod tests {
         assert_eq!(audio.quoted_usage.units().len(), 1);
 
         assert!(valid_comfy_pricing_unit(USAGE_INPUT_CHARACTER));
+    }
+
+    #[test]
+    fn custom_node_selector_names_are_required_parts() {
+        let policy = ComfyWorkflowDerivationPolicy {
+            whitelisted_nodes: [
+                "LongCat_Video_SM_Model",
+                "LongCat_Video_SM_WhisperModel",
+                "LongCat_Video_SM_Sampler",
+                "CreateVideo",
+                "SaveVideo",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            parts_by_name: BTreeMap::from([
+                (
+                    "LongCat-Video-Avatar-vae.safetensors".to_owned(),
+                    part("LongCat-Video-Avatar-vae.safetensors", "vae", "51"),
+                ),
+                (
+                    "longcat-avatar-dmd_lora.safetensors".to_owned(),
+                    part("longcat-avatar-dmd_lora.safetensors", "lora", "52"),
+                ),
+                (
+                    "whisper-large-v3.safetensors".to_owned(),
+                    part("whisper-large-v3.safetensors", "audio-model", "53"),
+                ),
+            ]),
+            max_width: 720,
+            max_height: 480,
+            max_frames: 125,
+            max_duration_seconds: 5,
+            max_steps: 8,
+            ..ComfyWorkflowDerivationPolicy::default()
+        };
+        let graph = json!({
+            "1": {"class_type": "LongCat_Video_SM_Model", "inputs": {
+                "inference_weight_mode": "official_int8_sharded",
+                "vae": "LongCat-Video-Avatar-vae.safetensors",
+                "lora": "longcat-avatar-dmd_lora.safetensors"
+            }},
+            "2": {"class_type": "LongCat_Video_SM_WhisperModel", "inputs": {
+                "audio_encoder": "whisper-large-v3.safetensors"
+            }},
+            "3": {"class_type": "LongCat_Video_SM_Sampler", "inputs": {
+                "model": ["1", 0],
+                "audio_encoder": ["2", 0],
+                "width": 720,
+                "height": 480,
+                "length": 125,
+                "steps": 8
+            }},
+            "4": {"class_type": "CreateVideo", "inputs": {
+                "images": ["3", 0],
+                "fps": 25
+            }},
+            "5": {"class_type": "SaveVideo", "inputs": {
+                "video": ["4", 0],
+                "filename_prefix": "mayhem-longcat/avatar"
+            }}
+        });
+
+        let required = derive_comfy_workflow(&graph, &policy)
+            .unwrap()
+            .parts_required
+            .into_iter()
+            .map(|part| part.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            required,
+            vec![
+                "LongCat-Video-Avatar-vae.safetensors",
+                "longcat-avatar-dmd_lora.safetensors",
+                "whisper-large-v3.safetensors"
+            ]
+        );
+
+        let mut missing_whisper = policy.clone();
+        missing_whisper
+            .parts_by_name
+            .remove("whisper-large-v3.safetensors");
+        assert_eq!(
+            derive_comfy_workflow(&graph, &missing_whisper).unwrap_err(),
+            ComfyWorkflowDerivationError::MissingPart("whisper-large-v3.safetensors".to_owned())
+        );
     }
 
     #[test]

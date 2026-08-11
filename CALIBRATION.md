@@ -146,13 +146,19 @@ A Comfy workflow is calibrated only after all gates below pass:
   `1d47264316354f7f0aa787da4637711e38a0b8e78a715682cb241a937e8f9699`.
 - `video.lipsync`: technical InfiniteTalk proof exists but product quality is
   not accepted. Do not present it as the solution for anime action video with
-  voice. The next accepted candidate is LongCat Video Avatar 1.5 or a better
-  equivalent, because it targets anime/stylized lipsync with Whisper-large-v3
-  audio features. It is not product-ready in OpenMayhem until the runtime
-  custom nodes, Python dependency/runtime profile, and all model/audio parts are
-  mirrored, signed, admitted, and proven through paid `/v1/workflows` with
-  intelligible speech, visible mouth sync, and fighting/action motion. The first
-  LongCat policy should use signed parts with runtime auto-download disabled.
+  voice. LongCat Video Avatar 1.5 now has signed v17 parts, a distinct
+  `comfyui-longcat-avatar-v0.30.1` runtime/custom-node profile, and `.42`
+  reference admission using request-carried image/audio media. Retained artifact:
+  `openmayhem-longcat-avatar-anime-fight-dialogue-reference-v0.2.129.mp4`,
+  output SHA-256
+  `d6e2622e2474c82f5324eecf4359c7877e14edbe77f811081da305460c4fc872`,
+  graph SHA-256
+  `7f6df53d5659f072ee4205765d6c78c7f7dc172273ca1d8ff0b19c1ad2f0431c`,
+  required memory `32.12GiB`, media `832x480`, `25` fps, `100` frames, `4s`.
+  This closes only the technical reference-admission gate. It is not
+  product-ready public capacity until a paid `/v1/workflows` proof passes media
+  review with intelligible speech and visible mouth sync; action motion remains
+  limited to lipsync/talking-video, not full anime choreography.
 
 Use `scripts/verify-comfy-cheatsheet.py` whenever the signed parts index or
 Comfy cheatsheet changes:

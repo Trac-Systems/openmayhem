@@ -167,11 +167,13 @@ policy, admission, paid-route, and retained media proof gates. The dev
   `openmayhem-upscale-conv-le24mp-paid-v0.2.128.png`, session
   `04a42dc2aa5159d317be3c0e80924421d1163021e91d8b41352d72ba96b940fe`,
   BLAKE3 `1d47264316354f7f0aa787da4637711e38a0b8e78a715682cb241a937e8f9699`.
-- `video.lipsync`: signed InfiniteTalk canary/policy evidence and
-  workflow-class modality fingerprint exist using runtime
-  `comfyui-2a68ce33b4c9`, but no current public catalog row exists and the
-  retained reference clip is not product-accepted: voice quality is robotic, lip
-  sync is not convincing, and there is no useful background sound.
+- `video.lipsync`: InfiniteTalk remains rejected for product quality. LongCat
+  Video Avatar 1.5 now has signed v17 parts and `.42` reference admission under
+  `comfyui-longcat-avatar-v0.30.1` with retained media
+  `openmayhem-longcat-avatar-anime-fight-dialogue-reference-v0.2.129.mp4`.
+  This is technical lipsync/talking-video evidence only: the clip is stable and
+  has visible mouth changes, but it is not full anime fight choreography and it
+  still needs a paid `/v1/workflows` proof before public acceptance.
 
 ## Workflow Policy To Parts Matrix
 
@@ -190,7 +192,7 @@ public capacity.
 | `video.heavy.le0_5mpf` | LTX 2.3 native audio/video generation up to 768x512, 8s, 192 frames | LTX 2.3 fp8 AV checkpoint `34dfabbf741978d452e2608769f0c83bb8b375b3b2b47185aa2b5a73430d3ae2`; Gemma 3 12B fp4 text encoder `20652c80fc8e88963343b9968722becb2118d507befbbf0272aa8d79e99893cc`; LTX distilled LoRA 384 `988522cff35f19d7c5977472be163f05b49bf381e441963da4182b0a90b1116c`; LTX spatial upscaler `e0f339c2b5c13fcae1b78cade132ae0307114026c6d20642335eccb4887a050d`; LTX audio VAE `8c108e3ce85d127cef5dbb5747f8c30d2a30c6d92f215278399224e38ffe806c` | `comfyui-v0.30.1` | Product-accepted for A/V generation after paid `.70` `/v1/workflows` proofs with retained video+audio artifacts. |
 | `video.minimax_h3.t2v_i2v` | MiniMax H3 text/image-to-video with native stereo audio up to 1344x768, 15s, 362 frames | FL2VA diffusion `4c371bcbf8e7a577457d7b0ace66345fa85c88a591ca0724a5da6e9642371f72`; Qwen3VL 32B NVFP4 text encoder `32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab`; H3 video VAE `3abef9354f37bb10b413e7034d373e95193511cd80ffa5aea315d1d822032ce7`; H3 audio VAE `6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2` | `comfyui-v0.30.1` | Product-accepted for the base T2V/I2V lane: parts mirrored in parts-index v12, signed catalog metadata published, enclave/price/room live on mainnet, `.70` admission passed, and retained paid `/v1/workflows` proofs passed quality review. Fresh live proof: `.70` served through the `.31` sponsored fiat gateway on 2026-08-11; retained artifact `openmayhem-minimax-h3-t2v-paid-proof-v0.2.127.mp4`, session `02e4b50f367548e156d1ca47975c1e2d213138bf4c1110311f87417af9173e58`, BLAKE3 `f258297d464d7ee060ed9f49f38008b3880379c3cf29adb922769c8c577b7ffc`. Stronger dialogue-oriented artifact: `openmayhem-minimax-h3-anime-dialogue-fight-paid-v0.2.123.mp4`, session `286e0bf679ae7dc44c34f4979a4b53affd6c209a8ecfe774eef9380dffada1b8`, BLAKE3 `431caae7624d36a15917a1f7ee60fdd47118b35c5e025f2efc4c41aca372aae1`. |
 | `video.minimax_h3.r2v` | MiniMax H3 reference-to-video / reference-media workflow | REF2VA diffusion `b5f18df20fb79f5ae577ed27d16182251712d9a1f30a29af3ffbd6526356b87b`; Qwen3VL 32B NVFP4 text encoder `32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab`; H3 video VAE `3abef9354f37bb10b413e7034d373e95193511cd80ffa5aea315d1d822032ce7`; H3 audio VAE `6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2` | `comfyui-v0.30.1` | Product-accepted after signed v13 parts, `.70` admission, live route, and a paid fiat `/v1/workflows` proof through the `.31` sponsored gateway; retained artifact `openmayhem-minimax-h3-r2v-paid-proof-v0.2.126.mp4`, session `a938e5efd7ddba9a610dbf16723d7a6da62c6e6f8c9dfe924f4765c0111ba81c`, BLAKE3 `19f92129c62ef352a2460a1a3d8654d957672fa1ae4cf0c138b3fdaea468cbfd`. |
-| `video.lipsync` | Wan/InfiniteTalk lipsync/talking-video workflow up to 832x480, 4s, 81 frames | Wan2.1 I2V 14B fp8 `6a05292de329cdb06923008742e4f17329548239c2e2c3b10234276d790e1ef6`; UMT5-XXL fp8 `720ea5ea7b9de57ca87b403856b0a7e42c96d1f1176ff886726ab602b6923709`; Wan 2.1 VAE `79f0076a485bca72333bfa34c767006606b4ff351e5d8abc2045865e12c8a664`; Lightx2v I2V LoRA `6294fc7c467c664debaa9a50ea13bfd21959fe7aa29a9759f07541b66562c491`; InfiniteTalk multi fp16 `fd1d93c0ead8d77bc79d457e45bb391063a21fe3111b0a19ef7dc6a605c3b1fd`; Wav2Vec2 Chinese base fp16 `42ed9ac2d65ac013f5d5a431ff93b1e452371a6f1ba9bf8fdaa5c85b631e4f28` | `comfyui-2a68ce33b4c9` | Signed dev policy and technical canary exist; product proof failed quality review. It is not accepted for general anime action video with voice; keep it scoped to lipsync/talking-head until a better-fit policy proves action, speech, and sync. |
+| `video.lipsync` | LongCat Avatar 1.5 lipsync/talking-video workflow up to 832x480, 4s, 100 frames | LongCat INT8 shards `03aec7302e68dd520503e1d86b3bd737676081c6d7bc87e23b958907c0e0d763`, `96024250fff268d22b3fe795de40cb12f326b9c0b78a64677521e6458b4cddbd`, `28e2da04259e4f557f906b16bc0ee9f9eb8abbfbdbe01991d217b079c622685a`, `1d5b361c161b284ef03be517230e82b88dff29c20ea4c40da153af4084655272`; index/config `94477286a0e2869d55f4e5fbe1d724957064ec8489c247fcefaf38004428a476`, `de863798826508a9aeedb68b74d1389b0dad8161098b4f150fb36c90353fc1c2`, `4c9359ce6feee6b6d2bedac09e5e0b26519efc1a35d1ddda1737518669bb03dd`; DMD LoRA `421eaeb552cec6e21c506bc1583b1a05ace4d82501a463611d1db033427f86ec`; VAE `6b437f1eb894131d58bebdfb6e8b7397e7031d945e8aa0e8712791344f11b4e5`; UMT5 fp8 `720ea5ea7b9de57ca87b403856b0a7e42c96d1f1176ff886726ab602b6923709`; Whisper-large-v3 `009d64bc53708635cca4b6cf2b4603bdf474e989c70ed47d550cca90b48f8c95`; custom node `29b4d476aab99bc848b06718d4b857f79fb155ab6ceac12ddf8f8b69c2cf99e3` | `comfyui-longcat-avatar-v0.30.1` | Reference-admitted on `.42` using signed inventory root `d301dcad94837f8b29471de0e7b78d0108dd08d26d273df834dfbcb3ab9ca88b`; required memory `32.12GiB`; graph SHA-256 `7f6df53d5659f072ee4205765d6c78c7f7dc172273ca1d8ff0b19c1ad2f0431c`; retained artifact `openmayhem-longcat-avatar-anime-fight-dialogue-reference-v0.2.129.mp4`, output SHA-256 `d6e2622e2474c82f5324eecf4359c7877e14edbe77f811081da305460c4fc872`. Not public-accepted until paid `/v1/workflows` proof passes review. |
 
 ### Optional Calibration Targets Still Missing Public Proof
 
@@ -410,20 +412,16 @@ These are signed support parts for lipsync/talking-video workflow classes. They 
 Current runtime status:
 
 - InfiniteTalk: the dev calibration runtime is `comfyui-2a68ce33b4c9`. The retained reference output is `openmayhem-infinitetalk-anime-fight-louder-reference-v0.2.119.mp4` in Downloads and proves only that a bounded two-speaker anime fight graph can run with request-carried image/audio media. It does not pass quality acceptance; do not advertise it as successful lipsync.
-- LongCat Video Avatar 1.5: preferred next candidate for anime/stylized
-  dialogue lipsync, but not yet admitted. The current `.70` Comfy v0.30.1 tree
-  only exposes LongCat image/edit support; it does not contain the avatar
-  lipsync nodes. The selected candidate implementation is
+- LongCat Video Avatar 1.5: preferred candidate for anime/stylized dialogue
+  lipsync. It is now reference-admitted on `.42` with signed v17 parts and
+  runtime `comfyui-longcat-avatar-v0.30.1`. The selected implementation is
   `rookiestar28/ComfyUI-LongCat-Avatar@08b4daedfaed69abaf467097f8665615b2137331`
-  (MIT), whose nine nodes cover model load, text encode, Whisper audio,
-  audio crop/window/encode, sampler, and optional vocal extraction. The current
-  `.70` Comfy v0.30.1 venv is missing most of that package's dependencies
-  (`diffusers`, `soundfile`, `librosa`, `pyloudnorm`, `imageio`,
-  `audio-separator`, `onnx`, `onnxruntime`, and friends), so LongCat requires a
-  distinct blessed runtime/dependency profile. Do not claim LongCat lipsync
-  support until an exact runtime/custom-node payload is mirrored and signed, all
-  LongCat/Whisper/audio parts are signed, and a paid `/v1/workflows` proof shows
-  intelligible speech, mouth sync, and action motion.
+  (MIT), whose nodes cover model load, text encode, Whisper audio, audio
+  window/encode, sampler, and optional vocal extraction. The distinct runtime
+  profile must include `diffusers`, `soundfile`, `librosa`, `pyloudnorm`,
+  `imageio`, `audio-separator`, `onnx`, `onnxruntime`, and friends. Do not claim
+  public LongCat serving until a paid `/v1/workflows` proof passes; the current
+  retained media proves stable lipsync/talking-video admission only.
 - Input media: InfiniteTalk proofs need a source image/video frame and an audio clip carried by
   `/v1/workflows` `input_files`. WAV, FLAC, and MP3 are acceptable only when the workflow-input
   bridge validates bounded duration and writes the files into the isolated Comfy input directory

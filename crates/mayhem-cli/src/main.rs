@@ -6038,6 +6038,10 @@ struct ProviderPartsAdmitArgs {
     #[arg(long = "reference-graph", value_name = "PATH")]
     reference_graph: Option<PathBuf>,
 
+    /// JSON array, or object with input_files, for request media used by the reference graph.
+    #[arg(long = "reference-input-files", value_name = "PATH")]
+    reference_input_files: Option<PathBuf>,
+
     /// Verified ComfyUI runtime checkout to execute the reference graph.
     #[arg(long = "reference-runtime", value_name = "PATH")]
     reference_runtime: Option<PathBuf>,
@@ -27233,6 +27237,9 @@ fn comfy_part_record_reference_model_path(
             return safe_relative_comfy_model_path(name);
         }
     }
+    if let Ok(path) = safe_relative_comfy_model_path(record.name.trim()) {
+        return Ok(path);
+    }
     let mut name = safe_path_component(record.name.trim());
     ensure!(
         !name.is_empty(),
@@ -29630,9 +29637,10 @@ fn provider_parts_admission_reference_proof(
     let Some(runtime) = args.reference_runtime.as_deref() else {
         ensure!(
             args.reference_graph.is_none()
+                && args.reference_input_files.is_none()
                 && args.reference_cache_dir.is_none()
                 && args.reference_output_dir.is_none(),
-            "--reference-graph, --reference-cache-dir, and --reference-output-dir require --reference-runtime"
+            "--reference-graph, --reference-input-files, --reference-cache-dir, and --reference-output-dir require --reference-runtime"
         );
         return Ok(None);
     };
@@ -29655,6 +29663,7 @@ fn provider_parts_admission_reference_proof(
         &args.runtime_id,
         args.load_plan.as_deref(),
         args.reference_graph.as_deref(),
+        args.reference_input_files.as_deref(),
         runtime,
         args.reference_cache_dir.as_deref(),
         output_dir,
@@ -29672,6 +29681,7 @@ fn provider_parts_admission_reference_proof_with_runtime(
     runtime_id: &str,
     load_plan: Option<&Path>,
     graph: Option<&Path>,
+    reference_input_files: Option<&Path>,
     runtime: &Path,
     cache_dir: Option<&Path>,
     output_dir: &Path,
@@ -29687,6 +29697,7 @@ fn provider_parts_admission_reference_proof_with_runtime(
             runtime_id,
             load_plan,
             graph,
+            reference_input_files,
             runtime,
             cache_dir,
             output_dir,
@@ -29703,6 +29714,7 @@ fn provider_parts_admission_reference_proof_with_runtime(
             runtime_id,
             load_plan,
             graph,
+            reference_input_files,
             runtime,
             cache_dir,
             output_dir,
@@ -29722,6 +29734,7 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
     runtime_id: &str,
     load_plan: Option<&Path>,
     graph: Option<&Path>,
+    reference_input_files: Option<&Path>,
     runtime: &Path,
     cache_dir: Option<&Path>,
     output_dir: &Path,
@@ -29754,6 +29767,7 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
                 runtime_id,
                 &phase.id,
                 &phase.graph,
+                reference_input_files,
                 runtime,
                 &phase_cache,
                 runtime_files,
@@ -29772,6 +29786,7 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
                 runtime_id,
                 "all-at-once",
                 graph,
+                reference_input_files,
                 runtime,
                 &cache_root.join("all-at-once"),
                 provider_parts_admission_reference_runtime_files(
@@ -29814,6 +29829,7 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
         runtime_id,
         "reference",
         graph,
+        reference_input_files,
         runtime,
         &cache_root,
         provider_parts_admission_reference_runtime_files(&by_part_id, required_ids, chunk_size)?,
@@ -29940,11 +29956,53 @@ fn provider_parts_admission_reference_runtime_files(
 }
 
 #[cfg(feature = "comfyui")]
+fn provider_parts_reference_input_files(
+    workflow: &Value,
+    input_files_path: Option<&Path>,
+) -> Result<Vec<WorkflowInputFile>> {
+    let Some(input_files_path) = input_files_path else {
+        return provider_workflow_input_files(&json!({ "workflow": workflow }))
+            .map(|(files, _stats)| files);
+    };
+    let input_files_doc = read_json_file(input_files_path).with_context(|| {
+        format!(
+            "reading reference input files {}",
+            input_files_path.display()
+        )
+    })?;
+    let input_files = if input_files_doc.is_array() {
+        input_files_doc
+    } else {
+        input_files_doc
+            .get("input_files")
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "reference input files {} must be a JSON array or an object with input_files",
+                    input_files_path.display()
+                )
+            })?
+    };
+    provider_workflow_input_files(&json!({
+        "workflow": workflow,
+        "input_files": input_files,
+    }))
+    .map(|(files, _stats)| files)
+    .with_context(|| {
+        format!(
+            "validating reference input files {}",
+            input_files_path.display()
+        )
+    })
+}
+
+#[cfg(feature = "comfyui")]
 #[allow(clippy::too_many_arguments)]
 fn provider_parts_run_comfy_reference_graph(
     runtime_id: &str,
     label: &str,
     graph: &Path,
+    reference_input_files: Option<&Path>,
     runtime: &Path,
     cache_root: &Path,
     runtime_files: ProviderComfyWorkflowRuntimeFiles,
@@ -29964,6 +30022,8 @@ fn provider_parts_run_comfy_reference_graph(
         .load(config)
         .context("loading ComfyUI runtime for provider admission reference proof")?;
     let mut request = WorkflowGenerationRequest::new(workflow);
+    request.input_files =
+        provider_parts_reference_input_files(&request.workflow, reference_input_files)?;
     request.timeout_ms = timeout_ms;
     let mut collector = AdminPartsCanaryArtifactCollector::default();
     let output = backend
@@ -96256,6 +96316,8 @@ status: linked
             "load-plan.json",
             "--reference-graph",
             "reference.json",
+            "--reference-input-files",
+            "input-files.json",
             "--reference-runtime",
             "ComfyUI",
             "--reference-cache-dir",
@@ -96289,6 +96351,10 @@ status: linked
         assert_eq!(args.max_sessions, 2);
         assert_eq!(args.load_plan, Some(PathBuf::from("load-plan.json")));
         assert_eq!(args.reference_graph, Some(PathBuf::from("reference.json")));
+        assert_eq!(
+            args.reference_input_files,
+            Some(PathBuf::from("input-files.json"))
+        );
         assert_eq!(args.reference_runtime, Some(PathBuf::from("ComfyUI")));
         assert_eq!(args.reference_cache_dir, Some(PathBuf::from("cache")));
         assert_eq!(args.reference_output_dir, Some(PathBuf::from("proofs")));
@@ -96403,6 +96469,7 @@ status: linked
             max_sessions: 2,
             load_plan: None,
             reference_graph: None,
+            reference_input_files: None,
             reference_runtime: None,
             reference_cache_dir: None,
             reference_output_dir: None,
@@ -96452,6 +96519,7 @@ status: linked
             max_sessions: 2,
             load_plan: Some(load_plan),
             reference_graph: None,
+            reference_input_files: None,
             reference_runtime: None,
             reference_cache_dir: None,
             reference_output_dir: None,
@@ -96551,6 +96619,7 @@ status: linked
             max_sessions: 1,
             load_plan: Some(load_plan),
             reference_graph: None,
+            reference_input_files: None,
             reference_runtime: None,
             reference_cache_dir: None,
             reference_output_dir: None,
@@ -96686,6 +96755,57 @@ status: linked
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(feature = "comfyui")]
+    #[test]
+    fn provider_parts_reference_input_files_use_live_workflow_validator() {
+        let temp = test_temp_dir("mayhem-provider-parts-reference-input-files");
+        fs::create_dir_all(&temp).unwrap();
+        let png = tiny_png_bytes();
+        let wav = tiny_wav_bytes(16_000);
+        let workflow = json!({
+            "1": {"class_type": "LoadImage", "inputs": {"image": "refs/hero.png"}},
+            "2": {"class_type": "LoadAudio", "inputs": {"audio": "dialogue/line.wav"}}
+        });
+        let missing = provider_parts_reference_input_files(&workflow, None)
+            .expect_err("reference proof must not read provider-local media implicitly");
+        assert!(
+            missing
+                .to_string()
+                .contains("refs/hero.png but it is not supplied"),
+            "{missing:#}"
+        );
+
+        let input_files = temp.join("input-files.json");
+        write_json_file(
+            &input_files,
+            &json!([
+                {
+                    "filename": "refs/hero.png",
+                    "kind": "image",
+                    "content_type": "image/png",
+                    "encoding": "base64",
+                    "data": base64::engine::general_purpose::STANDARD.encode(&png)
+                },
+                {
+                    "filename": "dialogue/line.wav",
+                    "kind": "audio",
+                    "content_type": "audio/wav",
+                    "encoding": "base64",
+                    "data": base64::engine::general_purpose::STANDARD.encode(&wav)
+                }
+            ]),
+        )
+        .unwrap();
+
+        let parsed = provider_parts_reference_input_files(&workflow, Some(&input_files)).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].filename, "refs/hero.png");
+        assert_eq!(parsed[0].bytes, png);
+        assert_eq!(parsed[1].filename, "dialogue/line.wav");
+        assert_eq!(parsed[1].bytes, wav);
+        let _ = fs::remove_dir_all(temp);
+    }
+
     #[test]
     fn provider_parts_reference_model_path_uses_safe_selector_or_adapter() {
         let mut record = test_comfy_part_record("Fancy Upscaler", "66");
@@ -96710,6 +96830,17 @@ status: linked
         assert_eq!(
             comfy_part_record_reference_model_path(&record).unwrap(),
             PathBuf::from("custom/FancyUpscaler.safetensors")
+        );
+
+        record.adapter.clear();
+        record.name =
+            "LongCat-Video-Avatar-1.5/base_model_int8/quantized_model.safetensors.index.json"
+                .to_owned();
+        assert_eq!(
+            comfy_part_record_reference_model_path(&record).unwrap(),
+            PathBuf::from(
+                "LongCat-Video-Avatar-1.5/base_model_int8/quantized_model.safetensors.index.json"
+            )
         );
 
         record.adapter.insert(
@@ -97210,6 +97341,7 @@ status: linked
             max_sessions: 2,
             load_plan: None,
             reference_graph: None,
+            reference_input_files: None,
             reference_runtime: None,
             reference_cache_dir: None,
             reference_output_dir: None,

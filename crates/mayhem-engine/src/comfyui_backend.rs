@@ -28,6 +28,7 @@ const WORKER_STDIN_BOOTSTRAP: &str = concat!(
     "exec(compile(base64.b64decode(sys.stdin.buffer.readline()),",
     "'<mayhem-comfyui-worker>','exec'))"
 );
+const WORKER_PROTOCOL_PREFIX: &str = "__mayhem_comfyui_worker_v1__";
 const PYTHON_ENV: &str = "MAYHEM_COMFYUI_PYTHON";
 const DEVICE_ENV: &str = "MAYHEM_COMFYUI_DEVICE";
 const ARTIFACT_CHUNK_BYTES: usize = 256 * 1024;
@@ -794,13 +795,7 @@ impl ComfyUiWorker {
             WorkerRead::Eof => return Err(self.exit_error("ComfyUI worker exited before replying")),
             WorkerRead::Error(error) => return Err(EngineError::ComfyUi(error)),
         };
-        serde_json::from_str(line.trim_end())
-            .map(Some)
-            .map_err(|error| {
-                EngineError::ComfyUi(format!(
-                    "decoding ComfyUI worker protocol line failed: {error}"
-                ))
-            })
+        parse_worker_protocol_line(&line)
     }
 
     fn stop(&mut self) {
@@ -1088,6 +1083,18 @@ fn read_worker_stdout(stdout: SandboxedChildStdout, sender: mpsc::SyncSender<Wor
     }
 }
 
+fn parse_worker_protocol_line(line: &str) -> Result<Option<WorkerMessage>> {
+    let line = line.trim_end_matches(['\r', '\n']);
+    let Some(payload) = line.strip_prefix(WORKER_PROTOCOL_PREFIX) else {
+        return Ok(None);
+    };
+    serde_json::from_str(payload).map(Some).map_err(|error| {
+        EngineError::ComfyUi(format!(
+            "decoding ComfyUI worker protocol line failed: {error}"
+        ))
+    })
+}
+
 fn read_bounded_line(reader: &mut impl BufRead, maximum: usize) -> std::io::Result<Option<String>> {
     let mut bytes = Vec::new();
     loop {
@@ -1190,6 +1197,35 @@ mod tests {
                 .unwrap();
         }
         archive.finish().unwrap();
+    }
+
+    #[test]
+    fn worker_protocol_ignores_custom_node_stdout_noise() {
+        assert!(
+            parse_worker_protocol_line("LongCat loading model on cuda\n")
+                .unwrap()
+                .is_none()
+        );
+        let message = parse_worker_protocol_line(
+            "__mayhem_comfyui_worker_v1__{\"id\":7,\"ok\":true,\"result\":{\"ready\":true}}\n",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(message.id, 7);
+        assert!(message.ok);
+        assert_eq!(message.result.unwrap()["ready"], true);
+    }
+
+    #[test]
+    fn worker_protocol_rejects_malformed_framed_reply() {
+        let error =
+            parse_worker_protocol_line("__mayhem_comfyui_worker_v1__not-json\n").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("decoding ComfyUI worker protocol line failed"),
+            "{error}"
+        );
     }
 
     #[test]

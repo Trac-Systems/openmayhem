@@ -9,9 +9,14 @@ import traceback
 import uuid
 from pathlib import Path
 
+PROTOCOL_PREFIX = "__mayhem_comfyui_worker_v1__"
 MAX_RESPONSE_ARTIFACT_BYTES = 128 * 1024 * 1024
 MAX_PROGRESS_EVENTS = 4096
 POLL_SECONDS = 0.05
+
+protocol_stdout = sys.stdout
+sys.stdout = sys.stderr
+sys.__stdout__ = sys.stderr
 
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
@@ -42,8 +47,8 @@ def reply(message_id, ok, result=None, error=None):
         response["result"] = result
     if error is not None:
         response["error"] = str(error)
-    sys.stdout.write(json.dumps(response, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
+    protocol_stdout.write(PROTOCOL_PREFIX + json.dumps(response, separators=(",", ":")) + "\n")
+    protocol_stdout.flush()
 
 
 def content_type(path):

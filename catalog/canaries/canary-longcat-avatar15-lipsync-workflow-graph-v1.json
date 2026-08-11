@@ -1,0 +1,132 @@
+{
+  "1": {
+    "class_type": "LongCat_Video_SM_Model",
+    "inputs": {
+      "attention_mode": "sdpa",
+      "auto_download_missing_weights": false,
+      "inference_weight_mode": "official_int8_sharded",
+      "lora": "longcat-avatar-dmd_lora.safetensors",
+      "vae": "LongCat-Video-Avatar-vae.safetensors"
+    }
+  },
+  "10": {
+    "class_type": "SaveVideo",
+    "inputs": {
+      "codec": "h264",
+      "filename_prefix": "mayhem-longcat-avatar/anime-fight-dialogue-quality-seed11",
+      "format": "mp4",
+      "video": [
+        "9",
+        0
+      ]
+    }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "device": "default",
+      "type": "wan"
+    }
+  },
+  "3": {
+    "class_type": "LongCat_Video_SM_Encode",
+    "inputs": {
+      "auto_download_missing_text_encoder": false,
+      "clip": [
+        "2",
+        0
+      ],
+      "negative_prompt": "blur, static, warped face, malformed mouth, extra eyes, missing eyes, subtitles, text, watermark, low quality, still image, bad hands, distorted anatomy, abstract fog",
+      "offload_device": "cpu",
+      "prompt": "modern anime fight scene, two young men exchange fast punches in a neon alley, dramatic close-up faces, clear mouth movement while shouting, sharp modern anime line art, kinetic camera, impact sparks, cinematic lighting, best quality",
+      "text_encoder_root": "LongCat-Video-Avatar-1.5/text_encoder"
+    }
+  },
+  "4": {
+    "class_type": "LongCat_Video_SM_WhisperModel",
+    "inputs": {
+      "audio_encoder": "whisper-large-v3.safetensors"
+    }
+  },
+  "5": {
+    "class_type": "LoadAudio",
+    "inputs": {
+      "audio": "dialogue/anime-dialogue.wav"
+    }
+  },
+  "6": {
+    "class_type": "LongCat_Video_SM_Audio",
+    "inputs": {
+      "audio": [
+        "5",
+        0
+      ],
+      "audio_encoder": [
+        "4",
+        0
+      ],
+      "audio_type": "para",
+      "p_box": "",
+      "save_fps": 25
+    }
+  },
+  "7": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "refs/anime-fight-reference-832x480.png"
+    }
+  },
+  "8": {
+    "class_type": "LongCat_Video_SM_Sampler",
+    "inputs": {
+      "au_cond": [
+        "6",
+        0
+      ],
+      "audio_guidance_scale": 1,
+      "block_num": 1,
+      "debug_mode": false,
+      "image": [
+        "7",
+        0
+      ],
+      "mask_frame_range": 3,
+      "model": [
+        "1",
+        0
+      ],
+      "mux_audio": [
+        "5",
+        0
+      ],
+      "mux_audio_path": "",
+      "offload_device": "cpu",
+      "ref_img_index": 10,
+      "resolution": "480p",
+      "seed": 11,
+      "stage_1": "ai2v",
+      "steps": 8,
+      "te_cond": [
+        "3",
+        0
+      ],
+      "text_guidance_scale": 1
+    }
+  },
+  "9": {
+    "class_type": "CreateVideo",
+    "inputs": {
+      "audio": [
+        "5",
+        0
+      ],
+      "bit_depth": 8,
+      "fps": 25,
+      "images": [
+        "8",
+        0
+      ]
+    }
+  }
+}
