@@ -413,11 +413,17 @@ Current runtime status:
 - LongCat Video Avatar 1.5: preferred next candidate for anime/stylized
   dialogue lipsync, but not yet admitted. The current `.70` Comfy v0.30.1 tree
   only exposes LongCat image/edit support; it does not contain the avatar
-  lipsync nodes `LongCatAvatarWhisperEmbeds` and
-  `WanVideoLongCatAvatarExtendEmbeds`. Do not claim LongCat lipsync support
-  until an exact runtime/custom-node payload is mirrored and signed, all
-  LongCat/Whisper/audio parts are signed, and a paid `/v1/workflows` proof
-  shows intelligible speech, mouth sync, and action motion.
+  lipsync nodes. The selected candidate implementation is
+  `rookiestar28/ComfyUI-LongCat-Avatar@08b4daedfaed69abaf467097f8665615b2137331`
+  (MIT), whose nine nodes cover model load, text encode, Whisper audio,
+  audio crop/window/encode, sampler, and optional vocal extraction. The current
+  `.70` Comfy v0.30.1 venv is missing most of that package's dependencies
+  (`diffusers`, `soundfile`, `librosa`, `pyloudnorm`, `imageio`,
+  `audio-separator`, `onnx`, `onnxruntime`, and friends), so LongCat requires a
+  distinct blessed runtime/dependency profile. Do not claim LongCat lipsync
+  support until an exact runtime/custom-node payload is mirrored and signed, all
+  LongCat/Whisper/audio parts are signed, and a paid `/v1/workflows` proof shows
+  intelligible speech, mouth sync, and action motion.
 - Input media: InfiniteTalk proofs need a source image/video frame and an audio clip carried by
   `/v1/workflows` `input_files`. WAV, FLAC, and MP3 are acceptable only when the workflow-input
   bridge validates bounded duration and writes the files into the isolated Comfy input directory
@@ -427,14 +433,26 @@ Current runtime status:
 
 LongCat candidate requirements before any public `video.lipsync` row:
 
-- Runtime/custom-node part: pin the exact implementation that provides
-  `LongCatAvatarWhisperEmbeds` and `WanVideoLongCatAvatarExtendEmbeds`, package
-  it as a rootless `custom-node` `tar.gz`, set
+- Runtime/custom-node part: pin
+  `rookiestar28/ComfyUI-LongCat-Avatar@08b4daedfaed69abaf467097f8665615b2137331`,
+  package it as a rootless `custom-node` `tar.gz`, set
   `adapter.comfy_custom_node_dir`, and start Comfy with only the signed
-  whitelist enabled.
-- Model/audio parts: mirror and sign the LongCat Avatar 1.5 model payload used
-  by the graph, Whisper-large-v3 files, any vocal-separator payload, and any
-  distilled LoRA or companion VAE/text-encoder files the graph actually loads.
+  whitelist enabled. The runtime must include the package dependencies; do not
+  install them into an already-serving H3/Krea runtime.
+- Model/audio parts: prefer the official Avatar 1.5 INT8 sharded DiT layout from
+  `meituan-longcat/LongCat-Video-Avatar-1.5@92016c71d5d318d0f5d84e4db30015a571484ab6`
+  (`base_model_int8/` config, quantization config, index, and four shards), the
+  same repo's `lora/dmd_lora.safetensors`, Whisper-large-v3
+  `model.safetensors`, and `meituan-longcat/LongCat-Video@03b55529b1d1d4045f5fbe14d65c8c6e8116b278`
+  `vae/diffusion_pytorch_model.safetensors`. The first public policy should use
+  the already signed UMT5 fallback path rather than the much larger native
+  official LongCat text encoder. `Kim_Vocal_2.onnx` is optional; include it only
+  for policies that actually expose vocal separation.
+- Graph rule: OpenMayhem policies must set LongCat runtime auto-download toggles
+  to `false`; all required files must come from signed parts. The public graph
+  should default to `official_int8_sharded`, 480p, 25 fps, DMD 8-step inference,
+  one session, and `sdpa`/portable attention unless a specific acceleration
+  backend is signed into the blessed runtime and separately proven.
 - Policy proof: the signed policy must bound frame count, duration, resolution,
   audio duration, speaker count, accepted audio/image content types, and node
   allowlist. The proof must use request-carried media through `/v1/workflows`;
