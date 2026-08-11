@@ -249,6 +249,7 @@ def load(payload):
     base_dir = Path(comfy_path(Path(payload["base_dir"]).resolve()))
     socket_path = Path(comfy_path(Path(payload["socket_path"]).resolve()))
     device = payload.get("device", "cpu")
+    custom_node_whitelist = payload.get("custom_node_whitelist", [])
     for path in (base_dir / "input", base_dir / "output", base_dir / "temp", base_dir / "user"):
         path.mkdir(parents=True, exist_ok=True)
     socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -265,6 +266,9 @@ def load(payload):
         "--base-directory",
         comfy_path(base_dir),
     ]
+    if custom_node_whitelist:
+        argv.append("--whitelist-custom-nodes")
+        argv.extend(str(name) for name in custom_node_whitelist)
     if device == "cpu":
         argv.append("--cpu")
     sys.argv = argv

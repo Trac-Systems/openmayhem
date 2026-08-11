@@ -21,6 +21,7 @@ const PART_TYPES: &[&str] = &[
     "checkpoint",
     "clip-vision",
     "controlnet",
+    "custom-node",
     "lipsync",
     "lora",
     "text-encoder",
@@ -1168,6 +1169,20 @@ mod tests {
             comfy_part_record_hash(&first).unwrap(),
             comfy_part_record_hash(&second).unwrap()
         );
+    }
+
+    #[test]
+    fn custom_node_parts_are_valid_catalog_records() {
+        let mut record = record("ComfyUI-Spectrum-MiniMax-H3", HEX_A);
+        record.part_type = "custom-node".to_owned();
+        record.file_format = "tar.gz".to_owned();
+        record.part_id = derive_comfy_part_id(&record.part_type, &record.name, &record.sha256);
+        record.adapter.insert(
+            "comfy_custom_node_dir".to_owned(),
+            Value::from("ComfyUI-Spectrum-MiniMax-H3"),
+        );
+
+        record.validate().unwrap();
     }
 
     #[test]

@@ -100,7 +100,8 @@ A Comfy workflow is calibrated only after all gates below pass:
   `19f92129c62ef352a2460a1a3d8654d957672fa1ae4cf0c138b3fdaea468cbfd`.
 - `video.minimax_h3.spectrum`: owner-approved optional calibration target as
   of 2026-08-11. It must be handled as a distinct H3 audio-quality enhancer
-  lane: mirror and sign the Spectrum custom-node/runtime payload, publish a
+  lane: mirror and sign the Spectrum custom-node/runtime payload as a rootless
+  `custom-node` `tar.gz` part with `adapter.comfy_custom_node_dir`, publish a
   bounded policy, run admission, and retain a paid `/v1/workflows` proof that
   shows audible improvement without replacing or re-proving the accepted base
   H3 and R2V lanes.

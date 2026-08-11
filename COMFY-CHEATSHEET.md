@@ -71,6 +71,14 @@ mayhem provider parts pull --layout-dir <parts-index-layout> --part-id <part-id>
 mayhem provider parts add --layout-dir <parts-index-layout> --part-id <part-id>
 ```
 
+Custom-node dependencies are signed parts too. Package them as a rootless
+`tar.gz` whose archive root contains the node package `__init__.py`, set
+`type: custom-node`, `file_format: tar.gz`, and set
+`adapter.comfy_custom_node_dir` to the exact Comfy custom-node folder name.
+Mayhem extracts the verified archive under `custom_nodes/<name>` and keeps
+Comfy started with `--disable-all-custom-nodes` plus that exact whitelist.
+Do not mislabel custom nodes as model/checkpoint/lipsync parts.
+
 Repeat both commands for every required part. Then prove the class and persist admission:
 
 ```bash

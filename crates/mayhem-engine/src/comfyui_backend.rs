@@ -5,6 +5,7 @@ use super::{
     WorkflowProgressEvent,
 };
 use base64::Engine as _;
+use flate2::read::GzDecoder;
 use mayhem_enclave::{
     SandboxConfig, SandboxedChild, SandboxedChildStderr, SandboxedChildStdin, SandboxedChildStdout,
     SandboxedCommand, SandboxedStderr,
@@ -15,7 +16,7 @@ use sha2::Digest as _;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -35,6 +36,10 @@ const MAX_WORKER_REQUEST_LINE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WORKER_RESPONSE_LINE_BYTES: usize = 192 * 1024 * 1024;
 const LOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const SANDBOX_HELPER_ENV: &str = "MAYHEM_ENCLAVE_SANDBOX_HELPER";
+const MAX_CUSTOM_NODE_ARCHIVE_ENTRIES: usize = 10_000;
+const MAX_CUSTOM_NODE_ARCHIVE_FILE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_CUSTOM_NODE_ARCHIVE_EXPANDED_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_CUSTOM_NODE_ARCHIVE_PATH_BYTES: usize = 512;
 
 #[derive(Default)]
 pub struct ComfyUiBackend {
@@ -130,11 +135,17 @@ impl EngineBackend for ComfyUiBackend {
             ))
         })?;
         materialize_comfyui_model_files(&cache_root, &config.comfyui_model_files)?;
+        materialize_comfyui_custom_nodes(&cache_root, &config.comfyui_custom_nodes)?;
         let python = env::var_os(PYTHON_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("python3"));
         let device = env::var(DEVICE_ENV).unwrap_or_else(|_| "cpu".to_owned());
         let socket_dir = short_socket_dir();
+        let custom_node_whitelist = config
+            .comfyui_custom_nodes
+            .iter()
+            .map(|node| comfyui_custom_node_dir_string(&node.node_dir))
+            .collect::<Result<Vec<_>>>()?;
         let mut worker = ComfyUiWorker::spawn(
             &python,
             config.memory_limit_bytes,
@@ -153,6 +164,7 @@ impl EngineBackend for ComfyUiBackend {
                 "base_dir": base_dir,
                 "socket_path": socket_path,
                 "device": device,
+                "custom_node_whitelist": custom_node_whitelist,
             }),
         )?;
         let response: WorkerLoadResult =
@@ -318,6 +330,63 @@ fn materialize_comfyui_model_files(
     Ok(())
 }
 
+fn materialize_comfyui_custom_nodes(
+    cache_root: &Path,
+    packages: &[super::ComfyUiCustomNodePackage],
+) -> Result<()> {
+    if packages.is_empty() {
+        return Ok(());
+    }
+    let custom_nodes_root = cache_root.join("base").join("custom_nodes");
+    fs::create_dir_all(&custom_nodes_root).map_err(|error| {
+        EngineError::ComfyUi(format!(
+            "creating ComfyUI custom_nodes directory {} failed: {error}",
+            custom_nodes_root.display()
+        ))
+    })?;
+    for package in packages {
+        validate_comfyui_custom_node_package(package)?;
+        let node_dir = comfyui_custom_node_dir_string(&package.node_dir)?;
+        let target = custom_nodes_root.join(&node_dir);
+        if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            fs::remove_file(&target).map_err(|error| {
+                EngineError::ComfyUi(format!(
+                    "removing stale ComfyUI custom node symlink {} failed: {error}",
+                    target.display()
+                ))
+            })?;
+        } else if target.is_file() {
+            fs::remove_file(&target).map_err(|error| {
+                EngineError::ComfyUi(format!(
+                    "removing stale ComfyUI custom node file {} failed: {error}",
+                    target.display()
+                ))
+            })?;
+        } else if target.is_dir() {
+            fs::remove_dir_all(&target).map_err(|error| {
+                EngineError::ComfyUi(format!(
+                    "removing stale ComfyUI custom node directory {} failed: {error}",
+                    target.display()
+                ))
+            })?;
+        }
+        fs::create_dir_all(&target).map_err(|error| {
+            EngineError::ComfyUi(format!(
+                "creating ComfyUI custom node directory {} failed: {error}",
+                target.display()
+            ))
+        })?;
+        extract_comfyui_custom_node_archive(&package.source, &target)?;
+        if !target.join("__init__.py").is_file() {
+            return Err(EngineError::ComfyUi(format!(
+                "ComfyUI custom node package {} must contain __init__.py at archive root",
+                package.source.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_comfyui_model_file(file: &super::ComfyUiModelFile) -> Result<()> {
     let metadata = fs::symlink_metadata(&file.source).map_err(|error| {
         EngineError::ComfyUi(format!(
@@ -354,6 +423,206 @@ fn validate_comfyui_model_file(file: &super::ComfyUiModelFile) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn validate_comfyui_custom_node_package(package: &super::ComfyUiCustomNodePackage) -> Result<()> {
+    let metadata = fs::symlink_metadata(&package.source).map_err(|error| {
+        EngineError::ComfyUi(format!(
+            "inspecting ComfyUI custom node source {} failed: {error}",
+            package.source.display()
+        ))
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(EngineError::ComfyUi(format!(
+            "ComfyUI custom node source {} must be a regular non-symlink tar.gz file",
+            package.source.display()
+        )));
+    }
+    comfyui_custom_node_dir_string(&package.node_dir)?;
+    Ok(())
+}
+
+fn comfyui_custom_node_dir_string(path: &Path) -> Result<String> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(EngineError::ComfyUi(
+            "ComfyUI custom node directory must be a single relative folder name".to_owned(),
+        ));
+    }
+    let mut components = path.components();
+    let Some(Component::Normal(value)) = components.next() else {
+        return Err(EngineError::ComfyUi(
+            "ComfyUI custom node directory must be a normal folder name".to_owned(),
+        ));
+    };
+    if components.next().is_some() {
+        return Err(EngineError::ComfyUi(
+            "ComfyUI custom node directory must not contain nested path components".to_owned(),
+        ));
+    }
+    let value = value.to_str().ok_or_else(|| {
+        EngineError::ComfyUi("ComfyUI custom node directory must be UTF-8".to_owned())
+    })?;
+    if !safe_comfyui_custom_node_component(value) {
+        return Err(EngineError::ComfyUi(
+            "ComfyUI custom node directory contains unsafe characters".to_owned(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn extract_comfyui_custom_node_archive(source: &Path, target: &Path) -> Result<()> {
+    let file = fs::File::open(source).map_err(|error| {
+        EngineError::ComfyUi(format!(
+            "opening ComfyUI custom node archive {} failed: {error}",
+            source.display()
+        ))
+    })?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let mut entry_count = 0_usize;
+    let mut total_file_bytes = 0_u64;
+    for entry in archive.entries().map_err(|error| {
+        EngineError::ComfyUi(format!(
+            "reading ComfyUI custom node archive {} failed: {error}",
+            source.display()
+        ))
+    })? {
+        let mut entry = entry.map_err(|error| {
+            EngineError::ComfyUi(format!(
+                "reading ComfyUI custom node archive entry from {} failed: {error}",
+                source.display()
+            ))
+        })?;
+        entry_count = entry_count.saturating_add(1);
+        if entry_count > MAX_CUSTOM_NODE_ARCHIVE_ENTRIES {
+            return Err(EngineError::ComfyUi(format!(
+                "ComfyUI custom node archive {} exceeds max entry count",
+                source.display()
+            )));
+        }
+        let entry_type = entry.header().entry_type();
+        let raw_path = entry.path().map_err(|error| {
+            EngineError::ComfyUi(format!(
+                "reading ComfyUI custom node archive path from {} failed: {error}",
+                source.display()
+            ))
+        })?;
+        let relative = normalized_custom_node_archive_path(raw_path.as_ref())?;
+        if entry_type.is_dir() {
+            if let Some(relative) = relative {
+                fs::create_dir_all(target.join(relative)).map_err(|error| {
+                    EngineError::ComfyUi(format!(
+                        "creating ComfyUI custom node archive directory failed: {error}"
+                    ))
+                })?;
+            }
+            continue;
+        }
+        if !entry_type.is_file() {
+            return Err(EngineError::ComfyUi(format!(
+                "ComfyUI custom node archive {} contains unsupported entry type",
+                source.display()
+            )));
+        }
+        let relative = relative.ok_or_else(|| {
+            EngineError::ComfyUi("ComfyUI custom node archive has an empty file path".to_owned())
+        })?;
+        let declared_size = entry.header().size().map_err(|error| {
+            EngineError::ComfyUi(format!(
+                "reading ComfyUI custom node archive entry size failed: {error}"
+            ))
+        })?;
+        if declared_size > MAX_CUSTOM_NODE_ARCHIVE_FILE_BYTES {
+            return Err(EngineError::ComfyUi(format!(
+                "ComfyUI custom node archive file {} exceeds max file bytes",
+                relative.display()
+            )));
+        }
+        total_file_bytes = total_file_bytes.saturating_add(declared_size);
+        if total_file_bytes > MAX_CUSTOM_NODE_ARCHIVE_EXPANDED_BYTES {
+            return Err(EngineError::ComfyUi(format!(
+                "ComfyUI custom node archive {} exceeds max expanded bytes",
+                source.display()
+            )));
+        }
+        let destination = target.join(&relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                EngineError::ComfyUi(format!(
+                    "creating ComfyUI custom node archive parent {} failed: {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        let mut output = fs::File::create(&destination).map_err(|error| {
+            EngineError::ComfyUi(format!(
+                "creating ComfyUI custom node file {} failed: {error}",
+                destination.display()
+            ))
+        })?;
+        let copied = std::io::copy(&mut entry, &mut output).map_err(|error| {
+            EngineError::ComfyUi(format!(
+                "extracting ComfyUI custom node file {} failed: {error}",
+                relative.display()
+            ))
+        })?;
+        if copied != declared_size {
+            return Err(EngineError::ComfyUi(format!(
+                "ComfyUI custom node archive file {} length mismatch",
+                relative.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn normalized_custom_node_archive_path(path: &Path) -> Result<Option<PathBuf>> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(EngineError::ComfyUi(
+            "ComfyUI custom node archive path must be relative".to_owned(),
+        ));
+    }
+    if path.as_os_str().as_encoded_bytes().len() > MAX_CUSTOM_NODE_ARCHIVE_PATH_BYTES {
+        return Err(EngineError::ComfyUi(
+            "ComfyUI custom node archive path exceeds max bytes".to_owned(),
+        ));
+    }
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(value) => {
+                let value = value.to_str().ok_or_else(|| {
+                    EngineError::ComfyUi(
+                        "ComfyUI custom node archive path must be UTF-8".to_owned(),
+                    )
+                })?;
+                if !safe_comfyui_custom_node_component(value) {
+                    return Err(EngineError::ComfyUi(
+                        "ComfyUI custom node archive path contains unsafe characters".to_owned(),
+                    ));
+                }
+                out.push(value);
+            }
+            Component::CurDir => {}
+            _ => {
+                return Err(EngineError::ComfyUi(
+                    "ComfyUI custom node archive path cannot contain parent or prefix components"
+                        .to_owned(),
+                ))
+            }
+        }
+    }
+    Ok((!out.as_os_str().is_empty()).then_some(out))
+}
+
+fn safe_comfyui_custom_node_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !matches!(value, "." | ".." | "__pycache__")
+        && !value.starts_with('.')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 impl Drop for ComfyUiBackend {
@@ -887,4 +1156,96 @@ fn worker_stderr_text(tail: &Arc<Mutex<Vec<u8>>>) -> String {
     tail.lock()
         .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Cursor;
+
+    fn test_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("{name}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_custom_node_archive(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = fs::File::create(path).unwrap();
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        for (name, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, *name, Cursor::new(*bytes))
+                .unwrap();
+        }
+        archive.finish().unwrap();
+    }
+
+    #[test]
+    fn custom_node_archives_materialize_under_whitelisted_directory() {
+        let temp = test_temp_dir("mayhem-comfy-custom-node");
+        let archive = temp.join("node.tar.gz");
+        write_custom_node_archive(
+            &archive,
+            &[
+                ("__init__.py", b"NODE_CLASS_MAPPINGS = {}\n"),
+                ("nodes.py", b"class Example: pass\n"),
+                ("web/main.js", b"export default {};\n"),
+            ],
+        );
+        let cache = temp.join("cache");
+
+        materialize_comfyui_custom_nodes(
+            &cache,
+            &[super::super::ComfyUiCustomNodePackage {
+                source: archive,
+                node_dir: PathBuf::from("ComfyUI-TestNode"),
+            }],
+        )
+        .unwrap();
+
+        assert!(cache
+            .join("base/custom_nodes/ComfyUI-TestNode/__init__.py")
+            .is_file());
+        assert!(cache
+            .join("base/custom_nodes/ComfyUI-TestNode/web/main.js")
+            .is_file());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn custom_node_archives_reject_unsafe_paths() {
+        let temp = test_temp_dir("mayhem-comfy-custom-node-escape");
+        let archive = temp.join("node.tar.gz");
+        write_custom_node_archive(&archive, &[(".git/config", b"bad\n")]);
+        let cache = temp.join("cache");
+
+        let error = materialize_comfyui_custom_nodes(
+            &cache,
+            &[super::super::ComfyUiCustomNodePackage {
+                source: archive,
+                node_dir: PathBuf::from("ComfyUI-TestNode"),
+            }],
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("archive path contains unsafe characters"),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
 }

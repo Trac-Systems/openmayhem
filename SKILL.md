@@ -140,6 +140,9 @@ Workflow parts still come only from the signed parts index and require `mayhem p
 provider start must pass `--artifact <comfy-runtime-dir>`; that path is the local ComfyUI runtime
 checkout, while the ledger artifact is the workflow class definition. On CUDA hosts set
 `MAYHEM_COMFYUI_DEVICE=cuda`; the backend defaults to CPU when the device is omitted. A Comfy
+custom node is a signed `custom-node` part, not a model-file workaround: package it as a rootless
+`tar.gz` with `__init__.py` at archive root, set `adapter.comfy_custom_node_dir`, and require it in
+the workflow policy so Mayhem can extract and whitelist only that node package. A Comfy
 provider home has one advertised inventory root; use separate provider homes for disjoint workflow
 inventories unless the signed policies require the same root. Krea base generation is a
 1024x1024 workflow lane. A Krea+4x lane is one workflow graph with a signed upscaler part, but it

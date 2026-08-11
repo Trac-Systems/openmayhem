@@ -68,9 +68,10 @@ use mayhem_enclave::{
 use mayhem_engine::ComfyUiBackend;
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, CancellationToken,
-    ComfyUiModelFile, EngineBackend, EngineError, GenerateRequest, GenerateSpecialityParameter,
-    GenerateSpecialityTarget, GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest,
-    LoadConfig, MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
+    ComfyUiCustomNodePackage, ComfyUiModelFile, EngineBackend, EngineError, GenerateRequest,
+    GenerateSpecialityParameter, GenerateSpecialityTarget, GrammarSpec,
+    ImageGenerationRequest as EngineImageGenerationRequest, LoadConfig,
+    MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
     SpeechReferenceAudio, SpeechRequest, TokenChunk, ToolSpec, WorkflowGenerationRequest,
     WorkflowInputFile, MTMD_MEDIA_MARKER,
 };
@@ -26872,27 +26873,6 @@ fn comfy_part_generate_canary_output_with_runtime_inner(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| output_dir.join(".runtime-cache"))
         .join(&part_id);
-    let model_subdir = comfy_part_model_subdir(draft)?;
-    let model_dir = cache_root.join("base").join("models").join(model_subdir);
-    fs::create_dir_all(&model_dir).with_context(|| {
-        format!(
-            "creating Comfy canary model directory {}",
-            model_dir.display()
-        )
-    })?;
-    let payload_name = payload_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(safe_path_component)
-        .filter(|name| !name.is_empty())
-        .context("Comfy canary payload path must have a usable file name")?;
-    let installed_payload = model_dir.join(payload_name);
-    fs::copy(payload_path, &installed_payload).with_context(|| {
-        format!(
-            "copying verified Comfy part payload into {}",
-            installed_payload.display()
-        )
-    })?;
 
     let workflow: Value = serde_json::from_value(read_json_file(canary_graph)?)
         .with_context(|| format!("parsing canary graph {}", canary_graph.display()))?;
@@ -26901,6 +26881,34 @@ fn comfy_part_generate_canary_output_with_runtime_inner(
 
     let mut config = LoadConfig::comfyui_runtime(runtime);
     config.backend_cache_dir = Some(cache_root.clone());
+    if comfy_part_is_custom_node(&draft.part_type) {
+        config.comfyui_custom_nodes.push(ComfyUiCustomNodePackage {
+            source: payload_path.to_path_buf(),
+            node_dir: comfy_part_draft_custom_node_dir(draft)?,
+        });
+    } else {
+        let model_subdir = comfy_part_model_subdir(draft)?;
+        let model_dir = cache_root.join("base").join("models").join(model_subdir);
+        fs::create_dir_all(&model_dir).with_context(|| {
+            format!(
+                "creating Comfy canary model directory {}",
+                model_dir.display()
+            )
+        })?;
+        let payload_name = payload_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(safe_path_component)
+            .filter(|name| !name.is_empty())
+            .context("Comfy canary payload path must have a usable file name")?;
+        let installed_payload = model_dir.join(payload_name);
+        fs::copy(payload_path, &installed_payload).with_context(|| {
+            format!(
+                "copying verified Comfy part payload into {}",
+                installed_payload.display()
+            )
+        })?;
+    }
     let mut backend = ComfyUiBackend::new();
     backend
         .load(config)
@@ -27071,6 +27079,10 @@ fn comfy_part_type_model_subdir(
     safe_relative_comfy_model_subdir(subdir)
 }
 
+fn comfy_part_is_custom_node(part_type: &str) -> bool {
+    part_type == "custom-node"
+}
+
 fn safe_relative_comfy_model_subdir(path: &str) -> Result<PathBuf> {
     let path = Path::new(path);
     ensure!(
@@ -27143,6 +27155,59 @@ fn comfy_part_file_format_extension(file_format: &str) -> Result<&'static str> {
         "bin" => Ok("bin"),
         other => bail!("unsupported Comfy part file_format for model mount: {other}"),
     }
+}
+
+fn comfy_part_custom_node_archive_format(file_format: &str) -> Result<()> {
+    match file_format.trim().to_ascii_lowercase().as_str() {
+        "tar.gz" | "tgz" => Ok(()),
+        other => bail!("unsupported Comfy custom-node file_format: {other}; expected tar.gz"),
+    }
+}
+
+fn safe_comfy_custom_node_dir(path: &str) -> Result<PathBuf> {
+    let path = Path::new(path);
+    ensure!(
+        !path.as_os_str().is_empty() && !path.is_absolute(),
+        "Comfy custom node directory must be a single relative folder name"
+    );
+    let mut components = path.components();
+    let Some(Component::Normal(value)) = components.next() else {
+        bail!("Comfy custom node directory must be a normal folder name");
+    };
+    ensure!(
+        components.next().is_none(),
+        "Comfy custom node directory cannot contain nested path components"
+    );
+    let value = value
+        .to_str()
+        .context("Comfy custom node directory must be UTF-8")?;
+    let safe = safe_path_component(value);
+    ensure!(
+        !safe.is_empty() && safe == value && !value.starts_with('.'),
+        "Comfy custom node directory contains an unsafe component"
+    );
+    Ok(PathBuf::from(value))
+}
+
+fn comfy_part_custom_node_dir(name: &str, adapter: &BTreeMap<String, Value>) -> Result<PathBuf> {
+    if let Some(dir) = adapter
+        .get("comfy_custom_node_dir")
+        .or_else(|| adapter.get("custom_node_dir"))
+        .and_then(Value::as_str)
+    {
+        return safe_comfy_custom_node_dir(dir);
+    }
+    safe_comfy_custom_node_dir(&safe_path_component(name.trim()))
+}
+
+fn comfy_part_record_custom_node_dir(record: &mayhem_proto::ComfyPartRecord) -> Result<PathBuf> {
+    comfy_part_custom_node_archive_format(&record.file_format)?;
+    comfy_part_custom_node_dir(&record.name, &record.adapter)
+}
+
+fn comfy_part_draft_custom_node_dir(draft: &mayhem_proto::ComfyPartDraft) -> Result<PathBuf> {
+    comfy_part_custom_node_archive_format(&draft.file_format)?;
+    comfy_part_custom_node_dir(&draft.name, &draft.adapter)
 }
 
 #[cfg(any(feature = "comfyui", test))]
@@ -28798,19 +28863,25 @@ fn provider_comfy_workflow_inventory_resident_bytes(
     Ok(total)
 }
 
-fn provider_comfy_workflow_model_files(
+#[derive(Default)]
+struct ProviderComfyWorkflowRuntimeFiles {
+    model_files: Vec<ComfyUiModelFile>,
+    custom_nodes: Vec<ComfyUiCustomNodePackage>,
+}
+
+fn provider_comfy_workflow_runtime_files(
     home: &Path,
     model: &catalog::CatalogModel,
     chunk_size: usize,
-) -> Result<Vec<ComfyUiModelFile>> {
+) -> Result<ProviderComfyWorkflowRuntimeFiles> {
     if !catalog_model_has_comfy_workflow_endpoint(model) {
-        return Ok(Vec::new());
+        return Ok(ProviderComfyWorkflowRuntimeFiles::default());
     }
     let Some(policy) = model.workflow.as_ref() else {
-        return Ok(Vec::new());
+        return Ok(ProviderComfyWorkflowRuntimeFiles::default());
     };
     if policy.parts.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ProviderComfyWorkflowRuntimeFiles::default());
     }
     let inventory = read_provider_comfy_inventory(home)?.with_context(|| {
         format!(
@@ -28831,7 +28902,7 @@ fn provider_comfy_workflow_model_files(
         .iter()
         .map(|part| (part.part_id.as_str(), part))
         .collect::<BTreeMap<_, _>>();
-    let mut files = Vec::new();
+    let mut files = ProviderComfyWorkflowRuntimeFiles::default();
     for required in &policy.parts {
         let part = by_part_id.get(required.part_id.as_str()).with_context(|| {
             format!(
@@ -28852,11 +28923,18 @@ fn provider_comfy_workflow_model_files(
             "verified Comfy part {} is missing or no longer matches its signed payload",
             part.part_id
         );
-        files.push(ComfyUiModelFile {
-            source,
-            model_subdir: comfy_part_record_model_subdir(&part.record)?,
-            model_path: safe_relative_comfy_model_path(&required.name)?,
-        });
+        if comfy_part_is_custom_node(&part.record.part_type) {
+            files.custom_nodes.push(ComfyUiCustomNodePackage {
+                source,
+                node_dir: comfy_part_record_custom_node_dir(&part.record)?,
+            });
+        } else {
+            files.model_files.push(ComfyUiModelFile {
+                source,
+                model_subdir: comfy_part_record_model_subdir(&part.record)?,
+                model_path: safe_relative_comfy_model_path(&required.name)?,
+            });
+        }
     }
     Ok(files)
 }
@@ -29663,7 +29741,7 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
         let mut phase_proofs = Vec::new();
         let mut total_progress_events = 0_usize;
         for phase in phase_plans {
-            let model_files = provider_parts_admission_reference_model_files(
+            let runtime_files = provider_parts_admission_reference_runtime_files(
                 &by_part_id,
                 &phase.resident_parts,
                 chunk_size,
@@ -29677,7 +29755,7 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
                 &phase.graph,
                 runtime,
                 &phase_cache,
-                model_files,
+                runtime_files,
                 output_dir,
                 timeout_ms,
             )?;
@@ -29695,7 +29773,7 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
                 graph,
                 runtime,
                 &cache_root.join("all-at-once"),
-                provider_parts_admission_reference_model_files(
+                provider_parts_admission_reference_runtime_files(
                     &by_part_id,
                     required_ids,
                     chunk_size,
@@ -29737,7 +29815,7 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
         graph,
         runtime,
         &cache_root,
-        provider_parts_admission_reference_model_files(&by_part_id, required_ids, chunk_size)?,
+        provider_parts_admission_reference_runtime_files(&by_part_id, required_ids, chunk_size)?,
         output_dir,
         timeout_ms,
     )?;
@@ -29829,12 +29907,12 @@ fn resolve_load_plan_reference_graph(load_plan: &Path, value: &str) -> Result<Pa
 }
 
 #[cfg(feature = "comfyui")]
-fn provider_parts_admission_reference_model_files(
+fn provider_parts_admission_reference_runtime_files(
     by_part_id: &BTreeMap<&str, &ProviderComfyInventoryPart>,
     part_ids: &[String],
     chunk_size: usize,
-) -> Result<Vec<ComfyUiModelFile>> {
-    let mut model_files = Vec::new();
+) -> Result<ProviderComfyWorkflowRuntimeFiles> {
+    let mut runtime_files = ProviderComfyWorkflowRuntimeFiles::default();
     for part_id in part_ids {
         let part = by_part_id
             .get(part_id.as_str())
@@ -29844,13 +29922,20 @@ fn provider_parts_admission_reference_model_files(
             provider_comfy_part_payload_matches(&source, &part.record, chunk_size)?,
             "required Comfy part {part_id} is missing or no longer matches its signed payload"
         );
-        model_files.push(ComfyUiModelFile {
-            source,
-            model_subdir: comfy_part_record_model_subdir(&part.record)?,
-            model_path: comfy_part_record_reference_model_path(&part.record)?,
-        });
+        if comfy_part_is_custom_node(&part.record.part_type) {
+            runtime_files.custom_nodes.push(ComfyUiCustomNodePackage {
+                source,
+                node_dir: comfy_part_record_custom_node_dir(&part.record)?,
+            });
+        } else {
+            runtime_files.model_files.push(ComfyUiModelFile {
+                source,
+                model_subdir: comfy_part_record_model_subdir(&part.record)?,
+                model_path: comfy_part_record_reference_model_path(&part.record)?,
+            });
+        }
     }
-    Ok(model_files)
+    Ok(runtime_files)
 }
 
 #[cfg(feature = "comfyui")]
@@ -29861,7 +29946,7 @@ fn provider_parts_run_comfy_reference_graph(
     graph: &Path,
     runtime: &Path,
     cache_root: &Path,
-    model_files: Vec<ComfyUiModelFile>,
+    runtime_files: ProviderComfyWorkflowRuntimeFiles,
     output_dir: &Path,
     timeout_ms: u64,
 ) -> Result<ProviderPartsAdmissionReferencePhaseProof> {
@@ -29871,7 +29956,8 @@ fn provider_parts_run_comfy_reference_graph(
         .with_context(|| format!("parsing reference graph {}", graph.display()))?;
     let mut config = LoadConfig::comfyui_runtime(runtime);
     config.backend_cache_dir = Some(cache_root.to_path_buf());
-    config.comfyui_model_files = model_files;
+    config.comfyui_model_files = runtime_files.model_files;
+    config.comfyui_custom_nodes = runtime_files.custom_nodes;
     let mut backend = ComfyUiBackend::new();
     backend
         .load(config)
@@ -83108,8 +83194,10 @@ fn provider_engine_load_config(
             .home
             .as_deref()
             .context("ComfyUI provider start requires a resolved Mayhem home")?;
-        config.comfyui_model_files =
-            provider_comfy_workflow_model_files(home, &selected.model, args.chunk_size)?;
+        let runtime_files =
+            provider_comfy_workflow_runtime_files(home, &selected.model, args.chunk_size)?;
+        config.comfyui_model_files = runtime_files.model_files;
+        config.comfyui_custom_nodes = runtime_files.custom_nodes;
     }
     if selected.artifact.engine == "stable-diffusion.cpp" {
         config.stable_diffusion_cpp = selected
@@ -96817,15 +96905,105 @@ status: linked
             provider_comfy_workflow_inventory_resident_bytes(Some(&home), &model).unwrap(),
             record.size_bytes
         );
-        let files = provider_comfy_workflow_model_files(&home, &model, 8).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].model_subdir, PathBuf::from("upscale_models"));
-        assert_eq!(files[0].model_path, PathBuf::from("tiny-upscaler.bin"));
-        assert!(files[0].source.is_file());
+        let files = provider_comfy_workflow_runtime_files(&home, &model, 8).unwrap();
+        assert_eq!(files.model_files.len(), 1);
+        assert!(files.custom_nodes.is_empty());
+        assert_eq!(
+            files.model_files[0].model_subdir,
+            PathBuf::from("upscale_models")
+        );
+        assert_eq!(
+            files.model_files[0].model_path,
+            PathBuf::from("tiny-upscaler.bin")
+        );
+        assert!(files.model_files[0].source.is_file());
 
         model.workflow.as_mut().unwrap().parts[0].name = "mounted-upscaler.bin".to_owned();
-        let files = provider_comfy_workflow_model_files(&home, &model, 8).unwrap();
-        assert_eq!(files[0].model_path, PathBuf::from("mounted-upscaler.bin"));
+        let files = provider_comfy_workflow_runtime_files(&home, &model, 8).unwrap();
+        assert_eq!(
+            files.model_files[0].model_path,
+            PathBuf::from("mounted-upscaler.bin")
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn provider_comfy_inventory_feeds_custom_node_runtime_mounts() {
+        let temp = test_temp_dir("mayhem-provider-comfy-inventory-custom-node");
+        let source_dir = temp.join("source");
+        let layout_dir = temp.join("layout");
+        let payload_dir = temp.join("payloads");
+        let cache_dir = temp.join("cache");
+        let home = temp.join("home");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&payload_dir).unwrap();
+        let payload_path = payload_dir.join("spectrum.tar.gz");
+        fs::write(&payload_path, b"fake archive bytes for inventory mapping").unwrap();
+        let mut record =
+            test_comfy_part_record_for_payload("ComfyUI-Spectrum-MiniMax-H3", &payload_path, 8);
+        record.part_type = "custom-node".to_owned();
+        record.file_format = "tar.gz".to_owned();
+        record.part_id =
+            mayhem_proto::derive_comfy_part_id(&record.part_type, &record.name, &record.sha256);
+        record.adapter.insert(
+            "comfy_custom_node_dir".to_owned(),
+            Value::from("ComfyUI-Spectrum-MiniMax-H3"),
+        );
+        record.validate().unwrap();
+        let record_path = source_dir.join("record.json");
+        write_json_file(&record_path, &record).unwrap();
+        admin_parts_build_index(&AdminPartsBuildIndexArgs {
+            records: vec![record_path],
+            output_dir: layout_dir.clone(),
+            index_ver: 24,
+            blessed_runtimes: vec!["comfyui-v0.30.1".to_owned()],
+            whitelist_ver: 1,
+            outcome_classes_ver: 1,
+        })
+        .unwrap();
+        provider_parts_add(ProviderPartsPullArgs {
+            home: Some(home.clone()),
+            layout_dir,
+            part_ids: vec![record.part_id.clone()],
+            all: false,
+            payload_dir: Some(payload_dir),
+            hf_token_file: None,
+            source_token_file: None,
+            cache_dir: Some(cache_dir),
+            disk_reserve: None,
+            offline: true,
+            require_payload: false,
+            chunk_size: 8,
+            json: true,
+        })
+        .unwrap();
+        let inventory_root = provider_comfy_inventory_root(&home).unwrap().unwrap();
+        let mut model = test_catalog(&"aa".repeat(32)).models[0].clone();
+        model.adapter.endpoint_families = vec![mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+        )
+        .unwrap()];
+        model.workflow = Some(mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["SpectrumApplyMiniMaxH3".to_owned()],
+            parts: vec![mayhem_proto::ComfyWorkflowPartRef {
+                part_id: record.part_id.clone(),
+                name: record.name.clone(),
+                part_type: record.part_type.clone(),
+                sha256: record.sha256.clone(),
+                scale: None,
+            }],
+            inventory_root: Some(inventory_root),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        });
+
+        let files = provider_comfy_workflow_runtime_files(&home, &model, 8).unwrap();
+        assert!(files.model_files.is_empty());
+        assert_eq!(files.custom_nodes.len(), 1);
+        assert_eq!(
+            files.custom_nodes[0].node_dir,
+            PathBuf::from("ComfyUI-Spectrum-MiniMax-H3")
+        );
+        assert!(files.custom_nodes[0].source.is_file());
         let _ = fs::remove_dir_all(temp);
     }
 
