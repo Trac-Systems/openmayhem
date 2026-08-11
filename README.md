@@ -764,7 +764,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
-| `upscale.conv.le24mp` | Comfy workflow, standalone 4x image upscale | A/B | calibrating |
+| `upscale.conv.le24mp` | Comfy workflow, standalone 4x image upscale | A/B | **live** |
 | `video.minimax_h3.r2v` | Comfy workflow, MiniMax H3 reference-media video with native audio | D | **live** |
 | `video.minimax_h3.t2v_i2v` | Comfy workflow, MiniMax H3 text/image-to-video with native audio | D | **live** |
 | `huihui-ai/Huihui-Agents-A1-abliterated` | Multimodal LLM, vision/video input, tools, uncensored, 262K ctx | C | **live** |
@@ -1015,7 +1015,12 @@ image `input_files` canary. Local reference admission passed with retained
 artifact `openmayhem-upscale-conv-le24mp-reference-v0.2.127.png`. The `0.2.128`
 source release fixes Comfy workflow input-file capacity accounting so one
 request-bound input plus one output artifact does not hide an otherwise eligible
-workflow route during dispatch; paid-route acceptance remains the next gate.
+workflow route during dispatch. Paid fiat proof then passed through the `.31`
+proof gateway against the `.42` provider with retained artifact
+`openmayhem-upscale-conv-le24mp-paid-v0.2.128.png`, session
+`04a42dc2aa5159d317be3c0e80924421d1163021e91d8b41352d72ba96b940fe`,
+usage `1` `megapixel`, and artifact BLAKE3
+`1d47264316354f7f0aa787da4637711e38a0b8e78a715682cb241a937e8f9699`.
 
 The `0.2.123` source release adds metadata-only Comfy workflow-class policy
 calibration, signs workflow-class modality fingerprints for Krea base,

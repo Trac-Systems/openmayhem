@@ -117,8 +117,12 @@ A Comfy workflow is calibrated only after all gates below pass:
   Local reference admission proof produced
   `openmayhem-upscale-conv-le24mp-reference-v0.2.127.png`, output SHA-256
   `3b78c0ecd45cfa63c75d2eea18c7056c417015908c7ec7c8dddc327949e4f8fc`.
-  A paid route proof is still required before calling live marketplace capacity
-  product-accepted.
+  Product acceptance passed with paid fiat `/v1/workflows` proof through the
+  `.31` proof gateway against the `.42` provider; retained artifact
+  `openmayhem-upscale-conv-le24mp-paid-v0.2.128.png`, session
+  `04a42dc2aa5159d317be3c0e80924421d1163021e91d8b41352d72ba96b940fe`,
+  usage `1` `megapixel`, BLAKE3
+  `1d47264316354f7f0aa787da4637711e38a0b8e78a715682cb241a937e8f9699`.
 - `video.lipsync`: technical InfiniteTalk proof exists but product quality is
   not accepted. Do not present it as the solution for anime action video with
   voice.
