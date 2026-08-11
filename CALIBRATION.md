@@ -82,11 +82,15 @@ A Comfy workflow is calibrated only after all gates below pass:
 ## Current Comfy Evidence
 
 - `video.minimax_h3.t2v_i2v`: product-accepted for the base H3 T2V/I2V lane
-  after signed v12 parts, admission, live provider route, and a retained paid
-  TNK `/v1/workflows` anime fight proof. The stronger dialogue-oriented
-  proof `openmayhem-minimax-h3-anime-dialogue-fight-paid-v0.2.123.mp4`
-  shows anime fighting action with native audio; it is still not lipsync
-  evidence.
+  after signed v12 parts, admission, live provider route, and retained paid
+  `/v1/workflows` anime fight proofs through the `.31` sponsored gateway. The
+  current live proof `openmayhem-minimax-h3-t2v-paid-proof-v0.2.127.mp4` is
+  `896x512`, `124` frames at `24` fps with AAC stereo, session
+  `02e4b50f367548e156d1ca47975c1e2d213138bf4c1110311f87417af9173e58`, BLAKE3
+  `f258297d464d7ee060ed9f49f38008b3880379c3cf29adb922769c8c577b7ffc`. The
+  stronger dialogue-oriented proof
+  `openmayhem-minimax-h3-anime-dialogue-fight-paid-v0.2.123.mp4` shows anime
+  fighting action with native audio; it is still not lipsync evidence.
 - `video.minimax_h3.r2v`: product-accepted for the MiniMax H3 REF2VA
   reference-media lane after signed v13 parts, `.70` admission, live route, and
   a paid fiat `/v1/workflows` proof through the `.31` sponsored gateway. The

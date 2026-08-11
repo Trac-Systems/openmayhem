@@ -983,8 +983,13 @@ the next `mayhem up` reuses durable provider registrations. Ordinary
 The current signed catalog adds `video.minimax_h3.t2v_i2v` as a Comfy
 workflow-class market with mirrored MiniMax H3 base parts, a signed
 workflow-class definition, active enclave/price/room rows, and native
-video+audio caps. `.70` completed admission and paid TNK `/v1/workflows`
-media proofs; the stronger retained review artifact is
+video+audio caps. `.70` completed admission and paid `/v1/workflows` media
+proofs through the `.31` sponsored gateway. The current retained live proof is
+`openmayhem-minimax-h3-t2v-paid-proof-v0.2.127.mp4`, session
+`02e4b50f367548e156d1ca47975c1e2d213138bf4c1110311f87417af9173e58`, BLAKE3
+`f258297d464d7ee060ed9f49f38008b3880379c3cf29adb922769c8c577b7ffc`; media
+is `896x512`, `124` frames at `24` fps with AAC stereo. The stronger
+dialogue-oriented retained artifact is
 `openmayhem-minimax-h3-anime-dialogue-fight-paid-v0.2.123.mp4`, session
 `286e0bf679ae7dc44c34f4979a4b53affd6c209a8ecfe774eef9380dffada1b8`, BLAKE3
 `431caae7624d36a15917a1f7ee60fdd47118b35c5e025f2efc4c41aca372aae1`. These
