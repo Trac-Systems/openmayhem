@@ -82680,7 +82680,7 @@ fn provider_comfy_workflow_canary_self_test_body(
         "response_format",
     ] {
         if let Some(value) = endpoint_contract_calibration_or_default_value(contract, path) {
-            object.insert(path.to_owned(), value);
+            object.entry(path.to_owned()).or_insert(value);
         }
     }
     Ok(Some(body))
@@ -109733,6 +109733,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
         let explicit_prompt: CanaryPrompt = serde_json::from_value(json!({
             "id": "explicit-comfy-workflow-smoke",
+            "timeout_ms": 1_800_000,
             "workflow": {
                 "1": {
                     "class_type": "SaveImage",
@@ -109746,6 +109747,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             explicit_body["workflow"]["1"]["class_type"],
             json!("SaveImage")
         );
+        assert_eq!(explicit_body["timeout_ms"], json!(1_800_000));
     }
 
     #[test]

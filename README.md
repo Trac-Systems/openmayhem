@@ -1041,7 +1041,7 @@ can be mirrored from immutable `/resolve/<40-hex>/...` sources instead of mutabl
 cheatsheet; H3 still requires parts mirroring, workflow policy publication, and
 a paid `/v1/workflows` quality proof before public serving.
 
-The `0.2.133` source release adds LongCat Avatar 1.5 as the active
+The `0.2.134` source release adds LongCat Avatar 1.5 as the active
 `video.lipsync` dev row with signed v17 parts, request-carried image/audio
 `input_files`, and a workflow-class `video_av_fingerprint` canary from retained
 reference media. It also mounts Comfy model files from the signed part record
