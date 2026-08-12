@@ -568,14 +568,17 @@ Current runtime status:
   before the proof counts.
   First candidate manifest for the anime-action dialogue proof:
   `kijai/ComfyUI-WanVideoWrapper@088128b224242e110d3906c6750e9a3a348a659b`
-  as a rootless custom-node part; `MeiGen-AI/MultiTalk@c1ad84009b99ed36c97ab18e4517ca5f98692438`
-  as the upstream implementation reference; `MeiGen-AI/MeiGen-MultiTalk@b3ccbea2f68c89fafb277b9bd907905fff7a9337`
-  `multitalk.safetensors` (~9.95 GB) plus its
-  `diffusion_pytorch_model.safetensors.index.json`; and
-  `TencentGameMate/chinese-wav2vec2-base@3991242c806928916fff4a8c0e4f76acf661b743`
-  `pytorch_model.bin` (~380 MB), config, and preprocessor files. The optional
-  Kokoro TTS files are not on the critical path because the first paid proof
-  should use request-carried audio rather than provider-local TTS.
+  as a rootless custom-node part (`e61b2cbd5291...`), plus
+  `MeiGen-AI/MeiGen-MultiTalk@b3ccbea2f68c89fafb277b9bd907905fff7a9337`
+  `multitalk.safetensors` (`0b92e833842b...`, ~9.95 GB). The first graph
+  should reuse existing signed Wan companions where exact hashes match,
+  especially Wan2.1 I2V 480p fp8, LightX2V, UMT5 fp8, Wan 2.1 VAE, and the
+  Kijai wav2vec2 Chinese base fp16 safetensors part. Only add raw
+  `TencentGameMate/chinese-wav2vec2-base` pickle/bin files if the actual graph
+  fails to load the signed safetensors repack. Tracked candidate evidence:
+  [`catalog/comfy/multitalk-lipsync-candidate-20260812.md`](catalog/comfy/multitalk-lipsync-candidate-20260812.md).
+  The optional Kokoro TTS files are not on the critical path because the first
+  paid proof should use request-carried audio rather than provider-local TTS.
 - `sync.so`/HeyGen API nodes: these are remote service nodes. They are not acceptable for local OpenMayhem provider proof unless a future catalog policy explicitly declares an external-service lane and its security/payment rules.
 
 LongCat policy requirements for `video.lipsync`:
