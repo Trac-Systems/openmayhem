@@ -91,8 +91,9 @@ Current catalog count: nine signed workflow rows. Product-accepted rows are
 `video.heavy.le0_5mpf`, `image.heavy.le1_2mp`, `image.heavy.le17mp`, and
 `upscale.conv.le24mp`, and `upscale.diffusion`. `video.minimax_h3.spectrum` is
 proven but parked as an optional enhancer with no measured product lift.
-`video.lipsync` has technical LongCat proof but remains a quality-fit gap for
-action anime.
+`video.lipsync` has technical LongCat paid proof and a newer MultiTalk
+reference-admission proof, but still needs a signed MultiTalk catalog policy and
+paid route proof before it closes the action-anime/dialogue quality gap.
 
 - `video.minimax_h3.t2v_i2v`: product-accepted for the base H3 T2V/I2V lane
   after signed v12 parts, admission, live provider route, and retained paid
@@ -247,20 +248,25 @@ action anime.
   faces. Keep the anime action+voice proof on the accepted H3/LTX A/V lanes
   unless a new signed workflow demonstrates both action and lipsync through the
   paid route.
-  Current next candidate research: `MeiGen-AI/MultiTalk` and Kijai's
+  Current next candidate research: `MeiGen-AI/MeiGen-MultiTalk` and Kijai's
   `ComfyUI-WanVideoWrapper` MultiTalk/FantasyTalking support are a better fit
   for multi-character dialogue/action than more LongCat prompt tuning, but
   MultiTalk is not accepted yet. On 2026-08-12, `.70` proved the clean signed
-  candidate inventory can materialize, then both sequential and parallel audio
+  candidate inventory can materialize. The first sequential and parallel audio
   graphs failed inside `WanVideoSampler` with a missing MultiTalk reference
-  attention map. The narrowed next probe is not a runtime patch: provide
-  request-carried left/right mask PNGs, stack them with core `ImageBatch`,
-  convert the batch with `ImageToMask`, and pass the resulting batched `MASK`
-  into `MultiTalkWav2VecEmbeds.ref_target_masks`. If that still fails, publish
-  no route; the clean path is a newly signed WanVideoWrapper custom-node part
-  that fixes mask propagation. Do not use provider-local WanVideoWrapper or
-  FantasyTalking files as proof, and do not publish a routing row until
-  admission and a paid `/v1/workflows` proof produce retained quality media.
+  attention map, but the graph-only explicit-mask probe passed through
+  `mayhem provider parts admit` without a provider-local patch: request-carried
+  left/right mask PNGs were stacked with core `ImageBatch`, converted with
+  `ImageToMask`, and passed into `MultiTalkWav2VecEmbeds.ref_target_masks`.
+  Retained review artifact:
+  `openmayhem-multitalk-explicit-mask-reference-v0.2.141.mp4`;
+  media `832x480`, `25` fps, `89` frames, `3.56s`, H.264/AAC mono; SHA-256
+  `376f1e3dfca3d46368df141df1d10ae282e54796a13bc249e4dde061a6db9f00`;
+  inventory root
+  `a8f570b99f081570cca7957f05bc6529f35a730490c4249a17a2a48929e6579e`.
+  Do not publish a routing row until a signed catalog/canary update points
+  `video.lipsync` at that policy and a paid `/v1/workflows` proof produces
+  retained quality media.
 
 Use `scripts/verify-comfy-cheatsheet.py` whenever the signed parts index or
 Comfy cheatsheet changes:
