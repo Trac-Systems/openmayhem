@@ -28940,7 +28940,7 @@ fn provider_comfy_workflow_runtime_files(
             files.model_files.push(ComfyUiModelFile {
                 source,
                 model_subdir: comfy_part_record_model_subdir(&part.record)?,
-                model_path: safe_relative_comfy_model_path(&required.name)?,
+                model_path: comfy_part_record_reference_model_path(&part.record)?,
             });
         }
     }
@@ -96986,7 +96986,15 @@ status: linked
         fs::create_dir_all(&payload_dir).unwrap();
         let payload_path = payload_dir.join("payload.bin");
         fs::write(&payload_path, b"openmayhem comfy resident bytes").unwrap();
-        let record = test_comfy_part_record_for_payload("tiny-upscaler.bin", &payload_path, 8);
+        let mut record = test_comfy_part_record_for_payload(
+            "UMT5-XXL fp8 scaled (Wan text encoder)",
+            &payload_path,
+            8,
+        );
+        record.adapter.insert(
+            "file_path".to_owned(),
+            Value::from("split_files/text_encoders/tiny-upscaler.bin"),
+        );
         let record_path = source_dir.join("record.json");
         write_json_file(&record_path, &record).unwrap();
         admin_parts_build_index(&AdminPartsBuildIndexArgs {
@@ -97050,11 +97058,12 @@ status: linked
         );
         assert!(files.model_files[0].source.is_file());
 
-        model.workflow.as_mut().unwrap().parts[0].name = "mounted-upscaler.bin".to_owned();
+        model.workflow.as_mut().unwrap().parts[0].name =
+            "Mounted Upscaler (display name)".to_owned();
         let files = provider_comfy_workflow_runtime_files(&home, &model, 8).unwrap();
         assert_eq!(
             files.model_files[0].model_path,
-            PathBuf::from("mounted-upscaler.bin")
+            PathBuf::from("tiny-upscaler.bin")
         );
         let _ = fs::remove_dir_all(temp);
     }
