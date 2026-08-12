@@ -774,7 +774,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
 | `video.lipsync` | Comfy workflow, LongCat Avatar talking-video lipsync | D | paid technical proof passed; quality-fit gap for action anime |
-| `upscale.diffusion` | Comfy workflow, SeedVR2 diffusion upscale/restore | A/B | paid fiat proof passed; product review pending |
+| `upscale.diffusion` | Comfy workflow, SeedVR2 diffusion upscale/restore | A/B | toy paid proof passed; real-world paid quality proof pending |
 | `upscale.conv.le24mp` | Comfy workflow, standalone 4x image upscale | A/B | **live** |
 | `video.minimax_h3.r2v` | Comfy workflow, MiniMax H3 reference-media video with native audio | D | **live** |
 | `video.minimax_h3.t2v_i2v` | Comfy workflow, MiniMax H3 text/image-to-video with native audio | D | **live** |
