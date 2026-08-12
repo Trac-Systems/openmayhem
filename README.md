@@ -1088,6 +1088,12 @@ and retained artifact
 `openmayhem-seedvr2-upscale-diffusion-reference-v0.2.136.png`. It is not live
 product capacity until a paid `/v1/workflows` route proof passes.
 
+The `0.2.138` source release fixes Comfy workflow provider startup. Workflow
+providers with a persisted signed admission proof now advertise admission-backed
+modality health immediately instead of rerunning an expensive functional canary
+before their first room heartbeat. The Comfy runtime default device is `auto`;
+explicit `MAYHEM_COMFYUI_DEVICE=cpu` still forces CPU for hosts that need it.
+
 The `0.2.118` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the
 local ComfyUI runtime directory, canonicalizes integer-valued workflow JSON

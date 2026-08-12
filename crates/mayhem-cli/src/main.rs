@@ -82152,10 +82152,37 @@ fn provider_session_responder_with_modality_health(
     Vec<ProviderModalityHealthReport>,
 )> {
     let terms = provider_session_terms(ctx)?;
-    let cases = provider_modality_self_test_plan(ctx, ctx.canaries_dir)?;
     let mut responder = provider_session_responder(ctx)?;
+    if let Some(health) =
+        provider_workflow_admission_modality_health(ctx.selected, ctx.workflow_admission.as_ref())
+    {
+        ensure!(
+            responder.component_healthy(),
+            "provider engine became unhealthy during Comfy workflow admission startup"
+        );
+        return Ok((responder, health));
+    }
+    let cases = provider_modality_self_test_plan(ctx, ctx.canaries_dir)?;
     let health = provider_modality_self_test(ctx, &terms, responder.as_mut(), cases)?;
     Ok((responder, health))
+}
+
+fn provider_workflow_admission_modality_health(
+    selected: &ProviderCandidate,
+    admission: Option<&ProviderComfyAdmission>,
+) -> Option<Vec<ProviderModalityHealthReport>> {
+    let admission = admission?;
+    if selected.artifact.engine != "comfyui"
+        || !catalog_model_has_comfy_workflow_endpoint(&selected.model)
+    {
+        return None;
+    }
+    Some(vec![ProviderModalityHealthReport {
+        prompt_id: format!("workflow-admission:{}", admission.report.outcome_class),
+        modalities: selected.served_modalities.clone(),
+        engine: selected.artifact.engine.clone(),
+        ok: true,
+    }])
 }
 
 fn provider_canary_prompt_modalities(
@@ -112967,6 +112994,63 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(classes["image.custom.512"]["max_concurrent"], json!(3));
         assert_eq!(classes["image.custom.512"]["active"], json!(2));
         assert!(classes.get("image.workflow").is_none());
+    }
+
+    #[test]
+    fn comfy_workflow_startup_health_uses_persisted_admission() {
+        let root = "aa".repeat(32);
+        let catalog = test_catalog(&root);
+        let contract = test_contract(&root);
+        let mut artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
+        artifact.engine = "comfyui".to_owned();
+        let mut selected = ProviderCandidate {
+            enclave: contract.enclaves[0].clone(),
+            model: catalog.models[0].clone(),
+            artifact_name: "workflow-class".to_owned(),
+            artifact,
+            verdict: BackendVerdict {
+                backend: "comfyui".to_owned(),
+                status: VerdictStatus::FullOffload,
+                reason: None,
+                est_tok_s: None,
+                n_layers_gpu: None,
+                max_sessions: 1,
+                kv_cache_bytes_budget: 0,
+            },
+            price: contract.prices.first().cloned(),
+            served_ctx: 1,
+            served_modalities: vec!["image".to_owned(), "video".to_owned()],
+            served_specialities: BTreeMap::new(),
+            modality_capacities: test_modality_capacities("image"),
+            feasibility: ProviderCtxFeasibility::not_applicable(1, 0),
+            ctx_bracket_schedule: default_ctx_bracket_schedule(),
+        };
+        let admission = test_provider_comfy_admission("video.workflow", "comfyui-v0.30.1", 1);
+
+        assert!(
+            provider_workflow_admission_modality_health(&selected, Some(&admission)).is_none(),
+            "non-workflow catalog entries must still run their normal canaries"
+        );
+
+        selected.model.adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            )
+            .unwrap()];
+        let health = provider_workflow_admission_modality_health(&selected, Some(&admission))
+            .expect("Comfy workflow providers with admission should use admission-backed health");
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].prompt_id, "workflow-admission:video.workflow");
+        assert_eq!(health[0].modalities, vec!["image", "video"]);
+        assert_eq!(health[0].engine, "comfyui");
+        assert!(health[0].ok);
+
+        selected.artifact.engine = "llama.cpp".to_owned();
+        assert!(
+            provider_workflow_admission_modality_health(&selected, Some(&admission)).is_none(),
+            "non-Comfy artifacts must keep functional modality self-tests"
+        );
+        assert!(provider_workflow_admission_modality_health(&selected, None).is_none());
     }
 
     #[test]

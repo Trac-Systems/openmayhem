@@ -140,7 +140,7 @@ impl EngineBackend for ComfyUiBackend {
         let python = env::var_os(PYTHON_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("python3"));
-        let device = env::var(DEVICE_ENV).unwrap_or_else(|_| "cpu".to_owned());
+        let device = env::var(DEVICE_ENV).unwrap_or_else(|_| default_comfyui_device().to_owned());
         let socket_dir = short_socket_dir();
         let custom_node_whitelist = config
             .comfyui_custom_nodes
@@ -1165,6 +1165,10 @@ fn worker_stderr_text(tail: &Arc<Mutex<Vec<u8>>>) -> String {
         .unwrap_or_default()
 }
 
+fn default_comfyui_device() -> &'static str {
+    "auto"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1197,6 +1201,11 @@ mod tests {
                 .unwrap();
         }
         archive.finish().unwrap();
+    }
+
+    #[test]
+    fn comfyui_device_defaults_to_runtime_auto_selection() {
+        assert_eq!(default_comfyui_device(), "auto");
     }
 
     #[test]

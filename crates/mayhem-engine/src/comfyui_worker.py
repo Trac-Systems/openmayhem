@@ -253,7 +253,7 @@ def load(payload):
     runtime_root = Path(comfy_path(Path(payload["runtime_root"]).resolve()))
     base_dir = Path(comfy_path(Path(payload["base_dir"]).resolve()))
     socket_path = Path(comfy_path(Path(payload["socket_path"]).resolve()))
-    device = payload.get("device", "cpu")
+    device = payload.get("device", "auto")
     custom_node_whitelist = payload.get("custom_node_whitelist", [])
     for path in (base_dir / "input", base_dir / "output", base_dir / "temp", base_dir / "user"):
         path.mkdir(parents=True, exist_ok=True)
