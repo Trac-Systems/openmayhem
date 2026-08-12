@@ -248,15 +248,18 @@ function Get-LlamaCppFeatureArgs {
         [string]$TargetTriple = $(Get-TargetTriple)
     )
 
+    $Features = @($Features)
     Assert-LlamaCppFeaturePrereqs -Features $Features -TargetTriple $TargetTriple
+    $sourceFeatures = @("mayhem-cli/comfyui") + $Features
 
     if ($Features.Count -eq 0) {
         Write-Log "building llama.cpp CPU fallback; set MAYHEM_LLAMA_CPP_FEATURES=cuda or vulkan for GPU source builds"
-        return @()
+        Write-Log "building ComfyUI provider backend feature"
+        return @("--features", ($sourceFeatures -join ","))
     }
 
-    Write-Log ("building llama.cpp provider feature(s): " + ($Features -join ", "))
-    return @("--features", ($Features -join ","))
+    Write-Log ("building provider feature(s): " + ($sourceFeatures -join ", "))
+    return @("--features", ($sourceFeatures -join ","))
 }
 
 function Get-WindowsSourceBuildCargoArgs {

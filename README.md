@@ -1084,9 +1084,11 @@ rather than choreographed fighting action. Keep `video.lipsync` separate from
 general A/V action-video acceptance until a workflow proves convincing action,
 speech, and sync through `/v1/workflows`.
 
-The `0.2.140` source release keeps the `video.lipsync` catalog scoped to the
+The `0.2.141` source release keeps the `video.lipsync` catalog scoped to the
 existing technical proofs and fixes Comfy custom-node archive extraction to
-accept harmless tar PAX metadata while preserving unsafe-path rejection. The
+accept harmless tar PAX metadata while preserving unsafe-path rejection. Source
+installs now build the ComfyUI provider backend by default, so workflow providers
+do not need hidden cargo feature flags. The
 2026-08-12 InfiniteTalk retained copy
 `openmayhem-infinitetalk-anime-fight-lipsync-reference-v0.2.139.mp4` shows the
 bounded two-character anime-fight graph at `832x480`, `25` fps, `81` frames,

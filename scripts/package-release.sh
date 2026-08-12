@@ -2382,6 +2382,7 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
   cuda_library_dirs=""
   cuda_toolkit_root=""
   cargo_args=(build --release --workspace --bins)
+  cargo_args+=(--features mayhem-cli/comfyui)
   [[ "$SIGNED_RELEASE" == "1" ]] && cargo_args+=(--locked)
   if [[ "$TARGET_SET" -eq 1 ]]; then
     cargo_args+=(--target "$TARGET")

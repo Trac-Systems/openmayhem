@@ -1560,6 +1560,8 @@ install_from_source() {
 
   log "building release binaries from $SOURCE_DIR"
   cargo_args=(build --release --workspace --bins)
+  log "building ComfyUI provider backend feature"
+  cargo_args+=(--features mayhem-cli/comfyui)
   if [[ "$(uname -s)" == "Darwin" ]]; then
     requested_features="$(
       printf '%s' "${MAYHEM_LLAMA_CPP_FEATURES:-}" |

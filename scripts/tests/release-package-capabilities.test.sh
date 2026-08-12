@@ -95,6 +95,9 @@ grep -F 'linux_llama_cpp_features Linux "$target_arch" "$(uname -m)"' \
 grep -F 'cargo_args+=(--features "$llama_cpp_features")' \
   <<<"$release_build_block" >/dev/null ||
   fail "release packaging does not pass selected llama.cpp features to Cargo"
+grep -F 'cargo_args+=(--features mayhem-cli/comfyui)' \
+  <<<"$release_build_block" >/dev/null ||
+  fail "release packaging does not include the ComfyUI provider backend"
 grep -F 'export_llama_cpp_cuda_link_search "$cuda_library_dirs"' \
   <<<"$release_build_block" >/dev/null ||
   fail "release packaging does not expose validated CUDA libraries to rustc"

@@ -333,6 +333,9 @@ grep -F 'linux_llama_cpp_features Linux "$(uname -m)" "$(uname -m)"' \
 grep -F 'cargo_args+=(--features "$llama_cpp_features")' \
   <<<"$shell_source_build" >/dev/null ||
   fail "Unix source build does not pass selected llama.cpp features to Cargo"
+grep -F 'cargo_args+=(--features mayhem-cli/comfyui)' \
+  <<<"$shell_source_build" >/dev/null ||
+  fail "Unix source build does not include the ComfyUI provider backend"
 grep -F 'export CUDA_LIBRARY_PATH=' <<<"$shell_source_build" >/dev/null ||
   fail "Unix source build does not expose validated CUDA libraries to Cargo"
 grep -F 'export CUDA_PATH=' <<<"$shell_source_build" >/dev/null ||
