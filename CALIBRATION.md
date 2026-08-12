@@ -105,7 +105,7 @@ A Comfy workflow is calibrated only after all gates below pass:
   Spectrum reference/admission runs unless the combined resident set has fresh
   headroom evidence.
 - `video.minimax_h3.spectrum`: owner-approved optional calibration target as
-  of 2026-08-11. It must be handled as a distinct H3 audio-quality enhancer
+  of 2026-08-11. It must be handled as a distinct optional H3 enhancer
   lane: mirror and sign the Spectrum custom-node/runtime payload as a rootless
   `custom-node` `tar.gz` part with `adapter.comfy_custom_node_dir`, publish a
   bounded policy, run admission, and retain a paid `/v1/workflows` proof that
@@ -125,9 +125,14 @@ A Comfy workflow is calibrated only after all gates below pass:
   The signed dev catalog row now has a matching workflow-class canary proof:
   catalog hash `debf0574baf90c286e132a518986c99ddf2789890cd7b8edb7262c54694fc34a`,
   canary set `canary-minimax-h3-spectrum-workflow-launch-v1`, and endpoint
-  matrix `49` cases. Do not count it as product-ready public capacity until a
-  paid `/v1/workflows` proof shows a measurable speed/quality win over the
-  accepted base H3 lane.
+  matrix `49` cases. Paid fiat route proof passed through the `.31` sponsored
+  gateway on 2026-08-12 with retained artifact
+  `openmayhem-minimax-h3-spectrum-paid-v0.2.136.mp4`, session
+  `c51f1fe861e46a6ebe680f1c57670f2982f81a782db7a9ce93c384ad78af7e6f`,
+  BLAKE3 `25b0a156e76ad22653cee1037f6bc0fb64955e668bc5b3ecc3af39a4915ed8f2`,
+  media `896x512`, `24` fps, `5.167s`, H.264/AAC stereo. Do not count it as
+  product-ready public capacity until owner review confirms a measurable
+  speed/quality win over the accepted base H3 lane.
 - `video.heavy.le0_5mpf`: product-accepted for LTX A/V generation after paid
   `/v1/workflows` proofs with video and audio. It is not lipsync evidence.
 - `image.heavy.le1_2mp`: product-accepted for Krea base image generation after
