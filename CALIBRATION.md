@@ -158,6 +158,9 @@ action anime.
   (`-18.10` dB RMS Spectrum vs. `-18.34` dB RMS base H3), and the base H3
   visual proof is at least as clear. Keep Spectrum parked as an optional proven
   dev lane; do not count it as product-ready public capacity.
+- Next H3/Spectrum action: none on the critical path. Revisit Spectrum only if
+  a future quality review shows an audible or visual improvement that the base
+  H3 lane cannot provide.
 - `video.heavy.le0_5mpf`: product-accepted for LTX A/V generation after paid
   `/v1/workflows` proofs with video and audio. It is not lipsync evidence.
 - `image.heavy.le1_2mp`: product-accepted for Krea base image generation after
@@ -240,6 +243,16 @@ action anime.
   faces. Keep the anime action+voice proof on the accepted H3/LTX A/V lanes
   unless a new signed workflow demonstrates both action and lipsync through the
   paid route.
+  Current next candidate research: `MeiGen-AI/MultiTalk` and Kijai's
+  `ComfyUI-WanVideoWrapper` MultiTalk/FantasyTalking support are a better fit
+  for multi-character dialogue/action than more LongCat prompt tuning. MultiTalk
+  is described by its upstream as audio-driven multi-person conversational video
+  with interaction/cartoon support, while FantasyTalking is single-speaker
+  talking portrait/body-motion support. Neither MultiTalk nor FantasyTalking
+  parts are present in the current signed parts index; adding either requires
+  normal parts mirroring, signed records, workflow policy, admission, paid
+  `/v1/workflows` proof, and retained quality media. Do not use provider-local
+  WanVideoWrapper/FantasyTalking files as proof.
 
 Use `scripts/verify-comfy-cheatsheet.py` whenever the signed parts index or
 Comfy cheatsheet changes:

@@ -188,7 +188,9 @@ below. Current acceptance state:
   product lift: both clips have identical duration/frame specs, similar loudness
   (`-18.10` dB RMS Spectrum vs. `-18.34` dB RMS base H3), and the base H3
   visual proof is at least as clear. Keep Spectrum parked as an optional proven
-  dev lane; it is not product-accepted.
+  dev lane; it is not product-accepted. Spectrum is not blocked by a crash,
+  license issue, or billing issue; it is parked because the proof did not show
+  enough product lift over base H3 to justify required/public capacity.
 - `video.heavy.le0_5mpf`: accepted as an LTX A/V video lane after the paid
   `.70` gateway proofs listed below. This is not lipsync evidence.
 - `image.heavy.le17mp`: accepted after `.42` admission and a paid fiat
@@ -264,6 +266,18 @@ below. Current acceptance state:
   choreographed fighting action, so this remains a `video.lipsync` quality-fit
   gap and must not be counted as the general anime-action-with-dialogue product
   proof.
+- Next lipsync/action candidate: prioritize a signed MultiTalk/WanVideoWrapper
+  policy before more LongCat prompt tuning. `MeiGen-AI/MultiTalk` targets
+  audio-driven multi-person conversational video and explicitly covers
+  interaction/cartoon use cases; Kijai's `ComfyUI-WanVideoWrapper` exposes
+  MultiTalk/FantasyTalking support, but the wrapper is fast-moving and must be
+  pinned as a blessed custom-node/runtime part before public serving.
+  FantasyTalking alone is single-speaker talking portrait/body-motion support
+  and is a fallback for one-speaker avatar proof, not the best two-person anime
+  fight candidate. Current signed parts index does not contain MultiTalk,
+  FantasyTalking, or WanVideoWrapper custom-node records, so the next accepted
+  proof requires new mirrored HF parts, signed records, workflow policy,
+  admission, and paid `/v1/workflows` route evidence.
 
 ## Workflow Policy To Parts Matrix
 
@@ -542,6 +556,16 @@ Current runtime status:
   video+audio lipsync node but works best on clear frontal real-face videos and
   currently does not support anime/cartoon faces. Treat it as a future
   real-person lipsync candidate, not the action-anime acceptance path.
+- MultiTalk/FantasyTalking: not signed yet. Upstream research points to
+  MultiTalk for multi-person conversation/interactions and FantasyTalking for
+  single-speaker talking portraits with stronger body/head motion than classic
+  lipsync. Candidate parts to evaluate before any public row are a pinned
+  WanVideoWrapper custom-node archive, MultiTalk or FantasyTalking condition
+  weights, Wav2Vec2/TencentGameMate audio encoder as applicable, Wan I2V base
+  model, Wan VAE, and common Wan text/vision encoders already present only when
+  the exact file names and hashes match. All of these must be mirrored into
+  `TracNetwork/openmayhem-parts-index` and pulled with `provider parts pull/add`
+  before the proof counts.
 - `sync.so`/HeyGen API nodes: these are remote service nodes. They are not acceptable for local OpenMayhem provider proof unless a future catalog policy explicitly declares an external-service lane and its security/payment rules.
 
 LongCat policy requirements for `video.lipsync`:

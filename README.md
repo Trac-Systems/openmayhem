@@ -1098,7 +1098,8 @@ Follow-up review compared it with the accepted base H3 proof and found no
 measurable product lift: both clips have identical duration/frame specs, similar
 loudness (`-18.10` dB RMS Spectrum vs. `-18.34` dB RMS base H3), and the base
 H3 visual proof is at least as clear. Keep Spectrum parked as an optional proven
-dev lane; it is not live product capacity.
+dev lane; it is not live product capacity. This is a product-fit decision, not
+a crash, license, billing, or route-health issue.
 
 The `0.2.137` source release materializes the SeedVR2 diffusion
 upscale/restore lane (`upscale.diffusion`) as a signed dev policy using the
