@@ -27149,7 +27149,6 @@ fn safe_relative_comfy_model_path(path: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
-#[cfg(any(feature = "comfyui", test))]
 fn comfy_part_file_format_extension(file_format: &str) -> Result<&'static str> {
     match file_format.trim().to_ascii_lowercase().as_str() {
         "safetensors" => Ok("safetensors"),
@@ -27215,7 +27214,6 @@ fn comfy_part_draft_custom_node_dir(draft: &mayhem_proto::ComfyPartDraft) -> Res
     comfy_part_custom_node_dir(&draft.name, &draft.adapter)
 }
 
-#[cfg(any(feature = "comfyui", test))]
 fn comfy_part_record_reference_model_path(
     record: &mayhem_proto::ComfyPartRecord,
 ) -> Result<PathBuf> {

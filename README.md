@@ -1041,12 +1041,13 @@ can be mirrored from immutable `/resolve/<40-hex>/...` sources instead of mutabl
 cheatsheet; H3 still requires parts mirroring, workflow policy publication, and
 a paid `/v1/workflows` quality proof before public serving.
 
-The `0.2.134` source release adds LongCat Avatar 1.5 as the active
+The `0.2.135` source release adds LongCat Avatar 1.5 as the active
 `video.lipsync` dev row with signed v17 parts, request-carried image/audio
 `input_files`, and a workflow-class `video_av_fingerprint` canary from retained
 reference media. It also mounts Comfy model files from the signed part record
 path rather than the policy display name, so display labels such as UMT5 do not
-break provider startup. Krea base, Krea+4x, LTX A/V, MiniMax H3, and standalone
+break provider startup, and keeps Comfy part record path derivation available in
+default source builds. Krea base, Krea+4x, LTX A/V, MiniMax H3, and standalone
 upscale have paid-route acceptance evidence; LongCat still needs the paid
 `/v1/workflows` product proof before being treated as accepted public capacity.
 
