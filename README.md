@@ -1048,8 +1048,13 @@ reference media. It also mounts Comfy model files from the signed part record
 path rather than the policy display name, so display labels such as UMT5 do not
 break provider startup, and keeps Comfy part record path derivation available in
 default source builds. Krea base, Krea+4x, LTX A/V, MiniMax H3, and standalone
-upscale have paid-route acceptance evidence; LongCat still needs the paid
-`/v1/workflows` product proof before being treated as accepted public capacity.
+upscale have paid-route acceptance evidence. LongCat paid fiat `/v1/workflows`
+proof passed through the `.31` proof gateway against the `.42` provider with
+retained artifact `openmayhem-longcat-paid-anime-fight-v0.2.135.mp4`, session
+`33fa30144eeb90c5086716231cffa9c6a0ad49e722b3d064b336760e2febae22`, and BLAKE3
+`acafe1209d34b02e2a97f045f507aed762a69fa71dc807521f7829ba10e9a2d3`; owner
+quality review for speech intelligibility and sync is still required before
+public product acceptance.
 
 The `0.2.118` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the

@@ -155,10 +155,18 @@ A Comfy workflow is calibrated only after all gates below pass:
   graph SHA-256
   `7f6df53d5659f072ee4205765d6c78c7f7dc172273ca1d8ff0b19c1ad2f0431c`,
   required memory `32.12GiB`, media `832x480`, `25` fps, `100` frames, `4s`.
-  This closes the technical reference-admission and catalog-canary gate. It is
-  not product-ready public capacity until a paid `/v1/workflows` proof passes
-  media review with intelligible speech and visible mouth sync; action motion
-  remains limited to lipsync/talking-video, not full anime choreography.
+  Paid fiat `/v1/workflows` proof passed through the `.31` proof gateway on
+  2026-08-12 with retained artifact
+  `openmayhem-longcat-paid-anime-fight-v0.2.135.mp4`, session
+  `33fa30144eeb90c5086716231cffa9c6a0ad49e722b3d064b336760e2febae22`, BLAKE3
+  `acafe1209d34b02e2a97f045f507aed762a69fa71dc807521f7829ba10e9a2d3`, and
+  media `832x480`, `25` fps, `100` frames, `4.000s`, H.264/AAC. This closes
+  the technical reference-admission, catalog-canary, and paid-route gates. It
+  is not product-ready public capacity until owner review confirms
+  intelligible speech and visible mouth sync; action motion remains limited to
+  lipsync/talking-video, not full anime choreography. The proof request had to
+  use `720x415` reference input media because an `832x480` input image exceeds
+  the signed `720x480` input-media cap and is correctly held before dispatch.
 
 Use `scripts/verify-comfy-cheatsheet.py` whenever the signed parts index or
 Comfy cheatsheet changes:
