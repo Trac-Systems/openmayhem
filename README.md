@@ -774,7 +774,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
 | `video.lipsync` | Comfy workflow, LongCat Avatar talking-video lipsync | D | paid technical proof passed; quality-fit gap for action anime |
-| `upscale.diffusion` | Comfy workflow, SeedVR2 diffusion upscale/restore | A/B | toy paid proof passed; real-world paid quality proof pending |
+| `upscale.diffusion` | Comfy workflow, SeedVR2 diffusion upscale/restore | A/B | **live** |
 | `upscale.conv.le24mp` | Comfy workflow, standalone 4x image upscale | A/B | **live** |
 | `video.minimax_h3.r2v` | Comfy workflow, MiniMax H3 reference-media video with native audio | D | **live** |
 | `video.minimax_h3.t2v_i2v` | Comfy workflow, MiniMax H3 text/image-to-video with native audio | D | **live** |
@@ -1127,7 +1127,14 @@ Follow-up real-world SeedVR2 admission on `.42` produced
 `openmayhem-seedvr2-realworld-upscale-admission-v0.2.138.png` from the same
 signed parts and graph, output SHA-256
 `9fe0f803f4699b882406d9271c1eafbd2f7bb415bfca7b173eb4669afd8c3d18`.
-The real-world paid-route proof is pending buyer-wallet funding.
+The real-world paid-route proof passed on 2026-08-12 through the `.31` v0.2.139
+proof gateway against the `.70` provider using the retained 128x72 anime/action
+source frame. Retained artifact:
+`openmayhem-seedvr2-realworld-upscale-paid-v0.2.139.png`, session
+`be95c4a70006f5210ae9b8d63d0d185e33067525705c33c2776d1b9a60c5883a`, BLAKE3
+`9c5dd50d7abf347c528ec36914506448670a4f7087ac32c3692ac5ed0be380d4`, SHA-256
+`9fe0f803f4699b882406d9271c1eafbd2f7bb415bfca7b173eb4669afd8c3d18`, media
+`512x288` PNG, usage `1` `megapixel_step`.
 
 The `0.2.138` source release fixes Comfy workflow provider startup. Workflow
 providers with a persisted signed admission proof now advertise admission-backed

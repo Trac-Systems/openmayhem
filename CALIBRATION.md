@@ -89,10 +89,10 @@ A Comfy workflow is calibrated only after all gates below pass:
 Current catalog count: nine signed workflow rows. Product-accepted rows are
 `video.minimax_h3.t2v_i2v`, `video.minimax_h3.r2v`,
 `video.heavy.le0_5mpf`, `image.heavy.le1_2mp`, `image.heavy.le17mp`, and
-`upscale.conv.le24mp`. `video.minimax_h3.spectrum` is proven but parked as an
-optional enhancer with no measured product lift. `upscale.diffusion` needs the
-real-world paid-route proof after buyer-wallet funding. `video.lipsync` has
-technical LongCat proof but remains a quality-fit gap for action anime.
+`upscale.conv.le24mp`, and `upscale.diffusion`. `video.minimax_h3.spectrum` is
+proven but parked as an optional enhancer with no measured product lift.
+`video.lipsync` has technical LongCat proof but remains a quality-fit gap for
+action anime.
 
 - `video.minimax_h3.t2v_i2v`: product-accepted for the base H3 T2V/I2V lane
   after signed v12 parts, admission, live provider route, and retained paid
@@ -200,7 +200,17 @@ technical LongCat proof but remains a quality-fit gap for action anime.
   `22895752f732ddfeb17f3aaa93fbad6b3e2bf60a9e7b9c93c7bcadd3140d1dfb`,
   output SHA-256
   `e23ce117ba5325919c642a531f69cea09dd9b36a0c27fdcb41ca14790730d9ff`,
-  media `256x256` PNG.
+  media `256x256` PNG. The real-world paid-route proof passed on 2026-08-12
+  through the `.31` v0.2.139 proof gateway against the `.70` provider using the
+  retained 128x72 anime/action source frame. Retained artifact:
+  `openmayhem-seedvr2-realworld-upscale-paid-v0.2.139.png`, session
+  `be95c4a70006f5210ae9b8d63d0d185e33067525705c33c2776d1b9a60c5883a`,
+  usage `1` `megapixel_step`, BLAKE3
+  `9c5dd50d7abf347c528ec36914506448670a4f7087ac32c3692ac5ed0be380d4`,
+  output SHA-256
+  `9fe0f803f4699b882406d9271c1eafbd2f7bb415bfca7b173eb4669afd8c3d18`,
+  media `512x288` PNG. Product review accepted this as the quality proof for
+  the bounded SeedVR2 diffusion upscale/restore lane.
 - `video.lipsync`: technical InfiniteTalk proof exists but product quality is
   not accepted. Do not present it as the solution for anime action video with
   voice. LongCat Video Avatar 1.5 now has a dev catalog row, signed v17 parts,
