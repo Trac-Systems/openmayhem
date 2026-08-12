@@ -308,6 +308,9 @@ v0.2.126 with retained artifact
 `24` fps, AAC audio, usage `124` `megapixel_step`, session
 `a938e5efd7ddba9a610dbf16723d7a6da62c6e6f8c9dfe924f4765c0111ba81c`, and
 artifact BLAKE3 `19f92129c62ef352a2460a1a3d8654d957672fa1ae4cf0c138b3fdaea468cbfd`.
+Treat this as the accepted anime fighting action plus native voice/sound proof,
+not as exact lipsync evidence. Exact mouth-sync stays scoped to the separate
+`video.lipsync` lane.
 No local cache bypasses or unanchored Comfy payloads are acceptable for future
 H3 proofs.
 

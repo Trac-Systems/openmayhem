@@ -1010,7 +1010,9 @@ proofs must not be replaced by a direct Comfy run.
 MiniMax H3 REF2VA/reference-media video (`video.minimax_h3.r2v`) is
 product-accepted against parts-index v13. Its policy requires request-carried
 reference media through bounded `/v1/workflows` `input_files`; retained proof
-artifact: `openmayhem-minimax-h3-r2v-paid-proof-v0.2.126.mp4`.
+artifact: `openmayhem-minimax-h3-r2v-paid-proof-v0.2.126.mp4`. This is the
+accepted Comfy proof lane for anime fighting action with native voice and sound,
+not a lipsync/talking-head proof.
 
 Krea 2 Turbo base image generation (`image.heavy.le1_2mp`) and Krea 2 Turbo
 with signed 4x upscaling (`image.heavy.le17mp`) are product-accepted after

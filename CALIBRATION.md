@@ -103,6 +103,9 @@ A Comfy workflow is calibrated only after all gates below pass:
   `896x512`, `124` frames at `24` fps with AAC audio, session
   `a938e5efd7ddba9a610dbf16723d7a6da62c6e6f8c9dfe924f4765c0111ba81c`, BLAKE3
   `19f92129c62ef352a2460a1a3d8654d957672fa1ae4cf0c138b3fdaea468cbfd`.
+  This is the accepted proof lane for anime fighting action with native voice
+  and sound. Do not confuse it with lipsync/talking-head proof; exact mouth-sync
+  remains a separate `video.lipsync` quality requirement.
 - H3 providers on GB10/Spark-class unified-memory hosts must be started
   sequentially with explicit reserve settings. The accepted `.70` T2V provider
   uses `--memory-reserve 15GB`; the default percentage reserve can falsely
