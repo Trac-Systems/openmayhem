@@ -28263,7 +28263,7 @@
           },
           {
             "part_id": "720ea5ea7b9de57ca87b403856b0a7e42c96d1f1176ff886726ab602b6923709",
-            "name": "UMT5-XXL fp8 scaled (Wan text encoder)",
+            "name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
             "type": "text-encoder",
             "sha256": "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68"
           },
