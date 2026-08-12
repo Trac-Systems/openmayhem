@@ -179,18 +179,18 @@ A Comfy workflow is calibrated only after all gates below pass:
   graph SHA-256
   `7f6df53d5659f072ee4205765d6c78c7f7dc172273ca1d8ff0b19c1ad2f0431c`,
   required memory `32.12GiB`, media `832x480`, `25` fps, `100` frames, `4s`.
-  Paid fiat `/v1/workflows` proof passed through the `.31` proof gateway on
-  2026-08-12 with retained artifact
-  `openmayhem-longcat-paid-anime-fight-v0.2.135.mp4`, session
-  `33fa30144eeb90c5086716231cffa9c6a0ad49e722b3d064b336760e2febae22`, BLAKE3
-  `acafe1209d34b02e2a97f045f507aed762a69fa71dc807521f7829ba10e9a2d3`, and
-  media `832x480`, `25` fps, `100` frames, `4.000s`, H.264/AAC. This closes
-  the technical reference-admission, catalog-canary, and paid-route gates. It
-  is not product-ready public capacity until owner review confirms
-  intelligible speech and visible mouth sync; action motion remains limited to
-  lipsync/talking-video, not full anime choreography. The proof request had to
-  use `720x415` reference input media because an `832x480` input image exceeds
-  the signed `720x480` input-media cap and is correctly held before dispatch.
+  Paid fiat `/v1/workflows` proof passed through a funded gateway against the
+  `.42` provider on 2026-08-12 after the admission-backed startup fix. Retained
+  artifact `openmayhem-longcat-paid-anime-fight-v0.2.138.mp4`, session
+  `76701a2e54769c2a40b071f5902f0c8e305cfc68374766cbff516078602475b8`,
+  BLAKE3 `e74704d5deec174ac2a53e70db009003986211d6ec0fbb2ac4242f77bd7137f6`,
+  media `768x512`, `25` fps, `4.800s`, H.264/AAC. This closes the technical
+  reference-admission, catalog-canary, and paid-route gates. It is not
+  product-ready public capacity until owner review confirms intelligible speech
+  and visible mouth sync; the current paid proof is mostly a two-character
+  face-off/dialogue shot, not full anime choreography. The proof request had to
+  use `720x480`-bounded reference input media because larger input images exceed
+  the signed input-media cap and are correctly held before dispatch.
 
 Use `scripts/verify-comfy-cheatsheet.py` whenever the signed parts index or
 Comfy cheatsheet changes:
