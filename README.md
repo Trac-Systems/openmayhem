@@ -1057,8 +1057,8 @@ retained artifact `openmayhem-longcat-paid-anime-fight-v0.2.135.mp4`, session
 quality review for speech intelligibility and sync is still required before
 public product acceptance.
 
-The current signed catalog also materializes the optional MiniMax H3 Spectrum
-workflow lane (`video.minimax_h3.spectrum`) as a dev policy with a
+The `0.2.136` source release materializes the optional MiniMax H3 Spectrum
+workflow lane (`video.minimax_h3.spectrum`) as a signed dev policy with a
 workflow-class canary proof. Catalog verification passes at hash
 `debf0574baf90c286e132a518986c99ddf2789890cd7b8edb7262c54694fc34a` with
 canary set `canary-minimax-h3-spectrum-workflow-launch-v1` and a 49-case
