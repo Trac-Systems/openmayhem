@@ -767,7 +767,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 | `upscale.conv.le24mp` | Comfy workflow, standalone 4x image upscale | A/B | **live** |
 | `video.minimax_h3.r2v` | Comfy workflow, MiniMax H3 reference-media video with native audio | D | **live** |
 | `video.minimax_h3.t2v_i2v` | Comfy workflow, MiniMax H3 text/image-to-video with native audio | D | **live** |
-| `video.minimax_h3.spectrum` | Comfy workflow, optional MiniMax H3 Spectrum enhancer lane | D | signed dev policy; paid proof pending |
+| `video.minimax_h3.spectrum` | Comfy workflow, optional MiniMax H3 Spectrum enhancer lane | D | signed dev policy; paid fiat proof passed; owner benefit review pending |
 | `huihui-ai/Huihui-Agents-A1-abliterated` | Multimodal LLM, vision/video input, tools, uncensored, 262K ctx | C | **live** |
 | `ResembleAI/chatterbox` | TTS + zero-shot voice cloning | A/B | **live** |
 | `SulphurAI/Sulphur-2-base` | Video with synchronized audio, uncensored | C/D | **live** |
@@ -1062,9 +1062,13 @@ workflow lane (`video.minimax_h3.spectrum`) as a signed dev policy with a
 workflow-class canary proof. Catalog verification passes at hash
 `debf0574baf90c286e132a518986c99ddf2789890cd7b8edb7262c54694fc34a` with
 canary set `canary-minimax-h3-spectrum-workflow-launch-v1` and a 49-case
-workflow endpoint matrix. It is not live product capacity until a paid
-`/v1/workflows` proof demonstrates a measurable speed/quality benefit over the
-accepted base H3 lane.
+workflow endpoint matrix. A paid fiat `/v1/workflows` route proof passed
+through the `.31` sponsored gateway on 2026-08-12 with retained artifact
+`openmayhem-minimax-h3-spectrum-paid-v0.2.136.mp4`, session
+`c51f1fe861e46a6ebe680f1c57670f2982f81a782db7a9ce93c384ad78af7e6f`, and
+BLAKE3 `25b0a156e76ad22653cee1037f6bc0fb64955e668bc5b3ecc3af39a4915ed8f2`.
+It is not live product capacity until owner review confirms a measurable
+speed/quality benefit over the accepted base H3 lane.
 
 The `0.2.118` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the
