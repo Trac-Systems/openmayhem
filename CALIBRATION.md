@@ -86,6 +86,14 @@ A Comfy workflow is calibrated only after all gates below pass:
 
 ## Current Comfy Evidence
 
+Current catalog count: nine signed workflow rows. Product-accepted rows are
+`video.minimax_h3.t2v_i2v`, `video.minimax_h3.r2v`,
+`video.heavy.le0_5mpf`, `image.heavy.le1_2mp`, `image.heavy.le17mp`, and
+`upscale.conv.le24mp`. `video.minimax_h3.spectrum` is proven but parked as an
+optional enhancer with no measured product lift. `upscale.diffusion` needs the
+real-world paid-route proof after buyer-wallet funding. `video.lipsync` has
+technical LongCat proof but remains a quality-fit gap for action anime.
+
 - `video.minimax_h3.t2v_i2v`: product-accepted for the base H3 T2V/I2V lane
   after signed v12 parts, admission, live provider route, and retained paid
   `/v1/workflows` anime fight proofs through the `.31` sponsored gateway. The

@@ -157,11 +157,13 @@ A Comfy calibration is not complete until all of these gates pass:
 
 ## Active Workflow Calibration Queue
 
-The signed catalog currently exposes nine public/dev workflow rows. Optional
-workflow lanes are tracked separately so they do not block already accepted
-lanes, but once selected they must pass the same research, signed-parts,
-policy, admission, paid-route, and retained media proof gates. The dev
-`video.lipsync` canary/policy note remains below. Current acceptance state:
+The signed catalog currently exposes nine public/dev workflow rows:
+six product-accepted lanes, one optional parked H3 enhancer, and two lanes that
+still have bounded quality/funding gaps. Optional workflow lanes are tracked
+separately so they do not block already accepted lanes, but once selected they
+must pass the same research, signed-parts, policy, admission, paid-route, and
+retained media proof gates. The dev `video.lipsync` canary/policy note remains
+below. Current acceptance state:
 
 - `video.minimax_h3.t2v_i2v`: accepted for the base H3 T2V/I2V lane after
   `.70` admission and paid TNK `/v1/workflows` proofs with inspected anime
