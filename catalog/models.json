@@ -25665,6 +25665,582 @@
       }
     },
     {
+      "model_id": "upscale.diffusion",
+      "min_app_version": "0.2.126",
+      "model_class": "workflow",
+      "family": "comfy-upscale-diffusion",
+      "params_b": 3,
+      "tier": "dev",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "publisher_key": "huggingface-repo",
+          "repo": "TracNetwork/openmayhem-parts-index",
+          "revision": "0c368cb7de7bce50223ac01c936207b523b0a774"
+        },
+        "conversion": [
+          {
+            "tool": "comfy-parts-index",
+            "method": "signed-seedvr2-3b-int8-convrot-diffusion-upscale-policy",
+            "input_sha256": "c3dec8bcc5916843a8a858572970597462e1f2dc598d6dfd818f6cd40f53a157",
+            "output_sha256": "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1"
+          }
+        ],
+        "license": "Apache-2.0",
+        "license_sha256": "8e873a5d1a1f28a5f20af74be3a2c5e1ac9f638c3dfec07f1783b18dbaf6f169"
+      },
+      "artifacts": {
+        "workflow-class": {
+          "engine": "comfyui",
+          "source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "TracNetwork/openmayhem-parts-index",
+            "revision": "0c368cb7de7bce50223ac01c936207b523b0a774"
+          },
+          "path": "comfy/outcome-classes/v1/upscale.diffusion.json",
+          "artifact_root": "154230ff74498819f644453a01900400ee1265307b435dd7b2e4406635421707",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 510,
+          "source_sha256": "6fc78e03037c87acf2f88b51da5b0615f0a8ec0cef0f3782751bdf07b1d96575",
+          "download_check": false,
+          "notes": "Signed Comfy outcome-class definition for SeedVR2 diffusion upscale/restore providers; concrete SeedVR2 payload bytes are required through the workflow parts inventory."
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": false,
+        "ctx_max": 1,
+        "vision": false,
+        "image": true,
+        "video": false,
+        "audio": false,
+        "output_modality": "image",
+        "output_modalities": [
+          "image"
+        ],
+        "max_image_width": 4096,
+        "max_image_height": 4096,
+        "max_image_steps": 8
+      },
+      "requirements": {
+        "min_ram_gb": 32,
+        "min_vram_gb_full_offload": 10,
+        "cpu_flags": [],
+        "backends": [
+          "comfyui"
+        ]
+      },
+      "adapter": {
+        "endpoint_families": [
+          {
+            "family": "mayhem_comfy_workflows",
+            "request_attributes": [
+              "model",
+              "workflow",
+              "runtime_id",
+              "outcome_class",
+              "timeout_ms",
+              "response_format",
+              "input_files",
+              "user"
+            ],
+            "required_request_attributes": [
+              "model",
+              "workflow",
+              "input_files"
+            ],
+            "response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "request_attribute_specs": {
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "calibration_values": [
+                  "$MODEL"
+                ]
+              },
+              "outcome_class": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "upscale.diffusion"
+                ]
+              },
+              "response_format": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "artifact",
+                "enum_values": [
+                  "artifact",
+                  "json"
+                ],
+                "calibration_values": [
+                  "artifact",
+                  "json"
+                ]
+              },
+              "runtime_id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "comfyui-v0.30.1"
+                ]
+              },
+              "timeout_ms": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 300000,
+                "minimum": 1000,
+                "maximum": 900000,
+                "calibration_values": [
+                  300000
+                ]
+              },
+              "user": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 512,
+                "calibration_values": [
+                  "mayhem-calibration-user"
+                ]
+              },
+              "workflow": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "1": {
+                      "class_type": "LoadImage",
+                      "inputs": {
+                        "image": "inputs/upscale-source.png"
+                      }
+                    },
+                    "2": {
+                      "class_type": "JoinImageWithAlpha",
+                      "inputs": {
+                        "image": [
+                          "1",
+                          0
+                        ],
+                        "alpha": [
+                          "1",
+                          1
+                        ]
+                      }
+                    },
+                    "3": {
+                      "class_type": "ResizeImageMaskNode",
+                      "inputs": {
+                        "input": [
+                          "2",
+                          0
+                        ],
+                        "resize_type": "scale by multiplier",
+                        "resize_type.multiplier": 4,
+                        "scale_method": "lanczos"
+                      }
+                    },
+                    "4": {
+                      "class_type": "VAELoader",
+                      "inputs": {
+                        "vae_name": "seedvr2_ema_vae_fp16.safetensors"
+                      }
+                    },
+                    "5": {
+                      "class_type": "UNETLoader",
+                      "inputs": {
+                        "unet_name": "seedvr2_3b_int8_convrot.safetensors",
+                        "weight_dtype": "default"
+                      }
+                    },
+                    "6": {
+                      "class_type": "SeedVR2Preprocess",
+                      "inputs": {
+                        "resized_images": [
+                          "3",
+                          0
+                        ]
+                      }
+                    },
+                    "7": {
+                      "class_type": "VAEEncodeTiled",
+                      "inputs": {
+                        "pixels": [
+                          "6",
+                          0
+                        ],
+                        "vae": [
+                          "4",
+                          0
+                        ],
+                        "tile_size": 512,
+                        "overlap": 128,
+                        "temporal_size": 4096,
+                        "temporal_overlap": 8
+                      }
+                    },
+                    "8": {
+                      "class_type": "SeedVR2Conditioning",
+                      "inputs": {
+                        "model": [
+                          "5",
+                          0
+                        ],
+                        "vae_conditioning": [
+                          "7",
+                          0
+                        ]
+                      }
+                    },
+                    "9": {
+                      "class_type": "KSampler",
+                      "inputs": {
+                        "seed": 959948902156062,
+                        "steps": 1,
+                        "cfg": 1,
+                        "sampler_name": "euler",
+                        "scheduler": "simple",
+                        "denoise": 1,
+                        "model": [
+                          "5",
+                          0
+                        ],
+                        "positive": [
+                          "8",
+                          0
+                        ],
+                        "negative": [
+                          "8",
+                          1
+                        ],
+                        "latent_image": [
+                          "7",
+                          0
+                        ]
+                      }
+                    },
+                    "10": {
+                      "class_type": "VAEDecodeTiled",
+                      "inputs": {
+                        "samples": [
+                          "9",
+                          0
+                        ],
+                        "vae": [
+                          "4",
+                          0
+                        ],
+                        "tile_size": 512,
+                        "overlap": 128,
+                        "temporal_size": 4096,
+                        "temporal_overlap": 8
+                      }
+                    },
+                    "11": {
+                      "class_type": "SeedVR2PostProcessing",
+                      "inputs": {
+                        "images": [
+                          "10",
+                          0
+                        ],
+                        "original_resized_images": [
+                          "3",
+                          0
+                        ],
+                        "color_correction_method": "none"
+                      }
+                    },
+                    "12": {
+                      "class_type": "SaveImage",
+                      "inputs": {
+                        "filename_prefix": "mayhem-seedvr2-upscale",
+                        "images": [
+                          "11",
+                          0
+                        ]
+                      }
+                    }
+                  }
+                ]
+              },
+              "input_files": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 1,
+                "max_items": 4,
+                "calibration_values": [
+                  [
+                    {
+                      "filename": "inputs/upscale-source.png",
+                      "kind": "image",
+                      "content_type": "image/png",
+                      "encoding": "base64",
+                      "data": "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAQKADAAQAAAABAAAAQAAAAABGUUKwAAACOElEQVRoBdWavVEDMRBGzwwlXO7EFUDigIgK6ISEMiiGCogIiKjAiYkdkDjnmxEj5D39rKTVeVczHks63eo9aQ9kjzfn889ks2y3O4Df2ISfHL1VAU9vUiCktydA6I/Hg6VnYElvaQei9GYEUvQQuMUrWu6fv6P963ee3h7DSZH3YVP7M5Cnh4lqgSK9agEOvV4BQj8/vYd5H9Y1phCfXuMOVNGrE6il1yXQQK9IoI1+DYHP0wumyZdmeoRNHiXyU+avEuiwuZ9fyb099PICISsBdU03wGt00iOm5P+BIr1XciP76SUF+PROQ4ReTKCWfvfx5XcDlcxJIRwWrQuk0BXpoSQgEF2YVCdZ+8PDXWoks79XoGr5o/RVEZZWvQLLiKmeKH1qML9/JYFB9PBcQ2Acfa8AJ3059Jw4qaTq2gF/IkhF59Dj3mKcVHz0dwlk4uISkz4fpHh1lMA69NAbIrAavYDAMn1r6ZcRimkTDhDegVr6EKWtLiDgl7CB3t/bRo+7BAQQBRxXoRcTIJ9OOGfM/rV3myawA1ekh0PvtxKEHp+t9tOUORpILbxb/l6BJb2LG1JCJmz6iaUq7SmUoidkQ+kxV6MAk57IjGi2COihb9kBVfTVAtro6wQU0lcI6KTnCqilZwlopi8LKKcvCOinzwmYoE8KkN/n9Hx/jzmGlshxmtCT3+cMpWkITs9CtughfCFgjv5CwCL9v4BR+j8Bu/QQ2MzzjDdflP/N8Zy+cvEQm6OHxi9ag+6VHvlgmwAAAABJRU5ErkJggg=="
+                    }
+                  ]
+                ]
+              }
+            },
+            "response_attribute_specs": {
+              "artifacts": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 0,
+                "max_items": 1000000,
+                "calibration_values": [
+                  []
+                ]
+              },
+              "id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "mayhem": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "object": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "progress": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 0,
+                "maximum": 18446744073709552000,
+                "calibration_values": [
+                  1
+                ]
+              },
+              "status": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "usage": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              }
+            },
+            "interaction_groups": []
+          }
+        ],
+        "chat_template_id": "generic_chatml",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "preserve",
+        "modality_set": [
+          "image"
+        ]
+      },
+      "modality_assessment": {
+        "detected": [
+          "image"
+        ],
+        "evidence": [
+          "Signed SeedVR2 3B int8 convrot diffusion model and SeedVR2 VAE parts from the OpenMayhem parts index; workflow uses request-bound image input_files and official SeedVR2 Comfy nodes."
+        ],
+        "calibrated_fingerprints": {},
+        "resource_profiles": {
+          "workflow-class": {
+            "image": {
+              "unit": "pixel",
+              "measurement_source": "seedvr2_3b_int8_convrot_diffusion_upscale_policy_live_admission_2026-08-12",
+              "max_item_bytes": 268435456,
+              "max_item_units": 17000000,
+              "measured_item_bytes": 268435456,
+              "measured_item_units": 17000000,
+              "measured_working_set_bytes": 12884901888,
+              "calibration_baseline_memory_bytes": 4294967296,
+              "calibration_peak_memory_bytes": 17179869184,
+              "calibration_f13_budget_bytes": 21474836480,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            }
+          }
+        }
+      },
+      "speciality_assessment": {
+        "detected": [],
+        "evidence": [
+          "No endpoint speciality is advertised for the signed SeedVR2 diffusion upscaler workflow class."
+        ],
+        "unsupported": {},
+        "calibrated": {}
+      },
+      "sampling": {
+        "temperature": 1,
+        "top_p": 1
+      },
+      "workflow": {
+        "whitelisted_nodes": [
+          "LoadImage",
+          "JoinImageWithAlpha",
+          "ResizeImageMaskNode",
+          "VAELoader",
+          "UNETLoader",
+          "SeedVR2Preprocess",
+          "VAEEncodeTiled",
+          "SeedVR2Conditioning",
+          "KSampler",
+          "VAEDecodeTiled",
+          "SeedVR2PostProcessing",
+          "SaveImage"
+        ],
+        "parts": [
+          {
+            "part_id": "e2a27b04c8c7244829fc5fbe3281cf7d29c7f65ef315fbb97386a66e2b3da7c7",
+            "name": "seedvr2_3b_int8_convrot.safetensors",
+            "type": "video-model",
+            "sha256": "c3dec8bcc5916843a8a858572970597462e1f2dc598d6dfd818f6cd40f53a157"
+          },
+          {
+            "part_id": "63e6908333939636708d0661208d534237a117d1a6a36f4c3544c1cff40be6a1",
+            "name": "seedvr2_ema_vae_fp16.safetensors",
+            "type": "vae",
+            "sha256": "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1"
+          }
+        ],
+        "runtime_id": "comfyui-v0.30.1",
+        "outcome_class": "upscale.diffusion",
+        "outcome_class_definition": {
+          "schema": "openmayhem.comfy.outcome-class-grid.v1",
+          "grid_version": 1,
+          "source": "docs/comfy/PRICING-GRID-2026-08-04.md",
+          "class_id": "upscale.diffusion",
+          "title": "Diffusion upscale/restore",
+          "media": "image",
+          "lane": "upscale-diffusion",
+          "pricing_unit": "megapixel_step",
+          "rate_map": [
+            {
+              "unit": "megapixel_step",
+              "per_unit_au": "180000000000000000",
+              "granularity": 1000
+            }
+          ],
+          "per_req_au": "0",
+          "min_session_au": "0",
+          "caps": {
+            "max_output_megapixels": "17",
+            "max_steps": 60,
+            "priority_scalars": {
+              "economy": "0.5",
+              "standard": "1",
+              "priority": "2"
+            }
+          }
+        },
+        "pricing_unit": "megapixel_step",
+        "inventory_root": "f501d4d7340fe2d891560aef0192adb28c0bd8e91c77b36e4ccc0e16b33fd15b",
+        "max_nodes": 16,
+        "max_width": 4096,
+        "max_height": 4096,
+        "max_frames": 1,
+        "max_duration_seconds": 1,
+        "max_steps": 8,
+        "max_artifacts": 1
+      },
+      "canary": {
+        "set_id": "canary-seedvr2-upscale-diffusion-workflow-launch-v1",
+        "match_min": 0.9,
+        "verification_method": "seed_perceptual_hash",
+        "verification_tolerance_bps": 500,
+        "fingerprints": {},
+        "token_prefixes": {},
+        "perceptual_hashes": {
+          "workflow-class": {
+            "seedvr2-upscale-tiny-source-seed7": "fe8181818181817f"
+          }
+        },
+        "embedding_vectors": {},
+        "transcripts": {},
+        "audio_fingerprints": {},
+        "video_fingerprints": {}
+      },
+      "price_ref_au": {
+        "denom": "au_usd",
+        "ver": 1,
+        "rate_map": [
+          {
+            "unit": "megapixel_step",
+            "per_unit_au": "180000000000000000",
+            "granularity": 1000
+          }
+        ],
+        "per_req_au": "0",
+        "min_session_au": "0"
+      }
+    },
+    {
       "model_id": "video.heavy.le0_5mpf",
       "min_app_version": "0.2.115",
       "model_class": "workflow",

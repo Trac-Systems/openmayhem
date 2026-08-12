@@ -153,6 +153,21 @@ A Comfy workflow is calibrated only after all gates below pass:
   `04a42dc2aa5159d317be3c0e80924421d1163021e91d8b41352d72ba96b940fe`,
   usage `1` `megapixel`, BLAKE3
   `1d47264316354f7f0aa787da4637711e38a0b8e78a715682cb241a937e8f9699`.
+- `upscale.diffusion`: signed dev SeedVR2 diffusion upscale/restore policy is
+  catalog-admitted with official Comfy-Org SeedVR2 3B int8 convrot part
+  `e2a27b04c8c7244829fc5fbe3281cf7d29c7f65ef315fbb97386a66e2b3da7c7` and
+  SeedVR2 VAE part
+  `63e6908333939636708d0661208d534237a117d1a6a36f4c3544c1cff40be6a1`.
+  `.70` reference admission passed on 2026-08-12 with inventory root
+  `f501d4d7340fe2d891560aef0192adb28c0bd8e91c77b36e4ccc0e16b33fd15b`,
+  graph SHA-256
+  `2f8f41767f90fd18a7a7109b156ef2464f9c22648ce37ada3126e02e76fc2c93`,
+  retained artifact
+  `openmayhem-seedvr2-upscale-diffusion-reference-v0.2.136.png`, output
+  SHA-256
+  `671c24b35e99ee28edbf08b3c88c37472fbb552dfd52764f9f2d6f422149e328`,
+  and canary perceptual hash `fe8181818181817f`. Paid route proof is still
+  required before product acceptance.
 - `video.lipsync`: technical InfiniteTalk proof exists but product quality is
   not accepted. Do not present it as the solution for anime action video with
   voice. LongCat Video Avatar 1.5 now has a dev catalog row, signed v17 parts,

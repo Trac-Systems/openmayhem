@@ -204,6 +204,20 @@ Current standalone 4x upscaler workflow lane:
 | Required part | `4x-spanx4-ch48.safetensors` / `d871ba305a9cbe521c3da166f06d84b80db02a36a1b4e89720d6bddf54965e0a` |
 | Reference proof | Local admission proof passed with graph SHA-256 `9a24896bfe8a78bcac41f7895126ad02593bde5bcabb9aec70229c7940d2f2a2`; output `openmayhem-upscale-conv-le24mp-reference-v0.2.127.png`; SHA-256 `3b78c0ecd45cfa63c75d2eea18c7056c417015908c7ec7c8dddc327949e4f8fc` |
 
+Current SeedVR2 diffusion upscale workflow lane:
+
+| Field | Value |
+|---|---|
+| Outcome class / model | `upscale.diffusion` |
+| Endpoint family | `mayhem_comfy_workflows` |
+| Endpoint | `POST /v1/workflows` |
+| Required inventory root | `f501d4d7340fe2d891560aef0192adb28c0bd8e91c77b36e4ccc0e16b33fd15b` |
+| Runtime | `comfyui-v0.30.1` |
+| Pricing unit | `megapixel_step` |
+| Required parts | SeedVR2 3B int8 convrot `e2a27b04c8c7244829fc5fbe3281cf7d29c7f65ef315fbb97386a66e2b3da7c7`; SeedVR2 VAE `63e6908333939636708d0661208d534237a117d1a6a36f4c3544c1cff40be6a1` |
+| Reference proof | `.70` admission proof passed with graph SHA-256 `2f8f41767f90fd18a7a7109b156ef2464f9c22648ce37ada3126e02e76fc2c93`; output `openmayhem-seedvr2-upscale-diffusion-reference-v0.2.136.png`; SHA-256 `671c24b35e99ee28edbf08b3c88c37472fbb552dfd52764f9f2d6f422149e328`; canary hash `fe8181818181817f` |
+| Product state | Signed dev policy and reference admission passed; paid `/v1/workflows` route proof still required |
+
 Krea providers must add these signed parts before admission:
 
 | Part | Part ID | Purpose |
@@ -327,7 +341,8 @@ executable version is not release-pinned, so this document does not invent one.
 | `Cactus-Compute/needle` | Deterministic tool selection | `needle-cpu` or CUDA-only `needle-gpu` | Tier 1; use highest proved tier | Managed preflight | See measured guidance | 30.4M parameters |
 | `video.minimax_h3.t2v_i2v` | Comfy workflow video+audio | ComfyUI / signed MiniMax H3 parts | Tier 1; live `.70` CUDA proof; paid dialogue-fight artifact `openmayhem-minimax-h3-anime-dialogue-fight-paid-v0.2.123.mp4` | 96 GiB | 48 GiB | Four signed base parts, 42.29 GiB total |
 | `video.minimax_h3.r2v` | Comfy workflow reference-media video+audio | ComfyUI / signed MiniMax H3 REF2VA parts | Tier 1; live `.70` admission and paid fiat proof `openmayhem-minimax-h3-r2v-paid-proof-v0.2.126.mp4` | 96 GiB | 48 GiB | Four signed R2V parts, 39.55 GiB payload |
-| `upscale.conv.le24mp` | Comfy workflow standalone 4x image upscale | ComfyUI / signed SPANx4 upscaler | Reference admission passed; paid route proof pending | 16 GiB | 4 GiB | One signed upscaler part, 8.6 MiB |
+| `upscale.conv.le24mp` | Comfy workflow standalone 4x image upscale | ComfyUI / signed SPANx4 upscaler | Reference admission and paid route proof passed | 16 GiB | 4 GiB | One signed upscaler part, 8.6 MiB |
+| `upscale.diffusion` | Comfy workflow SeedVR2 diffusion upscale | ComfyUI / signed SeedVR2 int8 + VAE parts | Reference admission passed; paid route proof pending | 32 GiB | 10 GiB | Two signed parts, 3.69 GiB payload |
 
 The RAM and full-offload columns are catalog admission/guidance fields. Model
 weights, runtime environments, caches, outputs, and build artifacts require

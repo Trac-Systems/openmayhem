@@ -764,6 +764,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
+| `upscale.diffusion` | Comfy workflow, SeedVR2 diffusion upscale/restore | A/B | signed dev policy; `.70` reference admission passed; paid route proof pending |
 | `upscale.conv.le24mp` | Comfy workflow, standalone 4x image upscale | A/B | **live** |
 | `video.minimax_h3.r2v` | Comfy workflow, MiniMax H3 reference-media video with native audio | D | **live** |
 | `video.minimax_h3.t2v_i2v` | Comfy workflow, MiniMax H3 text/image-to-video with native audio | D | **live** |
@@ -1069,6 +1070,23 @@ through the `.31` sponsored gateway on 2026-08-12 with retained artifact
 BLAKE3 `25b0a156e76ad22653cee1037f6bc0fb64955e668bc5b3ecc3af39a4915ed8f2`.
 It is not live product capacity until owner review confirms a measurable
 speed/quality benefit over the accepted base H3 lane.
+
+The current signed catalog also materializes the SeedVR2 diffusion
+upscale/restore lane (`upscale.diffusion`) as a signed dev policy using the
+official Comfy-Org SeedVR2 3B int8 convrot model plus SeedVR2 VAE. Parts index
+v19 adds the int8 part and verifies at root
+`6b75023e49e1d0954ae4f76004f1cb1b620f773ed700d2cb0e55280d0a52a2a0`.
+Catalog verification passes at hash
+`f1f8d1755311fd18a3f8334bbe09ffcaf0f19a6a929959f130831c5c430eb926`.
+`.70` completed signed-inventory admission with inventory root
+`f501d4d7340fe2d891560aef0192adb28c0bd8e91c77b36e4ccc0e16b33fd15b`,
+reference graph SHA-256
+`2f8f41767f90fd18a7a7109b156ef2464f9c22648ce37ada3126e02e76fc2c93`,
+output SHA-256
+`671c24b35e99ee28edbf08b3c88c37472fbb552dfd52764f9f2d6f422149e328`,
+and retained artifact
+`openmayhem-seedvr2-upscale-diffusion-reference-v0.2.136.png`. It is not live
+product capacity until a paid `/v1/workflows` route proof passes.
 
 The `0.2.118` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the

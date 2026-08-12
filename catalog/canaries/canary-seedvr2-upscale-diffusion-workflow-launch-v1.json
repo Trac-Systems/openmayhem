@@ -1,0 +1,179 @@
+{
+  "set_id": "canary-seedvr2-upscale-diffusion-workflow-launch-v1",
+  "description": "Launch canary for signed SeedVR2 diffusion Comfy upscaler workflow providers.",
+  "prompts": [
+    {
+      "id": "seedvr2-upscale-tiny-source-seed7",
+      "endpoint_family": "mayhem_comfy_workflows",
+      "model": "upscale.diffusion",
+      "runtime_id": "comfyui-v0.30.1",
+      "outcome_class": "upscale.diffusion",
+      "timeout_ms": 300000,
+      "response_format": "artifact",
+      "seed": 7,
+      "perceptual_hash": "fe8181818181817f",
+      "workflow": {
+        "1": {
+          "class_type": "LoadImage",
+          "inputs": {
+            "image": "inputs/upscale-source.png"
+          }
+        },
+        "2": {
+          "class_type": "JoinImageWithAlpha",
+          "inputs": {
+            "image": [
+              "1",
+              0
+            ],
+            "alpha": [
+              "1",
+              1
+            ]
+          }
+        },
+        "3": {
+          "class_type": "ResizeImageMaskNode",
+          "inputs": {
+            "input": [
+              "2",
+              0
+            ],
+            "resize_type": "scale by multiplier",
+            "resize_type.multiplier": 4,
+            "scale_method": "lanczos"
+          }
+        },
+        "4": {
+          "class_type": "VAELoader",
+          "inputs": {
+            "vae_name": "seedvr2_ema_vae_fp16.safetensors"
+          }
+        },
+        "5": {
+          "class_type": "UNETLoader",
+          "inputs": {
+            "unet_name": "seedvr2_3b_int8_convrot.safetensors",
+            "weight_dtype": "default"
+          }
+        },
+        "6": {
+          "class_type": "SeedVR2Preprocess",
+          "inputs": {
+            "resized_images": [
+              "3",
+              0
+            ]
+          }
+        },
+        "7": {
+          "class_type": "VAEEncodeTiled",
+          "inputs": {
+            "pixels": [
+              "6",
+              0
+            ],
+            "vae": [
+              "4",
+              0
+            ],
+            "tile_size": 512,
+            "overlap": 128,
+            "temporal_size": 4096,
+            "temporal_overlap": 8
+          }
+        },
+        "8": {
+          "class_type": "SeedVR2Conditioning",
+          "inputs": {
+            "model": [
+              "5",
+              0
+            ],
+            "vae_conditioning": [
+              "7",
+              0
+            ]
+          }
+        },
+        "9": {
+          "class_type": "KSampler",
+          "inputs": {
+            "seed": 959948902156062,
+            "steps": 1,
+            "cfg": 1,
+            "sampler_name": "euler",
+            "scheduler": "simple",
+            "denoise": 1,
+            "model": [
+              "5",
+              0
+            ],
+            "positive": [
+              "8",
+              0
+            ],
+            "negative": [
+              "8",
+              1
+            ],
+            "latent_image": [
+              "7",
+              0
+            ]
+          }
+        },
+        "10": {
+          "class_type": "VAEDecodeTiled",
+          "inputs": {
+            "samples": [
+              "9",
+              0
+            ],
+            "vae": [
+              "4",
+              0
+            ],
+            "tile_size": 512,
+            "overlap": 128,
+            "temporal_size": 4096,
+            "temporal_overlap": 8
+          }
+        },
+        "11": {
+          "class_type": "SeedVR2PostProcessing",
+          "inputs": {
+            "images": [
+              "10",
+              0
+            ],
+            "original_resized_images": [
+              "3",
+              0
+            ],
+            "color_correction_method": "none"
+          }
+        },
+        "12": {
+          "class_type": "SaveImage",
+          "inputs": {
+            "filename_prefix": "mayhem-seedvr2-upscale",
+            "images": [
+              "11",
+              0
+            ]
+          }
+        }
+      },
+      "input_files": [
+        {
+          "filename": "inputs/upscale-source.png",
+          "kind": "image",
+          "content_type": "image/png",
+          "encoding": "base64",
+          "data": "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAAXNSR0IArs4c6QAAAERlWElmTU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQAAAABAAAAQKADAAQAAAABAAAAQAAAAABGUUKwAAACOElEQVRoBdWavVEDMRBGzwwlXO7EFUDigIgK6ISEMiiGCogIiKjAiYkdkDjnmxEj5D39rKTVeVczHks63eo9aQ9kjzfn889ks2y3O4Df2ISfHL1VAU9vUiCktydA6I/Hg6VnYElvaQei9GYEUvQQuMUrWu6fv6P963ee3h7DSZH3YVP7M5Cnh4lqgSK9agEOvV4BQj8/vYd5H9Y1phCfXuMOVNGrE6il1yXQQK9IoI1+DYHP0wumyZdmeoRNHiXyU+avEuiwuZ9fyb099PICISsBdU03wGt00iOm5P+BIr1XciP76SUF+PROQ4ReTKCWfvfx5XcDlcxJIRwWrQuk0BXpoSQgEF2YVCdZ+8PDXWoks79XoGr5o/RVEZZWvQLLiKmeKH1qML9/JYFB9PBcQ2Acfa8AJ3059Jw4qaTq2gF/IkhF59Dj3mKcVHz0dwlk4uISkz4fpHh1lMA69NAbIrAavYDAMn1r6ZcRimkTDhDegVr6EKWtLiDgl7CB3t/bRo+7BAQQBRxXoRcTIJ9OOGfM/rV3myawA1ekh0PvtxKEHp+t9tOUORpILbxb/l6BJb2LG1JCJmz6iaUq7SmUoidkQ+kxV6MAk57IjGi2COihb9kBVfTVAtro6wQU0lcI6KTnCqilZwlopi8LKKcvCOinzwmYoE8KkN/n9Hx/jzmGlshxmtCT3+cMpWkITs9CtughfCFgjv5CwCL9v4BR+j8Bu/QQ2MzzjDdflP/N8Zy+cvEQm6OHxi9ag+6VHvlgmwAAAABJRU5ErkJggg=="
+        }
+      ]
+    }
+  ]
+}
