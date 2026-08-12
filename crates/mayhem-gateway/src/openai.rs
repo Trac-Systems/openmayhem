@@ -45022,6 +45022,13 @@ mod tests {
                         "content_type": "audio/wav",
                         "encoding": "base64",
                         "data": audio_b64
+                    },
+                    {
+                        "filename": "dialogue/reply.wav",
+                        "kind": "audio",
+                        "content_type": "audio/wav",
+                        "encoding": "base64",
+                        "data": audio_b64
                     }
                 ]
             }),
@@ -45043,7 +45050,7 @@ mod tests {
         assert!(image_load.max_item_bytes > 1);
         assert_eq!(image_load.max_item_units, 512 * 512);
         let audio_load = requirements.modality_load.get("audio").unwrap();
-        assert_eq!(audio_load.item_count, 1);
+        assert_eq!(audio_load.item_count, 2);
         assert!(audio_load.max_item_bytes > 1);
         assert_eq!(audio_load.max_item_units, 1);
     }

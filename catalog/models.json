@@ -28141,8 +28141,8 @@
               "calibration_baseline_memory_bytes": 21474836480,
               "calibration_peak_memory_bytes": 21477716480,
               "calibration_f13_budget_bytes": 103079215104,
-              "default_max_inflight_items": 1,
-              "default_max_items_per_request": 1
+              "default_max_inflight_items": 2,
+              "default_max_items_per_request": 2
             }
           }
         }

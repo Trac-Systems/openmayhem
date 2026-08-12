@@ -21848,11 +21848,10 @@ fn validate_modality_resource_profile_evidence(
             || profile.calibration_peak_memory_bytes > profile.calibration_f13_budget_bytes
             || profile.measured_working_set_bytes
                 != calibrated_resource_working_set_bytes(*modality, profile)
-            || profile.default_max_inflight_items != 1
-            || profile.default_max_items_per_request != 1
+            || !calibrated_resource_profile_request_bounds_are_valid(profile)
         {
             errors.push(format!(
-                "modality resource profile for {artifact}/{modality} is not a valid one-item F13 calibration"
+                "modality resource profile for {artifact}/{modality} is not a valid bounded F13 calibration"
             ));
         }
     }
@@ -22003,8 +22002,16 @@ fn calibrated_resource_profile_is_self_consistent(
             <= profile.calibration_f13_budget_bytes
         && profile.measured_working_set_bytes
             == calibrated_resource_working_set_bytes(modality, profile)
-        && profile.default_max_inflight_items == 1
-        && profile.default_max_items_per_request == 1
+        && calibrated_resource_profile_request_bounds_are_valid(profile)
+}
+
+fn calibrated_resource_profile_request_bounds_are_valid(
+    profile: &catalog::CatalogModalityResourceProfile,
+) -> bool {
+    (1..=MAX_PROVIDER_MODALITY_INFLIGHT_ITEMS).contains(&profile.default_max_inflight_items)
+        && (1..=MAX_PROVIDER_MODALITY_ITEMS_PER_REQUEST)
+            .contains(&profile.default_max_items_per_request)
+        && profile.default_max_items_per_request <= profile.default_max_inflight_items
 }
 
 fn calibrated_resource_working_set_bytes(
@@ -119106,6 +119113,18 @@ State initialization...
         secondary_profile.calibration_baseline_memory_bytes = 40_000_000;
         secondary_profile.calibration_peak_memory_bytes = 43_000_000;
         secondary_profile.calibration_f13_budget_bytes = 50_000_000_000;
+        let mut multi_reference_profile = reference_profile.clone();
+        multi_reference_profile.default_max_inflight_items = 2;
+        multi_reference_profile.default_max_items_per_request = 2;
+        assert!(calibrated_resource_profile_is_self_consistent(
+            "audio",
+            &multi_reference_profile
+        ));
+        multi_reference_profile.default_max_items_per_request = 3;
+        assert!(!calibrated_resource_profile_is_self_consistent(
+            "audio",
+            &multi_reference_profile
+        ));
         let reference_profiles = BTreeMap::from([("audio".to_owned(), reference_profile.clone())]);
         let secondary_profiles = BTreeMap::from([("audio".to_owned(), secondary_profile.clone())]);
         assert_eq!(

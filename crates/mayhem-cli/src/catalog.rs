@@ -35,6 +35,8 @@ const MODEL_CLASS_STT: &str = "stt";
 const MODEL_CLASS_AUDIO_GENERATION: &str = "audio-generation";
 const MODEL_CLASS_MUSIC_GENERATION: &str = "music-generation";
 const MODEL_CLASS_WORKFLOW: &str = "workflow";
+const MAX_CATALOG_MODALITY_INFLIGHT_ITEMS: u32 = 1_024;
+const MAX_CATALOG_MODALITY_ITEMS_PER_REQUEST: u32 = 1_024;
 
 #[derive(Debug, Clone)]
 pub struct VerifyOptions {
@@ -1833,10 +1835,9 @@ fn validate_modality_resource_profiles(model: &CatalogModel, errors: &mut Vec<St
                     model.model_id, artifact, modality
                 ));
             }
-            if profile.default_max_inflight_items != 1 || profile.default_max_items_per_request != 1
-            {
+            if !modality_profile_request_bounds_are_valid(profile) {
                 errors.push(format!(
-                    "{} modality resource profile for {}/{} must default to one in-flight item and one item per request",
+                    "{} modality resource profile for {}/{} must use bounded positive request limits with per-request not above in-flight",
                     model.model_id, artifact, modality
                 ));
             }
@@ -1891,6 +1892,13 @@ fn modality_profile_working_set_bytes(
         .saturating_sub(profile.calibration_baseline_memory_bytes)
         .max(decoded_floor)
         .max(1)
+}
+
+fn modality_profile_request_bounds_are_valid(profile: &CatalogModalityResourceProfile) -> bool {
+    (1..=MAX_CATALOG_MODALITY_INFLIGHT_ITEMS).contains(&profile.default_max_inflight_items)
+        && (1..=MAX_CATALOG_MODALITY_ITEMS_PER_REQUEST)
+            .contains(&profile.default_max_items_per_request)
+        && profile.default_max_items_per_request <= profile.default_max_inflight_items
 }
 
 fn validate_modality_calibration_fingerprints(model: &CatalogModel, errors: &mut Vec<String>) {
@@ -7664,6 +7672,61 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.contains("missing required unit frame")));
+    }
+
+    #[test]
+    fn catalog_modality_resource_profiles_allow_bounded_multi_item_requests() {
+        let mut model = verification_test_model(
+            "mayhem/workflow@multi-audio",
+            MODEL_CLASS_WORKFLOW,
+            "comfyui",
+            CanaryRef {
+                set_id: "canary-workflow-v1".to_owned(),
+                match_min: 1.0,
+                verification_method: "workflow_admission".to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
+            },
+        );
+        model.adapter.modality_set = vec!["audio".to_owned()];
+        model.caps.output_modality = Some("audio".to_owned());
+        model.caps.output_modalities = vec!["audio".to_owned()];
+        model.modality_assessment.detected = vec!["audio".to_owned()];
+        let mut profile = verification_test_resource_profile("audio");
+        profile.default_max_inflight_items = 2;
+        profile.default_max_items_per_request = 2;
+        model.modality_assessment.resource_profiles.clear();
+        model.modality_assessment.resource_profiles.insert(
+            "fixture".to_owned(),
+            BTreeMap::from([("audio".to_owned(), profile)]),
+        );
+
+        let mut errors = Vec::new();
+        validate_modality_resource_profiles(&model, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        let mut bad = model;
+        bad.modality_assessment
+            .resource_profiles
+            .get_mut("fixture")
+            .unwrap()
+            .get_mut("audio")
+            .unwrap()
+            .default_max_items_per_request = 3;
+        let mut errors = Vec::new();
+        validate_modality_resource_profiles(&bad, &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|error| { error.contains("must use bounded positive request limits") }),
+            "{errors:#?}"
+        );
     }
 
     fn verification_test_resource_profile(modality: &str) -> CatalogModalityResourceProfile {

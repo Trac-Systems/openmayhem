@@ -1177,8 +1177,7 @@ mod tests {
             max_steps: 24,
             ..ComfyWorkflowDerivationPolicy::default()
         };
-        let derivation =
-            derive_comfy_workflow(request.get("workflow").unwrap(), &policy).unwrap();
+        let derivation = derive_comfy_workflow(request.get("workflow").unwrap(), &policy).unwrap();
         assert_eq!(
             derivation.outcome_spec.output_modalities,
             vec!["audio".to_owned(), "video".to_owned()]
