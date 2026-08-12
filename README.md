@@ -217,8 +217,11 @@ sudo apt-get install -y build-essential clang libclang-dev cmake pkg-config git 
 - ComfyUI workflow providers need a verified ComfyUI runtime checkout for the
   blessed runtime, currently `comfyui-v0.30.1`. Use `python3` on `PATH`, or set
   `MAYHEM_COMFYUI_PYTHON` to the executable belonging to that checkout's
-  environment. Workflow parts still come only from the signed parts index and
-  must pass `mayhem provider parts pull`, `mayhem provider parts add`, and
+  environment. A checkout alone is not enough: create that runtime's Python
+  environment and install its own `requirements.txt` first, then verify imports
+  such as `torch`, `sqlalchemy`, and `alembic` before admission. Workflow parts
+  still come only from the signed parts index and must pass
+  `mayhem provider parts pull`, `mayhem provider parts add`, and
   `mayhem provider parts admit`.
 - AMD GPUs: ROCm, or a Vulkan loader for the Vulkan path.
 - Tier 2 needs a TPM 2.0 exposed at `/dev/tpmrm0` plus `tpm2-tools` (`sudo apt-get install -y tpm2-tools`). The quote helper runs as the provider user. If the distro exposes the device as `root:tss`, add the existing login to that existing distro group once with `sudo usermod -aG tss "$USER"`, then log out and back in. Mayhem never creates users or groups, changes device ACLs, or runs hardware-proof helpers merely because it detected a TPM.
@@ -254,9 +257,15 @@ Most installs are driven by a coding agent. Agent: execute in THIS order, verify
    - **vLLM, TensorRT-LLM, and MLX**: Mayhem creates exact-version Python environments under `~/.mayhem/venvs`, discovers CUDA when applicable, and owns the backend caches. The `MAYHEM_*_PYTHON` variables are diagnostic overrides, not setup steps.
    - **ComfyUI workflows**: verify the blessed ComfyUI runtime checkout and its
      Python executable. Use `python3` if it belongs to that checkout; otherwise
-     set `MAYHEM_COMFYUI_PYTHON` explicitly. Then pull verified parts and run
-     `mayhem provider parts add` and `mayhem provider parts admit --write`
-     before serving. Start workflow providers with
+     create a sibling/provider venv outside the checkout, install the checkout's
+     `requirements.txt`, and set `MAYHEM_COMFYUI_PYTHON` explicitly:
+     `R=<comfy-runtime-dir>; V=<provider-home>/venvs/comfyui-v0.30.1; python3 -m venv "$V" && "$V/bin/python" -m pip install -r "$R/requirements.txt"`.
+     Do not place the selected venv under the ComfyUI checkout; the provider
+     sandbox mounts the runtime and interpreter as separate roots and rejects
+     nested read-only roots.
+     Confirm the selected interpreter can import `torch`, `sqlalchemy`, and
+     `alembic`. Then pull verified parts and run `mayhem provider parts add`
+     and `mayhem provider parts admit --write` before serving. Start workflow providers with
      `--artifact <comfy-runtime-dir>` so the worker uses the verified local
      ComfyUI checkout; the ledger artifact is the workflow class definition.
    - **Audio/image serving**: the engines are external binaries that must be on `PATH` (or pointed at by env): `whisper-cli` (`MAYHEM_WHISPER_CPP_BIN`), `piper` (`MAYHEM_PIPER_BIN`), `sd-cli` (`MAYHEM_STABLE_DIFFUSION_CPP_BIN`). Accelerator selection is automatic. Text-only providers can ignore this.
@@ -764,6 +773,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
+| `video.lipsync` | Comfy workflow, LongCat Avatar talking-video lipsync | D | paid technical proof passed; quality-fit gap for action anime |
 | `upscale.diffusion` | Comfy workflow, SeedVR2 diffusion upscale/restore | A/B | paid fiat proof passed; product review pending |
 | `upscale.conv.le24mp` | Comfy workflow, standalone 4x image upscale | A/B | **live** |
 | `video.minimax_h3.r2v` | Comfy workflow, MiniMax H3 reference-media video with native audio | D | **live** |
@@ -1058,6 +1068,13 @@ retained artifact `openmayhem-longcat-paid-anime-fight-v0.2.135.mp4`, session
 quality review for speech intelligibility and sync is still required before
 public product acceptance.
 
+The stronger LongCat paid proof `openmayhem-longcat-paid-anime-fight-v0.2.138.mp4`
+is a valid route/billing proof for talking-video lipsync (`768x512`, `25` fps,
+`120` frames, `4.8s`, stereo AAC), but review shows a static anime face-off
+rather than choreographed fighting action. Keep `video.lipsync` separate from
+general A/V action-video acceptance until a workflow proves convincing action,
+speech, and sync through `/v1/workflows`.
+
 The `0.2.136` source release materializes the optional MiniMax H3 Spectrum
 workflow lane (`video.minimax_h3.spectrum`) as a signed dev policy with a
 workflow-class canary proof. Catalog verification passes at hash
@@ -1096,6 +1113,12 @@ artifact: `openmayhem-seedvr2-upscale-diffusion-paid-v0.2.138.png`, session
 BLAKE3 `22895752f732ddfeb17f3aaa93fbad6b3e2bf60a9e7b9c93c7bcadd3140d1dfb`,
 SHA-256 `e23ce117ba5325919c642a531f69cea09dd9b36a0c27fdcb41ca14790730d9ff`,
 media `256x256` PNG, usage `1` `megapixel_step`.
+
+Follow-up real-world SeedVR2 admission on `.42` produced
+`openmayhem-seedvr2-realworld-upscale-admission-v0.2.138.png` from the same
+signed parts and graph, output SHA-256
+`9fe0f803f4699b882406d9271c1eafbd2f7bb415bfca7b173eb4669afd8c3d18`.
+The real-world paid-route proof is pending buyer-wallet funding.
 
 The `0.2.138` source release fixes Comfy workflow provider startup. Workflow
 providers with a persisted signed admission proof now advertise admission-backed

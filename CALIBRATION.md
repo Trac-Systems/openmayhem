@@ -62,6 +62,11 @@ A Comfy workflow is calibrated only after all gates below pass:
 - Runtime gate: every node is available in the blessed ComfyUI runtime or in a
   separately blessed extension policy. External API nodes are not local proof
   unless the catalog explicitly declares that external-service lane.
+  The selected `MAYHEM_COMFYUI_PYTHON` must belong to that runtime and have the
+  runtime's own `requirements.txt` installed; a bare system Python that can
+  execute but cannot import `torch`, `sqlalchemy`, and `alembic` fails runtime
+  admission. Keep that interpreter environment outside the ComfyUI checkout so
+  the sandbox does not reject overlapping read-only roots.
 - Policy gate: the catalog row embeds or references the workflow policy,
   required parts, runtime id, node allowlist, output class, modality set,
   derivation limits, media input schema, permitted content types, user controls,
