@@ -113,12 +113,13 @@ technical LongCat proof but remains a quality-fit gap for action anime.
   `19f92129c62ef352a2460a1a3d8654d957672fa1ae4cf0c138b3fdaea468cbfd`.
   This is the accepted proof lane for anime fighting action with native voice
   and sound. Do not confuse it with lipsync/talking-head proof; exact mouth-sync
-  remains a separate `video.lipsync` quality requirement. The current signed
-  R2V canary uses `ref_images` only. Official Comfy H3 R2V workflow templates
-  also support standalone audio references via `ref_audios` and prompt tags such
-  as `<Audio 1>`; the next action+voice quality-gap experiment should prove that
-  route through request-carried `/v1/workflows` audio, not through provider-local
-  files or direct Comfy output.
+  remains a separate `video.lipsync` quality requirement. The signed R2V canary
+  uses `ref_images`, and the audio-reference route is now covered by retained
+  paid proof `openmayhem-minimax-h3-r2v-audio-reference-anime-fight-v0.2.139.mp4`
+  through request-carried `/v1/workflows` `input_files` for two audio clips.
+  It completed on the `.31` proof gateway against the `.70` provider with
+  BLAKE3 `1b622c70387b73ac667dd77440699eadb882cf7090ff3f3dfd6167c227ce130f`;
+  media is `896x512`, `124` frames at `24` fps, `5.167s`, H.264/AAC.
 - H3 providers on GB10/Spark-class unified-memory hosts must be started
   sequentially with explicit reserve settings. The accepted `.70` T2V provider
   uses `--memory-reserve 15GB`; the default percentage reserve can falsely

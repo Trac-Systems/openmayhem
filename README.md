@@ -1014,6 +1014,13 @@ artifact: `openmayhem-minimax-h3-r2v-paid-proof-v0.2.126.mp4`. This is the
 accepted Comfy proof lane for anime fighting action with native voice and sound,
 not a lipsync/talking-head proof.
 
+`0.2.139` extends the R2V proof path to two request-carried audio references
+without widening the workflow beyond the signed H3 parts. The retained paid
+proof is
+`openmayhem-minimax-h3-r2v-audio-reference-anime-fight-v0.2.139.mp4`, BLAKE3
+`1b622c70387b73ac667dd77440699eadb882cf7090ff3f3dfd6167c227ce130f`, `896x512`,
+`124` frames at `24` fps with AAC audio.
+
 Krea 2 Turbo base image generation (`image.heavy.le1_2mp`) and Krea 2 Turbo
 with signed 4x upscaling (`image.heavy.le17mp`) are product-accepted after
 `.42` admission and paid fiat `/v1/workflows` proofs through the `.31`
