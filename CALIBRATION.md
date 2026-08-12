@@ -130,9 +130,12 @@ A Comfy workflow is calibrated only after all gates below pass:
   `openmayhem-minimax-h3-spectrum-paid-v0.2.136.mp4`, session
   `c51f1fe861e46a6ebe680f1c57670f2982f81a782db7a9ce93c384ad78af7e6f`,
   BLAKE3 `25b0a156e76ad22653cee1037f6bc0fb64955e668bc5b3ecc3af39a4915ed8f2`,
-  media `896x512`, `24` fps, `5.167s`, H.264/AAC stereo. Do not count it as
-  product-ready public capacity until owner review confirms a measurable
-  speed/quality win over the accepted base H3 lane.
+  media `896x512`, `24` fps, `5.167s`, H.264/AAC stereo. Follow-up review
+  compared this clip with the accepted base H3 proof and found no measurable
+  product lift: both clips have identical duration/frame specs, similar loudness
+  (`-18.10` dB RMS Spectrum vs. `-18.34` dB RMS base H3), and the base H3
+  visual proof is at least as clear. Keep Spectrum parked as an optional proven
+  dev lane; do not count it as product-ready public capacity.
 - `video.heavy.le0_5mpf`: product-accepted for LTX A/V generation after paid
   `/v1/workflows` proofs with video and audio. It is not lipsync evidence.
 - `image.heavy.le1_2mp`: product-accepted for Krea base image generation after

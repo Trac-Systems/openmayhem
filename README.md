@@ -768,7 +768,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 | `upscale.conv.le24mp` | Comfy workflow, standalone 4x image upscale | A/B | **live** |
 | `video.minimax_h3.r2v` | Comfy workflow, MiniMax H3 reference-media video with native audio | D | **live** |
 | `video.minimax_h3.t2v_i2v` | Comfy workflow, MiniMax H3 text/image-to-video with native audio | D | **live** |
-| `video.minimax_h3.spectrum` | Comfy workflow, optional MiniMax H3 Spectrum enhancer lane | D | signed dev policy; paid fiat proof passed; owner benefit review pending |
+| `video.minimax_h3.spectrum` | Comfy workflow, optional MiniMax H3 Spectrum enhancer lane | D | paid proof passed; parked, not product-accepted |
 | `huihui-ai/Huihui-Agents-A1-abliterated` | Multimodal LLM, vision/video input, tools, uncensored, 262K ctx | C | **live** |
 | `ResembleAI/chatterbox` | TTS + zero-shot voice cloning | A/B | **live** |
 | `SulphurAI/Sulphur-2-base` | Video with synchronized audio, uncensored | C/D | **live** |
@@ -1068,8 +1068,11 @@ through the `.31` sponsored gateway on 2026-08-12 with retained artifact
 `openmayhem-minimax-h3-spectrum-paid-v0.2.136.mp4`, session
 `c51f1fe861e46a6ebe680f1c57670f2982f81a782db7a9ce93c384ad78af7e6f`, and
 BLAKE3 `25b0a156e76ad22653cee1037f6bc0fb64955e668bc5b3ecc3af39a4915ed8f2`.
-It is not live product capacity until owner review confirms a measurable
-speed/quality benefit over the accepted base H3 lane.
+Follow-up review compared it with the accepted base H3 proof and found no
+measurable product lift: both clips have identical duration/frame specs, similar
+loudness (`-18.10` dB RMS Spectrum vs. `-18.34` dB RMS base H3), and the base
+H3 visual proof is at least as clear. Keep Spectrum parked as an optional proven
+dev lane; it is not live product capacity.
 
 The `0.2.137` source release materializes the SeedVR2 diffusion
 upscale/restore lane (`upscale.diffusion`) as a signed dev policy using the
