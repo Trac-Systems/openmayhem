@@ -11,14 +11,17 @@ control.
 | Role | Source | Revision | Size | SHA-256 | Derived part ID |
 | --- | --- | --- | ---: | --- | --- |
 | MultiTalk audio projection model | `MeiGen-AI/MeiGen-MultiTalk`, `multitalk.safetensors` | `b3ccbea2f68c89fafb277b9bd907905fff7a9337` | `9,947,889,040` | `f4b48e2eb148e2407711dfc29ef411820094e5684435d5791a6d34b53fe9e1db` | `0b92e833842be82ad3369d454783895d80d25cdef9cecda1ace7cb745702c8db` |
-| WanVideoWrapper MultiTalk custom nodes | `kijai/ComfyUI-WanVideoWrapper` rootless deterministic archive | `088128b224242e110d3906c6750e9a3a348a659b` | `19,021,709` | `46db1c18c57c9e025107b6569a4351fe8ae8e335d3b7d9c14b16e100e3b61d0e` | `e61b2cbd5291ae0fbf15d820e9f23876e708cb68b97ca0e48e636c3b6d1dd831` |
+| WanVideoWrapper MultiTalk custom nodes | `kijai/ComfyUI-WanVideoWrapper` clean rootless candidate archive | `088128b224242e110d3906c6750e9a3a348a659b` | `18,780,215` | `31ef0cb7e539bae7dbc8098816d93579bcd55782f0ad90143a0d9d06d5729758` | `07408ee8ba6e2368d827cade50ce5a3c7aad666006731010bb8c551a5a6f5719` |
 
-The WanVideoWrapper archive is a deterministic `git archive` payload with the
-root directory `ComfyUI-WanVideoWrapper/` and gzip metadata disabled. The
-policy must restrict the wrapper to these node classes until separately
-reviewed: `Wav2VecModelLoader`, `MultiTalkModelLoader`,
-`MultiTalkWav2VecEmbeds`, `MultiTalkSilentEmbeds`, and
-`WanVideoImageToVideoMultiTalk`.
+The original WanVideoWrapper `git archive` payload includes tar PAX metadata
+and dotfile paths. OpenMayhem accepts harmless PAX extension records, but still
+rejects dotfiles and unsafe path shapes in custom-node archives. The clean
+candidate archive removes the top-level folder prefix and dotfiles without
+changing the reviewed source revision. The policy must restrict the wrapper to
+these node classes until separately reviewed: `Wav2VecModelLoader`,
+`MultiTalkModelLoader`, `MultiTalkWav2VecEmbeds`, `MultiTalkSilentEmbeds`,
+`WanVideoImageToVideoMultiTalk`, and the exact Wan sampler/decode nodes needed
+by the admitted graph.
 
 ## Existing Signed Companions
 
@@ -28,8 +31,13 @@ LoRA, UMT5-XXL fp8 scaled, Wan 2.1 VAE, and Wav2Vec2 Chinese base fp16.
 
 ## Proof Gate
 
-The candidate is not product-accepted until the new parts are mirrored into the
-OpenMayhem parts dataset, added to a signed workflow policy, admitted by a real
-provider, and proven through a paid `POST /v1/workflows` request. The retained
-proof must show a two-character anime fight with usable dialogue/audio through
-the intended OpenMayhem gateway path.
+The candidate is not product-accepted. On 2026-08-12, `.70` successfully
+materialized the clean signed candidate inventory with root
+`a8f570b99f081570cca7957f05bc6529f35a730490c4249a17a2a48929e6579e`, but both
+the sequential-audio and parallel-audio reference graphs failed inside
+`WanVideoSampler` with `AttributeError: 'NoneType' object has no attribute
+'max'` from WanVideoWrapper's MultiTalk attention path. Do not advertise this
+candidate until the workflow/runtime issue is solved through the intended
+admission path and a paid `POST /v1/workflows` proof. The retained proof must
+show a two-character anime fight with usable dialogue/audio through the
+OpenMayhem gateway path.

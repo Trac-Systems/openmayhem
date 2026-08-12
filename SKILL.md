@@ -36,6 +36,10 @@ upscaler, lipsync model, or helper model that is not in the signed parts index, 
 file first; do not prove or serve a workflow with manual out-of-policy downloads. Accepted workflow
 canary rows must carry the complete signed-policy request shape, including `input_files` for media
 loaders; do not widen a whitelist or use placeholder graphs to make calibration pass.
+Custom-node archives may contain harmless tar PAX metadata, but must still be rootless and free of
+dotfiles, symlinks, device files, parent traversal, and absolute paths. If a candidate archive needs
+repacking, document the exact source revision and cleaned payload hash before treating it as a
+signed part.
 
 ComfyUI workflows are not a second app. They use the same gateway, provider, route, voucher,
 receipt, and settlement machinery, with the Mayhem-native endpoint `/v1/workflows` and endpoint

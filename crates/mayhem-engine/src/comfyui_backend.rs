@@ -502,6 +502,9 @@ fn extract_comfyui_custom_node_archive(source: &Path, target: &Path) -> Result<(
             )));
         }
         let entry_type = entry.header().entry_type();
+        if entry_type.is_pax_global_extensions() || entry_type.is_pax_local_extensions() {
+            continue;
+        }
         let raw_path = entry.path().map_err(|error| {
             EngineError::ComfyUi(format!(
                 "reading ComfyUI custom node archive path from {} failed: {error}",
@@ -1203,6 +1206,32 @@ mod tests {
         archive.finish().unwrap();
     }
 
+    fn write_custom_node_archive_with_global_pax(path: &Path, entries: &[(&str, &[u8])]) {
+        let file = fs::File::create(path).unwrap();
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        let pax = b"21 comment=mayhem-test\n";
+        let mut pax_header = tar::Header::new_gnu();
+        pax_header.set_entry_type(tar::EntryType::XGlobalHeader);
+        pax_header.set_size(pax.len() as u64);
+        pax_header.set_mode(0o644);
+        pax_header.set_cksum();
+        archive
+            .append_data(&mut pax_header, "pax_global_header", Cursor::new(pax))
+            .unwrap();
+        for (name, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, *name, Cursor::new(*bytes))
+                .unwrap();
+        }
+        archive.finish().unwrap();
+    }
+
     #[test]
     fn comfyui_device_defaults_to_runtime_auto_selection() {
         assert_eq!(default_comfyui_device(), "auto");
@@ -1265,6 +1294,34 @@ mod tests {
             .is_file());
         assert!(cache
             .join("base/custom_nodes/ComfyUI-TestNode/web/main.js")
+            .is_file());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn custom_node_archives_accept_global_pax_metadata() {
+        let temp = test_temp_dir("mayhem-comfy-custom-node-pax");
+        let archive = temp.join("node.tar.gz");
+        write_custom_node_archive_with_global_pax(
+            &archive,
+            &[
+                ("__init__.py", b"NODE_CLASS_MAPPINGS = {}\n"),
+                ("nodes.py", b"class Example: pass\n"),
+            ],
+        );
+        let cache = temp.join("cache");
+
+        materialize_comfyui_custom_nodes(
+            &cache,
+            &[super::super::ComfyUiCustomNodePackage {
+                source: archive,
+                node_dir: PathBuf::from("ComfyUI-TestNode"),
+            }],
+        )
+        .unwrap();
+
+        assert!(cache
+            .join("base/custom_nodes/ComfyUI-TestNode/__init__.py")
             .is_file());
         let _ = fs::remove_dir_all(temp);
     }

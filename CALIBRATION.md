@@ -214,9 +214,13 @@ action anime.
   `9fe0f803f4699b882406d9271c1eafbd2f7bb415bfca7b173eb4669afd8c3d18`,
   media `512x288` PNG. Product review accepted this as the quality proof for
   the bounded SeedVR2 diffusion upscale/restore lane.
-- `video.lipsync`: technical InfiniteTalk proof exists but product quality is
-  not accepted. Do not present it as the solution for anime action video with
-  voice. LongCat Video Avatar 1.5 now has a dev catalog row, signed v17 parts,
+- `video.lipsync`: InfiniteTalk has technical/reference proof but product
+  quality is not accepted. The retained 2026-08-12 copy
+  `openmayhem-infinitetalk-anime-fight-lipsync-reference-v0.2.139.mp4` shows a
+  bounded two-character anime fight graph with AAC audio at `832x480`, `25`
+  fps, and `81` frames, but it is still not final speech/lipsync acceptance.
+  Do not present it as the solution for anime action video with voice. LongCat
+  Video Avatar 1.5 now has a dev catalog row, signed v17 parts,
   a distinct `comfyui-longcat-avatar-v0.30.1` runtime/custom-node profile, and
   `.42` reference admission using request-carried image/audio media. Retained artifact:
   `openmayhem-longcat-avatar-anime-fight-dialogue-reference-v0.2.129.mp4`,
@@ -245,14 +249,13 @@ action anime.
   paid route.
   Current next candidate research: `MeiGen-AI/MultiTalk` and Kijai's
   `ComfyUI-WanVideoWrapper` MultiTalk/FantasyTalking support are a better fit
-  for multi-character dialogue/action than more LongCat prompt tuning. MultiTalk
-  is described by its upstream as audio-driven multi-person conversational video
-  with interaction/cartoon support, while FantasyTalking is single-speaker
-  talking portrait/body-motion support. Neither MultiTalk nor FantasyTalking
-  parts are present in the current signed parts index; adding either requires
-  normal parts mirroring, signed records, workflow policy, admission, paid
-  `/v1/workflows` proof, and retained quality media. Do not use provider-local
-  WanVideoWrapper/FantasyTalking files as proof.
+  for multi-character dialogue/action than more LongCat prompt tuning, but
+  MultiTalk is not accepted yet. On 2026-08-12, `.70` proved the clean signed
+  candidate inventory can materialize, then both sequential and parallel audio
+  graphs failed inside `WanVideoSampler` with a missing MultiTalk reference
+  attention map. Do not use provider-local WanVideoWrapper/FantasyTalking files
+  as proof, and do not publish a routing row until admission and a paid
+  `/v1/workflows` proof produce retained quality media.
 
 Use `scripts/verify-comfy-cheatsheet.py` whenever the signed parts index or
 Comfy cheatsheet changes:

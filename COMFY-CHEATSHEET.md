@@ -247,7 +247,12 @@ below. Current acceptance state:
   output SHA-256
   `9fe0f803f4699b882406d9271c1eafbd2f7bb415bfca7b173eb4669afd8c3d18`,
   media `512x288` PNG, usage `1` `megapixel_step`.
-- `video.lipsync`: InfiniteTalk remains rejected for product quality. LongCat
+- `video.lipsync`: InfiniteTalk remains a technical/reference proof, not a
+  product-accepted lipsync lane. The retained proof copied on 2026-08-12 as
+  `/Users/muffin/Downloads/openmayhem-infinitetalk-anime-fight-lipsync-reference-v0.2.139.mp4`
+  shows two anime fighters in motion at `832x480`, `25` fps, `81` frames, with
+  AAC audio. Use it as evidence that the bounded InfiniteTalk graph can run,
+  not as evidence of final voice quality or mouth-sync acceptance. LongCat
   Video Avatar 1.5 now has a `video.lipsync` dev catalog row, signed v17 parts,
   a distinct `comfyui-longcat-avatar-v0.30.1` runtime/custom-node profile, `.42`
   reference admission, and a paid fiat `/v1/workflows` proof through the `.31`
@@ -266,8 +271,8 @@ below. Current acceptance state:
   choreographed fighting action, so this remains a `video.lipsync` quality-fit
   gap and must not be counted as the general anime-action-with-dialogue product
   proof.
-- Next lipsync/action candidate: prioritize a signed MultiTalk/WanVideoWrapper
-  policy before more LongCat prompt tuning. `MeiGen-AI/MultiTalk` targets
+- Next lipsync/action candidate: MultiTalk/WanVideoWrapper is investigated but
+  not accepted. `MeiGen-AI/MultiTalk` targets
   audio-driven multi-person conversational video and explicitly covers
   interaction/cartoon use cases; Kijai's `ComfyUI-WanVideoWrapper` exposes
   MultiTalk/FantasyTalking support, but the wrapper is fast-moving and must be
@@ -568,7 +573,7 @@ Current runtime status:
   before the proof counts.
   First candidate manifest for the anime-action dialogue proof:
   `kijai/ComfyUI-WanVideoWrapper@088128b224242e110d3906c6750e9a3a348a659b`
-  as a rootless custom-node part (`e61b2cbd5291...`), plus
+  as a clean rootless custom-node part (`07408ee8ba6e...`), plus
   `MeiGen-AI/MeiGen-MultiTalk@b3ccbea2f68c89fafb277b9bd907905fff7a9337`
   `multitalk.safetensors` (`0b92e833842b...`, ~9.95 GB). The first graph
   should reuse existing signed Wan companions where exact hashes match,
@@ -577,6 +582,10 @@ Current runtime status:
   `TencentGameMate/chinese-wav2vec2-base` pickle/bin files if the actual graph
   fails to load the signed safetensors repack. Tracked candidate evidence:
   [`catalog/comfy/multitalk-lipsync-candidate-20260812.md`](catalog/comfy/multitalk-lipsync-candidate-20260812.md).
+  Current blocker: `.70` admission attempts using both sequential and parallel
+  audio reached `WanVideoSampler` but failed in the MultiTalk attention path
+  with a missing `x_ref_attn_map`; keep this candidate out of public routing
+  until that runtime/workflow issue is fixed by proof, not by disabling checks.
   The optional Kokoro TTS files are not on the critical path because the first
   paid proof should use request-carried audio rather than provider-local TTS.
 - `sync.so`/HeyGen API nodes: these are remote service nodes. They are not acceptable for local OpenMayhem provider proof unless a future catalog policy explicitly declares an external-service lane and its security/payment rules.

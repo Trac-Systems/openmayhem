@@ -1084,6 +1084,17 @@ rather than choreographed fighting action. Keep `video.lipsync` separate from
 general A/V action-video acceptance until a workflow proves convincing action,
 speech, and sync through `/v1/workflows`.
 
+The `0.2.140` source release keeps the `video.lipsync` catalog scoped to the
+existing technical proofs and fixes Comfy custom-node archive extraction to
+accept harmless tar PAX metadata while preserving unsafe-path rejection. The
+2026-08-12 InfiniteTalk retained copy
+`openmayhem-infinitetalk-anime-fight-lipsync-reference-v0.2.139.mp4` shows the
+bounded two-character anime-fight graph at `832x480`, `25` fps, `81` frames,
+with AAC audio, but remains technical evidence rather than final lipsync product
+acceptance. The MultiTalk/WanVideoWrapper candidate materialized its clean
+signed inventory on `.70` but failed inside the upstream `WanVideoSampler`
+MultiTalk attention path, so it is deliberately not advertised as routable.
+
 The `0.2.136` source release materializes the optional MiniMax H3 Spectrum
 workflow lane (`video.minimax_h3.spectrum`) as a signed dev policy with a
 workflow-class canary proof. Catalog verification passes at hash
