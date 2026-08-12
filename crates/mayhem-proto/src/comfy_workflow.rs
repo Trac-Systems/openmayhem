@@ -1102,6 +1102,99 @@ mod tests {
         assert!(err.to_string().contains("refs/hero but it is not supplied"));
     }
 
+    #[test]
+    fn h3_r2v_audio_reference_graph_binds_request_audio() {
+        let request = json!({
+            "workflow": {
+                "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors"}},
+                "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"}},
+                "3": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}},
+                "4": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
+                "5": {"class_type": "LoadAudio", "inputs": {"audio": "dialogue/fight-lines.wav"}},
+                "6": {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": {
+                    "clip": ["2", 0],
+                    "vae": ["3", 0],
+                    "audio_vae": ["4", 0],
+                    "prompt": "<Audio 1> supplies the two fighters' voices while the shot shows fast anime combat.",
+                    "width": 896,
+                    "height": 512,
+                    "length": 124,
+                    "ref_audios": {"ref_audio_1": ["5", 0]}
+                }},
+                "7": {"class_type": "CreateVideo", "inputs": {"images": ["6", 0], "audio": ["6", 1], "fps": 24}},
+                "8": {"class_type": "SaveVideo", "inputs": {"video": ["7", 0], "filename_prefix": "mayhem-h3-r2v-audio-ref"}}
+            },
+            "input_files": [
+                {"filename": "dialogue/fight-lines.wav"}
+            ]
+        });
+        validate_comfy_workflow_media_input_file_bindings(&request).unwrap();
+
+        let policy = ComfyWorkflowDerivationPolicy {
+            whitelisted_nodes: [
+                "UNETLoader",
+                "CLIPLoader",
+                "VAELoader",
+                "LoadAudio",
+                "MiniMaxH3ReferenceToVideo",
+                "CreateVideo",
+                "SaveVideo",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            parts_by_name: BTreeMap::from([
+                (
+                    "minimax_h3_ref2va_pruned_int8_convrot.safetensors".to_owned(),
+                    part(
+                        "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+                        "video-model",
+                        "71",
+                    ),
+                ),
+                (
+                    "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors".to_owned(),
+                    part(
+                        "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+                        "text-encoder",
+                        "72",
+                    ),
+                ),
+                (
+                    "minimax_h3_video_vae_fp16.safetensors".to_owned(),
+                    part("minimax_h3_video_vae_fp16.safetensors", "vae", "73"),
+                ),
+                (
+                    "minimax_h3_audio_vae_fp32.safetensors".to_owned(),
+                    part("minimax_h3_audio_vae_fp32.safetensors", "vae", "74"),
+                ),
+            ]),
+            pricing_unit: Some(USAGE_MEGAPIXEL_STEP.to_owned()),
+            max_width: 1_344,
+            max_height: 768,
+            max_frames: 362,
+            max_duration_seconds: 15,
+            max_steps: 24,
+            ..ComfyWorkflowDerivationPolicy::default()
+        };
+        let derivation =
+            derive_comfy_workflow(request.get("workflow").unwrap(), &policy).unwrap();
+        assert_eq!(
+            derivation.outcome_spec.output_modalities,
+            vec!["audio".to_owned(), "video".to_owned()]
+        );
+        assert_eq!(derivation.outcome_spec.frames, Some(124));
+        assert_eq!(derivation.quoted_usage.get(USAGE_MEGAPIXEL_STEP), 124);
+
+        let mut unbound = request.clone();
+        unbound["input_files"] = json!([]);
+        let err = validate_comfy_workflow_media_input_file_bindings(&unbound)
+            .expect_err("H3 reference audio must be request-carried");
+        assert!(err
+            .to_string()
+            .contains("dialogue/fight-lines.wav but it is not supplied"));
+    }
+
     fn part(name: &str, part_type: &str, byte: &str) -> ComfyWorkflowPartRef {
         ComfyWorkflowPartRef {
             part_id: byte.repeat(32),

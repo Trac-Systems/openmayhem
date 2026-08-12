@@ -316,6 +316,17 @@ not as exact lipsync evidence. Exact mouth-sync stays scoped to the separate
 No local cache bypasses or unanchored Comfy payloads are acceptable for future
 H3 proofs.
 
+The current signed R2V canary exercises reference images only. Official Comfy
+H3 R2V templates also expose standalone audio references through `ref_audios`
+and prompt tags such as `<Audio 1>`. The next quality-gap experiment for
+anime action with a supplied voice track should therefore extend or add an H3
+R2V audio-reference policy using the existing signed H3 R2V parts if validation
+accepts the graph shape. Required proof: request-carried audio in
+`/v1/workflows` `input_files`, admission from signed inventory, paid route proof,
+retained media, and owner review for action, speech intelligibility, and sync.
+Do not count this as complete from a direct Comfy run or from the current
+image-only R2V proof.
+
 On GB10/Spark-class unified-memory hosts, start H3 providers sequentially and
 keep the memory reserve explicit. The accepted `.70` H3 T2V service publishes
 heartbeats with `--memory-reserve 15GB`; the default percentage reserve can
@@ -352,8 +363,8 @@ Current H3 state: official Comfy page plus `Comfy-Org/MiniMax-H3` prove native s
 weights and official template availability. `ComfyUI-MiniMaxH3-Easy` is adoption evidence for a
 compact H3 workflow surface, not permission to admit arbitrary optimizer/API nodes. Spectrum H3 is
 now in scope as a distinct optional enhancer lane with mirrored parts, signed
-policy, admission, and paid route proof, but it still needs owner benefit
-review before product acceptance. The H3 T2V/I2V class has
+policy, admission, and paid route proof, but follow-up review found no measurable
+product lift over base H3, so it is parked and not product-accepted. The H3 T2V/I2V class has
 signed metadata and mainnet rows, a live `.70` CUDA provider, and a retained paid TNK
 `/v1/workflows` quality proof in the operator proof set. Do not replace that proof with a direct
 Comfy run.
