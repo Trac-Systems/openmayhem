@@ -566,6 +566,16 @@ Current runtime status:
   the exact file names and hashes match. All of these must be mirrored into
   `TracNetwork/openmayhem-parts-index` and pulled with `provider parts pull/add`
   before the proof counts.
+  First candidate manifest for the anime-action dialogue proof:
+  `kijai/ComfyUI-WanVideoWrapper@088128b224242e110d3906c6750e9a3a348a659b`
+  as a rootless custom-node part; `MeiGen-AI/MultiTalk@c1ad84009b99ed36c97ab18e4517ca5f98692438`
+  as the upstream implementation reference; `MeiGen-AI/MeiGen-MultiTalk@b3ccbea2f68c89fafb277b9bd907905fff7a9337`
+  `multitalk.safetensors` (~9.95 GB) plus its
+  `diffusion_pytorch_model.safetensors.index.json`; and
+  `TencentGameMate/chinese-wav2vec2-base@3991242c806928916fff4a8c0e4f76acf661b743`
+  `pytorch_model.bin` (~380 MB), config, and preprocessor files. The optional
+  Kokoro TTS files are not on the critical path because the first paid proof
+  should use request-carried audio rather than provider-local TTS.
 - `sync.so`/HeyGen API nodes: these are remote service nodes. They are not acceptable for local OpenMayhem provider proof unless a future catalog policy explicitly declares an external-service lane and its security/payment rules.
 
 LongCat policy requirements for `video.lipsync`:
