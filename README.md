@@ -764,7 +764,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
-| `upscale.diffusion` | Comfy workflow, SeedVR2 diffusion upscale/restore | A/B | signed dev policy; `.70` reference admission passed; paid route proof pending |
+| `upscale.diffusion` | Comfy workflow, SeedVR2 diffusion upscale/restore | A/B | paid fiat proof passed; product review pending |
 | `upscale.conv.le24mp` | Comfy workflow, standalone 4x image upscale | A/B | **live** |
 | `video.minimax_h3.r2v` | Comfy workflow, MiniMax H3 reference-media video with native audio | D | **live** |
 | `video.minimax_h3.t2v_i2v` | Comfy workflow, MiniMax H3 text/image-to-video with native audio | D | **live** |
@@ -1085,8 +1085,14 @@ reference graph SHA-256
 output SHA-256
 `671c24b35e99ee28edbf08b3c88c37472fbb552dfd52764f9f2d6f422149e328`,
 and retained artifact
-`openmayhem-seedvr2-upscale-diffusion-reference-v0.2.136.png`. It is not live
-product capacity until a paid `/v1/workflows` route proof passes.
+`openmayhem-seedvr2-upscale-diffusion-reference-v0.2.136.png`. Paid fiat
+`/v1/workflows` proof passed through a funded gateway against the `.70` provider
+on 2026-08-12 after the mainnet enclave/price/room activation. Retained
+artifact: `openmayhem-seedvr2-upscale-diffusion-paid-v0.2.138.png`, session
+`35b01e56d29b1fe11c1dd1b73fe7eca055ff35825094c7302f2a47c158bb3101`,
+BLAKE3 `22895752f732ddfeb17f3aaa93fbad6b3e2bf60a9e7b9c93c7bcadd3140d1dfb`,
+SHA-256 `e23ce117ba5325919c642a531f69cea09dd9b36a0c27fdcb41ca14790730d9ff`,
+media `256x256` PNG, usage `1` `megapixel_step`.
 
 The `0.2.138` source release fixes Comfy workflow provider startup. Workflow
 providers with a persisted signed admission proof now advertise admission-backed

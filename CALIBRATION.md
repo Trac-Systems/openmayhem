@@ -166,8 +166,16 @@ A Comfy workflow is calibrated only after all gates below pass:
   `openmayhem-seedvr2-upscale-diffusion-reference-v0.2.136.png`, output
   SHA-256
   `671c24b35e99ee28edbf08b3c88c37472fbb552dfd52764f9f2d6f422149e328`,
-  and canary perceptual hash `fe8181818181817f`. Paid route proof is still
-  required before product acceptance.
+  and canary perceptual hash `fe8181818181817f`. Paid fiat `/v1/workflows`
+  proof passed through a funded gateway against the `.70` provider on
+  2026-08-12 after the mainnet enclave/price/room activation. Retained artifact:
+  `openmayhem-seedvr2-upscale-diffusion-paid-v0.2.138.png`, session
+  `35b01e56d29b1fe11c1dd1b73fe7eca055ff35825094c7302f2a47c158bb3101`,
+  usage `1` `megapixel_step`, BLAKE3
+  `22895752f732ddfeb17f3aaa93fbad6b3e2bf60a9e7b9c93c7bcadd3140d1dfb`,
+  output SHA-256
+  `e23ce117ba5325919c642a531f69cea09dd9b36a0c27fdcb41ca14790730d9ff`,
+  media `256x256` PNG.
 - `video.lipsync`: technical InfiniteTalk proof exists but product quality is
   not accepted. Do not present it as the solution for anime action video with
   voice. LongCat Video Avatar 1.5 now has a dev catalog row, signed v17 parts,

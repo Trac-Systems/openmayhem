@@ -216,7 +216,7 @@ Current SeedVR2 diffusion upscale workflow lane:
 | Pricing unit | `megapixel_step` |
 | Required parts | SeedVR2 3B int8 convrot `e2a27b04c8c7244829fc5fbe3281cf7d29c7f65ef315fbb97386a66e2b3da7c7`; SeedVR2 VAE `63e6908333939636708d0661208d534237a117d1a6a36f4c3544c1cff40be6a1` |
 | Reference proof | `.70` admission proof passed with graph SHA-256 `2f8f41767f90fd18a7a7109b156ef2464f9c22648ce37ada3126e02e76fc2c93`; output `openmayhem-seedvr2-upscale-diffusion-reference-v0.2.136.png`; SHA-256 `671c24b35e99ee28edbf08b3c88c37472fbb552dfd52764f9f2d6f422149e328`; canary hash `fe8181818181817f` |
-| Product state | Signed dev policy and reference admission passed; paid `/v1/workflows` route proof still required |
+| Product state | Signed dev policy, reference admission, and paid fiat `/v1/workflows` route proof passed; retained artifact `openmayhem-seedvr2-upscale-diffusion-paid-v0.2.138.png`, session `35b01e56d29b1fe11c1dd1b73fe7eca055ff35825094c7302f2a47c158bb3101`, BLAKE3 `22895752f732ddfeb17f3aaa93fbad6b3e2bf60a9e7b9c93c7bcadd3140d1dfb`, SHA-256 `e23ce117ba5325919c642a531f69cea09dd9b36a0c27fdcb41ca14790730d9ff`, `256x256` PNG, usage `1` `megapixel_step`; product review pending |
 
 Krea providers must add these signed parts before admission:
 
@@ -342,7 +342,7 @@ executable version is not release-pinned, so this document does not invent one.
 | `video.minimax_h3.t2v_i2v` | Comfy workflow video+audio | ComfyUI / signed MiniMax H3 parts | Tier 1; live `.70` CUDA proof; paid dialogue-fight artifact `openmayhem-minimax-h3-anime-dialogue-fight-paid-v0.2.123.mp4` | 96 GiB | 48 GiB | Four signed base parts, 42.29 GiB total |
 | `video.minimax_h3.r2v` | Comfy workflow reference-media video+audio | ComfyUI / signed MiniMax H3 REF2VA parts | Tier 1; live `.70` admission and paid fiat proof `openmayhem-minimax-h3-r2v-paid-proof-v0.2.126.mp4` | 96 GiB | 48 GiB | Four signed R2V parts, 39.55 GiB payload |
 | `upscale.conv.le24mp` | Comfy workflow standalone 4x image upscale | ComfyUI / signed SPANx4 upscaler | Reference admission and paid route proof passed | 16 GiB | 4 GiB | One signed upscaler part, 8.6 MiB |
-| `upscale.diffusion` | Comfy workflow SeedVR2 diffusion upscale | ComfyUI / signed SeedVR2 int8 + VAE parts | Reference admission passed; paid route proof pending | 32 GiB | 10 GiB | Two signed parts, 3.69 GiB payload |
+| `upscale.diffusion` | Comfy workflow SeedVR2 diffusion upscale | ComfyUI / signed SeedVR2 int8 + VAE parts | Reference admission and paid route proof passed; product review pending | 32 GiB | 10 GiB | Two signed parts, 3.69 GiB payload |
 
 The RAM and full-offload columns are catalog admission/guidance fields. Model
 weights, runtime environments, caches, outputs, and build artifacts require
