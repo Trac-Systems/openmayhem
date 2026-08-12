@@ -473,7 +473,14 @@ Current runtime status:
   `/v1/workflows` `input_files`. WAV, FLAC, and MP3 are acceptable only when the workflow-input
   bridge validates bounded duration and writes the files into the isolated Comfy input directory
   for that request. Provider-local seed files are not evidence.
-- LatentSync: the three model files are signed, but the LatentSync node pack is not part of the blessed runtime. Do not admit a LatentSync workflow until that node pack is mirrored, pinned, blessed, and covered by a canary.
+- LatentSync: the three model files are signed, but the LatentSync node pack is
+  not part of the blessed runtime. Do not admit a LatentSync workflow until that
+  node pack is mirrored, pinned, blessed, and covered by a canary. It is also
+  not the right first replacement for the anime-fight proof: the current
+  `ShmuelRonen/ComfyUI-LatentSyncWrapper` README says LatentSync 1.6 is a
+  video+audio lipsync node but works best on clear frontal real-face videos and
+  currently does not support anime/cartoon faces. Treat it as a future
+  real-person lipsync candidate, not the action-anime acceptance path.
 - `sync.so`/HeyGen API nodes: these are remote service nodes. They are not acceptable for local OpenMayhem provider proof unless a future catalog policy explicitly declares an external-service lane and its security/payment rules.
 
 LongCat policy requirements for `video.lipsync`:

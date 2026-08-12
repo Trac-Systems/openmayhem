@@ -202,6 +202,12 @@ A Comfy workflow is calibrated only after all gates below pass:
   face-off/dialogue shot, not full anime choreography. The proof request had to
   use `720x480`-bounded reference input media because larger input images exceed
   the signed input-media cap and are correctly held before dispatch.
+  LatentSync is not the next anime-fight fallback: its model files are signed,
+  but the Comfy node pack is not blessed, and the current wrapper describes a
+  clear-frontal-real-face video+audio path that does not support anime/cartoon
+  faces. Keep the anime action+voice proof on the accepted H3/LTX A/V lanes
+  unless a new signed workflow demonstrates both action and lipsync through the
+  paid route.
 
 Use `scripts/verify-comfy-cheatsheet.py` whenever the signed parts index or
 Comfy cheatsheet changes:
