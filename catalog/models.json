@@ -29515,8 +29515,8 @@
               "calibration_baseline_memory_bytes": 39153800167,
               "calibration_peak_memory_bytes": 47743734759,
               "calibration_f13_budget_bytes": 107374182400,
-              "default_max_inflight_items": 1,
-              "default_max_items_per_request": 1
+              "default_max_inflight_items": 3,
+              "default_max_items_per_request": 3
             },
             "audio": {
               "unit": "second",
@@ -29529,8 +29529,8 @@
               "calibration_baseline_memory_bytes": 39153800167,
               "calibration_peak_memory_bytes": 47743734759,
               "calibration_f13_budget_bytes": 107374182400,
-              "default_max_inflight_items": 1,
-              "default_max_items_per_request": 1
+              "default_max_inflight_items": 2,
+              "default_max_items_per_request": 2
             },
             "video": {
               "unit": "frame",
