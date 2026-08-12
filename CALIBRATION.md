@@ -253,9 +253,14 @@ action anime.
   MultiTalk is not accepted yet. On 2026-08-12, `.70` proved the clean signed
   candidate inventory can materialize, then both sequential and parallel audio
   graphs failed inside `WanVideoSampler` with a missing MultiTalk reference
-  attention map. Do not use provider-local WanVideoWrapper/FantasyTalking files
-  as proof, and do not publish a routing row until admission and a paid
-  `/v1/workflows` proof produce retained quality media.
+  attention map. The narrowed next probe is not a runtime patch: provide
+  request-carried left/right mask PNGs, stack them with core `ImageBatch`,
+  convert the batch with `ImageToMask`, and pass the resulting batched `MASK`
+  into `MultiTalkWav2VecEmbeds.ref_target_masks`. If that still fails, publish
+  no route; the clean path is a newly signed WanVideoWrapper custom-node part
+  that fixes mask propagation. Do not use provider-local WanVideoWrapper or
+  FantasyTalking files as proof, and do not publish a routing row until
+  admission and a paid `/v1/workflows` proof produce retained quality media.
 
 Use `scripts/verify-comfy-cheatsheet.py` whenever the signed parts index or
 Comfy cheatsheet changes:

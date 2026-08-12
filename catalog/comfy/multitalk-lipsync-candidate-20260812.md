@@ -36,8 +36,23 @@ materialized the clean signed candidate inventory with root
 `a8f570b99f081570cca7957f05bc6529f35a730490c4249a17a2a48929e6579e`, but both
 the sequential-audio and parallel-audio reference graphs failed inside
 `WanVideoSampler` with `AttributeError: 'NoneType' object has no attribute
-'max'` from WanVideoWrapper's MultiTalk attention path. Do not advertise this
-candidate until the workflow/runtime issue is solved through the intended
-admission path and a paid `POST /v1/workflows` proof. The retained proof must
-show a two-character anime fight with usable dialogue/audio through the
-OpenMayhem gateway path.
+'max'` from WanVideoWrapper's MultiTalk attention path. Local inspection showed
+why: the wrapper tries to synthesize default two-speaker masks inside
+`multitalk_loop`, but the sampler already copied `ref_target_masks = None`
+before entering that loop, so no reference attention map is computed for the
+two-speaker audio cross-attention. The same failure is reported upstream for
+multi-audio MultiTalk/InfiniteTalk runs, so a provider-local edit is not valid
+evidence.
+
+The next admissible proof path is graph-only if it works: supply explicit
+request-carried left/right mask PNGs, combine them with the core Comfy
+`ImageBatch` node, convert the batch with `ImageToMask`, and feed that single
+batched `MASK` into `MultiTalkWav2VecEmbeds.ref_target_masks`. This uses only
+bounded `/v1/workflows` input media and reviewed node classes. If that graph
+still fails, the clean follow-up is a new signed WanVideoWrapper custom-node
+part that fixes mask propagation, not a local runtime patch.
+
+Do not advertise this candidate until the exact admitted graph produces
+retained quality media through a paid `POST /v1/workflows` proof. The retained
+proof must show a two-character anime fight with usable dialogue/audio through
+the OpenMayhem gateway path.

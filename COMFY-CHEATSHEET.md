@@ -584,8 +584,13 @@ Current runtime status:
   [`catalog/comfy/multitalk-lipsync-candidate-20260812.md`](catalog/comfy/multitalk-lipsync-candidate-20260812.md).
   Current blocker: `.70` admission attempts using both sequential and parallel
   audio reached `WanVideoSampler` but failed in the MultiTalk attention path
-  with a missing `x_ref_attn_map`; keep this candidate out of public routing
-  until that runtime/workflow issue is fixed by proof, not by disabling checks.
+  with a missing `x_ref_attn_map`. The narrowed graph-only probe is to provide
+  request-carried left/right mask PNGs, stack them with core `ImageBatch`,
+  convert the batch with `ImageToMask`, and pass that batched `MASK` into
+  `MultiTalkWav2VecEmbeds.ref_target_masks`. If that still fails, the clean
+  path is a newly signed WanVideoWrapper custom-node part that fixes mask
+  propagation; keep this candidate out of public routing until the issue is
+  fixed by proof, not by disabling checks or editing provider-local files.
   The optional Kokoro TTS files are not on the critical path because the first
   paid proof should use request-carried audio rather than provider-local TTS.
 - `sync.so`/HeyGen API nodes: these are remote service nodes. They are not acceptable for local OpenMayhem provider proof unless a future catalog policy explicitly declares an external-service lane and its security/payment rules.
