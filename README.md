@@ -1071,7 +1071,7 @@ BLAKE3 `25b0a156e76ad22653cee1037f6bc0fb64955e668bc5b3ecc3af39a4915ed8f2`.
 It is not live product capacity until owner review confirms a measurable
 speed/quality benefit over the accepted base H3 lane.
 
-The current signed catalog also materializes the SeedVR2 diffusion
+The `0.2.137` source release materializes the SeedVR2 diffusion
 upscale/restore lane (`upscale.diffusion`) as a signed dev policy using the
 official Comfy-Org SeedVR2 3B int8 convrot model plus SeedVR2 VAE. Parts index
 v19 adds the int8 part and verifies at root
