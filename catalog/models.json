@@ -1,6 +1,6 @@
 {
   "catalog_id": "openmayhem-mainnet",
-  "generated_at": "2026-08-11T06:45:59.902Z",
+  "generated_at": "2026-08-12T03:45:20.000Z",
   "models": [
     {
       "model_id": "Cactus-Compute/needle",
@@ -27686,6 +27686,637 @@
         "video_fingerprints": {
           "workflow-class": {
             "h3-r2v-anime-reference-fight-seed23": "videoav-v1:7b227769647468223a3839362c22686569676874223a3531322c226672616d655f636f756e74223a3132342c226670735f6d696c6c69223a32343030302c22766964656f5f6475726174696f6e5f6d73223a353136372c22617564696f5f6475726174696f6e5f6d73223a353136372c226672616d655f686173686573223a5b2263303030343030303430303934323062343230626530306266323030663330306662383066643830666638326666623766666233653830306330303063303030222c2263303030343030303434303934343062343230626334336266363330663333306633623066663030666631306666396666663966646330306330303063303030222c2263303030303030303830353263353562633433666363376666383330663933306639333066383030666564306636646665666566643838303830303038303030222c2238303030383030303830313238353137386331376363313765633130666330306663393066653830666639306666386666666166623630303830303030303030222c2238303030383030303830303238343137386330376363303765633030663831306639393066386330666163306666646666376466663663303830303030303130222c2238303030383030303830303038343162383431623834336261343231653733386337333865376530653763306537633065626366656663666566633038313830222c2238303030383030303838303038383033396330333863336238633339383333383837333838666630386665343866653038666530616666303237653033376330222c2238303030653030306530303965633162656331623265316230363066383730633836303438363930636664306366653063376534633763373933383731333030222c2238303030383030303863303838633062616330626365336263613337636232303862363063316530383763303837663863376630653766316333653163316330222c2230303030303030303036363033363630333665643333666661316663633166636330666338316530633138303831383038316338383166383837663063376530222c2230303030303030303063303930633339306562643363626332646638633766306337633038376330383363303833343430376630306666383066663830666638222c2266643830666638336665343337653431376363306663376166633766666239336662393366333133653331623832316265303131653063316532643865323330222c2237653038376630383766306437663835653766353831666430303366303033663030326630316166303161663033326630323237303263373031653430313030222c2236343038363530383664303836663038363730386533623836336466303335663033316630333766303364663831376638313966383031663833303030303030222c2263336333653965313666663165376631376666313766663937666633336666313366653131643431313930303039303030303030303030303030303030303030222c2233666638316666393166626661653366623837663164666631666665316666653166666331666663316666633166666331376663306666633030373430303630225d2c22617564696f5f66696e6765727072696e74223a22617564696f737065632d76313a353230303a3337336433393263316130353038663766316465653165336462646264626365323431393138313231373232323665386564653230376533646264366439633533373236323631356663303232306633313265383031646665366430643263303332323932333137316331663134303030336538656565666562643263646265323231623133323132343138316266323063653566633034656564646462633830393131316631333062303030306565663664356566646564666334633362663264333433313262323130613032306330326535653566336537653064396339316332623264316331313133663730663066306166636566663764666431633130393138313032313336316131306664316131376664656366356438643662663232326133313236323730366563653965336533653866626637653364396337323331363064316231363038316130633137313066666561653964616435633433313430336633353165306131666632303265396665666666616564653163643138316531303237333231613138656531366639653865646630646464346334306331333064306130336661306530353236306266366537656264386365626632653264323231663333323131376635303565316563666566306561653864343164336132643231326431363035653730656666303030326639666565356432227d"
+          }
+        }
+      },
+      "price_ref_au": {
+        "denom": "au_usd",
+        "ver": 1,
+        "rate_map": [
+          {
+            "unit": "megapixel_step",
+            "per_unit_au": "103500000000000000",
+            "granularity": 1000
+          }
+        ],
+        "per_req_au": "0",
+        "min_session_au": "0"
+      }
+    },
+    {
+      "model_id": "video.minimax_h3.spectrum",
+      "min_app_version": "0.2.129",
+      "model_class": "workflow",
+      "family": "comfy-minimax-h3-spectrum",
+      "params_b": 33,
+      "tier": "dev",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "publisher_key": "huggingface-repo",
+          "repo": "TracNetwork/openmayhem-parts-index",
+          "revision": "d287a50f4dedb9621f1d78c177e0b694d25c1f8e"
+        },
+        "conversion": [
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:minimax-h3-four-part-official-comfy-layout-plus-spectrum-v0.2.1-custom-node",
+            "input_sha256": "f16f234699472fbe05f97c4ff9a751b293955f55021931390c9f65ac0b2065af",
+            "output_sha256": "f16f234699472fbe05f97c4ff9a751b293955f55021931390c9f65ac0b2065af"
+          }
+        ],
+        "license": "minimax-h3-owner-approved-2026-08-10-and-spectrum-gpl-3.0-or-later",
+        "license_sha256": "59b99642b95ea21630e311198ddbfffbfe05aadba0c2f5d884cbdf4efcc90f44"
+      },
+      "artifacts": {
+        "workflow-class": {
+          "engine": "comfyui",
+          "source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "TracNetwork/openmayhem-parts-index",
+            "revision": "d287a50f4dedb9621f1d78c177e0b694d25c1f8e"
+          },
+          "path": "comfy/outcome-classes/v1/video.minimax_h3.spectrum.json",
+          "artifact_root": "583eec9d510c4bdc8cac1c4af2daec47b3b55c191aa868b8587994c316011440",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 805,
+          "source_sha256": "8bab0f6b63e40bce4b20bc4275c9ff012e484b3023be8b7cf30385f72a928e99",
+          "download_check": false,
+          "notes": "Draft signed Comfy outcome-class definition for the optional MiniMax H3 Spectrum audio-quality workflow; public serving requires a retained paid A/V fingerprint proof."
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": false,
+        "ctx_max": 1,
+        "vision": false,
+        "image": false,
+        "video": true,
+        "audio": true,
+        "output_modality": "video",
+        "output_modalities": [
+          "video",
+          "audio"
+        ],
+        "max_video_width": 1344,
+        "max_video_height": 768,
+        "max_video_frames": 362,
+        "max_video_seconds": 15
+      },
+      "requirements": {
+        "min_ram_gb": 96,
+        "min_vram_gb_full_offload": 48,
+        "cpu_flags": [],
+        "backends": [
+          "comfyui"
+        ]
+      },
+      "adapter": {
+        "endpoint_families": [
+          {
+            "family": "mayhem_comfy_workflows",
+            "request_attributes": [
+              "model",
+              "workflow",
+              "runtime_id",
+              "outcome_class",
+              "timeout_ms",
+              "response_format",
+              "user"
+            ],
+            "required_request_attributes": [
+              "model",
+              "workflow"
+            ],
+            "response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "request_attribute_specs": {
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "calibration_values": [
+                  "$MODEL"
+                ]
+              },
+              "outcome_class": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "video.minimax_h3.spectrum"
+                ]
+              },
+              "response_format": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "artifact",
+                "enum_values": [
+                  "artifact",
+                  "json"
+                ],
+                "calibration_values": [
+                  "artifact",
+                  "json"
+                ]
+              },
+              "runtime_id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "comfyui-v0.30.1"
+                ]
+              },
+              "timeout_ms": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 900000,
+                "minimum": 1000,
+                "maximum": 3600000,
+                "calibration_values": [
+                  900000
+                ]
+              },
+              "user": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 512,
+                "calibration_values": [
+                  "mayhem-calibration-user"
+                ]
+              },
+              "workflow": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "1": {
+                      "class_type": "UNETLoader",
+                      "inputs": {
+                        "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+                        "weight_dtype": "default"
+                      }
+                    },
+                    "2": {
+                      "class_type": "CLIPLoader",
+                      "inputs": {
+                        "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+                        "type": "minimax",
+                        "device": "default"
+                      }
+                    },
+                    "3": {
+                      "class_type": "VAELoader",
+                      "inputs": {
+                        "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+                      }
+                    },
+                    "4": {
+                      "class_type": "VAELoader",
+                      "inputs": {
+                        "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+                      }
+                    },
+                    "5": {
+                      "class_type": "MiniMaxH3ImageToVideo",
+                      "inputs": {
+                        "clip": [
+                          "2",
+                          0
+                        ],
+                        "vae": [
+                          "3",
+                          0
+                        ],
+                        "prompt": "high quality modern anime fight scene, two rival young men in dramatic combat in a neon city alley at night, fast punches and kicks, impact sparks, cloth motion, cinematic camera, both characters shout short lines back and forth, audible voices, action sound effects, clean sharp anime line art",
+                        "width": 896,
+                        "height": 512,
+                        "length": 124
+                      }
+                    },
+                    "6": {
+                      "class_type": "BasicGuider",
+                      "inputs": {
+                        "model": [
+                          "15",
+                          0
+                        ],
+                        "conditioning": [
+                          "5",
+                          0
+                        ]
+                      }
+                    },
+                    "7": {
+                      "class_type": "RandomNoise",
+                      "inputs": {
+                        "noise_seed": 17
+                      }
+                    },
+                    "8": {
+                      "class_type": "KSamplerSelect",
+                      "inputs": {
+                        "sampler_name": "res_multistep"
+                      }
+                    },
+                    "9": {
+                      "class_type": "BasicScheduler",
+                      "inputs": {
+                        "model": [
+                          "15",
+                          0
+                        ],
+                        "scheduler": "simple",
+                        "steps": 20,
+                        "denoise": 1
+                      }
+                    },
+                    "10": {
+                      "class_type": "SamplerCustomAdvanced",
+                      "inputs": {
+                        "noise": [
+                          "7",
+                          0
+                        ],
+                        "guider": [
+                          "6",
+                          0
+                        ],
+                        "sampler": [
+                          "8",
+                          0
+                        ],
+                        "sigmas": [
+                          "9",
+                          0
+                        ],
+                        "latent_image": [
+                          "5",
+                          1
+                        ]
+                      }
+                    },
+                    "11": {
+                      "class_type": "VAEDecode",
+                      "inputs": {
+                        "samples": [
+                          "10",
+                          0
+                        ],
+                        "vae": [
+                          "3",
+                          0
+                        ]
+                      }
+                    },
+                    "12": {
+                      "class_type": "VAEDecodeAudio",
+                      "inputs": {
+                        "samples": [
+                          "10",
+                          0
+                        ],
+                        "vae": [
+                          "4",
+                          0
+                        ]
+                      }
+                    },
+                    "13": {
+                      "class_type": "CreateVideo",
+                      "inputs": {
+                        "images": [
+                          "11",
+                          0
+                        ],
+                        "audio": [
+                          "12",
+                          0
+                        ],
+                        "fps": 24,
+                        "bit_depth": 8
+                      }
+                    },
+                    "14": {
+                      "class_type": "SaveVideo",
+                      "inputs": {
+                        "video": [
+                          "13",
+                          0
+                        ],
+                        "filename_prefix": "mayhem-h3/anime-fight-seed17",
+                        "format": "mp4",
+                        "codec": "auto"
+                      }
+                    },
+                    "15": {
+                      "class_type": "SpectrumApplyMiniMaxH3",
+                      "inputs": {
+                        "model": [
+                          "1",
+                          0
+                        ],
+                        "enabled": true,
+                        "blend_weight": 0.5,
+                        "degree": 1,
+                        "ridge_lambda": 0.1,
+                        "window_size": 2,
+                        "flex_window": 0.75,
+                        "warmup_steps": 1,
+                        "tail_actual_steps": 1,
+                        "max_history": 8,
+                        "debug": false,
+                        "history_storage": "system_ram",
+                        "bootstrap_first_forecast": true,
+                        "anchor_residual_feedback": false,
+                        "selective_rollback_correction": false,
+                        "offline_smoothing_replay": true,
+                        "audio_blend_weight": 0
+                      }
+                    }
+                  }
+                ]
+              }
+            },
+            "response_attribute_specs": {
+              "artifacts": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 0,
+                "max_items": 1000000,
+                "calibration_values": [
+                  []
+                ]
+              },
+              "id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "mayhem": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "object": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "progress": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 0,
+                "maximum": 18446744073709552000,
+                "calibration_values": [
+                  1
+                ]
+              },
+              "status": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "usage": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              }
+            },
+            "interaction_groups": []
+          }
+        ],
+        "chat_template_id": "generic_chatml",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "preserve",
+        "modality_set": [
+          "video",
+          "audio"
+        ]
+      },
+      "modality_assessment": {
+        "detected": [
+          "video",
+          "audio"
+        ],
+        "evidence": [
+          "Draft optional Spectrum H3 policy uses the accepted four signed H3 parts plus signed Spectrum custom-node payload d9a5deca829e775cf5750c203d00499d5528bcc276fb9a84a4722ca133a9f52f from parts-index v14; final product acceptance requires paid A/V proof."
+        ],
+        "calibrated_fingerprints": {},
+        "resource_profiles": {
+          "workflow-class": {
+            "video": {
+              "unit": "frame",
+              "measurement_source": "minimax_h3_reference_profile_pending_paid_admission",
+              "max_item_bytes": 1073741824,
+              "max_item_units": 362,
+              "measured_item_bytes": 1073741824,
+              "measured_item_units": 362,
+              "measured_working_set_bytes": 51539607552,
+              "calibration_baseline_memory_bytes": 21474836480,
+              "calibration_peak_memory_bytes": 73014444032,
+              "calibration_f13_budget_bytes": 103079215104,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            },
+            "audio": {
+              "unit": "second",
+              "measurement_source": "minimax_h3_native_audio_reference_profile_pending_paid_admission",
+              "max_item_bytes": 2880000,
+              "max_item_units": 15,
+              "measured_item_bytes": 2880000,
+              "measured_item_units": 15,
+              "measured_working_set_bytes": 2880000,
+              "calibration_baseline_memory_bytes": 21474836480,
+              "calibration_peak_memory_bytes": 21477716480,
+              "calibration_f13_budget_bytes": 103079215104,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            }
+          }
+        }
+      },
+      "speciality_assessment": {
+        "detected": [],
+        "evidence": [
+          "Optional MiniMax H3 Spectrum audio-quality/smoothing lane; no endpoint speciality is advertised until paid quality proof passes."
+        ],
+        "unsupported": {},
+        "calibrated": {}
+      },
+      "sampling": {
+        "temperature": 1,
+        "top_p": 1
+      },
+      "workflow": {
+        "whitelisted_nodes": [
+          "BasicGuider",
+          "BasicScheduler",
+          "CLIPLoader",
+          "CreateVideo",
+          "KSamplerSelect",
+          "MiniMaxH3ImageToVideo",
+          "RandomNoise",
+          "SamplerCustomAdvanced",
+          "SaveVideo",
+          "UNETLoader",
+          "VAEDecode",
+          "VAEDecodeAudio",
+          "VAELoader",
+          "SpectrumApplyMiniMaxH3"
+        ],
+        "parts": [
+          {
+            "part_id": "4c371bcbf8e7a577457d7b0ace66345fa85c88a591ca0724a5da6e9642371f72",
+            "name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "type": "video-model",
+            "sha256": "e889202c41dafb67b10d67b97f0d8541508036a6090af23425a5c2615d03c47a"
+          },
+          {
+            "part_id": "32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab",
+            "name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            "type": "text-encoder",
+            "sha256": "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6"
+          },
+          {
+            "part_id": "3abef9354f37bb10b413e7034d373e95193511cd80ffa5aea315d1d822032ce7",
+            "name": "minimax_h3_video_vae_fp16.safetensors",
+            "type": "vae",
+            "sha256": "7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522"
+          },
+          {
+            "part_id": "6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2",
+            "name": "minimax_h3_audio_vae_fp32.safetensors",
+            "type": "vae",
+            "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48"
+          },
+          {
+            "part_id": "d9a5deca829e775cf5750c203d00499d5528bcc276fb9a84a4722ca133a9f52f",
+            "name": "ComfyUI-Spectrum-MiniMax-H3 v0.2.1",
+            "type": "custom-node",
+            "sha256": "1e7597c34e1df39c25fa5f176962d4affe47d47816b10ea21774ca54f566c4dc"
+          }
+        ],
+        "runtime_id": "comfyui-v0.30.1",
+        "outcome_class": "video.minimax_h3.spectrum",
+        "outcome_class_definition": {
+          "schema": "openmayhem.comfy.outcome-class-grid.v1",
+          "grid_version": 2,
+          "source": "COMFY-CHEATSHEET.md#optional-calibration-targets-still-missing-public-proof",
+          "class_id": "video.minimax_h3.spectrum",
+          "title": "MiniMax H3 Spectrum audio-quality workflow",
+          "media": "video",
+          "lane": "heavy",
+          "pricing_unit": "megapixel_step",
+          "rate_map": [
+            {
+              "unit": "megapixel_step",
+              "per_unit_au": "103500000000000000",
+              "granularity": 1000
+            }
+          ],
+          "per_req_au": "0",
+          "min_session_au": "0",
+          "caps": {
+            "max_megapixels_per_frame": "1.05",
+            "max_seconds": 15,
+            "max_frames": 362,
+            "trained_frames_min": 124,
+            "trained_frames_max": 362,
+            "fps": 24,
+            "priority_scalars": {
+              "economy": "0.5",
+              "standard": "1",
+              "priority": "2"
+            }
+          }
+        },
+        "pricing_unit": "megapixel_step",
+        "inventory_root": "0d2750e48d9b6d087233b85c0298d50323a9debc507a26cfafff99f951692864",
+        "max_nodes": 32,
+        "max_width": 1344,
+        "max_height": 768,
+        "max_frames": 362,
+        "max_duration_seconds": 15,
+        "max_steps": 24,
+        "max_artifacts": 1
+      },
+      "canary": {
+        "set_id": "canary-minimax-h3-spectrum-workflow-launch-v1",
+        "match_min": 0.9,
+        "verification_method": "video_av_fingerprint",
+        "verification_tolerance_bps": 1500,
+        "fingerprints": {},
+        "token_prefixes": {},
+        "perceptual_hashes": {},
+        "embedding_vectors": {},
+        "transcripts": {},
+        "audio_fingerprints": {},
+        "video_fingerprints": {
+          "workflow-class": {
+            "h3-spectrum-anime-fight-seed17": "videoav-v1:7b227769647468223a3839362c22686569676874223a3531322c226672616d655f636f756e74223a3132342c226670735f6d696c6c69223a32343030302c22766964656f5f6475726174696f6e5f6d73223a353136372c22617564696f5f6475726174696f6e5f6d73223a353136372c226672616d655f686173686573223a5b2230343030303630343036303430363663303436633036363430363730336266383762663666666634336666363337663633376565333036363165303030303030222c2230343030383630343836303438363263383432633032316330323465316334323163363633626566336665373366666633376666333165333036303130303035222c2238363031383730353036323730363265303432653037326330376665383363663831633735316333336263333166653331666666313837623165303130303034222c2230363030303730343036323631653265316332653166326333663463333836373363363737663637316636373166373731666635313830333065303130303034222c2230363030303730343036323430363265303432653036326330373765303365663331616633396137376638663166396631663366316437623165333130303035222c2230343030383630343836323430363265303432653036326330653765316133653338316637383066376531663365306633653666333865663365633130303064222c2230363030303730343036323630363265303432653037326330373765336262663764396633643866336638663366383733663837333835333365313130303063222c2230343030303732343036323430363265303432653036326330313765306663663366636633663866316533663365336630653266303830623036343130303035222c2230343031303630353036323430363263303432633036336330343565306363623366636633666166316661663166616633663866336330623036303130303063222c2230343031303636373036366530343665303132633033666531666665336666623364623337666231316662373366623733663731303837313036303130303034222c2230343030383630343836346338363663303036633032346331653761336264323364643337666433376639333366643333373939333037393365313930303030222c2230343030303630343034346330343663303037633061666330666632316666323166653631666536316663373366643333666633313037623036303130303030222c2230343030303630343034346338653463383034633032346331656636336266613364666133666332336663303337653833376363333463633065306330303063222c2230343030303630343036343430653434306335633065353831656532303366323231663337336533373765336637303366666462643463666565303330303031222c2230343031303630343036346330653463366535303765353033656438383363303031663832336638623766636237386562373065333434373365303330323030222c2230633030306530633063346330653563306335633065353231656632303366613033653030336531303765393137663831376438303163303065303630303030225d2c22617564696f5f66696e6765727072696e74223a22617564696f737065632d76313a353230303a3232323432303165316332303163306430636562646264366439643563616334326133353238323431623265326466666666666230316638663366306364633732353262316231373162323732366639666366626638303466346563633863333239333132353166316131323161303130336630666166396639663064306333316432643233316131636666663065366539653064626436646364306438636532353261323032303166323332363138306330346662663166366536633963303166326232303163316530613162656565666532646565376563653663626332323432353136313531363034666266373039303666336537663064626366626132343230313330666661306631663030313530303131303766626537636562633264333131643231313931373232666130666632303530363031653964396364313631393139306631316635653664396534653164636438643963326265623332373235316132323161313231633037313066663036666366366537643463623264333232373164313931333062306430663035303166636662653863396336313631663161666566636638323132326563666566313065666465356364633933363335333032353235313330396665303866616632663666396532643963653262326432373163313030636633663165386466653264656538646564646361227d"
           }
         }
       },

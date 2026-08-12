@@ -122,8 +122,12 @@ A Comfy workflow is calibrated only after all gates below pass:
   output SHA-256
   `713429ed1163b91b68116390185a3f8ec9d46f879fc95438ae59714cd8dd0887`, and
   retained artifact `openmayhem-minimax-h3-spectrum-reference-v0.2.129.mp4`.
-  Do not publish or serve this lane until a paid `/v1/workflows` proof shows a
-  measurable speed/quality win over the accepted base H3 lane.
+  The signed dev catalog row now has a matching workflow-class canary proof:
+  catalog hash `debf0574baf90c286e132a518986c99ddf2789890cd7b8edb7262c54694fc34a`,
+  canary set `canary-minimax-h3-spectrum-workflow-launch-v1`, and endpoint
+  matrix `49` cases. Do not count it as product-ready public capacity until a
+  paid `/v1/workflows` proof shows a measurable speed/quality win over the
+  accepted base H3 lane.
 - `video.heavy.le0_5mpf`: product-accepted for LTX A/V generation after paid
   `/v1/workflows` proofs with video and audio. It is not lipsync evidence.
 - `image.heavy.le1_2mp`: product-accepted for Krea base image generation after
