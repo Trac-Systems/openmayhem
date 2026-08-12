@@ -1084,8 +1084,7 @@ rather than choreographed fighting action. Keep `video.lipsync` separate from
 general A/V action-video acceptance until a workflow proves convincing action,
 speech, and sync through `/v1/workflows`.
 
-The `0.2.141` source release keeps the `video.lipsync` catalog scoped to the
-existing technical proofs and fixes Comfy custom-node archive extraction to
+The `0.2.141` source release fixed Comfy custom-node archive extraction to
 accept harmless tar PAX metadata while preserving unsafe-path rejection. Source
 installs now build the ComfyUI provider backend by default, so workflow providers
 do not need hidden cargo feature flags. The
@@ -1093,9 +1092,16 @@ do not need hidden cargo feature flags. The
 `openmayhem-infinitetalk-anime-fight-lipsync-reference-v0.2.139.mp4` shows the
 bounded two-character anime-fight graph at `832x480`, `25` fps, `81` frames,
 with AAC audio, but remains technical evidence rather than final lipsync product
-acceptance. The MultiTalk/WanVideoWrapper candidate materialized its clean
-signed inventory on `.70` but failed inside the upstream `WanVideoSampler`
-MultiTalk attention path, so it is deliberately not advertised as routable.
+acceptance.
+
+The `0.2.142` catalog update points the dev `video.lipsync` row at the
+MultiTalk/WanVideoWrapper explicit-mask policy and canary evidence. The retained
+reference artifact is
+`openmayhem-multitalk-explicit-mask-reference-v0.2.141.mp4` (`832x480`, `25`
+fps, `89` frames, `3.56s`, H.264/AAC mono, SHA-256
+`376f1e3dfca3d46368df141df1d10ae282e54796a13bc249e4dde061a6db9f00`). This is
+a signed catalog/admission proof; paid `/v1/workflows` route proof is still
+required before product acceptance.
 
 The `0.2.136` source release materializes the optional MiniMax H3 Spectrum
 workflow lane (`video.minimax_h3.spectrum`) as a signed dev policy with a

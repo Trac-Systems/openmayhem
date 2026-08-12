@@ -271,18 +271,19 @@ below. Current acceptance state:
   choreographed fighting action, so this remains a `video.lipsync` quality-fit
   gap and must not be counted as the general anime-action-with-dialogue product
   proof.
-- Next lipsync/action candidate: MultiTalk/WanVideoWrapper is investigated but
-  not accepted. `MeiGen-AI/MultiTalk` targets
+- Current lipsync/action candidate: MultiTalk/WanVideoWrapper is signed in the
+  `0.2.142` dev catalog row but not product-accepted until paid route proof.
+  `MeiGen-AI/MultiTalk` targets
   audio-driven multi-person conversational video and explicitly covers
   interaction/cartoon use cases; Kijai's `ComfyUI-WanVideoWrapper` exposes
   MultiTalk/FantasyTalking support, but the wrapper is fast-moving and must be
   pinned as a blessed custom-node/runtime part before public serving.
   FantasyTalking alone is single-speaker talking portrait/body-motion support
   and is a fallback for one-speaker avatar proof, not the best two-person anime
-  fight candidate. Current signed parts index does not contain MultiTalk,
-  FantasyTalking, or WanVideoWrapper custom-node records, so the next accepted
-  proof requires new mirrored HF parts, signed records, workflow policy,
-  admission, and paid `/v1/workflows` route evidence.
+  fight candidate. The signed MultiTalk policy uses explicit request-carried
+  masks and the seven-part inventory root
+  `a8f570b99f081570cca7957f05bc6529f35a730490c4249a17a2a48929e6579e`.
+  Product acceptance still requires paid `/v1/workflows` route evidence.
 
 ## Workflow Policy To Parts Matrix
 
@@ -462,7 +463,7 @@ and every referenced file must appear in `workflow.parts`.
 | `upscale.conv.le512mp` | Class exists. A provider policy must choose one or more signed upscaler parts and prove the exact graph. The `le24mp` SPANx4 lane is now a current signed workflow row; larger/restoration variants remain separate policy work. | Convolutional/restoration upscalers: `121becf8`, `17b705c5`, `23178907`, `34889283`, `522bad49`, `6a1ac0ec`, `6adc20e6`, `776268ba`, `7c3058ae`, `7c985640`, `851b706a`, `8dc290bc`, `96cfc3a4`, `a95240c0`, `b40716b2`, `c21510f4`, `dfa6e5df`. Use `e0f339c2` only inside LTX-AV latent-upscale policies. |
 | `upscale.diffusion` | SeedVR2 3B int8 convrot has a signed dev policy, `.70` reference admission proof, toy paid proof, and accepted real-world paid fiat proof. Do not mix diffusion upscale into convolutional-upscale admission. | Active policy parts: `e2a27b04` SeedVR2 3B int8 convrot, `63e69083` SeedVR2 VAE. Older/restoration candidates: `9c98aed7` SeedVR2 3B fp8, `ca6bff3f` SeedVR2 7B fp8. Optional video preprocessing/interpolation support: `6cc88536` RIFE 4.7, `865582d1` RIFE 4.9. |
 | `video.light.le0_5mpf`, `video.light.le2_2mpf`, `video.heavy.le0_5mpf`, `video.heavy.le2_2mpf` | Official LTX-AV uses `video.heavy.le0_5mpf` and has a paid mainnet proof for bounded anime fighting video with a real audio track. That proof is A/V evidence, not lipsync evidence. Other video classes need separate signed policy/canary if their caps or lane differ. | Video models: `34dfabbf` official LTX 2.3 fp8, `25055314` LTX GTAnimation low-VRAM candidate. Text encoders: `20652c80` Gemma 3 12B fp4, `720ea5ea` UMT5-XXL fp8 for Wan policies. LTX AV support: `988522cf` distilled LoRA, `e0f339c2` LTX spatial x2 latent upscaler, `8c108e3c` LTX audio VAE, `32b0af06` LTX tiny VAE. Video support: `40dd2b8b` Wan low-noise control, `660c1350` Wan high-noise control, `79f0076a` Wan VAE, `34889283` animevideo x2, `851b706a` animevideo x4, `6cc88536` RIFE 4.7, `865582d1` RIFE 4.9. |
-| `video.lipsync` | LongCat Avatar 1.5 is the active dev catalog row for anime/stylized talking-video lipsync. It has signed v17 parts, a distinct `comfyui-longcat-avatar-v0.30.1` runtime/custom-node profile, request-carried image/audio `input_files`, workflow-class canary evidence, and paid route proofs. Quality review classifies it as a valid talking-video/lipsync proof, not as the general action-anime-with-dialogue proof: the retained video is a static face-off rather than choreographed fighting. InfiniteTalk remains rejected for product quality. MultiTalk/WanVideoWrapper is the current best action-dialogue candidate: its explicit-mask graph now passes reference admission on `.70` with inventory root `a8f570b99f081570cca7957f05bc6529f35a730490c4249a17a2a48929e6579e`, retained artifact `openmayhem-multitalk-explicit-mask-reference-v0.2.141.mp4`, media `832x480`, `25` fps, `89` frames, `3.56s`, H.264/AAC mono, SHA-256 `376f1e3dfca3d46368df141df1d10ae282e54796a13bc249e4dde061a6db9f00`. It is not public-routable until a signed catalog/canary update and paid `/v1/workflows` proof land. LatentSync remains unblessed. | Active LongCat parts: `03aec730`, `96024250`, `28e2da04`, `1d5b361c` Avatar INT8 shards; `94477286`, `de863798`, `4c9359ce` index/config; `421eaeb5` DMD LoRA; `6b437f1e` VAE; `720ea5ea` UMT5 fp8; `009d64bc` Whisper-large-v3; `29b4d476` custom node. Current MultiTalk candidate parts: `07408ee8` WanVideoWrapper MultiTalk nodes, `0b92e833` MultiTalk projection model, `c4dcb593` Wav2Vec2 Chinese base fp16, `6a05292d` Wan2.1 I2V 14B 480p fp8, `6294fc7c` LightX2V I2V rank64 LoRA, `720ea5ea` UMT5-XXL fp8, and `79f0076a` Wan 2.1 VAE. Older signed lipsync candidates kept for future policies: `471fb7a0` LatentSync Whisper tiny, `d4330bc7` LatentSync SyncNet, `5cebda44` LatentSync UNet, `20bbd004` MeiGen InfiniteTalk single, `d8903b87` MeiGen InfiniteTalk multi, `b36a713b` Comfy-Org InfiniteTalk single fp16, and `fd1d93c0` Comfy-Org InfiniteTalk multi fp16. |
+| `video.lipsync` | MultiTalk/WanVideoWrapper is the active dev catalog row for anime/stylized talking-video lipsync as of `0.2.142`. Its explicit-mask graph passes reference admission on `.70` with inventory root `a8f570b99f081570cca7957f05bc6529f35a730490c4249a17a2a48929e6579e`, retained artifact `openmayhem-multitalk-explicit-mask-reference-v0.2.141.mp4`, media `832x480`, `25` fps, `89` frames, `3.56s`, H.264/AAC mono, SHA-256 `376f1e3dfca3d46368df141df1d10ae282e54796a13bc249e4dde061a6db9f00`. It is signed/admitted but not product-accepted until paid `/v1/workflows` proof lands. LongCat remains a prior paid technical proof for talking-video lipsync only; InfiniteTalk remains rejected for product quality; LatentSync remains unblessed. | Active MultiTalk parts: `07408ee8` WanVideoWrapper MultiTalk nodes, `0b92e833` MultiTalk projection model, `c4dcb593` Wav2Vec2 Chinese base fp16, `6a05292d` Wan2.1 I2V 14B 480p fp8, `6294fc7c` LightX2V I2V rank64 LoRA, `4e06add4` UMT5-XXL bf16, and `79f0076a` Wan 2.1 VAE. Older signed lipsync candidates kept for future policies: LongCat parts `03aec730`, `96024250`, `28e2da04`, `1d5b361c`, `94477286`, `de863798`, `4c9359ce`, `421eaeb5`, `6b437f1e`, `720ea5ea`, `009d64bc`, `29b4d476`; LatentSync `471fb7a0`, `d4330bc7`, `5cebda44`; InfiniteTalk `20bbd004`, `d8903b87`, `b36a713b`, `fd1d93c0`. |
 | `audio.tts`, `audio.generation`, `audio.stt` | Classes exist but this parts index has no standalone TTS, audio-generation, or STT model policy ready for public serving. | No standalone audio-class parts are currently signed. `8c108e3c` is only the LTX AV audio VAE, and the lipsync parts are only for `video.lipsync` policies. |
 | `compute.norm` | Class exists for bounded residual workflow compute, not for arbitrary unsigned execution. | No class-ready parts in this index. A workflow must publish its own signed parts and policy before admission. |
 
@@ -561,7 +562,8 @@ Current runtime status:
   video+audio lipsync node but works best on clear frontal real-face videos and
   currently does not support anime/cartoon faces. Treat it as a future
   real-person lipsync candidate, not the action-anime acceptance path.
-- MultiTalk/FantasyTalking: not signed yet. Upstream research points to
+- MultiTalk/FantasyTalking: MultiTalk is signed as the active `video.lipsync`
+  dev policy in `0.2.142`; FantasyTalking is not signed yet. Upstream research points to
   MultiTalk for multi-person conversation/interactions and FantasyTalking for
   single-speaker talking portraits with stronger body/head motion than classic
   lipsync. Candidate parts to evaluate before any public row are a pinned
@@ -582,15 +584,11 @@ Current runtime status:
   `TencentGameMate/chinese-wav2vec2-base` pickle/bin files if the actual graph
   fails to load the signed safetensors repack. Tracked candidate evidence:
   [`catalog/comfy/multitalk-lipsync-candidate-20260812.md`](catalog/comfy/multitalk-lipsync-candidate-20260812.md).
-  Current blocker: `.70` admission attempts using both sequential and parallel
-  audio reached `WanVideoSampler` but failed in the MultiTalk attention path
-  with a missing `x_ref_attn_map`. The narrowed graph-only probe is to provide
-  request-carried left/right mask PNGs, stack them with core `ImageBatch`,
-  convert the batch with `ImageToMask`, and pass that batched `MASK` into
-  `MultiTalkWav2VecEmbeds.ref_target_masks`. If that still fails, the clean
-  path is a newly signed WanVideoWrapper custom-node part that fixes mask
-  propagation; keep this candidate out of public routing until the issue is
-  fixed by proof, not by disabling checks or editing provider-local files.
+  The original blocker was fixed by proof: request-carried left/right mask PNGs
+  are stacked with core `ImageBatch`, converted with `ImageToMask`, and passed
+  as a batched `MASK` into `MultiTalkWav2VecEmbeds.ref_target_masks`. Keep paid
+  route acceptance separate from this reference admission; do not disable checks
+  or edit provider-local files to make a graph pass.
   The optional Kokoro TTS files are not on the critical path because the first
   paid proof should use request-carried audio rather than provider-local TTS.
 - `sync.so`/HeyGen API nodes: these are remote service nodes. They are not acceptable for local OpenMayhem provider proof unless a future catalog policy explicitly declares an external-service lane and its security/payment rules.

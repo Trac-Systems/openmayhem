@@ -91,9 +91,9 @@ Current catalog count: nine signed workflow rows. Product-accepted rows are
 `video.heavy.le0_5mpf`, `image.heavy.le1_2mp`, `image.heavy.le17mp`, and
 `upscale.conv.le24mp`, and `upscale.diffusion`. `video.minimax_h3.spectrum` is
 proven but parked as an optional enhancer with no measured product lift.
-`video.lipsync` has technical LongCat paid proof and a newer MultiTalk
-reference-admission proof, but still needs a signed MultiTalk catalog policy and
-paid route proof before it closes the action-anime/dialogue quality gap.
+`video.lipsync` has technical LongCat paid proof and a newer signed MultiTalk
+catalog/canary policy with reference-admission proof, but still needs a paid
+route proof before it closes the action-anime/dialogue quality gap.
 
 - `video.minimax_h3.t2v_i2v`: product-accepted for the base H3 T2V/I2V lane
   after signed v12 parts, admission, live provider route, and retained paid
@@ -264,9 +264,9 @@ paid route proof before it closes the action-anime/dialogue quality gap.
   `376f1e3dfca3d46368df141df1d10ae282e54796a13bc249e4dde061a6db9f00`;
   inventory root
   `a8f570b99f081570cca7957f05bc6529f35a730490c4249a17a2a48929e6579e`.
-  Do not publish a routing row until a signed catalog/canary update points
-  `video.lipsync` at that policy and a paid `/v1/workflows` proof produces
-  retained quality media.
+  The `0.2.142` catalog update signs `video.lipsync` against this MultiTalk
+  policy and canary evidence. Do not call the lane product-accepted until a paid
+  `/v1/workflows` proof produces retained quality media through the gateway.
 
 Use `scripts/verify-comfy-cheatsheet.py` whenever the signed parts index or
 Comfy cheatsheet changes:

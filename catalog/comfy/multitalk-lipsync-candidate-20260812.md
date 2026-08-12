@@ -67,12 +67,9 @@ Admission result:
 - artifact SHA-256:
   `376f1e3dfca3d46368df141df1d10ae282e54796a13bc249e4dde061a6db9f00`
 
-This closes the graph/runtime blocker. It does not yet close public paid-route
-acceptance because the current signed `video.lipsync` catalog row still points
-at the older LongCat inventory root
-`d301dcad94837f8b29471de0e7b78d0108dd08d26d273df834dfbcb3ab9ca88b`.
-Advertising MultiTalk through the live gateway therefore requires a signed
-catalog update that changes the `video.lipsync` policy graph, allowed nodes,
-parts envelope, canary, resource evidence, and fingerprint set together. Do not
-advertise this candidate until that signed catalog update is in place and a
-paid `POST /v1/workflows` proof succeeds through the OpenMayhem gateway path.
+This closes the graph/runtime blocker. The `0.2.142` repo catalog signs
+`video.lipsync` against the MultiTalk policy graph, allowed nodes, parts
+envelope, canary, resource evidence, and fingerprint set together. It does not
+yet close public paid-route acceptance: keep the lane out of product-accepted
+status until a paid `POST /v1/workflows` proof succeeds through the OpenMayhem
+gateway path and the retained media passes review.

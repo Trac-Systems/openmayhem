@@ -136,8 +136,8 @@ binary before succeeding. Managed Python backends need no system Python, `venv`,
 `pip`: Mayhem downloads the exact hash-pinned standalone `uv` for the host and atomically creates
 the frozen runtime under `~/.mayhem`.
 **ComfyUI workflows:** verify the blessed ComfyUI runtime checkout, currently
-`comfyui-v0.30.1` for Krea/LTX/MiniMax H3/upscale lanes,
-`comfyui-longcat-avatar-v0.30.1` for the LongCat `video.lipsync` dev lane, or
+`comfyui-v0.30.1` for Krea/LTX/MiniMax H3/upscale/MultiTalk `video.lipsync` lanes,
+`comfyui-longcat-avatar-v0.30.1` only for the older LongCat `video.lipsync` proof lane, or
 `comfyui-2a68ce33b4c9` only for the rejected InfiniteTalk reference lane. Use
 the Python executable that belongs to that runtime; use `python3` only when it
 is the runtime environment's interpreter, otherwise set `MAYHEM_COMFYUI_PYTHON`
