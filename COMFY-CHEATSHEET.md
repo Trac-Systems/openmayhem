@@ -32,6 +32,25 @@ curl -X POST http://127.0.0.1:11435/v1/workflows \
   -d @request.json
 ```
 
+For long workflow renders, use the durable async job path:
+
+```bash
+curl -X POST http://127.0.0.1:11435/v1/workflows \
+  -H 'authorization: Bearer <gateway-token>' \
+  -H 'content-type: application/json' \
+  -H 'prefer: respond-async' \
+  -H 'idempotency-key: <stable-request-key>' \
+  -d @request.json
+```
+
+The initial response is `202 Accepted` with `x-mayhem-job-id` and a
+`/v1/jobs/<id>` location. Poll `GET /v1/jobs/<id>` for state,
+`GET /v1/jobs/<id>/result` for the completed result and receipt, and
+`GET /v1/jobs/<id>/artifacts/<artifact_id>` for retained media. Async clients
+may disconnect between polls. Plain synchronous `/v1/workflows` requests are
+not a background render contract; if the client disconnects before delivery, the
+gateway cancels the request.
+
 Minimal request shape:
 
 ```json

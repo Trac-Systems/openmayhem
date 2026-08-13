@@ -48,6 +48,14 @@ required parts, graph hash, runtime id, output class, and usage from the signed 
 Providers choose and verify their own parts from the anchored parts index; a user request must never
 trigger a provider download.
 
+For long-running Comfy jobs, tell users and client implementers to send
+`Prefer: respond-async` plus a stable `Idempotency-Key` on `POST /v1/workflows`.
+The gateway returns `202 Accepted`, `x-mayhem-job-id`, and `/v1/jobs/<id>`; the
+client can disconnect and later poll `/v1/jobs/<id>`, `/v1/jobs/<id>/result`,
+and `/v1/jobs/<id>/artifacts/<artifact_id>`. Without `Prefer: respond-async`, a
+plain synchronous workflow request waits for delivery and a premature client
+disconnect is cancellation, not a background render promise.
+
 When one host will serve multiple models, start their provider workers **serially**. Wait for each
 worker to finish artifact verification, model load, functional canary, and fresh-heartbeat
 stabilization before admitting and starting the next worker. Concurrent startup can overlap

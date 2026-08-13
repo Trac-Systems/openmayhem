@@ -855,6 +855,25 @@ Schematic request shape:
 }
 ```
 
+Long-running workflow clients should opt into the same durable gateway job path
+used by other artifact endpoints:
+
+```bash
+curl -X POST http://127.0.0.1:11435/v1/workflows \
+  -H 'authorization: Bearer <gateway-token>' \
+  -H 'content-type: application/json' \
+  -H 'prefer: respond-async' \
+  -H 'idempotency-key: <stable-request-key>' \
+  -d @request.json
+```
+
+That returns `202 Accepted`, `x-mayhem-job-id`, and `/v1/jobs/<id>`. The client
+may disconnect, then later poll `GET /v1/jobs/<id>`, retrieve the result with
+`GET /v1/jobs/<id>/result`, and download retained media from
+`GET /v1/jobs/<id>/artifacts/<artifact_id>`. A plain synchronous request without
+`Prefer: respond-async` waits for completion; if that client disconnects before
+delivery, the gateway treats it as cancellation.
+
 Providers never download parts because a user asks for them. A provider first
 pulls verified parts from the anchored parts index, proves a reference graph and
 headroom for an outcome class, then advertises that class through ordinary
