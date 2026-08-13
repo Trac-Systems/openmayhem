@@ -1026,6 +1026,14 @@ dialogue-oriented retained artifact is
 `431caae7624d36a15917a1f7ee60fdd47118b35c5e025f2efc4c41aca372aae1`. These
 proofs must not be replaced by a direct Comfy run.
 
+The same `video.minimax_h3.t2v_i2v` workflow class admits an optional SeedVR2
+2x branch, not a separate public policy. Branch-capable providers must add the
+four H3 parts plus SeedVR2 int8/VAE parts and advertise inventory root
+`1165f3bb28092852c60cdc61d524bb280a45eca39017147484adf9e1d9816ec6`.
+The branch uses final-output billing at `$2.00/1000` `megapixel_step`; the
+retained 896x512/124-frame -> 1792x1024/124-frame proof measured `340.669s`
+base generation, `440.957s` upscale, `781.626s` total, about `$0.496`.
+
 MiniMax H3 REF2VA/reference-media video (`video.minimax_h3.r2v`) is
 product-accepted against parts-index v13. Its policy requires request-carried
 reference media through bounded `/v1/workflows` `input_files`; retained proof

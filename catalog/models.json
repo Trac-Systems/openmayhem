@@ -27028,7 +27028,7 @@
     },
     {
       "model_id": "video.minimax_h3.t2v_i2v",
-      "min_app_version": "0.2.123",
+      "min_app_version": "0.2.144",
       "model_class": "workflow",
       "family": "comfy-minimax-h3",
       "params_b": 33,
@@ -27038,7 +27038,7 @@
           "kind": "huggingface",
           "publisher_key": "huggingface-repo",
           "repo": "TracNetwork/openmayhem-parts-index",
-          "revision": "866c3b60b4804f34c1e84dff58a600cfbd465c73"
+          "revision": "f166080812e390c359b69f491c2196dd1b6d692f"
         },
         "conversion": [
           {
@@ -27058,15 +27058,15 @@
             "kind": "huggingface",
             "publisher_key": "huggingface-repo",
             "repo": "TracNetwork/openmayhem-parts-index",
-            "revision": "866c3b60b4804f34c1e84dff58a600cfbd465c73"
+            "revision": "f166080812e390c359b69f491c2196dd1b6d692f"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.t2v_i2v.json",
-          "artifact_root": "42d00db18bb575e89fb703556f122aa05fd66c1f665259d462f8e0c05183384d",
+          "artifact_root": "60428cfafa4e1262acdc21c638f3118903cc39d5341be00c55a9efeea47d4775",
           "artifact_root_kind": "blake3_merkle_v1",
-          "weights_bytes": 631,
-          "source_sha256": "c199cf4e12e461c5c6c013cba0967615a3d68dea6280ae3de99fe49c16939934",
+          "weights_bytes": 797,
+          "source_sha256": "9d3064a34eb3678b170777398c9139fc0fb1395e3b3db12a325acf90c9baa114",
           "download_check": false,
-          "notes": "Signed Comfy outcome-class definition for MiniMax H3 text/image-to-video providers with native audio; payload bytes are required through the signed parts inventory."
+          "notes": "Signed Comfy outcome-class definition for MiniMax H3 text/image-to-video providers with native audio and an optional SeedVR2 2x branch; payload bytes are required through the signed parts inventory."
         }
       },
       "caps": {
@@ -27082,8 +27082,8 @@
           "video",
           "audio"
         ],
-        "max_video_width": 1344,
-        "max_video_height": 768,
+        "max_video_width": 1792,
+        "max_video_height": 1024,
         "max_video_frames": 362,
         "max_video_seconds": 15
       },
@@ -27361,6 +27361,289 @@
                         "codec": "auto"
                       }
                     }
+                  },
+                  {
+                    "1": {
+                      "class_type": "UNETLoader",
+                      "inputs": {
+                        "unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+                        "weight_dtype": "default"
+                      }
+                    },
+                    "2": {
+                      "class_type": "CLIPLoader",
+                      "inputs": {
+                        "clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+                        "type": "minimax",
+                        "device": "default"
+                      }
+                    },
+                    "3": {
+                      "class_type": "VAELoader",
+                      "inputs": {
+                        "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+                      }
+                    },
+                    "4": {
+                      "class_type": "VAELoader",
+                      "inputs": {
+                        "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+                      }
+                    },
+                    "5": {
+                      "class_type": "MiniMaxH3ImageToVideo",
+                      "inputs": {
+                        "clip": [
+                          "2",
+                          0
+                        ],
+                        "vae": [
+                          "3",
+                          0
+                        ],
+                        "prompt": "high quality modern anime fight scene, two rival young men in dramatic combat in a neon city alley at night, fast punches and kicks, impact sparks, cloth motion, cinematic camera, both characters shout short lines back and forth, audible voices, action sound effects, clean sharp anime line art",
+                        "width": 896,
+                        "height": 512,
+                        "length": 124
+                      }
+                    },
+                    "6": {
+                      "class_type": "BasicGuider",
+                      "inputs": {
+                        "model": [
+                          "1",
+                          0
+                        ],
+                        "conditioning": [
+                          "5",
+                          0
+                        ]
+                      }
+                    },
+                    "7": {
+                      "class_type": "RandomNoise",
+                      "inputs": {
+                        "noise_seed": 17
+                      }
+                    },
+                    "8": {
+                      "class_type": "KSamplerSelect",
+                      "inputs": {
+                        "sampler_name": "res_multistep"
+                      }
+                    },
+                    "9": {
+                      "class_type": "BasicScheduler",
+                      "inputs": {
+                        "model": [
+                          "1",
+                          0
+                        ],
+                        "scheduler": "simple",
+                        "steps": 20,
+                        "denoise": 1
+                      }
+                    },
+                    "10": {
+                      "class_type": "SamplerCustomAdvanced",
+                      "inputs": {
+                        "noise": [
+                          "7",
+                          0
+                        ],
+                        "guider": [
+                          "6",
+                          0
+                        ],
+                        "sampler": [
+                          "8",
+                          0
+                        ],
+                        "sigmas": [
+                          "9",
+                          0
+                        ],
+                        "latent_image": [
+                          "5",
+                          1
+                        ]
+                      }
+                    },
+                    "11": {
+                      "class_type": "VAEDecode",
+                      "inputs": {
+                        "samples": [
+                          "10",
+                          0
+                        ],
+                        "vae": [
+                          "3",
+                          0
+                        ]
+                      }
+                    },
+                    "12": {
+                      "class_type": "VAEDecodeAudio",
+                      "inputs": {
+                        "samples": [
+                          "10",
+                          0
+                        ],
+                        "vae": [
+                          "4",
+                          0
+                        ]
+                      }
+                    },
+                    "13": {
+                      "class_type": "ResizeImageMaskNode",
+                      "inputs": {
+                        "input": [
+                          "11",
+                          0
+                        ],
+                        "resize_type": "scale by multiplier",
+                        "resize_type.multiplier": 2,
+                        "scale_method": "lanczos"
+                      }
+                    },
+                    "14": {
+                      "class_type": "VAELoader",
+                      "inputs": {
+                        "vae_name": "seedvr2_ema_vae_fp16.safetensors"
+                      }
+                    },
+                    "15": {
+                      "class_type": "UNETLoader",
+                      "inputs": {
+                        "unet_name": "seedvr2_3b_int8_convrot.safetensors",
+                        "weight_dtype": "default"
+                      }
+                    },
+                    "16": {
+                      "class_type": "SeedVR2Preprocess",
+                      "inputs": {
+                        "resized_images": [
+                          "13",
+                          0
+                        ]
+                      }
+                    },
+                    "17": {
+                      "class_type": "VAEEncodeTiled",
+                      "inputs": {
+                        "pixels": [
+                          "16",
+                          0
+                        ],
+                        "vae": [
+                          "14",
+                          0
+                        ],
+                        "tile_size": 512,
+                        "overlap": 128,
+                        "temporal_size": 64,
+                        "temporal_overlap": 8
+                      }
+                    },
+                    "18": {
+                      "class_type": "SeedVR2Conditioning",
+                      "inputs": {
+                        "model": [
+                          "15",
+                          0
+                        ],
+                        "vae_conditioning": [
+                          "17",
+                          0
+                        ]
+                      }
+                    },
+                    "19": {
+                      "class_type": "KSampler",
+                      "inputs": {
+                        "seed": 7,
+                        "steps": 1,
+                        "cfg": 1,
+                        "sampler_name": "euler",
+                        "scheduler": "simple",
+                        "denoise": 1,
+                        "model": [
+                          "15",
+                          0
+                        ],
+                        "positive": [
+                          "18",
+                          0
+                        ],
+                        "negative": [
+                          "18",
+                          1
+                        ],
+                        "latent_image": [
+                          "17",
+                          0
+                        ]
+                      }
+                    },
+                    "20": {
+                      "class_type": "VAEDecodeTiled",
+                      "inputs": {
+                        "samples": [
+                          "19",
+                          0
+                        ],
+                        "vae": [
+                          "14",
+                          0
+                        ],
+                        "tile_size": 512,
+                        "overlap": 128,
+                        "temporal_size": 64,
+                        "temporal_overlap": 8
+                      }
+                    },
+                    "21": {
+                      "class_type": "SeedVR2PostProcessing",
+                      "inputs": {
+                        "images": [
+                          "20",
+                          0
+                        ],
+                        "original_resized_images": [
+                          "13",
+                          0
+                        ],
+                        "color_correction_method": "none"
+                      }
+                    },
+                    "22": {
+                      "class_type": "CreateVideo",
+                      "inputs": {
+                        "images": [
+                          "21",
+                          0
+                        ],
+                        "audio": [
+                          "12",
+                          0
+                        ],
+                        "fps": 24,
+                        "bit_depth": 8
+                      }
+                    },
+                    "23": {
+                      "class_type": "SaveVideo",
+                      "inputs": {
+                        "video": [
+                          "22",
+                          0
+                        ],
+                        "filename_prefix": "mayhem-h3/anime-fight-seed17-seedvr2-2x",
+                        "format": "mp4",
+                        "codec": "auto"
+                      }
+                    }
                   }
                 ]
               }
@@ -27460,7 +27743,8 @@
           "audio"
         ],
         "evidence": [
-          "Official Comfy-Org MiniMax H3 workflow assets mirrored as four signed parts in parts-index v12; owner approved MiniMax H3 for served territories on 2026-08-10."
+          "Official Comfy-Org MiniMax H3 workflow assets mirrored as four signed parts in parts-index v12; owner approved MiniMax H3 for served territories on 2026-08-10.",
+          "Optional SeedVR2 2x branch is admitted in the same H3 workflow class using the six-part inventory root 1165f3bb28092852c60cdc61d524bb280a45eca39017147484adf9e1d9816ec6; retained proof generated 896x512/124-frame H3 base in 340.669s and 1792x1024/124-frame 2x SeedVR2 output in 440.957s on 2026-08-13."
         ],
         "calibrated_fingerprints": {},
         "resource_profiles": {
@@ -27514,14 +27798,21 @@
           "BasicScheduler",
           "CLIPLoader",
           "CreateVideo",
+          "KSampler",
           "KSamplerSelect",
           "MiniMaxH3ImageToVideo",
           "RandomNoise",
+          "ResizeImageMaskNode",
           "SamplerCustomAdvanced",
           "SaveVideo",
+          "SeedVR2Conditioning",
+          "SeedVR2PostProcessing",
+          "SeedVR2Preprocess",
           "UNETLoader",
           "VAEDecode",
           "VAEDecodeAudio",
+          "VAEDecodeTiled",
+          "VAEEncodeTiled",
           "VAELoader"
         ],
         "parts": [
@@ -27548,6 +27839,18 @@
             "name": "minimax_h3_audio_vae_fp32.safetensors",
             "type": "vae",
             "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48"
+          },
+          {
+            "part_id": "e2a27b04c8c7244829fc5fbe3281cf7d29c7f65ef315fbb97386a66e2b3da7c7",
+            "name": "seedvr2_3b_int8_convrot.safetensors",
+            "type": "video-model",
+            "sha256": "c3dec8bcc5916843a8a858572970597462e1f2dc598d6dfd818f6cd40f53a157"
+          },
+          {
+            "part_id": "63e6908333939636708d0661208d534237a117d1a6a36f4c3544c1cff40be6a1",
+            "name": "seedvr2_ema_vae_fp16.safetensors",
+            "type": "vae",
+            "sha256": "20678548f420d98d26f11442d3528f8b8c94e57ee046ef93dbb7633da8612ca1"
           }
         ],
         "runtime_id": "comfyui-v0.30.1",
@@ -27564,14 +27867,14 @@
           "rate_map": [
             {
               "unit": "megapixel_step",
-              "per_unit_au": "103500000000000000",
+              "per_unit_au": "2000000000000000000",
               "granularity": 1000
             }
           ],
           "per_req_au": "0",
           "min_session_au": "0",
           "caps": {
-            "max_megapixels_per_frame": "1.05",
+            "max_megapixels_per_frame": "2",
             "max_seconds": 15,
             "max_frames": 362,
             "trained_frames_min": 124,
@@ -27581,14 +27884,23 @@
               "economy": "0.5",
               "standard": "1",
               "priority": "2"
-            }
+            },
+            "native_max_width": 1344,
+            "native_max_height": 768,
+            "upscaled_max_width": 1792,
+            "upscaled_max_height": 1024,
+            "upscale_branch": "seedvr2_2x",
+            "output_modalities": [
+              "video",
+              "audio"
+            ]
           }
         },
         "pricing_unit": "megapixel_step",
-        "inventory_root": "8adf9293fb04adfbf976e809f2bccb0981df155cd24ad1382d8f9062d9251c58",
+        "inventory_root": "1165f3bb28092852c60cdc61d524bb280a45eca39017147484adf9e1d9816ec6",
         "max_nodes": 32,
-        "max_width": 1344,
-        "max_height": 768,
+        "max_width": 1792,
+        "max_height": 1024,
         "max_frames": 362,
         "max_duration_seconds": 15,
         "max_steps": 24,
@@ -27607,7 +27919,8 @@
         "audio_fingerprints": {},
         "video_fingerprints": {
           "workflow-class": {
-            "h3-anime-fight-seed17": "videoav-v1:7b227769647468223a3839362c22686569676874223a3531322c226672616d655f636f756e74223a3132342c226670735f6d696c6c69223a32343030302c22766964656f5f6475726174696f6e5f6d73223a353136372c22617564696f5f6475726174696f6e5f6d73223a353136372c226672616d655f686173686573223a5b2230663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066222c2230663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066225d2c22617564696f5f66696e6765727072696e74223a22617564696f737065632d76313a353136373a3031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031227d"
+            "h3-anime-fight-seed17": "videoav-v1:7b227769647468223a3839362c22686569676874223a3531322c226672616d655f636f756e74223a3132342c226670735f6d696c6c69223a32343030302c22766964656f5f6475726174696f6e5f6d73223a353136372c22617564696f5f6475726174696f6e5f6d73223a353136372c226672616d655f686173686573223a5b2230663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066222c2230663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066306630663066225d2c22617564696f5f66696e6765727072696e74223a22617564696f737065632d76313a353136373a3031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031303130313031227d",
+            "h3-anime-fight-seed17-seedvr2-2x": "videoav-v1:7b227769647468223a313739322c22686569676874223a313032342c226672616d655f636f756e74223a3132342c226670735f6d696c6c69223a32343030302c22766964656f5f6475726174696f6e5f6d73223a353136372c22617564696f5f6475726174696f6e5f6d73223a353136372c226672616d655f686173686573223a5b2230303066396666666666306663313837666666666338646666303163666533646436636638303637303030303030303030303030303030303030343030303430222c2232303738316666396666666639633366666666663961666666383737666331376436633038303630303034303030303030303030303030303030343030303430222c2263336533373165336666666666396666666666666261666561303166663830373134633030303633303034303030303030303030303030303030303030303430222c2238623863323338656666666565336664376666663734373830303363353031303130666630306666303063333030303030303030303036303030373430306638222c2231333130306631303666373064666633666666666663373336303333666466303135666630306666303063333630303031633030303365303030363030303630222c2232363233336532333165323066666166666666666663666666383166666530306463383738306537303063303030303030303030303030303030363030303030222c2234633032376331653363316566663166666666666638666665383363666530306664386338306537303063303030303030303030303030303030363030303030222c2264383066663832663738656366653538376666386630376465303239663030313364636330306666303063313030303030303030303030303030653030303763222c2239303766393037666631653066393631376663316530366636303264333162383364666630306666303038333030303130303030303030373030663330306665222c2262306166623066666637653066373837376630666530336636383763666666616264666638306666383038333830303030303030303030303030303030303430222c2261326666613366666533666165653163666537666630376265383333666333666663396438306563303038303030303030303030303030303030303030303030222c2232646638323766626537666166633636666466666630666665303666663833663135666330306663303038303030303030303030303030303030303030303030222c2230626662346263333466653764383137356139666330376663303365303033663031666630306666303038313030303030303033303030333030343730303637222c2231666666316664383137313862313366373637656330376565303736336466653035666630306666303038333030303030303030303030303030303030303030222c2233663966336666623365363766656665656466366530666565383765666366653835663430306332303038303030303030303030303030303030303030303030222c2233653163376566653366393866646638656266336630663765303333663839373835383438316330303138303030303030303030303030303030303030303030225d2c22617564696f5f66696e6765727072696e74223a22617564696f737065632d76313a353230303a3161313431633139313830643166313631306639663764626533646564616361316431623162313631393134323231363138663166386461643964346438633730623136313131303164306431623135313366396537646665396461646163613339326132323234323930643163306430646630653564336437643064316334343031643138323132383138323130643063663465386463653064396436633834303063313531393163313831333135303466636563653765626533646563643434313932303236323131643132313630306634653664646534646264386363326531613239323232333165313530613036656466396435653264356463636232613134316631653231323931363064666366316466643865626439643963373165313731653136316132393161306466656635656465636563646664626430313630663134316431623236323031326663663265376533656665306466636166363030316531393233326531663066306166336538653465306436643964313038303530353163323931653232306130626636656664386538646264396338333632333230323032343139316431383038656565336439643363656365633832313165323032303163316131643164303866316633653464666435643663653331326532653232316631323232313930356566653764636533643064346337227d"
           }
         }
       },
@@ -27617,7 +27930,7 @@
         "rate_map": [
           {
             "unit": "megapixel_step",
-            "per_unit_au": "103500000000000000",
+            "per_unit_au": "2000000000000000000",
             "granularity": 1000
           }
         ],

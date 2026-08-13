@@ -104,7 +104,16 @@ route proof before it closes the action-anime/dialogue quality gap.
   `f258297d464d7ee060ed9f49f38008b3880379c3cf29adb922769c8c577b7ffc`. The
   stronger dialogue-oriented proof
   `openmayhem-minimax-h3-anime-dialogue-fight-paid-v0.2.123.mp4` shows anime
-  fighting action with native audio; it is still not lipsync evidence.
+  fighting action with native audio; it is still not lipsync evidence. The
+  same workflow policy now admits an optional SeedVR2 2x branch, not a separate
+  public policy: branch-capable providers must advertise six signed parts under
+  inventory root
+  `1165f3bb28092852c60cdc61d524bb280a45eca39017147484adf9e1d9816ec6`. The
+  retained branch proof generated H3 base `896x512`, `124` frames in
+  `340.669s`, then SeedVR2 2x output `1792x1024`, `124` frames in `440.957s`
+  (`781.626s` total). Pricing is one H3 workflow price at `$2.00/1000`
+  `megapixel_step`: base proof usage `124` costs about `$0.248`; the 2x branch
+  usage `248` costs about `$0.496`.
 - `video.minimax_h3.r2v`: product-accepted for the MiniMax H3 REF2VA
   reference-media lane after signed v13 parts, `.70` admission, live route, and
   a paid fiat `/v1/workflows` proof through the `.31` sponsored gateway. The

@@ -166,6 +166,10 @@ route the 4096x4096 output instead of the base image.
 Standalone upscaling is a separate workflow market: `upscale.conv.le24mp` uses
 only the signed `4x-spanx4-ch48.safetensors` part, requires an `input_files`
 image, and has paid-route acceptance evidence.
+MiniMax H3 2x video upscale is different: it is an optional SeedVR2 branch
+inside `video.minimax_h3.t2v_i2v`, requires the six-part inventory root
+`1165f3bb28092852c60cdc61d524bb280a45eca39017147484adf9e1d9816ec6`, and needs
+v0.2.144+ so `ResizeImageMaskNode` final dimensions are billed correctly.
 **Tier 2:** install `tpm2-tools`; the provider uses `/dev/tpmrm0` unprivileged. If the distro owns
 that device as `root:tss`, add the login to the existing group with
 `sudo usermod -aG tss "$USER"`, then start a new login. Mayhem never creates users/groups or changes

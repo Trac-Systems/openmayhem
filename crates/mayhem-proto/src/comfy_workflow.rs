@@ -805,6 +805,34 @@ fn infer_node_image_dimensions(
             }
             Ok(Some(scale_dimensions(source, scale)))
         }
+        "ResizeImageMaskNode" => {
+            let Some(source) = linked_dimensions(inputs, dimensions, &["input", "image", "images"])
+            else {
+                return Ok(None);
+            };
+            let resize_type = inputs
+                .get("resize_type")
+                .and_then(Value::as_str)
+                .map(|value| value.to_ascii_lowercase());
+            let scale = inputs
+                .get("resize_type.multiplier")
+                .and_then(numeric_f64)
+                .or_else(|| inputs.get("multiplier").and_then(numeric_f64));
+            let Some(scale) = scale else {
+                return Ok(Some(source));
+            };
+            if let Some(resize_type) = resize_type.as_deref() {
+                if !resize_type.contains("multiplier") {
+                    return Ok(Some(source));
+                }
+            }
+            if !scale.is_finite() || scale <= 0.0 || scale > 64.0 {
+                return Err(ComfyWorkflowDerivationError::InvalidGraph(
+                    "ResizeImageMaskNode multiplier must be finite and between 0 and 64".to_owned(),
+                ));
+            }
+            Ok(Some(scale_dimensions(source, scale)))
+        }
         "ImageUpscaleWithModel" => {
             let Some(source) = linked_dimensions(inputs, dimensions, &["image", "images"]) else {
                 return Ok(None);
@@ -824,7 +852,16 @@ fn infer_node_image_dimensions(
         _ => Ok(linked_dimensions(
             inputs,
             dimensions,
-            &["image", "images", "samples", "latent_image"],
+            &[
+                "image",
+                "images",
+                "input",
+                "pixels",
+                "resized_images",
+                "original_resized_images",
+                "samples",
+                "latent_image",
+            ],
         )),
     }
 }
@@ -1536,6 +1573,114 @@ mod tests {
             err,
             ComfyWorkflowDerivationError::OutcomeOverflow("width exceeds 1024".to_owned())
         );
+    }
+
+    #[test]
+    fn resize_image_mask_branch_expands_video_workflow_usage() {
+        let policy = ComfyWorkflowDerivationPolicy {
+            whitelisted_nodes: [
+                "UNETLoader",
+                "CLIPLoader",
+                "VAELoader",
+                "MiniMaxH3ImageToVideo",
+                "BasicGuider",
+                "RandomNoise",
+                "KSamplerSelect",
+                "BasicScheduler",
+                "SamplerCustomAdvanced",
+                "VAEDecode",
+                "VAEDecodeAudio",
+                "ResizeImageMaskNode",
+                "SeedVR2Preprocess",
+                "VAEEncodeTiled",
+                "SeedVR2Conditioning",
+                "KSampler",
+                "VAEDecodeTiled",
+                "SeedVR2PostProcessing",
+                "CreateVideo",
+                "SaveVideo",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            parts_by_name: BTreeMap::from([
+                (
+                    "minimax_h3_fl2va_pruned_int8_convrot.safetensors".to_owned(),
+                    part(
+                        "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+                        "video-model",
+                        "61",
+                    ),
+                ),
+                (
+                    "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors".to_owned(),
+                    part(
+                        "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+                        "text-encoder",
+                        "62",
+                    ),
+                ),
+                (
+                    "minimax_h3_video_vae_fp16.safetensors".to_owned(),
+                    part("minimax_h3_video_vae_fp16.safetensors", "vae", "63"),
+                ),
+                (
+                    "minimax_h3_audio_vae_fp32.safetensors".to_owned(),
+                    part("minimax_h3_audio_vae_fp32.safetensors", "vae", "64"),
+                ),
+                (
+                    "seedvr2_3b_int8_convrot.safetensors".to_owned(),
+                    part("seedvr2_3b_int8_convrot.safetensors", "video-model", "65"),
+                ),
+                (
+                    "seedvr2_ema_vae_fp16.safetensors".to_owned(),
+                    part("seedvr2_ema_vae_fp16.safetensors", "vae", "66"),
+                ),
+            ]),
+            pricing_unit: Some(USAGE_MEGAPIXEL_STEP.to_owned()),
+            max_width: 1_792,
+            max_height: 1_024,
+            max_frames: 124,
+            max_steps: 20,
+            max_artifacts: 1,
+            ..ComfyWorkflowDerivationPolicy::default()
+        };
+        let graph = json!({
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "minimax_h3_fl2va_pruned_int8_convrot.safetensors", "weight_dtype": "default"}},
+            "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "type": "minimax", "device": "default"}},
+            "3": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_video_vae_fp16.safetensors"}},
+            "4": {"class_type": "VAELoader", "inputs": {"vae_name": "minimax_h3_audio_vae_fp32.safetensors"}},
+            "5": {"class_type": "MiniMaxH3ImageToVideo", "inputs": {"clip": ["2", 0], "vae": ["3", 0], "prompt": "anime fight", "width": 896, "height": 512, "length": 124}},
+            "6": {"class_type": "BasicGuider", "inputs": {"model": ["1", 0], "conditioning": ["5", 0]}},
+            "7": {"class_type": "RandomNoise", "inputs": {"noise_seed": 17}},
+            "8": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "res_multistep"}},
+            "9": {"class_type": "BasicScheduler", "inputs": {"model": ["1", 0], "scheduler": "simple", "steps": 20, "denoise": 1}},
+            "10": {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["7", 0], "guider": ["6", 0], "sampler": ["8", 0], "sigmas": ["9", 0], "latent_image": ["5", 1]}},
+            "11": {"class_type": "VAEDecode", "inputs": {"samples": ["10", 0], "vae": ["3", 0]}},
+            "12": {"class_type": "VAEDecodeAudio", "inputs": {"samples": ["10", 0], "vae": ["4", 0]}},
+            "13": {"class_type": "ResizeImageMaskNode", "inputs": {"input": ["11", 0], "resize_type": "scale by multiplier", "resize_type.multiplier": 2, "scale_method": "lanczos"}},
+            "14": {"class_type": "VAELoader", "inputs": {"vae_name": "seedvr2_ema_vae_fp16.safetensors"}},
+            "15": {"class_type": "UNETLoader", "inputs": {"unet_name": "seedvr2_3b_int8_convrot.safetensors", "weight_dtype": "default"}},
+            "16": {"class_type": "SeedVR2Preprocess", "inputs": {"resized_images": ["13", 0]}},
+            "17": {"class_type": "VAEEncodeTiled", "inputs": {"pixels": ["16", 0], "vae": ["14", 0], "tile_size": 512, "overlap": 128, "temporal_size": 64, "temporal_overlap": 8}},
+            "18": {"class_type": "SeedVR2Conditioning", "inputs": {"model": ["15", 0], "vae_conditioning": ["17", 0]}},
+            "19": {"class_type": "KSampler", "inputs": {"seed": 7, "steps": 1, "cfg": 1, "sampler_name": "euler", "scheduler": "simple", "denoise": 1, "model": ["15", 0], "positive": ["18", 0], "negative": ["18", 1], "latent_image": ["17", 0]}},
+            "20": {"class_type": "VAEDecodeTiled", "inputs": {"samples": ["19", 0], "vae": ["14", 0], "tile_size": 512, "overlap": 128, "temporal_size": 64, "temporal_overlap": 8}},
+            "21": {"class_type": "SeedVR2PostProcessing", "inputs": {"images": ["20", 0], "original_resized_images": ["13", 0], "color_correction_method": "none"}},
+            "22": {"class_type": "CreateVideo", "inputs": {"images": ["21", 0], "audio": ["12", 0], "fps": 24, "bit_depth": 8}},
+            "23": {"class_type": "SaveVideo", "inputs": {"video": ["22", 0], "filename_prefix": "mayhem-h3/anime-fight-seed17-upscale", "format": "mp4", "codec": "auto"}}
+        });
+
+        let derivation = derive_comfy_workflow(&graph, &policy).unwrap();
+
+        assert_eq!(derivation.outcome_spec.width, Some(1_792));
+        assert_eq!(derivation.outcome_spec.height, Some(1_024));
+        assert_eq!(derivation.outcome_spec.frames, Some(124));
+        assert_eq!(
+            derivation.outcome_spec.output_modalities,
+            vec!["audio".to_owned(), "video".to_owned()]
+        );
+        assert_eq!(derivation.quoted_usage.get(USAGE_MEGAPIXEL_STEP), 248);
     }
 
     #[test]
