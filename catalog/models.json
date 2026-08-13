@@ -27061,10 +27061,10 @@
             "revision": "f166080812e390c359b69f491c2196dd1b6d692f"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.t2v_i2v.json",
-          "artifact_root": "60428cfafa4e1262acdc21c638f3118903cc39d5341be00c55a9efeea47d4775",
+          "artifact_root": "2092da076ac52d4eccddbb2c33a2e71175b589ec9ec715d029839649f4ef6026",
           "artifact_root_kind": "blake3_merkle_v1",
-          "weights_bytes": 797,
-          "source_sha256": "9d3064a34eb3678b170777398c9139fc0fb1395e3b3db12a325acf90c9baa114",
+          "weights_bytes": 796,
+          "source_sha256": "9044ce8d187ece691f033d1f3edb39e54e5e902bee695aaff2ac84a55db51403",
           "download_check": false,
           "notes": "Signed Comfy outcome-class definition for MiniMax H3 text/image-to-video providers with native audio and an optional SeedVR2 2x branch; payload bytes are required through the signed parts inventory."
         }
@@ -27084,7 +27084,7 @@
         ],
         "max_video_width": 1792,
         "max_video_height": 1024,
-        "max_video_frames": 362,
+        "max_video_frames": 360,
         "max_video_seconds": 15
       },
       "requirements": {
@@ -27753,9 +27753,9 @@
               "unit": "frame",
               "measurement_source": "minimax_h3_reference_profile_pending_paid_admission",
               "max_item_bytes": 1073741824,
-              "max_item_units": 362,
+              "max_item_units": 360,
               "measured_item_bytes": 1073741824,
-              "measured_item_units": 362,
+              "measured_item_units": 360,
               "measured_working_set_bytes": 51539607552,
               "calibration_baseline_memory_bytes": 21474836480,
               "calibration_peak_memory_bytes": 73014444032,
@@ -27867,7 +27867,7 @@
           "rate_map": [
             {
               "unit": "megapixel_step",
-              "per_unit_au": "2000000000000000000",
+              "per_unit_au": "694444444444444444",
               "granularity": 1000
             }
           ],
@@ -27876,7 +27876,7 @@
           "caps": {
             "max_megapixels_per_frame": "2",
             "max_seconds": 15,
-            "max_frames": 362,
+            "max_frames": 360,
             "trained_frames_min": 124,
             "trained_frames_max": 362,
             "fps": 24,
@@ -27901,7 +27901,7 @@
         "max_nodes": 32,
         "max_width": 1792,
         "max_height": 1024,
-        "max_frames": 362,
+        "max_frames": 360,
         "max_duration_seconds": 15,
         "max_steps": 24,
         "max_artifacts": 1
@@ -27930,7 +27930,7 @@
         "rate_map": [
           {
             "unit": "megapixel_step",
-            "per_unit_au": "2000000000000000000",
+            "per_unit_au": "694444444444444444",
             "granularity": 1000
           }
         ],
@@ -27973,10 +27973,10 @@
             "revision": "d5b5d1f8d397168f440f1857224c6e27af1dd9b4"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.r2v.json",
-          "artifact_root": "8c75853d2c8f29aaa088e6d3e9aaa9643c2e44d5d893d7733077c11ae9b3942c",
+          "artifact_root": "bd74f0f78c91cea5455815dc91058486ed5194e859a2aa61b1d9bf172102e6bf",
           "artifact_root_kind": "blake3_merkle_v1",
-          "weights_bytes": 786,
-          "source_sha256": "4012b82ce5a5af0cbc1d10fadc262f030e84c1d2b4286292c8264b8ecfdb55d0",
+          "weights_bytes": 625,
+          "source_sha256": "68ccfedcb4738cb1c4b311c3e6f84105fd8640f5883fcd7e7bd195fa88994a33",
           "download_check": false,
           "notes": "Signed Comfy outcome-class definition for MiniMax H3 reference-to-video providers with request-bound reference media; payload bytes are required through the signed parts inventory."
         }
@@ -27996,7 +27996,7 @@
         ],
         "max_video_width": 1344,
         "max_video_height": 768,
-        "max_video_frames": 362,
+        "max_video_frames": 360,
         "max_video_seconds": 15
       },
       "requirements": {
@@ -28433,9 +28433,9 @@
               "unit": "frame",
               "measurement_source": "minimax_h3_r2v_reference_profile_pending_paid_admission",
               "max_item_bytes": 1073741824,
-              "max_item_units": 362,
+              "max_item_units": 360,
               "measured_item_bytes": 1073741824,
-              "measured_item_units": 362,
+              "measured_item_units": 360,
               "measured_working_set_bytes": 51539607552,
               "calibration_baseline_memory_bytes": 21474836480,
               "calibration_peak_memory_bytes": 73014444032,
@@ -28540,7 +28540,7 @@
           "caps": {
             "max_megapixels_per_frame": "1.05",
             "max_seconds": 15,
-            "max_frames": 362,
+            "max_frames": 360,
             "trained_frames_min": 124,
             "trained_frames_max": 362,
             "fps": 24,
@@ -28556,7 +28556,7 @@
         "max_nodes": 40,
         "max_width": 1344,
         "max_height": 768,
-        "max_frames": 362,
+        "max_frames": 360,
         "max_duration_seconds": 15,
         "max_steps": 24,
         "max_artifacts": 1
@@ -28627,10 +28627,10 @@
             "revision": "d287a50f4dedb9621f1d78c177e0b694d25c1f8e"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.spectrum.json",
-          "artifact_root": "583eec9d510c4bdc8cac1c4af2daec47b3b55c191aa868b8587994c316011440",
+          "artifact_root": "70ff781774f1fa02e1556ca413daea8ae52024df2465fd77d711ffe5baaeb829",
           "artifact_root_kind": "blake3_merkle_v1",
-          "weights_bytes": 805,
-          "source_sha256": "8bab0f6b63e40bce4b20bc4275c9ff012e484b3023be8b7cf30385f72a928e99",
+          "weights_bytes": 644,
+          "source_sha256": "abc1397cf1b42d67a2f9ca25ece21cbe59b6863439555e523688a0f544683250",
           "download_check": false,
           "notes": "Draft signed Comfy outcome-class definition for the optional MiniMax H3 Spectrum audio-quality workflow; public serving requires a retained paid A/V fingerprint proof."
         }
@@ -28650,7 +28650,7 @@
         ],
         "max_video_width": 1344,
         "max_video_height": 768,
-        "max_video_frames": 362,
+        "max_video_frames": 360,
         "max_video_seconds": 15
       },
       "requirements": {
@@ -29060,9 +29060,9 @@
               "unit": "frame",
               "measurement_source": "minimax_h3_reference_profile_pending_paid_admission",
               "max_item_bytes": 1073741824,
-              "max_item_units": 362,
+              "max_item_units": 360,
               "measured_item_bytes": 1073741824,
-              "measured_item_units": 362,
+              "measured_item_units": 360,
               "measured_working_set_bytes": 51539607552,
               "calibration_baseline_memory_bytes": 21474836480,
               "calibration_peak_memory_bytes": 73014444032,
@@ -29171,7 +29171,7 @@
           "caps": {
             "max_megapixels_per_frame": "1.05",
             "max_seconds": 15,
-            "max_frames": 362,
+            "max_frames": 360,
             "trained_frames_min": 124,
             "trained_frames_max": 362,
             "fps": 24,
@@ -29187,7 +29187,7 @@
         "max_nodes": 32,
         "max_width": 1344,
         "max_height": 768,
-        "max_frames": 362,
+        "max_frames": 360,
         "max_duration_seconds": 15,
         "max_steps": 24,
         "max_artifacts": 1

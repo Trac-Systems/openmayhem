@@ -67101,15 +67101,29 @@ fn resolve_provider_lifecycle_enclave(
     }
 }
 
-fn current_au_usd_price(schedule: &LedgerPriceSchedule) -> Option<&LedgerPriceRecord> {
-    let current = schedule.current.as_ref()?;
-    (schedule.denom == "au_usd"
-        && current.denom == "au_usd"
-        && schedule.ctx_bracket.as_deref() == current.ctx_bracket.as_deref()
-        && schedule.ctx_bracket_table_ver == current.ctx_bracket_table_ver
-        && !current.rate_map.is_empty()
-        && admin_role_marker_ok(current.set_by_role.as_deref()))
-    .then_some(current)
+fn active_au_usd_price_at(schedule: &LedgerPriceSchedule, at: u64) -> Option<&LedgerPriceRecord> {
+    let selected = schedule
+        .pending
+        .as_ref()
+        .filter(|pending| pending.effective_at <= at)
+        .or(schedule.current.as_ref())?;
+    au_usd_price_record_matches_schedule(schedule, selected).then_some(selected)
+}
+
+fn active_au_usd_price_now(schedule: &LedgerPriceSchedule) -> Option<&LedgerPriceRecord> {
+    active_au_usd_price_at(schedule, unix_epoch_seconds().unwrap_or(0))
+}
+
+fn au_usd_price_record_matches_schedule(
+    schedule: &LedgerPriceSchedule,
+    record: &LedgerPriceRecord,
+) -> bool {
+    schedule.denom == "au_usd"
+        && record.denom == "au_usd"
+        && schedule.ctx_bracket.as_deref() == record.ctx_bracket.as_deref()
+        && schedule.ctx_bracket_table_ver == record.ctx_bracket_table_ver
+        && !record.rate_map.is_empty()
+        && admin_role_marker_ok(record.set_by_role.as_deref())
 }
 
 fn ledger_price_market_key(enclave_id: &str, ctx_bracket: Option<&str>) -> String {
@@ -67119,23 +67133,26 @@ fn ledger_price_market_key(enclave_id: &str, ctx_bracket: Option<&str>) -> Strin
     }
 }
 
-fn current_au_usd_price_for_ctx<'a>(
+fn active_au_usd_price_for_ctx_at<'a>(
     schedule: &'a LedgerPriceSchedule,
     ctx_bracket: Option<&str>,
+    at: u64,
 ) -> Option<&'a LedgerPriceRecord> {
-    let current = current_au_usd_price(schedule)?;
+    let current = active_au_usd_price_at(schedule, at)?;
     (schedule.ctx_bracket.as_deref() == ctx_bracket
         && current.ctx_bracket.as_deref() == ctx_bracket)
         .then_some(current)
 }
 
-fn find_current_au_usd_price_schedule<'a>(
+fn find_active_au_usd_price_schedule_at<'a>(
     prices: &'a [LedgerPriceSchedule],
     enclave_id: &str,
     ctx_bracket: Option<&str>,
+    at: u64,
 ) -> Option<&'a LedgerPriceSchedule> {
     prices.iter().find(|price| {
-        price.enclave_id == enclave_id && current_au_usd_price_for_ctx(price, ctx_bracket).is_some()
+        price.enclave_id == enclave_id
+            && active_au_usd_price_for_ctx_at(price, ctx_bracket, at).is_some()
     })
 }
 
@@ -67165,7 +67182,7 @@ fn provider_join_context_terms_from_price(
     served_specialities: BTreeMap<String, Vec<String>>,
     price: &LedgerPriceSchedule,
 ) -> Result<ProviderJoinContextTerms> {
-    let current = current_au_usd_price(price).with_context(|| {
+    let current = active_au_usd_price_now(price).with_context(|| {
         format!(
             "enclave {} has no current au_usd admin price",
             enclave.enclave_id
@@ -67261,7 +67278,7 @@ fn require_current_au_usd_price<'a>(
                 "enclave {enclave_id} has no admin price; ask the admin to run `mayhem admin set-price` before providers join it"
             )
         })?;
-    if current_au_usd_price(schedule).is_none() {
+    if active_au_usd_price_now(schedule).is_none() {
         bail!(
             "enclave {enclave_id} has no current au_usd admin price; ask the admin to run `mayhem admin set-price` before providers join it"
         );
@@ -69183,7 +69200,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
 
     let mut prices_by_market = BTreeMap::new();
     for schedule in &contract.prices {
-        let Some(price) = current_au_usd_price(schedule) else {
+        let Some(price) = active_au_usd_price_at(schedule, now) else {
             continue;
         };
         let mut price = price.clone();
@@ -72731,10 +72748,11 @@ fn build_provider_candidates(
             &contract.ctx_bracket_schedule,
             now,
         )?;
-        let Some(price) = find_current_au_usd_price_schedule(
+        let Some(price) = find_active_au_usd_price_schedule_at(
             &contract.prices,
             &enclave.enclave_id,
             price_ctx_bracket.as_deref(),
+            now,
         )
         .cloned() else {
             rejections.push(provider_rejection(
@@ -84692,13 +84710,13 @@ fn trt_kv_cache_dtype_for_artifact(
 }
 
 fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSessionTerms> {
+    let started_at = unix_epoch_seconds()?;
     let price = ctx
         .selected
         .price
         .as_ref()
-        .and_then(current_au_usd_price)
+        .and_then(|schedule| active_au_usd_price_at(schedule, started_at))
         .context("selected provider enclave has no current admin price")?;
-    let started_at = unix_epoch_seconds()?;
     let served_ctx = u32::try_from(ctx.selected.served_ctx).unwrap_or(u32::MAX);
     let (ctx_bracket, ctx_bracket_table_ver) = if ctx.selected.enclave.model_class
         == DEFAULT_MODEL_CLASS
@@ -84856,7 +84874,7 @@ fn provider_session_contract_decision(
             "admin price schedule is no longer present for this enclave".to_owned(),
         );
     };
-    if current_au_usd_price(schedule).is_none() {
+    if active_au_usd_price_now(schedule).is_none() {
         return reject(
             "PRICE_VER",
             "admin price schedule is no longer current au_usd".to_owned(),
@@ -105055,6 +105073,36 @@ esac
             wrong_same_model_enclave.enclaves[0].enclave_id
         );
         assert_eq!(models[0].mayhem.markets[0].route_count, 0);
+    }
+
+    #[test]
+    fn gateway_models_use_due_pending_admin_price() {
+        let root = "aa".repeat(32);
+        let mut contract = test_contract(&root);
+        let mut pending = contract.prices[0].current.clone().unwrap();
+        pending.ver = 2;
+        pending.rate_map = text_generation_rate_map(3, 5);
+        pending.effective_at = 0;
+        contract.prices[0].pending = Some(pending);
+
+        let models = gateway_models_from_contract(&contract).unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].mayhem.price_ref_au.ver, 2);
+        assert_eq!(
+            models[0].mayhem.price_ref_au.rate_map,
+            normalize_rate_map(text_generation_rate_map(3, 5))
+        );
+        assert_eq!(models[0].mayhem.markets[0].price_ref_au.ver, 2);
+        assert_eq!(models[0].mayhem.route_candidates[0].price_ver, 2);
+        assert_eq!(
+            models[0].mayhem.route_candidates[0]
+                .price_ref_au
+                .as_ref()
+                .unwrap()
+                .rate_map,
+            normalize_rate_map(text_generation_rate_map(3, 5))
+        );
     }
 
     #[test]
