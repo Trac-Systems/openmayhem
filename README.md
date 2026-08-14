@@ -840,6 +840,10 @@ curl 'http://127.0.0.1:11435/v1/models?endpoint_family=mayhem_comfy_workflows&li
 
 The full provider/user workflow, outcome-class grid, and current signed parts inventory are in
 **[COMFY-CHEATSHEET.md](COMFY-CHEATSHEET.md)**.
+That file is the public GitHub reference for workflow routing details, including
+the MiniMax H3 split between `video.minimax_h3.t2v_i2v` and
+`video.minimax_h3.r2v`. Users and providers should be able to understand
+supported workflow markets from the public repository docs alone.
 Every Comfy calibration must enumerate all files the graph loads in the signed
 workflow policy. Missing checkpoints, encoders, VAEs, LoRAs, ControlNets,
 upscalers, lipsync models, or helper models must be mirrored and signed as
@@ -1030,7 +1034,7 @@ The same `video.minimax_h3.t2v_i2v` workflow class admits an optional SeedVR2
 2x branch, not a separate public policy. Branch-capable providers must add the
 four H3 parts plus SeedVR2 int8/VAE parts and advertise inventory root
 `1165f3bb28092852c60cdc61d524bb280a45eca39017147484adf9e1d9816ec6`.
-The branch uses final-output billing at `$2.00/1000` `megapixel_step`; the
+The branch uses final-output billing at `$0.694444444444444444/1000` `megapixel_step`; the
 retained 896x512/124-frame -> 1792x1024/124-frame proof measured `340.669s`
 base generation, `440.957s` upscale, `781.626s` total, about `$0.496`.
 

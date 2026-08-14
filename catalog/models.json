@@ -27038,7 +27038,7 @@
           "kind": "huggingface",
           "publisher_key": "huggingface-repo",
           "repo": "TracNetwork/openmayhem-parts-index",
-          "revision": "f166080812e390c359b69f491c2196dd1b6d692f"
+          "revision": "79ac7f5c078c44cce04a65430f17daeabe32307e"
         },
         "conversion": [
           {
@@ -27058,7 +27058,7 @@
             "kind": "huggingface",
             "publisher_key": "huggingface-repo",
             "repo": "TracNetwork/openmayhem-parts-index",
-            "revision": "f166080812e390c359b69f491c2196dd1b6d692f"
+            "revision": "79ac7f5c078c44cce04a65430f17daeabe32307e"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.t2v_i2v.json",
           "artifact_root": "2092da076ac52d4eccddbb2c33a2e71175b589ec9ec715d029839649f4ef6026",

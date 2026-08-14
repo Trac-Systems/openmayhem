@@ -114,15 +114,18 @@
       "caps": { "max_megapixels_per_frame": "2.2", "max_seconds": 30, "max_frames": 720, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
     },
     {
+      "schema": "openmayhem.comfy.outcome-class-grid.v1",
+      "grid_version": 2,
+      "source": "COMFY-CHEATSHEET.md#minimax-h3-owner-approved-2026-08-10",
       "class_id": "video.minimax_h3.t2v_i2v",
       "title": "MiniMax H3 text/image-to-video with native audio",
       "media": "video",
-      "lane": "minimax-h3",
+      "lane": "heavy",
       "pricing_unit": "megapixel_step",
-      "rate_map": [{ "unit": "megapixel_step", "per_unit_au": "2000000000000000000", "granularity": 1000 }],
+      "rate_map": [{ "unit": "megapixel_step", "per_unit_au": "694444444444444444", "granularity": 1000 }],
       "per_req_au": "0",
       "min_session_au": "0",
-      "caps": { "max_width": 1792, "max_height": 1024, "max_seconds": 15, "max_frames": 362, "output_modalities": ["video", "audio"], "native_max_width": 1344, "native_max_height": 768, "upscale_branch": "seedvr2_2x", "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+      "caps": { "max_megapixels_per_frame": "2", "max_seconds": 15, "max_frames": 360, "trained_frames_min": 124, "trained_frames_max": 362, "fps": 24, "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" }, "native_max_width": 1344, "native_max_height": 768, "upscaled_max_width": 1792, "upscaled_max_height": 1024, "upscale_branch": "seedvr2_2x", "output_modalities": ["video", "audio"] }
     },
     {
       "class_id": "video.minimax_h3.r2v",

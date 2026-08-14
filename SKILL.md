@@ -30,6 +30,9 @@ Before declaring a new model or workflow done, read
 For ComfyUI workflows, also read **[`COMFY-CHEATSHEET.md`](COMFY-CHEATSHEET.md)** before
 calibrating, admitting, serving, or using a workflow class. It lists every current outcome class,
 the signed parts index, required part sets, and `/v1/workflows` request shape.
+Publicly needed workflow behavior must live in `README.md`, `SKILL.md`,
+`MODEL-CHEATSHEET.md`, or `COMFY-CHEATSHEET.md` so users and providers can
+follow it directly from the GitHub repository.
 Every Comfy calibration must enumerate every file the graph actually loads in the signed workflow
 policy `parts` list. If the graph uses a checkpoint, text encoder, VAE, LoRA, ControlNet,
 upscaler, lipsync model, or helper model that is not in the signed parts index, mirror/sign that

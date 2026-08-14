@@ -70,14 +70,20 @@ bounded PNG/JPEG; audio inputs are accepted only for formats the gateway and pro
 for duration and content type, currently WAV, FLAC, and MP3 when the workflow-input bridge is
 present. If a workflow needs a format outside that list, add bounded validation first.
 
-MiniMax H3 has two separate signed video workflow markets. `video.minimax_h3.t2v_i2v`
-is the base H3 text/image-to-video policy and may include its optional SeedVR2
-2x branch when the provider advertises the six-part inventory root.
-`video.minimax_h3.r2v` is the REF2VA/reference-media policy for request-carried
-reference media through `input_files`. A live `video.minimax_h3.t2v_i2v`
-provider does not make `video.minimax_h3.r2v` dispatch-eligible; clients must
-target the market whose signed policy matches the request shape, and operators
-must keep the corresponding provider route online.
+MiniMax H3 has separate signed video workflow markets. Liveness is per market,
+not per model family: a live base H3 provider does not make reference-media H3
+requests routable.
+
+| Request shape | Target model | Provider route required |
+|---|---|---|
+| Text-to-video or image-to-video through the base FL2VA policy | `video.minimax_h3.t2v_i2v` | A live `video.minimax_h3.t2v_i2v` provider |
+| Base H3 plus optional SeedVR2 2x branch | `video.minimax_h3.t2v_i2v` | A live `video.minimax_h3.t2v_i2v` provider advertising the six-part branch inventory root |
+| Request-carried reference media through `input_files` / REF2VA | `video.minimax_h3.r2v` | A live `video.minimax_h3.r2v` provider |
+
+Clients must target the market whose signed policy matches the request shape,
+and operators must keep the corresponding provider route online. Seeing
+`video.minimax_h3.t2v_i2v` in `/v1/models?live=true` is not evidence that
+`video.minimax_h3.r2v` is available.
 
 ## Provider Path
 
