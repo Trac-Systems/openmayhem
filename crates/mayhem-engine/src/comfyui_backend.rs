@@ -622,8 +622,12 @@ fn normalized_custom_node_archive_path(path: &Path) -> Result<Option<PathBuf>> {
 fn safe_comfyui_custom_node_component(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
-        && !matches!(value, "." | ".." | "__pycache__")
-        && !value.starts_with('.')
+        && !matches!(value, "." | ".." | ".git" | ".env" | "__pycache__")
+        && (!value.starts_with('.')
+            || matches!(
+                value,
+                ".editorconfig" | ".gitattributes" | ".github" | ".gitignore"
+            ))
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
@@ -1327,10 +1331,67 @@ mod tests {
     }
 
     #[test]
+    fn custom_node_archives_allow_harmless_dotfiles() {
+        let temp = test_temp_dir("mayhem-comfy-custom-node-dotfiles");
+        let archive = temp.join("node.tar.gz");
+        write_custom_node_archive(
+            &archive,
+            &[
+                ("__init__.py", b"NODE_CLASS_MAPPINGS = {}\n"),
+                (".gitignore", b"*.pyc\n"),
+                (".github/workflows/publish.yml", b"name: publish\n"),
+            ],
+        );
+        let cache = temp.join("cache");
+
+        materialize_comfyui_custom_nodes(
+            &cache,
+            &[super::super::ComfyUiCustomNodePackage {
+                source: archive,
+                node_dir: PathBuf::from("ComfyUI-TestNode"),
+            }],
+        )
+        .unwrap();
+
+        assert!(cache
+            .join("base/custom_nodes/ComfyUI-TestNode/.gitignore")
+            .is_file());
+        assert!(cache
+            .join("base/custom_nodes/ComfyUI-TestNode/.github/workflows/publish.yml")
+            .is_file());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn custom_node_archives_reject_unsafe_paths() {
         let temp = test_temp_dir("mayhem-comfy-custom-node-escape");
         let archive = temp.join("node.tar.gz");
         write_custom_node_archive(&archive, &[(".git/config", b"bad\n")]);
+        let cache = temp.join("cache");
+
+        let error = materialize_comfyui_custom_nodes(
+            &cache,
+            &[super::super::ComfyUiCustomNodePackage {
+                source: archive,
+                node_dir: PathBuf::from("ComfyUI-TestNode"),
+            }],
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("archive path contains unsafe characters"),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn custom_node_archives_reject_sensitive_dotfiles() {
+        let temp = test_temp_dir("mayhem-comfy-custom-node-dotenv");
+        let archive = temp.join("node.tar.gz");
+        write_custom_node_archive(&archive, &[(".env", b"TOKEN=bad\n")]);
         let cache = temp.join("cache");
 
         let error = materialize_comfyui_custom_nodes(
