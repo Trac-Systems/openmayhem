@@ -70,6 +70,15 @@ bounded PNG/JPEG; audio inputs are accepted only for formats the gateway and pro
 for duration and content type, currently WAV, FLAC, and MP3 when the workflow-input bridge is
 present. If a workflow needs a format outside that list, add bounded validation first.
 
+MiniMax H3 has two separate signed video workflow markets. `video.minimax_h3.t2v_i2v`
+is the base H3 text/image-to-video policy and may include its optional SeedVR2
+2x branch when the provider advertises the six-part inventory root.
+`video.minimax_h3.r2v` is the REF2VA/reference-media policy for request-carried
+reference media through `input_files`. A live `video.minimax_h3.t2v_i2v`
+provider does not make `video.minimax_h3.r2v` dispatch-eligible; clients must
+target the market whose signed policy matches the request shape, and operators
+must keep the corresponding provider route online.
+
 ## Provider Path
 
 Verify the local runtime and backend:
@@ -192,6 +201,9 @@ below. Current acceptance state:
   signed v13 parts, `.70` admission, live route, and a paid fiat
   `/v1/workflows` proof through the `.31` sponsored gateway. The retained proof
   is `openmayhem-minimax-h3-r2v-paid-proof-v0.2.126.mp4`.
+  This is a separate market from `video.minimax_h3.t2v_i2v`; if no R2V provider
+  is live, request-carried reference-media jobs fail with no eligible provider
+  even when the base H3 T2V/I2V lane is online.
 - `video.minimax_h3.spectrum`: signed dev catalog row and workflow-class
   canary proof exist for the optional H3 Spectrum lane. Catalog hash
   `debf0574baf90c286e132a518986c99ddf2789890cd7b8edb7262c54694fc34a`

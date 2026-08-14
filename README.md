@@ -1040,6 +1040,10 @@ reference media through bounded `/v1/workflows` `input_files`; retained proof
 artifact: `openmayhem-minimax-h3-r2v-paid-proof-v0.2.126.mp4`. This is the
 accepted Comfy proof lane for anime fighting action with native voice and sound,
 not a lipsync/talking-head proof.
+This is a separate signed market from `video.minimax_h3.t2v_i2v`. A live
+T2V/I2V provider does not make R2V/reference-media requests routable; clients
+that send request-carried reference media must target `video.minimax_h3.r2v`
+and need a live R2V provider route.
 
 `0.2.139` extends the R2V proof path to two request-carried audio references
 without widening the workflow beyond the signed H3 parts. The retained paid
