@@ -30227,7 +30227,7 @@
             "part_id": "32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab",
             "name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
             "type": "text-encoder",
-            "sha256": "35a88d51044231fe332301d7a62aa81e3f2c6"
+            "sha256": "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6"
           },
           {
             "part_id": "1d5fabc53ac20225d3889b9f13a0d2b2e73b3403fd589ec8bbd8fb1190ff328e",
@@ -30322,7 +30322,7 @@
           "title": "MiniMax H3 low-VRAM text/image-to-video with native audio"
         },
         "pricing_unit": "megapixel_step",
-        "inventory_root": "f9e7cb7dd31befccf3e033e4203a427b886fb33aa7fad54af3268b5a54398900",
+        "inventory_root": "f5ea23a6e3557c7ec434b264c16608cce3ce19c908f26eec54c347252761a72c",
         "max_nodes": 32,
         "max_width": 736,
         "max_height": 1280,
@@ -30969,7 +30969,7 @@
             "part_id": "32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab",
             "name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
             "type": "text-encoder",
-            "sha256": "35a88d51044231fe332301d7a62aa81e3f2c6"
+            "sha256": "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6"
           },
           {
             "part_id": "1d5fabc53ac20225d3889b9f13a0d2b2e73b3403fd589ec8bbd8fb1190ff328e",
