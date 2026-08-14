@@ -139,6 +139,34 @@
       "caps": { "max_width": 1344, "max_height": 768, "max_seconds": 15, "max_frames": 362, "output_modalities": ["video", "audio"], "reference_media": ["image", "audio", "video"], "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
     },
     {
+      "schema": "openmayhem.comfy.outcome-class-grid.v1",
+      "grid_version": 2,
+      "source": "COMFY-CHEATSHEET.md#minimax-h3-low-vram-candidate",
+      "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+      "title": "MiniMax H3 low-VRAM text/image-to-video with native audio",
+      "media": "video",
+      "lane": "minimax-h3-lowvram",
+      "pricing_unit": "megapixel_step",
+      "rate_map": [{ "unit": "megapixel_step", "per_unit_au": "1041666666666666667", "granularity": 1000 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_megapixels_per_frame": "1", "max_seconds": 10, "max_frames": 243, "trained_frames_min": 240, "trained_frames_max": 243, "fps": 24, "allowed_steps": [4, 6, 8], "default_steps": 4, "native_max_width": 736, "native_max_height": 1280, "output_modalities": ["video", "audio"], "reference_media": ["image"], "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
+      "schema": "openmayhem.comfy.outcome-class-grid.v1",
+      "grid_version": 2,
+      "source": "COMFY-CHEATSHEET.md#minimax-h3-low-vram-candidate",
+      "class_id": "video.minimax_h3.lowvram_r2v",
+      "title": "MiniMax H3 low-VRAM reference-to-video with native audio",
+      "media": "video",
+      "lane": "minimax-h3-lowvram",
+      "pricing_unit": "megapixel_step",
+      "rate_map": [{ "unit": "megapixel_step", "per_unit_au": "1041666666666666667", "granularity": 1000 }],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "caps": { "max_megapixels_per_frame": "1", "max_seconds": 10, "max_frames": 243, "trained_frames_min": 240, "trained_frames_max": 243, "fps": 24, "allowed_steps": [4], "default_steps": 4, "native_max_width": 736, "native_max_height": 1280, "output_modalities": ["video", "audio"], "reference_media": ["image", "video"], "priority_scalars": { "economy": "0.5", "standard": "1", "priority": "2" } }
+    },
+    {
       "class_id": "upscale.conv.le24mp",
       "title": "Convolutional upscale/restore <=24MP",
       "media": "image",

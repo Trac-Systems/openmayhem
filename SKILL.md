@@ -178,12 +178,13 @@ MiniMax H3 REF2VA/reference-media requests are a separate signed market:
 R2V capacity. If the request carries reference media through `input_files`, the
 client must target `video.minimax_h3.r2v` and the operator must have that R2V
 provider route live.
-Low-VRAM MiniMax H3 is a separate candidate policy family. For the T2V/I2V
-candidate, only steps `4`, `6`, and `8` are permitted and `4` is the default;
-do not reuse the existing 20-step H3 graph. The submitted low-VRAM R2V graph is
-4-step only. Do not advertise either low-VRAM candidate until all missing parts
-and custom nodes are mirrored/signed and the provider has passed admission plus
-paid `/v1/workflows` proof.
+Low-VRAM MiniMax H3 is a separate policy family on `comfyui-v0.32.0`. For the
+T2V/I2V lane, only steps `4`, `6`, and `8` are permitted and `4` is the
+default; do not reuse the existing 20-step H3 graph. The low-VRAM R2V lane is
+separate and 4-step only. Do not advertise either low-VRAM lane from an older
+release/catalog or without matching provider admission and paid `/v1/workflows`
+proof. The R2V lane itself is supported; the public route is the part that must
+exist before promising availability.
 **Tier 2:** install `tpm2-tools`; the provider uses `/dev/tpmrm0` unprivileged. If the distro owns
 that device as `root:tss`, add the login to the existing group with
 `sudo usermod -aG tss "$USER"`, then start a new login. Mayhem never creates users/groups or changes

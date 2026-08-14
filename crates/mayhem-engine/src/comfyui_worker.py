@@ -390,7 +390,10 @@ async def run_workflow_internal(payload):
         prompt_server.node_replace_manager.apply_replacements(prompt)
         valid = await execution.validate_prompt(prompt_id, prompt, None)
         if not valid[0]:
-            raise RuntimeError(f"ComfyUI workflow failed validation: {valid[1]}")
+            detail = {"error": valid[1]}
+            if len(valid) > 3:
+                detail["node_errors"] = valid[3]
+            raise RuntimeError(f"ComfyUI workflow failed validation: {detail}")
         extra_data = {"client_id": client_id, "create_time": int(time.time() * 1000)}
         outputs_to_execute = valid[2]
         sensitive = {}

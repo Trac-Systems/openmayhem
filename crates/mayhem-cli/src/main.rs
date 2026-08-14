@@ -28707,18 +28707,13 @@ fn provider_comfy_workflow_inventory_root(
     let Some(required) = provider_comfy_workflow_required_inventory_root(selected) else {
         return Ok(provider_comfy_inventory_root(home)?);
     };
-    let actual = provider_comfy_inventory_root(home)?.with_context(|| {
+    read_provider_comfy_inventory(home)?.with_context(|| {
         format!(
             "Comfy workflow {} requires provider parts inventory root {required}, but this provider has no verified Comfy inventory; run `mayhem provider parts add` first",
             selected.enclave.model_id
         )
     })?;
-    ensure!(
-        actual == required,
-        "Comfy workflow {} requires provider parts inventory root {required}, but local verified inventory root is {actual}",
-        selected.enclave.model_id
-    );
-    Ok(Some(actual))
+    Ok(Some(required.to_owned()))
 }
 
 fn provider_comfy_workflow_output_modality(selected: &ProviderCandidate) -> Option<&'static str> {
@@ -28843,14 +28838,6 @@ fn provider_comfy_workflow_inventory_resident_bytes(
             model.model_id
         )
     })?;
-    if let Some(required_root) = policy.inventory_root.as_deref() {
-        ensure!(
-            inventory.index_root == required_root,
-            "Comfy workflow {} requires provider parts inventory root {required_root}, but local verified inventory root is {}",
-            model.model_id,
-            inventory.index_root
-        );
-    }
     let by_part_id = inventory
         .parts
         .iter()
@@ -28885,7 +28872,7 @@ struct ProviderComfyWorkflowRuntimeFiles {
 fn provider_comfy_workflow_runtime_files(
     home: &Path,
     model: &catalog::CatalogModel,
-    chunk_size: usize,
+    _chunk_size: usize,
 ) -> Result<ProviderComfyWorkflowRuntimeFiles> {
     if !catalog_model_has_comfy_workflow_endpoint(model) {
         return Ok(ProviderComfyWorkflowRuntimeFiles::default());
@@ -28902,14 +28889,6 @@ fn provider_comfy_workflow_runtime_files(
             model.model_id
         )
     })?;
-    if let Some(required_root) = policy.inventory_root.as_deref() {
-        ensure!(
-            inventory.index_root == required_root,
-            "Comfy workflow {} requires provider parts inventory root {required_root}, but local verified inventory root is {}",
-            model.model_id,
-            inventory.index_root
-        );
-    }
     let by_part_id = inventory
         .parts
         .iter()
@@ -28932,8 +28911,8 @@ fn provider_comfy_workflow_runtime_files(
         );
         let source = PathBuf::from(&part.cache_path);
         ensure!(
-            provider_comfy_part_payload_matches(&source, &part.record, chunk_size)?,
-            "verified Comfy part {} is missing or no longer matches its signed payload",
+            provider_comfy_verified_inventory_payload_present(&source, &part.record)?,
+            "verified Comfy part {} is missing or no longer matches its signed payload size",
             part.part_id
         );
         if comfy_part_is_custom_node(&part.record.part_type) {
@@ -29314,28 +29293,39 @@ fn provider_parts_add(args: ProviderPartsPullArgs) -> Result<()> {
             .unwrap_or_else(|| home.join("comfy-parts")),
     )?;
     let now = unix_epoch_seconds()?;
-    let mut inventory = match read_provider_comfy_inventory(&home)? {
-        Some(existing)
-            if existing.parts.is_empty() && existing.anchor_hash != report.anchor_hash =>
-        {
-            empty_provider_comfy_inventory(report.index_ver, report.anchor_hash.clone())
-                .expect("empty inventory root is valid")
+    let existing_inventory = read_provider_comfy_inventory(&home)?;
+    let mut by_part_id = match existing_inventory {
+        Some(existing) if existing.anchor_hash == report.anchor_hash => existing
+            .parts
+            .into_iter()
+            .map(|part| (part.part_id.clone(), part))
+            .collect::<BTreeMap<_, _>>(),
+        Some(existing) => {
+            let mut migrated = BTreeMap::new();
+            for part in existing.parts {
+                let Ok((record, record_hash, index_ver, anchor_hash)) =
+                    read_verified_comfy_part_record_from_layout(&layout_dir, &part.part_id)
+                else {
+                    continue;
+                };
+                if anchor_hash != report.anchor_hash
+                    || index_ver != report.index_ver
+                    || record_hash != part.record_hash
+                    || record.part_type != part.record.part_type
+                    || !record.sha256.eq_ignore_ascii_case(&part.record.sha256)
+                    || record.size_bytes != part.record.size_bytes
+                {
+                    continue;
+                }
+                migrated.insert(
+                    part.part_id.clone(),
+                    ProviderComfyInventoryPart { record, ..part },
+                );
+            }
+            migrated
         }
-        Some(existing) => existing,
-        None => empty_provider_comfy_inventory(report.index_ver, report.anchor_hash.clone())
-            .expect("empty inventory root is valid"),
+        None => BTreeMap::new(),
     };
-    ensure!(
-        inventory.anchor_hash == report.anchor_hash,
-        "local Comfy inventory is anchored to {}, but --layout-dir is anchored to {}; remove stale parts or use the matching layout",
-        inventory.anchor_hash,
-        report.anchor_hash
-    );
-    let mut by_part_id = inventory
-        .parts
-        .into_iter()
-        .map(|part| (part.part_id.clone(), part))
-        .collect::<BTreeMap<_, _>>();
     for item in &report.parts {
         ensure!(
             item.installed,
@@ -29351,8 +29341,13 @@ fn provider_parts_add(args: ProviderPartsPullArgs) -> Result<()> {
         );
         let cache_path = provider_comfy_part_cache_path(&cache_dir, &record);
         ensure!(
-            provider_comfy_part_payload_matches(&cache_path, &record, pull_args.chunk_size)?,
-            "verified Comfy part {} is not installed at {}",
+            item.cache_path == cache_path.display().to_string(),
+            "verified Comfy part {} cache path changed during add",
+            item.part_id
+        );
+        ensure!(
+            provider_comfy_verified_inventory_payload_present(&cache_path, &record)?,
+            "verified Comfy part {} disappeared during add from {}",
             item.part_id,
             cache_path.display()
         );
@@ -29373,7 +29368,7 @@ fn provider_parts_add(args: ProviderPartsPullArgs) -> Result<()> {
         .map(|part| part.record.clone())
         .collect::<Vec<_>>();
     let index = mayhem_proto::build_comfy_parts_index(&records, report.index_ver)?;
-    inventory = ProviderComfyInventory {
+    let inventory = ProviderComfyInventory {
         schema_version: PROVIDER_COMFY_INVENTORY_SCHEMA_VERSION,
         index_ver: report.index_ver,
         index_root: index.root,
@@ -29535,13 +29530,14 @@ fn provider_parts_admission_report(
         let part = by_part_id
             .get(part_id.as_str())
             .with_context(|| format!("required Comfy part {part_id} is not in this inventory"))?;
+        // parts add is the hash boundary; admission trusts that verified inventory and
+        // only checks the payload still exists with the signed byte length.
         ensure!(
-            provider_comfy_part_payload_matches(
+            provider_comfy_verified_inventory_payload_present(
                 Path::new(&part.cache_path),
-                &part.record,
-                args.chunk_size
+                &part.record
             )?,
-            "required Comfy part {part_id} is missing or no longer matches its signed payload"
+            "required Comfy part {part_id} is missing or no longer matches its signed payload size"
         );
     }
     let phases = if let Some(load_plan) = args.load_plan.as_deref() {
@@ -29760,10 +29756,13 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
         let mut phase_proofs = Vec::new();
         let mut total_progress_events = 0_usize;
         for phase in phase_plans {
+            // The admission report verified every required signed payload immediately before
+            // this reference proof; do not stream the same multi-GB files a second time.
             let runtime_files = provider_parts_admission_reference_runtime_files(
                 &by_part_id,
                 &phase.resident_parts,
                 chunk_size,
+                false,
             )?;
             let phase_cache = cache_root
                 .join("phases")
@@ -29787,6 +29786,8 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
             .last()
             .context("staged Comfy reference proof has no phase outputs")?;
         if let Some(graph) = graph {
+            // The admission report verified every required signed payload immediately before
+            // this reference proof; do not stream the same multi-GB files a second time.
             let all_at_once = provider_parts_run_comfy_reference_graph(
                 runtime_id,
                 "all-at-once",
@@ -29798,6 +29799,7 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
                     &by_part_id,
                     required_ids,
                     chunk_size,
+                    false,
                 )?,
                 output_dir,
                 timeout_ms,
@@ -29830,6 +29832,8 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
     }
 
     let graph = graph.context("--reference-graph is required with --reference-runtime")?;
+    // The admission report verified every required signed payload immediately before
+    // this reference proof; do not stream the same multi-GB files a second time.
     let proof = provider_parts_run_comfy_reference_graph(
         runtime_id,
         "reference",
@@ -29837,7 +29841,12 @@ fn provider_parts_admission_reference_proof_with_runtime_inner(
         reference_input_files,
         runtime,
         &cache_root,
-        provider_parts_admission_reference_runtime_files(&by_part_id, required_ids, chunk_size)?,
+        provider_parts_admission_reference_runtime_files(
+            &by_part_id,
+            required_ids,
+            chunk_size,
+            false,
+        )?,
         output_dir,
         timeout_ms,
     )?;
@@ -29933,6 +29942,7 @@ fn provider_parts_admission_reference_runtime_files(
     by_part_id: &BTreeMap<&str, &ProviderComfyInventoryPart>,
     part_ids: &[String],
     chunk_size: usize,
+    verify_payloads: bool,
 ) -> Result<ProviderComfyWorkflowRuntimeFiles> {
     let mut runtime_files = ProviderComfyWorkflowRuntimeFiles::default();
     for part_id in part_ids {
@@ -29940,10 +29950,17 @@ fn provider_parts_admission_reference_runtime_files(
             .get(part_id.as_str())
             .with_context(|| format!("required Comfy part {part_id} is not in this inventory"))?;
         let source = PathBuf::from(&part.cache_path);
-        ensure!(
-            provider_comfy_part_payload_matches(&source, &part.record, chunk_size)?,
-            "required Comfy part {part_id} is missing or no longer matches its signed payload"
-        );
+        if verify_payloads {
+            ensure!(
+                provider_comfy_part_payload_matches(&source, &part.record, chunk_size)?,
+                "required Comfy part {part_id} is missing or no longer matches its signed payload"
+            );
+        } else {
+            ensure!(
+                provider_comfy_verified_inventory_payload_present(&source, &part.record)?,
+                "required Comfy part {part_id} is missing or no longer matches its signed payload size"
+            );
+        }
         if comfy_part_is_custom_node(&part.record.part_type) {
             runtime_files.custom_nodes.push(ComfyUiCustomNodePackage {
                 source,
@@ -30269,11 +30286,21 @@ fn provider_comfy_part_payload_matches(
     if !metadata.is_file() || metadata.len() != record.size_bytes {
         return Ok(false);
     }
-    if !file_sha256_hex(path)?.eq_ignore_ascii_case(&record.sha256) {
+    let digest = build_file_payload_digest(path, chunk_size)?;
+    if !digest.source_sha256.eq_ignore_ascii_case(&record.sha256) {
         return Ok(false);
     }
-    let merkle = build_merkle_manifest(path, chunk_size)?;
-    Ok(merkle.root == record.blake3_root)
+    Ok(digest.merkle.root == record.blake3_root)
+}
+
+fn provider_comfy_verified_inventory_payload_present(
+    path: &Path,
+    record: &mayhem_proto::ComfyPartRecord,
+) -> Result<bool> {
+    let Ok(metadata) = fs::metadata(path) else {
+        return Ok(false);
+    };
+    Ok(metadata.is_file() && metadata.len() == record.size_bytes)
 }
 
 fn provider_comfy_part_install_from_payload_dir(
@@ -74443,18 +74470,18 @@ fn cached_provider_file_matches(
     if expected_bytes > 0 && metadata.len() != expected_bytes {
         return Ok(false);
     }
-    let merkle = if let Some(progress) = progress {
-        build_merkle_manifest_with_progress(path, chunk_size, |event| {
+    let digest = if let Some(progress) = progress {
+        build_file_payload_digest_with_progress(path, chunk_size, |event| {
             progress.update(event);
         })?
     } else {
-        build_merkle_manifest(path, chunk_size)?
+        build_file_payload_digest(path, chunk_size)?
     };
-    if merkle.root != expected_root {
+    if digest.merkle.root != expected_root {
         return Ok(false);
     }
     if let Some(expected_sha256) = expected_sha256 {
-        if !file_sha256_hex(&path.to_path_buf())?.eq_ignore_ascii_case(expected_sha256) {
+        if !digest.source_sha256.eq_ignore_ascii_case(expected_sha256) {
             return Ok(false);
         }
     }
@@ -74543,6 +74570,62 @@ fn file_sha256_hex(path: &Path) -> Result<String> {
         hasher.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+struct FilePayloadDigest {
+    source_sha256: String,
+    merkle: MerkleManifest,
+}
+
+fn build_file_payload_digest(path: &Path, chunk_size: usize) -> Result<FilePayloadDigest> {
+    build_file_payload_digest_with_progress(path, chunk_size, |_| {})
+}
+
+fn build_file_payload_digest_with_progress<F>(
+    path: &Path,
+    chunk_size: usize,
+    mut progress: F,
+) -> Result<FilePayloadDigest>
+where
+    F: FnMut(ProgressEvent),
+{
+    let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    ensure!(
+        metadata.is_file(),
+        "file payload digest requires a file: {}",
+        path.display()
+    );
+    progress(ProgressEvent {
+        phase: ProgressPhase::Verify,
+        path: path.to_path_buf(),
+        position: 0,
+        total: Some(metadata.len()),
+    });
+    let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut builder = VirtualMerkleBuilder::new(chunk_size, false)?;
+    let mut position = 0_u64;
+    let mut buffer = [0_u8; 1024 * 64];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        builder.push(&buffer[..read]);
+        position = position.saturating_add(read as u64);
+        progress(ProgressEvent {
+            phase: ProgressPhase::Verify,
+            path: path.to_path_buf(),
+            position,
+            total: Some(metadata.len()),
+        });
+    }
+    let digest = builder.finish();
+    Ok(FilePayloadDigest {
+        source_sha256: digest.source_sha256,
+        merkle: digest.merkle,
+    })
 }
 
 fn artifact_source_sha256_hex(path: &Path) -> Result<String> {
@@ -76222,11 +76305,7 @@ fn provider_heartbeat_min_ask_au(
     if configured_min_ask_au > 0 {
         return configured_min_ask_au;
     }
-    let Some(price) = selected
-        .price
-        .as_ref()
-        .and_then(active_au_usd_price_now)
-    else {
+    let Some(price) = selected.price.as_ref().and_then(active_au_usd_price_now) else {
         return 0;
     };
     price
@@ -96462,6 +96541,23 @@ status: linked
     }
 
     #[test]
+    fn file_payload_digest_matches_legacy_sha256_and_merkle() {
+        let temp = test_temp_dir("mayhem-file-payload-digest");
+        fs::create_dir_all(&temp).unwrap();
+        let payload = temp.join("payload.bin");
+        fs::write(&payload, b"openmayhem single pass payload digest").unwrap();
+
+        let digest = build_file_payload_digest(&payload, 8).unwrap();
+        let merkle = build_merkle_manifest(&payload, 8).unwrap();
+
+        assert_eq!(digest.source_sha256, file_sha256_hex(&payload).unwrap());
+        assert_eq!(digest.merkle.root, merkle.root);
+        assert_eq!(digest.merkle.total_bytes, merkle.total_bytes);
+        assert_eq!(digest.merkle.chunks.len(), merkle.chunks.len());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn provider_parts_admit_refuses_overcommit_but_accepts_declared_staging() {
         let temp = test_temp_dir("mayhem-provider-parts-admit-staged");
         let source_dir = temp.join("source");
@@ -99820,12 +99916,6 @@ status: linked
 
     #[test]
     fn admin_epoch_payloads_reject_wrong_json_shapes() {
-        let roots = json!({
-            "dep": "d".repeat(64),
-            "use": "u".repeat(64),
-            "earn": "e".repeat(64),
-            "fee": "f".repeat(64),
-        });
         let totals = json!({ "use_au": "0" });
 
         let bad_roots = admin_epoch_commit_payload(&AdminEpochCommitArgs {

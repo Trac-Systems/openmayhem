@@ -1049,13 +1049,14 @@ T2V/I2V provider does not make R2V/reference-media requests routable; clients
 that send request-carried reference media must target `video.minimax_h3.r2v`
 and need a live R2V provider route.
 
-The submitted low-VRAM MiniMax H3 workflow pack is a separate candidate, not a
-replacement for the current H3 markets. Candidate T2V/I2V must use W4A8/INT8
-parts and allow only `4`, `6`, or `8` steps, with `4` as the default; 20-step
-H3 graphs are rejected for that policy. Candidate R2V currently has only a
-4-step submitted graph. Neither low-VRAM candidate is public until the missing
-parts are mirrored/signed, the current Comfy runtime is proven or split, and
-admission plus paid `/v1/workflows` proof pass.
+The submitted low-VRAM MiniMax H3 workflow pack is a separate policy family,
+not a replacement for the current H3 markets. Low-VRAM T2V/I2V uses W4A8/INT8
+parts and allows only `4`, `6`, or `8` steps, with `4` as the default; 20-step
+H3 graphs are rejected for that policy. Low-VRAM R2V is a separate 4-step
+reference-media market. Both low-VRAM lanes require `comfyui-v0.32.0`; source
+reference admission proofs passed, but public serving is not live until a
+matching release/catalog, provider admission, and paid `/v1/workflows` route
+proof exist.
 
 `0.2.139` extends the R2V proof path to two request-carried audio references
 without widening the workflow beyond the signed H3 parts. The retained paid

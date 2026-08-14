@@ -29223,7 +29223,1878 @@
         "min_session_au": "0"
       }
     },
-                {
+    {
+      "model_id": "video.minimax_h3.lowvram_t2v_i2v",
+      "min_app_version": "0.2.147",
+      "model_class": "workflow",
+      "family": "comfy-minimax-h3",
+      "params_b": 33,
+      "tier": "dev",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "publisher_key": "huggingface-repo",
+          "repo": "TracNetwork/openmayhem-parts-index",
+          "revision": "3fae8359db18e4d3ac4d498bc032dcbe39fe0b9e"
+        },
+        "conversion": [
+          {
+            "tool": "openmayhem-comfy-policy-converter",
+            "method": "canonical-conversion:MiniMax_H3_ComfyUI_Workflow_Pack.zip-to-mayhem-policy-v1",
+            "input_sha256": "c762bb0b7559ad2650cb446dc8edb593c2292ad9d10e55fabad10fd373d73a35",
+            "output_sha256": "595e419f02d40bb6bfe0c43ca701297b21b23d907cca17aa381c291d7b4a2073"
+          }
+        ],
+        "license": "minimax-h3-owner-approved-2026-08-10",
+        "license_sha256": "59b99642b95ea21630e311198ddbfffbfe05aadba0c2f5d884cbdf4efcc90f44"
+      },
+      "artifacts": {
+        "workflow-class": {
+          "engine": "comfyui",
+          "source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "TracNetwork/openmayhem-parts-index",
+            "revision": "3fae8359db18e4d3ac4d498bc032dcbe39fe0b9e"
+          },
+          "path": "comfy/outcome-classes/v1/video.minimax_h3.lowvram_t2v_i2v.json",
+          "artifact_root": "3cd7ddea8da5d3e4fb53f4a9a76dd63d9d177eb9052eb770f4ff04b44ab2fad0",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 807,
+          "source_sha256": "595e419f02d40bb6bfe0c43ca701297b21b23d907cca17aa381c291d7b4a2073",
+          "download_check": false,
+          "notes": "Signed Comfy outcome-class definition for the converted low-VRAM MiniMax H3 text/image-to-video lane. The workflow uses the W4A8 FL2VA model, INT8 video VAE, native audio VAE, 4/6/8-step turbo LoRAs, and pinned low-VRAM custom nodes through the signed parts inventory."
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": false,
+        "ctx_max": 1,
+        "vision": false,
+        "image": true,
+        "video": true,
+        "audio": true,
+        "output_modality": "video",
+        "output_modalities": [
+          "video",
+          "audio"
+        ],
+        "max_video_width": 736,
+        "max_video_height": 1280,
+        "max_video_frames": 243,
+        "max_video_seconds": 10
+      },
+      "requirements": {
+        "min_ram_gb": 48,
+        "min_vram_gb_full_offload": 16,
+        "cpu_flags": [],
+        "backends": [
+          "comfyui"
+        ]
+      },
+      "adapter": {
+        "endpoint_families": [
+          {
+            "family": "mayhem_comfy_workflows",
+            "request_attributes": [
+              "model",
+              "workflow",
+              "runtime_id",
+              "outcome_class",
+              "timeout_ms",
+              "response_format",
+              "input_files",
+              "user"
+            ],
+            "required_request_attributes": [
+              "model",
+              "workflow"
+            ],
+            "response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "request_attribute_specs": {
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "calibration_values": [
+                  "$MODEL"
+                ]
+              },
+              "outcome_class": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "video.minimax_h3.lowvram_t2v_i2v"
+                ]
+              },
+              "response_format": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "artifact",
+                "enum_values": [
+                  "artifact",
+                  "json"
+                ],
+                "calibration_values": [
+                  "artifact",
+                  "json"
+                ]
+              },
+              "runtime_id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "comfyui-v0.32.0"
+                ]
+              },
+              "timeout_ms": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 900000,
+                "minimum": 1000,
+                "maximum": 3600000,
+                "calibration_values": [
+                  900000
+                ]
+              },
+              "user": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 512,
+                "calibration_values": [
+                  "mayhem-calibration-user"
+                ]
+              },
+              "workflow": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "1": {
+                      "class_type": "MiniMaxH3EasyLoader",
+                      "inputs": {
+                        "audio_vae": "minimax_h3_audio_vae_fp32.safetensors",
+                        "fl2va_model": "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors",
+                        "ref2va_model": "None",
+                        "text_encoder": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+                        "video_vae": "minimax_h3_video_vae_int8_convrot.safetensors"
+                      }
+                    },
+                    "2": {
+                      "class_type": "MiniMaxH3Easy",
+                      "inputs": {
+                        "advanced": false,
+                        "aspect_ratio": "9:16",
+                        "fps": 24,
+                        "h3_bundle": [
+                          "1",
+                          0
+                        ],
+                        "height": 1280,
+                        "keyframe_role": "first",
+                        "mode": "image",
+                        "prompt": "A compact cinematic product demo of a small robot chef flipping pancakes in a tiny neon diner, clear motion, native cafe ambience, no subtitles, no watermark.",
+                        "prompt_optimizer_scene_guide": "none",
+                        "prompt_optimizer_settings": false,
+                        "ref_image_size": "match",
+                        "reference_mention_mode": "index",
+                        "resolution": "720P",
+                        "seconds": 10,
+                        "width": 736
+                      }
+                    },
+                    "4": {
+                      "class_type": "BasicGuider",
+                      "inputs": {
+                        "conditioning": [
+                          "13",
+                          0
+                        ],
+                        "model": [
+                          "27",
+                          0
+                        ]
+                      }
+                    },
+                    "5": {
+                      "class_type": "BasicScheduler",
+                      "inputs": {
+                        "denoise": 1,
+                        "model": [
+                          "27",
+                          0
+                        ],
+                        "scheduler": "simple",
+                        "steps": 4
+                      }
+                    },
+                    "6": {
+                      "class_type": "RandomNoise",
+                      "inputs": {
+                        "noise_seed": 4242424242
+                      }
+                    },
+                    "7": {
+                      "class_type": "KSamplerSelect",
+                      "inputs": {
+                        "sampler_name": "euler"
+                      }
+                    },
+                    "8": {
+                      "class_type": "SamplerCustomAdvanced",
+                      "inputs": {
+                        "guider": [
+                          "4",
+                          0
+                        ],
+                        "latent_image": [
+                          "13",
+                          1
+                        ],
+                        "noise": [
+                          "6",
+                          0
+                        ],
+                        "sampler": [
+                          "7",
+                          0
+                        ],
+                        "sigmas": [
+                          "5",
+                          0
+                        ]
+                      }
+                    },
+                    "9": {
+                      "class_type": "VAEDecode",
+                      "inputs": {
+                        "samples": [
+                          "8",
+                          0
+                        ],
+                        "vae": [
+                          "13",
+                          2
+                        ]
+                      }
+                    },
+                    "10": {
+                      "class_type": "VAEDecodeAudio",
+                      "inputs": {
+                        "samples": [
+                          "8",
+                          1
+                        ],
+                        "vae": [
+                          "13",
+                          3
+                        ]
+                      }
+                    },
+                    "11": {
+                      "class_type": "CreateVideo",
+                      "inputs": {
+                        "audio": [
+                          "10",
+                          0
+                        ],
+                        "bit_depth": 8,
+                        "fps": 24,
+                        "images": [
+                          "9",
+                          0
+                        ]
+                      }
+                    },
+                    "12": {
+                      "class_type": "SaveVideo",
+                      "inputs": {
+                        "codec": "auto",
+                        "filename_prefix": "mayhem-h3-lowvram/t2v-4step-seed4242424242",
+                        "format": "mp4",
+                        "video": [
+                          "11",
+                          0
+                        ]
+                      }
+                    },
+                    "13": {
+                      "class_type": "MiniMaxH3EasyOutput",
+                      "inputs": {
+                        "h3_context": [
+                          "2",
+                          1
+                        ]
+                      }
+                    },
+                    "24": {
+                      "class_type": "LoraLoaderModelOnly",
+                      "inputs": {
+                        "lora_name": "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_resized_avg_rank_21_bf16.safetensors",
+                        "model": [
+                          "2",
+                          0
+                        ],
+                        "strength_model": 1
+                      }
+                    },
+                    "26": {
+                      "class_type": "MiniMaxLowVRAMAttention",
+                      "inputs": {
+                        "head_chunks": 4,
+                        "model": [
+                          "30",
+                          0
+                        ]
+                      }
+                    },
+                    "27": {
+                      "class_type": "MiniMaxChunkFeedForward",
+                      "inputs": {
+                        "chunks": 2,
+                        "model": [
+                          "26",
+                          0
+                        ],
+                        "seq_threshold": 4096
+                      }
+                    },
+                    "30": {
+                      "class_type": "MiniMaxH3SigmaShift",
+                      "inputs": {
+                        "model": [
+                          "24",
+                          0
+                        ],
+                        "shift_audio": 3,
+                        "shift_video": 6
+                      }
+                    }
+                  },
+                  {
+                    "1": {
+                      "class_type": "MiniMaxH3EasyLoader",
+                      "inputs": {
+                        "audio_vae": "minimax_h3_audio_vae_fp32.safetensors",
+                        "fl2va_model": "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors",
+                        "ref2va_model": "None",
+                        "text_encoder": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+                        "video_vae": "minimax_h3_video_vae_int8_convrot.safetensors"
+                      }
+                    },
+                    "2": {
+                      "class_type": "MiniMaxH3Easy",
+                      "inputs": {
+                        "advanced": false,
+                        "aspect_ratio": "9:16",
+                        "fps": 24,
+                        "h3_bundle": [
+                          "1",
+                          0
+                        ],
+                        "height": 1280,
+                        "keyframe_role": "first",
+                        "mode": "image",
+                        "prompt": "A compact cinematic product demo of a small robot chef flipping pancakes in a tiny neon diner, clear motion, native cafe ambience, no subtitles, no watermark.",
+                        "prompt_optimizer_scene_guide": "none",
+                        "prompt_optimizer_settings": false,
+                        "ref_image_size": "match",
+                        "reference_mention_mode": "index",
+                        "resolution": "720P",
+                        "seconds": 10,
+                        "width": 736
+                      }
+                    },
+                    "4": {
+                      "class_type": "BasicGuider",
+                      "inputs": {
+                        "conditioning": [
+                          "13",
+                          0
+                        ],
+                        "model": [
+                          "27",
+                          0
+                        ]
+                      }
+                    },
+                    "5": {
+                      "class_type": "BasicScheduler",
+                      "inputs": {
+                        "denoise": 1,
+                        "model": [
+                          "27",
+                          0
+                        ],
+                        "scheduler": "beta",
+                        "steps": 6
+                      }
+                    },
+                    "6": {
+                      "class_type": "RandomNoise",
+                      "inputs": {
+                        "noise_seed": 4242424242
+                      }
+                    },
+                    "7": {
+                      "class_type": "KSamplerSelect",
+                      "inputs": {
+                        "sampler_name": "euler"
+                      }
+                    },
+                    "8": {
+                      "class_type": "SamplerCustomAdvanced",
+                      "inputs": {
+                        "guider": [
+                          "4",
+                          0
+                        ],
+                        "latent_image": [
+                          "13",
+                          1
+                        ],
+                        "noise": [
+                          "6",
+                          0
+                        ],
+                        "sampler": [
+                          "7",
+                          0
+                        ],
+                        "sigmas": [
+                          "5",
+                          0
+                        ]
+                      }
+                    },
+                    "9": {
+                      "class_type": "VAEDecode",
+                      "inputs": {
+                        "samples": [
+                          "8",
+                          0
+                        ],
+                        "vae": [
+                          "13",
+                          2
+                        ]
+                      }
+                    },
+                    "10": {
+                      "class_type": "VAEDecodeAudio",
+                      "inputs": {
+                        "samples": [
+                          "8",
+                          1
+                        ],
+                        "vae": [
+                          "13",
+                          3
+                        ]
+                      }
+                    },
+                    "11": {
+                      "class_type": "CreateVideo",
+                      "inputs": {
+                        "audio": [
+                          "10",
+                          0
+                        ],
+                        "bit_depth": 8,
+                        "fps": 24,
+                        "images": [
+                          "9",
+                          0
+                        ]
+                      }
+                    },
+                    "12": {
+                      "class_type": "SaveVideo",
+                      "inputs": {
+                        "codec": "auto",
+                        "filename_prefix": "mayhem-h3-lowvram/t2v-6step-seed4242424242",
+                        "format": "mp4",
+                        "video": [
+                          "11",
+                          0
+                        ]
+                      }
+                    },
+                    "13": {
+                      "class_type": "MiniMaxH3EasyOutput",
+                      "inputs": {
+                        "h3_context": [
+                          "2",
+                          1
+                        ]
+                      }
+                    },
+                    "24": {
+                      "class_type": "LoraLoaderModelOnly",
+                      "inputs": {
+                        "lora_name": "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors",
+                        "model": [
+                          "2",
+                          0
+                        ],
+                        "strength_model": 1
+                      }
+                    },
+                    "26": {
+                      "class_type": "MiniMaxLowVRAMAttention",
+                      "inputs": {
+                        "head_chunks": 4,
+                        "model": [
+                          "30",
+                          0
+                        ]
+                      }
+                    },
+                    "27": {
+                      "class_type": "MiniMaxChunkFeedForward",
+                      "inputs": {
+                        "chunks": 2,
+                        "model": [
+                          "26",
+                          0
+                        ],
+                        "seq_threshold": 4096
+                      }
+                    },
+                    "30": {
+                      "class_type": "MiniMaxH3SigmaShift",
+                      "inputs": {
+                        "model": [
+                          "24",
+                          0
+                        ],
+                        "shift_audio": 3,
+                        "shift_video": 6
+                      }
+                    }
+                  },
+                  {
+                    "1": {
+                      "class_type": "MiniMaxH3EasyLoader",
+                      "inputs": {
+                        "audio_vae": "minimax_h3_audio_vae_fp32.safetensors",
+                        "fl2va_model": "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors",
+                        "ref2va_model": "None",
+                        "text_encoder": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+                        "video_vae": "minimax_h3_video_vae_int8_convrot.safetensors"
+                      }
+                    },
+                    "2": {
+                      "class_type": "MiniMaxH3Easy",
+                      "inputs": {
+                        "advanced": false,
+                        "aspect_ratio": "9:16",
+                        "fps": 24,
+                        "h3_bundle": [
+                          "1",
+                          0
+                        ],
+                        "height": 1280,
+                        "keyframe_role": "first",
+                        "media": [
+                          "29",
+                          0
+                        ],
+                        "mode": "image",
+                        "prompt": "Use the reference image as the main character. The character bounces forward like a playful boxer doing quick air-boxing moves, small hops, energetic motion, native room ambience, no subtitles, no watermark.",
+                        "prompt_optimizer_scene_guide": "none",
+                        "prompt_optimizer_settings": false,
+                        "ref_image_size": "match",
+                        "reference_mention_mode": "index",
+                        "resolution": "720P",
+                        "seconds": 10,
+                        "width": 736
+                      }
+                    },
+                    "4": {
+                      "class_type": "BasicGuider",
+                      "inputs": {
+                        "conditioning": [
+                          "13",
+                          0
+                        ],
+                        "model": [
+                          "27",
+                          0
+                        ]
+                      }
+                    },
+                    "5": {
+                      "class_type": "BasicScheduler",
+                      "inputs": {
+                        "denoise": 1,
+                        "model": [
+                          "27",
+                          0
+                        ],
+                        "scheduler": "simple",
+                        "steps": 8
+                      }
+                    },
+                    "6": {
+                      "class_type": "RandomNoise",
+                      "inputs": {
+                        "noise_seed": 4242424243
+                      }
+                    },
+                    "7": {
+                      "class_type": "KSamplerSelect",
+                      "inputs": {
+                        "sampler_name": "euler"
+                      }
+                    },
+                    "8": {
+                      "class_type": "SamplerCustomAdvanced",
+                      "inputs": {
+                        "guider": [
+                          "4",
+                          0
+                        ],
+                        "latent_image": [
+                          "13",
+                          1
+                        ],
+                        "noise": [
+                          "6",
+                          0
+                        ],
+                        "sampler": [
+                          "7",
+                          0
+                        ],
+                        "sigmas": [
+                          "5",
+                          0
+                        ]
+                      }
+                    },
+                    "9": {
+                      "class_type": "VAEDecode",
+                      "inputs": {
+                        "samples": [
+                          "8",
+                          0
+                        ],
+                        "vae": [
+                          "13",
+                          2
+                        ]
+                      }
+                    },
+                    "10": {
+                      "class_type": "VAEDecodeAudio",
+                      "inputs": {
+                        "samples": [
+                          "8",
+                          1
+                        ],
+                        "vae": [
+                          "13",
+                          3
+                        ]
+                      }
+                    },
+                    "11": {
+                      "class_type": "CreateVideo",
+                      "inputs": {
+                        "audio": [
+                          "10",
+                          0
+                        ],
+                        "bit_depth": 8,
+                        "fps": 24,
+                        "images": [
+                          "9",
+                          0
+                        ]
+                      }
+                    },
+                    "12": {
+                      "class_type": "SaveVideo",
+                      "inputs": {
+                        "codec": "auto",
+                        "filename_prefix": "mayhem-h3-lowvram/i2v-8step-seed4242424242",
+                        "format": "mp4",
+                        "video": [
+                          "11",
+                          0
+                        ]
+                      }
+                    },
+                    "13": {
+                      "class_type": "MiniMaxH3EasyOutput",
+                      "inputs": {
+                        "h3_context": [
+                          "2",
+                          1
+                        ]
+                      }
+                    },
+                    "24": {
+                      "class_type": "LoraLoaderModelOnly",
+                      "inputs": {
+                        "lora_name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_resized_avg_rank_21_bf16.safetensors",
+                        "model": [
+                          "2",
+                          0
+                        ],
+                        "strength_model": 1
+                      }
+                    },
+                    "26": {
+                      "class_type": "MiniMaxLowVRAMAttention",
+                      "inputs": {
+                        "head_chunks": 4,
+                        "model": [
+                          "30",
+                          0
+                        ]
+                      }
+                    },
+                    "27": {
+                      "class_type": "MiniMaxChunkFeedForward",
+                      "inputs": {
+                        "chunks": 2,
+                        "model": [
+                          "26",
+                          0
+                        ],
+                        "seq_threshold": 4096
+                      }
+                    },
+                    "29": {
+                      "class_type": "LoadImage",
+                      "inputs": {
+                        "image": "refs/h3-lowvram-reference.png"
+                      }
+                    },
+                    "30": {
+                      "class_type": "MiniMaxH3SigmaShift",
+                      "inputs": {
+                        "model": [
+                          "24",
+                          0
+                        ],
+                        "shift_audio": 3,
+                        "shift_video": 6
+                      }
+                    }
+                  }
+                ]
+              },
+              "input_files": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 1,
+                "max_items": 16,
+                "calibration_values": [
+                  [
+                    {
+                      "filename": "refs/anime-fighter.png",
+                      "kind": "image",
+                      "content_type": "image/png",
+                      "encoding": "base64",
+                      "data": "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAoElEQVR4nO3WsQ3AIAwEwSxZvP+VnYIUSZuhJI5Drn8vpiQA4K7r7gAAOAWBBQKLBQILBBYILBBYILBAYIHAAoEFgm8JAJz1tZunP9b0Zpj3OMa7+bwScFa1bUUcKG49i5LRBxYILBBYILBAYIHAAoEFAgsEFggsEFggsEBggcACgQUCCwQWCCwQWCCwQGCBwAKBBQILBBYILBBYILBA8AX2ZAT1HoWHxAAAAABJRU5ErkJggg=="
+                    }
+                  ]
+                ]
+              }
+            },
+            "response_attribute_specs": {
+              "artifacts": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 0,
+                "max_items": 1000000,
+                "calibration_values": [
+                  []
+                ]
+              },
+              "id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "mayhem": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "object": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "progress": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 0,
+                "maximum": 18446744073709552000,
+                "calibration_values": [
+                  1
+                ]
+              },
+              "status": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "usage": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              }
+            },
+            "interaction_groups": []
+          }
+        ],
+        "chat_template_id": "generic_chatml",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "preserve",
+        "modality_set": [
+          "image",
+          "video",
+          "audio"
+        ]
+      },
+      "modality_assessment": {
+        "detected": [
+          "image",
+          "video",
+          "audio"
+        ],
+        "evidence": [
+          "Converted MiniMax_H3_ComfyUI_Workflow_Pack.zip into Mayhem canonical workflow policy JSON; no ZIP-native schema is trusted at runtime.",
+          "This low-VRAM lane supports text prompts plus optional image references through input_files, and serves video with native audio. It is limited to 736x1280, 10 seconds, one artifact, and user-selectable steps 4, 6, or 8."
+        ],
+        "calibrated_fingerprints": {},
+        "resource_profiles": {
+          "workflow-class": {
+            "image": {
+              "unit": "pixel",
+              "measurement_source": "submitted_minimax_h3_lowvram_pack_pending_paid_admission_image_reference",
+              "max_item_bytes": 16777216,
+              "max_item_units": 942080,
+              "measured_item_bytes": 16777216,
+              "measured_item_units": 942080,
+              "measured_working_set_bytes": 16777216,
+              "calibration_baseline_memory_bytes": 17179869184,
+              "calibration_peak_memory_bytes": 17196646400,
+              "calibration_f13_budget_bytes": 51539607552,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            },
+            "video": {
+              "unit": "frame",
+              "measurement_source": "submitted_minimax_h3_lowvram_pack_pending_paid_admission",
+              "max_item_bytes": 1073741824,
+              "max_item_units": 243,
+              "measured_item_bytes": 1073741824,
+              "measured_item_units": 243,
+              "measured_working_set_bytes": 34359738368,
+              "calibration_baseline_memory_bytes": 17179869184,
+              "calibration_peak_memory_bytes": 51539607552,
+              "calibration_f13_budget_bytes": 51539607552,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            },
+            "audio": {
+              "unit": "second",
+              "measurement_source": "submitted_minimax_h3_lowvram_pack_pending_paid_admission_audio",
+              "max_item_bytes": 1920000,
+              "max_item_units": 10,
+              "measured_item_bytes": 1920000,
+              "measured_item_units": 10,
+              "measured_working_set_bytes": 1920000,
+              "calibration_baseline_memory_bytes": 17179869184,
+              "calibration_peak_memory_bytes": 17181789184,
+              "calibration_f13_budget_bytes": 51539607552,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            }
+          }
+        }
+      },
+      "speciality_assessment": {
+        "detected": [],
+        "evidence": [
+          "No endpoint speciality is advertised for the generic MiniMax H3 workflow class."
+        ],
+        "unsupported": {},
+        "calibrated": {}
+      },
+      "sampling": {
+        "temperature": 1,
+        "top_p": 1
+      },
+      "workflow": {
+        "whitelisted_nodes": [
+          "BasicGuider",
+          "BasicScheduler",
+          "CreateVideo",
+          "KSamplerSelect",
+          "LoadImage",
+          "LoraLoaderModelOnly",
+          "MiniMaxChunkFeedForward",
+          "MiniMaxH3Easy",
+          "MiniMaxH3EasyLoader",
+          "MiniMaxH3EasyOutput",
+          "MiniMaxH3SigmaShift",
+          "MiniMaxLowVRAMAttention",
+          "RandomNoise",
+          "SamplerCustomAdvanced",
+          "SaveVideo",
+          "VAEDecode",
+          "VAEDecodeAudio"
+        ],
+        "parts": [
+          {
+            "part_id": "d65d8fbd4344b9dbeb912abc5d0f6db1ae58e12f21b8e32156c93f73511f50cb",
+            "name": "minimax_h3_fl2va_pruned_w4a8_mixed.safetensors",
+            "type": "video-model",
+            "sha256": "01aa7b92c007c599890461c325f9b7e3c96fb06c36f242f95b62f7f20e538dec"
+          },
+          {
+            "part_id": "32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab",
+            "name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            "type": "text-encoder",
+            "sha256": "35a88d51044231fe332301d7a62aa81e3f2c6"
+          },
+          {
+            "part_id": "1d5fabc53ac20225d3889b9f13a0d2b2e73b3403fd589ec8bbd8fb1190ff328e",
+            "name": "minimax_h3_video_vae_int8_convrot.safetensors",
+            "type": "vae",
+            "sha256": "9bb2d96f218c76babd85e0611b85ca8fb330a90546c01a0005e8a58a59593410"
+          },
+          {
+            "part_id": "6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2",
+            "name": "minimax_h3_audio_vae_fp32.safetensors",
+            "type": "vae",
+            "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48"
+          },
+          {
+            "part_id": "b9b438dc6fdaac1e86b7655979de00a727a891760f26a2c6ca291e5f99435616",
+            "name": "minimax_h3_fl2v_turbo_lora_4step_768p.safetensors",
+            "type": "lora",
+            "sha256": "1b85da614014024a0c9507f12558917dcc69b6adb564e716324594f401723115"
+          },
+          {
+            "part_id": "eeb05336a8602223e7e44d94d0e9beb76ebd7cb856c65ce1a7efb77cb8413dca",
+            "name": "minimax_h3_turbo_v4_step600_ema_lora.safetensors",
+            "type": "lora",
+            "sha256": "7098acf3ee75028fd9fcd948f50fcc8d995057fabb76f86bd3ca2c0ffc58e409"
+          },
+          {
+            "part_id": "dd4a391825411ca79af8ea1b21bd422e94b328a056982097e1a49750e033701b",
+            "name": "minimax_h3_fl2v_turbo_lora_8step.safetensors",
+            "type": "lora",
+            "sha256": "a3208be61329c27a6754c53db9a21a3c86e2a285381700adf2d97e279c062840"
+          },
+          {
+            "part_id": "ce43141c4e565c32cb0c957bcc6ba6879c4039e49ae7a80a30bf035e8d5f39f8",
+            "name": "ComfyUI-MiniMaxH3-Easy-8138215.tar.gz",
+            "type": "custom-node",
+            "sha256": "475fb92ab679041d1b51f1b980e0b077df9ffe20b51815202a941cb0532b0742"
+          },
+          {
+            "part_id": "fdc1931f51cc2c3db27a46f18cdef40443ee0d23fa1aa8b95d03580f040ca71a",
+            "name": "ComfyUI-KJNodes-6ab7e81.tar.gz",
+            "type": "custom-node",
+            "sha256": "b05ad1229bae8e7ed0bea1639fe90fe6c667dfb47059b24d1eb2556a1e810e66"
+          }
+        ],
+        "runtime_id": "comfyui-v0.32.0",
+        "outcome_class": "video.minimax_h3.lowvram_t2v_i2v",
+        "outcome_class_definition": {
+          "caps": {
+            "allowed_steps": [
+              4,
+              6,
+              8
+            ],
+            "default_steps": 4,
+            "fps": 24,
+            "max_frames": 243,
+            "max_megapixels_per_frame": "1",
+            "max_seconds": 10,
+            "native_max_height": 1280,
+            "native_max_width": 736,
+            "output_modalities": [
+              "video",
+              "audio"
+            ],
+            "priority_scalars": {
+              "economy": "0.5",
+              "priority": "2",
+              "standard": "1"
+            },
+            "reference_media": [
+              "image"
+            ],
+            "trained_frames_max": 243,
+            "trained_frames_min": 240
+          },
+          "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+          "grid_version": 2,
+          "lane": "minimax-h3-lowvram",
+          "media": "video",
+          "min_session_au": "0",
+          "per_req_au": "0",
+          "pricing_unit": "megapixel_step",
+          "rate_map": [
+            {
+              "granularity": 1000,
+              "per_unit_au": "1041666666666666667",
+              "unit": "megapixel_step"
+            }
+          ],
+          "schema": "openmayhem.comfy.outcome-class-grid.v1",
+          "source": "COMFY-CHEATSHEET.md#minimax-h3-low-vram-candidate",
+          "title": "MiniMax H3 low-VRAM text/image-to-video with native audio"
+        },
+        "pricing_unit": "megapixel_step",
+        "inventory_root": "f9e7cb7dd31befccf3e033e4203a427b886fb33aa7fad54af3268b5a54398900",
+        "max_nodes": 32,
+        "max_width": 736,
+        "max_height": 1280,
+        "max_frames": 243,
+        "max_duration_seconds": 10,
+        "max_steps": 8,
+        "allowed_steps": [
+          4,
+          6,
+          8
+        ],
+        "max_artifacts": 1
+      },
+      "canary": {
+        "set_id": "canary-minimax-h3-lowvram-workflow-launch-v1",
+        "match_min": 0.9,
+        "verification_method": "video_av_fingerprint",
+        "verification_tolerance_bps": 1500,
+        "fingerprints": {},
+        "token_prefixes": {},
+        "perceptual_hashes": {},
+        "embedding_vectors": {},
+        "transcripts": {},
+        "audio_fingerprints": {},
+        "video_fingerprints": {
+          "workflow-class": {
+            "h3-lowvram-t2v-4step-seed4242424242": "videoav-v1:7b227769647468223a3733362c22686569676874223a313238302c226672616d655f636f756e74223a3234332c226670735f6d696c6c69223a32343030302c22766964656f5f6475726174696f6e5f6d73223a31303132352c22617564696f5f6475726174696f6e5f6d73223a31303132352c226672616d655f686173686573223a5b2230303030303363303066663830666665336666383066663830376330303430303037653030666638666666666666666630343038303030306633313162666537222c2230303030303363303066663830666665336666383066663830376530303430303037653030666638666666666666666630343038303030306633313162666537222c2230303030303363303066663830666665336666383066663830376530303032303037653030666630666666666666666630343038303030306633313162666537222c2230303030303363303066663830666665336666383066663830376530303032303037653030666630666666666666666630343038303030306633313162666537222c2230303030303363303066663830666665336666383066663830376530303032303037653030666630666666666666666630343038303030306633313162666537222c2230303030303363303066663830666665336666383066663830336530303032303037653030666638666666666666666630343038303030306633313162666537222c2230303030303363303066663830666665336666383066663830336530303032303037653030666638666666666666666630343038303030306633313162666537222c2230303030303363303066663830666665336666383066663830336530303032303037653030666630666666666666666630343038303030306633313162666537222c2230303030303363303066663830666665336666383066663830376330303430303037653030666638666666666666666630343038303030306633313162666537222c2230303030303363303066663830666665336666383066663830376330303432303037663030663738666666666666666630343038303030306633313162666537222c2230303030303363303066663830666665336666383066663830376530303032303037653030666630666666666666666630343038303030306633313162666537222c2230303030303363303066663830666665336666383066663830376530303032303037653030666630666666666666666630343038303030306633313162666537222c2230303030303363303066663830666665336666383066663830376530303032303037653030666630666666666666666630343038303030306633313162666537222c2230303030303363303066663830666665336666383066663830336530303032303037653030666630666666666666666630343038303030306633313162666537222c2230303030303363303066663830666665336666383066663830376530303032303037653030666630666666666666666630343038303030306633313162666537222c2230303030303363303066663830666665336666383066663830376330303430303037653030666638666666666666666630343038303030306633313162666537225d2c22617564696f5f66696e6765727072696e74223a22617564696f737065632d76313a31303130303a6562653865666661303733663439326631623031303965396538653164626461653665626562663130343263336533303061306666656566653665366530646465316534656565633039333633343338303630633038663165366535646664646530653565626539303032393362326130343131303265666561653564666464656266356634303330373336343933333261313730626631656665386534646665366630663366363066343634633334323031346663653465366535653365316562656665616635303932373263333966663133303465666537653865306465656366346665663531323464343933303161313230326632656165386532646565356630663365663036323733333332303930316564656465326531646364626532653965666565666233313332333165383035656464646464646264616439646564656530653630363235343531623034313066356536653665306464646465656634663766633236343934373365313031623062663465396561653265306536656265636566306334323263326330663066303966306534653864666465646665346630656130633234326533353061313430316639653765616530646566346638663730343165326634643334313130643065656565366534646664646564663930303033323134613530333431373161303766316562653764666463227d",
+            "h3-lowvram-t2v-6step-seed4242424242": "videoav-v1:7b227769647468223a3733362c22686569676874223a313238302c226672616d655f636f756e74223a3234332c226670735f6d696c6c69223a32343030302c22766964656f5f6475726174696f6e5f6d73223a31303132352c22617564696f5f6475726174696f6e5f6d73223a31303132352c226672616d655f686173686573223a5b2230303030303030306630303038316439666264666662646637613230666331633166663831666663336666653066666234303033383330306266383737663837222c2230303030303030306630303030316439663364666662646637613230666331343166663831666663336666653066646234303033383130306266383337663833222c2230303030303030306630303031333935663364666633646666383230666333633166663831666565336666653166666234303031303130303366633337666333222c2230303030303030306630303031336237663362666633666666363230666331633166663831666565336666653166666234303032303138303366653133666530222c2230303030303030306530303031336233663762666633666666343230666333633337663831666565336666653166666234303032303130383162653031666630222c2230303030303030306530303030336161653762666537666666653230666533383737663033666665336666653166663963303031383130633033663030666630222c2230303030303030306530303032336536653737656537666565653030666133303737663033666665336666653166663934303433383138613031663830336638222c2230303030303030306330303030376534656637656566666565653030666131303737663033666665336666653366666434303431633038663031666130316663222c2230303030303030306333303034376563636666636366666366633030663430303766663033666665336666653366666434303231636330663030376630303763222c2230303030303030303837383034666538646566386366666364633030663430306666663837666665336666653366666463303231636530373030336430303163222c2230303030323030303837383030666638646666386466666366633030663430306666663837666663336666653366666463303331656630373030306630303065222c2230303030653030303837633038666430396466303966666362633030663632306666663837666663336666653366666663303331653738336330303330303032222c2230303030633030303066633039626530626666306266666462633231663430306566663037666663336666653366666663303333653363316638303030303030222c2230303030633030303037633031626130336265306262663966633231663434306566663037666663336666653766666663303162653165306665303030303030222c2230303430633030303037633033336330376265303766666237633032643434306566663037666663336666653766666663303161653066306666303065303030222c2230303430383030303037633033376330376665303737666137633032393434306566663037666663336666633366666663303161653037306666383066383030225d2c22617564696f5f66696e6765727072696e74223a22617564696f737065632d76313a31303130303a6434643564666635663733353239316330376536653864346430643063666366643366383036663830333136333231373130303066336539646264346434643364316431663131373037313830333236303565646634653364356435643164306433643264376631316532363232316566363034663666396561653964376433313531326636313731343335336331383238323931323030663966636539646231343065663466613430333733353263313031376635656565356466643764613162313566613131323133633230326430323032663366376664666165356439316631643032313032353362336533303138313666643034303630306634646431333033656165646564663131613137653630633064303364336537643064306432643264336462303431613237306666333161303865646436653064336430316430646634303231313338333631393138306566636666666666646538646232373234303832303361336632653333313532323130663765356631653164653133303666383061316433373331313832383237316430396539663765386463646164636466666632343431323233353230316431303034306666646536643630303063653331643134316133313233303265636565643764306366636663666530653465633162306133613364316566663065666265316435643364306366227d",
+            "h3-lowvram-i2v-8step-seed4242424242": "videoav-v1:7b227769647468223a3733362c22686569676874223a313238302c226672616d655f636f756e74223a3234332c226670735f6d696c6c69223a32343030302c22766964656f5f6475726174696f6e5f6d73223a31303132352c22617564696f5f6475726174696f6e5f6d73223a31303132352c226672616d655f686173686573223a5b2230666665306637653065376530633365303837653138666531306665323166653433666534336665383766653033646530333965303733653037336530653765222c2230303030303230303033303030333030383766303066643930666639306666383438313330303033303030303763393866633966666339666666666666666666222c2230303030303230303032303030333830386666303066663930663639306633383430313330303033303030303739383866626366663363666666666666666666222c2230303030303230303032303030333030393366303066643930666439306666383433363330303033303030303731653466396537663966336666666666666666222c2230303030303230303032303030333030393766303066373930633439306666383433373330303033303030303733633466336566663765666666666666666666222c2230303030303230303033383030336530393566383063363930636631306466383434653330303033303030303731633066336537666666336666666666666666222c2230303030303230303032383030333830396665303135383930356539306465383435643330303033303030303633386365376337663765336666666666666666222c2230303030303230303033303030333830393761303066663930383039306630383437313330303033303030303731633465336537653765336666666666666666222c2230303030303230303036303030336330396666303063346430653139306337383438353330303033303030303633316365373966636639666666666666666666222c2230303030303230303033383030303030396663303066383930393839306465383431663330303033303030303631386365376337653765336666666266666666222c2230303030303230303033383030336330393666383065316430663839306663383433633330303033303030303731633065376633656666336666666666666666222c2230303030303230303032303030336230393762383063316430643239306633383437333330303033303030303633636365373866633764666366666666666666222c2230303030303230303033383030313030393765303066666431613239303162383433643330303033303030303633633463666337636665376666666666666666222c2230303030303230303032383030376630393764303063303930643339306662383430313330303033303030303739396366623966663362666666666666666666222c2230303030303230303033303030376330396665303038306430636539306666383434353330303033303030303763343466653637666637336666666666666666222c2230303030303230303037653030373130393830303066366430663739306633383430303330303033303030303763343466653666666632376666666666666666225d2c22617564696f5f66696e6765727072696e74223a22617564696f737065632d76313a31303130303a6335636665626665303530376639306466353032656665336466653064386432323531353165306431623135303831326662663866376439653065316336636132643163333531653231316430363065656165346631653464656532633763633232313032383237323232313133313766626664666265656536653063376339323932343263323332613231303930656566653965626535653164396337636132393163326632363235316131333138666666356663656264646465636264303237313832353235323431636661313066316564656565396535653163626364323232323331323431663230303731376661663865646532646465316361636532343230333432313234313731373136303766396634653764656532633863383139313432653231323531633063313330346662666265666533653363386337326232363263323432333233666330653036663666346537653565306362633932653130316332303230323230643062656665386539653765366466636363633232323033343262326331656639313330343036303066326564653563656362323931653239323231663139303031326633666465666564653965396364636233323166323831663239313830653065666466366637656265626534643063653263323233373236316431663034313130363031663566356632653964326431227d"
+          }
+        }
+      },
+      "price_ref_au": {
+        "denom": "au_usd",
+        "ver": 1,
+        "rate_map": [
+          {
+            "granularity": 1000,
+            "per_unit_au": "1041666666666666667",
+            "unit": "megapixel_step"
+          }
+        ],
+        "per_req_au": "0",
+        "min_session_au": "0"
+      }
+    },
+    {
+      "model_id": "video.minimax_h3.lowvram_r2v",
+      "min_app_version": "0.2.147",
+      "model_class": "workflow",
+      "family": "comfy-minimax-h3",
+      "params_b": 33,
+      "tier": "dev",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "publisher_key": "huggingface-repo",
+          "repo": "TracNetwork/openmayhem-parts-index",
+          "revision": "3fae8359db18e4d3ac4d498bc032dcbe39fe0b9e"
+        },
+        "conversion": [
+          {
+            "tool": "openmayhem-comfy-policy-converter",
+            "method": "canonical-conversion:MiniMax_H3_ComfyUI_Workflow_Pack.zip-to-mayhem-policy-v1",
+            "input_sha256": "c762bb0b7559ad2650cb446dc8edb593c2292ad9d10e55fabad10fd373d73a35",
+            "output_sha256": "a273f50e3755a52b836d16574e0e7ba360dd4d638ae7f1d858b7839fe04670b4"
+          }
+        ],
+        "license": "minimax-h3-owner-approved-2026-08-10",
+        "license_sha256": "59b99642b95ea21630e311198ddbfffbfe05aadba0c2f5d884cbdf4efcc90f44"
+      },
+      "artifacts": {
+        "workflow-class": {
+          "engine": "comfyui",
+          "source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "TracNetwork/openmayhem-parts-index",
+            "revision": "3fae8359db18e4d3ac4d498bc032dcbe39fe0b9e"
+          },
+          "path": "comfy/outcome-classes/v1/video.minimax_h3.lowvram_r2v.json",
+          "artifact_root": "9bc72e6ae35b307bfd6b459303b700eb5e872e26061ac261442f17c4eaec4798",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 806,
+          "source_sha256": "a273f50e3755a52b836d16574e0e7ba360dd4d638ae7f1d858b7839fe04670b4",
+          "download_check": false,
+          "notes": "Signed Comfy outcome-class definition for the converted low-VRAM MiniMax H3 reference-to-video lane. The workflow uses the W4A8 REF2VA model, INT8 video VAE, native audio VAE, 4-step REF2V turbo LoRA, and pinned low-VRAM custom nodes through the signed parts inventory."
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": false,
+        "ctx_max": 1,
+        "vision": false,
+        "image": true,
+        "video": true,
+        "audio": true,
+        "output_modality": "video",
+        "output_modalities": [
+          "video",
+          "audio"
+        ],
+        "max_video_width": 736,
+        "max_video_height": 1280,
+        "max_video_frames": 243,
+        "max_video_seconds": 10
+      },
+      "requirements": {
+        "min_ram_gb": 48,
+        "min_vram_gb_full_offload": 16,
+        "cpu_flags": [],
+        "backends": [
+          "comfyui"
+        ]
+      },
+      "adapter": {
+        "endpoint_families": [
+          {
+            "family": "mayhem_comfy_workflows",
+            "request_attributes": [
+              "model",
+              "workflow",
+              "runtime_id",
+              "outcome_class",
+              "timeout_ms",
+              "response_format",
+              "input_files",
+              "user"
+            ],
+            "required_request_attributes": [
+              "model",
+              "workflow"
+            ],
+            "response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "model",
+              "status",
+              "progress",
+              "artifacts",
+              "usage",
+              "mayhem"
+            ],
+            "request_attribute_specs": {
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "calibration_values": [
+                  "$MODEL"
+                ]
+              },
+              "outcome_class": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "video.minimax_h3.lowvram_r2v"
+                ]
+              },
+              "response_format": {
+                "value_types": [
+                  "string"
+                ],
+                "default": "artifact",
+                "enum_values": [
+                  "artifact",
+                  "json"
+                ],
+                "calibration_values": [
+                  "artifact",
+                  "json"
+                ]
+              },
+              "runtime_id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "comfyui-v0.32.0"
+                ]
+              },
+              "timeout_ms": {
+                "value_types": [
+                  "integer"
+                ],
+                "default": 900000,
+                "minimum": 1000,
+                "maximum": 3600000,
+                "calibration_values": [
+                  900000
+                ]
+              },
+              "user": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 512,
+                "calibration_values": [
+                  "mayhem-calibration-user"
+                ]
+              },
+              "workflow": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "1": {
+                      "class_type": "MiniMaxH3EasyLoader",
+                      "inputs": {
+                        "audio_vae": "minimax_h3_audio_vae_fp32.safetensors",
+                        "fl2va_model": "None",
+                        "ref2va_model": "minimax_h3_ref2va_pruned_w4a8_mixed.safetensors",
+                        "text_encoder": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+                        "video_vae": "minimax_h3_video_vae_int8_convrot.safetensors"
+                      }
+                    },
+                    "2": {
+                      "class_type": "MiniMaxH3Easy",
+                      "inputs": {
+                        "advanced": false,
+                        "aspect_ratio": "9:16",
+                        "fps": 24,
+                        "h3_bundle": [
+                          "1",
+                          0
+                        ],
+                        "height": 1280,
+                        "keyframe_role": "first",
+                        "media": [
+                          "29",
+                          0
+                        ],
+                        "mode": "reference",
+                        "prompt": "<Picture 1> Use the reference picture as the subject. The subject trains like a boxer, quick air punches and small jumps, energetic camera, native room ambience, no subtitles, no watermark.",
+                        "prompt_optimizer_scene_guide": "none",
+                        "prompt_optimizer_settings": false,
+                        "ref_image_size": "match",
+                        "reference_mention_mode": "index",
+                        "resolution": "720P",
+                        "seconds": 10,
+                        "width": 736
+                      }
+                    },
+                    "4": {
+                      "class_type": "BasicGuider",
+                      "inputs": {
+                        "conditioning": [
+                          "13",
+                          0
+                        ],
+                        "model": [
+                          "27",
+                          0
+                        ]
+                      }
+                    },
+                    "5": {
+                      "class_type": "BasicScheduler",
+                      "inputs": {
+                        "denoise": 1,
+                        "model": [
+                          "27",
+                          0
+                        ],
+                        "scheduler": "simple",
+                        "steps": 4
+                      }
+                    },
+                    "6": {
+                      "class_type": "RandomNoise",
+                      "inputs": {
+                        "noise_seed": 4242424244
+                      }
+                    },
+                    "7": {
+                      "class_type": "KSamplerSelect",
+                      "inputs": {
+                        "sampler_name": "euler"
+                      }
+                    },
+                    "8": {
+                      "class_type": "SamplerCustomAdvanced",
+                      "inputs": {
+                        "guider": [
+                          "4",
+                          0
+                        ],
+                        "latent_image": [
+                          "13",
+                          1
+                        ],
+                        "noise": [
+                          "6",
+                          0
+                        ],
+                        "sampler": [
+                          "7",
+                          0
+                        ],
+                        "sigmas": [
+                          "5",
+                          0
+                        ]
+                      }
+                    },
+                    "9": {
+                      "class_type": "VAEDecode",
+                      "inputs": {
+                        "samples": [
+                          "8",
+                          0
+                        ],
+                        "vae": [
+                          "13",
+                          2
+                        ]
+                      }
+                    },
+                    "10": {
+                      "class_type": "VAEDecodeAudio",
+                      "inputs": {
+                        "samples": [
+                          "8",
+                          1
+                        ],
+                        "vae": [
+                          "13",
+                          3
+                        ]
+                      }
+                    },
+                    "11": {
+                      "class_type": "CreateVideo",
+                      "inputs": {
+                        "audio": [
+                          "10",
+                          0
+                        ],
+                        "bit_depth": 8,
+                        "fps": 24,
+                        "images": [
+                          "9",
+                          0
+                        ]
+                      }
+                    },
+                    "12": {
+                      "class_type": "SaveVideo",
+                      "inputs": {
+                        "codec": "auto",
+                        "filename_prefix": "mayhem-h3-lowvram/r2v-4step-seed4242424242",
+                        "format": "mp4",
+                        "video": [
+                          "11",
+                          0
+                        ]
+                      }
+                    },
+                    "13": {
+                      "class_type": "MiniMaxH3EasyOutput",
+                      "inputs": {
+                        "h3_context": [
+                          "2",
+                          1
+                        ]
+                      }
+                    },
+                    "24": {
+                      "class_type": "LoraLoaderModelOnly",
+                      "inputs": {
+                        "lora_name": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_resized_avg_rank_21_bf16.safetensors",
+                        "model": [
+                          "2",
+                          0
+                        ],
+                        "strength_model": 1
+                      }
+                    },
+                    "26": {
+                      "class_type": "MiniMaxLowVRAMAttention",
+                      "inputs": {
+                        "head_chunks": 4,
+                        "model": [
+                          "30",
+                          0
+                        ]
+                      }
+                    },
+                    "27": {
+                      "class_type": "MiniMaxChunkFeedForward",
+                      "inputs": {
+                        "chunks": 2,
+                        "model": [
+                          "26",
+                          0
+                        ],
+                        "seq_threshold": 4096
+                      }
+                    },
+                    "29": {
+                      "class_type": "LoadImage",
+                      "inputs": {
+                        "image": "refs/h3-lowvram-reference.png"
+                      }
+                    },
+                    "30": {
+                      "class_type": "MiniMaxH3SigmaShift",
+                      "inputs": {
+                        "model": [
+                          "24",
+                          0
+                        ],
+                        "shift_audio": 3,
+                        "shift_video": 6
+                      }
+                    }
+                  }
+                ]
+              },
+              "input_files": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 1,
+                "max_items": 16,
+                "calibration_values": [
+                  [
+                    {
+                      "filename": "refs/anime-fighter.png",
+                      "kind": "image",
+                      "content_type": "image/png",
+                      "encoding": "base64",
+                      "data": "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAoElEQVR4nO3WsQ3AIAwEwSxZvP+VnYIUSZuhJI5Drn8vpiQA4K7r7gAAOAWBBQKLBQILBBYILBBYILBAYIHAAoEFgm8JAJz1tZunP9b0Zpj3OMa7+bwScFa1bUUcKG49i5LRBxYILBBYILBAYIHAAoEFAgsEFggsEFggsEBggcACgQUCCwQWCCwQWCCwQGCBwAKBBQILBBYILBBYILBA8AX2ZAT1HoWHxAAAAABJRU5ErkJggg=="
+                    }
+                  ]
+                ]
+              }
+            },
+            "response_attribute_specs": {
+              "artifacts": {
+                "value_types": [
+                  "array"
+                ],
+                "min_items": 0,
+                "max_items": 1000000,
+                "calibration_values": [
+                  []
+                ]
+              },
+              "id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "mayhem": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "object": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "progress": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 0,
+                "maximum": 18446744073709552000,
+                "calibration_values": [
+                  1
+                ]
+              },
+              "status": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "usage": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              }
+            },
+            "interaction_groups": []
+          }
+        ],
+        "chat_template_id": "generic_chatml",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "preserve",
+        "modality_set": [
+          "image",
+          "video",
+          "audio"
+        ]
+      },
+      "modality_assessment": {
+        "detected": [
+          "image",
+          "video",
+          "audio"
+        ],
+        "evidence": [
+          "Converted the reference-video branch from MiniMax_H3_ComfyUI_Workflow_Pack.zip into Mayhem canonical workflow policy JSON; the pack only included a 4-step R2V graph.",
+          "This low-VRAM reference-media lane accepts image/video references through input_files and serves video with native audio. It is limited to 736x1280, 10 seconds, one artifact, and the signed W4A8 REF2VA/INT8 VAE/REF2V LoRA inventory."
+        ],
+        "calibrated_fingerprints": {},
+        "resource_profiles": {
+          "workflow-class": {
+            "image": {
+              "unit": "pixel",
+              "measurement_source": "submitted_minimax_h3_lowvram_r2v_pack_pending_paid_admission_image_reference",
+              "max_item_bytes": 16777216,
+              "max_item_units": 942080,
+              "measured_item_bytes": 16777216,
+              "measured_item_units": 942080,
+              "measured_working_set_bytes": 16777216,
+              "calibration_baseline_memory_bytes": 17179869184,
+              "calibration_peak_memory_bytes": 17196646400,
+              "calibration_f13_budget_bytes": 51539607552,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            },
+            "video": {
+              "unit": "frame",
+              "measurement_source": "submitted_minimax_h3_lowvram_r2v_pack_pending_paid_admission",
+              "max_item_bytes": 1073741824,
+              "max_item_units": 243,
+              "measured_item_bytes": 1073741824,
+              "measured_item_units": 243,
+              "measured_working_set_bytes": 34359738368,
+              "calibration_baseline_memory_bytes": 17179869184,
+              "calibration_peak_memory_bytes": 51539607552,
+              "calibration_f13_budget_bytes": 51539607552,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            },
+            "audio": {
+              "unit": "second",
+              "measurement_source": "submitted_minimax_h3_lowvram_r2v_pack_pending_paid_admission_audio",
+              "max_item_bytes": 1920000,
+              "max_item_units": 10,
+              "measured_item_bytes": 1920000,
+              "measured_item_units": 10,
+              "measured_working_set_bytes": 1920000,
+              "calibration_baseline_memory_bytes": 17179869184,
+              "calibration_peak_memory_bytes": 17181789184,
+              "calibration_f13_budget_bytes": 51539607552,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            }
+          }
+        }
+      },
+      "speciality_assessment": {
+        "detected": [],
+        "evidence": [
+          "No endpoint speciality is advertised for the generic MiniMax H3 R2V workflow class."
+        ],
+        "unsupported": {},
+        "calibrated": {}
+      },
+      "sampling": {
+        "temperature": 1,
+        "top_p": 1
+      },
+      "workflow": {
+        "whitelisted_nodes": [
+          "BasicGuider",
+          "BasicScheduler",
+          "CreateVideo",
+          "KSamplerSelect",
+          "LoadImage",
+          "LoraLoaderModelOnly",
+          "MiniMaxChunkFeedForward",
+          "MiniMaxH3Easy",
+          "MiniMaxH3EasyLoader",
+          "MiniMaxH3EasyOutput",
+          "MiniMaxH3SigmaShift",
+          "MiniMaxLowVRAMAttention",
+          "RandomNoise",
+          "SamplerCustomAdvanced",
+          "SaveVideo",
+          "VAEDecode",
+          "VAEDecodeAudio"
+        ],
+        "parts": [
+          {
+            "part_id": "c13fa59e060835d0fb4dc44330325c1adc24721b724b47532cd089c97c3961c8",
+            "name": "minimax_h3_ref2va_pruned_w4a8_mixed.safetensors",
+            "type": "video-model",
+            "sha256": "de2c6c29c4ee702b45e48e40daae3834aeee58ab681c732d9152589a87c89910"
+          },
+          {
+            "part_id": "32432239ffed7077993a928a915c0dc8252238657ecd4926335cfa8afff7e0ab",
+            "name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            "type": "text-encoder",
+            "sha256": "35a88d51044231fe332301d7a62aa81e3f2c6"
+          },
+          {
+            "part_id": "1d5fabc53ac20225d3889b9f13a0d2b2e73b3403fd589ec8bbd8fb1190ff328e",
+            "name": "minimax_h3_video_vae_int8_convrot.safetensors",
+            "type": "vae",
+            "sha256": "9bb2d96f218c76babd85e0611b85ca8fb330a90546c01a0005e8a58a59593410"
+          },
+          {
+            "part_id": "6058c1f32eae8766393ece25f7e65871313c90197d76608b62b4ed5fac78dcd2",
+            "name": "minimax_h3_audio_vae_fp32.safetensors",
+            "type": "vae",
+            "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48"
+          },
+          {
+            "part_id": "9bd6195814909a40166a4b156169d249117e00766c1a06d41023e24306860290",
+            "name": "minimax_h3_ref2v_turbo_lora_4step.safetensors",
+            "type": "lora",
+            "sha256": "2c6abb194cff3e26c2295c87892913adf0c92d8f784f305238246759f9b333d0"
+          },
+          {
+            "part_id": "ce43141c4e565c32cb0c957bcc6ba6879c4039e49ae7a80a30bf035e8d5f39f8",
+            "name": "ComfyUI-MiniMaxH3-Easy-8138215.tar.gz",
+            "type": "custom-node",
+            "sha256": "475fb92ab679041d1b51f1b980e0b077df9ffe20b51815202a941cb0532b0742"
+          },
+          {
+            "part_id": "fdc1931f51cc2c3db27a46f18cdef40443ee0d23fa1aa8b95d03580f040ca71a",
+            "name": "ComfyUI-KJNodes-6ab7e81.tar.gz",
+            "type": "custom-node",
+            "sha256": "b05ad1229bae8e7ed0bea1639fe90fe6c667dfb47059b24d1eb2556a1e810e66"
+          }
+        ],
+        "runtime_id": "comfyui-v0.32.0",
+        "outcome_class": "video.minimax_h3.lowvram_r2v",
+        "outcome_class_definition": {
+          "caps": {
+            "allowed_steps": [
+              4
+            ],
+            "default_steps": 4,
+            "fps": 24,
+            "max_frames": 243,
+            "max_megapixels_per_frame": "1",
+            "max_seconds": 10,
+            "native_max_height": 1280,
+            "native_max_width": 736,
+            "output_modalities": [
+              "video",
+              "audio"
+            ],
+            "priority_scalars": {
+              "economy": "0.5",
+              "priority": "2",
+              "standard": "1"
+            },
+            "reference_media": [
+              "image",
+              "video"
+            ],
+            "trained_frames_max": 243,
+            "trained_frames_min": 240
+          },
+          "class_id": "video.minimax_h3.lowvram_r2v",
+          "grid_version": 2,
+          "lane": "minimax-h3-lowvram",
+          "media": "video",
+          "min_session_au": "0",
+          "per_req_au": "0",
+          "pricing_unit": "megapixel_step",
+          "rate_map": [
+            {
+              "granularity": 1000,
+              "per_unit_au": "1041666666666666667",
+              "unit": "megapixel_step"
+            }
+          ],
+          "schema": "openmayhem.comfy.outcome-class-grid.v1",
+          "source": "COMFY-CHEATSHEET.md#minimax-h3-low-vram-candidate",
+          "title": "MiniMax H3 low-VRAM reference-to-video with native audio"
+        },
+        "pricing_unit": "megapixel_step",
+        "inventory_root": "cd8657f770f09a4fe7baaaf9a8cc2c42560c5282279bae1512fed30467f2d0dc",
+        "max_nodes": 32,
+        "max_width": 736,
+        "max_height": 1280,
+        "max_frames": 243,
+        "max_duration_seconds": 10,
+        "max_steps": 4,
+        "allowed_steps": [
+          4
+        ],
+        "max_artifacts": 1
+      },
+      "canary": {
+        "set_id": "canary-minimax-h3-lowvram-r2v-workflow-launch-v1",
+        "match_min": 0.9,
+        "verification_method": "video_av_fingerprint",
+        "verification_tolerance_bps": 1500,
+        "fingerprints": {},
+        "token_prefixes": {},
+        "perceptual_hashes": {},
+        "embedding_vectors": {},
+        "transcripts": {},
+        "audio_fingerprints": {},
+        "video_fingerprints": {
+          "workflow-class": {
+            "h3-lowvram-r2v-4step-seed4242424242": "videoav-v1:7b227769647468223a3733362c22686569676874223a313238302c226672616d655f636f756e74223a3234332c226670735f6d696c6c69223a32343030302c22766964656f5f6475726174696f6e5f6d73223a31303132352c22617564696f5f6475726174696f6e5f6d73223a31303132352c226672616d655f686173686573223a5b2238323666393766663935656639316137643565666633386666333066663032663838326463303066633032666630326566383366653033666662626637383763222c2238303266393766663935656638353237643561666638666666316466663831663863336463303066633030666530306566303266633262666637383737303163222c2239336566393766663937656639353266643765666638356666353166663331663930336664303266653030666330326565303237633033666537623765353165222c2230336566313766663137666639353866646466666638376666383866663338663930326664303266653030666530323565303337653033666533623763313166222c2230366666316666663137666631346366666662666663666666643566663963663838303364383066663030666530326465303237653037376533333763313164222c2232666666336666663066666630633966656366666665626666313966663031373130306638303066653030666330303766303333633564666533643765666537222c2232366466326666663266646632393366613966666635336665373166613035663230356661303466633031666330356663303266633833663937396639323066222c2232376666326666663262666632383366626466666638316666643966653331663230353761303666633030666330366663303666633037663866336638333166222c2230323666326666663062666638393066616666666638376666626666663039666230336265303166653031666530316463303066633032663933396638333066222c2238333666393766663937656639343066646666666663666666633866666231666430326664303066663030666530306666303037663031666533626663313166222c2238333666393766663937656639366166646465666664376666373166653034666530366263303066633030666530306665303266633437663833336664313163222c2239376666393766663937666639363066666566666665666666623966663030376430303966303066663030666530306665303066653738666366646665626366222c2239336666393766663937666639346166646665666663666666663166663033663930303963303066663030666530306666303037663133376531626665353966222c2231336666393766663937666639356166643565666663666666333966633032666530326263303266653030666530326665303037653233376362396663313966222c2239376666393766663937666639366466666366666663386666623866663032373930303366303037663030376530313766303133663133666633626665373966222c2238336666386666663862666663613937656137666664346666393866663831666330303965303066653030666530326666303337653231666537646665396366225d2c22617564696f5f66696e6765727072696e74223a22617564696f737065632d76313a31303130303a6330633863636337636263386438663166383135666330316661303965656561646565396638303265666565666130373130333232383336316433313161306563646438646466666637656266303063313032353162323431373237313030366236626563646539653164656632303531343266316432343161326431363064633763626436663665666532653030303063323431343166313232303039303463356432653431613032653566343036316132643230323931333238313430626366636664376632656265356634306331623265316632613137323630653038633864396432306330316535656330333231326332303237313832383161313063366364643365666537646464633030313532663234326231343232313030386336633964316566653964636539303831373262316232613139323731353065633963636462663865666633663830343162323231393231313432383137306664636534653030336638646465373032313032373161323431353233306530366432643164376634653364626539303531663330316432613139323531323039653064396437663365646538656530633163333232623335313932353131303864656362653066316531643064636661306532353136323531313165306230336436643865306665663165626562303731653330323532653230326231623131227d"
+          }
+        }
+      },
+      "price_ref_au": {
+        "denom": "au_usd",
+        "ver": 1,
+        "rate_map": [
+          {
+            "granularity": 1000,
+            "per_unit_au": "1041666666666666667",
+            "unit": "megapixel_step"
+          }
+        ],
+        "per_req_au": "0",
+        "min_session_au": "0"
+      }
+    },
+    {
       "model_id": "video.lipsync",
       "min_app_version": "0.2.142",
       "model_class": "workflow",
