@@ -63,6 +63,8 @@ pub struct ComfyWorkflowCatalogPolicy {
     pub max_duration_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_steps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_steps: Vec<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_artifacts: Option<u64>,
 }
@@ -141,6 +143,25 @@ impl ComfyWorkflowCatalogPolicy {
             }
         }
         let defaults = ComfyWorkflowDerivationPolicy::default();
+        let max_steps = self.max_steps.unwrap_or(defaults.max_steps).max(1);
+        let mut allowed_steps = BTreeSet::new();
+        for step in &self.allowed_steps {
+            if *step == 0 {
+                return Err(ComfyWorkflowDerivationError::InvalidPolicy(
+                    "allowed_steps contains zero".to_owned(),
+                ));
+            }
+            if *step > max_steps {
+                return Err(ComfyWorkflowDerivationError::InvalidPolicy(format!(
+                    "allowed_steps value {step} exceeds max_steps {max_steps}"
+                )));
+            }
+            if !allowed_steps.insert(*step) {
+                return Err(ComfyWorkflowDerivationError::InvalidPolicy(format!(
+                    "duplicate allowed_steps value {step}"
+                )));
+            }
+        }
         Ok(ComfyWorkflowDerivationPolicy {
             whitelisted_nodes,
             parts_by_name,
@@ -153,7 +174,8 @@ impl ComfyWorkflowCatalogPolicy {
                 .max_duration_seconds
                 .unwrap_or(defaults.max_duration_seconds)
                 .max(1),
-            max_steps: self.max_steps.unwrap_or(defaults.max_steps).max(1),
+            max_steps,
+            allowed_steps,
             max_artifacts: self.max_artifacts.unwrap_or(defaults.max_artifacts).max(1),
         })
     }
@@ -197,6 +219,7 @@ pub struct ComfyWorkflowDerivationPolicy {
     pub max_frames: u64,
     pub max_duration_seconds: u64,
     pub max_steps: u64,
+    pub allowed_steps: BTreeSet<u64>,
     pub max_artifacts: u64,
 }
 
@@ -212,6 +235,7 @@ impl Default for ComfyWorkflowDerivationPolicy {
             max_frames: DEFAULT_COMFY_WORKFLOW_MAX_FRAMES,
             max_duration_seconds: DEFAULT_COMFY_WORKFLOW_MAX_DURATION_SECONDS,
             max_steps: DEFAULT_COMFY_WORKFLOW_MAX_STEPS,
+            allowed_steps: BTreeSet::new(),
             max_artifacts: DEFAULT_COMFY_WORKFLOW_MAX_ARTIFACTS,
         }
     }
@@ -569,6 +593,19 @@ impl OutcomeMetrics {
                 "steps exceeds {}",
                 policy.max_steps
             )));
+        }
+        if let Some(value) = steps {
+            if !policy.allowed_steps.is_empty() && !policy.allowed_steps.contains(&value) {
+                let allowed = policy
+                    .allowed_steps
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(ComfyWorkflowDerivationError::OutcomeOverflow(format!(
+                    "steps must be one of {allowed}"
+                )));
+            }
         }
         if artifact_count > policy.max_artifacts {
             return Err(ComfyWorkflowDerivationError::OutcomeOverflow(format!(
@@ -1098,6 +1135,12 @@ mod tests {
         })
     }
 
+    fn image_graph_with_steps(steps: u64) -> Value {
+        let mut graph = image_graph();
+        graph["3"]["inputs"]["steps"] = json!(steps);
+        graph
+    }
+
     #[test]
     fn media_loader_filenames_must_come_from_input_files() {
         let request = json!({
@@ -1229,6 +1272,55 @@ mod tests {
         assert!(err
             .to_string()
             .contains("dialogue/fight-lines.wav but it is not supplied"));
+    }
+
+    #[test]
+    fn allowed_steps_constrains_workflow_step_values() {
+        let mut policy = policy();
+        policy.max_steps = 8;
+        policy.allowed_steps = [4, 6, 8].into_iter().collect();
+
+        for steps in [4, 6, 8] {
+            let derivation = derive_comfy_workflow(&image_graph_with_steps(steps), &policy)
+                .expect("declared low-step values should pass");
+            assert_eq!(derivation.outcome_spec.steps, Some(steps));
+        }
+
+        for steps in [5, 20] {
+            let err = derive_comfy_workflow(&image_graph_with_steps(steps), &policy)
+                .expect_err("undeclared step value should fail");
+            assert!(
+                err.to_string().contains("steps must be one of 4, 6, 8")
+                    || err.to_string().contains("steps exceeds 8"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_policy_rejects_invalid_allowed_steps() {
+        let mut catalog_policy = ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["KSampler".to_owned()],
+            max_steps: Some(8),
+            allowed_steps: vec![4, 4],
+            ..ComfyWorkflowCatalogPolicy::default()
+        };
+        let err = catalog_policy
+            .derivation_policy()
+            .expect_err("duplicate allowed steps must be invalid");
+        assert!(err.to_string().contains("duplicate allowed_steps value 4"));
+
+        catalog_policy.allowed_steps = vec![4, 9];
+        let err = catalog_policy
+            .derivation_policy()
+            .expect_err("allowed steps cannot exceed max_steps");
+        assert!(err.to_string().contains("exceeds max_steps 8"));
+
+        catalog_policy.allowed_steps = vec![0];
+        let err = catalog_policy
+            .derivation_policy()
+            .expect_err("zero step value must be invalid");
+        assert!(err.to_string().contains("contains zero"));
     }
 
     fn part(name: &str, part_type: &str, byte: &str) -> ComfyWorkflowPartRef {

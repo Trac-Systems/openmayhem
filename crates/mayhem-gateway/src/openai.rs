@@ -45208,6 +45208,82 @@ mod tests {
     }
 
     #[test]
+    fn comfy_workflow_allowed_steps_are_enforced_at_gateway() {
+        let graph_with_steps = |steps| {
+            json!({
+                "1": {"class_type": "EmptyLatentImage", "inputs": {"width": 736, "height": 1280, "batch_size": 1}},
+                "2": {"class_type": "KSampler", "inputs": {"seed": 7, "steps": steps, "cfg": 1, "sampler_name": "euler", "scheduler": "simple", "denoise": 1, "model": ["9", 0], "positive": ["9", 0], "negative": ["9", 0], "latent_image": ["1", 0]}},
+                "3": {"class_type": "VAEDecode", "inputs": {"samples": ["2", 0], "vae": ["9", 0]}},
+                "4": {"class_type": "SaveImage", "inputs": {"images": ["3", 0], "filename_prefix": "mayhem-h3-lowvram"}}
+            })
+        };
+        let policy = mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec![
+                "EmptyLatentImage".to_owned(),
+                "KSampler".to_owned(),
+                "VAEDecode".to_owned(),
+                "SaveImage".to_owned(),
+            ],
+            runtime_id: Some("comfyui-v0.30.1".to_owned()),
+            outcome_class: Some("video.minimax_h3.lowvram_t2v_i2v".to_owned()),
+            pricing_unit: Some(mayhem_proto::USAGE_MEGAPIXEL_STEP.to_owned()),
+            max_width: Some(736),
+            max_height: Some(1280),
+            max_steps: Some(8),
+            allowed_steps: vec![4, 6, 8],
+            max_artifacts: Some(1),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        };
+
+        for steps in [4, 6, 8] {
+            artifact_generation_request_with_workflow_policy(
+                "video.minimax_h3.lowvram_t2v_i2v",
+                mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+                json!({
+                    "model": "video.minimax_h3.lowvram_t2v_i2v",
+                    "workflow": graph_with_steps(steps),
+                    "response_format": "artifact"
+                }),
+                VideoRequestPreparation::default(),
+                Some(&policy),
+            )
+            .expect("allowed low-VRAM H3 step value should pass");
+        }
+
+        let err = artifact_generation_request_with_workflow_policy(
+            "video.minimax_h3.lowvram_t2v_i2v",
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            json!({
+                "model": "video.minimax_h3.lowvram_t2v_i2v",
+                "workflow": graph_with_steps(20),
+                "response_format": "artifact"
+            }),
+            VideoRequestPreparation::default(),
+            Some(&policy),
+        )
+        .expect_err("20-step graph must not fit low-VRAM H3 policy");
+        assert!(err.message.contains("steps exceeds 8"), "{}", err.message);
+
+        let err = artifact_generation_request_with_workflow_policy(
+            "video.minimax_h3.lowvram_t2v_i2v",
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            json!({
+                "model": "video.minimax_h3.lowvram_t2v_i2v",
+                "workflow": graph_with_steps(5),
+                "response_format": "artifact"
+            }),
+            VideoRequestPreparation::default(),
+            Some(&policy),
+        )
+        .expect_err("unlisted low step value must not fit low-VRAM H3 policy");
+        assert!(
+            err.message.contains("steps must be one of 4, 6, 8"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
     fn comfy_workflow_endpoint_normalizes_through_gateway_contract() {
         let graph = json!({
             "1": {

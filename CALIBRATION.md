@@ -168,9 +168,24 @@ route proof before it closes the action-anime/dialogue quality gap.
   (`-18.10` dB RMS Spectrum vs. `-18.34` dB RMS base H3), and the base H3
   visual proof is at least as clear. Keep Spectrum parked as an optional proven
   dev lane; do not count it as product-ready public capacity.
-- Next H3/Spectrum action: none on the critical path. Revisit Spectrum only if
-  a future quality review shows an audible or visual improvement that the base
-  H3 lane cannot provide.
+- Candidate `video.minimax_h3.lowvram_t2v_i2v`: submitted low-VRAM MiniMax H3
+  pack, not a replacement for the accepted 20-step H3 class. Before any public
+  advertisement, mirror/sign the W4A8 FL2VA diffusion, INT8 video VAE,
+  4/6/8-step turbo LoRAs, `ComfyUI-MiniMaxH3-Easy@8138215`, and
+  `ComfyUI-KJNodes@6ab7e81`; reuse only the already signed Qwen3VL NVFP4 text
+  encoder and H3 audio VAE. The policy must set `max_steps=8`,
+  `allowed_steps=[4,6,8]`, default `steps=4`, `max_width=736`,
+  `max_height=1280`, `max_frames=243`, and `max_duration_seconds=11`. A 20-step
+  graph must fail derivation for this policy. First prove the current blessed
+  Comfy runtime; split to a newer runtime only if that render fails.
+- Candidate `video.minimax_h3.lowvram_r2v`: separate low-VRAM reference-media
+  lane. The submitted pack has only a 4-step R2V graph, so do not list 6/8-step
+  R2V until separately proven. The exported UI graph has a missing
+  `VAEDecode -> CreateVideo.images` edge; the Mayhem API graph/canary must
+  include that edge before proof.
+- Next H3 action: low-VRAM H3 requires the signed-parts/runtime/admission/paid
+  proof path above. Revisit Spectrum only if a future quality review shows an
+  audible or visual improvement that the base H3 lane cannot provide.
 - `video.heavy.le0_5mpf`: product-accepted for LTX A/V generation after paid
   `/v1/workflows` proofs with video and audio. It is not lipsync evidence.
 - `image.heavy.le1_2mp`: product-accepted for Krea base image generation after
