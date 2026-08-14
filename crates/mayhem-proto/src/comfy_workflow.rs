@@ -554,7 +554,11 @@ impl OutcomeMetrics {
 
         let width = self.width;
         let height = self.height;
-        let frames = self.frames;
+        let frames = self.frames.or_else(|| {
+            self.duration_seconds
+                .zip(self.fps)
+                .map(|(seconds, fps)| seconds.saturating_mul(fps.max(1)))
+        });
         let duration_seconds = self.duration_seconds.or_else(|| {
             frames.zip(self.fps).map(|(frames, fps)| {
                 let fps = fps.max(1);
@@ -1819,6 +1823,46 @@ mod tests {
         assert_eq!(derivation.quoted_usage.get(USAGE_VIDEO_SECOND), 12);
         assert_eq!(derivation.quoted_usage.get(USAGE_FRAME), 96);
         assert_eq!(derivation.quoted_usage.get(USAGE_STEP), 32);
+    }
+
+    #[test]
+    fn derives_video_frames_from_seconds_and_fps_when_length_is_absent() {
+        let mut policy = av_policy();
+        policy.pricing_unit = Some(USAGE_MEGAPIXEL_STEP.to_owned());
+        policy
+            .whitelisted_nodes
+            .extend(["MiniMaxH3Easy", "BasicScheduler", "CreateVideo"].map(str::to_owned));
+        policy.max_height = 1_280;
+        policy.max_frames = 512;
+        policy.max_steps = 8;
+
+        let graph = json!({
+            "1": {
+                "class_type": "MiniMaxH3Easy",
+                "inputs": {
+                    "width": 736,
+                    "height": 1280,
+                    "seconds": 10,
+                    "fps": 24
+                }
+            },
+            "2": {
+                "class_type": "BasicScheduler",
+                "inputs": { "steps": 4 }
+            },
+            "3": {
+                "class_type": "CreateVideo",
+                "inputs": {
+                    "images": ["1", 0],
+                    "fps": 24
+                }
+            }
+        });
+
+        let derivation = derive_comfy_workflow(&graph, &policy).unwrap();
+        assert_eq!(derivation.outcome_spec.frames, Some(240));
+        assert_eq!(derivation.outcome_spec.duration_seconds, Some(10));
+        assert_eq!(derivation.quoted_usage.get(USAGE_MEGAPIXEL_STEP), 240);
     }
 
     #[test]
