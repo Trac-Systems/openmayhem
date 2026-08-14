@@ -76225,7 +76225,7 @@ fn provider_heartbeat_min_ask_au(
     let Some(price) = selected
         .price
         .as_ref()
-        .and_then(|price| price.current.as_ref())
+        .and_then(active_au_usd_price_now)
     else {
         return 0;
     };
@@ -113169,6 +113169,39 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         )
         .expect("Comfy endpoint should advertise workflow class");
         assert_eq!(classes["image.workflow"]["min_ask_au"], json!("11"));
+    }
+
+    #[test]
+    fn provider_heartbeat_min_ask_uses_due_pending_admin_price() {
+        let root = "aa".repeat(32);
+        let contract = test_workflow_contract(&root);
+        let catalog = test_catalog(&root);
+        let hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        let mut args = test_provider_start_args();
+        args.engine_backend = "comfyui".to_owned();
+        let mut selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
+            .unwrap()
+            .remove(0);
+        let schedule = selected.price.as_mut().expect("test price schedule");
+        let current = schedule.current.as_mut().expect("current price");
+        current.min_session_au = 0;
+        current.per_req_au = 0;
+        current.rate_map = vec![RateMapEntry {
+            unit: "image".to_owned(),
+            per_unit_au: 99,
+            granularity: 1,
+        }];
+        let mut pending = current.clone();
+        pending.ver = current.ver + 1;
+        pending.effective_at = 0;
+        pending.rate_map = vec![RateMapEntry {
+            unit: "image".to_owned(),
+            per_unit_au: 7,
+            granularity: 1,
+        }];
+        schedule.pending = Some(pending);
+
+        assert_eq!(provider_heartbeat_min_ask_au(&selected, 0), 7);
     }
 
     #[test]
