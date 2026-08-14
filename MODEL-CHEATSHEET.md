@@ -6,7 +6,7 @@ the signed canonical catalog. It is derived from
 [detached signature](catalog/signatures/models.json.sig), the canaries named
 by that catalog, the managed-runtime locks in
 [`python_runtime.rs`](crates/mayhem-cli/src/python_runtime.rs), and
-[`CALIBRATION.md`](docs/CALIBRATION.md).
+[`CALIBRATION.md`](CALIBRATION.md).
 
 The live ledger remains authoritative for active enclave IDs, rooms, prices,
 routes, and revisions. Never copy an enclave ID or price from documentation:
