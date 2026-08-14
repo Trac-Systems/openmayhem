@@ -30260,16 +30260,16 @@
             "sha256": "a3208be61329c27a6754c53db9a21a3c86e2a285381700adf2d97e279c062840"
           },
           {
-            "part_id": "ce43141c4e565c32cb0c957bcc6ba6879c4039e49ae7a80a30bf035e8d5f39f8",
+            "part_id": "6788e26a9402dcfbf6595de9cfcd3fa56e303132ec225f751f987c9e0444d72c",
             "name": "ComfyUI-MiniMaxH3-Easy-8138215.tar.gz",
             "type": "custom-node",
-            "sha256": "475fb92ab679041d1b51f1b980e0b077df9ffe20b51815202a941cb0532b0742"
+            "sha256": "0b36c10133fc649ed5346e73e1956d12652f1e5cf5a0a29eb878b611803e45fe"
           },
           {
-            "part_id": "fdc1931f51cc2c3db27a46f18cdef40443ee0d23fa1aa8b95d03580f040ca71a",
+            "part_id": "7963f1e083e362fb64b7072ba8a6648605feec4e0f2a1f7b45a5903c68aeffb8",
             "name": "ComfyUI-KJNodes-6ab7e81.tar.gz",
             "type": "custom-node",
-            "sha256": "b05ad1229bae8e7ed0bea1639fe90fe6c667dfb47059b24d1eb2556a1e810e66"
+            "sha256": "4614fb0035fae2fab8492c8c8d71d205da5fc662976acf036b6a4a81e41f618c"
           }
         ],
         "runtime_id": "comfyui-v0.32.0",
@@ -30990,16 +30990,16 @@
             "sha256": "2c6abb194cff3e26c2295c87892913adf0c92d8f784f305238246759f9b333d0"
           },
           {
-            "part_id": "ce43141c4e565c32cb0c957bcc6ba6879c4039e49ae7a80a30bf035e8d5f39f8",
+            "part_id": "6788e26a9402dcfbf6595de9cfcd3fa56e303132ec225f751f987c9e0444d72c",
             "name": "ComfyUI-MiniMaxH3-Easy-8138215.tar.gz",
             "type": "custom-node",
-            "sha256": "475fb92ab679041d1b51f1b980e0b077df9ffe20b51815202a941cb0532b0742"
+            "sha256": "0b36c10133fc649ed5346e73e1956d12652f1e5cf5a0a29eb878b611803e45fe"
           },
           {
-            "part_id": "fdc1931f51cc2c3db27a46f18cdef40443ee0d23fa1aa8b95d03580f040ca71a",
+            "part_id": "7963f1e083e362fb64b7072ba8a6648605feec4e0f2a1f7b45a5903c68aeffb8",
             "name": "ComfyUI-KJNodes-6ab7e81.tar.gz",
             "type": "custom-node",
-            "sha256": "b05ad1229bae8e7ed0bea1639fe90fe6c667dfb47059b24d1eb2556a1e810e66"
+            "sha256": "4614fb0035fae2fab8492c8c8d71d205da5fc662976acf036b6a4a81e41f618c"
           }
         ],
         "runtime_id": "comfyui-v0.32.0",
