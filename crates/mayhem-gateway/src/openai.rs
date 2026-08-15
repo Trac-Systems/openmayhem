@@ -2646,6 +2646,10 @@ struct ApiError {
     status: StatusCode,
     message: String,
     param: Option<&'static str>,
+    public_code: &'static str,
+    category: &'static str,
+    retryable: bool,
+    safe_detail: Option<Value>,
 }
 
 pub type GatewaySessionFuture<'a> =
@@ -8385,6 +8389,44 @@ fn gateway_job_metadata(job: &StoredGatewayJob) -> Value {
     gateway_job_summary_metadata(&StoredGatewayJobSummary::from(job))
 }
 
+fn persisted_job_error_info(message: &str) -> Value {
+    let lower = message.to_ascii_lowercase();
+    let (code, category, retryable) = if lower.contains("insufficient local balance") {
+        ("insufficient_balance", "payment", false)
+    } else if lower.contains("spend reservation") {
+        ("payment_reservation_failed", "payment", true)
+    } else if lower.contains("exceeds the signed capacity envelope")
+        || lower.contains("exceeds provider")
+        || lower.contains("exceeds caps")
+    {
+        (
+            "request_exceeds_provider_capacity",
+            "request_validation",
+            false,
+        )
+    } else if lower.contains("no otherwise eligible provider had free capacity")
+        || lower.contains("no eligible provider became available")
+        || lower.contains("free capacity")
+    {
+        ("provider_admission_no_capacity", "provider_admission", true)
+    } else if lower.contains("transport closed") {
+        ("provider_transport_closed", "provider_response", true)
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        ("provider_response_timeout", "provider_response", true)
+    } else if lower.contains("failed verification") || lower.contains("signature") {
+        ("provider_verification_failed", "provider_response", false)
+    } else if lower.contains("cancel") {
+        ("job_cancelled", "client_connection", false)
+    } else {
+        ("provider_error", "provider_response", true)
+    };
+    json!({
+        "code": code,
+        "category": category,
+        "retryable": retryable,
+    })
+}
+
 fn gateway_job_summary_metadata(job: &StoredGatewayJobSummary) -> Value {
     json!({
         "id": job.id,
@@ -8405,6 +8447,7 @@ fn gateway_job_summary_metadata(job: &StoredGatewayJobSummary) -> Value {
         })).collect::<Vec<_>>(),
         "receipt": job.receipt,
         "error": job.error,
+        "error_info": job.error.as_deref().map(persisted_job_error_info),
     })
 }
 
@@ -9635,6 +9678,7 @@ fn video_generation_metadata_from_summary(
         "completed_at": job.finished_at,
         "expires_at": job.expires_at,
         "error": job.error,
+        "error_info": job.error.as_deref().map(persisted_job_error_info),
         "prompt": prompt,
         "size": size,
         "seconds": seconds,
@@ -10778,9 +10822,9 @@ fn artifact_generation_request_with_workflow_policy(
                 ApiError::bad_request("workflow request is missing workflow", Some("workflow"))
             })?;
             let policy = gateway_comfy_workflow_derivation_policy(workflow_policy)
-                .map_err(|err| ApiError::bad_request(err.to_string(), Some("workflow")))?;
+                .map_err(|err| workflow_request_policy_error(err.to_string(), Some("workflow")))?;
             let derivation = mayhem_proto::derive_comfy_workflow(workflow_graph, &policy)
-                .map_err(|err| ApiError::bad_request(err.to_string(), Some("workflow")))?;
+                .map_err(|err| workflow_request_policy_error(err.to_string(), Some("workflow")))?;
             let output_modality = if derivation
                 .outcome_spec
                 .output_modalities
@@ -13999,10 +14043,35 @@ fn provider_reported_session_error(
 }
 
 fn request_scoped_api_error(error: &GatewaySessionError) -> Option<ApiError> {
-    error
-        .failure_class
-        .is_request_scoped()
-        .then(|| ApiError::bad_request(error.message.clone(), Some("model")))
+    error.failure_class.is_request_scoped().then(|| {
+        let lower = error.message.to_ascii_lowercase();
+        let (code, category, message) = if lower.contains("receive rate") {
+            (
+                "client_receive_rate_exceeded",
+                "client_connection",
+                "The client connection exceeded its receive rate while receiving provider output.",
+            )
+        } else if lower.contains("model_output_invalid") {
+            (
+                "provider_model_output_invalid",
+                "provider_response",
+                "The provider returned output that does not satisfy the requested response contract.",
+            )
+        } else if lower.contains("request_chunk_failed") || lower.contains("request_reassembly_failed") {
+            (
+                "request_media_reassembly_failed",
+                "request_validation",
+                "The request media could not be reassembled or validated.",
+            )
+        } else {
+            (
+                "request_rejected_by_provider_contract",
+                "request_validation",
+                "The request does not satisfy the provider contract for this endpoint.",
+            )
+        };
+        ApiError::bad_request(message, Some("model")).with_public_error(code, category, false)
+    })
 }
 
 impl GatewayRequestOptions {
@@ -15888,7 +15957,158 @@ fn terminal_balance_refusal(err: &GatewaySessionError) -> Option<ApiError> {
             .message
             .to_ascii_lowercase()
             .contains("insufficient unreserved credit balance"))
-    .then(|| ApiError::payment_required(err.message.clone(), Some("model")))
+    .then(|| {
+        ApiError::payment_required(
+            "insufficient local balance for spend voucher",
+            Some("model"),
+        )
+        .with_public_error("insufficient_balance", "payment", false)
+    })
+}
+
+fn provider_session_api_error(err: &GatewaySessionError) -> ApiError {
+    if let Some(error) = request_scoped_api_error(err) {
+        return error;
+    }
+    let lower = err.message.to_ascii_lowercase();
+    if err.transport_closed {
+        return ApiError::bad_gateway(
+            "The provider transport closed before returning a terminal result.",
+            Some("model"),
+        )
+        .with_public_error("provider_transport_closed", "provider_response", true);
+    }
+    if err.wait_elapsed || lower.contains("timed out waiting") {
+        return ApiError::bad_gateway(
+            "The provider did not return the expected session event before the request deadline.",
+            Some("model"),
+        )
+        .with_public_error("provider_response_timeout", "provider_response", true);
+    }
+    if lower.contains("signature")
+        || lower.contains("attestation")
+        || lower.contains("receipt exceeds signed spend voucher")
+        || lower.contains("usage exceeded signed spend voucher")
+        || (lower.contains("receipt") && lower.contains("mismatch"))
+    {
+        return ApiError::bad_gateway(
+            "The provider returned signed session data that failed verification.",
+            Some("model"),
+        )
+        .with_public_error("provider_verification_failed", "provider_response", false);
+    }
+    if lower.contains("returned invalid")
+        || lower.contains("returned no ")
+        || lower.contains("expected")
+        || lower.contains("content type")
+    {
+        return ApiError::bad_gateway(
+            "The provider returned output that does not satisfy the endpoint contract.",
+            Some("model"),
+        )
+        .with_public_error("provider_response_invalid", "provider_response", true);
+    }
+    ApiError::bad_gateway(
+        "The provider failed before returning a billable result.",
+        Some("model"),
+    )
+    .with_public_error("provider_error", "provider_response", err.retryable)
+}
+
+fn route_attempt_error_code(last_error: Option<&str>) -> (&'static str, &'static str, bool) {
+    let lower = last_error.unwrap_or("").to_ascii_lowercase();
+    if lower.contains("request exceeds provider")
+        || lower.contains("per-request capacity")
+        || lower.contains("output exceeds caps")
+        || lower.contains("exceeds caps")
+    {
+        return (
+            "request_exceeds_provider_capacity",
+            "request_validation",
+            false,
+        );
+    }
+    if lower.contains("capacity is full")
+        || lower.contains(" with capacity:")
+        || lower.contains(" with busy:")
+        || lower.contains(" with rate:")
+        || lower.contains(" with quota:")
+        || lower.contains(" with draining:")
+        || lower.contains("provider full")
+    {
+        return ("provider_admission_no_capacity", "provider_admission", true);
+    }
+    if lower.contains("balance")
+        || lower.contains("spend reservation")
+        || lower.contains("payout binding")
+        || lower.contains("contract spend reservation")
+    {
+        return ("payment_reservation_failed", "payment", true);
+    }
+    if lower.contains("price_floor") || lower.contains("price floor") {
+        return ("provider_price_floor", "route_selection", false);
+    }
+    if lower.contains("direct transport closed") || lower.contains("sc-bridge closed") {
+        return ("provider_transport_closed", "provider_response", true);
+    }
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return ("provider_response_timeout", "provider_response", true);
+    }
+    if lower.contains("signature")
+        || lower.contains("attestation")
+        || (lower.contains("receipt") && lower.contains("mismatch"))
+    {
+        return ("provider_verification_failed", "provider_response", false);
+    }
+    ("provider_attempts_failed", "provider_response", true)
+}
+
+fn route_attempts_failed_error(
+    attempts_made: usize,
+    last_error: Option<String>,
+    phase: &'static str,
+) -> ApiError {
+    let (code, category, retryable) = route_attempt_error_code(last_error.as_deref());
+    let message = match code {
+        "request_exceeds_provider_capacity" => {
+            "The request exceeds the signed capacity envelope of every otherwise eligible provider."
+        }
+        "provider_admission_no_capacity" => {
+            "No otherwise eligible provider had free capacity before the request deadline."
+        }
+        "payment_reservation_failed" => {
+            "The spend reservation did not complete before provider work began."
+        }
+        "provider_price_floor" => {
+            "Every otherwise eligible provider refused the request at the offered price."
+        }
+        "provider_transport_closed" => {
+            "Every attempted provider transport closed before returning a billable result."
+        }
+        "provider_response_timeout" => {
+            "Every attempted provider timed out before returning a billable result."
+        }
+        "provider_verification_failed" => {
+            "Every attempted provider returned session data that failed verification."
+        }
+        _ => "Every attempted provider failed before returning a billable result.",
+    };
+    let status = match code {
+        "request_exceeds_provider_capacity" => StatusCode::BAD_REQUEST,
+        "provider_admission_no_capacity" | "provider_response_timeout" => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        "payment_reservation_failed" => StatusCode::PAYMENT_REQUIRED,
+        "provider_price_floor" => StatusCode::BAD_REQUEST,
+        "provider_verification_failed" => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    ApiError::new(status, message, Some("model"), code, category, retryable).with_safe_detail(
+        json!({
+            "attempts": attempts_made,
+            "phase": phase,
+        }),
+    )
 }
 
 fn verify_provider_receipt_signature(
@@ -20601,7 +20821,7 @@ async fn run_embedding_with_route_retry(
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                return Err(ApiError::bad_gateway(err.message, Some("model")));
+                return Err(provider_session_api_error(&err));
             }
         }
     }
@@ -20609,13 +20829,10 @@ async fn run_embedding_with_route_retry(
     if recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero() {
         return Err(route_wait_expired_error(&options));
     }
-    Err(ApiError::bad_gateway(
-        format!(
-            "all {} route attempt(s) failed before spend; last error: {}",
-            recovery.attempts_made,
-            last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
-        ),
-        Some("model"),
+    Err(route_attempts_failed_error(
+        recovery.attempts_made,
+        last_retryable_error,
+        "pre_spend",
     ))
 }
 
@@ -20794,7 +21011,7 @@ async fn run_image_generation_with_route_retry(
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                return Err(ApiError::bad_gateway(err.message, Some("model")));
+                return Err(provider_session_api_error(&err));
             }
         }
     }
@@ -20802,13 +21019,10 @@ async fn run_image_generation_with_route_retry(
     if recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero() {
         return Err(route_wait_expired_error(&options));
     }
-    Err(ApiError::bad_gateway(
-        format!(
-            "all {} route attempt(s) failed before spend; last error: {}",
-            recovery.attempts_made,
-            last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
-        ),
-        Some("model"),
+    Err(route_attempts_failed_error(
+        recovery.attempts_made,
+        last_retryable_error,
+        "pre_spend",
     ))
 }
 
@@ -20983,20 +21197,17 @@ async fn run_audio_speech_with_route_retry(
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                return Err(ApiError::bad_gateway(err.message, Some("model")));
+                return Err(provider_session_api_error(&err));
             }
         }
     }
     if recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero() {
         return Err(route_wait_expired_error(&options));
     }
-    Err(ApiError::bad_gateway(
-        format!(
-            "all {} route attempt(s) failed before spend; last error: {}",
-            recovery.attempts_made,
-            last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
-        ),
-        Some("model"),
+    Err(route_attempts_failed_error(
+        recovery.attempts_made,
+        last_retryable_error,
+        "pre_spend",
     ))
 }
 
@@ -21176,20 +21387,17 @@ async fn run_audio_transcription_with_route_retry(
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                return Err(ApiError::bad_gateway(err.message, Some("model")));
+                return Err(provider_session_api_error(&err));
             }
         }
     }
     if recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero() {
         return Err(route_wait_expired_error(&options));
     }
-    Err(ApiError::bad_gateway(
-        format!(
-            "all {} route attempt(s) failed before spend; last error: {}",
-            recovery.attempts_made,
-            last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
-        ),
-        Some("model"),
+    Err(route_attempts_failed_error(
+        recovery.attempts_made,
+        last_retryable_error,
+        "pre_spend",
     ))
 }
 
@@ -21376,20 +21584,17 @@ async fn run_artifact_generation_with_route_retry(
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                return Err(ApiError::bad_gateway(err.message, Some("model")));
+                return Err(provider_session_api_error(&err));
             }
         }
     }
     if recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero() {
         return Err(route_wait_expired_error(&options));
     }
-    Err(ApiError::bad_gateway(
-        format!(
-            "all {} route attempt(s) failed before spend; last error: {}",
-            recovery.attempts_made,
-            last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
-        ),
-        Some("model"),
+    Err(route_attempts_failed_error(
+        recovery.attempts_made,
+        last_retryable_error,
+        "pre_spend",
     ))
 }
 
@@ -21451,6 +21656,13 @@ fn preferred_provider_refusal_error(
             "model"
         }),
     ))
+    .map(|error| {
+        error
+            .with_public_error("preferred_provider_unavailable", "route_selection", true)
+            .with_safe_detail(json!({
+                "preferred_provider_count": preferred.len(),
+            }))
+    })
 }
 
 fn route_retry_total_attempt_limit(
@@ -21490,7 +21702,9 @@ fn no_eligible_route_error(
         return ApiError::payment_required(
             format!("no provider accepts the {rail} payment rail"),
             Some("model"),
-        );
+        )
+        .with_public_error("payment_rail_not_supported_by_provider", "payment", false)
+        .with_safe_detail(json!({ "rail": rail }));
     }
     let att_candidates = rail_candidates
         .iter()
@@ -21506,6 +21720,11 @@ fn no_eligible_route_error(
         return ApiError::bad_request(
             "no provider route satisfies X-Mayhem-Min-Att-Tier",
             Some("X-Mayhem-Min-Att-Tier"),
+        )
+        .with_public_error(
+            "no_provider_satisfies_attestation_tier",
+            "route_selection",
+            false,
         );
     }
     let quant_candidates = att_candidates
@@ -21523,7 +21742,8 @@ fn no_eligible_route_error(
         return ApiError::bad_request(
             "no provider route satisfies X-Mayhem-Quant",
             Some("X-Mayhem-Quant"),
-        );
+        )
+        .with_public_error("no_provider_satisfies_quant", "route_selection", false);
     }
     let modality_candidates = quant_candidates
         .iter()
@@ -21546,7 +21766,9 @@ fn no_eligible_route_error(
                 non_text_modalities.join(", ")
             ),
             Some("model"),
-        );
+        )
+        .with_public_error("required_modality_unavailable", "route_selection", true)
+        .with_safe_detail(json!({ "modalities": non_text_modalities }));
     }
     let now_millis = now_millis_u64();
     if modality_candidates
@@ -21556,7 +21778,8 @@ fn no_eligible_route_error(
         return ApiError::service_unavailable(
             "all otherwise eligible provider routes are cooling off after a retryable failure",
             Some("model"),
-        );
+        )
+        .with_public_error("provider_routes_cooling_off", "provider_admission", true);
     }
     if options.max_price_au.is_some() {
         return no_price_band_route_error();
@@ -21568,9 +21791,12 @@ fn no_eligible_route_error(
                 non_text_modalities.join(", ")
             ),
             Some("model"),
-        );
+        )
+        .with_public_error("provider_admission_no_capacity", "provider_admission", true)
+        .with_safe_detail(json!({ "modalities": non_text_modalities }));
     }
     ApiError::bad_request("no provider route is currently eligible", Some("model"))
+        .with_public_error("no_provider_route_eligible", "route_selection", false)
 }
 
 fn chat_context_capacity_error(
@@ -21610,6 +21836,8 @@ fn chat_context_capacity_error(
             ),
             Some("model"),
         )
+        .with_public_error("context_capacity_unavailable", "route_selection", true)
+        .with_safe_detail(json!({ "required_ctx": required_ctx }))
     })
 }
 
@@ -22142,6 +22370,8 @@ fn route_wait_expired_error(options: &GatewayRequestOptions) -> ApiError {
         ),
         Some("model"),
     )
+    .with_public_error("provider_admission_no_capacity", "provider_admission", true)
+    .with_safe_detail(json!({ "max_wait_ms": options.max_wait_ms }))
 }
 
 fn no_price_band_route_error() -> ApiError {
@@ -22149,6 +22379,7 @@ fn no_price_band_route_error() -> ApiError {
         "no provider route is at or below X-Mayhem-Max-Price-Au",
         Some("X-Mayhem-Max-Price-Au"),
     )
+    .with_public_error("no_provider_within_price_band", "route_selection", false)
 }
 
 fn ensure_max_price_allows(
@@ -22758,7 +22989,7 @@ async fn prepare_live_direct_chat_session(
             }
             Err(err) => {
                 record_route_attempt_error(&state, route.as_ref(), attempt_started.elapsed(), &err);
-                return Err(ApiError::bad_gateway(err.message, Some("model")));
+                return Err(provider_session_api_error(&err));
             }
         }
     }
@@ -22766,13 +22997,10 @@ async fn prepare_live_direct_chat_session(
     if recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero() {
         return Err(route_wait_expired_error(&options));
     }
-    Err(ApiError::bad_gateway(
-        format!(
-            "all {} route attempt(s) failed before streaming; last error: {}",
-            recovery.attempts_made,
-            last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
-        ),
-        Some("model"),
+    Err(route_attempts_failed_error(
+        recovery.attempts_made,
+        last_retryable_error,
+        "stream_open",
     ))
 }
 
@@ -24574,7 +24802,7 @@ async fn run_chat_with_route_retry(
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                return Err(ApiError::bad_gateway(err.message, Some("model")));
+                return Err(provider_session_api_error(&err));
             }
         }
     }
@@ -24582,13 +24810,10 @@ async fn run_chat_with_route_retry(
     if recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero() {
         return Err(route_wait_expired_error(&options));
     }
-    Err(ApiError::bad_gateway(
-        format!(
-            "all {attempts_made} route attempt(s) failed before spend; last error: {last_error}",
-            attempts_made = recovery.attempts_made,
-            last_error = last_retryable_error.unwrap_or_else(|| "no route attempted".to_owned())
-        ),
-        Some("model"),
+    Err(route_attempts_failed_error(
+        recovery.attempts_made,
+        last_retryable_error,
+        "pre_spend",
     ))
 }
 
@@ -28686,7 +28911,7 @@ fn validate_chat_video_input(
         .div_ceil(3)
         .saturating_add(4);
     if encoded.len() > encoded_limit {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::request_capacity(
             format!(
                 "video input exceeds the {}-byte gateway limit",
                 limits.max_video_bytes
@@ -28717,7 +28942,7 @@ fn validate_chat_video_input(
             )
         })?;
     if frames > limits.max_video_frames {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::request_capacity(
             format!(
                 "video input exceeds the {}-frame gateway limit",
                 limits.max_video_frames
@@ -28756,7 +28981,7 @@ fn workflow_input_file_stats(
         ApiError::bad_request("workflow input_files must be an array", Some("input_files"))
     })?;
     if files.len() > usize::try_from(limits.max_items_per_request).unwrap_or(usize::MAX) {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::request_capacity(
             format!(
                 "workflow input_files exceeds the {}-item gateway media limit",
                 limits.max_items_per_request
@@ -28844,7 +29069,7 @@ fn workflow_input_file_stats(
             .div_ceil(3)
             .saturating_add(4);
         if encoded.len() > encoded_limit {
-            return Err(ApiError::bad_request(
+            return Err(ApiError::request_capacity(
                 format!("workflow input_files[{index}] exceeds the {max_bytes}-byte limit"),
                 Some("input_files"),
             ));
@@ -28856,7 +29081,7 @@ fn workflow_input_file_stats(
             )
         })?;
         if bytes.is_empty() || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
-            return Err(ApiError::bad_request(
+            return Err(ApiError::request_capacity(
                 format!("workflow input_files[{index}] must be 1..={max_bytes} decoded bytes"),
                 Some("input_files"),
             ));
@@ -28902,7 +29127,7 @@ fn workflow_input_file_stats(
                         )
                     })?;
                 if frames > limits.max_video_frames {
-                    return Err(ApiError::bad_request(
+                    return Err(ApiError::request_capacity(
                         format!(
                             "workflow input_files[{index}] exceeds the {}-frame limit",
                             limits.max_video_frames
@@ -28931,6 +29156,19 @@ fn workflow_input_file_stats(
         }
     }
     Ok(stats)
+}
+
+fn workflow_request_policy_error(message: String, param: Option<&'static str>) -> ApiError {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("exceeds")
+        || lower.contains("outside caps")
+        || lower.contains("above caps")
+        || lower.contains("too large")
+    {
+        ApiError::request_capacity(message, param)
+    } else {
+        ApiError::bad_request(message, param)
+    }
 }
 
 fn normalized_media_content_type(value: &str) -> String {
@@ -29032,7 +29270,7 @@ fn validate_workflow_input_image_bytes(
         })?;
     let pixels = u64::from(width).saturating_mul(u64::from(height));
     if width == 0 || height == 0 || pixels > max_pixels {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::request_capacity(
             format!("workflow input_files[{index}] exceeds the {max_pixels}-pixel limit"),
             Some("input_files"),
         ));
@@ -29075,7 +29313,7 @@ fn validate_workflow_input_audio_bytes(
     }
     let seconds = metadata.duration_seconds_ceil;
     if seconds == 0 || seconds > max_seconds {
-        return Err(ApiError::bad_request(
+        return Err(ApiError::request_capacity(
             format!("workflow input_files[{index}] exceeds the {max_seconds}-second limit"),
             Some("input_files"),
         ));
@@ -29627,7 +29865,7 @@ impl GatewayState {
                 .session_backend
                 .run_chat(model, &request, &invocation)
                 .await
-                .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+                .map_err(|err| provider_session_api_error(&err))?;
             let token_fingerprint = token_fingerprint(result.token_ids.iter().copied()).digest;
             observed_tokens.insert(prompt.id.clone(), result.token_ids.clone());
             let receipt = self.meter_chat_session(
@@ -29912,7 +30150,7 @@ impl GatewayState {
                         .session_backend
                         .run_chat(model, &request, &invocation)
                         .await
-                        .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+                        .map_err(|err| provider_session_api_error(&err))?;
                     let expected_prefix = expected.token_prefixes.get(&prompt.id).ok_or_else(|| {
                         ApiError::bad_gateway(
                             format!(
@@ -30159,7 +30397,7 @@ impl GatewayState {
                         .session_backend
                         .run_artifact_generation(model, &request, &invocation)
                         .await
-                        .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+                        .map_err(|err| provider_session_api_error(&err))?;
                     let receipt = self.meter_artifact_generation_session(
                         model,
                         &request,
@@ -30187,7 +30425,7 @@ impl GatewayState {
                         .session_backend
                         .run_image_generation(model, &request, &invocation)
                         .await
-                        .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+                        .map_err(|err| provider_session_api_error(&err))?;
                     let receipt = self.meter_image_generation_session(
                         model,
                         &request,
@@ -30377,7 +30615,7 @@ impl GatewayState {
                 .session_backend
                 .run_embedding(model, &request, &invocation)
                 .await
-                .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+                .map_err(|err| provider_session_api_error(&err))?;
             let observed = result.output.embeddings.first().cloned().ok_or_else(|| {
                 ApiError::bad_gateway("provider returned no canary embedding", Some("model"))
             })?;
@@ -30489,7 +30727,7 @@ impl GatewayState {
                 .session_backend
                 .run_audio_transcription(model, &request, &invocation)
                 .await
-                .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+                .map_err(|err| provider_session_api_error(&err))?;
             if prompt.require_word_timestamps && result.output.transcription.words.is_empty() {
                 return Err(ApiError::bad_gateway(
                     format!("STT canary prompt {} requires word timestamps", prompt.id),
@@ -30614,7 +30852,7 @@ impl GatewayState {
                     .session_backend
                     .run_audio_speech(model, &request, &invocation)
                     .await
-                    .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+                    .map_err(|err| provider_session_api_error(&err))?;
                 let receipt = self.meter_audio_speech_session(
                     model,
                     &request,
@@ -30640,7 +30878,7 @@ impl GatewayState {
                     .session_backend
                     .run_artifact_generation(model, &request, &invocation)
                     .await
-                    .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+                    .map_err(|err| provider_session_api_error(&err))?;
                 let expected_artifacts = usize::try_from(request.artifact_count).map_err(|_| {
                     ApiError::bad_gateway(
                         "signed canary artifact count exceeds this gateway platform",
@@ -30799,7 +31037,7 @@ impl GatewayState {
                 .session_backend
                 .run_artifact_generation(model, &request, &invocation)
                 .await
-                .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+                .map_err(|err| provider_session_api_error(&err))?;
             let expected_artifacts = usize::try_from(request.artifact_count).map_err(|_| {
                 ApiError::bad_gateway(
                     "signed video canary artifact count exceeds this gateway platform",
@@ -31755,7 +31993,7 @@ impl GatewayState {
                 &invocation.spend_voucher.body.locked_rate_map,
                 invocation,
             )
-            .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+            .map_err(|err| provider_session_api_error(&err))?;
             let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
             if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
                 return Err(ApiError::payment_required(
@@ -31786,7 +32024,7 @@ impl GatewayState {
                 &invocation.spend_voucher.body.locked_rate_map,
                 invocation,
             )
-            .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+            .map_err(|err| provider_session_api_error(&err))?;
             let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
             if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
                 return Err(ApiError::payment_required(
@@ -31870,7 +32108,7 @@ impl GatewayState {
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
         let usage = authoritative_embedding_usage(inputs, output)
-            .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+            .map_err(|err| provider_session_api_error(&err))?;
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
         if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
@@ -31985,7 +32223,7 @@ impl GatewayState {
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
         let usage = authoritative_image_generation_usage(request, output)
-            .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+            .map_err(|err| provider_session_api_error(&err))?;
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
         if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
@@ -32100,7 +32338,7 @@ impl GatewayState {
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
         let usage = authoritative_artifact_generation_usage(request, output)
-            .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+            .map_err(|err| provider_session_api_error(&err))?;
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
         if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
@@ -32243,7 +32481,7 @@ impl GatewayState {
             &invocation.spend_voucher.body.locked_rate_map,
             invocation,
         )
-        .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+        .map_err(|err| provider_session_api_error(&err))?;
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
         if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
@@ -32289,7 +32527,7 @@ impl GatewayState {
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
         let usage = authoritative_audio_speech_usage(request, output)
-            .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+            .map_err(|err| provider_session_api_error(&err))?;
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
         if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
@@ -32404,7 +32642,7 @@ impl GatewayState {
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
         let usage = authoritative_audio_transcription_usage(request, output)
-            .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+            .map_err(|err| provider_session_api_error(&err))?;
         let au_owed_cum = calculate_locked_au_owed(invocation, &usage);
         if locked_increment_exceeds_voucher(invocation, au_owed_cum) {
             return Err(ApiError::payment_required(
@@ -32519,7 +32757,7 @@ impl GatewayState {
     ) -> Result<SessionReceipt, ApiError> {
         let body = &provider_receipt.body;
         validate_provider_receipt(model, invocation, provider_receipt, expected)
-            .map_err(|err| ApiError::bad_gateway(err.message, Some("model")))?;
+            .map_err(|err| provider_session_api_error(&err))?;
         let receipt_ack = receipt_ack_for_body(&self.receipt_config.user_seed, body)
             .map_err(ApiError::internal)?;
         Ok(SessionReceipt {
@@ -34295,11 +34533,10 @@ fn require_model(state: &GatewayState, model: &str) -> Result<GatewayModel, ApiE
             return Ok(model);
         }
     }
-    Err(ApiError {
-        status: StatusCode::NOT_FOUND,
-        message: format!("model '{model}' is not available"),
-        param: Some("model"),
-    })
+    Err(
+        ApiError::not_found(format!("model '{model}' is not available"), Some("model"))
+            .with_public_error("model_not_available", "route_selection", true),
+    )
 }
 
 fn route_price_ref_au<'a>(
@@ -35502,117 +35739,196 @@ fn now_millis_u64() -> u64 {
 }
 
 impl ApiError {
-    fn unauthorized(message: impl Into<String>, param: Option<&'static str>) -> Self {
+    fn new(
+        status: StatusCode,
+        message: impl Into<String>,
+        param: Option<&'static str>,
+        public_code: &'static str,
+        category: &'static str,
+        retryable: bool,
+    ) -> Self {
         Self {
-            status: StatusCode::UNAUTHORIZED,
+            status,
             message: message.into(),
             param,
+            public_code,
+            category,
+            retryable,
+            safe_detail: None,
         }
+    }
+
+    fn with_public_error(
+        mut self,
+        public_code: &'static str,
+        category: &'static str,
+        retryable: bool,
+    ) -> Self {
+        self.public_code = public_code;
+        self.category = category;
+        self.retryable = retryable;
+        self
+    }
+
+    fn with_safe_detail(mut self, safe_detail: Value) -> Self {
+        self.safe_detail = Some(safe_detail);
+        self
+    }
+
+    fn unauthorized(message: impl Into<String>, param: Option<&'static str>) -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            message,
+            param,
+            "authentication_required",
+            "authentication",
+            false,
+        )
     }
 
     fn bad_request(message: impl Into<String>, param: Option<&'static str>) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            message: message.into(),
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            message,
             param,
-        }
+            "invalid_request",
+            "request_validation",
+            false,
+        )
+    }
+
+    fn request_capacity(message: impl Into<String>, param: Option<&'static str>) -> Self {
+        Self::bad_request(message, param).with_public_error(
+            "request_exceeds_provider_capacity",
+            "request_validation",
+            false,
+        )
     }
 
     fn not_found(message: impl Into<String>, param: Option<&'static str>) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            message: message.into(),
+        Self::new(
+            StatusCode::NOT_FOUND,
+            message,
             param,
-        }
+            "not_found",
+            "request_validation",
+            false,
+        )
     }
 
     fn payment_required(message: impl Into<String>, param: Option<&'static str>) -> Self {
-        Self {
-            status: StatusCode::PAYMENT_REQUIRED,
-            message: message.into(),
+        Self::new(
+            StatusCode::PAYMENT_REQUIRED,
+            message,
             param,
-        }
+            "payment_required",
+            "payment",
+            false,
+        )
     }
 
     fn forbidden(message: impl Into<String>, param: Option<&'static str>) -> Self {
-        Self {
-            status: StatusCode::FORBIDDEN,
-            message: message.into(),
+        Self::new(
+            StatusCode::FORBIDDEN,
+            message,
             param,
-        }
+            "forbidden",
+            "authorization",
+            false,
+        )
     }
 
     fn service_unavailable(message: impl Into<String>, param: Option<&'static str>) -> Self {
-        Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: message.into(),
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            message,
             param,
-        }
+            "service_unavailable",
+            "routing",
+            true,
+        )
     }
 
     fn conflict(message: impl Into<String>, param: Option<&'static str>) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            message: message.into(),
+        Self::new(
+            StatusCode::CONFLICT,
+            message,
             param,
-        }
+            "conflict",
+            "idempotency",
+            false,
+        )
     }
 
     fn bad_gateway(message: impl Into<String>, param: Option<&'static str>) -> Self {
-        Self {
-            status: StatusCode::BAD_GATEWAY,
-            message: message.into(),
+        Self::new(
+            StatusCode::BAD_GATEWAY,
+            message,
             param,
-        }
+            "provider_error",
+            "provider_response",
+            true,
+        )
     }
 
     fn client_closed_request(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::from_u16(499).expect("499 is a valid extension status"),
-            message: message.into(),
-            param: None,
-        }
+        Self::new(
+            StatusCode::from_u16(499).expect("499 is a valid extension status"),
+            message,
+            None,
+            "client_closed_request",
+            "client_connection",
+            false,
+        )
     }
 
     fn too_many_requests(message: impl Into<String>, param: Option<&'static str>) -> Self {
-        Self {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            message: message.into(),
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            message,
             param,
-        }
+            "rate_limited",
+            "rate_limit",
+            true,
+        )
     }
 
     fn internal(err: serde_json::Error) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: format!("receipt signing payload failed: {err}"),
-            param: None,
-        }
+        Self::internal_message(format!("receipt signing payload failed: {err}"))
     }
 
     fn internal_message(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            message: message.into(),
-            param: None,
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+            None,
+            "internal_error",
+            "internal",
+            true,
+        )
+    }
+
+    fn public_error_value(&self) -> Value {
+        let mut error = serde_json::Map::new();
+        error.insert("message".to_owned(), json!(self.message));
+        error.insert("type".to_owned(), json!("invalid_request_error"));
+        error.insert(
+            "param".to_owned(),
+            self.param.map_or(Value::Null, |param| json!(param)),
+        );
+        error.insert("code".to_owned(), json!(self.public_code));
+        error.insert("category".to_owned(), json!(self.category));
+        error.insert("retryable".to_owned(), json!(self.retryable));
+        if let Some(safe_detail) = self.safe_detail.clone() {
+            error.insert("safe_detail".to_owned(), safe_detail);
         }
+        json!({ "error": Value::Object(error) })
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(json!({
-                "error": {
-                    "message": self.message,
-                    "type": "invalid_request_error",
-                    "param": self.param,
-                    "code": null,
-                }
-            })),
-        )
-            .into_response()
+        (self.status, Json(self.public_error_value())).into_response()
     }
 }
 
@@ -35623,6 +35939,91 @@ mod tests {
         attestation_signing_bytes, ctx_bracket_for_tokens, reassemble_json_payload,
         AttestationSigner, CTX_BRACKET_TABLE_VERSION,
     };
+
+    fn public_error_code(error: &ApiError) -> String {
+        error
+            .public_error_value()
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .expect("public error code")
+            .to_owned()
+    }
+
+    fn public_error_category(error: &ApiError) -> String {
+        error
+            .public_error_value()
+            .pointer("/error/category")
+            .and_then(Value::as_str)
+            .expect("public error category")
+            .to_owned()
+    }
+
+    fn public_error_retryable(error: &ApiError) -> bool {
+        error
+            .public_error_value()
+            .pointer("/error/retryable")
+            .and_then(Value::as_bool)
+            .expect("public error retryable")
+    }
+
+    fn assert_provider_verification_api_error(error: &ApiError) {
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(public_error_code(error), "provider_verification_failed");
+        assert_eq!(public_error_category(error), "provider_response");
+        assert!(!public_error_retryable(error));
+    }
+
+    #[test]
+    fn api_errors_expose_stable_public_taxonomy() {
+        let request_error = ApiError::bad_request("bad size", Some("size"));
+        assert_eq!(public_error_code(&request_error), "invalid_request");
+        assert_eq!(public_error_category(&request_error), "request_validation");
+        assert!(!public_error_retryable(&request_error));
+
+        let wait_error = route_wait_expired_error(&GatewayRequestOptions {
+            max_wait_ms: 42,
+            ..GatewayRequestOptions::default()
+        });
+        let wait_value = wait_error.public_error_value();
+        assert_eq!(
+            wait_value["error"]["code"],
+            "provider_admission_no_capacity"
+        );
+        assert_eq!(wait_value["error"]["category"], "provider_admission");
+        assert_eq!(wait_value["error"]["retryable"], true);
+        assert_eq!(wait_value["error"]["safe_detail"]["max_wait_ms"], 42);
+    }
+
+    #[test]
+    fn public_route_attempt_errors_do_not_leak_provider_session_text() {
+        let error = route_attempts_failed_error(
+            1,
+            Some(
+                "provider rejected session abc123 with BALANCE: spend reservation did not complete"
+                    .to_owned(),
+            ),
+            "pre_spend",
+        );
+        let value = error.public_error_value();
+        assert_eq!(value["error"]["code"], "payment_reservation_failed");
+        assert_eq!(value["error"]["category"], "payment");
+        assert_eq!(value["error"]["retryable"], true);
+        let message = value["error"]["message"].as_str().expect("message");
+        assert!(!message.contains("abc123"));
+        assert!(!message.contains("provider rejected"));
+        assert_eq!(value["error"]["safe_detail"]["attempts"], 1);
+        assert_eq!(value["error"]["safe_detail"]["phase"], "pre_spend");
+    }
+
+    #[test]
+    fn persisted_job_errors_expose_public_info() {
+        let info = persisted_job_error_info(
+            "The request exceeds the signed capacity envelope of every otherwise eligible provider.",
+        );
+        assert_eq!(info["code"], "request_exceeds_provider_capacity");
+        assert_eq!(info["category"], "request_validation");
+        assert_eq!(info["retryable"], false);
+    }
 
     #[derive(Debug)]
     struct FullReceiptSettlementPublisher;
@@ -38476,7 +38877,7 @@ mod tests {
                 Some(&false_cache),
             )
             .expect_err("false cache hit must not be co-signed");
-        assert!(err.message.contains("cached prompt usage mismatch"));
+        assert_provider_verification_api_error(&err);
 
         let mut wrong_amount = provider_receipt.clone();
         wrong_amount.body.au_owed_cum = wrong_amount.body.au_owed_cum.saturating_add(1);
@@ -38487,7 +38888,7 @@ mod tests {
         let err = state
             .meter_chat_session(&model, &request, &output, &invocation, Some(&wrong_amount))
             .expect_err("wrong amount must be rejected");
-        assert!(err.message.contains("amount"));
+        assert_provider_verification_api_error(&err);
 
         let mut wrong_usage = provider_receipt.clone();
         wrong_usage.body.usage = ReceiptUsage::text(
@@ -38516,7 +38917,7 @@ mod tests {
         let err = state
             .meter_chat_session(&model, &request, &output, &invocation, Some(&wrong_sig))
             .expect_err("wrong enclave signature must be rejected");
-        assert!(err.message.contains("signature"));
+        assert_provider_verification_api_error(&err);
     }
 
     #[test]
@@ -39097,7 +39498,7 @@ mod tests {
         let err = state
             .meter_embedding_session(&model, &inputs, &output, &invocation, Some(&wrong_amount))
             .expect_err("wrong embedding amount must be rejected");
-        assert!(err.message.contains("amount"));
+        assert_provider_verification_api_error(&err);
     }
 
     #[test]
@@ -40590,11 +40991,13 @@ mod tests {
     impl ProviderReportedFailureBackend {
         fn error(&self, context: &str, retryable: bool) -> GatewaySessionError {
             if clean_provider_reject_code(self.code) {
+                let reason = if self.code == "BALANCE" {
+                    "Insufficient unreserved credit balance."
+                } else {
+                    "focused route-runner refusal"
+                };
                 return GatewaySessionError::clean_refusal_with_code(
-                    format!(
-                        "provider rejected {context} with {}: focused route-runner refusal",
-                        self.code
-                    ),
+                    format!("provider rejected {context} with {}: {reason}", self.code,),
                     Some(self.code),
                 );
             }
@@ -43838,7 +44241,7 @@ mod tests {
             .active_job_cancellations
             .lock_recover("active gateway job cancellations")
             .contains_key(&job.id));
-        let pressure_error = match prepare_gateway_job(
+        let pressure_job = match prepare_gateway_job(
             &state,
             &HeaderMap::new(),
             mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
@@ -43848,10 +44251,10 @@ mod tests {
         )
         .await
         {
-            Err(error) => error,
-            Ok(_) => panic!("ACK-pending result must remain protected under job pressure"),
+            Ok(PreparedGatewayJob::Started(job)) => job,
+            _ => panic!("ACK-pending result must not block unrelated async work"),
         };
-        assert!(pressure_error.message.contains("configured limit"));
+        pressure_job.cancellation().cancel();
         let pressure_survivor = state
             .jobs
             .lock_recover("gateway job vault")
@@ -45168,6 +45571,27 @@ mod tests {
         assert_eq!(image_load.item_count, 1);
         assert_eq!(image_load.max_item_units, 1024 * 1024);
         assert!(image_load.max_item_units > 736 * 1280);
+    }
+
+    #[test]
+    fn comfy_workflow_input_file_capacity_returns_public_capacity_code() {
+        let err = workflow_input_file_stats(
+            &json!({
+                "input_files": [
+                    {},
+                    {}
+                ]
+            }),
+            &GatewayMediaLimits {
+                max_items_per_request: 1,
+                ..GatewayMediaLimits::default()
+            },
+        )
+        .expect_err("oversized workflow input_files must be rejected");
+
+        assert_eq!(public_error_code(&err), "request_exceeds_provider_capacity");
+        assert_eq!(public_error_category(&err), "request_validation");
+        assert!(!public_error_retryable(&err));
     }
 
     #[test]
@@ -47040,6 +47464,17 @@ mod tests {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "{runner:?}"
             );
+            assert_eq!(
+                public_error_code(&capacity_error),
+                "provider_admission_no_capacity",
+                "{runner:?}"
+            );
+            assert_eq!(
+                public_error_category(&capacity_error),
+                "provider_admission",
+                "{runner:?}"
+            );
+            assert!(public_error_retryable(&capacity_error), "{runner:?}");
             let route = &model.mayhem.route_candidates[0];
             assert!(
                 !state.route_provider_in_cooloff(route, now_millis_u64()),
@@ -47066,6 +47501,9 @@ mod tests {
                 StatusCode::PAYMENT_REQUIRED,
                 "{runner:?}"
             );
+            assert_eq!(public_error_code(&balance_error), "insufficient_balance");
+            assert_eq!(public_error_category(&balance_error), "payment");
+            assert!(!public_error_retryable(&balance_error));
         }
     }
 

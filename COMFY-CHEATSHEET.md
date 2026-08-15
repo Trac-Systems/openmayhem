@@ -63,6 +63,20 @@ Minimal request shape:
 
 The gateway derives required parts, graph hash, runtime id, output class, modalities, and billable usage from the signed workflow policy. Unknown nodes, unsafe paths, missing parts, output dimensions outside caps, or wrong modality sets fail before spend.
 
+If a workflow fails, read the structured public error fields first. A direct
+API error has `error.code`, `error.category`, `error.retryable`, and optional
+`error.safe_detail`; an async job has the same classification as `error_info`
+in `GET /v1/jobs/<id>`.
+
+| Code | Comfy workflow meaning |
+|---|---|
+| `request_exceeds_provider_capacity` | The workflow request is outside the signed policy/provider envelope. Common causes are oversized `input_files`, too many pixels, too many frames, duration above caps, or unsupported step counts. Reduce the request or target a larger workflow market. |
+| `required_modality_unavailable` | The exact workflow market is not live. A live T2V route is not evidence that R2V/reference-media capacity is live. |
+| `provider_admission_no_capacity` | The route is live but the provider did not accept before the wait deadline, usually because the serial workflow lane is already rendering or draining. Use `Prefer: respond-async`, a stable `Idempotency-Key`, and a body `timeout_ms` large enough for the render; retry later if the lane is busy. |
+| `payment_reservation_failed` | The provider did not start work because accounting admission failed before spend. No receipt means no completed billable render. |
+| `provider_transport_closed` / `provider_response_timeout` | The provider crashed, restarted, disconnected, or exceeded the session deadline during admission/render. Check provider health and memory before retrying heavy workflows. |
+| `provider_response_invalid` | The provider produced an artifact that does not match the signed workflow output contract. |
+
 Workflow requests that consume user media use bounded `input_files` entries. Each entry must name a
 safe relative filename used by the graph and carry inline base64 bytes plus content type. Providers
 must not rely on files already present in their local Comfy input directory. Image inputs are

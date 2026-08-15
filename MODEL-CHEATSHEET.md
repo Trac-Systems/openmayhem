@@ -97,6 +97,28 @@ routing, vouchers, receipts, and reporting. Current price brackets are:
 A lower context does not create a new enclave and does not need admin approval.
 If a provider changes its committed context, it signs its own leave/rejoin.
 
+## Public API error codes
+
+Every model class uses the same public gateway error taxonomy. Direct failures
+return `error.code`, `error.category`, `error.retryable`, and optional
+`error.safe_detail`; async artifact/workflow jobs expose the same classification
+as `error_info` in `/v1/jobs/<id>`.
+
+Use the code, not prose guessing, when triaging:
+
+| Code | Model/provider interpretation |
+|---|---|
+| `request_exceeds_provider_capacity` | Request exceeds the signed envelope for the chosen model or workflow: context, media size, duration, frames, steps, output count, or input bytes. |
+| `required_modality_unavailable` | The catalog entry exists but no live route serves the requested modality set. |
+| `provider_admission_no_capacity` | A route exists but no provider accepted before the wait deadline; the lane may be full, busy, or draining. |
+| `payment_rail_not_supported_by_provider` | Buyer selected a rail no live provider for that model accepts. |
+| `insufficient_balance` | Buyer has too little unreserved credit on the selected rail. |
+| `payment_reservation_failed` | Spend reservation failed before work began; retry after route/accounting health recovers. |
+| `provider_transport_closed` / `provider_response_timeout` | Provider disconnected, restarted, or exceeded the session deadline. |
+| `provider_response_invalid` / `provider_model_output_invalid` | Provider output did not satisfy the endpoint contract, including strict JSON/tool-response contracts. |
+| `provider_verification_failed` | Signed provider data, receipt, canary, or attestation failed verification; do not keep retrying the same route unchanged. |
+| `client_receive_rate_exceeded` | The caller or proxy is not reading the stream fast enough; use async job mode for long artifact/workflow requests. |
+
 ## Comfy workflow provider workflow
 
 ComfyUI workflow classes are not ordinary single-weight model entries. They are

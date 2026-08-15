@@ -823,6 +823,69 @@ Class = smallest machine class that serves it well: **A** CPU/laptop, **B** cons
 | Audio and music generation | `/v1/audio/generations`, `/v1/music/generations` |
 | ComfyUI workflows | `/v1/workflows` — Mayhem-native workflow graph execution |
 
+### Public error codes
+
+All gateway errors return an OpenAI-style JSON envelope with stable Mayhem
+fields:
+
+```json
+{
+  "error": {
+    "message": "No otherwise eligible provider had free capacity before the request deadline.",
+    "type": "invalid_request_error",
+    "param": "model",
+    "code": "provider_admission_no_capacity",
+    "category": "provider_admission",
+    "retryable": true,
+    "safe_detail": { "max_wait_ms": 60000 }
+  }
+}
+```
+
+Async jobs expose the same classification in `/v1/jobs/<id>` as
+`error_info`. The public fields are intentionally safe: they do not include
+provider stderr, wallet internals, peer addresses, private rooms, tokens, store
+paths, raw graphs, or session transport details.
+
+| Code | Category | Retry? | Meaning |
+|---|---|---:|---|
+| `authentication_required` | `authentication` | no | A bearer token or dashboard token is missing or invalid. |
+| `forbidden` | `authorization` | no | The token is valid but not allowed to access the requested model/job/action. |
+| `invalid_request` | `request_validation` | no | JSON, field, endpoint, or unsupported-value validation failed before routing. |
+| `request_exceeds_provider_capacity` | `request_validation` | no | The request is outside the signed input/output/resource envelope of otherwise eligible providers. Reduce size, duration, media bytes, steps, context, or target a larger market. |
+| `request_rejected_by_provider_contract` | `request_validation` | no | A provider rejected the request as not satisfying its signed endpoint contract. |
+| `request_media_reassembly_failed` | `request_validation` | no | Inline or chunked media could not be decoded, reassembled, or validated. |
+| `not_found` | `request_validation` | no | The requested resource, such as a job or artifact, does not exist or is not visible to this token. |
+| `model_not_available` | `route_selection` | yes | The requested model/workflow is not visible in the local signed catalog snapshot. |
+| `no_provider_route_eligible` | `route_selection` | no | The model exists but no route satisfies the current filters. |
+| `required_modality_unavailable` | `route_selection` | yes | No live provider currently serves the requested modality set, such as audio+video or reference image+video. |
+| `context_capacity_unavailable` | `route_selection` | yes | Live text providers exist, but none currently advertises enough context. |
+| `no_provider_within_price_band` | `route_selection` | no | `X-Mayhem-Max-Price-Au` is below every eligible route. |
+| `no_provider_satisfies_attestation_tier` | `route_selection` | no | `X-Mayhem-Min-Att-Tier` excludes every route. |
+| `no_provider_satisfies_quant` | `route_selection` | no | `X-Mayhem-Quant` excludes every route. |
+| `preferred_provider_unavailable` | `route_selection` | yes | The requested preferred provider set has no available eligible route. |
+| `provider_price_floor` | `route_selection` | no | Providers refused because the offered/locked price was below their ask. |
+| `payment_required` | `payment` | no | Generic payment precondition failure. |
+| `payment_rail_not_supported_by_provider` | `payment` | no | The buyer gateway rail does not match any provider's accepted rails for that model. |
+| `insufficient_balance` | `payment` | no | The buyer has insufficient unreserved local credit for the spend voucher. |
+| `payment_reservation_failed` | `payment` | yes | Accounting admission failed before provider work began; no spend should occur without a receipt. |
+| `provider_admission_no_capacity` | `provider_admission` | yes | Providers were live or otherwise eligible but none accepted before the wait deadline, usually because the lane is full or draining. |
+| `provider_routes_cooling_off` | `provider_admission` | yes | Routes are temporarily suppressed after retryable failures. |
+| `provider_transport_closed` | `provider_response` | yes | The direct or relayed provider transport closed before a terminal result. |
+| `provider_response_timeout` | `provider_response` | yes | The provider did not return the expected session event before the deadline. |
+| `provider_response_invalid` | `provider_response` | yes | The provider returned malformed output or the wrong artifact shape/content type. |
+| `provider_model_output_invalid` | `provider_response` | no | The model output did not satisfy a strict requested response contract. |
+| `provider_verification_failed` | `provider_response` | no | Signed provider session data, receipt data, or attestation failed verification. |
+| `provider_attempts_failed` | `provider_response` | yes | All attempted providers failed before a billable result, but no narrower public class matched. |
+| `provider_error` | `provider_response` | yes | Generic provider failure. |
+| `client_receive_rate_exceeded` | `client_connection` | no | The client connection did not keep up with provider output quickly enough; use async jobs or a client/proxy that drains the response stream. |
+| `client_closed_request` | `client_connection` | no | The client disconnected or cancelled before completion. |
+| `job_cancelled` | `client_connection` | no | A durable async job was cancelled before producing a deliverable result. |
+| `rate_limited` | `rate_limit` | yes | The gateway or token rate limit rejected the request. |
+| `conflict` | `idempotency` | no | An idempotent retry conflicts with a different existing request or terminal job. |
+| `service_unavailable` | `routing` | yes | Generic temporary service/routing unavailability when no narrower code matched. |
+| `internal_error` | `internal` | yes | Gateway-side internal failure. Retry once; report if repeated. |
+
 ### ComfyUI workflows
 
 When the signed catalog exposes a workflow-enabled model, users call the same

@@ -239,6 +239,40 @@ to the next tier it can prove.
    model IDs, dashboard URL, endpoint. Never pad with prose. Never fabricate a value.
 5. **State what's next** in one line (e.g. "credit will land after payment; then run a completion").
 
+### 4.0 Public error-code handling
+
+When a gateway/API/job request fails, read the structured public fields before
+guessing. Normal responses use:
+
+```json
+{"error":{"code":"<stable-code>","category":"<class>","retryable":true}}
+```
+
+Async artifact and workflow jobs expose the same classification at
+`GET /v1/jobs/<id>` as `error_info`. Relay `code`, `category`, `retryable`, and
+any `safe_detail`. Do not ask the user to infer from generic prose.
+The exhaustive public code list is in `README.md`; the table below is the
+operator triage subset that most often needs action.
+
+Important codes:
+
+| Code | What to do |
+|---|---|
+| `request_exceeds_provider_capacity` | The request is too large for the signed provider envelope. Reduce media bytes, pixels, seconds, frames, steps, or context, or choose a larger workflow/model market. Do not retry unchanged. |
+| `provider_admission_no_capacity` | Provider lane is busy/draining or did not accept before the wait deadline. For workflows use `Prefer: respond-async`, a stable `Idempotency-Key`, and a body `timeout_ms` appropriate for the render. Retry later or choose another live route. |
+| `required_modality_unavailable` | The model family may be visible, but the exact modality market is not live. For H3, `video.minimax_h3.t2v_i2v`, `video.minimax_h3.r2v`, and low-VRAM variants are separate markets. |
+| `payment_rail_not_supported_by_provider` | The buyer rail and provider accepted rails do not overlap. Switch rail or choose a route that accepts it. |
+| `insufficient_balance` | Fund the selected buyer rail and confirm `mayhem balance` before retrying. |
+| `payment_reservation_failed` | No spend should occur without a receipt. Retry after the route or settlement path is healthy; report if repeated. |
+| `provider_transport_closed` / `provider_response_timeout` | Provider became unreachable or exceeded the session deadline. Retry, or check provider health if operating that machine. |
+| `provider_response_invalid` / `provider_model_output_invalid` | The provider/model returned a result that did not satisfy the endpoint contract. For strict JSON/tool mode, simplify the request or choose a stronger compatible model. |
+| `provider_verification_failed` | Treat as non-retryable for that route until the provider/operator fixes the signed data, canary, attestation, or receipt path. |
+| `client_receive_rate_exceeded` | The client/proxy did not drain the provider stream fast enough. Prefer async jobs for long artifact/workflow work or fix the client transport before retrying. |
+
+Public error fields are intentionally sanitized. Never request or reveal private
+rooms, peer tokens, wallet secrets, store paths, provider stderr, or raw graph
+internals while troubleshooting.
+
 ### 4.1 User — buy inference
 **Ask first:**
 - **Which payment rail?** `fiat` (card via Stripe) · `tap` (Ethereum ERC-20) · `tnk` (Trac native).
