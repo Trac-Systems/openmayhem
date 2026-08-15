@@ -33665,20 +33665,51 @@ fn workflow_outcome_class_definition_value(
 }
 
 fn workflow_outcome_class_enclave_caps(class: &AdminWorkflowOutcomeClassDefinition) -> Value {
-    let modalities: Vec<&str> = match class.media.as_str() {
-        "image" => vec!["image"],
-        "video" => vec!["video"],
-        "audio" => vec!["audio"],
-        _ => Vec::new(),
+    let primary_modality = match class.media.as_str() {
+        "image" | "video" | "audio" => class.media.as_str(),
+        _ => "image",
     };
-    let output_modality = modalities.first().copied().unwrap_or("image");
+    let output_modalities = class
+        .caps
+        .get("output_modalities")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|modality| matches!(*modality, "image" | "video" | "audio"))
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| vec![primary_modality]);
+    let mut modality_set = BTreeSet::new();
+    modality_set.insert(primary_modality);
+    for modality in &output_modalities {
+        modality_set.insert(*modality);
+    }
+    if let Some(reference_media) = class.caps.get("reference_media").and_then(Value::as_array) {
+        for modality in reference_media
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|modality| matches!(*modality, "image" | "video" | "audio"))
+        {
+            modality_set.insert(modality);
+        }
+    }
+    let output_modality = output_modalities
+        .first()
+        .copied()
+        .unwrap_or(primary_modality);
+    let image = modality_set.contains("image");
+    let video = modality_set.contains("video");
+    let audio = modality_set.contains("audio");
     json!({
-        "image": class.media == "image",
-        "video": class.media == "video",
-        "audio": class.media == "audio",
+        "image": image,
+        "video": video,
+        "audio": audio,
         "output_modality": output_modality,
-        "output_modalities": modalities,
-        "modality_set": modalities,
+        "output_modalities": output_modalities,
+        "modality_set": modality_set.into_iter().collect::<Vec<_>>(),
         "speciality_levels": {},
     })
 }
@@ -94897,21 +94928,31 @@ mod tests {
             limit_classes: None,
         };
         let report = admin_workflow_grid_report(&args, &grid, &input, &admin_pubkey).unwrap();
-        assert_eq!(report["class_count"], json!(18));
-        assert_eq!(report["outcome_classes"].as_array().unwrap().len(), 18);
+        let expected_classes = grid.classes.len();
+        assert_eq!(report["class_count"], json!(expected_classes));
+        assert_eq!(
+            report["outcome_classes"].as_array().unwrap().len(),
+            expected_classes
+        );
         assert_eq!(
             report["register_enclave_payloads"]
                 .as_array()
                 .unwrap()
                 .len(),
-            18
+            expected_classes
         );
         assert_eq!(
             report["set_model_ref_payloads"].as_array().unwrap().len(),
-            18
+            expected_classes
         );
-        assert_eq!(report["set_price_payloads"].as_array().unwrap().len(), 18);
-        assert_eq!(report["open_room_payloads"].as_array().unwrap().len(), 18);
+        assert_eq!(
+            report["set_price_payloads"].as_array().unwrap().len(),
+            expected_classes
+        );
+        assert_eq!(
+            report["open_room_payloads"].as_array().unwrap().len(),
+            expected_classes
+        );
 
         let first_ref = &report["outcome_classes"][0];
         assert_eq!(first_ref["class_id"], "image.light.le1_2mp");
@@ -94937,6 +94978,21 @@ mod tests {
             "workflow-grid register payload must match the strict registerEnclave schema"
         );
         validate_admin_register_enclave_identity(&admin_pubkey, first_register).unwrap();
+
+        let h3_lowvram_register = report["register_enclave_payloads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|payload| payload["model_id"] == "video.minimax_h3.lowvram_t2v_i2v")
+            .expect("low-VRAM H3 class");
+        assert_eq!(
+            h3_lowvram_register["caps"]["output_modalities"],
+            json!(["video", "audio"])
+        );
+        assert_eq!(
+            h3_lowvram_register["caps"]["modality_set"],
+            json!(["audio", "image", "video"])
+        );
 
         let first_price = &report["set_price_payloads"][0];
         assert_eq!(first_price["effective_at"], json!(86_400));

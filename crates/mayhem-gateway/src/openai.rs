@@ -200,6 +200,7 @@ const AU_PER_USD: MoneyAu = 1_000_000_000_000_000_000;
 const AU_PER_CENT: MoneyAu = AU_PER_USD / 100;
 pub const DEFAULT_ROUTE_MAX_WAIT_MS: u64 = 10_000;
 pub const MAX_ROUTE_MAX_WAIT_MS: u64 = 60_000;
+const MAX_ASYNC_ARTIFACT_ROUTE_WAIT_MS: u64 = 60 * 60 * 1000;
 const ROUTE_WAIT_POLL_MS: u64 = 1_000;
 const SESSION_OPEN_REPLAY_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS: u64 = 1_024;
@@ -2377,6 +2378,7 @@ pub struct ArtifactGenerationRequest {
     pub input_audio_max_bytes: u64,
     pub input_audio_max_seconds: u64,
     pub response_format: String,
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -8482,6 +8484,17 @@ fn gateway_prefers_async_response(headers: &HeaderMap) -> bool {
         .any(|preference| preference.eq_ignore_ascii_case("respond-async"))
 }
 
+fn apply_async_artifact_route_wait(
+    options: &mut GatewayRequestOptions,
+    request: &ArtifactGenerationRequest,
+) {
+    if let Some(timeout_ms) = request.timeout_ms {
+        options.max_wait_ms = options
+            .max_wait_ms
+            .max(timeout_ms.min(MAX_ASYNC_ARTIFACT_ROUTE_WAIT_MS));
+    }
+}
+
 fn gateway_job_in_progress_metadata(
     id: &str,
     endpoint_family: &str,
@@ -9536,7 +9549,11 @@ async fn execute_artifact_generation_endpoint(
     };
     options.job = Some(job.clone());
     options.client_cancellation = Some(job.cancellation());
-    if gateway_prefers_async_response(headers) {
+    let prefer_async = gateway_prefers_async_response(headers);
+    if prefer_async {
+        apply_async_artifact_route_wait(&mut options, &request);
+    }
+    if prefer_async {
         let job_id = job.id.clone();
         let request_state = state.clone();
         let task_request = request.clone();
@@ -10874,6 +10891,10 @@ fn artifact_generation_request_with_workflow_policy(
         WorkflowInputFileStats::default()
     };
     let response_format = response_format.to_owned();
+    let timeout_ms = raw_request
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0);
     Ok(ArtifactGenerationRequest {
         model: model_id.to_owned(),
         prompt,
@@ -10898,6 +10919,7 @@ fn artifact_generation_request_with_workflow_policy(
         input_audio_max_bytes: inline_audio.max_item_bytes,
         input_audio_max_seconds: inline_audio.max_item_seconds,
         response_format,
+        timeout_ms,
     })
 }
 
@@ -21620,8 +21642,7 @@ struct RouteWaitDeadline {
 impl RouteWaitDeadline {
     fn new(max_wait_ms: u64) -> Self {
         Self {
-            expires_at: Instant::now()
-                + Duration::from_millis(max_wait_ms.min(MAX_ROUTE_MAX_WAIT_MS)),
+            expires_at: Instant::now() + Duration::from_millis(max_wait_ms),
         }
     }
 
@@ -37313,6 +37334,45 @@ mod tests {
     }
 
     #[test]
+    fn async_artifact_route_wait_uses_bounded_request_timeout() {
+        let mut options = GatewayRequestOptions {
+            max_wait_ms: MAX_ROUTE_MAX_WAIT_MS,
+            ..GatewayRequestOptions::default()
+        };
+        let request = artifact_generation_request(
+            "mayhem/video-test",
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            json!({
+                "model": "mayhem/video-test",
+                "prompt": "queued async video",
+                "seconds": 1,
+                "fps": 8,
+                "response_format": "b64_json",
+                "timeout_ms": 900_000
+            }),
+            VideoRequestPreparation::default(),
+        )
+        .expect("artifact request");
+
+        apply_async_artifact_route_wait(&mut options, &request);
+
+        assert_eq!(options.max_wait_ms, 900_000);
+
+        let mut capped = GatewayRequestOptions {
+            max_wait_ms: MAX_ROUTE_MAX_WAIT_MS,
+            ..GatewayRequestOptions::default()
+        };
+        let oversized = ArtifactGenerationRequest {
+            timeout_ms: Some(MAX_ASYNC_ARTIFACT_ROUTE_WAIT_MS + 1),
+            ..request
+        };
+
+        apply_async_artifact_route_wait(&mut capped, &oversized);
+
+        assert_eq!(capped.max_wait_ms, MAX_ASYNC_ARTIFACT_ROUTE_WAIT_MS);
+    }
+
+    #[test]
     fn shared_gateway_bind_requires_active_tokens_and_enforced_auth() {
         let loopback = "127.0.0.1:11435".parse().unwrap();
         let shared = "0.0.0.0:11435".parse().unwrap();
@@ -39977,8 +40037,12 @@ mod tests {
     }
 
     fn test_png_data_url() -> String {
+        test_png_data_url_with_size(1, 1)
+    }
+
+    fn test_png_data_url_with_size(width: u32, height: u32) -> String {
         let mut bytes = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::new_rgb8(1, 1)
+        image::DynamicImage::new_rgb8(width, height)
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
         format!(
@@ -45056,6 +45120,57 @@ mod tests {
     }
 
     #[test]
+    fn comfy_workflow_reference_image_capacity_uses_source_pixels_not_render_canvas() {
+        let graph = json!({
+            "1": {
+                "class_type": "EmptyLatentImage",
+                "inputs": { "width": 736, "height": 1280, "batch_size": 1 }
+            },
+            "2": {
+                "class_type": "SaveImage",
+                "inputs": { "images": ["1", 0] }
+            }
+        });
+        let image_b64 = test_png_data_url_with_size(1024, 1024)
+            .split_once(',')
+            .expect("data url")
+            .1
+            .to_owned();
+        let request = artifact_generation_request(
+            "video.minimax_h3.lowvram_t2v_i2v",
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            json!({
+                "model": "video.minimax_h3.lowvram_t2v_i2v",
+                "workflow": graph,
+                "runtime_id": "comfyui-v0.30.1",
+                "outcome_class": "video.minimax_h3.lowvram_t2v_i2v",
+                "response_format": "artifact",
+                "input_files": [
+                    {
+                        "filename": "refs/large-reference.png",
+                        "kind": "image",
+                        "content_type": "image/png",
+                        "encoding": "base64",
+                        "data": image_b64
+                    }
+                ]
+            }),
+            VideoRequestPreparation::default(),
+        )
+        .unwrap();
+
+        let model = test_model();
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let requirements =
+            request_requirements_for_artifact_generation(&state, &model, &request, 1, None, None);
+
+        let image_load = requirements.modality_load.get("image").unwrap();
+        assert_eq!(image_load.item_count, 1);
+        assert_eq!(image_load.max_item_units, 1024 * 1024);
+        assert!(image_load.max_item_units > 736 * 1280);
+    }
+
+    #[test]
     fn comfy_workflow_media_loader_requires_matching_input_file() {
         let policy = mayhem_proto::ComfyWorkflowCatalogPolicy {
             whitelisted_nodes: vec!["LoadAudio".to_owned(), "SaveAudio".to_owned()],
@@ -46441,6 +46556,7 @@ mod tests {
                     input_audio_max_bytes: 0,
                     input_audio_max_seconds: 0,
                     response_format: "mp4".to_owned(),
+                    timeout_ms: None,
                 };
                 focused_route_runner_error(
                     run_artifact_generation_with_route_retry(&state, &model, &request, options)

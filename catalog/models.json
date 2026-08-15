@@ -923,7 +923,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -1382,7 +1382,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -4006,7 +4006,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -4016,7 +4016,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -4036,7 +4036,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -4084,7 +4084,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -8112,7 +8112,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-06,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -8210,7 +8210,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -8432,7 +8432,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-06,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -8513,7 +8513,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -8770,7 +8770,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-06,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -8844,7 +8844,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -9257,7 +9257,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-06,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -9340,7 +9340,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -11420,7 +11420,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-06,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -11495,7 +11495,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -11735,7 +11735,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-06,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -11796,7 +11796,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -12047,7 +12047,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-06,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -12099,7 +12099,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -12574,7 +12574,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-06,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -12636,7 +12636,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -15281,7 +15281,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-06,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -15366,7 +15366,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -15587,7 +15587,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-06,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -15647,7 +15647,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -15880,7 +15880,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-06,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -15942,7 +15942,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -16399,7 +16399,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-06,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -16487,7 +16487,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -19246,7 +19246,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-06,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -19335,7 +19335,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -19564,7 +19564,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-06,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -19639,7 +19639,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -19881,7 +19881,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-06,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -19947,7 +19947,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -20413,7 +20413,7 @@
                   0.95
                 ],
                 "maximum": 1,
-                "minimum": 1e-06,
+                "minimum": 0.000001,
                 "value_types": [
                   "number"
                 ]
@@ -20489,7 +20489,7 @@
                 "calibration_values": [
                   1
                 ],
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "minimum": 0,
                 "value_types": [
                   "integer"
@@ -24885,7 +24885,7 @@
                   "integer"
                 ],
                 "minimum": 0,
-                "maximum": 1.8446744073709552e+19,
+                "maximum": 1.8446744073709552E+19,
                 "calibration_values": [
                   1
                 ]
@@ -28410,7 +28410,7 @@
           "audio"
         ],
         "evidence": [
-          "Official Comfy-Org MiniMax H3 R2V workflow assets mirrored as five signed parts in parts-index v13; owner approved MiniMax H3 for served territories on 2026-08-10."
+          "Official Comfy-Org MiniMax H3 R2V workflow assets mirrored as five signed parts in parts-index v13; owner approved MiniMax H3 for served territories on 2026-08-10. Request-bound source reference images may be larger than the render canvas and are downsampled inside the signed workflow."
         ],
         "calibrated_fingerprints": {},
         "resource_profiles": {
@@ -28419,12 +28419,12 @@
               "unit": "pixel",
               "measurement_source": "minimax_h3_r2v_reference_input_profile_pending_paid_admission",
               "max_item_bytes": 16777216,
-              "max_item_units": 1032192,
+              "max_item_units": 17000000,
               "measured_item_bytes": 16777216,
-              "measured_item_units": 1032192,
-              "measured_working_set_bytes": 16777216,
+              "measured_item_units": 17000000,
+              "measured_working_set_bytes": 204000000,
               "calibration_baseline_memory_bytes": 21474836480,
-              "calibration_peak_memory_bytes": 21491613696,
+              "calibration_peak_memory_bytes": 21678836480,
               "calibration_f13_budget_bytes": 103079215104,
               "default_max_inflight_items": 1,
               "default_max_items_per_request": 1
@@ -29258,10 +29258,10 @@
             "revision": "3fae8359db18e4d3ac4d498bc032dcbe39fe0b9e"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.lowvram_t2v_i2v.json",
-          "artifact_root": "3cd7ddea8da5d3e4fb53f4a9a76dd63d9d177eb9052eb770f4ff04b44ab2fad0",
+          "artifact_root": "a2983450a18594705465d0e7277ba79505fb79d04fe213eac10cb3c34ffbcf95",
           "artifact_root_kind": "blake3_merkle_v1",
-          "weights_bytes": 807,
-          "source_sha256": "595e419f02d40bb6bfe0c43ca701297b21b23d907cca17aa381c291d7b4a2073",
+          "weights_bytes": 1061,
+          "source_sha256": "3056eb861c45f82547536faf4e202c431981134a30195be45bb63fb867a975f9",
           "download_check": false,
           "notes": "Signed Comfy outcome-class definition for the converted low-VRAM MiniMax H3 text/image-to-video lane. The workflow uses the W4A8 FL2VA model, INT8 video VAE, native audio VAE, 4/6/8-step turbo LoRAs, and pinned low-VRAM custom nodes through the signed parts inventory."
         }
@@ -30134,7 +30134,7 @@
         ],
         "evidence": [
           "Converted MiniMax_H3_ComfyUI_Workflow_Pack.zip into Mayhem canonical workflow policy JSON; no ZIP-native schema is trusted at runtime.",
-          "This low-VRAM lane supports text prompts plus optional image references through input_files, and serves video with native audio. It is limited to 736x1280, 10 seconds, one artifact, and user-selectable steps 4, 6, or 8."
+          "This low-VRAM lane supports text prompts plus optional image references through input_files, and serves video with native audio. The output render is limited to 736x1280, 10 seconds, one artifact, and user-selectable steps 4, 6, or 8; request-bound source reference images may be larger and are downsampled inside the signed workflow."
         ],
         "calibrated_fingerprints": {},
         "resource_profiles": {
@@ -30143,12 +30143,12 @@
               "unit": "pixel",
               "measurement_source": "submitted_minimax_h3_lowvram_pack_pending_paid_admission_image_reference",
               "max_item_bytes": 16777216,
-              "max_item_units": 942080,
+              "max_item_units": 17000000,
               "measured_item_bytes": 16777216,
-              "measured_item_units": 942080,
-              "measured_working_set_bytes": 16777216,
+              "measured_item_units": 17000000,
+              "measured_working_set_bytes": 204000000,
               "calibration_baseline_memory_bytes": 17179869184,
-              "calibration_peak_memory_bytes": 17196646400,
+              "calibration_peak_memory_bytes": 17383869184,
               "calibration_f13_budget_bytes": 51539607552,
               "default_max_inflight_items": 1,
               "default_max_items_per_request": 1
@@ -30243,19 +30243,19 @@
           },
           {
             "part_id": "b9b438dc6fdaac1e86b7655979de00a727a891760f26a2c6ca291e5f99435616",
-            "name": "minimax_h3_fl2v_turbo_lora_4step_768p.safetensors",
+            "name": "minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_resized_avg_rank_21_bf16.safetensors",
             "type": "lora",
             "sha256": "1b85da614014024a0c9507f12558917dcc69b6adb564e716324594f401723115"
           },
           {
             "part_id": "eeb05336a8602223e7e44d94d0e9beb76ebd7cb856c65ce1a7efb77cb8413dca",
-            "name": "minimax_h3_turbo_v4_step600_ema_lora.safetensors",
+            "name": "minimax_h3_turbo_v4_step600_ema_pruned_comfyui.safetensors",
             "type": "lora",
             "sha256": "7098acf3ee75028fd9fcd948f50fcc8d995057fabb76f86bd3ca2c0ffc58e409"
           },
           {
             "part_id": "dd4a391825411ca79af8ea1b21bd422e94b328a056982097e1a49750e033701b",
-            "name": "minimax_h3_fl2v_turbo_lora_8step.safetensors",
+            "name": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_resized_avg_rank_21_bf16.safetensors",
             "type": "lora",
             "sha256": "a3208be61329c27a6754c53db9a21a3c86e2a285381700adf2d97e279c062840"
           },
@@ -30318,7 +30318,7 @@
             }
           ],
           "schema": "openmayhem.comfy.outcome-class-grid.v1",
-          "source": "COMFY-CHEATSHEET.md#minimax-h3-low-vram-candidate",
+          "source": "COMFY-CHEATSHEET.md#minimax-h3-low-vram-published",
           "title": "MiniMax H3 low-VRAM text/image-to-video with native audio"
         },
         "pricing_unit": "megapixel_step",
@@ -30404,12 +30404,12 @@
             "revision": "3fae8359db18e4d3ac4d498bc032dcbe39fe0b9e"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.lowvram_r2v.json",
-          "artifact_root": "9bc72e6ae35b307bfd6b459303b700eb5e872e26061ac261442f17c4eaec4798",
+          "artifact_root": "c3824980a72ebc769d3eda4e60e2e5d1c8a89964c4afab5495d57ffe656789e0",
           "artifact_root_kind": "blake3_merkle_v1",
-          "weights_bytes": 806,
-          "source_sha256": "a273f50e3755a52b836d16574e0e7ba360dd4d638ae7f1d858b7839fe04670b4",
+          "weights_bytes": 1053,
+          "source_sha256": "a17f0104694d366b498b62b83026d69d58e0074bdea6f07daea7d752adbcad6e",
           "download_check": false,
-          "notes": "Signed Comfy outcome-class definition for the converted low-VRAM MiniMax H3 reference-to-video lane. The workflow uses the W4A8 REF2VA model, INT8 video VAE, native audio VAE, 4-step REF2V turbo LoRA, and pinned low-VRAM custom nodes through the signed parts inventory."
+          "notes": "Signed Comfy outcome-class definition for the converted low-VRAM MiniMax H3 reference-to-video lane. The workflow uses the W4A8 REF2VA model, INT8 video VAE, native audio VAE, 4-step reference-video turbo LoRA, and pinned low-VRAM custom nodes through the signed parts inventory."
         }
       },
       "caps": {
@@ -30876,7 +30876,7 @@
         ],
         "evidence": [
           "Converted the reference-video branch from MiniMax_H3_ComfyUI_Workflow_Pack.zip into Mayhem canonical workflow policy JSON; the pack only included a 4-step R2V graph.",
-          "This low-VRAM reference-media lane accepts image/video references through input_files and serves video with native audio. It is limited to 736x1280, 10 seconds, one artifact, and the signed W4A8 REF2VA/INT8 VAE/REF2V LoRA inventory."
+          "This low-VRAM reference-media lane accepts image/video references through input_files and serves video with native audio. The output render is limited to 736x1280, 10 seconds, one artifact, and the signed W4A8 REF2VA/INT8 VAE/REF2V LoRA inventory; request-bound source reference images may be larger and are downsampled inside the signed workflow."
         ],
         "calibrated_fingerprints": {},
         "resource_profiles": {
@@ -30885,12 +30885,12 @@
               "unit": "pixel",
               "measurement_source": "submitted_minimax_h3_lowvram_r2v_pack_pending_paid_admission_image_reference",
               "max_item_bytes": 16777216,
-              "max_item_units": 942080,
+              "max_item_units": 17000000,
               "measured_item_bytes": 16777216,
-              "measured_item_units": 942080,
-              "measured_working_set_bytes": 16777216,
+              "measured_item_units": 17000000,
+              "measured_working_set_bytes": 204000000,
               "calibration_baseline_memory_bytes": 17179869184,
-              "calibration_peak_memory_bytes": 17196646400,
+              "calibration_peak_memory_bytes": 17383869184,
               "calibration_f13_budget_bytes": 51539607552,
               "default_max_inflight_items": 1,
               "default_max_items_per_request": 1
@@ -31047,7 +31047,7 @@
             }
           ],
           "schema": "openmayhem.comfy.outcome-class-grid.v1",
-          "source": "COMFY-CHEATSHEET.md#minimax-h3-low-vram-candidate",
+          "source": "COMFY-CHEATSHEET.md#minimax-h3-low-vram-published",
           "title": "MiniMax H3 low-VRAM reference-to-video with native audio"
         },
         "pricing_unit": "megapixel_step",
