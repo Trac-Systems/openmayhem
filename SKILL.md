@@ -345,6 +345,13 @@ mayhem provider limits set [--max-concurrent N] [--accept-rate R] [--budget <USD
 mayhem provider health                          # green AND the model appears in /v1/models
 ```
 
+Accepted rails are not enough for buyer routing. A provider can be active,
+room-joined, and heartbeating while staying invisible to buyers if it lacks an
+active verified payout binding for an accepted rail. In that case
+`mayhem provider health --json` reports
+`gateway.route_preconditions.status = no_active_verified_payout_binding`; run
+`mayhem provider payout get`, then bind TAP/TNK or complete Stripe readiness.
+
 For fiat, run `mayhem provider stripe onboard` with the provider's actual
 two-letter country code. It always prints the hosted `connect.stripe.com` URL
 before attempting a browser open; use `--no-open` on a remote terminal and then

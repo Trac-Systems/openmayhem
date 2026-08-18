@@ -196,6 +196,15 @@ mayhem provider serve add <workflow-enclave-id> \
   --json
 ```
 
+If `provider health` shows an active Comfy serve and fresh heartbeats but buyers
+still see zero route candidates, check payout bindings before debugging
+heartbeats. `mayhem provider rails set --rails fiat,tap,tnk --submit` only
+declares accepted rails; buyers see a paid route only after at least one
+accepted rail also has an active verified payout binding:
+`mayhem provider payout set --rail tap --submit`,
+`mayhem provider payout set --rail tnk --submit`, or
+`mayhem provider stripe onboard|adopt|relink` followed by readiness.
+
 One provider home has one advertised Comfy inventory root. Do not add parts for
 an unrelated workflow class into a home that is already serving another Comfy
 class unless both classes are signed against the same inventory root. Use a

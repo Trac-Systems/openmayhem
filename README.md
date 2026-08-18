@@ -648,6 +648,12 @@ first Stripe/TAP/TNK binding activates at `E+1` and a rotation activates at
 revision remains current until that boundary, and reservations and earnings
 already tied to it continue to settle there afterward.
 
+Accepted rails alone do not make a provider routable. Buyer gateways advertise a
+route only when the provider has an active verified payout binding for at least
+one accepted rail. If `mayhem provider health` shows active serving and fresh
+heartbeats but zero route candidates, inspect `route_preconditions` and
+`mayhem provider payout get` before debugging heartbeats.
+
 All payout submissions travel through the provider's local read-only peer. The
 sole canonical indexer verifies the signatures and appends valid bindings
 automatically; providers receive no writer capability, and no operator SSH or

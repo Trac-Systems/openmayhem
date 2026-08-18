@@ -62484,6 +62484,8 @@ async fn provider_health(args: ProviderHealthArgs) -> Result<()> {
         .get("rail")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let route_preconditions =
+        provider_route_precondition_diagnostics(&contract, &ctx.provider, gateway_rail.as_deref());
     let gateway_models = fetch_gateway_models(&client, &ctx.gateway_url).await;
     let (gateway_models_ok, gateway_routes) = match gateway_models {
         Ok(models) => (
@@ -62533,6 +62535,7 @@ async fn provider_health(args: ProviderHealthArgs) -> Result<()> {
             "provider_effective_rails": gateway_routes["provider_effective_rails"].clone(),
             "rail_compatible": gateway_routes["rail_compatible"].clone(),
             "route_visibility": gateway_routes["route_visibility"].clone(),
+            "route_preconditions": route_preconditions,
         },
     });
     print_provider_health_report(&report, args.read.json)
@@ -68117,6 +68120,62 @@ fn provider_gateway_route_diagnostics(
     })
 }
 
+fn provider_route_precondition_diagnostics(
+    contract: &ContractCatalog,
+    provider: &str,
+    gateway_rail: Option<&str>,
+) -> Value {
+    let provider_record = contract
+        .providers
+        .iter()
+        .find(|record| record.provider == provider);
+    let active_serves = active_provider_serves_from_contract(contract, provider);
+    let active_rooms = active_provider_roomserves_from_contract(contract, provider);
+    let accepted_rails = provider_record
+        .map(|record| record.accepted_rails.clone())
+        .unwrap_or_default();
+    let active_payout_rails = provider_record
+        .filter(|record| record.status == "active")
+        .map(|record| provider_routable_payout_rails(record, &contract.active_payout_revisions))
+        .unwrap_or_default();
+    let active_payout_set = active_payout_rails
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let missing_payout_rails = accepted_rails
+        .iter()
+        .filter(|rail| !active_payout_set.contains(rail.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let gateway_rail_bound = gateway_rail.map(|rail| active_payout_set.contains(rail));
+    let status = if provider_record.is_none() {
+        "provider_not_registered"
+    } else if provider_record.is_some_and(|record| record.status != "active") {
+        "provider_not_active"
+    } else if active_serves.is_empty() {
+        "no_active_serve"
+    } else if active_rooms.is_empty() {
+        "no_active_roomserve"
+    } else if active_payout_rails.is_empty() {
+        "no_active_verified_payout_binding"
+    } else if gateway_rail_bound == Some(false) {
+        "gateway_rail_not_bound"
+    } else {
+        "ok"
+    };
+    json!({
+        "status": status,
+        "provider_active": provider_record.is_some_and(|record| record.status == "active"),
+        "active_serve_count": active_serves.len(),
+        "active_roomserve_count": active_rooms.len(),
+        "accepted_rails": accepted_rails,
+        "active_verified_payout_rails": active_payout_rails,
+        "missing_payout_rails": missing_payout_rails,
+        "gateway_rail": gateway_rail,
+        "gateway_rail_bound": gateway_rail_bound,
+    })
+}
+
 fn print_provider_list_report(report: &Value, json_output: bool) -> Result<()> {
     if json_output {
         println!("{}", serde_json::to_string_pretty(report)?);
@@ -68179,6 +68238,41 @@ fn print_provider_health_report(report: &Value, json_output: bool) -> Result<()>
         );
     } else {
         println!("Gateway routes visible: {route_count}");
+    }
+    let preconditions = &report["gateway"]["route_preconditions"];
+    match preconditions["status"].as_str() {
+        Some("no_active_verified_payout_binding") => {
+            let accepted = preconditions["accepted_rails"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "Route precondition failed: no active verified payout binding for accepted rail(s): {accepted}."
+            );
+            println!(
+                "Bind TAP/TNK with `mayhem provider payout set --rail <tap|tnk> --submit`; bind fiat with `mayhem provider stripe onboard|adopt|relink` and wait for the activation epoch."
+            );
+        }
+        Some("gateway_rail_not_bound") => {
+            let gateway_rail = preconditions["gateway_rail"].as_str().unwrap_or("unknown");
+            let active = preconditions["active_verified_payout_rails"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "Route precondition failed: local gateway rail {gateway_rail} is not among active verified payout rail(s): {active}."
+            );
+        }
+        Some("ok") | None => {}
+        Some(status) => {
+            println!("Route precondition status: {status}.");
+        }
     }
     Ok(())
 }
@@ -100767,6 +100861,32 @@ status: linked
         assert_eq!(live["route_count"], 1);
         assert_eq!(live["route_visibility"], "visible");
         assert_eq!(live["routing_ok"], true);
+    }
+
+    #[test]
+    fn provider_health_reports_missing_verified_payout_precondition() {
+        let root = "aa".repeat(32);
+        let provider = "55".repeat(32);
+        let mut contract = test_contract(&root);
+        contract.active_payout_revisions.clear();
+
+        let blocked = provider_route_precondition_diagnostics(&contract, &provider, Some("fiat"));
+        assert_eq!(blocked["status"], "no_active_verified_payout_binding");
+        assert_eq!(blocked["provider_active"], true);
+        assert_eq!(blocked["active_serve_count"], 1);
+        assert_eq!(blocked["active_roomserve_count"], 1);
+        assert_eq!(blocked["accepted_rails"], json!(["fiat"]));
+        assert_eq!(blocked["active_verified_payout_rails"], json!([]));
+        assert_eq!(blocked["missing_payout_rails"], json!(["fiat"]));
+
+        contract.active_payout_revisions.insert(
+            provider.clone(),
+            BTreeMap::from([("fiat".to_owned(), "11".repeat(32))]),
+        );
+        let ready = provider_route_precondition_diagnostics(&contract, &provider, Some("fiat"));
+        assert_eq!(ready["status"], "ok");
+        assert_eq!(ready["active_verified_payout_rails"], json!(["fiat"]));
+        assert_eq!(ready["gateway_rail_bound"], true);
     }
 
     #[test]
