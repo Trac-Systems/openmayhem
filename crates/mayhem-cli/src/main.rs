@@ -6331,6 +6331,14 @@ struct ProviderServeAddArgs {
     #[arg(long)]
     ctx: Option<u64>,
 
+    /// Local runtime artifact directory used by file-backed engines such as ComfyUI.
+    #[arg(long, value_name = "PATH")]
+    artifact: Option<PathBuf>,
+
+    /// Local workflow class definition JSON used by ComfyUI workflow providers.
+    #[arg(long = "workflow-class-definition", value_name = "PATH")]
+    workflow_class_definition: Option<PathBuf>,
+
     /// Disable a non-core catalog modality for this worker. Repeat or comma-separate.
     #[arg(long = "disable-modality", value_delimiter = ',')]
     disable_modalities: Vec<String>,
@@ -6387,6 +6395,14 @@ struct ProviderServeSwitchArgs {
     /// Maximum context tokens this provider commits to serve for the selected enclave.
     #[arg(long)]
     ctx: Option<u64>,
+
+    /// Local runtime artifact directory used by file-backed engines such as ComfyUI.
+    #[arg(long, value_name = "PATH")]
+    artifact: Option<PathBuf>,
+
+    /// Local workflow class definition JSON used by ComfyUI workflow providers.
+    #[arg(long = "workflow-class-definition", value_name = "PATH")]
+    workflow_class_definition: Option<PathBuf>,
 
     /// Disable a non-core catalog modality for this worker. Repeat or comma-separate.
     #[arg(long = "disable-modality", value_delimiter = ',')]
@@ -27243,7 +27259,13 @@ fn comfy_part_record_reference_model_path(
         }
     }
     if let Ok(path) = safe_relative_comfy_model_path(record.name.trim()) {
-        return Ok(path);
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| !value.is_empty())
+        {
+            return Ok(path);
+        }
     }
     let mut name = safe_path_component(record.name.trim());
     ensure!(
@@ -40452,6 +40474,8 @@ async fn up_add_selected_provider_workers(
                 .flatten(),
             plan.provider_gpu_layers,
             Some(candidate.served_ctx),
+            None,
+            None,
             &candidate.served_modalities,
             &candidate.served_specialities,
             hardware_quote_config,
@@ -60501,6 +60525,12 @@ async fn prepare_provider_serve_worker(
         std::slice::from_ref(selected),
         None,
     )?;
+    let local_artifact = provider_serve_local_artifact_path(args.artifact.as_ref(), selected)?;
+    let workflow_class_definition = args
+        .workflow_class_definition
+        .clone()
+        .map(absolutize)
+        .transpose()?;
     let child = provider_serve_child_config(
         &home,
         &selected.enclave.enclave_id,
@@ -60509,6 +60539,8 @@ async fn prepare_provider_serve_worker(
         vllm_memory_utilization.as_ref(),
         computed.gpu_layers,
         Some(selected.served_ctx),
+        local_artifact.as_deref(),
+        workflow_class_definition.as_deref(),
         &selected.served_modalities,
         &selected.served_specialities,
         computed.hardware_quote_config.as_ref(),
@@ -60710,6 +60742,8 @@ async fn provider_serve_switch(args: ProviderServeSwitchArgs) -> Result<()> {
                 .then_some(existing_serve_row?.served_ctx)
                 .flatten()
         }),
+        artifact: args.artifact.clone(),
+        workflow_class_definition: args.workflow_class_definition.clone(),
         disable_modalities: if preserving_same_enclave && args.disable_modalities.is_empty() {
             inherited_disabled_modalities
         } else {
@@ -60830,6 +60864,27 @@ fn mayhemd_control_url_if_running(home: &Path) -> Result<Option<String>> {
     Ok(Some(format!("http://{bind}")))
 }
 
+fn provider_serve_local_artifact_path(
+    artifact: Option<&PathBuf>,
+    selected: &ProviderCandidate,
+) -> Result<Option<PathBuf>> {
+    let artifact = artifact.cloned().map(absolutize).transpose()?;
+    if selected.artifact.engine == "comfyui" {
+        let path = artifact.as_ref().with_context(|| {
+            format!(
+                "ComfyUI workflow provider {} requires `mayhem provider serve add {} --artifact <ComfyUI runtime checkout>`",
+                selected.enclave.model_id, selected.enclave.enclave_id
+            )
+        })?;
+        ensure!(
+            path.join("main.py").is_file(),
+            "ComfyUI runtime {} must contain main.py",
+            path.display()
+        );
+    }
+    Ok(artifact)
+}
+
 fn provider_serve_child_config(
     home: &Path,
     enclave: &str,
@@ -60838,6 +60893,8 @@ fn provider_serve_child_config(
     vllm_memory_utilization: Option<&VllmMemoryUtilizationPlan>,
     gpu_layers: Option<u32>,
     ctx: Option<u64>,
+    artifact: Option<&Path>,
+    workflow_class_definition: Option<&Path>,
     served_modalities: &[String],
     served_specialities: &BTreeMap<String, Vec<String>>,
     hardware_quote_config: Option<&ProviderHardwareQuoteConfig>,
@@ -60853,6 +60910,8 @@ fn provider_serve_child_config(
         vllm_memory_utilization,
         gpu_layers,
         ctx,
+        artifact,
+        workflow_class_definition,
         served_modalities,
         served_specialities,
         hardware_quote_config,
@@ -60869,6 +60928,8 @@ fn provider_serve_child_config_with_pear_runtime(
     vllm_memory_utilization: Option<&VllmMemoryUtilizationPlan>,
     gpu_layers: Option<u32>,
     ctx: Option<u64>,
+    artifact: Option<&Path>,
+    workflow_class_definition: Option<&Path>,
     served_modalities: &[String],
     served_specialities: &BTreeMap<String, Vec<String>>,
     hardware_quote_config: Option<&ProviderHardwareQuoteConfig>,
@@ -60919,6 +60980,23 @@ fn provider_serve_child_config_with_pear_runtime(
         "--enclave".to_owned(),
         enclave.to_owned(),
     ];
+    if backend == "comfyui" {
+        let artifact = artifact.context(
+            "ComfyUI supervised provider worker is missing --artifact; rerun `mayhem provider serve add <enclave> --artifact <ComfyUI runtime checkout>`",
+        )?;
+        args.extend(["--artifact".to_owned(), artifact.display().to_string()]);
+        if let Some(definition) = workflow_class_definition {
+            args.extend([
+                "--workflow-class-definition".to_owned(),
+                definition.display().to_string(),
+            ]);
+        }
+    } else {
+        ensure!(
+            artifact.is_none() && workflow_class_definition.is_none(),
+            "--artifact and --workflow-class-definition are only supported for ComfyUI supervised workers"
+        );
+    }
     append_provider_hardware_quote_args(&mut args, hardware_quote_config);
     if backend == "vllm" {
         let admitted = vllm_memory_utilization.context(
@@ -97016,6 +97094,12 @@ status: linked
             PathBuf::from("Fancy_Upscaler.safetensors")
         );
 
+        record.name = "4x-spanx4-ch48".to_owned();
+        assert_eq!(
+            comfy_part_record_reference_model_path(&record).unwrap(),
+            PathBuf::from("4x-spanx4-ch48.safetensors")
+        );
+
         record.adapter.insert(
             "file_path".to_owned(),
             Value::from("split_files/upscale_models/real-upscaler.pth"),
@@ -101140,6 +101224,10 @@ status: linked
             "35",
             "--ctx",
             "131072",
+            "--artifact",
+            "/tmp/ComfyUI",
+            "--workflow-class-definition",
+            "/tmp/workflow.json",
             "--hardware-quote-kind",
             "tpm2-quote-ek",
             "--hardware-quote-command",
@@ -101161,6 +101249,11 @@ status: linked
         assert_eq!(args.enclave, "enclave-a");
         assert_eq!(args.gpu_layers, Some(35));
         assert_eq!(args.ctx, Some(131_072));
+        assert_eq!(args.artifact.as_deref(), Some(Path::new("/tmp/ComfyUI")));
+        assert_eq!(
+            args.workflow_class_definition.as_deref(),
+            Some(Path::new("/tmp/workflow.json"))
+        );
         assert_eq!(args.hardware_quote_kind.as_deref(), Some("tpm2-quote-ek"));
         assert_eq!(
             args.hardware_quote_command.as_deref(),
@@ -101202,6 +101295,10 @@ status: linked
             "enclave-b",
             "--ctx",
             "32768",
+            "--artifact",
+            "/tmp/ComfyUI",
+            "--workflow-class-definition",
+            "/tmp/workflow.json",
             "--timeout-seconds",
             "90",
             "--json",
@@ -101219,6 +101316,11 @@ status: linked
         assert_eq!(args.target, "enclave-a");
         assert_eq!(args.enclave, "enclave-b");
         assert_eq!(args.ctx, Some(32_768));
+        assert_eq!(args.artifact.as_deref(), Some(Path::new("/tmp/ComfyUI")));
+        assert_eq!(
+            args.workflow_class_definition.as_deref(),
+            Some(Path::new("/tmp/workflow.json"))
+        );
         assert_eq!(args.timeout_seconds, 90);
         assert!(args.tx.json);
 
@@ -102191,6 +102293,8 @@ status: linked
             None,
             None,
             None,
+            None,
+            None,
             &["text".to_owned()],
             &BTreeMap::new(),
             None,
@@ -102213,6 +102317,74 @@ status: linked
             child["startup_probes"],
             json!(["http://127.0.0.1:49223/v1/health", "tcp://127.0.0.1:8001"])
         );
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn provider_serve_child_carries_comfy_runtime_artifact() {
+        let home = test_temp_dir("provider-child-comfy-runtime");
+        let config = toml::from_str::<toml::Value>(
+            r#"
+            [network]
+            rpc_url = "http://127.0.0.1:49223/v1"
+            sc_bridge_url = "ws://127.0.0.1:8001"
+            sc_bridge_token = "provider-secret-token"
+            "#,
+        )
+        .unwrap();
+        write_config_toml_value(&config_path_for_home(&home), &config).unwrap();
+
+        let pear_runtime = PathBuf::from("/opt/pear/bin/pear-runtime");
+        let artifact = PathBuf::from("/tmp/ComfyUI");
+        let definition = PathBuf::from("/tmp/workflow.json");
+        let child = provider_serve_child_config_with_pear_runtime(
+            &home,
+            &"22".repeat(32),
+            "comfyui",
+            &ProviderBackendRuntime::default(),
+            None,
+            None,
+            None,
+            Some(&artifact),
+            Some(&definition),
+            &["image".to_owned()],
+            &BTreeMap::new(),
+            None,
+            Some("provider-comfy-test".to_owned()),
+            &pear_runtime,
+        )
+        .unwrap();
+        let args = child["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        let artifact_flag = args.iter().position(|arg| *arg == "--artifact").unwrap();
+        let artifact_display = artifact.display().to_string();
+        assert_eq!(args[artifact_flag + 1], artifact_display.as_str());
+        let definition_flag = args
+            .iter()
+            .position(|arg| *arg == "--workflow-class-definition")
+            .unwrap();
+        let definition_display = definition.display().to_string();
+        assert_eq!(args[definition_flag + 1], definition_display.as_str());
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--disable-modality", "text"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--disable-modality", "embedding"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--disable-modality", "video"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--disable-modality", "audio"]));
+        assert!(!args
+            .windows(2)
+            .any(|pair| pair == ["--disable-modality", "image"]));
 
         fs::remove_dir_all(home).unwrap();
     }
@@ -103234,6 +103406,8 @@ status: linked
             Some(&admitted),
             None,
             Some(selected.served_ctx),
+            None,
+            None,
             &selected.served_modalities,
             &selected.served_specialities,
             None,
@@ -103268,6 +103442,8 @@ status: linked
             Some(&persisted),
             None,
             Some(selected.served_ctx),
+            None,
+            None,
             &selected.served_modalities,
             &selected.served_specialities,
             None,

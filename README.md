@@ -268,6 +268,9 @@ Most installs are driven by a coding agent. Agent: execute in THIS order, verify
      and `mayhem provider parts admit --write` before serving. Start workflow providers with
      `--artifact <comfy-runtime-dir>` so the worker uses the verified local
      ComfyUI checkout; the ledger artifact is the workflow class definition.
+     On Linux containers/VMs, the real gate is `mayhem-enclave sandbox-run`:
+     read-only writes and outbound TCP must be denied. Disabled user namespaces
+     alone do not make the host invalid when Landlock/seccomp sandboxing passes.
    - **Audio/image serving**: the engines are external binaries that must be on `PATH` (or pointed at by env): `whisper-cli` (`MAYHEM_WHISPER_CPP_BIN`), `piper` (`MAYHEM_PIPER_BIN`), `sd-cli` (`MAYHEM_STABLE_DIFFUSION_CPP_BIN`). Accelerator selection is automatic. Text-only providers can ignore this.
 7. **Start and verify**: `mayhem up --yes` (or `--provider`), then confirm the gateway answers (`curl http://127.0.0.1:11435/v1/models`) and, for providers, `mayhem provider health` is green AND the served model appears in `/v1/models`. A green health with a missing route means the model failed to load — re-run `mayhem doctor` and check the backend extras above.
 8. **Explain to the human** what was installed, where the dashboards are, and (providers) what their earnings depend on.
@@ -950,7 +953,8 @@ admitted capacity, not merely catalog presence.
 Provider start shape:
 
 ```bash
-mayhem up --provider --provider-enclave <workflow-enclave-id> --artifact <comfy-runtime-dir> --workflow-class-definition <definition.json> --yes
+mayhem up --yes
+mayhem provider serve add <workflow-enclave-id> --artifact <comfy-runtime-dir> --workflow-class-definition <definition.json> --json
 ```
 
 `--workflow-class-definition` may be omitted only when the signed catalog embeds

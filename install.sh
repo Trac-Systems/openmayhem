@@ -129,16 +129,51 @@ configure_linux_user_namespace_sandbox() {
   [[ -r "$restriction" ]] || return 0
   [[ "$(cat "$restriction")" == "1" ]] || return 0
 
+  enclave="$(readlink -f "$INSTALL_DIR/mayhem-enclave")"
+  if [[ -x "$enclave" ]]; then
+    smoke_root="$TMP_ROOT/linux-sandbox-smoke"
+    mkdir -p "$smoke_root/read-only" "$smoke_root/writable"
+    printf 'mayhem-sandbox-ready\n' > "$smoke_root/read-only/input.txt"
+    if output="$(
+      "$enclave" sandbox-run \
+        --read-only-dir "$smoke_root/read-only" \
+        --writable-dir "$smoke_root/writable" \
+        -- \
+        "$enclave" sandbox-probe-store-read \
+        --path "$smoke_root/read-only/input.txt" 2>&1
+    )" && [[ "$output" == "mayhem-sandbox-ready" ]] &&
+      "$enclave" sandbox-run \
+        --read-only-dir "$smoke_root/read-only" \
+        --writable-dir "$smoke_root/writable" \
+        -- \
+        "$enclave" sandbox-probe-store-write \
+        --sealed-store "$smoke_root/read-only" \
+        --expect-denied \
+        --attempt-restore-permissions \
+        --json >/dev/null 2>&1 &&
+      "$enclave" sandbox-run \
+        --read-only-dir "$smoke_root/read-only" \
+        --writable-dir "$smoke_root/writable" \
+        -- \
+        "$enclave" sandbox-probe-tcp \
+        --addr 1.1.1.1:443 \
+        --expect-denied \
+        --timeout-ms 1000 \
+        --json >/dev/null 2>&1; then
+      log "verified the real Linux Landlock/seccomp sandbox; skipping the AppArmor userns profile"
+      return 0
+    fi
+  fi
+
   command -v unshare >/dev/null 2>&1 ||
-    die "util-linux unshare is required for the Linux enclave sandbox"
+    die "the Linux enclave sandbox is unavailable, and util-linux unshare is required for the AppArmor fallback"
   if unshare --user --map-root-user --mount true >/dev/null 2>&1; then
     return 0
   fi
   command -v apparmor_parser >/dev/null 2>&1 ||
-    die "AppArmor is restricting user namespaces; install apparmor_parser and rerun install.sh"
+    die "the Linux enclave sandbox is unavailable and AppArmor is restricting user namespaces; install apparmor_parser on a VM/bare-metal host or use a container profile that permits the real Mayhem sandbox"
 
   cli="$(readlink -f "$INSTALL_DIR/mayhem")"
-  enclave="$(readlink -f "$INSTALL_DIR/mayhem-enclave")"
   unshare_bin="$(readlink -f "$(command -v unshare)")"
   cli_quoted="$(apparmor_quote_path "$cli")"
   enclave_quoted="$(apparmor_quote_path "$enclave")"

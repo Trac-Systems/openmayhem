@@ -157,7 +157,8 @@ Workflow parts still come only from the signed parts index and require `mayhem p
 `mayhem provider parts add`, and `mayhem provider parts admit --write` before serving. Workflow
 provider start must pass `--artifact <comfy-runtime-dir>`; that path is the local ComfyUI runtime
 checkout, while the ledger artifact is the workflow class definition. On CUDA hosts set
-`MAYHEM_COMFYUI_DEVICE=cuda`; the backend defaults to CPU when the device is omitted. A Comfy
+`MAYHEM_COMFYUI_DEVICE=cuda` when CUDA is required; omitted means runtime auto-selection, while
+`MAYHEM_COMFYUI_DEVICE=cpu` is only for intentional CPU proofs. A Comfy
 custom node is a signed `custom-node` part, not a model-file workaround: package it as a rootless
 `tar.gz` with `__init__.py` at archive root, set `adapter.comfy_custom_node_dir`, and require it in
 the workflow policy so Mayhem can extract and whitelist only that node package. A Comfy
@@ -185,6 +186,11 @@ separate and 4-step only. Do not advertise either low-VRAM lane from an older
 release/catalog or without matching provider admission and paid `/v1/workflows`
 proof. The R2V lane itself is supported; the public route is the part that must
 exist before promising availability.
+On Linux containers and VMs, validate sandbox support with the real
+`mayhem-enclave sandbox-run` smoke, not with `unshare` alone: read-only writes
+and outbound TCP must be denied. Disabled user namespaces do not disqualify a
+host when Landlock/seccomp passes.
+
 **Tier 2:** install `tpm2-tools`; the provider uses `/dev/tpmrm0` unprivileged. If the distro owns
 that device as `root:tss`, add the login to the existing group with
 `sudo usermod -aG tss "$USER"`, then start a new login. Mayhem never creates users/groups or changes
@@ -665,7 +671,8 @@ mayhem provider parts admit \
   --reference-graph <path.json> \
   --reference-runtime <comfy-runtime-dir> \
   --write
-mayhem up --provider --provider-enclave <workflow-enclave-id> --artifact <comfy-runtime-dir> --workflow-class-definition <definition.json> --yes
+mayhem up --yes
+mayhem provider serve add <workflow-enclave-id> --artifact <comfy-runtime-dir> --workflow-class-definition <definition.json> --json
 ```
 
 If the class uses staged load/unload, pass the approved `--load-plan`. Without it, Mayhem assumes

@@ -122,8 +122,9 @@ mayhem doctor --provider-backend comfyui
 
 Use a real ComfyUI `v0.30.1` runtime checkout. Set `MAYHEM_COMFYUI_PYTHON` when
 `python3` is not the interpreter from that runtime. On CUDA hosts, set
-`MAYHEM_COMFYUI_DEVICE=cuda`; otherwise the Comfy backend intentionally defaults
-to CPU and heavy canaries can take far too long.
+`MAYHEM_COMFYUI_DEVICE=cuda` when CUDA is required. When omitted, the backend
+uses the runtime's automatic device selection; set `MAYHEM_COMFYUI_DEVICE=cpu`
+only for an intentional CPU proof.
 
 Prepare the runtime's Python environment before admission or provider start:
 
@@ -149,6 +150,14 @@ venv nested below the checkout is rejected as an overlapping sandbox root.
 Do not rely on `/usr/bin/python3` unless it is intentionally the runtime
 environment. A bare system Python can pass the executable lookup and then fail
 engine load with missing Comfy dependencies such as `SQLAlchemy`.
+
+On Linux containers or VMs, judge sandbox support with the Mayhem sandbox probe,
+not with `unshare` alone. A valid host/container profile must allow the real
+`mayhem-enclave sandbox-run` path to read mounted inputs, deny writes to
+read-only roots, and deny outbound TCP. User namespaces may be disabled and the
+provider can still be valid when Landlock/seccomp sandboxing passes; `install.sh`
+uses the real sandbox smoke first and only falls back to the AppArmor userns
+profile when that smoke fails.
 
 Pull and advertise every required part for the workflow class:
 
@@ -180,11 +189,11 @@ mayhem provider parts admit \
   --reference-output-dir <proof-output-dir> \
   --write
 
-mayhem up --provider \
-  --provider-enclave <workflow-enclave-id> \
+mayhem up --yes
+mayhem provider serve add <workflow-enclave-id> \
   --artifact <comfy-runtime-dir> \
   --workflow-class-definition <definition.json> \
-  --yes
+  --json
 ```
 
 One provider home has one advertised Comfy inventory root. Do not add parts for

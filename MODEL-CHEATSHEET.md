@@ -156,7 +156,8 @@ mayhem provider parts admit \
   --reference-runtime <comfy-runtime-dir> \
   --reference-output-dir <proof-dir> \
   --write
-mayhem up --provider --provider-enclave <workflow-enclave-id> --artifact <comfy-runtime-dir> --workflow-class-definition <definition.json> --yes
+mayhem up --yes
+mayhem provider serve add <workflow-enclave-id> --artifact <comfy-runtime-dir> --workflow-class-definition <definition.json> --json
 mayhem provider health --json
 ```
 
