@@ -185,6 +185,34 @@ test('v17 recompute pages more than 1000 exact receipt heads without peers', asy
   }
 });
 
+test('v17 recompute reserves feature bytes for final earning and market evidence', async () => {
+  const result = await recomputeEpoch(await canonicalBundle(240, {
+    mutateBody: (body, ordinal) => {
+      const bucket = (ordinal % 60) + 1;
+      body.provider = hex(40_000 + bucket);
+      body.payout_revision = hex(50_000 + bucket);
+      body.enclave_id = hex(60_000 + bucket);
+      body.ctx_bracket = `le${bucket}k`;
+    },
+  }));
+
+  assert.ok(result.apply_pages.length > 1);
+  assert.equal(result.apply_pages.at(-1).earning_finals.length, 60);
+  assert.equal(result.apply_pages.at(-1).market_usage.length, 60);
+  assert.ok(
+    result.apply_pages.at(-1).allocations.length <
+      result.apply_pages.at(-2).allocations.length,
+  );
+  assert.equal(
+    result.apply_pages.reduce((sum, page) => sum + page.allocations.length, 0),
+    240,
+  );
+  for (const [index, page] of result.apply_pages.entries()) {
+    assert.ok(page.max_feature_operation_json_bytes <= 60_000);
+    assert.equal(page.last_page, index === result.apply_pages.length - 1);
+  }
+});
+
 test('v17 recompute accepts late receipts in their current settlement epoch', async (t) => {
   for (const scenario of ['after-empty-seal', 'during-prior-pending-apply']) {
     await t.test(scenario, async () => {

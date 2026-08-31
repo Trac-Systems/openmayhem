@@ -593,7 +593,7 @@ function targetedEpochFeatureOperationJsonBytes(
   return Buffer.byteLength(JSON.stringify(operation));
 }
 
-function applyPageCanFit(state, row, limits, page, receiptIndex) {
+function applyPageCanFit(state, row, limits, page, receiptIndex, finalMetadata) {
   if (state.allocations.length + 1 > limits.maxAllocations) return false;
   const debitKey = JSON.stringify([row.allocation.rail, row.allocation.user]);
   const earningKey = JSON.stringify([
@@ -624,7 +624,12 @@ function applyPageCanFit(state, row, limits, page, receiptIndex) {
     ])),
   };
   addApplyPageRow(candidate, row);
-  return targetedEpochFeatureOperationJsonBytes(candidate, page, receiptIndex) <= limits.maxFeatureJsonBytes;
+  return targetedEpochFeatureOperationJsonBytes(
+    candidate,
+    page,
+    receiptIndex,
+    finalMetadata,
+  ) <= limits.maxFeatureJsonBytes;
 }
 
 function addApplyPageRow(state, row) {
@@ -674,15 +679,18 @@ function materializeApplyPage(state, page, receiptIndex) {
 function buildApplyPages(rows, receiptIndex, limits, { earningFinals, marketUsage }) {
   const pages = [];
   let state = emptyApplyPageState();
-  for (const row of rows) {
-    if (!applyPageCanFit(state, row, limits, pages.length, receiptIndex)) {
+  for (const [rowIndex, row] of rows.entries()) {
+    const finalMetadata = rowIndex === rows.length - 1
+      ? { earningFinals, marketUsage }
+      : undefined;
+    if (!applyPageCanFit(state, row, limits, pages.length, receiptIndex, finalMetadata)) {
       if (state.allocations.length === 0) {
         throw new Error('one canonical receipt allocation exceeds the active apply-page limits');
       }
       pages.push(materializeApplyPage(state, pages.length, receiptIndex));
       state = emptyApplyPageState();
     }
-    if (!applyPageCanFit(state, row, limits, pages.length, receiptIndex)) {
+    if (!applyPageCanFit(state, row, limits, pages.length, receiptIndex, finalMetadata)) {
       throw new Error('one canonical receipt allocation exceeds the active apply-page limits');
     }
     addApplyPageRow(state, row);
