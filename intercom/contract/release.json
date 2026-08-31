@@ -1,16 +1,16 @@
 {
   "schema": 1,
-  "release_version": "0.2.103",
-  "contract_version": 20,
-  "contract_code_sha256": "9d1b6751d4e36e41abfb6c3bde6a0bc903631b7141ab135a65449b9f771f7101",
+  "release_version": "0.2.154",
+  "contract_version": 21,
+  "contract_code_sha256": "e271f2bb4b96219856d6bca1f71959aef74d4b050fa1cf9df6f9259a6b96163e",
   "files": [
     {
       "path": "contract/contract.js",
-      "sha256": "e5a6cee17287aed0e01c855148478f90134f44a1cf840de574d8f9fbbc4200cc"
+      "sha256": "a4111dcf8793277169ae10c78f53d540be52c3ca069ee8d24b2dfff60db39804"
     },
     {
       "path": "contract/protocol.js",
-      "sha256": "3dea6213343155b7dfe13c6383cfb0e3b84576626220f72b53cca691ff379dac"
+      "sha256": "eff31d791a08ade48c84a403d1af3f9efbbfe43fd03ab1fa083a1717159406b4"
     },
     {
       "path": "features/mayhem/index.js",

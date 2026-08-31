@@ -100250,7 +100250,7 @@ status: linked
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 20);
+        assert_eq!(CONTRACT_VERSION, 21);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 11);
     }

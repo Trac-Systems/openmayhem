@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import test from 'node:test';
 
+import MayhemContract from '../contract/contract.js';
 import {
   opaqueHash,
   recomputeEpoch,
@@ -150,25 +151,37 @@ test('v17 recompute preserves insertion-order snapshots and emits targeted field
 });
 
 test('v17 recompute pages more than 1000 exact receipt heads without peers', async () => {
-  const bundle = await canonicalBundle(1_001);
+  const receiptCount = Number(process.env.MAYHEM_RECOMPUTE_SCALE_RECEIPTS ?? 1_001);
+  const bundle = await canonicalBundle(receiptCount);
   const result = await recomputeEpoch(bundle);
-  assert.equal(result.allocations.length, 1_001);
-  assert.equal(result.apply_pages.length, 8);
+  assert.equal(result.allocations.length, receiptCount);
+  assert.ok(result.apply_pages.length > 8);
   assert.equal(
     result.apply_pages.reduce((sum, page) => sum + page.allocations.length, 0),
-    1_001,
+    receiptCount,
   );
   for (const [index, page] of result.apply_pages.entries()) {
     assert.ok(page.allocations.length <= 128);
+    assert.ok(page.max_feature_operation_json_bytes <= 60_000);
     assert.equal(page.page, index);
     assert.equal(page.last_page, index === result.apply_pages.length - 1);
     const allocations = page.allocations.reduce((sum, entry) => sum + BigInt(entry.au), 0n);
     const debits = page.debits.reduce((sum, entry) => sum + BigInt(entry.au), 0n);
     const earnings = page.earnings.reduce((sum, entry) => sum + BigInt(entry.gross_au), 0n);
-    const usage = page.market_usage.reduce((sum, entry) => sum + BigInt(entry.demand_au), 0n);
     assert.equal(allocations, debits);
     assert.equal(allocations, earnings);
-    assert.equal(allocations, usage);
+    if (page.last_page) {
+      assert.equal(Object.hasOwn(page, 'market_usage'), true);
+      assert.equal(Object.hasOwn(page, 'earning_finals'), true);
+      assert.equal(
+        page.market_usage.reduce((sum, entry) => sum + BigInt(entry.demand_au), 0n),
+        BigInt(receiptCount),
+      );
+      assert.equal(page.earning_finals.length, result.totals.provider_count);
+    } else {
+      assert.equal(Object.hasOwn(page, 'market_usage'), false);
+      assert.equal(Object.hasOwn(page, 'earning_finals'), false);
+    }
   }
 });
 
@@ -187,12 +200,48 @@ test('v17 recompute accepts late receipts in their current settlement epoch', as
   }
 });
 
-test('v17 recompute rejects v9, epoch, reservation, and payout drift', async () => {
+test('v17 recompute and contract share canonical ordering across billing epochs', async () => {
+  const result = await recomputeEpoch(await canonicalBundle(2, {
+    settlementEpoch: 2,
+    mutateBody: (body, ordinal) => {
+      body.billing_epoch = ordinal === 1 ? 2 : 1;
+      body.user = '9'.repeat(64);
+      body.rail = 'fiat';
+      body.provider = 'c'.repeat(64);
+    },
+  }));
+  assert.deepEqual(
+    result.allocations.map((allocation) => allocation.billing_id),
+    [hex(2), hex(1)],
+  );
+
+  const {
+    page_sha256: _pageSha256,
+    max_feature_operation_json_bytes: _maxFeatureOperationJsonBytes,
+    ...page
+  } = result.apply_pages[0];
+  const normalized = await new MayhemContract({}, {}).normalizeTargetedEpochFeatureValue({
+    op: 'apply_targeted_epoch',
+    epoch: 2,
+    at: 7_200,
+    epoch_commit_hash: '0'.repeat(64),
+    ...page,
+  });
+  assert.equal(normalized instanceof Error, false, normalized.message);
+});
+
+test('v17 recompute accepts historical schema 10 and rejects v9, epoch, reservation, and payout drift', async () => {
+  const mixed = await canonicalBundle(2, {
+    mutateBody: (body, ordinal) => { body.schema_version = ordinal === 1 ? 10 : 11; },
+  });
+  const mixedResult = await recomputeEpoch(mixed);
+  assert.equal(mixedResult.totals.use_count, 2);
+
   await assert.rejects(
     recomputeEpoch(await canonicalBundle(1, {
       mutateBody: (body) => { body.schema_version = 9; },
     })),
-    /schema_version must be 11/,
+    /schema_version must be one of 10, 11/,
   );
   await assert.rejects(
     recomputeEpoch(await canonicalBundle(1, {

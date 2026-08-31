@@ -5,7 +5,7 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 20;
+export const CONTRACT_VERSION = 21;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -1595,6 +1595,11 @@ class MayhemContract extends Contract {
     }
     if (value.op === 'apply_targeted_epoch') {
       const result = await this.applyTargetedEpochFeature(key, value);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'commit_apply_targeted_epoch_page0') {
+      const result = await this.applyCommitTargetedEpochPageZeroFeature(key, value);
       this._mayhemLastFeatureResult = result;
       return result;
     }
@@ -4456,16 +4461,24 @@ class MayhemContract extends Contract {
     }
   }
 
-  async applyTargetedEpochFeature(key, value) {
-    const normalized = await this.normalizeTargetedEpochFeatureValue(value);
+  async applyTargetedEpochFeature(key, value, options = {}) {
+    const normalized = options.normalized ?? await this.normalizeTargetedEpochFeatureValue(value);
     if (normalized instanceof Error) return normalized;
-    const expectedKey = await this.targetedEpochFeatureKey(value);
+    const expectedKey = options.expectedKey ?? await this.targetedEpochFeatureKey(value);
     if (expectedKey instanceof Error) return expectedKey;
     if (key !== expectedKey) return new Error('Invalid targeted epoch feature key.');
 
     const applyState = await this.epochApplyStateRecord();
     const page = this.epochApplyPage(value);
     if (page instanceof Error) return page;
+    const lastPage = this.epochApplyLastPage(value);
+    if (lastPage instanceof Error) return lastPage;
+    const replayPosition = this.isEpochApplyPagePositionReplay(
+      applyState,
+      value.epoch,
+      page,
+      lastPage
+    );
     const params = await this.activeParamsAt(value.at, [
       'fee_bps',
       'probation_successful_sessions',
@@ -4495,18 +4508,26 @@ class MayhemContract extends Contract {
       key: this.receiptConsumedKey(allocation.billing_id, allocation.billing_attempt),
       value: this.receiptConsumptionRecord(value.epoch, allocation, key),
     }));
+    let hasPreexistingFeatureArtifact = false;
     for (const update of allocationUpdates) {
       const existing = await this.get(update.key);
       if (existing !== null && stableJson(existing) !== stableJson(update.value)) {
         return new Error('Targeted epoch session allocation already exists.');
       }
+      hasPreexistingFeatureArtifact ||= existing !== null;
     }
     for (const update of consumptionUpdates) {
       const existing = await this.get(update.key);
       if (existing !== null && stableJson(existing) !== stableJson(update.value)) {
         return new Error('Canonical receipt billing attempt is already consumed.');
       }
+      hasPreexistingFeatureArtifact ||= existing !== null;
     }
+    const epochCommit = options.commitTransition?.record ??
+      await this.get(`epoch/commit/${value.epoch}`);
+    const boundedReceiptSettlement =
+      epochCommit?.apply_mode === 'targeted_receipt_pages_v1';
+    const providerSettlementDeltas = new Map();
     const liabilityUpdates = [];
     for (const earning of normalized.targeted_earnings) {
       const binding = await this.providerPayoutBindingForEpoch(
@@ -4520,17 +4541,51 @@ class MayhemContract extends Contract {
       if (!provider || provider.status !== 'active') {
         return new Error('Targeted epoch provider is not active.');
       }
-      const feeAu = this.safeMulDivAu(earning.gross_au, params.fee_bps, 10_000);
-      if (feeAu instanceof Error) return feeAu;
-      const burnAu = earning.rail === 'tap'
-        ? this.safeMulDivAu(earning.gross_au, TAP_BURN_BPS, 10_000)
-        : ZERO_AU;
-      if (burnAu instanceof Error) return burnAu;
-      const providerAu = this.safeSubAu(
-        this.safeSubAu(earning.gross_au, feeAu),
-        burnAu
+      let priorGrossAu = ZERO_AU;
+      if (boundedReceiptSettlement) {
+        const marker = await this.get(
+          `epoch/earning-provider/${value.epoch}/${earning.rail}/${earning.provider}`
+        );
+        if (marker !== null) {
+          if (marker.type !== 'epoch_provider_earning' ||
+              marker.epoch !== value.epoch ||
+              marker.rail !== earning.rail ||
+              marker.provider !== earning.provider ||
+              !Number.isSafeInteger(marker.last_page) ||
+              (replayPosition ? marker.last_page !== page : marker.last_page >= page)) {
+            return new Error('Bounded receipt provider earning marker is inconsistent.');
+          }
+          priorGrossAu = replayPosition
+            ? this.safeSubAu(marker.gross_au, earning.gross_au)
+            : this.normalizeAu(
+                marker.gross_au,
+                'bounded receipt prior provider gross earning',
+                { allowZero: true }
+              );
+          if (priorGrossAu instanceof Error) return priorGrossAu;
+        } else if (replayPosition) {
+          return new Error('Bounded receipt provider earning marker is missing on replay.');
+        }
+      }
+      const settlementDelta = this.providerSettlementPageDelta({
+        grossAu: earning.gross_au,
+        priorGrossAu,
+        rail: earning.rail,
+        feeBps: params.fee_bps,
+      });
+      if (settlementDelta instanceof Error) return settlementDelta;
+      const {
+        fee_au: feeAu,
+        burn_au: burnAu,
+        provider_au: providerAu,
+      } = settlementDelta;
+      providerSettlementDeltas.set(
+        stableJson([earning.rail, earning.provider]),
+        {
+          gross_au: earning.gross_au,
+          ...settlementDelta,
+        }
       );
-      if (providerAu instanceof Error) return providerAu;
 
       const liabilityKey = this.providerPayoutLiabilityKey(
         earning.provider,
@@ -4641,6 +4696,21 @@ class MayhemContract extends Contract {
       key
     );
     if (liabilityIndexUpdates instanceof Error) return liabilityIndexUpdates;
+    for (const update of liabilityUpdates) {
+      const existing = await this.get(update.snapshot_key);
+      if (existing !== null && stableJson(existing) !== stableJson(update.snapshot)) {
+        return new Error('Targeted epoch payout snapshot already exists.');
+      }
+      hasPreexistingFeatureArtifact ||= existing !== null;
+    }
+    for (const update of liabilityIndexUpdates) {
+      const existing = await this.get(update.key);
+      hasPreexistingFeatureArtifact ||=
+        existing !== null && stableJson(existing) === stableJson(update.value);
+    }
+    if (hasPreexistingFeatureArtifact && !replayPosition) {
+      return new Error('Targeted epoch feature artifacts require an idempotent page replay.');
+    }
 
     const previousTx = this.tx;
     this.tx = key;
@@ -4649,7 +4719,12 @@ class MayhemContract extends Contract {
       result = await this.targetedEpochApply(
         normalized.ledger_value,
         normalized.revision_bindings,
-        normalized.allocations
+        normalized.allocations,
+        {
+          commitTransition: options.commitTransition ?? null,
+          providerSettlementDeltas,
+          canonicalMarketUsage: reservationBindings.market_usage,
+        }
       );
     } finally {
       this.tx = previousTx;
@@ -4680,24 +4755,16 @@ class MayhemContract extends Contract {
           return new Error('Canonical receipt consumption is missing.');
         }
       }
-      return { ...result, op: 'applyTargetedEpoch' };
+      return {
+        ...result,
+        op: options.commitTransition ? 'commitApplyTargetedEpochPage0' : 'applyTargetedEpoch',
+        ...(options.commitTransition ? {
+          commit_hash: options.commitTransition.record.commit_hash,
+          replaced_commit: false,
+        } : {}),
+      };
     }
 
-    for (const update of liabilityUpdates) {
-      if ((await this.get(update.snapshot_key)) !== null) {
-        return new Error('Targeted epoch payout snapshot already exists.');
-      }
-    }
-    for (const update of allocationUpdates) {
-      if ((await this.get(update.key)) !== null) {
-        return new Error('Targeted epoch session allocation already exists.');
-      }
-    }
-    for (const update of consumptionUpdates) {
-      if ((await this.get(update.key)) !== null) {
-        return new Error('Canonical receipt billing attempt is already consumed.');
-      }
-    }
     for (const update of reservationBindings.hold_updates) {
       await this.put(update.key, update.value);
     }
@@ -4738,7 +4805,38 @@ class MayhemContract extends Contract {
     for (const update of liabilityIndexUpdates) {
       await this.put(update.key, update.value);
     }
-    return { ...result, op: 'applyTargetedEpoch' };
+    return {
+      ...result,
+      op: options.commitTransition ? 'commitApplyTargetedEpochPage0' : 'applyTargetedEpoch',
+      ...(options.commitTransition ? {
+        commit_hash: options.commitTransition.record.commit_hash,
+        replaced_commit: options.commitTransition.archive !== null,
+      } : {}),
+    };
+  }
+
+  async applyCommitTargetedEpochPageZeroFeature(key, value) {
+    const expectedKey = await this.commitTargetedEpochPageZeroFeatureKey(value);
+    if (expectedKey instanceof Error) return expectedKey;
+    if (key !== expectedKey) return new Error('Invalid commit-plus-page-zero feature key.');
+    const prepared = await this.normalizeCommitTargetedEpochPageZeroFeatureValue(value);
+    if (prepared instanceof Error) return prepared;
+    const applyState = await this.epochApplyStateRecord();
+    const commitTransition = await this.prepareTargetedEpochCommitTransition(
+      prepared,
+      applyState,
+      key
+    );
+    if (commitTransition instanceof Error) return commitTransition;
+    return await this.applyTargetedEpochFeature(
+      key,
+      prepared.targeted_value,
+      {
+        normalized: prepared.normalized,
+        expectedKey: key,
+        commitTransition,
+      }
+    );
   }
 
   async applyDepositTnkFeature(key, value) {
@@ -9371,10 +9469,6 @@ class MayhemContract extends Contract {
     if (marketUsageMap instanceof Error) return marketUsageMap;
     const marketUsageTotal = this.sumMarketDemandAu(marketUsageMap);
     if (marketUsageTotal instanceof Error) return marketUsageTotal;
-    if (marketUsageProvided && this.compareAu(marketUsageTotal, grossTotal) !== 0) {
-      return new Error('Epoch market usage demand must equal gross provider earnings.');
-    }
-
     const applyState = await this.epochApplyStateRecord();
     const previousApplyHash = page === 0 ? null : applyState.last_apply_hash;
     const normalized = {
@@ -9752,7 +9846,7 @@ class MayhemContract extends Contract {
     return result;
   }
 
-  async targetedEpochApply(value, revisionBindings, allocations) {
+  async targetedEpochApply(value, revisionBindings, allocations, options = {}) {
     const adminError = await this.requireAdmin();
     if (adminError) return adminError;
 
@@ -9822,9 +9916,7 @@ class MayhemContract extends Contract {
     if (marketUsageMap instanceof Error) return marketUsageMap;
     const marketUsageTotal = this.sumMarketDemandAu(marketUsageMap);
     if (marketUsageTotal instanceof Error) return marketUsageTotal;
-    if (marketUsageProvided && this.compareAu(marketUsageTotal, grossTotal) !== 0) {
-      return new Error('Epoch market usage demand must equal gross provider earnings.');
-    }
+    const earningFinals = value.earning_finals ?? [];
 
     const receiptIndex = this.normalizeReceiptEpochIndexMetadata(
       value.receipt_index,
@@ -9839,7 +9931,8 @@ class MayhemContract extends Contract {
     if (stableJson(currentReceiptIndex) !== stableJson(receiptIndex)) {
       return new Error('Canonical receipt epoch index changed after the apply snapshot.');
     }
-    const epochCommit = await this.get(`epoch/commit/${value.epoch}`);
+    const epochCommit = options.commitTransition?.record ??
+      await this.get(`epoch/commit/${value.epoch}`);
     if (!epochCommit ||
         epochCommit.type !== 'epoch_commit' ||
         epochCommit.epoch !== value.epoch ||
@@ -9847,8 +9940,87 @@ class MayhemContract extends Contract {
         epochCommit.commit_hash !== value.epoch_commit_hash) {
       return new Error('Matching provisional epoch commit required for targeted apply.');
     }
+    const boundedReceiptSettlement =
+      epochCommit.apply_mode === 'targeted_receipt_pages_v1';
+    const canonicalPageMarketUsageMap = new Map();
+    if (boundedReceiptSettlement) {
+      if (!Array.isArray(options.canonicalMarketUsage) ||
+          options.canonicalMarketUsage.length === 0) {
+        return new Error('Bounded receipt canonical market usage is missing.');
+      }
+      let canonicalPageDemandAu = ZERO_AU;
+      let canonicalPageSessionCount = 0;
+      for (const usage of options.canonicalMarketUsage) {
+        const ctxBracket = usage?.ctx_bracket ?? null;
+        const marketKey = this.priceMarketKey(usage?.enclave_id, ctxBracket);
+        const demandAu = this.normalizeAu(
+          usage?.demand_au,
+          'bounded receipt canonical market demand',
+          { allowZero: false }
+        );
+        const providers = Array.isArray(usage?.providers)
+          ? usage.providers.slice().sort(compareCodepoint)
+          : [];
+        if (!usage ||
+            !this.isSafeKeyPart(usage.enclave_id) ||
+            (ctxBracket !== null && !this.isSafeKeyPart(ctxBracket)) ||
+            (usage.ctx_bracket_table_ver !== undefined &&
+              (!Number.isSafeInteger(usage.ctx_bracket_table_ver) ||
+                usage.ctx_bracket_table_ver < 1)) ||
+            demandAu instanceof Error ||
+            !Number.isSafeInteger(usage.session_count) ||
+            usage.session_count < 1 ||
+            providers.length < 1 ||
+            providers.some((provider) => !this.isSafeKeyPart(provider)) ||
+            new Set(providers).size !== providers.length ||
+            stableJson(providers) !== stableJson(usage.providers) ||
+            canonicalPageMarketUsageMap.has(marketKey)) {
+          return new Error('Bounded receipt canonical market usage is invalid.');
+        }
+        canonicalPageDemandAu = this.safeAddAu(canonicalPageDemandAu, demandAu);
+        canonicalPageSessionCount = this.safeAddCount(
+          canonicalPageSessionCount,
+          usage.session_count,
+          'bounded receipt canonical market sessions'
+        );
+        if (canonicalPageDemandAu instanceof Error ||
+            canonicalPageSessionCount instanceof Error) {
+          return new Error('Bounded receipt canonical market usage overflow.');
+        }
+        canonicalPageMarketUsageMap.set(marketKey, {
+          enclave_id: usage.enclave_id,
+          ...(ctxBracket ? { ctx_bracket: ctxBracket } : {}),
+          ...(usage.ctx_bracket_table_ver ? {
+            ctx_bracket_table_ver: usage.ctx_bracket_table_ver,
+          } : {}),
+          demand_au: demandAu,
+          session_count: usage.session_count,
+          providers,
+        });
+      }
+      if (this.compareAu(canonicalPageDemandAu, grossTotal) !== 0 ||
+          canonicalPageSessionCount !== allocations.length) {
+        return new Error('Bounded receipt canonical market usage does not match page allocations.');
+      }
+    }
+    if (boundedReceiptSettlement && epochCommit.at !== value.at) {
+      return new Error('Bounded receipt settlement timestamp must match its epoch commit.');
+    }
     if (epochCommit.totals?.use_count !== receiptIndex.count) {
       return new Error('Epoch commit receipt count does not match the canonical receipt index.');
+    }
+    if (boundedReceiptSettlement) {
+      if (lastPage !== hasOwn(value, 'earning_finals') ||
+          lastPage !== marketUsageProvided) {
+        return new Error(
+          'Bounded receipt settlement requires earning_finals and market_usage on its final page only.'
+        );
+      }
+      if (lastPage && this.compareAu(marketUsageTotal, epochCommit.totals.use_au) !== 0) {
+        return new Error('Final epoch market usage demand must equal committed usage.');
+      }
+    } else if (marketUsageProvided && this.compareAu(marketUsageTotal, grossTotal) !== 0) {
+      return new Error('Epoch market usage demand must equal gross provider earnings.');
     }
 
     const applyState = await this.epochApplyStateRecord();
@@ -9918,6 +10090,9 @@ class MayhemContract extends Contract {
     }
     if (marketUsageProvided) {
       normalized.market_usage = this.mapMarketUsageEntriesForHash(marketUsageMap);
+    }
+    if (hasOwn(value, 'earning_finals')) {
+      normalized.earning_finals = earningFinals;
     }
     const applyHash = await this.opaqueHash(
       'mayhem-targeted-epoch-apply-v1',
@@ -9999,16 +10174,25 @@ class MayhemContract extends Contract {
         return new Error('Provider does not accept payment rail.');
       }
 
-      const feeAu = this.safeMulDivAu(grossAu, params.fee_bps, 10_000);
-      if (feeAu instanceof Error) return feeAu;
-      const burnAu = rail === 'tap'
+      const settlementDelta = boundedReceiptSettlement
+        ? options.providerSettlementDeltas?.get(stableJson([rail, provider]))
+        : null;
+      if (boundedReceiptSettlement &&
+          (!settlementDelta || settlementDelta.gross_au !== grossAu)) {
+        return new Error('Bounded receipt provider settlement delta is missing.');
+      }
+      const feeAu = settlementDelta?.fee_au ??
+        this.safeMulDivAu(grossAu, params.fee_bps, 10_000);
+      const burnAu = settlementDelta?.burn_au ?? (rail === 'tap'
         ? this.safeMulDivAu(grossAu, TAP_BURN_BPS, 10_000)
-        : ZERO_AU;
-      if (burnAu instanceof Error) return burnAu;
-      const afterFeeAu = this.safeSubAu(grossAu, feeAu);
-      if (afterFeeAu instanceof Error) return afterFeeAu;
-      const providerAu = this.safeSubAu(afterFeeAu, burnAu);
-      if (providerAu instanceof Error) return providerAu;
+        : ZERO_AU);
+      const providerAu = settlementDelta?.provider_au ?? this.safeSubAu(
+        this.safeSubAu(grossAu, feeAu),
+        burnAu
+      );
+      if (feeAu instanceof Error || burnAu instanceof Error || providerAu instanceof Error) {
+        return new Error('Invalid provider settlement delta.');
+      }
       feeDeltaTotalAu = this.safeAddAu(feeDeltaTotalAu, feeAu);
       if (feeDeltaTotalAu instanceof Error) return feeDeltaTotalAu;
       const nextRailFee = this.safeAddAu(feeDeltaByRail.get(rail) ?? ZERO_AU, feeAu);
@@ -10070,6 +10254,306 @@ class MayhemContract extends Contract {
       });
       earnCumTotal = this.safeAddAu(earnCumTotal, totalAu);
       if (earnCumTotal instanceof Error) return earnCumTotal;
+    }
+
+    const epochEarningUpdates = [];
+    const epochMarketUsageUpdates = [];
+    const epochMarketProviderUpdates = [];
+    let epochProviderCount = 0;
+    let epochMarketCount = 0;
+    let epochEarnCumAu = ZERO_AU;
+    let epochFeeAu = feeDeltaTotalAu;
+    let epochBurnAu = burnDeltaTotalAu;
+    if (boundedReceiptSettlement) {
+      const priorProviderCount = page === 0
+        ? 0
+        : applyState.pending_receipt_provider_count;
+      const priorMarketCount = page === 0
+        ? 0
+        : applyState.pending_receipt_market_count;
+      const priorEarnCumAu = page === 0
+        ? ZERO_AU
+        : this.normalizeAu(
+          applyState.pending_receipt_earn_cum_au,
+          'pending receipt cumulative earning',
+          { allowZero: true }
+        );
+      const priorFeeAu = page === 0
+        ? ZERO_AU
+        : this.normalizeAu(
+          applyState.pending_receipt_fee_au,
+          'pending receipt epoch fee',
+          { allowZero: true }
+        );
+      const priorBurnAu = page === 0
+        ? ZERO_AU
+        : this.normalizeAu(
+          applyState.pending_receipt_burn_au,
+          'pending receipt epoch burn',
+          { allowZero: true }
+        );
+      if (!Number.isSafeInteger(priorProviderCount) || priorProviderCount < 0 ||
+          !Number.isSafeInteger(priorMarketCount) || priorMarketCount < 0 ||
+          priorEarnCumAu instanceof Error || priorFeeAu instanceof Error ||
+          priorBurnAu instanceof Error) {
+        return new Error('Bounded receipt settlement cumulative state is invalid.');
+      }
+      let newProviderCount = 0;
+      for (const earning of this.sortedRailRecords(grossEarningMap, 'provider')) {
+        const identity = stableJson([earning.rail, earning.provider]);
+        const delta = earningDeltas.get(identity);
+        const nextEarning = earnings.get(identity);
+        if (!delta || !nextEarning) {
+          return new Error('Bounded receipt provider earning update is missing.');
+        }
+        const key = `epoch/earning-provider/${value.epoch}/${earning.rail}/${earning.provider}`;
+        const existing = await this.get(key);
+        const priorTotalAu = this.safeSubAu(nextEarning.total_au, delta.au);
+        if (priorTotalAu instanceof Error) return priorTotalAu;
+        let marker = existing;
+        if (marker === null) {
+          newProviderCount += 1;
+          marker = {
+            type: 'epoch_provider_earning',
+            epoch: value.epoch,
+            rail: earning.rail,
+            provider: earning.provider,
+            prior_cumulative_au: priorTotalAu,
+            gross_au: ZERO_AU,
+            net_au: ZERO_AU,
+            cumulative_au: priorTotalAu,
+            first_page: page,
+            last_page: page - 1,
+            updated_at: null,
+          };
+        } else if (
+          marker.type !== 'epoch_provider_earning' ||
+          marker.epoch !== value.epoch ||
+          marker.rail !== earning.rail ||
+          marker.provider !== earning.provider ||
+          marker.cumulative_au !== priorTotalAu ||
+          !Number.isSafeInteger(marker.first_page) ||
+          !Number.isSafeInteger(marker.last_page) ||
+          marker.first_page < 0 ||
+          marker.last_page >= page
+        ) {
+          return new Error('Bounded receipt provider earning marker is inconsistent.');
+        }
+        const grossAu = this.safeAddAu(marker.gross_au, earning.gross_au);
+        const netAu = this.safeAddAu(marker.net_au, delta.au);
+        if (grossAu instanceof Error || netAu instanceof Error) {
+          return new Error('Bounded receipt provider earning marker overflow.');
+        }
+        epochEarningUpdates.push({
+          key,
+          value: {
+            ...marker,
+            gross_au: grossAu,
+            net_au: netAu,
+            cumulative_au: nextEarning.total_au,
+            last_page: page,
+            updated_at: this.tx,
+          },
+        });
+      }
+      let newMarketCount = 0;
+      const updatedMarketMarkers = new Map();
+      for (const usage of canonicalPageMarketUsageMap.values()) {
+        const ctxKey = usage.ctx_bracket ? `ctx/${usage.ctx_bracket}` : 'base';
+        const markerKey =
+          `epoch/market-usage/${value.epoch}/${usage.enclave_id}/${ctxKey}`;
+        const existing = await this.get(markerKey);
+        let marker = existing;
+        if (marker === null) {
+          newMarketCount += 1;
+          marker = {
+            type: 'epoch_market_usage',
+            epoch: value.epoch,
+            enclave_id: usage.enclave_id,
+            ...(usage.ctx_bracket ? { ctx_bracket: usage.ctx_bracket } : {}),
+            ...(usage.ctx_bracket_table_ver ? {
+              ctx_bracket_table_ver: usage.ctx_bracket_table_ver,
+            } : {}),
+            demand_au: ZERO_AU,
+            session_count: 0,
+            provider_count: 0,
+            first_page: page,
+            last_page: page - 1,
+            updated_at: null,
+          };
+        } else if (
+          marker.type !== 'epoch_market_usage' ||
+          marker.epoch !== value.epoch ||
+          marker.enclave_id !== usage.enclave_id ||
+          (marker.ctx_bracket ?? null) !== (usage.ctx_bracket ?? null) ||
+          (marker.ctx_bracket_table_ver ?? null) !==
+            (usage.ctx_bracket_table_ver ?? null) ||
+          !Number.isSafeInteger(marker.first_page) ||
+          !Number.isSafeInteger(marker.last_page) ||
+          marker.first_page < 0 ||
+          marker.last_page >= page ||
+          !Number.isSafeInteger(marker.session_count) ||
+          marker.session_count < 1 ||
+          !Number.isSafeInteger(marker.provider_count) ||
+          marker.provider_count < 1
+        ) {
+          return new Error('Bounded receipt market usage marker is inconsistent.');
+        }
+        let newProviderCount = 0;
+        for (const provider of usage.providers) {
+          const providerKey =
+            `epoch/market-provider/${value.epoch}/${usage.enclave_id}/${ctxKey}/${provider}`;
+          const providerMarker = await this.get(providerKey);
+          if (providerMarker === null) {
+            newProviderCount += 1;
+            epochMarketProviderUpdates.push({
+              key: providerKey,
+              value: {
+                type: 'epoch_market_provider',
+                epoch: value.epoch,
+                enclave_id: usage.enclave_id,
+                ...(usage.ctx_bracket ? { ctx_bracket: usage.ctx_bracket } : {}),
+                provider,
+                first_page: page,
+                updated_at: this.tx,
+              },
+            });
+          } else if (
+            providerMarker.type !== 'epoch_market_provider' ||
+            providerMarker.epoch !== value.epoch ||
+            providerMarker.enclave_id !== usage.enclave_id ||
+            (providerMarker.ctx_bracket ?? null) !== (usage.ctx_bracket ?? null) ||
+            providerMarker.provider !== provider ||
+            !Number.isSafeInteger(providerMarker.first_page) ||
+            providerMarker.first_page < 0 ||
+            providerMarker.first_page >= page
+          ) {
+            return new Error('Bounded receipt market provider marker is inconsistent.');
+          }
+        }
+        const demandAu = this.safeAddAu(marker.demand_au, usage.demand_au);
+        const sessionCount = this.safeAddCount(
+          marker.session_count,
+          usage.session_count,
+          'bounded receipt market sessions'
+        );
+        const providerCount = this.safeAddCount(
+          marker.provider_count,
+          newProviderCount,
+          'bounded receipt market providers'
+        );
+        if (demandAu instanceof Error || sessionCount instanceof Error ||
+            providerCount instanceof Error) {
+          return new Error('Bounded receipt market usage marker overflow.');
+        }
+        const nextMarker = {
+          ...marker,
+          demand_au: demandAu,
+          session_count: sessionCount,
+          provider_count: providerCount,
+          last_page: page,
+          updated_at: this.tx,
+        };
+        epochMarketUsageUpdates.push({ key: markerKey, value: nextMarker });
+        updatedMarketMarkers.set(
+          this.priceMarketKey(usage.enclave_id, usage.ctx_bracket ?? null),
+          nextMarker
+        );
+      }
+      epochProviderCount = this.safeAddCount(
+        priorProviderCount,
+        newProviderCount,
+        'bounded receipt provider count'
+      );
+      if (epochProviderCount instanceof Error) return epochProviderCount;
+      epochMarketCount = this.safeAddCount(
+        priorMarketCount,
+        newMarketCount,
+        'bounded receipt market count'
+      );
+      if (epochMarketCount instanceof Error) return epochMarketCount;
+      epochFeeAu = this.safeAddAu(priorFeeAu, feeDeltaTotalAu);
+      epochBurnAu = this.safeAddAu(priorBurnAu, burnDeltaTotalAu);
+      if (epochFeeAu instanceof Error || epochBurnAu instanceof Error) {
+        return new Error('Bounded receipt epoch fee or burn overflow.');
+      }
+      if (!lastPage) {
+        epochEarnCumAu = priorEarnCumAu;
+      } else {
+        if (marketUsageMap.size !== epochMarketCount) {
+          return new Error('Final market usage count does not match bounded settlement state.');
+        }
+        for (const usage of marketUsageMap.values()) {
+          const marketKey = this.priceMarketKey(
+            usage.enclave_id,
+            usage.ctx_bracket ?? null
+          );
+          const ctxKey = usage.ctx_bracket ? `ctx/${usage.ctx_bracket}` : 'base';
+          const marker = updatedMarketMarkers.get(marketKey) ?? await this.get(
+            `epoch/market-usage/${value.epoch}/${usage.enclave_id}/${ctxKey}`
+          );
+          if (!marker || stableJson({
+            enclave_id: marker.enclave_id,
+            ...(marker.ctx_bracket ? { ctx_bracket: marker.ctx_bracket } : {}),
+            ...(marker.ctx_bracket_table_ver ? {
+              ctx_bracket_table_ver: marker.ctx_bracket_table_ver,
+            } : {}),
+            demand_au: marker.demand_au,
+            session_count: marker.session_count,
+            provider_count: marker.provider_count,
+          }) !== stableJson(usage)) {
+            return new Error('Final market usage does not match canonical receipt settlement state.');
+          }
+        }
+        const updatedMarkers = new Map(
+          epochEarningUpdates.map((update) => [
+            stableJson([update.value.rail, update.value.provider]),
+            update.value,
+          ])
+        );
+        if (earningFinals.length !== epochProviderCount) {
+          return new Error('Final provider earning count does not match bounded settlement state.');
+        }
+        const leaves = [];
+        for (const final of earningFinals) {
+          const identity = stableJson([final.rail, final.provider]);
+          const marker = updatedMarkers.get(identity) ??
+            await this.get(`epoch/earning-provider/${value.epoch}/${final.rail}/${final.provider}`);
+          if (!marker || stableJson({
+            rail: marker.rail,
+            provider: marker.provider,
+            gross_au: marker.gross_au,
+            net_au: marker.net_au,
+            cumulative_au: marker.cumulative_au,
+          }) !== stableJson(final)) {
+            return new Error('Final provider earning evidence does not match applied settlement state.');
+          }
+          epochEarnCumAu = this.safeAddAu(epochEarnCumAu, final.cumulative_au);
+          if (epochEarnCumAu instanceof Error) return epochEarnCumAu;
+          leaves.push(await this.opaqueHash('mayhem-earn-leaf-v1', final));
+        }
+        if (epochProviderCount !== epochCommit.totals.provider_count ||
+            this.compareAu(epochEarnCumAu, epochCommit.totals.earn_au) !== 0 ||
+            this.compareAu(epochFeeAu, epochCommit.totals.fee_au) !== 0 ||
+            this.compareAu(epochBurnAu, epochCommit.totals.burn_au) !== 0) {
+          return new Error('Final bounded settlement totals do not match the epoch commit.');
+        }
+        const earnRoot = await this.merkleRoot('earn', leaves);
+        if (earnRoot !== epochCommit.roots.earn) {
+          return new Error('Final provider earning root does not match the epoch commit.');
+        }
+        const feeRoot = await this.opaqueHash('mayhem-fee-root-v1', {
+          epoch: value.epoch,
+          fee_au: epochFeeAu,
+          fee_cum_au: epochCommit.totals.fee_cum_au,
+          burn_au: epochBurnAu,
+          burn_cum_au: epochCommit.totals.burn_cum_au,
+          tap_burn_bps: TAP_BURN_BPS,
+        });
+        if (feeRoot !== epochCommit.roots.fee) {
+          return new Error('Final fee root does not match the epoch commit.');
+        }
+      }
     }
 
     const feeRecords = new Map();
@@ -10174,7 +10658,7 @@ class MayhemContract extends Contract {
       epoch: value.epoch,
       at: value.at,
       epochSeconds: params.epoch_seconds,
-      usageRoot: roots?.use ?? null,
+      usageRoot: boundedReceiptSettlement ? epochCommit.roots.use : (roots?.use ?? null),
     });
     if (priceDerivations instanceof Error) return priceDerivations;
 
@@ -10196,20 +10680,16 @@ class MayhemContract extends Contract {
       if (totalsError) return totalsError;
     }
 
-    for (const balance of this.sortedRailRecords(balances, 'user')) {
-      await this.put(this.balanceKey(balance.user, balance.rail), balance);
+    if (lastPage && boundedReceiptSettlement) {
+      const finalEvidenceError = await this.validatePagedEpochCommitEvidence({
+        commit: epochCommit,
+        feeCumAu: nextFeeCumTotal,
+        burnCumAu: nextBurnCumTotal,
+        priceDerivations,
+      });
+      if (finalEvidenceError) return finalEvidenceError;
     }
-    for (const earning of this.sortedRailRecords(earnings, 'provider')) {
-      await this.put(this.earningKey(earning.provider, earning.rail), earning);
-    }
-    for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER.filter((rail) => touchedRails.has(rail))) {
-      const feeRecord = {
-        ...nextFeeRecords.get(rail),
-        settled_cum_au: guardian.next_settled_cum_by_rail.get(rail),
-      };
-      await this.put(this.feeCumKey(rail), feeRecord);
-      await this.put(this.burnCumKey(rail), nextBurnRecords.get(rail));
-    }
+
     const nextApplyState = this.nextEpochApplyState({
       applyState,
       epoch: value.epoch,
@@ -10226,18 +10706,82 @@ class MayhemContract extends Contract {
         index_updated_at: receiptIndex.updated_at,
         commit_hash: value.epoch_commit_hash,
         allocation_count: cumulativeAllocationCount,
+        provider_count: epochProviderCount,
+        market_count: epochMarketCount,
+        earn_cum_au: epochEarnCumAu,
+        fee_au: epochFeeAu,
+        burn_au: epochBurnAu,
       },
     });
-    const previousChallengeError = await this.rememberCanaryChallengeAnchor(applyState);
-    if (previousChallengeError) return previousChallengeError;
-    await this.put('epoch/apply/state', nextApplyState);
-    if (lastPage) {
-      const anchorError = await this.rememberEpochApplyAnchor(nextApplyState);
-      if (anchorError) return anchorError;
-      const challengeError = await this.rememberCanaryChallengeAnchor(nextApplyState);
-      if (challengeError) return challengeError;
+    const previousChallengeAnchor = await this.prepareCanaryChallengeAnchor(applyState);
+    if (previousChallengeAnchor instanceof Error) return previousChallengeAnchor;
+    const epochApplyAnchor = lastPage
+      ? await this.prepareEpochApplyAnchor(nextApplyState)
+      : null;
+    if (epochApplyAnchor instanceof Error) return epochApplyAnchor;
+    const challengeAnchor = lastPage
+      ? await this.prepareCanaryChallengeAnchor(nextApplyState)
+      : null;
+    if (challengeAnchor instanceof Error) return challengeAnchor;
+
+    if (options.commitTransition?.write) {
+      if (options.commitTransition.archive) {
+        await this.put(
+          options.commitTransition.archive.key,
+          options.commitTransition.archive.value
+        );
+      }
+      await this.put(options.commitTransition.key, options.commitTransition.record);
     }
-    if (totals) {
+
+    for (const balance of this.sortedRailRecords(balances, 'user')) {
+      await this.put(this.balanceKey(balance.user, balance.rail), balance);
+    }
+    for (const earning of this.sortedRailRecords(earnings, 'provider')) {
+      await this.put(this.earningKey(earning.provider, earning.rail), earning);
+    }
+    for (const update of epochEarningUpdates) {
+      await this.put(update.key, update.value);
+    }
+    for (const update of epochMarketProviderUpdates) {
+      await this.put(update.key, update.value);
+    }
+    for (const update of epochMarketUsageUpdates) {
+      await this.put(update.key, update.value);
+    }
+    for (const rail of PROVIDER_ACCEPTED_RAIL_ORDER.filter((rail) => touchedRails.has(rail))) {
+      const feeRecord = {
+        ...nextFeeRecords.get(rail),
+        settled_cum_au: guardian.next_settled_cum_by_rail.get(rail),
+      };
+      await this.put(this.feeCumKey(rail), feeRecord);
+      await this.put(this.burnCumKey(rail), nextBurnRecords.get(rail));
+    }
+    await this.writePreparedAnchor(previousChallengeAnchor);
+    await this.put('epoch/apply/state', nextApplyState);
+    await this.writePreparedAnchor(epochApplyAnchor);
+    await this.writePreparedAnchor(challengeAnchor);
+    if (lastPage && boundedReceiptSettlement) {
+      await this.writeEpochEvidenceRoots({
+        epoch: value.epoch,
+        at: value.at,
+        epoch_seconds: params.epoch_seconds,
+        roots: epochCommit.roots,
+        totals: epochCommit.totals,
+        feeDeltaAu: epochCommit.totals.fee_au,
+        feeCumAu: nextFeeCumTotal,
+        burnDeltaAu: epochCommit.totals.burn_au,
+        burnCumAu: nextBurnCumTotal,
+        priceDerivations: [],
+      });
+      await this.writeBoundedMarketPriceEvidence({
+        epoch: value.epoch,
+        at: value.at,
+        epochSeconds: params.epoch_seconds,
+        usageRoot: epochCommit.roots.use,
+        derivations: priceDerivations,
+      });
+    } else if (totals) {
       await this.writeEpochEvidenceRoots({
         epoch: value.epoch,
         at: value.at,
@@ -10402,7 +10946,6 @@ class MayhemContract extends Contract {
       seal_hash: sealHash,
       sealed_at: this.tx,
     };
-    await this.put(key, record);
     const nextApplyState = this.nextEpochApplyState({
       applyState,
       epoch: this.value.epoch,
@@ -10412,13 +10955,18 @@ class MayhemContract extends Contract {
       epochSeconds: params.epoch_seconds,
       settledAt: this.value.at,
     });
-    const previousChallengeError = await this.rememberCanaryChallengeAnchor(applyState);
-    if (previousChallengeError) return previousChallengeError;
+    const previousChallengeAnchor = await this.prepareCanaryChallengeAnchor(applyState);
+    if (previousChallengeAnchor instanceof Error) return previousChallengeAnchor;
+    const epochApplyAnchor = await this.prepareEpochApplyAnchor(nextApplyState);
+    if (epochApplyAnchor instanceof Error) return epochApplyAnchor;
+    const challengeAnchor = await this.prepareCanaryChallengeAnchor(nextApplyState);
+    if (challengeAnchor instanceof Error) return challengeAnchor;
+
+    await this.put(key, record);
+    await this.writePreparedAnchor(previousChallengeAnchor);
     await this.put('epoch/apply/state', nextApplyState);
-    const anchorError = await this.rememberEpochApplyAnchor(nextApplyState);
-    if (anchorError) return anchorError;
-    const challengeError = await this.rememberCanaryChallengeAnchor(nextApplyState);
-    if (challengeError) return challengeError;
+    await this.writePreparedAnchor(epochApplyAnchor);
+    await this.writePreparedAnchor(challengeAnchor);
     const result = {
       ok: true,
       op: 'epochSealEmpty',
@@ -16187,6 +16735,16 @@ class MayhemContract extends Contract {
     return `epoch/targeted/${value.epoch}/${b4a.toString(digest, 'hex')}`;
   }
 
+  async commitTargetedEpochPageZeroFeatureKey(value) {
+    const normalized = await this.normalizeCommitTargetedEpochPageZeroFeatureValue(value);
+    if (normalized instanceof Error) return normalized;
+    const digest = await blake3(b4a.from(stableJson({
+      domain: 'mayhem-commit-targeted-epoch-page-zero-feature-v1',
+      value,
+    })));
+    return `epoch/targeted/${value.epoch}/${b4a.toString(digest, 'hex')}`;
+  }
+
   async providerPayoutBindingContext(intent) {
     const context = {
       network: intent.network,
@@ -16302,6 +16860,7 @@ class MayhemContract extends Contract {
     const sessionDeletes = [];
     const sessions = new Set();
     const billingAttempts = new Set();
+    const marketUsage = new Map();
     for (const allocation of value.allocations) {
       if (sessions.has(allocation.session_id)) {
         return new Error('Targeted epoch session allocation is duplicated.');
@@ -16333,6 +16892,51 @@ class MayhemContract extends Contract {
           this.compareAu(head.incremental_au, allocation.au) !== 0) {
         return new Error('Targeted epoch allocation does not match its canonical receipt head.');
       }
+      const receiptBody = head.receipt?.body;
+      if (!receiptBody ||
+          receiptBody.session_id !== allocation.session_id ||
+          receiptBody.provider !== allocation.provider ||
+          !this.isSafeKeyPart(receiptBody.enclave_id) ||
+          (receiptBody.ctx_bracket !== undefined &&
+            receiptBody.ctx_bracket !== null &&
+            !this.isSafeKeyPart(receiptBody.ctx_bracket)) ||
+          (receiptBody.ctx_bracket_table_ver !== undefined &&
+            receiptBody.ctx_bracket_table_ver !== null &&
+            (!Number.isSafeInteger(receiptBody.ctx_bracket_table_ver) ||
+              receiptBody.ctx_bracket_table_ver < 1))) {
+        return new Error('Canonical receipt market identity is invalid.');
+      }
+      const marketKey = this.priceMarketKey(
+        receiptBody.enclave_id,
+        receiptBody.ctx_bracket ?? null
+      );
+      const currentMarket = marketUsage.get(marketKey) ?? {
+        enclave_id: receiptBody.enclave_id,
+        ...(receiptBody.ctx_bracket ? { ctx_bracket: receiptBody.ctx_bracket } : {}),
+        ...(receiptBody.ctx_bracket_table_ver ? {
+          ctx_bracket_table_ver: receiptBody.ctx_bracket_table_ver,
+        } : {}),
+        demand_au: ZERO_AU,
+        session_count: 0,
+        providers: new Set(),
+      };
+      if ((currentMarket.ctx_bracket_table_ver ?? null) !==
+          (receiptBody.ctx_bracket_table_ver ?? currentMarket.ctx_bracket_table_ver ?? null)) {
+        return new Error('Canonical receipt market context version changed within an epoch.');
+      }
+      const marketDemandAu = this.safeAddAu(currentMarket.demand_au, allocation.au);
+      const marketSessionCount = this.safeAddCount(
+        currentMarket.session_count,
+        1,
+        'canonical receipt market session count'
+      );
+      if (marketDemandAu instanceof Error || marketSessionCount instanceof Error) {
+        return new Error('Canonical receipt market usage overflow.');
+      }
+      currentMarket.demand_au = marketDemandAu;
+      currentMarket.session_count = marketSessionCount;
+      currentMarket.providers.add(allocation.provider);
+      marketUsage.set(marketKey, currentMarket);
       const consumeKey = this.receiptConsumedKey(
         allocation.billing_id,
         allocation.billing_attempt
@@ -16463,6 +17067,21 @@ class MayhemContract extends Contract {
         value: summary,
       })),
       session_deletes: [...new Set(sessionDeletes)],
+      market_usage: Array.from(marketUsage.values())
+        .sort((left, right) => (
+          compareCodepoint(left.enclave_id, right.enclave_id) ||
+          compareCodepoint(left.ctx_bracket ?? '', right.ctx_bracket ?? '')
+        ))
+        .map((entry) => ({
+          enclave_id: entry.enclave_id,
+          ...(entry.ctx_bracket ? { ctx_bracket: entry.ctx_bracket } : {}),
+          ...(entry.ctx_bracket_table_ver ? {
+            ctx_bracket_table_ver: entry.ctx_bracket_table_ver,
+          } : {}),
+          demand_au: entry.demand_au,
+          session_count: entry.session_count,
+          providers: Array.from(entry.providers).sort(compareCodepoint),
+        })),
     };
   }
 
@@ -19314,6 +19933,7 @@ class MayhemContract extends Contract {
       ['earnings', value.earnings],
     ];
     if (value.market_usage !== undefined) arrays.push(['market_usage', value.market_usage]);
+    if (value.earning_finals !== undefined) arrays.push(['earning_finals', value.earning_finals]);
     for (const [name, entries] of arrays) {
       if (!Array.isArray(entries)) return new Error(`Epoch apply ${name} must be an array.`);
     }
@@ -19483,6 +20103,11 @@ class MayhemContract extends Contract {
         last_receipt_index_updated_at: receiptApply.index_updated_at,
         last_receipt_commit_hash: receiptApply.commit_hash,
         last_receipt_allocation_count: receiptApply.allocation_count,
+        last_receipt_provider_count: receiptApply.provider_count,
+        last_receipt_market_count: receiptApply.market_count,
+        last_receipt_earn_cum_au: receiptApply.earn_cum_au,
+        last_receipt_fee_au: receiptApply.fee_au,
+        last_receipt_burn_au: receiptApply.burn_au,
       } : {}),
     };
     if (lastPage) {
@@ -19501,6 +20126,11 @@ class MayhemContract extends Contract {
           pending_receipt_index_updated_at: null,
           pending_receipt_commit_hash: null,
           pending_receipt_allocation_count: null,
+          pending_receipt_provider_count: null,
+          pending_receipt_market_count: null,
+          pending_receipt_earn_cum_au: null,
+          pending_receipt_fee_au: null,
+          pending_receipt_burn_au: null,
         } : {}),
         last_page: page,
       };
@@ -19518,6 +20148,11 @@ class MayhemContract extends Contract {
         pending_receipt_index_updated_at: receiptApply.index_updated_at,
         pending_receipt_commit_hash: receiptApply.commit_hash,
         pending_receipt_allocation_count: receiptApply.allocation_count,
+        pending_receipt_provider_count: receiptApply.provider_count,
+        pending_receipt_market_count: receiptApply.market_count,
+        pending_receipt_earn_cum_au: receiptApply.earn_cum_au,
+        pending_receipt_fee_au: receiptApply.fee_au,
+        pending_receipt_burn_au: receiptApply.burn_au,
       } : {}),
       updated_epoch: applyState.updated_epoch,
       last_page: page,
@@ -19554,6 +20189,189 @@ class MayhemContract extends Contract {
     return this.validateEpochApplyShape(value);
   }
 
+  async normalizeCommitTargetedEpochPageZeroFeatureValue(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return new Error('Commit-plus-page-zero feature value must be an object.');
+    }
+    const required = [
+      'op',
+      'epoch',
+      'at',
+      'epoch_commit_hash',
+      'receipt_index',
+      'debits',
+      'earnings',
+      'allocations',
+      'last_page',
+      'roots',
+      'totals',
+    ];
+    const allowed = new Set([
+      ...required,
+      'earning_finals',
+      'market_usage',
+      'supersedes_commit_hash',
+    ]);
+    const unknown = Object.keys(value).filter((key) => !allowed.has(key)).sort();
+    if (unknown.length > 0) {
+      return new Error(`Commit-plus-page-zero feature does not accept fields: ${unknown.join(', ')}.`);
+    }
+    for (const field of required) {
+      if (!hasOwn(value, field)) {
+        return new Error(`Commit-plus-page-zero feature is missing ${field}.`);
+      }
+    }
+    if (value.op !== 'commit_apply_targeted_epoch_page0') {
+      return new Error('Invalid commit-plus-page-zero feature op.');
+    }
+    if (hasOwn(value, 'supersedes_commit_hash') &&
+        (!this.isHexBytes(value.supersedes_commit_hash, 32) ||
+          value.supersedes_commit_hash !== value.supersedes_commit_hash.toLowerCase())) {
+      return new Error('Invalid superseded epoch commit hash.');
+    }
+    const roots = this.normalizeEpochRoots(value.roots);
+    if (roots instanceof Error) return roots;
+    const totals = this.normalizeEpochTotals(value.totals);
+    if (totals instanceof Error) return totals;
+    if (totals.price_count !== 0) {
+      return new Error('Receipt settlement page zero cannot carry market price derivations.');
+    }
+    const emptyPriceRoot = await this.priceDerivationRoot([]);
+    if (roots.price !== emptyPriceRoot) {
+      return new Error('Receipt settlement price root must be the canonical empty root.');
+    }
+    const targetedValue = {
+      op: 'apply_targeted_epoch',
+      epoch: value.epoch,
+      at: value.at,
+      epoch_commit_hash: value.epoch_commit_hash,
+      receipt_index: value.receipt_index,
+      debits: value.debits,
+      earnings: value.earnings,
+      allocations: value.allocations,
+      ...(hasOwn(value, 'earning_finals') ? { earning_finals: value.earning_finals } : {}),
+      ...(hasOwn(value, 'market_usage') ? { market_usage: value.market_usage } : {}),
+      page: 0,
+      last_page: value.last_page,
+    };
+    const normalized = await this.normalizeTargetedEpochFeatureValue(targetedValue);
+    if (normalized instanceof Error) return normalized;
+    return {
+      epoch: value.epoch,
+      at: value.at,
+      roots,
+      totals,
+      receipt_index: normalized.ledger_value.receipt_index,
+      epoch_commit_hash: value.epoch_commit_hash,
+      supersedes_commit_hash: value.supersedes_commit_hash ?? null,
+      targeted_value: targetedValue,
+      normalized,
+    };
+  }
+
+  async prepareTargetedEpochCommitTransition(prepared, applyState, featureKey) {
+    const currentReceiptIndex = this.normalizeReceiptEpochIndexMetadata(
+      await this.get(this.receiptEpochIndexKey(prepared.epoch)),
+      prepared.epoch
+    );
+    if (currentReceiptIndex instanceof Error) return currentReceiptIndex;
+    if (stableJson(currentReceiptIndex) !== stableJson(prepared.receipt_index)) {
+      return new Error('Canonical receipt epoch index changed before commit-plus-page-zero.');
+    }
+    if (prepared.totals.use_count !== currentReceiptIndex.count) {
+      return new Error('Epoch commit receipt count must match the canonical receipt index.');
+    }
+    const params = await this.activeParamsAt(prepared.at, ['challenge_epochs', 'epoch_seconds']);
+    const commitHash = await this.epochCommitHash({
+      epoch: prepared.epoch,
+      epoch_seconds: params.epoch_seconds,
+      roots: prepared.roots,
+      totals: prepared.totals,
+    });
+    if (commitHash !== prepared.epoch_commit_hash) {
+      return new Error('Commit-plus-page-zero epoch commit hash is invalid.');
+    }
+    const key = `epoch/commit/${prepared.epoch}`;
+    const existing = await this.get(key);
+    if (existing?.commit_hash === commitHash) {
+      if (
+        existing.type !== 'epoch_commit' ||
+        existing.status !== 'provisional' ||
+        existing.apply_mode !== 'targeted_receipt_pages_v1' ||
+        existing.epoch !== prepared.epoch ||
+        existing.at !== prepared.at ||
+        stableJson(existing.roots) !== stableJson(prepared.roots) ||
+        stableJson(existing.totals) !== stableJson(prepared.totals)
+      ) {
+        return new Error('Existing epoch commit does not match commit-plus-page-zero.');
+      }
+      return { key, record: existing, archive: null, write: false };
+    }
+    if (existing !== null) {
+      if (
+        existing.type !== 'epoch_commit' ||
+        existing.status !== 'provisional' ||
+        existing.epoch !== prepared.epoch ||
+        !this.isHexBytes(existing.commit_hash, 32) ||
+        existing.commit_hash !== existing.commit_hash.toLowerCase() ||
+        (existing.replacement_count !== undefined &&
+          (!Number.isSafeInteger(existing.replacement_count) || existing.replacement_count < 0))
+      ) {
+        return new Error('Only a canonical provisional epoch commit can be superseded.');
+      }
+      if (prepared.supersedes_commit_hash !== existing.commit_hash) {
+        return new Error('Commit-plus-page-zero must identify the current provisional commit.');
+      }
+      if (applyState.updated_epoch !== prepared.epoch - 1 ||
+          (applyState.pending_epoch ?? null) !== null) {
+        return new Error('Epoch commit cannot be superseded after targeted apply has started.');
+      }
+      for (const evidenceKey of ['use', 'earn', 'fee', 'price']) {
+        if (await this.get(`ev/${evidenceKey}/${prepared.epoch}`)) {
+          return new Error('Epoch commit cannot be superseded after settlement evidence exists.');
+        }
+      }
+      if (!Number.isSafeInteger(existing.totals?.use_count) ||
+          prepared.totals.use_count <= existing.totals.use_count) {
+        return new Error('Replacement epoch commit must strictly extend the canonical receipt count.');
+      }
+      if (!Number.isSafeInteger(existing.at) || prepared.at < existing.at) {
+        return new Error('Replacement epoch commit timestamp cannot precede the superseded commit.');
+      }
+    } else if (prepared.supersedes_commit_hash !== null) {
+      return new Error('Epoch commit has nothing to supersede.');
+    }
+    const record = {
+      type: 'epoch_commit',
+      epoch: prepared.epoch,
+      epoch_seconds: params.epoch_seconds,
+      apply_mode: 'targeted_receipt_pages_v1',
+      roots: prepared.roots,
+      totals: prepared.totals,
+      status: 'provisional',
+      challenge_epochs: params.challenge_epochs,
+      provisional_until_epoch: prepared.epoch + params.challenge_epochs,
+      commit_hash: commitHash,
+      submitted_by: this.address,
+      submitted_at: featureKey,
+      at: prepared.at,
+      ...(existing ? {
+        supersedes: existing.commit_hash,
+        replacement_count: (existing.replacement_count ?? 0) + 1,
+      } : {}),
+    };
+    const archive = existing ? {
+      key: `epoch/commit/superseded/${prepared.epoch}/${existing.commit_hash}`,
+      value: {
+        ...existing,
+        status: 'superseded',
+        superseded_by: commitHash,
+        superseded_at: featureKey,
+      },
+    } : null;
+    return { key, record, archive, write: true };
+  }
+
   async normalizeTargetedEpochFeatureValue(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return new Error('Targeted epoch feature value must be an object.');
@@ -19570,7 +20388,7 @@ class MayhemContract extends Contract {
       'page',
       'last_page',
     ];
-    const allowed = new Set([...required, 'market_usage']);
+    const allowed = new Set([...required, 'market_usage', 'earning_finals']);
     const unknown = Object.keys(value).filter((key) => !allowed.has(key)).sort();
     if (unknown.length > 0) {
       return new Error(`Targeted epoch feature does not accept fields: ${unknown.join(', ')}.`);
@@ -19666,6 +20484,7 @@ class MayhemContract extends Contract {
       PROVIDER_PAYOUT_BINDING_RAIL_ORDER.indexOf(left.rail) -
         PROVIDER_PAYOUT_BINDING_RAIL_ORDER.indexOf(right.rail) ||
       compareCodepoint(left.user, right.user) ||
+      left.billing_epoch - right.billing_epoch ||
       compareCodepoint(left.billing_id, right.billing_id) ||
       left.billing_attempt - right.billing_attempt ||
       compareCodepoint(left.session_id, right.session_id)
@@ -19724,16 +20543,82 @@ class MayhemContract extends Contract {
       compareCodepoint(left.provider, right.provider) ||
       compareCodepoint(left.payout_revision, right.payout_revision)
     ));
+    let earningFinals = null;
+    if (hasOwn(value, 'earning_finals')) {
+      if (value.last_page !== true || !Array.isArray(value.earning_finals) ||
+          value.earning_finals.length === 0) {
+        return new Error('Targeted epoch earning_finals require a non-empty final page.');
+      }
+      earningFinals = [];
+      const identities = new Set();
+      for (const entry of value.earning_finals) {
+        const entryError = this.validateExactObjectKeys(
+          entry,
+          ['rail', 'provider', 'gross_au', 'net_au', 'cumulative_au'],
+          'targeted epoch final earning'
+        );
+        if (entryError) return entryError;
+        const rail = this.normalizeLedgerRail(entry.rail, 'targeted epoch final earning rail');
+        if (rail instanceof Error) return rail;
+        if (!this.isHexBytes(entry.provider, 32) ||
+            entry.provider !== entry.provider.toLowerCase()) {
+          return new Error('Invalid targeted epoch final earning provider.');
+        }
+        const identity = stableJson([rail, entry.provider]);
+        if (identities.has(identity)) {
+          return new Error('Duplicate targeted epoch final earning provider.');
+        }
+        identities.add(identity);
+        const grossAu = this.normalizeAu(
+          entry.gross_au,
+          'targeted epoch final gross earning',
+          { allowZero: false }
+        );
+        const netAu = this.normalizeAu(
+          entry.net_au,
+          'targeted epoch final net earning',
+          { allowZero: false }
+        );
+        const cumulativeAu = this.normalizeAu(
+          entry.cumulative_au,
+          'targeted epoch final cumulative earning',
+          { allowZero: false }
+        );
+        if (grossAu instanceof Error || netAu instanceof Error || cumulativeAu instanceof Error) {
+          return new Error('Invalid targeted epoch final earning amount.');
+        }
+        if (this.compareAu(netAu, grossAu) > 0 || this.compareAu(cumulativeAu, netAu) < 0) {
+          return new Error('Targeted epoch final earning totals are inconsistent.');
+        }
+        earningFinals.push({
+          rail,
+          provider: entry.provider,
+          gross_au: grossAu,
+          net_au: netAu,
+          cumulative_au: cumulativeAu,
+        });
+      }
+      earningFinals.sort((left, right) => (
+        PROVIDER_PAYOUT_BINDING_RAIL_ORDER.indexOf(left.rail) -
+          PROVIDER_PAYOUT_BINDING_RAIL_ORDER.indexOf(right.rail) ||
+        compareCodepoint(left.provider, right.provider)
+      ));
+      if (stableJson(earningFinals) !== stableJson(value.earning_finals)) {
+        return new Error('Targeted epoch final earnings must be canonical.');
+      }
+    }
     const {
       allocations: _allocations,
       op: _op,
       earnings: _earnings,
+      earning_finals: _earningFinals,
       ...ledgerFields
     } = value;
     const ledgerValue = {
       ...ledgerFields,
       receipt_index: receiptIndex,
       earnings: targetedEarnings.map(({ payout_revision: _revision, ...earning }) => earning),
+      ...(earningFinals ? { earning_finals: earningFinals } : {}),
     };
     if (!Number.isSafeInteger(ledgerValue.epoch) || ledgerValue.epoch < 1) {
       return new Error('Invalid targeted epoch.');
@@ -19751,6 +20636,7 @@ class MayhemContract extends Contract {
       ledger_value: ledgerValue,
       allocations,
       targeted_earnings: targetedEarnings,
+      earning_finals: earningFinals,
       revision_bindings: targetedEarnings.map((earning) => ({
         provider: earning.provider,
         rail: earning.rail,
@@ -21750,6 +22636,78 @@ class MayhemContract extends Contract {
     return null;
   }
 
+  async validatePagedEpochCommitEvidence({
+    commit,
+    feeCumAu,
+    burnCumAu,
+    priceDerivations,
+  }) {
+    if (commit.totals.price_count !== 0) {
+      return new Error('Paged receipt settlement cannot finalize market price derivations.');
+    }
+    const emptyPriceRoot = await this.priceDerivationRoot([]);
+    if (commit.roots.price !== emptyPriceRoot) {
+      return new Error('Paged receipt settlement requires the canonical empty price root.');
+    }
+    if (this.compareAu(commit.totals.fee_cum_au, feeCumAu) !== 0) {
+      return new Error('Epoch cumulative fee total does not match paged settlement state.');
+    }
+    if (this.compareAu(commit.totals.burn_cum_au, burnCumAu) !== 0) {
+      return new Error('Epoch cumulative burn total does not match paged settlement state.');
+    }
+    const depositRoot = await this.get(`ev/dep/${commit.epoch}`);
+    if (depositRoot && (
+      depositRoot.type !== 'deposit_root' ||
+      depositRoot.merkle_root !== commit.roots.dep ||
+      depositRoot.count !== commit.totals.dep_count ||
+      this.compareAu(depositRoot.au_total, commit.totals.dep_au) !== 0
+    )) {
+      return new Error('Committed deposit root does not match deposit evidence.');
+    }
+    for (const key of ['use', 'earn', 'fee', 'price']) {
+      if ((await this.get(`ev/${key}/${commit.epoch}`)) !== null) {
+        return new Error(`Epoch ${key} evidence root already exists.`);
+      }
+    }
+    if ((await this.get(`market/price/${commit.epoch}`)) !== null) {
+      return new Error('Bounded market price evidence already exists.');
+    }
+    if (!Array.isArray(priceDerivations)) {
+      return new Error('Bounded market price derivations are invalid.');
+    }
+    return null;
+  }
+
+  async writeBoundedMarketPriceEvidence({
+    epoch,
+    at,
+    epochSeconds,
+    usageRoot,
+    derivations,
+  }) {
+    const root = await this.priceDerivationRoot(derivations);
+    await this.put(`market/price/${epoch}`, {
+      type: 'bounded_market_price_root',
+      epoch,
+      epoch_seconds: epochSeconds,
+      usage_root: usageRoot,
+      price_root: root,
+      price_count: derivations.length,
+      ts: at,
+      updated_at: this.tx,
+    });
+    for (const derivation of derivations) {
+      const suffix = derivation.ctx_bracket
+        ? `${derivation.enclave_id}/${derivation.ctx_bracket}`
+        : derivation.enclave_id;
+      await this.put(`market/price/${epoch}/${suffix}`, {
+        ...derivation,
+        price_root: root,
+        updated_at: this.tx,
+      });
+    }
+  }
+
   async writePriceDerivationEvidence({ epoch, at, epoch_seconds, root, count, derivations }) {
     await this.put(`ev/price/${epoch}`, {
       type: 'price_root',
@@ -22113,6 +23071,39 @@ class MayhemContract extends Contract {
     return this.canonicalAu((amount * BigInt(b)) / BigInt(divisor));
   }
 
+  providerSettlementPageDelta({ grossAu, priorGrossAu, rail, feeBps }) {
+    const nextGrossAu = this.safeAddAu(priorGrossAu, grossAu);
+    if (nextGrossAu instanceof Error) return nextGrossAu;
+    const priorFeeAu = this.safeMulDivAu(priorGrossAu, feeBps, 10_000);
+    const nextFeeAu = this.safeMulDivAu(nextGrossAu, feeBps, 10_000);
+    if (priorFeeAu instanceof Error || nextFeeAu instanceof Error) {
+      return new Error('Provider settlement fee overflow.');
+    }
+    const feeAu = this.safeSubAu(nextFeeAu, priorFeeAu);
+    if (feeAu instanceof Error) return feeAu;
+    const priorBurnAu = rail === 'tap'
+      ? this.safeMulDivAu(priorGrossAu, TAP_BURN_BPS, 10_000)
+      : ZERO_AU;
+    const nextBurnAu = rail === 'tap'
+      ? this.safeMulDivAu(nextGrossAu, TAP_BURN_BPS, 10_000)
+      : ZERO_AU;
+    if (priorBurnAu instanceof Error || nextBurnAu instanceof Error) {
+      return new Error('Provider settlement burn overflow.');
+    }
+    const burnAu = this.safeSubAu(nextBurnAu, priorBurnAu);
+    if (burnAu instanceof Error) return burnAu;
+    const providerAu = this.safeSubAu(
+      this.safeSubAu(grossAu, feeAu),
+      burnAu
+    );
+    if (providerAu instanceof Error) return providerAu;
+    return {
+      fee_au: feeAu,
+      burn_au: burnAu,
+      provider_au: providerAu,
+    };
+  }
+
   safeAddCount(a, b, label = 'count') {
     if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b) || a < 0 || b < 0) {
       return new Error(`Invalid ${label}.`);
@@ -22316,7 +23307,7 @@ class MayhemContract extends Contract {
     return `epoch/apply-anchor/${epoch}`;
   }
 
-  async rememberEpochApplyAnchor(state) {
+  async prepareEpochApplyAnchor(state) {
     if (
       !state ||
       !Number.isSafeInteger(state.updated_epoch) ||
@@ -22342,7 +23333,13 @@ class MayhemContract extends Contract {
         ? null
         : new Error('Epoch apply anchor conflict.');
     }
-    await this.put(key, record);
+    return { key, record, write: true };
+  }
+
+  async rememberEpochApplyAnchor(state) {
+    const prepared = await this.prepareEpochApplyAnchor(state);
+    if (prepared instanceof Error) return prepared;
+    await this.writePreparedAnchor(prepared);
     return null;
   }
 
@@ -22393,7 +23390,7 @@ class MayhemContract extends Contract {
     return anchor;
   }
 
-  async rememberCanaryChallengeAnchor(state) {
+  async prepareCanaryChallengeAnchor(state) {
     if (
       !state ||
       !Number.isSafeInteger(state.updated_epoch) ||
@@ -22414,9 +23411,21 @@ class MayhemContract extends Contract {
       if (existing.epoch !== record.epoch || existing.apply_hash !== record.apply_hash) {
         return new Error('Canary challenge anchor conflict.');
       }
-      return null;
+      return { key, record, write: false };
     }
-    await this.put(key, record);
+    return { key, record, write: true };
+  }
+
+  async writePreparedAnchor(prepared) {
+    if (prepared?.write === true) {
+      await this.put(prepared.key, prepared.record);
+    }
+  }
+
+  async rememberCanaryChallengeAnchor(state) {
+    const prepared = await this.prepareCanaryChallengeAnchor(state);
+    if (prepared instanceof Error) return prepared;
+    await this.writePreparedAnchor(prepared);
     return null;
   }
 

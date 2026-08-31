@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # OpenMayhem canonical-receipt epoch finalization (admin server).
 # Settles the active billing epoch from exact contract-recorded receipt heads:
-#   exact sparse snapshot -> recompute -> epoch-commit -> epoch-apply
+#   exact sparse snapshot -> recompute -> atomic commit+page zero -> remaining pages
 # Finalization artifacts use a deterministic epoch directory so a retry after
 # apply verifies the same frozen evidence instead of attempting the next epoch.
-# Every epoch submit is preceded by a sim. Aborts on any mismatch.
+# Every exact writer envelope is materialized and size-checked before submission.
 # Usage: ops-settle-epoch.sh [epoch]   (defaults to updated_epoch + 1)
 set -euo pipefail
 
@@ -222,19 +222,19 @@ PY
 }
 
 write_targeted_feature() {
-    local page_path="$1" feature_path="$2"
+    local page_path="$1" feature_path="$2" recomputed_path="$3" supersedes_hash="$4"
     node --input-type=module - \
         "$SOURCE_DIR/intercom/scripts/recompute-epoch-roots.mjs" \
-        "$page_path" "$feature_path" <<'NODE'
+        "$page_path" "$feature_path" "$recomputed_path" "$supersedes_hash" <<'NODE'
 import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-const [modulePath, pagePath, featurePath] = process.argv.slice(2);
+const [modulePath, pagePath, featurePath, recomputedPath, supersedesHash] = process.argv.slice(2);
 const { opaqueHash } = await import(pathToFileURL(modulePath).href);
 const page = JSON.parse(fs.readFileSync(pagePath, 'utf8'));
-const value = {
-  op: 'apply_targeted_epoch',
+const recomputed = JSON.parse(fs.readFileSync(recomputedPath, 'utf8'));
+const common = {
   epoch: page.epoch,
   at: page.at,
   epoch_commit_hash: page.epoch_commit_hash,
@@ -242,16 +242,51 @@ const value = {
   debits: page.debits,
   earnings: page.earnings,
   allocations: page.allocations,
-  market_usage: page.market_usage,
-  page: page.page,
+  ...(page.earning_finals ? { earning_finals: page.earning_finals } : {}),
+  ...(page.market_usage ? { market_usage: page.market_usage } : {}),
   last_page: page.last_page,
 };
-const digest = await opaqueHash('mayhem-targeted-epoch-feature-v1', value);
+const value = page.page === 0
+  ? {
+      op: 'commit_apply_targeted_epoch_page0',
+      ...common,
+      roots: recomputed.roots,
+      totals: recomputed.totals,
+      ...(supersedesHash ? { supersedes_commit_hash: supersedesHash } : {}),
+    }
+  : {
+      op: 'apply_targeted_epoch',
+      ...common,
+      page: page.page,
+    };
+const domain = page.page === 0
+  ? 'mayhem-commit-targeted-epoch-page-zero-feature-v1'
+  : 'mayhem-targeted-epoch-feature-v1';
+const digest = await opaqueHash(domain, value);
 const feature = {
   feature: 'mayhem',
   key: `epoch/targeted/${value.epoch}/${digest}`,
   value,
 };
+const operation = {
+  type: 'feature',
+  key: `mayhem_${feature.key}`,
+  value: {
+    dispatch: {
+      type: 'mayhem_feature',
+      contract_version: Number.MAX_SAFE_INTEGER,
+      key: feature.key,
+      hash: '0'.repeat(128),
+      value,
+      nonce: '0'.repeat(64),
+      address: '0'.repeat(64),
+    },
+  },
+};
+const operationBytes = Buffer.byteLength(JSON.stringify(operation));
+if (operationBytes > 64_000) {
+  throw new Error(`targeted epoch feature operation is ${operationBytes} bytes, over 64000`);
+}
 const temporary = `${featurePath}.tmp`;
 const fd = fs.openSync(temporary, 'w', 0o600);
 try {
@@ -359,6 +394,35 @@ if [[ "$epoch" != "$next_epoch" && "$epoch" != "$updated_epoch" ]]; then
 fi
 
 run_dir="$STATE_DIR/epochs/epoch-$epoch"
+if [[ -z "$pending_epoch" && "$epoch" == "$next_epoch" && \
+      -f "$run_dir/canonical-receipts.json" ]]; then
+    set +e
+    python3 - "$RPC_URL" "$epoch" "$run_dir/canonical-receipts.json" <<'PY'
+import json, sys, urllib.parse, urllib.request
+rpc, epoch_text, snapshot_path = sys.argv[1:]
+epoch = int(epoch_text)
+snapshot = json.load(open(snapshot_path))
+key = f"receipt/epoch/{epoch}/index"
+query = urllib.parse.urlencode({"key": key, "confirmed": "true"})
+with urllib.request.urlopen(f"{rpc}/state?{query}", timeout=10) as response:
+    record = json.load(response)
+if not isinstance(record, dict) or record.get("confirmed") is not True:
+    raise SystemExit("canonical receipt index is not confirmed")
+if record.get("value") != snapshot.get("metadata"):
+    raise SystemExit(42)
+PY
+    snapshot_status=$?
+    set -e
+    if [[ "$snapshot_status" == "42" ]]; then
+        archive_dir="$STATE_DIR/superseded/epoch-$epoch/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+        mkdir -p "$(dirname "$archive_dir")"
+        mv "$run_dir" "$archive_dir"
+        echo "archived stale unapplied epoch snapshot at $archive_dir"
+    elif [[ "$snapshot_status" != "0" ]]; then
+        echo "abort: failed to compare the retained epoch snapshot with canonical state" >&2
+        exit 1
+    fi
+fi
 mkdir -p "$run_dir"
 echo "settling epoch $epoch; artifacts in $run_dir"
 
@@ -596,8 +660,8 @@ for identity in identities:
     canonical_au(head.get("incremental_au"), "canonical receipt head incremental_au", allow_zero=False)
     receipt = head.get("receipt")
     body = receipt.get("body") if isinstance(receipt, dict) else None
-    if not isinstance(body, dict) or body.get("schema_version") != 11:
-        raise SystemExit("canonical receipt head must contain a schema v11 signed receipt")
+    if not isinstance(body, dict) or body.get("schema_version") not in {10, 11}:
+        raise SystemExit("canonical receipt head must contain a signed receipt schema 10 or 11")
     if (
         body.get("billing_id") != identity["billing_id"]
         or body.get("billing_attempt") != identity["billing_attempt"]
@@ -657,9 +721,15 @@ max_market_usage_entries = safe_int(
     active_param("max_market_usage_entries", 5000),
     "canonical max_market_usage_entries",
 )
+epoch_seconds = safe_int(
+    active_param("epoch_seconds", 3600),
+    "canonical epoch_seconds",
+    allow_zero=False,
+)
 bundle = {
     "epoch": epoch,
     "params": {
+        "epoch_seconds": epoch_seconds,
         "fee_bps": fee_bps,
         "max_apply_batch": max_apply_batch,
         "max_market_usage_entries": max_market_usage_entries,
@@ -733,43 +803,46 @@ else
 fi
 echo "recomputed: use_au=$(json_field totals.use_au <"$run_dir/epoch-recomputed.json") earn_au=$(json_field totals.earn_au <"$run_dir/epoch-recomputed.json")"
 
-commit_common=(
-    admin epoch-commit
-    --home "$ADMIN_HOME"
-    --rpc-url "$RPC_URL"
-    --peer-store-name "$ADMIN_STORE"
-    --recomputed-file "$run_dir/epoch-recomputed.json"
-    --at "$at"
-    --submit --json
-)
-if [[ -z "$pending_epoch" ]]; then
-    assert_receipt_metadata_unchanged "$epoch" "$run_dir/canonical-receipts.json"
-    "$MAYHEM_BIN" "${commit_common[@]}" --sim >"$run_dir/epoch-commit-sim.json"
-    sim_ok="$(python3 -c '
-import json, sys
-d = json.load(open(sys.argv[1]))
-ok = d.get("ok")
-if ok is None:
-    ok = d.get("tx", {}).get("result", {}).get("ok")
-print(ok)
-' "$run_dir/epoch-commit-sim.json")"
-    if [[ "$sim_ok" != "True" && "$sim_ok" != "true" ]]; then
-        echo "abort: epoch-commit sim did not return ok" >&2
-        exit 1
-    fi
-    assert_receipt_metadata_unchanged "$epoch" "$run_dir/canonical-receipts.json"
-    "$MAYHEM_BIN" "${commit_common[@]}" >"$run_dir/epoch-commit.json"
-    echo "epoch-commit submitted"
-else
-    echo "resuming pending targeted apply at page $pending_next_page"
-fi
-
 assert_receipt_metadata_unchanged "$epoch" "$run_dir/canonical-receipts.json"
-commit_hash="$(read_epoch_commit_hash "$epoch" "$run_dir/epoch-recomputed.json" "$at")"
+commit_hash="$(node --input-type=module - \
+    "$SOURCE_DIR/intercom/scripts/recompute-epoch-roots.mjs" \
+    "$run_dir/epoch-recomputed.json" <<'NODE'
+import fs from 'node:fs';
+import { pathToFileURL } from 'node:url';
+const [modulePath, recomputedPath] = process.argv.slice(2);
+const { opaqueHash } = await import(pathToFileURL(modulePath).href);
+const value = JSON.parse(fs.readFileSync(recomputedPath, 'utf8'));
+process.stdout.write(await opaqueHash('mayhem-epoch-commit-v1', {
+  epoch: value.epoch,
+  epoch_seconds: value.params.epoch_seconds,
+  roots: value.roots,
+  totals: value.totals,
+}));
+NODE
+)"
 [[ "$commit_hash" =~ ^[0-9a-f]{64}$ ]] || {
-    echo "abort: canonical provisional epoch commit hash is invalid" >&2
+    echo "abort: recomputed epoch commit hash is invalid" >&2
     exit 1
 }
+canonical_commit="$(curl -sf -m 10 "$RPC_URL/state?key=epoch/commit/$epoch&confirmed=true")"
+existing_commit_hash="$(printf '%s' "$canonical_commit" | json_field value.commit_hash)"
+supersedes_commit_hash=""
+if [[ -n "$existing_commit_hash" ]]; then
+    [[ "$existing_commit_hash" =~ ^[0-9a-f]{64}$ ]] || {
+        echo "abort: existing epoch commit hash is invalid" >&2
+        exit 1
+    }
+    if [[ "$existing_commit_hash" != "$commit_hash" ]]; then
+        [[ -z "$pending_epoch" ]] || {
+            echo "abort: pending targeted apply commit differs from the frozen recomputation" >&2
+            exit 1
+        }
+        supersedes_commit_hash="$existing_commit_hash"
+    fi
+fi
+if [[ -n "$pending_epoch" ]]; then
+    echo "resuming pending targeted apply at page $pending_next_page"
+fi
 
 pages_dir="$run_dir/apply-pages"
 mkdir -p "$pages_dir"
@@ -828,6 +901,7 @@ if not isinstance(expected_count, int) or isinstance(expected_count, bool) or ex
     raise SystemExit("frozen receipt index count is invalid")
 
 cumulative = 0
+settled_au = canonical_au(recomputed.get("totals", {}).get("use_au"), "epoch use_au")
 for number, page in enumerate(pages):
     if (
         not isinstance(page, dict)
@@ -837,8 +911,9 @@ for number, page in enumerate(pages):
         or not page["allocations"]
         or not isinstance(page.get("debits"), list)
         or not isinstance(page.get("earnings"), list)
-        or not isinstance(page.get("market_usage"), list)
         or not isinstance(page.get("last_page"), bool)
+        or not isinstance(page.get("max_feature_operation_json_bytes"), int)
+        or page["max_feature_operation_json_bytes"] > 60000
     ):
         raise SystemExit(f"recomputed targeted apply page {number} is malformed")
     for allocation in page["allocations"]:
@@ -871,16 +946,27 @@ for number, page in enumerate(pages):
         canonical_au(entry.get("gross_au"), f"page {number} earning au")
         for entry in page["earnings"]
     )
-    market_total = sum(
-        canonical_au(entry.get("demand_au"), f"page {number} market usage au")
-        for entry in page["market_usage"]
-    )
-    if not (allocation_total == debit_total == earning_total == market_total):
+    if not (allocation_total == debit_total == earning_total):
         raise SystemExit(f"targeted apply page {number} aggregates do not reconcile")
     cumulative += len(page["allocations"])
     expected_last = cumulative == expected_count
     if page["last_page"] is not expected_last:
         raise SystemExit(f"targeted apply page {number} last_page is inconsistent")
+    earning_finals = page.get("earning_finals")
+    market_usage = page.get("market_usage")
+    if expected_last:
+        if not isinstance(earning_finals, list) or not earning_finals:
+            raise SystemExit("final targeted apply page is missing earning_finals")
+        if not isinstance(market_usage, list) or not market_usage:
+            raise SystemExit("final targeted apply page is missing market_usage")
+        market_total = sum(
+            canonical_au(entry.get("demand_au"), "final market usage demand")
+            for entry in market_usage
+        )
+        if market_total != settled_au:
+            raise SystemExit("final market usage does not reconcile with epoch usage")
+    elif earning_finals is not None or market_usage is not None:
+        raise SystemExit("non-final targeted apply page carries final evidence")
     submission = {
         "schema_version": 1,
         "type": "canonical_targeted_epoch_apply_page",
@@ -893,7 +979,8 @@ for number, page in enumerate(pages):
         "allocations": page["allocations"],
         "debits": page["debits"],
         "earnings": page["earnings"],
-        "market_usage": page["market_usage"],
+        **({"earning_finals": earning_finals} if earning_finals is not None else {}),
+        **({"market_usage": market_usage} if market_usage is not None else {}),
         "page_sha256": page_hash,
     }
     submission["submission_sha256"] = hashlib.sha256(stable_json(submission).encode()).hexdigest()
@@ -924,6 +1011,28 @@ positive_integer "$page_count" || {
     exit 1
 }
 
+# Materialize and size-check every exact writer feature before page zero can
+# create or replace the provisional commit.
+for ((page = 0; page < page_count; page++)); do
+    page_path="$pages_dir/page-$page.json"
+    feature_path="$pages_dir/page-$page-feature.json"
+    write_targeted_feature \
+        "$page_path" \
+        "$feature_path.candidate" \
+        "$run_dir/epoch-recomputed.json" \
+        "$supersedes_commit_hash"
+    if [[ -f "$feature_path" ]]; then
+        cmp -s "$feature_path" "$feature_path.candidate" || {
+            rm -f "$feature_path.candidate"
+            echo "abort: targeted apply feature changed on retry for page $page" >&2
+            exit 1
+        }
+        rm -f "$feature_path.candidate"
+    else
+        mv "$feature_path.candidate" "$feature_path"
+    fi
+done
+
 current_apply_state="$(curl -sf -m 10 "$RPC_URL/state?key=epoch/apply/state&confirmed=true")"
 current_updated_epoch="$(printf '%s' "$current_apply_state" | json_field value.updated_epoch)"
 current_pending_epoch="$(printf '%s' "$current_apply_state" | json_field value.pending_epoch)"
@@ -943,6 +1052,14 @@ non_negative_integer "$start_page" || {
     echo "abort: canonical targeted apply resume page exceeds frozen page count" >&2
     exit 1
 }
+if (( start_page > 0 )); then
+    canonical_commit_hash="$(read_epoch_commit_hash \
+        "$epoch" "$run_dir/epoch-recomputed.json" "$at")"
+    [[ "$canonical_commit_hash" == "$commit_hash" ]] || {
+        echo "abort: pending targeted apply has an unexpected epoch commit" >&2
+        exit 1
+    }
+fi
 
 for ((page = start_page; page < page_count; page++)); do
     page_path="$pages_dir/page-$page.json"
@@ -956,17 +1073,6 @@ for ((page = start_page; page < page_count; page++)); do
 
     assert_receipt_metadata_unchanged "$epoch" "$run_dir/canonical-receipts.json"
     feature_path="$pages_dir/page-$page-feature.json"
-    write_targeted_feature "$page_path" "$feature_path.candidate"
-    if [[ -f "$feature_path" ]]; then
-        cmp -s "$feature_path" "$feature_path.candidate" || {
-            rm -f "$feature_path.candidate"
-            echo "abort: targeted apply feature changed on retry for page $page" >&2
-            exit 1
-        }
-        rm -f "$feature_path.candidate"
-    else
-        mv "$feature_path.candidate" "$feature_path"
-    fi
     cp "$feature_path" "$pages_dir/page-$page-sim.json"
 
     assert_receipt_metadata_unchanged "$epoch" "$run_dir/canonical-receipts.json"
@@ -986,6 +1092,14 @@ for ((page = start_page; page < page_count; page++)); do
         exit 1
     fi
     wait_for_targeted_page "$epoch" "$page" "$last_page_json"
+    if (( page == 0 )); then
+        canonical_commit_hash="$(read_epoch_commit_hash \
+            "$epoch" "$run_dir/epoch-recomputed.json" "$at")"
+        [[ "$canonical_commit_hash" == "$commit_hash" ]] || {
+            echo "abort: atomic page zero installed an unexpected epoch commit" >&2
+            exit 1
+        }
+    fi
     echo "targeted epoch apply page $page submitted"
 done
 

@@ -304,7 +304,8 @@ class MayhemProtocol extends Protocol {
         value: json,
       };
     }
-    if (json?.op === 'apply_targeted_epoch') return null;
+    if (json?.op === 'apply_targeted_epoch' ||
+        json?.op === 'commit_apply_targeted_epoch_page0') return null;
     if (json?.op === 'epoch_commit') {
       return {
         type: 'epochCommit',

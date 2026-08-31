@@ -412,7 +412,11 @@ test('epoch recompute applies TAP 75/15/10 without burning fiat or TNK', async (
     })),
   }));
 
-  assert.deepEqual(roll.params, { fee_bps: 1_500, tap_burn_bps: 1_000 });
+  assert.deepEqual(roll.params, {
+    epoch_seconds: 3_600,
+    fee_bps: 1_500,
+    tap_burn_bps: 1_000,
+  });
   assert.equal(roll.totals.use_au, '30000');
   assert.equal(roll.totals.earn_au, '24500');
   assert.equal(roll.totals.fee_au, '4500');

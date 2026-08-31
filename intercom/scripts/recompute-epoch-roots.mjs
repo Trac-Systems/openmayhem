@@ -10,7 +10,12 @@ const LEDGER_RAIL_ORDER = ['fiat', 'tap', 'tnk'];
 const MAX_OPERATOR_FEE_BPS = 1_500;
 const TAP_BURN_BPS = 1_000;
 const SESSION_RECEIPT_SCHEMA_VERSION = 11;
+const SETTLEMENT_RECEIPT_SCHEMA_VERSIONS = new Set([10, SESSION_RECEIPT_SCHEMA_VERSION]);
 const CANONICAL_RECEIPT_SNAPSHOT_SCHEMA_VERSION = 1;
+// trac-peer's canonical feature ceiling is 64,000 bytes. Keep enough room for
+// its compact-encoding envelope instead of discovering an oversized page only
+// after the immutable epoch commit has been submitted.
+const TARGETED_EPOCH_FEATURE_JSON_MAX_BYTES = 60_000;
 
 export const stableValue = (value) => {
   if (Array.isArray(value)) return value.map((item) => stableValue(item));
@@ -238,9 +243,11 @@ function normalizeReceiptUsage(usageSource) {
   return Object.fromEntries(Object.entries(usage).sort(([left], [right]) => left.localeCompare(right)));
 }
 
-function normalizeCurrentReceiptBody(body) {
-  if (body.schema_version !== SESSION_RECEIPT_SCHEMA_VERSION) {
-    throw new Error(`receipt schema_version must be ${SESSION_RECEIPT_SCHEMA_VERSION}`);
+function normalizeSettlementReceiptBody(body) {
+  if (!SETTLEMENT_RECEIPT_SCHEMA_VERSIONS.has(body.schema_version)) {
+    throw new Error(
+      `receipt schema_version must be one of ${Array.from(SETTLEMENT_RECEIPT_SCHEMA_VERSIONS).join(', ')}`
+    );
   }
   if (typeof body.billing_id !== 'string' || !/^[0-9a-f]{64}$/.test(body.billing_id)) {
     throw new Error('receipt billing_id must be 32 bytes of lowercase hex');
@@ -505,6 +512,7 @@ function applyPageLimits(bundle, receiptPageSize) {
     maxApplyBatch,
     maxMarketUsageEntries,
     maxAllocations: Math.min(receiptPageSize, Math.floor(maxApplyBatch / 2)),
+    maxFeatureJsonBytes: TARGETED_EPOCH_FEATURE_JSON_MAX_BYTES,
   };
 }
 
@@ -517,7 +525,75 @@ function emptyApplyPageState() {
   };
 }
 
-function applyPageCanFit(state, row, limits) {
+function targetedEpochFeatureOperationJsonBytes(
+  state,
+  page,
+  receiptIndex,
+  { earningFinals = [], marketUsage = [] } = {}
+) {
+  const materialized = {
+    ...materializeApplyPage(state, page, receiptIndex),
+    ...(earningFinals.length > 0 ? { earning_finals: earningFinals } : {}),
+    ...(marketUsage.length > 0 ? { market_usage: marketUsage } : {}),
+  };
+  const key = `epoch/targeted/${Number.MAX_SAFE_INTEGER}/${'0'.repeat(64)}`;
+  const common = {
+    epoch: Number.MAX_SAFE_INTEGER,
+    at: Number.MAX_SAFE_INTEGER,
+    epoch_commit_hash: '0'.repeat(64),
+    receipt_index: materialized.receipt_index,
+    debits: materialized.debits,
+    earnings: materialized.earnings,
+    allocations: materialized.allocations,
+    ...(materialized.earning_finals ? { earning_finals: materialized.earning_finals } : {}),
+    ...(materialized.market_usage ? { market_usage: materialized.market_usage } : {}),
+    // false is one byte longer than true, so it covers both page positions.
+    last_page: false,
+  };
+  const value = page === 0
+    ? {
+        op: 'commit_apply_targeted_epoch_page0',
+        ...common,
+        roots: Object.fromEntries(ROOT_KINDS.map((kind) => [kind, '0'.repeat(64)])),
+        totals: {
+          dep_count: Number.MAX_SAFE_INTEGER,
+          dep_au: '9'.repeat(78),
+          use_count: Number.MAX_SAFE_INTEGER,
+          use_au: '9'.repeat(78),
+          provider_count: Number.MAX_SAFE_INTEGER,
+          earn_au: '9'.repeat(78),
+          fee_au: '9'.repeat(78),
+          fee_cum_au: '9'.repeat(78),
+          burn_au: '9'.repeat(78),
+          burn_cum_au: '9'.repeat(78),
+          price_count: Number.MAX_SAFE_INTEGER,
+        },
+        supersedes_commit_hash: '0'.repeat(64),
+      }
+    : {
+        op: 'apply_targeted_epoch',
+        ...common,
+        page: Number.MAX_SAFE_INTEGER,
+      };
+  const operation = {
+    type: 'feature',
+    key: `mayhem_${key}`,
+    value: {
+      dispatch: {
+        type: 'mayhem_feature',
+        contract_version: Number.MAX_SAFE_INTEGER,
+        key,
+        hash: '0'.repeat(128),
+        value,
+        nonce: '0'.repeat(64),
+        address: '0'.repeat(64),
+      },
+    },
+  };
+  return Buffer.byteLength(JSON.stringify(operation));
+}
+
+function applyPageCanFit(state, row, limits, page, receiptIndex) {
   if (state.allocations.length + 1 > limits.maxAllocations) return false;
   const debitKey = JSON.stringify([row.allocation.rail, row.allocation.user]);
   const earningKey = JSON.stringify([
@@ -529,10 +605,26 @@ function applyPageCanFit(state, row, limits) {
   const debitCount = state.debits.size + (state.debits.has(debitKey) ? 0 : 1);
   const earningCount = state.earnings.size + (state.earnings.has(earningKey) ? 0 : 1);
   const marketUsageCount = state.marketUsage.size + (state.marketUsage.has(usageKey) ? 0 : 1);
-  return (
+  if (!(
     debitCount + earningCount <= limits.maxApplyBatch &&
     marketUsageCount <= limits.maxMarketUsageEntries
-  );
+  )) return false;
+
+  const candidate = {
+    allocations: state.allocations.slice(),
+    debits: new Map(state.debits),
+    earnings: new Map(Array.from(state.earnings, ([key, value]) => [key, { ...value }])),
+    marketUsage: new Map(Array.from(state.marketUsage, ([key, value]) => [
+      key,
+      {
+        ...value,
+        sessions: new Set(value.sessions),
+        providers: new Set(value.providers),
+      },
+    ])),
+  };
+  addApplyPageRow(candidate, row);
+  return targetedEpochFeatureOperationJsonBytes(candidate, page, receiptIndex) <= limits.maxFeatureJsonBytes;
 }
 
 function addApplyPageRow(state, row) {
@@ -566,14 +658,12 @@ function materializeApplyPage(state, page, receiptIndex) {
       payout_revision,
       gross_au: canonicalAu(au),
     }));
-  const market_usage = sortedMarketUsageEntries(state.marketUsage);
   const pageValue = {
     page,
     receipt_index: receiptIndex.metadata,
     allocations,
     debits,
     earnings,
-    market_usage,
   };
   return {
     ...pageValue,
@@ -581,18 +671,18 @@ function materializeApplyPage(state, page, receiptIndex) {
   };
 }
 
-function buildApplyPages(rows, receiptIndex, limits) {
+function buildApplyPages(rows, receiptIndex, limits, { earningFinals, marketUsage }) {
   const pages = [];
   let state = emptyApplyPageState();
   for (const row of rows) {
-    if (!applyPageCanFit(state, row, limits)) {
+    if (!applyPageCanFit(state, row, limits, pages.length, receiptIndex)) {
       if (state.allocations.length === 0) {
         throw new Error('one canonical receipt allocation exceeds the active apply-page limits');
       }
       pages.push(materializeApplyPage(state, pages.length, receiptIndex));
       state = emptyApplyPageState();
     }
-    if (!applyPageCanFit(state, row, limits)) {
+    if (!applyPageCanFit(state, row, limits, pages.length, receiptIndex)) {
       throw new Error('one canonical receipt allocation exceeds the active apply-page limits');
     }
     addApplyPageRow(state, row);
@@ -604,14 +694,38 @@ function buildApplyPages(rows, receiptIndex, limits) {
   for (const page of pages) {
     cumulativeAllocations += page.allocations.length;
     page.last_page = cumulativeAllocations === receiptIndex.count;
+    if (page.last_page) {
+      page.earning_finals = earningFinals;
+      page.market_usage = marketUsage;
+    }
+    const sizingState = {
+      allocations: [],
+      debits: new Map(),
+      earnings: new Map(),
+      marketUsage: new Map(),
+    };
+    for (const row of rows.slice(cumulativeAllocations - page.allocations.length, cumulativeAllocations)) {
+      addApplyPageRow(sizingState, row);
+    }
+    page.max_feature_operation_json_bytes = targetedEpochFeatureOperationJsonBytes(
+      sizingState,
+      page.page,
+      receiptIndex,
+      page.last_page ? { earningFinals, marketUsage } : undefined
+    );
+    if (page.max_feature_operation_json_bytes > limits.maxFeatureJsonBytes) {
+      throw new Error('final canonical receipt page exceeds the active feature byte limit');
+    }
     page.page_sha256 = sha256Stable({
       page: page.page,
       receipt_index: page.receipt_index,
       allocations: page.allocations,
       debits: page.debits,
       earnings: page.earnings,
-      market_usage: page.market_usage,
+      ...(page.earning_finals ? { earning_finals: page.earning_finals } : {}),
+      ...(page.market_usage ? { market_usage: page.market_usage } : {}),
       last_page: page.last_page,
+      max_feature_operation_json_bytes: page.max_feature_operation_json_bytes,
     });
   }
   if (
@@ -644,7 +758,7 @@ function receiptEnvelope(entry) {
     voucher: _voucher,
     ...body
   } = bodySource;
-  const currentBody = normalizeCurrentReceiptBody(body);
+  const currentBody = normalizeSettlementReceiptBody(body);
   const envelope = {
     body: currentBody,
     enclave_sig: receipt.enclave_sig ?? entry.enclave_sig ?? null,
@@ -783,6 +897,7 @@ export async function recomputeEpoch(bundle) {
   }
   const epoch = safeCount(bundle.epoch, 'epoch');
   const feeBps = adminFeeBps(bundle);
+  const epochSeconds = safeCount(bundle.params?.epoch_seconds ?? 3_600, 'params.epoch_seconds');
   if (feeBps > MAX_OPERATOR_FEE_BPS) throw new Error(`fee_bps must be <= ${MAX_OPERATOR_FEE_BPS}`);
 
   const deposits = Array.isArray(bundle.deposits) ? bundle.deposits : [];
@@ -790,6 +905,11 @@ export async function recomputeEpoch(bundle) {
   const receiptIndex = validateCanonicalReceiptSnapshot(bundle, receipts, epoch);
   const pageLimits = applyPageLimits(bundle, receiptIndex.pageSize);
   const priceDerivations = Array.isArray(bundle.price_derivations) ? bundle.price_derivations : [];
+  if (priceDerivations.length > 0) {
+    throw new Error(
+      'bounded receipt settlement does not accept external price derivations; price updates require a dedicated canonical operation'
+    );
+  }
   const payouts = Array.isArray(bundle.payouts) ? bundle.payouts : [];
   if (payouts.length > 0) {
     throw new Error('payouts are non-custodial TAP claims; do not include payout entries in epoch bundles');
@@ -981,8 +1101,11 @@ export async function recomputeEpoch(bundle) {
   if (stableJson(allocations) !== stableJson(allocationRows.map((row) => row.allocation))) {
     throw new Error('canonical allocation/page ordering diverged');
   }
-  const apply_pages = buildApplyPages(allocationRows, receiptIndex, pageLimits);
   const market_usage = sortedMarketUsageEntries(marketUsageMap);
+  const apply_pages = buildApplyPages(allocationRows, receiptIndex, pageLimits, {
+    earningFinals: earningEntries,
+    marketUsage: market_usage,
+  });
   const useAu = sortedRailEntries(debitMap).reduce((sum, entry) => sum + entry.au, 0n);
   const totals = {
     dep_count: dep.count,
@@ -1000,7 +1123,11 @@ export async function recomputeEpoch(bundle) {
 
   return {
     epoch,
-    params: { fee_bps: feeBps, tap_burn_bps: TAP_BURN_BPS },
+    params: {
+      epoch_seconds: epochSeconds,
+      fee_bps: feeBps,
+      tap_burn_bps: TAP_BURN_BPS,
+    },
     roots,
     totals,
     debits,
@@ -1012,6 +1139,7 @@ export async function recomputeEpoch(bundle) {
       max_allocations: pageLimits.maxAllocations,
       max_apply_batch: pageLimits.maxApplyBatch,
       max_market_usage_entries: pageLimits.maxMarketUsageEntries,
+      max_feature_json_bytes: pageLimits.maxFeatureJsonBytes,
     },
     apply_pages,
   };

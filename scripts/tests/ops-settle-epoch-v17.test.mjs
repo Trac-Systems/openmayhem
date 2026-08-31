@@ -76,6 +76,7 @@ async function harness({
   failPageOnce = null,
   driftAtIndexRead = null,
   bareIndexOnly = false,
+  staleSnapshotAndCommit = false,
   settlementEpoch = 1,
   billingEpoch = settlementEpoch,
 } = {}) {
@@ -138,6 +139,18 @@ async function harness({
   for (const head of heads) {
     records[`receipt/head/${head.billing_id}/${head.billing_attempt}`] = head;
   }
+  if (staleSnapshotAndCommit) {
+    const staleRunDir = path.join(stateDir, `epochs/epoch-${settlementEpoch}`);
+    fs.mkdirSync(staleRunDir, { recursive: true });
+    fs.writeFileSync(path.join(staleRunDir, 'canonical-receipts.json'), JSON.stringify({
+      schema_version: 1,
+      type: 'canonical_epoch_receipt_snapshot',
+      settlement_epoch: settlementEpoch,
+      metadata: { ...index, count: 1, revision: 1 },
+      identities: [],
+      heads: [],
+    }));
+  }
   fs.writeFileSync(rpcStatePath, `${JSON.stringify({
     apply: {
       updated_epoch: settlementEpoch - 1,
@@ -147,7 +160,16 @@ async function harness({
       last_apply_hash: null,
       last_page: null,
     },
-    commit: null,
+    commit: staleSnapshotAndCommit ? {
+      type: 'epoch_commit',
+      epoch: settlementEpoch,
+      status: 'provisional',
+      at: 3_600,
+      roots: {},
+      totals: { use_count: 1 },
+      commit_hash: COMMIT_HASH,
+    } : null,
+    superseded_commit: null,
     records,
     features: [],
     index_reads: 0,
@@ -204,28 +226,88 @@ const server = http.createServer((req, res) => {
       const feature = JSON.parse(raw);
       const value = feature.value;
       state.features.push(feature);
+      const page = value.op === 'commit_apply_targeted_epoch_page0' ? 0 : value.page;
       const allocationAu = value.allocations.reduce((sum, entry) => sum + BigInt(entry.au), 0n);
       const debitAu = value.debits.reduce((sum, entry) => sum + BigInt(entry.au), 0n);
       const earningAu = value.earnings.reduce((sum, entry) => sum + BigInt(entry.gross_au), 0n);
-      const usageAu = value.market_usage.reduce((sum, entry) => sum + BigInt(entry.demand_au), 0n);
       const index = state.records['receipt/epoch/${settlementEpoch}/index'];
       const errors = [];
-      if (value.op !== 'apply_targeted_epoch') errors.push('op');
-      if (value.epoch_commit_hash !== '${COMMIT_HASH}') errors.push('commit');
+      const writerOperation = {
+        type: 'feature',
+        key: 'mayhem_' + feature.key,
+        value: {
+          dispatch: {
+            type: 'mayhem_feature',
+            contract_version: Number.MAX_SAFE_INTEGER,
+            key: feature.key,
+            hash: '0'.repeat(128),
+            value,
+            nonce: '0'.repeat(64),
+            address: '0'.repeat(64),
+          },
+        },
+      };
+      if (Buffer.byteLength(JSON.stringify(writerOperation)) > 64_000) errors.push('writer_bytes');
+      if (page === 0 && value.op !== 'commit_apply_targeted_epoch_page0') errors.push('page0_op');
+      if (page > 0 && value.op !== 'apply_targeted_epoch') errors.push('page_op');
+      if (!/^[0-9a-f]{64}$/.test(value.epoch_commit_hash)) errors.push('commit');
       if (JSON.stringify(stable(value.receipt_index)) !== JSON.stringify(stable(index))) errors.push('index');
       if (allocationAu !== debitAu) errors.push('debits');
       if (allocationAu !== earningAu) errors.push('earnings');
-      if (allocationAu !== usageAu) errors.push('market_usage');
+      const hasFinalEvidence = value.last_page === true;
+      if (hasFinalEvidence) {
+        if (!Array.isArray(value.market_usage) || value.market_usage.length === 0 ||
+            !Array.isArray(value.earning_finals) || value.earning_finals.length === 0) {
+          errors.push('final_evidence');
+        } else {
+          const usageAu = value.market_usage.reduce(
+            (sum, entry) => sum + BigInt(entry.demand_au),
+            0n,
+          );
+          if (usageAu !== BigInt(index.count)) errors.push('market_usage');
+        }
+      } else if (value.market_usage !== undefined || value.earning_finals !== undefined) {
+        errors.push('early_final_evidence');
+      }
+      if (page === 0) {
+        if (!value.roots || !value.totals || value.totals.use_count !== index.count) {
+          errors.push('commit_evidence');
+        }
+      } else if (!state.commit || value.epoch_commit_hash !== state.commit.commit_hash) {
+        errors.push('missing_commit');
+      }
       if (errors.length > 0) {
         write(state);
         res.writeHead(200, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ ok: false, error: 'fixture validation failed: ' + errors.join(',') }));
       }
-      if (state.fail_page_once === value.page && !state.failed_once) {
+      if (state.fail_page_once === page && !state.failed_once) {
         state.failed_once = true;
         write(state);
         res.writeHead(503, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ ok: false, error: 'forced page failure' }));
+      }
+      if (page === 0) {
+        if (state.commit && state.commit.commit_hash !== value.epoch_commit_hash &&
+            value.supersedes_commit_hash !== state.commit.commit_hash) {
+          write(state);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          return res.end(JSON.stringify({ ok: false, error: 'superseded commit mismatch' }));
+        }
+        if (state.commit && state.commit.commit_hash !== value.epoch_commit_hash) {
+          state.superseded_commit = state.commit;
+        }
+        state.commit = {
+          type: 'epoch_commit',
+          epoch: ${settlementEpoch},
+          epoch_seconds: 3600,
+          apply_mode: 'targeted_receipt_pages_v1',
+          status: 'provisional',
+          at: value.at,
+          roots: value.roots,
+          totals: value.totals,
+          commit_hash: value.epoch_commit_hash,
+        };
       }
       if (value.last_page) {
         state.apply = {
@@ -234,24 +316,24 @@ const server = http.createServer((req, res) => {
           pending_epoch: null,
           pending_next_page: 0,
           last_apply_hash: '${APPLY_HASH}',
-          last_page: value.page,
+          last_page: page,
         };
       } else {
         state.apply = {
           ...state.apply,
           pending_epoch: ${settlementEpoch},
-          pending_next_page: value.page + 1,
+          pending_next_page: page + 1,
           pending_receipt_index_count: index.count,
           pending_receipt_index_revision: index.revision,
           pending_receipt_index_page_count: index.page_count,
           pending_receipt_index_updated_at: index.updated_at,
           last_apply_hash: '${APPLY_HASH}',
-          last_page: value.page,
+          last_page: page,
         };
       }
       write(state);
       res.writeHead(200, { 'content-type': 'application/json' });
-      return res.end(JSON.stringify({ ok: true, page: value.page }));
+      return res.end(JSON.stringify({ ok: true, page }));
     });
   }
   res.writeHead(404);
@@ -340,7 +422,7 @@ printf '%s\\n' '{"ok":true}'
   };
 }
 
-test('finalizer commits globally then submits only bounded exact targeted pages', async (t) => {
+test('finalizer atomically commits page zero then submits bounded exact targeted pages', async (t) => {
   const ctx = await harness();
   t.after(() => ctx.close());
   const result = ctx.run();
@@ -348,11 +430,24 @@ test('finalizer commits globally then submits only bounded exact targeted pages'
   const state = ctx.state();
   assert.equal(state.apply.updated_epoch, 1);
   assert.equal(state.features.length, 2);
-  assert.deepEqual(state.features.map((feature) => feature.value.page), [0, 1]);
+  assert.deepEqual(
+    state.features.map((feature) =>
+      feature.value.op === 'commit_apply_targeted_epoch_page0' ? 0 : feature.value.page
+    ),
+    [0, 1],
+  );
+  assert.deepEqual(
+    state.features.map((feature) => feature.value.op),
+    ['commit_apply_targeted_epoch_page0', 'apply_targeted_epoch'],
+  );
   assert.deepEqual(state.features.map((feature) => feature.value.last_page), [false, true]);
   assert.deepEqual(state.features.map((feature) => feature.value.allocations.length), [2, 1]);
-  assert.equal(state.features.every((feature) => feature.value.roots === undefined), true);
-  assert.equal(state.features.every((feature) => feature.value.totals === undefined), true);
+  assert.equal(state.features[0].value.roots !== undefined, true);
+  assert.equal(state.features[0].value.totals !== undefined, true);
+  assert.equal(state.features[1].value.roots, undefined);
+  assert.equal(state.features[1].value.totals, undefined);
+  assert.equal(state.commit.commit_hash, state.features[0].value.epoch_commit_hash);
+  assert.equal(state.commit.apply_mode, 'targeted_receipt_pages_v1');
   assert.equal(state.features.every((feature) => feature.value.receipt_index.revision === 3), true);
   assert.equal(
     state.features.every((feature) =>
@@ -360,9 +455,7 @@ test('finalizer commits globally then submits only bounded exact targeted pages'
     ),
     true,
   );
-  const calls = fs.readFileSync(ctx.mayhemLog, 'utf8').trim().split('\n');
-  assert.equal(calls.length, 2, 'global commit must simulate then submit exactly once');
-  assert.match(calls[0], /epoch-commit.*--sim/);
+  assert.equal(fs.existsSync(ctx.mayhemLog), false, 'page zero must not use a standalone commit');
   assert.equal(
     fs.existsSync(path.join(ctx.stateDir, 'cadence.last-advance')),
     false,
@@ -407,7 +500,12 @@ test('mid-page failure resumes the exact page and completed retry is idempotent'
   assert.equal(second.status, 0, `${second.stdout}\n${second.stderr}`);
   const after = ctx.state();
   assert.equal(after.apply.updated_epoch, 1);
-  assert.deepEqual(after.features.map((feature) => feature.value.page), [0, 1, 1]);
+  assert.deepEqual(
+    after.features.map((feature) =>
+      feature.value.op === 'commit_apply_targeted_epoch_page0' ? 0 : feature.value.page
+    ),
+    [0, 1, 1],
+  );
   assert.deepEqual(
     after.features.filter((feature) => feature.value.page === 1),
     [firstPageOne, firstPageOne],
@@ -419,8 +517,8 @@ test('mid-page failure resumes the exact page and completed retry is idempotent'
   assert.match(third.stdout, /already finalized/);
 });
 
-test('metadata drift after commit aborts before targeted page zero starts', async (t) => {
-  const ctx = await harness({ driftAtIndexRead: 5 });
+test('metadata drift aborts before atomic targeted page zero starts', async (t) => {
+  const ctx = await harness({ driftAtIndexRead: 4 });
   t.after(() => ctx.close());
   const result = ctx.run();
   assert.notEqual(result.status, 0);
@@ -428,6 +526,25 @@ test('metadata drift after commit aborts before targeted page zero starts', asyn
   assert.equal(ctx.state().features.length, 0);
   assert.equal(ctx.state().apply.updated_epoch, 0);
   assert.equal(ctx.state().apply.pending_epoch, null);
+});
+
+test('finalizer archives a stale snapshot and supersedes its unapplied commit', async (t) => {
+  const ctx = await harness({ staleSnapshotAndCommit: true });
+  t.after(() => ctx.close());
+  const result = ctx.run();
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /archived stale unapplied epoch snapshot/);
+  const state = ctx.state();
+  assert.equal(state.apply.updated_epoch, 1);
+  assert.equal(state.superseded_commit.commit_hash, COMMIT_HASH);
+  assert.equal(state.features[0].value.supersedes_commit_hash, COMMIT_HASH);
+  assert.notEqual(state.commit.commit_hash, COMMIT_HASH);
+  const archiveRoot = path.join(ctx.stateDir, 'superseded/epoch-1');
+  assert.equal(fs.readdirSync(archiveRoot).length, 1);
+  assert.equal(
+    fs.existsSync(path.join(archiveRoot, fs.readdirSync(archiveRoot)[0], 'canonical-receipts.json')),
+    true,
+  );
 });
 
 test('finalizer requires the exact receipt epoch index key and rejects the bare key', async (t) => {

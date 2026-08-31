@@ -418,6 +418,15 @@ async function seedCanonicalReceiptEpoch(
       receipt_seq: 1,
       receipt_hash: (index + 1).toString(16).repeat(64),
       incremental_au: String(au),
+      receipt: {
+        body: {
+          session_id: voucher.session_id,
+          provider: voucher.provider,
+          enclave_id: voucher.enclave_id,
+          ctx_bracket: voucher.ctx_bracket,
+          ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
+        },
+      },
       feature_key: updatedAt,
       updated_at: updatedAt,
     };

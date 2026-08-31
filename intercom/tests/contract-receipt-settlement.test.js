@@ -126,6 +126,11 @@ async function setupContract() {
     created_at: makeTxKey(5),
     updated_at: makeTxKey(5),
   });
+  await storage.put(`modelref/${MODEL_ID}`, {
+    id: MODEL_ID,
+    model_class: 'text-generation',
+    rate_map: LOCKED_RATE_MAP,
+  });
   await storage.put(`serve/${provider.publicKey}/${ENCLAVE_ID}`, {
     provider: provider.publicKey,
     enclave_id: ENCLAVE_ID,
@@ -176,6 +181,25 @@ async function setupContract() {
   });
   return { admin, provider, user, enclave, submitter, storage, contract };
 }
+
+test('provider settlement page deltas preserve cumulative TNK, fiat, and TAP rounding', async () => {
+  const ctx = await setupContract();
+  assert.deepEqual(ctx.contract.providerSettlementPageDelta({
+    grossAu: '10', priorGrossAu: '0', rail: 'tnk', feeBps: 1_500,
+  }), { fee_au: '1', burn_au: '0', provider_au: '9' });
+  assert.deepEqual(ctx.contract.providerSettlementPageDelta({
+    grossAu: '10', priorGrossAu: '10', rail: 'tnk', feeBps: 1_500,
+  }), { fee_au: '2', burn_au: '0', provider_au: '8' });
+  assert.deepEqual(ctx.contract.providerSettlementPageDelta({
+    grossAu: '10', priorGrossAu: '10', rail: 'fiat', feeBps: 1_500,
+  }), { fee_au: '2', burn_au: '0', provider_au: '8' });
+  assert.deepEqual(ctx.contract.providerSettlementPageDelta({
+    grossAu: '10', priorGrossAu: '0', rail: 'tap', feeBps: 1_500,
+  }), { fee_au: '1', burn_au: '1', provider_au: '8' });
+  assert.deepEqual(ctx.contract.providerSettlementPageDelta({
+    grossAu: '10', priorGrossAu: '10', rail: 'tap', feeBps: 1_500,
+  }), { fee_au: '2', burn_au: '1', provider_au: '7' });
+});
 
 function reservationValue(ctx, {
   sessionId = '71'.repeat(32),
@@ -665,6 +689,27 @@ async function submitTargetedApply(ctx, value) {
   return { key, result: result ?? ctx.contract._mayhemLastFeatureResult };
 }
 
+async function submitCommitTargetedPageZero(ctx, value) {
+  const previousStorage = ctx.contract.storage;
+  ctx.contract.storage = ctx.storage;
+  let key;
+  try {
+    key = await ctx.contract.commitTargetedEpochPageZeroFeatureKey(value);
+  } finally {
+    ctx.contract.storage = previousStorage;
+  }
+  assert.equal(key instanceof Error, false, key.message);
+  const result = await executeFeature(
+    ctx.contract,
+    ctx.storage,
+    'mayhem_feature',
+    key,
+    value,
+    ctx.admin.publicKey
+  );
+  return { key, result: result ?? ctx.contract._mayhemLastFeatureResult };
+}
+
 test('only the provider can immediately close an outstanding reservation', async () => {
   const ctx = await setupContract();
   const reservation = await submitReservation(ctx);
@@ -1014,6 +1059,25 @@ test('receipt-bound targeted apply consumes a final head once and rejects later 
     heads: [head],
     commitHash: commit.commit_hash,
   });
+  const balanceKey = `bal/${ctx.user.publicKey}/tnk`;
+  const balanceBeforeConflict = (await ctx.storage.get(balanceKey)).value;
+  await ctx.storage.put('epoch/apply-anchor/1', {
+    type: 'epoch_apply_anchor',
+    epoch: 1,
+    apply_hash: 'f1'.repeat(32),
+    settlement_unix: 3_600,
+    applied_at: makeTxKey(998),
+  });
+  const rejected = await submitTargetedApply(ctx, applyValue);
+  assert.match(rejected.result.message, /epoch apply anchor conflict/i);
+  assert.deepEqual((await ctx.storage.get(balanceKey)).value, balanceBeforeConflict);
+  assert.equal(await ctx.storage.get(`receipt/consumed/${head.billing_id}/0`), null);
+  assert.equal(
+    await ctx.storage.get(`payout/allocation/1/${head.session_id}`),
+    null
+  );
+  await ctx.storage.del('epoch/apply-anchor/1');
+
   const applied = await submitTargetedApply(ctx, applyValue);
   assert.equal(applied.result.ok, true, applied.result.message);
   assert.equal(applied.result.idempotent, false);
@@ -1037,6 +1101,51 @@ test('receipt-bound targeted apply consumes a final head once and rejects later 
     (await submitReceipt(ctx, higher)).result.message,
     /consumed canonical receipt head cannot advance/i
   );
+});
+
+test('pre-existing targeted artifacts reject before financial settlement writes', async () => {
+  const ctx = await setupContract();
+  const reservation = await submitReservation(ctx);
+  const receipt = receiptValue(ctx, reservation, { final: true });
+  assert.equal((await submitReceipt(ctx, receipt)).result.ok, true);
+  const head = (
+    await ctx.storage.get(`receipt/head/${receipt.receipt.body.billing_id}/0`)
+  ).value;
+  const commit = await commitEpoch(ctx, { count: 1, useAu: '100' });
+  const applyValue = await targetedApplyValue(ctx, {
+    heads: [head],
+    commitHash: commit.commit_hash,
+  });
+  const previousStorage = ctx.contract.storage;
+  ctx.contract.storage = ctx.storage;
+  let featureKey;
+  try {
+    featureKey = await ctx.contract.targetedEpochFeatureKey(applyValue);
+  } finally {
+    ctx.contract.storage = previousStorage;
+  }
+  assert.equal(featureKey instanceof Error, false, featureKey.message);
+  const allocation = allocationFor(ctx, head);
+  await ctx.storage.put(`payout/allocation/1/${head.session_id}`, {
+    type: 'provider_payout_session_allocation',
+    epoch: 1,
+    page: 0,
+    ...allocation,
+    feature_key: featureKey,
+  });
+
+  const balanceKey = `bal/${ctx.user.publicKey}/tnk`;
+  const balanceBefore = (await ctx.storage.get(balanceKey)).value;
+  const earningBefore = await ctx.storage.get(`earn/${ctx.provider.publicKey}/tnk`);
+  const feeBefore = await ctx.storage.get('fee/cum/tnk');
+  const applyStateBefore = await ctx.storage.get('epoch/apply/state');
+  const rejected = await submitTargetedApply(ctx, applyValue);
+  assert.match(rejected.result.message, /idempotent page replay/i);
+  assert.deepEqual((await ctx.storage.get(balanceKey)).value, balanceBefore);
+  assert.deepEqual(await ctx.storage.get(`earn/${ctx.provider.publicKey}/tnk`), earningBefore);
+  assert.deepEqual(await ctx.storage.get('fee/cum/tnk'), feeBefore);
+  assert.equal(await ctx.storage.get(`receipt/consumed/${head.billing_id}/0`), null);
+  assert.deepEqual(await ctx.storage.get('epoch/apply/state'), applyStateBefore);
 });
 
 test('workflow targeted reservations bind voucher, delivered output, and settlement', async () => {
@@ -1371,6 +1480,169 @@ test('paged targeted apply is bounded, commit-bound, complete, and idempotent', 
   const closed = (await ctx.storage.get('epoch/apply/state')).value;
   assert.equal(closed.updated_epoch, 1);
   assert.equal(closed.last_receipt_allocation_count, 2);
+});
+
+test('atomic commit plus page zero safely replaces an unapplied stale commit', async () => {
+  const ctx = await setupContract();
+  const firstReservation = await submitReservation(ctx);
+  const secondReservation = await submitReservation(ctx, {
+    sessionId: 'b1'.repeat(32),
+    billingId: 'b2'.repeat(32),
+    reservationId: 'b3'.repeat(32),
+  });
+  const firstReceipt = await submitReceipt(
+    ctx,
+    receiptValue(ctx, firstReservation, {
+      final: true,
+      usage: { input_token: 1 },
+      auOwedCum: '10',
+    })
+  );
+  const secondReceipt = await submitReceipt(ctx, receiptValue(ctx, secondReservation, {
+    final: true,
+    usage: { input_token: 1 },
+    auOwedCum: '10',
+  }));
+  assert.equal(firstReceipt.result.ok, true, firstReceipt.result.message);
+  assert.equal(secondReceipt.result.ok, true, secondReceipt.result.message);
+  const firstHead = (
+    await ctx.storage.get(`receipt/head/${firstReservation.value.voucher.billing_id}/0`)
+  ).value;
+  const secondHead = (
+    await ctx.storage.get(`receipt/head/${secondReservation.value.voucher.billing_id}/0`)
+  ).value;
+
+  const stale = await commitEpoch(ctx, { count: 1, useAu: '10' });
+  const staleRecord = (await ctx.storage.get('epoch/commit/1')).value;
+  const page0 = await targetedApplyValue(ctx, {
+    heads: [firstHead],
+    commitHash: '00'.repeat(32),
+    page: 0,
+    lastPage: false,
+  });
+  delete page0.page;
+  const earningFinals = [{
+    rail: 'tnk',
+    provider: ctx.provider.publicKey,
+    gross_au: '20',
+    net_au: '17',
+    cumulative_au: '17',
+  }];
+  const roots = {
+    dep: 'a1'.repeat(32),
+    use: 'a2'.repeat(32),
+    earn: await ctx.contract.merkleRoot('earn', [
+      await ctx.contract.opaqueHash('mayhem-earn-leaf-v1', earningFinals[0]),
+    ]),
+    fee: await ctx.contract.opaqueHash('mayhem-fee-root-v1', {
+      epoch: 1,
+      fee_au: '3',
+      fee_cum_au: '3',
+      burn_au: '0',
+      burn_cum_au: '0',
+      tap_burn_bps: 1_000,
+    }),
+    price: await ctx.contract.priceDerivationRoot([]),
+  };
+  const totals = {
+    dep_count: 0,
+    dep_au: '0',
+    use_count: 2,
+    use_au: '20',
+    provider_count: 1,
+    earn_au: '17',
+    fee_au: '3',
+    fee_cum_au: '3',
+    burn_au: '0',
+    burn_cum_au: '0',
+    price_count: 0,
+  };
+  const replacementHash = await ctx.contract.epochCommitHash({
+    epoch: 1,
+    epoch_seconds: 3_600,
+    roots,
+    totals,
+  });
+  const atomicValue = {
+    ...page0,
+    op: 'commit_apply_targeted_epoch_page0',
+    epoch_commit_hash: replacementHash,
+    roots,
+    totals,
+    supersedes_commit_hash: stale.commit_hash,
+  };
+  await ctx.storage.put('epoch/commit/1', { ...staleRecord, epoch: 2 });
+  const malformedReplacement = await submitCommitTargetedPageZero(ctx, atomicValue);
+  assert.match(
+    malformedReplacement.result.message,
+    /canonical provisional epoch commit/i
+  );
+  await ctx.storage.put('epoch/commit/1', staleRecord);
+
+  const firstPage = await submitCommitTargetedPageZero(ctx, atomicValue);
+  assert.equal(firstPage.result.ok, true, firstPage.result.message);
+  assert.equal(firstPage.result.replaced_commit, true);
+  assert.equal(firstPage.result.commit_hash, replacementHash);
+
+  const activeCommit = (await ctx.storage.get('epoch/commit/1')).value;
+  assert.equal(activeCommit.commit_hash, replacementHash);
+  assert.equal(activeCommit.apply_mode, 'targeted_receipt_pages_v1');
+  assert.equal(activeCommit.supersedes, stale.commit_hash);
+  const archived = (
+    await ctx.storage.get(`epoch/commit/superseded/1/${stale.commit_hash}`)
+  ).value;
+  assert.equal(archived.status, 'superseded');
+  assert.equal(archived.superseded_by, replacementHash);
+
+  const page0Replay = await submitCommitTargetedPageZero(ctx, atomicValue);
+  assert.equal(page0Replay.result.ok, true, page0Replay.result.message);
+  assert.equal(page0Replay.result.idempotent, true);
+
+  const page1 = await targetedApplyValue(ctx, {
+    heads: [secondHead],
+    commitHash: replacementHash,
+    page: 1,
+    lastPage: true,
+  });
+  page1.earning_finals = earningFinals;
+  page1.market_usage = [{
+    enclave_id: ENCLAVE_ID,
+    ctx_bracket: 'le8k',
+    ctx_bracket_table_ver: 1,
+    demand_au: '20',
+    session_count: 2,
+    provider_count: 1,
+  }];
+  const falseMarketPage = structuredClone(page1);
+  falseMarketPage.market_usage[0].session_count = 1;
+  const balanceBeforeFalseMarket = (
+    await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)
+  ).value;
+  const falseMarket = await submitTargetedApply(ctx, falseMarketPage);
+  assert.match(
+    falseMarket.result.message,
+    /market usage does not match canonical receipt settlement state/i
+  );
+  assert.deepEqual(
+    (await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)).value,
+    balanceBeforeFalseMarket
+  );
+  const secondPage = await submitTargetedApply(ctx, page1);
+  assert.equal(secondPage.result.ok, true, secondPage.result.message);
+  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)).value.au, '99980');
+  const liabilityKey = ctx.contract.providerPayoutLiabilityKey(
+    ctx.provider.publicKey,
+    'tnk',
+    PAYOUT_REVISION
+  );
+  assert.equal((await ctx.storage.get(liabilityKey)).value.total_au, '17');
+  assert.equal((await ctx.storage.get('ev/use/1')).value.au_total, '20');
+  assert.equal((await ctx.storage.get('ev/fee/1')).value.au_fee_epoch, '3');
+
+  const page1Replay = await submitTargetedApply(ctx, page1);
+  assert.equal(page1Replay.result.ok, true, page1Replay.result.message);
+  assert.equal(page1Replay.result.idempotent, true);
+  assert.equal((await ctx.storage.get(liabilityKey)).value.total_au, '17');
 });
 
 test('empty epoch seal treats absent metadata as empty and rejects indexed receipts', async () => {
