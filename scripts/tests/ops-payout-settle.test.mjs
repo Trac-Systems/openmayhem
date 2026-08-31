@@ -996,6 +996,8 @@ function harness({ bundle = true, emptySeal = !bundle } = {}) {
   writeExecutable(path.join(bin, 'curl'), `#!/usr/bin/env bash
 if [[ "$*" == *"prefix=payout/liability/tnk/"* && "\${MOCK_TNK_OUTSTANDING:-0}" == "1" ]]; then
   printf '%s\\n' '{"values":[{"key":"payout/liability/tnk/provider/revision","value":{"total_au":"10","paid_cum_au":"0"}}]}'
+elif [[ "$*" =~ key=(payout/epoch-plan/(fiat|tnk)/[0-9]+|settle/targeted/(fiat|tnk)/[0-9]+) ]]; then
+  printf '{"key":"%s","confirmed":true,"signed_length":123,"value":null}\\n' "\${BASH_REMATCH[1]}"
 elif [[ "$*" == *"key=settle/targeted/tap/"* ]]; then
   if [[ -f "$MOCK_TAP_SETTLEMENT_STATE" ]]; then
     cat "$MOCK_TAP_SETTLEMENT_STATE"
@@ -1084,7 +1086,10 @@ for arg in "$@"; do
 done
 if [[ "$rail" == "fiat-settlement" ]]; then
   mode="\${MOCK_FIAT_MODE:-success}"
-  if [[ "$mode" == "blocking" || "$mode" == "stale_epoch" ]]; then
+  if [[ "$mode" == "command_error" ]]; then
+    printf '%s\\n' 'simulated fiat command failure before a report was written' >&2
+    exit 1
+  elif [[ "$mode" == "blocking" || "$mode" == "stale_epoch" ]]; then
     cat "$MOCK_FIAT_FIXTURES/$mode.json"
   elif [[ "$mode" == "no_work" || "$mode" == "below_threshold" ]]; then
     if (( submit == 1 )); then
@@ -1704,12 +1709,12 @@ test('epoch advance fails closed before current planning when prior evidence con
   );
 });
 
-test('a failed rail predecessor does not block later eligible work on other rails', (t) => {
+test('an unplanned fiat predecessor is superseded without losing current liability work', (t) => {
   const ctx = harness({ bundle: false });
   t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));
 
   const first = runWorker(ctx, {
-    MOCK_FIAT_MODE: 'blocking',
+    MOCK_FIAT_MODE: 'command_error',
     MOCK_TNK_MODE: 'no_work',
   });
   assert.notEqual(first.status, 0);
@@ -1737,15 +1742,23 @@ test('a failed rail predecessor does not block later eligible work on other rail
   const next = runWorker(ctx, {
     MOCK_FIAT_MODE: 'blocking',
     MAYHEM_TNK_SETTLEMENT_ENABLED: '0',
-    MOCK_EMPTY_SEAL_8: '1',
+    MAYHEM_TAP_SETTLEMENT_ENABLED: '0',
   });
   assert.notEqual(next.status, 0);
-  assert.match(next.stderr, /prior payout work remains failed for fiat/);
   const currentWork = path.join(ctx.state, `payout/epoch-8-${NEXT_APPLY_HASH}`);
+  assert.equal(fs.existsSync(path.join(priorWork, 'fiat.complete')), true, next.stderr);
+  const priorFiatMarker = JSON.parse(
+    fs.readFileSync(path.join(priorWork, 'fiat.complete'), 'utf8')
+  );
+  assert.equal(priorFiatMarker.status, 'superseded');
+  assert.equal(
+    JSON.parse(fs.readFileSync(priorFiatMarker.evidence, 'utf8')).reason,
+    'no canonical payout plan or close exists; cumulative liability remains eligible in the latest epoch'
+  );
   assert.equal(fs.existsSync(path.join(currentWork, 'fiat.complete')), false);
   assert.equal(
     JSON.parse(fs.readFileSync(path.join(currentWork, 'tap.complete'), 'utf8')).status,
-    'no_work'
+    'disabled'
   );
   assert.equal(
     logLines(ctx).filter((line) => line.startsWith('admin fiat-settlement')).length,

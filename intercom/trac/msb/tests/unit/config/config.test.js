@@ -21,6 +21,7 @@ test('Config: valid overrideable startup fields remain usable after validation',
         bootstrap: 'ab'.repeat(32),
         channel: 'custom-channel',
         storesDirectory: 'custom-stores/',
+        storeName: 'treasury',
         host: '0.0.0.0',
         port: 5050,
         dhtBootstrap: ['node1.example.test:1234', 'node2.example.test:5678']
@@ -31,6 +32,8 @@ test('Config: valid overrideable startup fields remain usable after validation',
     t.ok(b4a.isBuffer(config.channel));
     t.is(config.channel.length, 32);
     t.is(config.storesDirectory, 'custom-stores');
+    t.is(config.storeName, 'treasury');
+    t.is(config.storesFullPath, 'custom-stores/treasury');
     t.is(config.host, '0.0.0.0');
     t.is(config.port, 5050);
     t.alike(config.dhtBootstrap, ['node1.example.test:1234', 'node2.example.test:5678']);
@@ -95,6 +98,16 @@ test('Config: invalid storesDirectory, host, and port overrides fail early', t =
     t.exception(
         () => createConfig(ENV.MAINNET, { storesDirectory: 123 }),
         /MainSettlementBus Config: storesDirectory must be a non-empty string\./
+    );
+
+    t.exception(
+        () => createConfig(ENV.MAINNET, { storeName: '' }),
+        /MainSettlementBus Config: storeName must be a non-empty string\./
+    );
+
+    t.exception(
+        () => createConfig(ENV.MAINNET, { storeName: 123 }),
+        /MainSettlementBus Config: storeName must be a non-empty string\./
     );
 
     t.exception(

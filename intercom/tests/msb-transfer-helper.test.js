@@ -58,6 +58,7 @@ test('app-owned network adapter supplies testnet without modifying pinned config
   });
   assert.equal(msb.networkId, 919);
   assert.equal(msb.addressPrefix, 'testtrac');
+  assert.equal(msb.storeName, 'test-msb');
   assert.equal(
     msb.bootstrap.toString('hex'),
     'c184f4ad8e9cf5e911f9415b60e7dcfb30aed73ebd8a402ef68e1b154624f5ef'

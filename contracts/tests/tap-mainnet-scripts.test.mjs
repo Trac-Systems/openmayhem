@@ -63,6 +63,9 @@ test('mainnet settlement service resumes delayed governed roots using current re
   assert.match(source, /root_pending/);
   assert.match(source, /awaiting_governance_delay/);
   assert.match(source, /execution_tx/);
+  assert.match(source, /report\["status"\] = "no_work"/);
+  assert.match(source, /report\["outcome"\] = "carry"/);
+  assert.match(source, /TAP carry report lacks confirmed payout policy evidence/);
 });
 
 test('mainnet deploy and Etherscan verify scripts dry-run and deploy against a locked RPC node', async (t) => {

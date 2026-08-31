@@ -30,6 +30,7 @@ import {
   resolveTargetedTapPayoutsFromLedger,
   resolveTapSettlementRate,
   resolveTapSettlementEpochPolicy,
+  resolveTapSettlementPayoutMinimum,
   rollTapSettlement,
   verifyReceiptEnvelope,
 } from '../scripts/tap-settlement-roller.mjs';
@@ -188,6 +189,71 @@ test('TAP roller reconstructs Rust receipt wire order from sorted retained value
 
   assert.equal(receiptMessage(body), message.toString());
   assert.doesNotThrow(() => verifyReceiptEnvelope(signed.receipt));
+});
+
+test('TAP roller accepts current schema 11 while rejecting unknown receipt schemas', () => {
+  const current = receipt({
+    session: 'tap-current-schema',
+    au: '123',
+    epoch: 17,
+    extraBody: { schema_version: 11 },
+  });
+  assert.doesNotThrow(() => verifyReceiptEnvelope(current.receipt));
+
+  for (const schemaVersion of [9, 12]) {
+    const unsupported = structuredClone(current.receipt);
+    unsupported.body.schema_version = schemaVersion;
+    assert.throws(
+      () => verifyReceiptEnvelope(unsupported),
+      /receipt schema_version must be one of 10, 11/
+    );
+  }
+});
+
+test('TAP roller locks payout minimum from confirmed historical parameter evidence', async () => {
+  const calls = [];
+  const fetchImpl = async (url) => {
+    calls.push(String(url));
+    return {
+      ok: true,
+      async json() {
+        return {
+          key: 'params/payout_min_au',
+          confirmed: true,
+          signed_length: 321,
+          value: {
+            key: 'payout_min_au',
+            current: { value: '100', ver: 1, effective_at: 10 },
+            pending: { value: '250', ver: 2, effective_at: 20 },
+          },
+        };
+      },
+    };
+  };
+
+  const before = await resolveTapSettlementPayoutMinimum({
+    peerRpcUrl: 'http://127.0.0.1:49223/v1',
+    at: 19,
+    fetchImpl,
+  });
+  const after = await resolveTapSettlementPayoutMinimum({
+    peerRpcUrl: 'http://127.0.0.1:49223/v1',
+    at: 20,
+    fetchImpl,
+  });
+
+  assert.equal(before.value, '100');
+  assert.deepEqual(after.evidence, {
+    type: 'tap_payout_minimum_lock',
+    key: 'params/payout_min_au',
+    at: 20,
+    signed_length: 321,
+    value: '250',
+    version: 2,
+    effective_at: 20,
+  });
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every((url) => url.includes('confirmed=true')));
 });
 
 function targetedBindingsFor(bundle, providerAccounts, revisions = {}) {

@@ -22,7 +22,8 @@ export const BPS = 10_000n;
 export const PROVIDER_BPS = 7_500n;
 export const OPERATOR_BPS = 1_500n;
 const PROVIDER_CAP_TOLERANCE_WEI = 0n;
-const SESSION_RECEIPT_SCHEMA_VERSION = 10;
+const SESSION_RECEIPT_SCHEMA_VERSION = 11;
+const SETTLEMENT_RECEIPT_SCHEMA_VERSIONS = new Set([10, SESSION_RECEIPT_SCHEMA_VERSION]);
 const SIGNING_MESSAGE_VERSION = 2;
 const DEFAULT_TAP_CHALLENGE_EPOCHS = 6;
 const CONTRACT_VERSION = 19;
@@ -350,8 +351,10 @@ function verifyEd25519Hex(signatureHex, message, publicKeyHex, label) {
 export function verifyReceiptEnvelope(envelope) {
   if (!isObject(envelope?.body)) throw new Error('receipt body must be an object');
   const body = envelope.body;
-  if (body.schema_version !== SESSION_RECEIPT_SCHEMA_VERSION) {
-    throw new Error(`receipt schema_version must be ${SESSION_RECEIPT_SCHEMA_VERSION}`);
+  if (!SETTLEMENT_RECEIPT_SCHEMA_VERSIONS.has(body.schema_version)) {
+    throw new Error(
+      `receipt schema_version must be one of ${Array.from(SETTLEMENT_RECEIPT_SCHEMA_VERSIONS).join(', ')}`
+    );
   }
   if (body.rail !== 'tap') throw new Error('TAP settlement receipt rail must be tap');
   for (const field of ['session_id', 'model_id', 'prompt_hash']) {
@@ -708,13 +711,14 @@ function tapLedgerFeeBps(inputBundle, explicitFeeBps) {
   return feeBps;
 }
 
-function tapPayoutMinAu(inputBundle) {
+function tapPayoutMinAu(inputBundle, explicitPayoutMinAu) {
   if (hasOwn(inputBundle ?? {}, 'payout_min_au')) {
     throw new Error(
       'top-level payout_min_au is not accepted; use params.payout_min_au from the frozen admin-ledger bundle'
     );
   }
   const sources = [
+    explicitPayoutMinAu,
     inputBundle?.params?.payout_min_au,
     inputBundle?.audited_epoch?.params?.payout_min_au,
     inputBundle?.recomputed?.params?.payout_min_au,
@@ -1017,6 +1021,7 @@ export function buildTapSettlement({
   holdbackEpochs = 0,
   targetedSessionBindings,
   canonicalLiabilities,
+  payoutMinAu,
 } = {}) {
   const inputBundle = receipts ? { receipts } : bundle;
   const input = receipts ?? normalizedReceipts(bundle);
@@ -1026,7 +1031,7 @@ export function buildTapSettlement({
   }
   const rate = safeAu(tapUsdAu, 'tap_usd_au').toString();
   const feeBps = tapLedgerFeeBps(inputBundle, ledgerFeeBps);
-  const payoutMinimumAu = tapPayoutMinAu(inputBundle);
+  const payoutMinimumAu = tapPayoutMinAu(inputBundle, payoutMinAu);
   const policy = releasePolicy({
     settleThroughEpoch: tapSettlementThroughEpoch(inputBundle, settleThroughEpoch),
     challengeEpochs: tapSettlementChallengeEpochs(inputBundle, challengeEpochs),
@@ -1844,6 +1849,7 @@ export async function rollTapSettlement({
   receipts,
   targetedSessionBindings,
   canonicalLiabilities,
+  payoutMinAu,
   buyerAccounts,
   tapUsdAu,
   ledgerFeeBps,
@@ -1862,7 +1868,7 @@ export async function rollTapSettlement({
   post = true,
 } = {}) {
   const inputBundle = receipts ? { receipts } : bundle;
-  tapPayoutMinAu(inputBundle);
+  tapPayoutMinAu(inputBundle, payoutMinAu);
   tapLedgerFeeBps(inputBundle, ledgerFeeBps);
   if (!isObject(targetedSessionBindings)) {
     throw new Error('confirmed targeted TAP session bindings are required');
@@ -1894,6 +1900,7 @@ export async function rollTapSettlement({
       holdbackEpochs,
       targetedSessionBindings,
       canonicalLiabilities,
+      payoutMinAu,
     });
   if (!settlement.root) return settlement;
 
@@ -2460,6 +2467,60 @@ async function readContractStateValue(rpcUrl, key, {
   return body?.value ?? null;
 }
 
+export async function resolveTapSettlementPayoutMinimum({
+  peerRpcUrl,
+  at,
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  const effectiveAt = parseNonNegativeInt(at, 'TAP payout minimum evidence timestamp');
+  const url = new URL('state', ensureRpcBase(peerRpcUrl));
+  url.searchParams.set('key', 'params/payout_min_au');
+  url.searchParams.set('confirmed', 'true');
+  const record = await fetchJson(url, fetchImpl);
+  const schedule = record?.value;
+  if (record?.confirmed !== true ||
+      record?.key !== 'params/payout_min_au' ||
+      !Number.isSafeInteger(record?.signed_length) ||
+      record.signed_length < 1 ||
+      !isObject(schedule) ||
+      schedule.key !== 'payout_min_au' ||
+      !isObject(schedule.current) ||
+      (schedule.pending !== null && schedule.pending !== undefined &&
+        !isObject(schedule.pending))) {
+    throw new Error('confirmed TAP payout_min_au parameter evidence is malformed');
+  }
+  let selected = schedule.current;
+  if (isObject(schedule.pending)) {
+    const pendingEffectiveAt = parseNonNegativeInt(
+      schedule.pending.effective_at,
+      'pending TAP payout_min_au effective_at'
+    );
+    if (pendingEffectiveAt <= effectiveAt) selected = schedule.pending;
+  }
+  const selectedEffectiveAt = parseNonNegativeInt(
+    selected.effective_at,
+    'active TAP payout_min_au effective_at'
+  );
+  if (selectedEffectiveAt > effectiveAt) {
+    throw new Error('TAP payout_min_au schedule has no value active at the settlement timestamp');
+  }
+  const value = safeAu(selected.value, 'active TAP payout_min_au', {
+    allowZero: true,
+  }).toString();
+  return {
+    value,
+    evidence: {
+      type: 'tap_payout_minimum_lock',
+      key: 'params/payout_min_au',
+      at: effectiveAt,
+      signed_length: record.signed_length,
+      value,
+      version: parseNonNegativeInt(selected.ver, 'active TAP payout_min_au version'),
+      effective_at: selectedEffectiveAt,
+    },
+  };
+}
+
 export async function resolveTargetedTapPayoutsFromLedger({
   bundle,
   peerRpcUrl,
@@ -2633,7 +2694,10 @@ export async function resolveTargetedTapPayoutsFromLedger({
 }
 
 async function resolveActiveEpochParam({ peerRpcUrl, key, fallback, fetchImpl } = {}) {
-  const record = await readContractStateValue(peerRpcUrl, `params/${key}`, { fetchImpl });
+  const record = await readContractStateValue(peerRpcUrl, `params/${key}`, {
+    confirmed: true,
+    fetchImpl,
+  });
   const now = Math.floor(Date.now() / 1_000);
   const active = record?.pending && Number(record.pending.effective_at) <= now
     ? record.pending
@@ -2645,7 +2709,10 @@ export async function resolveTapSettlementEpochPolicy({
   peerRpcUrl,
   fetchImpl,
 } = {}) {
-  const applyState = await readContractStateValue(peerRpcUrl, 'epoch/apply/state', { fetchImpl });
+  const applyState = await readContractStateValue(peerRpcUrl, 'epoch/apply/state', {
+    confirmed: true,
+    fetchImpl,
+  });
   const resolvedThrough = parseOptionalNonNegativeInt(
     applyState?.updated_epoch,
     'settle through epoch'
@@ -3426,6 +3493,10 @@ async function main() {
     throw new Error('Configured TAP pool does not match the canonical payment pool');
   }
   const tapUsdAu = tapRateLock.tap_usd_au;
+  const payoutMinimum = await resolveTapSettlementPayoutMinimum({
+    peerRpcUrl,
+    at: tapPreparationAt(bundle, tapRateLock),
+  });
   const ledgerFeeBps = args['ledger-fee-bps'];
   for (const binding of Object.values(targetedPayouts.sessionBindings)) {
     if (binding.chain_id !== tapRateLock.chain_id) {
@@ -3471,6 +3542,7 @@ async function main() {
     bundle,
     targetedSessionBindings: targetedPayouts.sessionBindings,
     canonicalLiabilities: targetedPayouts.liabilities,
+    payoutMinAu: payoutMinimum.value,
     buyerAccounts,
     prior,
     tapUsdAu,
@@ -3497,6 +3569,7 @@ async function main() {
   if (signerEnvName) report.signer_env = signerEnvName;
   if (governanceSignerEnvName) report.governance_signer_env = governanceSignerEnvName;
   report.tap_rate_lock = tapRateLock;
+  report.payout_minimum_lock = payoutMinimum.evidence;
   report.copy_paste_replay_command = buildReplayCommand({
     bundlePath,
     peerRpcUrl,

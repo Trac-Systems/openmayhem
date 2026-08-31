@@ -35101,6 +35101,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
                 signer,
                 &settlement,
                 &output_record_key,
+                None,
                 |record| {
                     record.get("type").and_then(Value::as_str)
                         == Some("targeted_tnk_output_settlement")
@@ -36515,22 +36516,47 @@ fn targeted_payout_control_feature_key(value: &Value) -> Result<String> {
     Ok(format!("{key}/{digest}"))
 }
 
+fn reconcile_existing_targeted_payout_control<F>(
+    existing: Option<Value>,
+    record_key: &str,
+    expected_existing: Option<&Value>,
+    predicate: &F,
+) -> Result<Option<Value>>
+where
+    F: Fn(&Value) -> bool,
+{
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    if predicate(&existing) {
+        return Ok(Some(existing));
+    }
+    ensure!(
+        expected_existing.is_some_and(|expected| &existing == expected),
+        "canonical targeted payout state {record_key} conflicts with the requested operation"
+    );
+    Ok(None)
+}
+
 async fn submit_targeted_payout_control<F>(
     rpc: &PeerRpcClient,
     signer: &TargetedPayoutPreparationSigner,
     value: &Value,
     record_key: &str,
+    expected_existing: Option<&Value>,
     predicate: F,
 ) -> Result<Value>
 where
     F: Fn(&Value) -> bool,
 {
     let value = sign_targeted_payout_control(signer, value).await?;
-    if let Some(existing) = read_confirmed_state_value(rpc, record_key).await? {
-        ensure!(
-            predicate(&existing),
-            "canonical targeted payout state {record_key} conflicts with the requested operation"
-        );
+    let existing = read_confirmed_state_value(rpc, record_key).await?;
+    if let Some(existing) = reconcile_existing_targeted_payout_control(
+        existing,
+        record_key,
+        expected_existing,
+        &predicate,
+    )? {
         return Ok(existing);
     }
     let feature = json!({
@@ -36684,7 +36710,7 @@ async fn ensure_targeted_payout_epoch_plan(
     let record = if let Some(existing) = read_confirmed_state_value(rpc, &record_key).await? {
         existing
     } else {
-        submit_targeted_payout_control(rpc, signer, candidate, &record_key, |record| {
+        submit_targeted_payout_control(rpc, signer, candidate, &record_key, None, |record| {
             record.get("value") == Some(&signed)
         })
         .await?
@@ -36736,6 +36762,7 @@ async fn close_targeted_payout_epoch(
         signer,
         &value,
         &format!("settle/targeted/{rail}/{epoch}"),
+        None,
         |record| {
             record.get("type").and_then(Value::as_str) == Some("targeted_payout_epoch_close")
                 && record.get("plan_root").and_then(Value::as_str) == Some(plan_root.as_str())
@@ -54602,7 +54629,7 @@ async fn prepare_targeted_fiat_attempt(
         "admin_sig": "",
     }));
     let record_key = format!("payout/attempt/fiat/{economic_op_id}/{attempt_id}");
-    submit_targeted_payout_control(rpc, signer, &value, &record_key, |record| {
+    submit_targeted_payout_control(rpc, signer, &value, &record_key, None, |record| {
         record.get("type").and_then(Value::as_str) == Some("targeted_fiat_attempt")
             && record.get("economic_op_id").and_then(Value::as_str) == Some(economic_op_id)
             && record.get("attempt_id").and_then(Value::as_str) == Some(attempt_id.as_str())
@@ -54645,11 +54672,18 @@ async fn finalize_targeted_fiat_attempt(
         "admin_sig": "",
     }));
     let record_key = format!("payout/attempt/fiat/{economic_op_id}/{attempt_id}");
-    submit_targeted_payout_control(rpc, signer, &value, &record_key, |record| {
-        record.get("status").and_then(Value::as_str) == Some(status)
-            && record.get("economic_op_id").and_then(Value::as_str) == Some(economic_op_id)
-            && record.get("attempt_id").and_then(Value::as_str) == Some(attempt_id)
-    })
+    submit_targeted_payout_control(
+        rpc,
+        signer,
+        &value,
+        &record_key,
+        Some(preparation),
+        |record| {
+            record.get("status").and_then(Value::as_str) == Some(status)
+                && record.get("economic_op_id").and_then(Value::as_str) == Some(economic_op_id)
+                && record.get("attempt_id").and_then(Value::as_str) == Some(attempt_id)
+        },
+    )
     .await
 }
 
@@ -54691,7 +54725,7 @@ async fn settle_targeted_fiat_output(
         "admin_sig": "",
     }));
     let record_key = format!("settle/targeted/fiat/{epoch}/output/{economic_op_id}");
-    submit_targeted_payout_control(rpc, signer, &value, &record_key, |record| {
+    submit_targeted_payout_control(rpc, signer, &value, &record_key, None, |record| {
         record.get("type").and_then(Value::as_str) == Some("targeted_fiat_output_settlement")
             && record.get("economic_op_id").and_then(Value::as_str) == Some(economic_op_id)
             && record.pointer("/value/attempt_id").and_then(Value::as_str) == Some(attempt_id)
@@ -91365,6 +91399,40 @@ mod tests {
             );
         }
         available
+    }
+
+    #[test]
+    fn targeted_payout_control_allows_only_an_exact_predecessor_transition() {
+        let prepared = json!({"attempt_id": "aa", "status": "prepared"});
+        let succeeded = json!({"attempt_id": "aa", "status": "succeeded"});
+        let is_succeeded =
+            |record: &Value| record.get("status").and_then(Value::as_str) == Some("succeeded");
+
+        assert_eq!(
+            reconcile_existing_targeted_payout_control(
+                Some(succeeded.clone()),
+                "payout/attempt/fiat/test",
+                None,
+                &is_succeeded,
+            )
+            .unwrap(),
+            Some(succeeded)
+        );
+        assert!(reconcile_existing_targeted_payout_control(
+            Some(prepared.clone()),
+            "payout/attempt/fiat/test",
+            Some(&prepared),
+            &is_succeeded,
+        )
+        .unwrap()
+        .is_none());
+        assert!(reconcile_existing_targeted_payout_control(
+            Some(json!({"attempt_id": "bb", "status": "prepared"})),
+            "payout/attempt/fiat/test",
+            Some(&prepared),
+            &is_succeeded,
+        )
+        .is_err());
     }
 
     #[test]

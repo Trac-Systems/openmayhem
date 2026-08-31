@@ -178,6 +178,8 @@ export class Config {
     }
 
     get storeName() {
+        // OpenMayhem patch: settlement helpers must isolate treasury stores from the live writer.
+        if (this.#isOverriden('storeName')) return this.#options.storeName
         return this.#config.storeName
     }
 
@@ -361,6 +363,10 @@ export class Config {
 
         if (isDefined(options.storesDirectory)) {
             this.#validateStringOverride('storesDirectory', options.storesDirectory);
+        }
+
+        if (isDefined(options.storeName)) {
+            this.#validateStringOverride('storeName', options.storeName);
         }
 
         if (isDefined(options.host)) {

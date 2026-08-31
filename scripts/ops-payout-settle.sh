@@ -655,7 +655,9 @@ if (
     or d.get("epoch") != int(expected_epoch)
     or d.get("epoch_apply_hash") != expected_hash
     or d.get("canonical_settlement_unix") != int(expected_settlement_unix)
-    or d.get("status") not in {"settled", "already_settled", "carry", "no_work", "disabled"}
+    or d.get("status") not in {
+        "settled", "already_settled", "carry", "no_work", "disabled", "superseded"
+    }
 ):
     raise SystemExit(f"{expected_rail} completion marker is stale or malformed")
 if d["status"] == "disabled":
@@ -2714,11 +2716,156 @@ PY
   return 2
 }
 
+supersede_unplanned_prior_rail_work() {
+  local rail="$1" prior_dir="$2" prior_epoch="$3"
+  local prior_name prior_hash canonical_prior_hash plan_key close_key
+  local plan_tmp close_tmp evidence marker result=0
+
+  prior_name="${prior_dir##*/}"
+  prior_hash="${prior_name##epoch-${prior_epoch}-}"
+  [[ "$prior_name" == "epoch-$prior_epoch-$prior_hash" && "$prior_hash" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "abort: retained $rail payout directory name is malformed: $prior_dir" >&2
+    return 1
+  }
+  canonical_prior_hash="$(confirmed_apply_anchor_hash "$prior_epoch")" || return 1
+  if [[ "$canonical_prior_hash" != "$prior_hash" ]]; then
+    echo "abort: retained payout work for epoch $prior_epoch is superseded by canonical apply hash $canonical_prior_hash; audit and quarantine it before continuing" >&2
+    return 1
+  fi
+
+  plan_key="payout/epoch-plan/$rail/$prior_epoch"
+  close_key="settle/targeted/$rail/$prior_epoch"
+  plan_tmp="$prior_dir/$rail-superseded-plan.json.tmp"
+  close_tmp="$prior_dir/$rail-superseded-close.json.tmp"
+  evidence="$prior_dir/$rail-superseded.json"
+  marker="$prior_dir/$rail.complete"
+  curl -sf -m 10 "$RPC_URL/state?key=$plan_key&confirmed=true" >"$plan_tmp" || {
+    echo "abort: could not read confirmed $rail plan state for prior epoch $prior_epoch" >&2
+    return 1
+  }
+  curl -sf -m 10 "$RPC_URL/state?key=$close_key&confirmed=true" >"$close_tmp" || {
+    echo "abort: could not read confirmed $rail close state for prior epoch $prior_epoch" >&2
+    return 1
+  }
+
+  python3 - "$plan_tmp" "$close_tmp" "$prior_dir/apply-state.json" \
+    "$evidence.tmp" "$marker.tmp" "$rail" "$prior_epoch" "$prior_hash" \
+    "$canonical_applied_epoch" "$canonical_apply_hash" "$plan_key" "$close_key" \
+    "$evidence" "$prior_dir/$rail-settlement.json" "$marker" <<'PY' || result=$?
+import hashlib, json, os, sys
+
+(
+    plan_path,
+    close_path,
+    apply_path,
+    evidence_tmp,
+    marker_tmp,
+    rail,
+    prior_epoch,
+    prior_hash,
+    latest_epoch,
+    latest_hash,
+    plan_key,
+    close_key,
+    evidence_path,
+    final_report,
+    marker_path,
+) = sys.argv[1:]
+prior_epoch = int(prior_epoch)
+latest_epoch = int(latest_epoch)
+
+def confirmed_record(path, expected_key):
+    record = json.load(open(path))
+    if (
+        not isinstance(record, dict)
+        or record.get("key") != expected_key
+        or record.get("confirmed") is not True
+        or not isinstance(record.get("signed_length"), int)
+        or isinstance(record.get("signed_length"), bool)
+        or record["signed_length"] < 0
+    ):
+        raise SystemExit(f"{expected_key} is not confirmed canonical state")
+    return record
+
+plan = confirmed_record(plan_path, plan_key)
+close = confirmed_record(close_path, close_key)
+if plan.get("value") is not None or close.get("value") is not None:
+    raise SystemExit(3)
+if os.path.exists(final_report):
+    raise SystemExit(f"{rail} prior work has final local evidence but no canonical plan or close")
+if os.path.exists(marker_path):
+    raise SystemExit(f"{rail} prior work unexpectedly acquired a completion marker")
+
+apply_record = json.load(open(apply_path))
+apply_value = apply_record.get("value") if isinstance(apply_record, dict) else None
+if (
+    apply_record.get("confirmed") is not True
+    or not isinstance(apply_value, dict)
+    or apply_value.get("updated_epoch") != prior_epoch
+    or str(apply_value.get("last_apply_hash", "")).lower() != prior_hash
+    or not isinstance(apply_value.get("last_settlement_unix"), int)
+    or isinstance(apply_value.get("last_settlement_unix"), bool)
+    or apply_value["last_settlement_unix"] < 1
+):
+    raise SystemExit(f"{rail} prior work apply evidence is stale or malformed")
+
+evidence = {
+    "schema_version": 1,
+    "kind": "superseded_unplanned_targeted_payout",
+    "rail": rail,
+    "epoch": prior_epoch,
+    "epoch_apply_hash": prior_hash,
+    "superseded_by_epoch": latest_epoch,
+    "superseded_by_apply_hash": latest_hash,
+    "reason": "no canonical payout plan or close exists; cumulative liability remains eligible in the latest epoch",
+    "canonical_plan_record": plan,
+    "canonical_close_record": close,
+}
+with open(evidence_tmp, "w") as out:
+    json.dump(evidence, out, indent=2)
+    out.write("\n")
+    out.flush()
+    os.fsync(out.fileno())
+os.replace(evidence_tmp, evidence_path)
+
+marker = {
+    "schema_version": 1,
+    "rail": rail,
+    "status": "superseded",
+    "epoch": prior_epoch,
+    "epoch_apply_hash": prior_hash,
+    "canonical_settlement_unix": apply_value["last_settlement_unix"],
+    "evidence": evidence_path,
+    "evidence_sha256": hashlib.sha256(open(evidence_path, "rb").read()).hexdigest(),
+}
+with open(marker_tmp, "w") as out:
+    json.dump(marker, out, indent=2)
+    out.write("\n")
+    out.flush()
+    os.fsync(out.fileno())
+os.replace(marker_tmp, marker_path)
+PY
+
+  case "$result" in
+    0)
+      echo "recovery: superseded unplanned $rail work for epoch $prior_epoch; cumulative liability remains in the latest epoch"
+      return 0
+      ;;
+    3)
+      return 3
+      ;;
+    *)
+      echo "abort: could not safely classify prior $rail payout work at $prior_dir" >&2
+      return 1
+      ;;
+  esac
+}
+
 resume_prior_rail_work() {
   local rail="$1"
   [[ "${MAYHEM_PAYOUT_RESUME_PRIOR:-0}" != "1" ]] || return 0
 
-  local prior_dir prior_epoch resume_result
+  local prior_dir prior_epoch resume_result supersede_result
   local resume_list="$work_dir/$rail-prior-payout-work.list"
   if ! python3 - "$STATE_DIR/payout" "$work_dir" "$canonical_applied_epoch" "$rail" \
     >"$resume_list.tmp" <<'PY'
@@ -2758,6 +2905,15 @@ PY
   while IFS= read -r -d '' prior_dir; do
     prior_epoch="${prior_dir##*/epoch-}"
     prior_epoch="${prior_epoch%%-*}"
+    if [[ "$rail" != "tap" ]] && (( prior_epoch < canonical_applied_epoch )); then
+      supersede_result=0
+      supersede_unplanned_prior_rail_work "$rail" "$prior_dir" "$prior_epoch" || supersede_result=$?
+      if (( supersede_result == 0 )); then
+        continue
+      elif (( supersede_result != 3 )); then
+        return 1
+      fi
+    fi
     echo "recovery: resuming unresolved $rail payout work for epoch $prior_epoch before new $rail liabilities"
     resume_result=0
     MAYHEM_PAYOUT_RESUME_PRIOR=1 \

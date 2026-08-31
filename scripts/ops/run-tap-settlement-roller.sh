@@ -124,6 +124,110 @@ while true; do
     sleep "$interval"
     continue
   fi
+  if jq -e '
+    .posted == false and
+    .blocked != true and
+    .root == null and
+    .entries == [] and
+    .providers == [] and
+    .refunds == [] and
+    .cumulative_spent_wei == "0" and
+    .spent_au == "0" and
+    (.checkpoint_outputs == []) and
+    (.reason == "provider earnings await challenge or holdback maturity" or
+      .reason == "provider earnings are below payout minimum")
+  ' "$dry_report" >/dev/null; then
+    if ! python3 - "$bundle" "$dry_report" "$bound_report" <<'PY'
+import hashlib, json, re, sys
+bundle_path, report_path, target = sys.argv[1:]
+bundle_raw = open(bundle_path, "rb").read()
+bundle = json.loads(bundle_raw)
+report = json.load(open(report_path))
+epoch = bundle.get("epoch")
+apply_hash = bundle.get("epoch_apply_hash")
+receipts = bundle.get("receipts")
+
+def uint(value, label):
+    if not isinstance(value, str) or not re.fullmatch(r"(0|[1-9][0-9]*)", value):
+        raise SystemExit(f"{label} is not a canonical unsigned integer")
+    return int(value)
+
+if (
+    bundle.get("rail") != "tap"
+    or not isinstance(epoch, int)
+    or epoch < 1
+    or not isinstance(apply_hash, str)
+    or not re.fullmatch(r"[0-9a-f]{64}", apply_hash)
+    or not isinstance(receipts, list)
+    or not receipts
+):
+    raise SystemExit("TAP carry bundle is missing exact rail/epoch/apply binding")
+held_count = report.get("held_receipt_count")
+threshold_count = report.get("threshold_held_provider_count")
+if (
+    report.get("posted") is not False
+    or report.get("blocked") is True
+    or report.get("root") is not None
+    or report.get("entries") != []
+    or report.get("providers") != []
+    or report.get("refunds") != []
+    or report.get("checkpoint_outputs") != []
+    or report.get("cumulative_spent_wei") != "0"
+    or report.get("spent_au") != "0"
+    or report.get("receipt_count") != len(receipts)
+    or not isinstance(held_count, int)
+    or isinstance(held_count, bool)
+    or held_count < 0
+    or not isinstance(threshold_count, int)
+    or isinstance(threshold_count, bool)
+    or threshold_count < 0
+    or held_count + threshold_count < 1
+):
+    raise SystemExit("TAP carry report has payable or unclassified work")
+held_au = uint(report.get("held_au"), "TAP held_au")
+threshold_au = uint(report.get("threshold_held_au"), "TAP threshold_held_au")
+payout_min_au = uint(report.get("payout_min_au"), "TAP payout_min_au")
+if held_au < threshold_au or (held_count == 0 and held_au != threshold_au):
+    raise SystemExit("TAP carry report held totals are inconsistent")
+rate_lock = report.get("tap_rate_lock")
+minimum_lock = report.get("payout_minimum_lock")
+if (
+    not isinstance(rate_lock, dict)
+    or rate_lock.get("epoch") != epoch
+    or not isinstance(rate_lock.get("rate_ts"), int)
+    or not isinstance(minimum_lock, dict)
+    or minimum_lock.get("type") != "tap_payout_minimum_lock"
+    or minimum_lock.get("key") != "params/payout_min_au"
+    or minimum_lock.get("at") != rate_lock.get("rate_ts")
+    or minimum_lock.get("value") != str(payout_min_au)
+    or not isinstance(minimum_lock.get("signed_length"), int)
+    or minimum_lock.get("signed_length") < 1
+):
+    raise SystemExit("TAP carry report lacks confirmed payout policy evidence")
+report["status"] = "no_work"
+report["outcome"] = "carry"
+report["rail"] = "tap"
+report["epoch"] = epoch
+report["epoch_apply_hash"] = apply_hash
+report["bundle_sha256"] = hashlib.sha256(bundle_raw).hexdigest()
+report["tap_settlement_checkpoint"] = None
+with open(target, "w") as out:
+    json.dump(report, out, indent=2)
+    out.write("\n")
+PY
+    then
+      echo "TAP carry report binding failed for $name" >&2
+      sleep "$interval"
+      continue
+    fi
+    install -m 600 "$bound_report" "$processed/$name.settlement.json"
+    install -m 600 "$bound_report" "$processed/latest.json"
+    install -m 600 "$rate_lock" "$processed/$name.tap-rate.json"
+    mv "$bundle" "$processed/"
+    [[ -f "$buyer_accounts" ]] && mv "$buyer_accounts" "$processed/"
+    rm -f "$rate_lock" "$dry_report" "$raw_report" "$bound_report" "$final_report"
+    continue
+  fi
   if ! jq -e '
     .blocked != true and
     (.root | type == "string") and
