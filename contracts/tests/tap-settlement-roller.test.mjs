@@ -31,6 +31,7 @@ import {
   resolveTapSettlementRate,
   resolveTapSettlementEpochPolicy,
   rollTapSettlement,
+  verifyReceiptEnvelope,
 } from '../scripts/tap-settlement-roller.mjs';
 import { makeReceiptIdentity, signedTapReceipt } from './helpers/signed-receipt.mjs';
 
@@ -104,6 +105,89 @@ test('TAP roller uses the canonical contract schema-10 receipt bytes', () => {
   }).receipt.body;
 
   assert.equal(receiptMessage(body), contractReceiptMessage(body));
+});
+
+test('TAP roller reconstructs Rust receipt wire order from sorted retained values', () => {
+  const user = makeReceiptIdentity();
+  const enclave = makeReceiptIdentity();
+  const signed = receipt({
+    session: 'tap-retained-wire-order',
+    au: '123',
+    epoch: 17,
+    user,
+    enclave,
+  });
+  const body = signed.receipt.body;
+  body.locked_rate_map = [{
+    granularity: 1,
+    per_unit_au: '123',
+    unit: 'input_token',
+  }];
+  body.workflow = {
+    graph_hash: '31'.repeat(32),
+    outcome_class: 'image.heavy.le1_2mp',
+    quoted_usage: { step: 4, image: 1 },
+    runtime_id: 'comfyui-v0.30.1',
+    endpoint_family: 'mayhem_comfy_workflows',
+  };
+  body.workflow_output = {
+    metrics: { step: 4, image: 1 },
+    output_modalities: ['image'],
+  };
+
+  const rustWireBody = {
+    schema_version: body.schema_version,
+    session_id: body.session_id,
+    billing_id: body.billing_id,
+    billing_attempt: body.billing_attempt,
+    billing_prior_usage: body.billing_prior_usage,
+    billing_prior_au_owed_cum: body.billing_prior_au_owed_cum,
+    billing_epoch: body.billing_epoch,
+    reservation_id: body.reservation_id,
+    reservation_expires_after_epoch: body.reservation_expires_after_epoch,
+    reservation_receipt_grace_epochs: body.reservation_receipt_grace_epochs,
+    payout_revision: body.payout_revision,
+    seq: body.seq,
+    final: body.final,
+    rail: body.rail,
+    user: body.user,
+    provider: body.provider,
+    enclave_id: body.enclave_id,
+    model_id: body.model_id,
+    price_ver: body.price_ver,
+    locked_rate_map: [{ unit: 'input_token', per_unit_au: '123', granularity: 1 }],
+    locked_per_req_au: body.locked_per_req_au,
+    locked_min_session_au: body.locked_min_session_au,
+    served_ctx: body.served_ctx,
+    ctx_bracket: body.ctx_bracket,
+    ctx_bracket_table_ver: body.ctx_bracket_table_ver,
+    rules_ver: body.rules_ver,
+    workflow: {
+      endpoint_family: 'mayhem_comfy_workflows',
+      graph_hash: '31'.repeat(32),
+      runtime_id: 'comfyui-v0.30.1',
+      outcome_class: 'image.heavy.le1_2mp',
+      quoted_usage: { image: 1, step: 4 },
+    },
+    workflow_output: {
+      output_modalities: ['image'],
+      metrics: { image: 1, step: 4 },
+    },
+    usage: body.usage,
+    au_owed_cum: body.au_owed_cum,
+    prompt_hash: body.prompt_hash,
+    ts: body.ts,
+  };
+  const message = Buffer.from(JSON.stringify({
+    domain: 'mayhem-session-receipt',
+    signing_version: 2,
+    body: rustWireBody,
+  }));
+  signed.receipt.enclave_sig = crypto.sign(null, message, enclave.privateKey).toString('hex');
+  signed.receipt.user_sig = crypto.sign(null, message, user.privateKey).toString('hex');
+
+  assert.equal(receiptMessage(body), message.toString());
+  assert.doesNotThrow(() => verifyReceiptEnvelope(signed.receipt));
 });
 
 function targetedBindingsFor(bundle, providerAccounts, revisions = {}) {

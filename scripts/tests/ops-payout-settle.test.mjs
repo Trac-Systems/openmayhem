@@ -1753,6 +1753,44 @@ test('a failed rail predecessor does not block later eligible work on other rail
   );
 });
 
+test('superseded prior payout work is never resumed against a replacement apply anchor', (t) => {
+  const ctx = harness({ bundle: false });
+  t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));
+
+  const first = runWorker(ctx, {
+    MOCK_FIAT_MODE: 'blocking',
+    MOCK_TNK_MODE: 'no_work',
+  });
+  assert.notEqual(first.status, 0);
+  writeJson(ctx.applyState, {
+    key: 'epoch/apply/state',
+    confirmed: true,
+    value: {
+      updated_epoch: 8,
+      pending_epoch: null,
+      last_apply_hash: NEXT_APPLY_HASH.toUpperCase(),
+      last_settlement_unix: 1000,
+    },
+  });
+
+  const replay = runWorker(ctx, {
+    MOCK_STALE_ANCHOR: '1',
+    MOCK_FIAT_MODE: 'final',
+    MAYHEM_TNK_SETTLEMENT_ENABLED: '0',
+    MAYHEM_TAP_SETTLEMENT_ENABLED: '0',
+  });
+  assert.notEqual(replay.status, 0);
+  assert.match(replay.stderr, /retained payout work for epoch 7 is superseded/);
+  assert.equal(
+    payoutEventLines(ctx).filter((event) => event === 'fiat:external-transfer').length,
+    0
+  );
+  assert.equal(
+    fs.existsSync(path.join(ctx.state, `payout/epoch-7-${APPLY_HASH}/fiat.complete`)),
+    false
+  );
+});
+
 test('TAP queue publication survives a crash without a duplicate item or complete marker', (t) => {
   const ctx = harness();
   t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));

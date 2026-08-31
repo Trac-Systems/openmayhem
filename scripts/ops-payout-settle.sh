@@ -45,6 +45,33 @@ else:
 ' "$1"
 }
 
+confirmed_apply_anchor_hash() {
+  local epoch="$1" record
+  record="$(
+    curl -sf -m 10 \
+      "$RPC_URL/state?key=epoch/apply-anchor/$epoch&confirmed=true"
+  )" || {
+    echo "abort: could not read confirmed apply anchor for payout epoch $epoch" >&2
+    return 1
+  }
+  printf '%s' "$record" | python3 -c '
+import json, re, sys
+epoch = int(sys.argv[1])
+record = json.load(sys.stdin)
+value = record.get("value") if isinstance(record, dict) else None
+apply_hash = value.get("apply_hash") if isinstance(value, dict) else None
+if (
+    record.get("confirmed") is not True
+    or record.get("key") not in (None, f"epoch/apply-anchor/{epoch}")
+    or value.get("type") != "epoch_apply_anchor"
+    or value.get("epoch") != epoch
+    or not re.fullmatch(r"[0-9a-f]{64}", str(apply_hash))
+):
+    raise SystemExit(f"confirmed apply anchor for payout epoch {epoch} is invalid")
+print(apply_hash)
+' "$epoch"
+}
+
 positive_integer() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]] && \
     python3 -c 'import sys; raise SystemExit(0 if int(sys.argv[1]) <= 9007199254740991 else 1)' "$1"
@@ -365,6 +392,14 @@ fi
 apply_hash="$(printf '%s' "$apply_hash" | tr '[:upper:]' '[:lower:]')"
 
 validate_execution_context
+
+if [[ -n "$resume_work_dir" ]]; then
+  canonical_resume_hash="$(confirmed_apply_anchor_hash "$applied_epoch")" || exit 1
+  if [[ "$canonical_resume_hash" != "$apply_hash" ]]; then
+    echo "abort: retained payout work for epoch $applied_epoch is superseded by canonical apply hash $canonical_resume_hash; audit and quarantine it before continuing" >&2
+    exit 1
+  fi
+fi
 
 validate_epoch_artifact() {
   local bundle="$epoch_dir/epoch-bundle.json"

@@ -242,6 +242,50 @@ function sortedDistributionEntries(map) {
     .sort((a, b) => a.account.localeCompare(b.account));
 }
 
+// Stored contract values are recursively key-sorted, while receipt signatures
+// cover Rust's struct field order. Rebuild the signed nested values explicitly
+// before verifying a retained receipt.
+function canonicalLockedRateMap(rateMap) {
+  if (!Array.isArray(rateMap)) return rateMap;
+  return rateMap.map((entry) => {
+    if (!isObject(entry)) return entry;
+    return {
+      unit: entry.unit,
+      per_unit_au: entry.per_unit_au,
+      granularity: entry.granularity,
+    };
+  });
+}
+
+function stableValue(value) {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (!isObject(value)) return value;
+  return Object.fromEntries(
+    Object.keys(value)
+      .sort()
+      .map((key) => [key, stableValue(value[key])])
+  );
+}
+
+function canonicalWorkflowBinding(workflow) {
+  if (!isObject(workflow)) return workflow;
+  return {
+    endpoint_family: workflow.endpoint_family,
+    graph_hash: workflow.graph_hash,
+    runtime_id: workflow.runtime_id,
+    outcome_class: workflow.outcome_class,
+    quoted_usage: stableValue(workflow.quoted_usage),
+  };
+}
+
+function canonicalWorkflowOutput(output) {
+  if (!isObject(output)) return output;
+  return {
+    output_modalities: output.output_modalities,
+    metrics: stableValue(output.metrics),
+  };
+}
+
 export function canonicalReceiptBody(body) {
   const canonical = {
     schema_version: body.schema_version,
@@ -263,7 +307,7 @@ export function canonicalReceiptBody(body) {
     enclave_id: body.enclave_id,
     model_id: body.model_id,
     price_ver: body.price_ver,
-    locked_rate_map: body.locked_rate_map,
+    locked_rate_map: canonicalLockedRateMap(body.locked_rate_map),
     locked_per_req_au: body.locked_per_req_au,
     locked_min_session_au: body.locked_min_session_au,
     served_ctx: body.served_ctx,
@@ -271,6 +315,10 @@ export function canonicalReceiptBody(body) {
   if (hasOwn(body, 'ctx_bracket')) canonical.ctx_bracket = body.ctx_bracket;
   if (hasOwn(body, 'ctx_bracket_table_ver')) canonical.ctx_bracket_table_ver = body.ctx_bracket_table_ver;
   canonical.rules_ver = body.rules_ver;
+  if (hasOwn(body, 'workflow')) canonical.workflow = canonicalWorkflowBinding(body.workflow);
+  if (hasOwn(body, 'workflow_output')) {
+    canonical.workflow_output = canonicalWorkflowOutput(body.workflow_output);
+  }
   canonical.usage = body.usage;
   if (isObject(body.usage_attribution) && Object.keys(body.usage_attribution).length > 0) {
     canonical.usage_attribution = body.usage_attribution;
