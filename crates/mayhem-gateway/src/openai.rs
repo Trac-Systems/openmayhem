@@ -2378,7 +2378,6 @@ pub struct ArtifactGenerationRequest {
     pub input_audio_max_bytes: u64,
     pub input_audio_max_seconds: u64,
     pub response_format: String,
-    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -8527,15 +8526,52 @@ fn gateway_prefers_async_response(headers: &HeaderMap) -> bool {
         .any(|preference| preference.eq_ignore_ascii_case("respond-async"))
 }
 
-fn apply_async_artifact_route_wait(
-    options: &mut GatewayRequestOptions,
-    request: &ArtifactGenerationRequest,
-) {
-    if let Some(timeout_ms) = request.timeout_ms {
+fn extract_async_artifact_route_wait_ms(
+    raw_request: &mut Value,
+    contract: &EndpointFamilyContract,
+) -> Result<Option<u64>, ApiError> {
+    let Some(request) = raw_request.as_object_mut() else {
+        return Ok(None);
+    };
+    let timeout_is_model_attribute = contract
+        .request_attributes
+        .iter()
+        .any(|path| path == "timeout_ms");
+    let raw_timeout = if timeout_is_model_attribute {
+        request.get("timeout_ms").cloned()
+    } else {
+        request.remove("timeout_ms")
+    };
+    let Some(raw_timeout) = raw_timeout else {
+        return Ok(None);
+    };
+    let timeout_ms = raw_timeout
+        .as_u64()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            ApiError::bad_request("timeout_ms must be a positive integer", Some("timeout_ms"))
+        })?;
+    Ok(Some(timeout_ms))
+}
+
+fn apply_async_artifact_route_wait(options: &mut GatewayRequestOptions, timeout_ms: Option<u64>) {
+    if let Some(timeout_ms) = timeout_ms {
         options.max_wait_ms = options
             .max_wait_ms
             .max(timeout_ms.min(MAX_ASYNC_ARTIFACT_ROUTE_WAIT_MS));
     }
+}
+
+fn resolve_async_artifact_route_wait_ms(
+    requested_timeout_ms: Option<u64>,
+    normalized_request: &Value,
+) -> Option<u64> {
+    requested_timeout_ms.or_else(|| {
+        normalized_request
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+    })
 }
 
 fn gateway_job_in_progress_metadata(
@@ -9544,12 +9580,19 @@ enum ArtifactEndpointOutcome {
 async fn execute_artifact_generation_endpoint(
     state: &GatewayState,
     headers: &HeaderMap,
-    raw_request: Value,
+    mut raw_request: Value,
     endpoint_family: &str,
     client_cancellation: Option<GatewayRequestCancellation>,
 ) -> Result<ArtifactEndpointOutcome, ApiError> {
     let model_id = endpoint_request_model(&raw_request)?.to_owned();
     let access_token = state.authorize_gateway_request(headers, Some(&model_id))?;
+    let prefer_async = gateway_prefers_async_response(headers);
+    let mut async_route_wait_ms = if prefer_async {
+        let contract = catalog_endpoint_contract(state, &model_id, endpoint_family)?;
+        extract_async_artifact_route_wait_ms(&mut raw_request, &contract)?
+    } else {
+        None
+    };
     let prepared = normalize_catalog_endpoint_request_with_metadata(
         state,
         &model_id,
@@ -9557,6 +9600,10 @@ async fn execute_artifact_generation_endpoint(
         &raw_request,
     )?;
     let normalized = prepared.normalized;
+    if prefer_async {
+        async_route_wait_ms =
+            resolve_async_artifact_route_wait_ms(async_route_wait_ms, &normalized);
+    }
     let model = require_model(state, &model_id)?;
     let request = artifact_generation_request_with_workflow_policy(
         &model_id,
@@ -9592,9 +9639,8 @@ async fn execute_artifact_generation_endpoint(
     };
     options.job = Some(job.clone());
     options.client_cancellation = Some(job.cancellation());
-    let prefer_async = gateway_prefers_async_response(headers);
     if prefer_async {
-        apply_async_artifact_route_wait(&mut options, &request);
+        apply_async_artifact_route_wait(&mut options, async_route_wait_ms);
     }
     if prefer_async {
         let job_id = job.id.clone();
@@ -10935,10 +10981,6 @@ fn artifact_generation_request_with_workflow_policy(
         WorkflowInputFileStats::default()
     };
     let response_format = response_format.to_owned();
-    let timeout_ms = raw_request
-        .get("timeout_ms")
-        .and_then(Value::as_u64)
-        .filter(|value| *value > 0);
     Ok(ArtifactGenerationRequest {
         model: model_id.to_owned(),
         prompt,
@@ -10963,7 +11005,6 @@ fn artifact_generation_request_with_workflow_policy(
         input_audio_max_bytes: inline_audio.max_item_bytes,
         input_audio_max_seconds: inline_audio.max_item_seconds,
         response_format,
-        timeout_ms,
     })
 }
 
@@ -37736,26 +37777,49 @@ mod tests {
 
     #[test]
     fn async_artifact_route_wait_uses_bounded_request_timeout() {
+        let contract =
+            mayhem_proto::endpoint_family_contract_template(mayhem_proto::ENDPOINT_OPENAI_VIDEOS)
+                .expect("video endpoint contract");
+        let mut raw_request = json!({
+            "model": "mayhem/video-test",
+            "prompt": "queued async video",
+            "seconds": "1",
+            "fps": 8,
+            "timeout_ms": 900_000
+        });
+        let error = normalize_endpoint_request_for_provider(&contract, &raw_request)
+            .expect_err("transport metadata is not a model attribute");
+        assert!(error.contains("timeout_ms"), "unexpected error: {error}");
+
+        let timeout_ms = extract_async_artifact_route_wait_ms(&mut raw_request, &contract)
+            .expect("transport timeout");
+        let normalized = normalize_endpoint_request_for_provider(&contract, &raw_request)
+            .expect("transport metadata is absent from the model request");
+        assert!(normalized.normalized_request.get("timeout_ms").is_none());
+
+        let mut same_request_different_wait = json!({
+            "model": "mayhem/video-test",
+            "prompt": "queued async video",
+            "seconds": "1",
+            "fps": 8,
+            "timeout_ms": 1_800_000
+        });
+        extract_async_artifact_route_wait_ms(&mut same_request_different_wait, &contract)
+            .expect("second transport timeout");
+        let same_normalized =
+            normalize_endpoint_request_for_provider(&contract, &same_request_different_wait)
+                .expect("second transport timeout is absent from the model request");
+        assert_eq!(
+            normalized.normalized_request,
+            same_normalized.normalized_request
+        );
+
         let mut options = GatewayRequestOptions {
             max_wait_ms: MAX_ROUTE_MAX_WAIT_MS,
             ..GatewayRequestOptions::default()
         };
-        let request = artifact_generation_request(
-            "mayhem/video-test",
-            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
-            json!({
-                "model": "mayhem/video-test",
-                "prompt": "queued async video",
-                "seconds": 1,
-                "fps": 8,
-                "response_format": "b64_json",
-                "timeout_ms": 900_000
-            }),
-            VideoRequestPreparation::default(),
-        )
-        .expect("artifact request");
 
-        apply_async_artifact_route_wait(&mut options, &request);
+        apply_async_artifact_route_wait(&mut options, timeout_ms);
 
         assert_eq!(options.max_wait_ms, 900_000);
 
@@ -37763,14 +37827,102 @@ mod tests {
             max_wait_ms: MAX_ROUTE_MAX_WAIT_MS,
             ..GatewayRequestOptions::default()
         };
-        let oversized = ArtifactGenerationRequest {
-            timeout_ms: Some(MAX_ASYNC_ARTIFACT_ROUTE_WAIT_MS + 1),
-            ..request
-        };
-
-        apply_async_artifact_route_wait(&mut capped, &oversized);
+        apply_async_artifact_route_wait(&mut capped, Some(MAX_ASYNC_ARTIFACT_ROUTE_WAIT_MS + 1));
 
         assert_eq!(capped.max_wait_ms, MAX_ASYNC_ARTIFACT_ROUTE_WAIT_MS);
+
+        for invalid in [json!(0), json!(-1), json!(1.5), json!("900000")] {
+            let mut invalid_request = json!({
+                "model": "mayhem/video-test",
+                "timeout_ms": invalid
+            });
+            let error = extract_async_artifact_route_wait_ms(&mut invalid_request, &contract)
+                .expect_err("invalid timeout rejects");
+            assert_eq!(error.param, Some("timeout_ms"));
+        }
+    }
+
+    #[test]
+    fn async_artifact_timeout_split_is_contract_driven() {
+        for family in [
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+        ] {
+            let contract = mayhem_proto::endpoint_family_contract_template(family)
+                .expect("artifact endpoint contract");
+            let mut raw_request = json!({"timeout_ms": 900_000});
+
+            assert_eq!(
+                extract_async_artifact_route_wait_ms(&mut raw_request, &contract)
+                    .expect("transport timeout"),
+                Some(900_000)
+            );
+            assert!(raw_request.get("timeout_ms").is_none(), "family {family}");
+        }
+    }
+
+    #[test]
+    fn async_comfy_timeout_remains_a_signed_model_attribute() {
+        let contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+        )
+        .expect("Comfy endpoint contract");
+        let mut raw_request = json!({
+            "model": "mayhem/comfy-test",
+            "workflow": {
+                "1": {
+                    "class_type": "EmptyImage",
+                    "inputs": {"width": 64, "height": 64, "batch_size": 1, "color": 0}
+                },
+                "2": {
+                    "class_type": "SaveImage",
+                    "inputs": {"images": ["1", 0], "filename_prefix": "mayhem-comfy-smoke"}
+                }
+            },
+            "timeout_ms": 900_000
+        });
+
+        let timeout_ms = extract_async_artifact_route_wait_ms(&mut raw_request, &contract)
+            .expect("valid timeout");
+        let normalized = normalize_endpoint_request_for_provider(&contract, &raw_request)
+            .expect("declared Comfy timeout remains valid");
+
+        assert_eq!(timeout_ms, Some(900_000));
+        assert_eq!(raw_request["timeout_ms"], json!(900_000));
+        assert_eq!(normalized.normalized_request["timeout_ms"], json!(900_000));
+    }
+
+    #[test]
+    fn async_comfy_default_timeout_survives_normalization() {
+        let contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+        )
+        .expect("Comfy endpoint contract");
+        let mut raw_request = json!({
+            "model": "mayhem/comfy-test",
+            "workflow": {
+                "1": {
+                    "class_type": "EmptyImage",
+                    "inputs": {"width": 64, "height": 64, "batch_size": 1, "color": 0}
+                },
+                "2": {
+                    "class_type": "SaveImage",
+                    "inputs": {"images": ["1", 0], "filename_prefix": "mayhem-comfy-smoke"}
+                }
+            }
+        });
+
+        let requested_timeout = extract_async_artifact_route_wait_ms(&mut raw_request, &contract)
+            .expect("omitted timeout is valid");
+        let normalized = normalize_endpoint_request_for_provider(&contract, &raw_request)
+            .expect("Comfy defaults normalize");
+        let route_wait =
+            resolve_async_artifact_route_wait_ms(requested_timeout, &normalized.normalized_request);
+
+        assert_eq!(requested_timeout, None);
+        assert_eq!(normalized.normalized_request["timeout_ms"], json!(120_000));
+        assert_eq!(route_wait, Some(120_000));
     }
 
     #[test]
@@ -43214,6 +43366,52 @@ mod tests {
         assert_eq!(response["status"], json!("completed"));
     }
 
+    #[tokio::test]
+    async fn async_video_timeout_is_consumed_before_model_normalization() {
+        let mut model = test_model();
+        model.id = "mayhem/video-timeout-test".to_owned();
+        model.mayhem.model_class = "video-generation".to_owned();
+        model.mayhem.caps.video = true;
+        model.mayhem.caps.output_modality = Some("video".to_owned());
+        model.mayhem.caps.output_modalities = vec!["video".to_owned()];
+        model.mayhem.adapter.modality_set = vec!["video".to_owned()];
+        model.mayhem.adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            )
+            .expect("video endpoint contract")];
+        model.mayhem.price_ref_au.rate_map = vec![RateMapEntry {
+            unit: USAGE_VIDEO_SECOND.to_owned(),
+            per_unit_au: 1,
+            granularity: 1,
+        }];
+        let state = GatewayState::from_models(vec![model.clone()])
+            .with_dev_session_shim()
+            .with_session_backend(Arc::new(ArtifactGenerationSuccessBackend));
+        let mut headers = HeaderMap::new();
+        headers.insert("prefer", HeaderValue::from_static("respond-async"));
+
+        let outcome = execute_artifact_generation_endpoint(
+            &state,
+            &headers,
+            json!({
+                "model": model.id,
+                "prompt": "queued async video",
+                "seconds": "3",
+                "timeout_ms": 900_000
+            }),
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            None,
+        )
+        .await
+        .expect("async transport metadata must not reach model normalization");
+
+        let ArtifactEndpointOutcome::Immediate(response) = outcome else {
+            panic!("respond-async must return a polling handle");
+        };
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
     fn signed_joint_video_model() -> GatewayModel {
         let mut model = test_model();
         model.id = "mayhem/joint-video-test".to_owned();
@@ -46980,7 +47178,6 @@ mod tests {
                     input_audio_max_bytes: 0,
                     input_audio_max_seconds: 0,
                     response_format: "mp4".to_owned(),
-                    timeout_ms: None,
                 };
                 focused_route_runner_error(
                     run_artifact_generation_with_route_retry(&state, &model, &request, options)
