@@ -47,7 +47,7 @@ use crate::{
     },
     provider_table::{
         baseline_route_state, BaselineRouteRequirements, BaselineRouteState,
-        ContractProviderSnapshot, LcgBalancerRng, ModalityRequestLoad,
+        ContractProviderSnapshot, IneligibilityReason, LcgBalancerRng, ModalityRequestLoad,
         ProviderCapacityMismatchEvent, ProviderObservationSample, ProviderTable,
         ProviderTableEntry, ProviderUnderdeliveryEvent, RequestRequirements,
         RouteAttestationPolicyReadiness, SelectionWeights, WorkflowRouteRequirements,
@@ -288,6 +288,8 @@ pub struct GatewayState {
     provider_load_progress_dir: Arc<Option<PathBuf>>,
     provider_table: Arc<Mutex<ProviderTable>>,
     modality_admission: Arc<Mutex<BTreeMap<(ProviderKey, String), u32>>>,
+    modality_admission_generation: Arc<AtomicU64>,
+    modality_admission_notify: Arc<Notify>,
     provider_cooloffs: Arc<Mutex<BTreeMap<ProviderKey, u64>>>,
     chat_affinity: Arc<Mutex<BTreeMap<ChatAffinityKey, ProviderKey>>>,
     preferred_providers: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
@@ -585,7 +587,67 @@ struct ChatAffinityKey {
 
 struct GatewayModalityAdmissionGuard {
     active: Arc<Mutex<BTreeMap<(ProviderKey, String), u32>>>,
+    generation: Arc<AtomicU64>,
+    notify: Arc<Notify>,
     reservations: Vec<(ProviderKey, String, u32)>,
+}
+
+#[derive(Debug)]
+enum ModalityAdmissionError {
+    LocalCapacity(String),
+    RemoteCapacity(String),
+    Unavailable(String),
+}
+
+impl ModalityAdmissionError {
+    fn local_capacity(message: impl Into<String>) -> Self {
+        Self::LocalCapacity(message.into())
+    }
+
+    fn remote_capacity(message: impl Into<String>) -> Self {
+        Self::RemoteCapacity(message.into())
+    }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable(message.into())
+    }
+}
+
+fn modality_capacity_refusal_is_transient(
+    heartbeat: &ProviderHeartbeat,
+    requirements: &RequestRequirements,
+) -> bool {
+    if requirements.modality_load.iter().any(|(modality, load)| {
+        modality == "text"
+            || !requirements.required_modalities.contains(modality)
+            || load.item_count == 0
+            || load.max_item_bytes == 0
+            || load.max_item_units == 0
+    }) {
+        return false;
+    }
+    let mut currently_full = false;
+    for modality in requirements
+        .required_modalities
+        .iter()
+        .filter(|modality| modality.as_str() != "text")
+    {
+        let Some(load) = requirements.modality_load.get(modality) else {
+            return false;
+        };
+        let Some(capacity) = heartbeat.caps.modality_capacity.get(modality) else {
+            return false;
+        };
+        if load.item_count > capacity.max_items_per_request
+            || load.max_item_bytes > capacity.max_item_bytes
+            || load.max_item_units > capacity.max_item_units
+        {
+            return false;
+        }
+        currently_full |=
+            capacity.active_items.saturating_add(load.item_count) > capacity.max_inflight_items;
+    }
+    currently_full
 }
 
 impl Drop for GatewayModalityAdmissionGuard {
@@ -603,6 +665,9 @@ impl Drop for GatewayModalityAdmissionGuard {
                 active.remove(&key);
             }
         }
+        drop(active);
+        self.generation.fetch_add(1, Ordering::Release);
+        self.notify.notify_waiters();
     }
 }
 
@@ -4337,6 +4402,8 @@ impl GatewayState {
             provider_load_progress_dir: Arc::new(None),
             provider_table: Arc::new(Mutex::new(provider_table)),
             modality_admission: Arc::new(Mutex::new(BTreeMap::new())),
+            modality_admission_generation: Arc::new(AtomicU64::new(0)),
+            modality_admission_notify: Arc::new(Notify::new()),
             provider_cooloffs: Arc::new(Mutex::new(BTreeMap::new())),
             chat_affinity: Arc::new(Mutex::new(BTreeMap::new())),
             preferred_providers: Arc::new(Mutex::new(BTreeMap::new())),
@@ -20796,12 +20863,11 @@ async fn run_embedding_with_route_retry(
         {
             break;
         }
-        recovery.begin_attempt(route);
         let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
             Ok(admission) => admission,
             Err(err) => {
-                recovery.exhaust(route);
-                last_retryable_error = Some(err);
+                last_retryable_error =
+                    Some(recovery.record_modality_admission_error(state, route, err));
                 pending_routes = ordered_route_candidates_for_embedding_with_options(
                     state,
                     model,
@@ -20811,6 +20877,7 @@ async fn run_embedding_with_route_retry(
                 continue;
             }
         };
+        recovery.begin_attempt(route);
         let invocation =
             state.prepare_embedding_invocation_for_route(model, inputs, route, &attempt_options)?;
         let attempt_started = Instant::now();
@@ -20978,12 +21045,11 @@ async fn run_image_generation_with_route_retry(
         {
             break;
         }
-        recovery.begin_attempt(route);
         let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
             Ok(admission) => admission,
             Err(err) => {
-                recovery.exhaust(route);
-                last_retryable_error = Some(err);
+                last_retryable_error =
+                    Some(recovery.record_modality_admission_error(state, route, err));
                 pending_routes = ordered_route_candidates_for_image_generation_with_options(
                     state,
                     model,
@@ -20993,6 +21059,7 @@ async fn run_image_generation_with_route_retry(
                 continue;
             }
         };
+        recovery.begin_attempt(route);
         let invocation = state.prepare_image_generation_invocation_for_route(
             model,
             request,
@@ -21164,12 +21231,11 @@ async fn run_audio_speech_with_route_retry(
         {
             break;
         }
-        recovery.begin_attempt(route);
         let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
             Ok(admission) => admission,
             Err(err) => {
-                recovery.exhaust(route);
-                last_retryable_error = Some(err);
+                last_retryable_error =
+                    Some(recovery.record_modality_admission_error(state, route, err));
                 pending_routes = ordered_route_candidates_for_audio_speech_with_options(
                     state,
                     model,
@@ -21179,6 +21245,7 @@ async fn run_audio_speech_with_route_retry(
                 continue;
             }
         };
+        recovery.begin_attempt(route);
         let invocation = state.prepare_audio_speech_invocation_for_route(
             model,
             request,
@@ -21354,12 +21421,11 @@ async fn run_audio_transcription_with_route_retry(
         {
             break;
         }
-        recovery.begin_attempt(route);
         let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
             Ok(admission) => admission,
             Err(err) => {
-                recovery.exhaust(route);
-                last_retryable_error = Some(err);
+                last_retryable_error =
+                    Some(recovery.record_modality_admission_error(state, route, err));
                 pending_routes = ordered_route_candidates_for_audio_transcription_with_options(
                     state,
                     model,
@@ -21369,6 +21435,7 @@ async fn run_audio_transcription_with_route_retry(
                 continue;
             }
         };
+        recovery.begin_attempt(route);
         let invocation = state.prepare_audio_transcription_invocation_for_route(
             model,
             request,
@@ -21552,12 +21619,11 @@ async fn run_artifact_generation_with_route_retry(
         {
             break;
         }
-        recovery.begin_attempt(route);
         let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
             Ok(admission) => admission,
             Err(err) => {
-                recovery.exhaust(route);
-                last_retryable_error = Some(err);
+                last_retryable_error =
+                    Some(recovery.record_modality_admission_error(state, route, err));
                 pending_routes = ordered_route_candidates_for_artifact_generation_with_options(
                     state,
                     model,
@@ -21567,6 +21633,7 @@ async fn run_artifact_generation_with_route_retry(
                 continue;
             }
         };
+        recovery.begin_attempt(route);
         let invocation = state.prepare_artifact_generation_invocation_for_route(
             model,
             request,
@@ -21927,9 +21994,15 @@ struct RouteAdmissionRecovery {
     attempted_route_keys: BTreeSet<ProviderKey>,
     attempted_providers: BTreeSet<String>,
     exhausted_route_keys: BTreeSet<ProviderKey>,
-    capacity_refusal_generations: BTreeMap<ProviderKey, Option<u64>>,
+    capacity_refusal_generations: BTreeMap<ProviderKey, CapacityRefusalGeneration>,
     dev_route_attempted: bool,
     attempts_made: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CapacityRefusalGeneration {
+    Provider(Option<u64>),
+    Local(u64),
 }
 
 impl RouteAdmissionRecovery {
@@ -21962,7 +22035,7 @@ impl RouteAdmissionRecovery {
             }
             let recovered = match self.capacity_refusal_generations.get(&key) {
                 None => false,
-                Some(Some(refused_generation)) => {
+                Some(CapacityRefusalGeneration::Provider(Some(refused_generation))) => {
                     if !table
                         .heartbeat_received_at_millis(&key)
                         .is_some_and(|current| current > *refused_generation)
@@ -21971,8 +22044,16 @@ impl RouteAdmissionRecovery {
                     }
                     true
                 }
-                Some(None) => {
+                Some(CapacityRefusalGeneration::Provider(None)) => {
                     if table.heartbeat_received_at_millis(&key).is_none() {
+                        continue;
+                    }
+                    true
+                }
+                Some(CapacityRefusalGeneration::Local(refused_generation)) => {
+                    if state.modality_admission_generation.load(Ordering::Acquire)
+                        <= *refused_generation
+                    {
                         continue;
                     }
                     true
@@ -22007,7 +22088,7 @@ impl RouteAdmissionRecovery {
             }
             let recovered = match self.capacity_refusal_generations.get(&key) {
                 None => false,
-                Some(Some(refused_generation)) => {
+                Some(CapacityRefusalGeneration::Provider(Some(refused_generation))) => {
                     if !table
                         .heartbeat_received_at_millis(&key)
                         .is_some_and(|current| current > *refused_generation)
@@ -22016,8 +22097,16 @@ impl RouteAdmissionRecovery {
                     }
                     true
                 }
-                Some(None) => {
+                Some(CapacityRefusalGeneration::Provider(None)) => {
                     if table.heartbeat_received_at_millis(&key).is_none() {
+                        continue;
+                    }
+                    true
+                }
+                Some(CapacityRefusalGeneration::Local(refused_generation)) => {
+                    if state.modality_admission_generation.load(Ordering::Acquire)
+                        <= *refused_generation
+                    {
                         continue;
                     }
                     true
@@ -22063,7 +22152,22 @@ impl RouteAdmissionRecovery {
                 .lock_recover("provider table")
                 .heartbeat_received_at_millis(&key);
             self.capacity_refusal_generations
-                .insert(key, refused_generation);
+                .insert(key, CapacityRefusalGeneration::Provider(refused_generation));
+        }
+    }
+
+    fn record_local_capacity_refusal(
+        &mut self,
+        state: &GatewayState,
+        route: Option<&GatewayRouteCandidate>,
+    ) {
+        if let Some(route) = route {
+            self.capacity_refusal_generations.insert(
+                route_key(route),
+                CapacityRefusalGeneration::Local(
+                    state.modality_admission_generation.load(Ordering::Acquire),
+                ),
+            );
         }
     }
 
@@ -22072,6 +22176,28 @@ impl RouteAdmissionRecovery {
             let key = route_key(route);
             self.capacity_refusal_generations.remove(&key);
             self.exhausted_route_keys.insert(key);
+        }
+    }
+
+    fn record_modality_admission_error(
+        &mut self,
+        state: &GatewayState,
+        route: Option<&GatewayRouteCandidate>,
+        error: ModalityAdmissionError,
+    ) -> String {
+        match error {
+            ModalityAdmissionError::LocalCapacity(message) => {
+                self.record_local_capacity_refusal(state, route);
+                message
+            }
+            ModalityAdmissionError::RemoteCapacity(message) => {
+                self.record_capacity_refusal(state, route);
+                message
+            }
+            ModalityAdmissionError::Unavailable(message) => {
+                self.exhaust(route);
+                message
+            }
         }
     }
 
@@ -22196,16 +22322,21 @@ async fn wait_for_capacity_recovery<'a, F>(
 where
     F: FnMut() -> Vec<&'a GatewayRouteCandidate>,
 {
-    let mut routes = recovery.filter_routes(state, refresh());
-    while routes.is_empty() && !recovery.deadline.remaining().is_zero() {
+    loop {
+        let notified = state.modality_admission_notify.notified();
+        let routes = recovery.filter_routes(state, refresh());
+        if !routes.is_empty() || recovery.deadline.remaining().is_zero() {
+            return routes;
+        }
         let nap = recovery
             .deadline
             .remaining()
             .min(poll_interval.max(Duration::from_millis(1)));
-        tokio::time::sleep(nap).await;
-        routes = recovery.filter_routes(state, refresh());
+        tokio::select! {
+            _ = tokio::time::sleep(nap) => {}
+            _ = notified => {}
+        }
     }
-    routes
 }
 
 async fn wait_for_owned_capacity_recovery<F>(
@@ -22217,16 +22348,21 @@ async fn wait_for_owned_capacity_recovery<F>(
 where
     F: FnMut() -> Vec<GatewayRouteCandidate>,
 {
-    let mut routes = recovery.filter_owned_routes(state, refresh());
-    while routes.is_empty() && !recovery.deadline.remaining().is_zero() {
+    loop {
+        let notified = state.modality_admission_notify.notified();
+        let routes = recovery.filter_owned_routes(state, refresh());
+        if !routes.is_empty() || recovery.deadline.remaining().is_zero() {
+            return routes;
+        }
         let nap = recovery
             .deadline
             .remaining()
             .min(poll_interval.max(Duration::from_millis(1)));
-        tokio::time::sleep(nap).await;
-        routes = recovery.filter_owned_routes(state, refresh());
+        tokio::select! {
+            _ = tokio::time::sleep(nap) => {}
+            _ = notified => {}
+        }
     }
-    routes
 }
 
 fn capacity_refusal(err: &GatewaySessionError) -> bool {
@@ -22943,13 +23079,12 @@ async fn prepare_live_direct_chat_session(
         if route.is_none() {
             break;
         }
-        recovery.begin_attempt(route.as_ref());
         let modality_admission =
             match state.try_acquire_modality_admission(route.as_ref(), &requirements) {
                 Ok(admission) => admission,
                 Err(err) => {
-                    recovery.exhaust(route.as_ref());
-                    last_retryable_error = Some(err);
+                    last_retryable_error =
+                        Some(recovery.record_modality_admission_error(&state, route.as_ref(), err));
                     pending_routes = ordered_route_candidates_for_request_with_options(
                         &state,
                         &model,
@@ -22962,6 +23097,7 @@ async fn prepare_live_direct_chat_session(
                     continue;
                 }
             };
+        recovery.begin_attempt(route.as_ref());
         let invocation = state.prepare_chat_invocation_for_route(
             &model,
             &request,
@@ -24708,7 +24844,6 @@ async fn run_chat_with_route_retry(
                 break;
             }
         }
-        recovery.begin_attempt(route);
         let requirements = request_requirements_for_chat(
             state,
             model,
@@ -24721,8 +24856,8 @@ async fn run_chat_with_route_retry(
         let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
             Ok(admission) => admission,
             Err(err) => {
-                recovery.exhaust(route);
-                last_retryable_error = Some(err);
+                last_retryable_error =
+                    Some(recovery.record_modality_admission_error(state, route, err));
                 pending_routes = ordered_route_candidates_for_request_with_options(
                     state,
                     model,
@@ -24732,6 +24867,7 @@ async fn run_chat_with_route_retry(
                 continue;
             }
         };
+        recovery.begin_attempt(route);
         let invocation = state.prepare_chat_invocation_for_route(
             model,
             &attempt_request,
@@ -25860,7 +25996,7 @@ impl GatewayState {
         &self,
         route: Option<&GatewayRouteCandidate>,
         requirements: &RequestRequirements,
-    ) -> Result<Option<GatewayModalityAdmissionGuard>, String> {
+    ) -> Result<Option<GatewayModalityAdmissionGuard>, ModalityAdmissionError> {
         if requirements.modality_load.is_empty() {
             return Ok(None);
         }
@@ -25868,7 +26004,9 @@ impl GatewayState {
             return if self.dev_session_shim {
                 Ok(None)
             } else {
-                Err("non-text request has no provider route".to_owned())
+                Err(ModalityAdmissionError::unavailable(
+                    "non-text request has no provider route",
+                ))
             };
         };
         let provider = route_key(route);
@@ -25878,13 +26016,31 @@ impl GatewayState {
             .entries(now_millis_u64())
             .into_iter()
             .find(|entry| entry.key == provider)
-            .ok_or_else(|| "provider disappeared before modality admission".to_owned())?;
-        crate::provider_table::evaluate_eligibility(&entry, requirements).map_err(|reason| {
-            format!("provider became ineligible before modality admission: {reason:?}")
+            .ok_or_else(|| {
+                ModalityAdmissionError::unavailable(
+                    "provider disappeared before modality admission",
+                )
+            })?;
+        let heartbeat = entry.heartbeat.as_ref().ok_or_else(|| {
+            ModalityAdmissionError::unavailable(
+                "provider heartbeat disappeared before modality admission",
+            )
         })?;
-        let heartbeat = entry
-            .heartbeat
-            .ok_or_else(|| "provider heartbeat disappeared before modality admission".to_owned())?;
+        let transient_modality_capacity =
+            modality_capacity_refusal_is_transient(heartbeat, requirements);
+        crate::provider_table::evaluate_eligibility(&entry, requirements).map_err(|reason| {
+            let message =
+                format!("provider became ineligible before modality admission: {reason:?}");
+            if matches!(
+                reason,
+                IneligibilityReason::Saturated | IneligibilityReason::ProbationConcurrentLimit
+            ) || (reason == IneligibilityReason::ModalityCapacity && transient_modality_capacity)
+            {
+                ModalityAdmissionError::remote_capacity(message)
+            } else {
+                ModalityAdmissionError::unavailable(message)
+            }
+        })?;
         let mut reservations = Vec::new();
         let mut active = self
             .modality_admission
@@ -25894,7 +26050,11 @@ impl GatewayState {
                 .caps
                 .modality_capacity
                 .get(modality)
-                .ok_or_else(|| format!("provider no longer advertises {modality} capacity"))?;
+                .ok_or_else(|| {
+                    ModalityAdmissionError::unavailable(format!(
+                        "provider no longer advertises {modality} capacity"
+                    ))
+                })?;
             if load.item_count == 0
                 || load.item_count > capacity.max_items_per_request
                 || load.max_item_bytes == 0
@@ -25902,9 +26062,9 @@ impl GatewayState {
                 || load.max_item_units == 0
                 || load.max_item_units > capacity.max_item_units
             {
-                return Err(format!(
+                return Err(ModalityAdmissionError::unavailable(format!(
                     "request exceeds provider {modality} item size or per-request capacity"
-                ));
+                )));
             }
             let locally_active = active
                 .get(&(provider.clone(), modality.clone()))
@@ -25916,9 +26076,9 @@ impl GatewayState {
                 .saturating_add(load.item_count)
                 > capacity.max_inflight_items
             {
-                return Err(format!(
+                return Err(ModalityAdmissionError::local_capacity(format!(
                     "provider {modality} capacity is full; try another provider or wait"
-                ));
+                )));
             }
             reservations.push((provider.clone(), modality.clone(), load.item_count));
         }
@@ -25931,6 +26091,8 @@ impl GatewayState {
         drop(active);
         Ok(Some(GatewayModalityAdmissionGuard {
             active: Arc::clone(&self.modality_admission),
+            generation: Arc::clone(&self.modality_admission_generation),
+            notify: Arc::clone(&self.modality_admission_notify),
             reservations,
         }))
     }
@@ -43240,8 +43402,8 @@ mod tests {
         assert!(!routes.iter().any(|route| route.provider == text_only));
     }
 
-    #[test]
-    fn modality_admission_rechecks_live_capability_and_releases_capacity() {
+    #[tokio::test]
+    async fn modality_admission_rechecks_live_capability_and_releases_capacity() {
         let mut model = test_routed_model(1);
         model.mayhem.caps.vision = true;
         model.mayhem.adapter.modality_set = vec!["text".to_owned(), "image".to_owned()];
@@ -43278,15 +43440,58 @@ mod tests {
             .try_acquire_modality_admission(Some(route), &requirements)
             .expect("first image admission")
             .expect("image admission guard");
-        assert!(state
+        let contention = state
             .try_acquire_modality_admission(Some(route), &requirements)
             .err()
-            .expect("second image request must be refused")
-            .contains("capacity is full"));
+            .expect("second image request must be refused");
+        let ModalityAdmissionError::LocalCapacity(message) = contention else {
+            panic!("local contention must remain retryable");
+        };
+        assert!(message.contains("capacity is full"));
+
+        let contention = state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .err()
+            .expect("contended request remains capacity-bound");
+        let mut recovery = RouteAdmissionRecovery::new(
+            RouteWaitDeadline::new(100),
+            usize::from(DEFAULT_MAX_OPEN_ATTEMPTS),
+        );
+        let message = recovery.record_modality_admission_error(&state, Some(route), contention);
+        assert!(message.contains("capacity is full"));
+        assert!(recovery.has_capacity_waiters());
+        assert_eq!(recovery.attempts_made, 0);
+        for offset in 1..=usize::from(DEFAULT_MAX_OPEN_ATTEMPTS) + 1 {
+            state.ingest_provider_heartbeat(
+                heartbeat.clone(),
+                now.saturating_add(u64::try_from(offset).unwrap()),
+            );
+            assert!(recovery.filter_routes(&state, vec![route]).is_empty());
+            assert_eq!(recovery.attempts_made, 0);
+        }
+
         drop(admission);
+        let recovered =
+            wait_for_capacity_recovery(&state, &recovery, || vec![route], Duration::from_millis(1))
+                .await;
+        assert_eq!(recovered, vec![route]);
         assert!(state
             .try_acquire_modality_admission(Some(route), &requirements)
             .is_ok());
+
+        let mut oversized = requirements.clone();
+        oversized
+            .modality_load
+            .get_mut("image")
+            .expect("image load")
+            .max_item_bytes = 1024 * 1024 + 1;
+        assert!(matches!(
+            state
+                .try_acquire_modality_admission(Some(route), &oversized)
+                .err()
+                .expect("oversized request must be refused"),
+            ModalityAdmissionError::Unavailable(_)
+        ));
 
         heartbeat.caps.served_modalities = vec!["text".to_owned()];
         state.ingest_provider_heartbeat(heartbeat, now.saturating_add(1));
@@ -43294,6 +43499,9 @@ mod tests {
             .try_acquire_modality_admission(Some(route), &requirements)
             .err()
             .expect("dropped image capability must be refused");
+        let ModalityAdmissionError::Unavailable(err) = err else {
+            panic!("capability loss must be a permanent admission failure");
+        };
         assert!(err.contains("Capabilities"), "unexpected error: {err}");
     }
 
