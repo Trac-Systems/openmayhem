@@ -594,14 +594,20 @@ struct GatewayModalityAdmissionGuard {
 
 #[derive(Debug)]
 enum ModalityAdmissionError {
-    LocalCapacity(String),
+    LocalCapacity {
+        message: String,
+        observed_generation: u64,
+    },
     RemoteCapacity(String),
     Unavailable(String),
 }
 
 impl ModalityAdmissionError {
-    fn local_capacity(message: impl Into<String>) -> Self {
-        Self::LocalCapacity(message.into())
+    fn local_capacity(message: impl Into<String>, observed_generation: u64) -> Self {
+        Self::LocalCapacity {
+            message: message.into(),
+            observed_generation,
+        }
     }
 
     fn remote_capacity(message: impl Into<String>) -> Self {
@@ -22158,15 +22164,13 @@ impl RouteAdmissionRecovery {
 
     fn record_local_capacity_refusal(
         &mut self,
-        state: &GatewayState,
         route: Option<&GatewayRouteCandidate>,
+        observed_generation: u64,
     ) {
         if let Some(route) = route {
             self.capacity_refusal_generations.insert(
                 route_key(route),
-                CapacityRefusalGeneration::Local(
-                    state.modality_admission_generation.load(Ordering::Acquire),
-                ),
+                CapacityRefusalGeneration::Local(observed_generation),
             );
         }
     }
@@ -22186,8 +22190,11 @@ impl RouteAdmissionRecovery {
         error: ModalityAdmissionError,
     ) -> String {
         match error {
-            ModalityAdmissionError::LocalCapacity(message) => {
-                self.record_local_capacity_refusal(state, route);
+            ModalityAdmissionError::LocalCapacity {
+                message,
+                observed_generation,
+            } => {
+                self.record_local_capacity_refusal(route, observed_generation);
                 message
             }
             ModalityAdmissionError::RemoteCapacity(message) => {
@@ -26076,9 +26083,10 @@ impl GatewayState {
                 .saturating_add(load.item_count)
                 > capacity.max_inflight_items
             {
-                return Err(ModalityAdmissionError::local_capacity(format!(
-                    "provider {modality} capacity is full; try another provider or wait"
-                )));
+                return Err(ModalityAdmissionError::local_capacity(
+                    format!("provider {modality} capacity is full; try another provider or wait"),
+                    self.modality_admission_generation.load(Ordering::Acquire),
+                ));
             }
             reservations.push((provider.clone(), modality.clone(), load.item_count));
         }
@@ -43444,7 +43452,7 @@ mod tests {
             .try_acquire_modality_admission(Some(route), &requirements)
             .err()
             .expect("second image request must be refused");
-        let ModalityAdmissionError::LocalCapacity(message) = contention else {
+        let ModalityAdmissionError::LocalCapacity { message, .. } = contention else {
             panic!("local contention must remain retryable");
         };
         assert!(message.contains("capacity is full"));
@@ -43478,6 +43486,31 @@ mod tests {
         assert!(state
             .try_acquire_modality_admission(Some(route), &requirements)
             .is_ok());
+
+        let admission = state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .expect("race admission")
+            .expect("race admission guard");
+        let contention = state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .err()
+            .expect("race contention");
+        drop(admission);
+        let mut race_recovery = RouteAdmissionRecovery::new(
+            RouteWaitDeadline::new(100),
+            usize::from(DEFAULT_MAX_OPEN_ATTEMPTS),
+        );
+        race_recovery.record_modality_admission_error(&state, Some(route), contention);
+        assert_eq!(
+            wait_for_capacity_recovery(
+                &state,
+                &race_recovery,
+                || vec![route],
+                Duration::from_millis(1),
+            )
+            .await,
+            vec![route]
+        );
 
         let mut oversized = requirements.clone();
         oversized
