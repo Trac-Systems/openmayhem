@@ -352,7 +352,7 @@ executable version is not release-pinned, so this document does not invent one.
 
 | Exact model ID | Class | Canonical backend/artifact | Tier floor/fallback | Catalog RAM | Full-offload guidance | Download |
 |---|---|---|---|---:|---:|---:|
-| `Qwen/Qwen3.8-27B` | Text generation | vLLM / NVFP4 | Tier 1; cataloged, paid/live proof pending | 48 GiB | 24 GiB NVIDIA | 23,114,056,343 B (21.52 GiB) |
+| `Qwen/Qwen3.8-27B` | Text generation | vLLM / NVFP4 | Tier 1; live paid FIAT and website proof | 48 GiB | 24 GiB NVIDIA | 23,114,056,343 B (21.52 GiB) |
 | `hauhaucs/qwen3.6-35b-a3b-uncensored` | Text generation | vLLM / NVFP4 | Tier 1; use highest proved tier | 48 GiB | 24 GiB NVIDIA | 23,374,279,873 B (21.77 GiB) |
 | `google/gemma-4-E4B-it` | Text generation | llama.cpp / Q4_K_M GGUF | Tier 1; use highest proved tier; cataloged, not owned-fleet served | 12 GiB | 8 GiB | 6,326,841,504 B (5.89 GiB) |
 | `tongyi/z-image-turbo` | Image generation | stable-diffusion.cpp / Q4_K GGUF | Tier 1; use highest proved tier | 16 GiB | 8 GiB | 6,696,835,812 B (6.24 GiB) |
@@ -376,13 +376,12 @@ additional disk and memory headroom.
 
 ## Qwen 3.8 27B NVFP4
 
-Current status: signed catalog entry and `.29` technical calibration are
-present; paid OpenMayhem, confirmed live-route, and website billing proof are
-not retained. Do not report this model as paid-proven or live yet.
+Current status: signed catalog entry, `.29` technical calibration, paid FIAT
+receipts, confirmed live route, and website billing proof are retained.
 
 **Selector and source**
 
-- Model: `Qwen/Qwen3.8-27B`; minimum Mayhem version `0.2.159`.
+- Model: `Qwen/Qwen3.8-27B`; minimum Mayhem version `0.2.161`.
 - Canonical provenance:
   `Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`.
 - Backend/artifact: `vllm` / `nvfp4`. The approved upstream artifact is
@@ -428,8 +427,11 @@ not retained. Do not report this model as paid-proven or live yet.
   Process-tree RSS was about `5.435 GiB`; measured working sets were `12 MiB`
   for image and `9.19 MiB` for video. RSS excludes accelerator allocations and
   does not replace the catalog admission floors.
-- No retained prefill/decode throughput values or paid session/receipt are in
-  the repository. Do not infer or advertise them from the overlap pass.
+- No retained prefill/decode throughput values are in the repository. Do not
+  infer or advertise them from the overlap pass. Paid proof retained during
+  launch used two overlapping full-context FIAT requests with independent
+  final signed receipts; cancellation of one shorter overlap did not disrupt
+  its paid peer. A metered `openmayhem.ai` request also completed successfully.
 
 **Independent dispatch and capacity**
 
@@ -451,9 +453,9 @@ mayhem up --provider --provider-enclave Qwen/Qwen3.8-27B --yes
 ```
 
 Do not substitute another Qwen checkpoint, quantization, runtime, or local
-weights. A green local start is still not paid/live proof; verify the selected
-rails and payout bindings, route visibility, paid request, usage, and final
-receipt before changing that status.
+weights. A green local start is not sufficient proof for a new provider;
+verify its selected rails and payout bindings, route visibility, paid request,
+usage, and final receipt.
 
 ## Qwen 3.6 35B-A3B uncensored
 

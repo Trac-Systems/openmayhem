@@ -396,7 +396,7 @@ its managed runtime only. The exact model/artifact/enclave fit is decided by the
 
 | Exact selector | Doctor backend | Canonical artifact | Supported execution | Catalog minimum | Gateway endpoints |
 |---|---|---|---|---|---|
-| `Qwen/Qwen3.8-27B` | `vllm` | `nvfp4` / vLLM safetensors | Linux NVIDIA Blackwell; compute capability >= 12.0; signed independent dispatch is text-only | 48 GiB RAM, 24 GiB NVIDIA dedicated or unified memory, AVX2 or NEON; Mayhem >= 0.2.159 | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/hf-inference/models/<model-id>` |
+| `Qwen/Qwen3.8-27B` | `vllm` | `nvfp4` / vLLM safetensors | Linux NVIDIA Blackwell; compute capability >= 12.0; signed independent dispatch is text-only | 48 GiB RAM, 24 GiB NVIDIA dedicated or unified memory, AVX2 or NEON; Mayhem >= 0.2.161 | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/hf-inference/models/<model-id>` |
 | `hauhaucs/qwen3.6-35b-a3b-uncensored` | `vllm` | `nvfp4` / vLLM safetensors | Current documented path is Linux NVIDIA; CLI rejects Windows; artifact requires compute capability >= 12.0 | 48 GiB RAM, 24 GiB NVIDIA dedicated or unified memory, AVX2 or NEON | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/hf-inference/models/<model-id>` |
 | `google/gemma-4-E4B-it` | `llama.cpp` | `gguf-q4_k_m` + mandatory BF16 projector | Linux/Windows/macOS CPU; CUDA, Metal, or Vulkan when the installed Mayhem build has that feature | 12 GiB RAM, 8 GiB VRAM for full offload, AVX2 or NEON | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/hf-inference/models/<model-id>` |
 | `tongyi/z-image-turbo` | `stable-diffusion.cpp` | `gguf-q4_k` + text encoder + VAE | Linux/Windows/macOS CPU fallback; CUDA, Metal, ROCm, or Vulkan selected from hwprobe when the matching `sd-cli`/`sd-server` build is installed | 16 GiB RAM, 8 GiB VRAM for full offload; no catalog CPU-flag floor | `/v1/images/generations`, `/hf-inference/models/<model-id>` |
@@ -434,7 +434,7 @@ serve, `heartbeat.live=true`, `gateway.ok=true`, `gateway.route_count>0`, and th
 `/v1/models`.
 
 **Qwen 3.8 27B NVFP4**
-- **Install/start:** require Mayhem `0.2.159` or newer, run
+- **Install/start:** require Mayhem `0.2.161` or newer, run
   `mayhem doctor --provider-backend vllm`, then
   `mayhem up --provider --provider-enclave Qwen/Qwen3.8-27B --yes`.
 - **Exact pins:** canonical model
@@ -460,7 +460,9 @@ serve, `heartbeat.live=true`, `gateway.ok=true`, `gateway.route_count>0`, and th
   A 1-megapixel image and 16-frame video calibration used a 15% (`17.35 GiB`)
   unified-memory reserve and `98.32 GiB` F13 budget; process-tree RSS was about
   `5.435 GiB`, excluding accelerator allocations. No retained prefill/decode
-  rates or paid session/receipt exist; never invent or imply them.
+  rates exist; never invent or imply them. Paid launch proof used two
+  overlapping full-context FIAT requests with independent final signed
+  receipts, plus cancellation isolation and a metered website request.
 - **Concurrency:** `independent_dispatch` is a signed, artifact-root-bound
   opt-in and currently authorizes only the exact text-only modality set.
   Image/video requests remain exclusive, and artifacts without a matching
@@ -469,12 +471,11 @@ serve, `heartbeat.live=true`, `gateway.ok=true`, `gateway.route_count>0`, and th
   reserves and claims, per-session KV memory, any signed scheduler ceiling,
   and vLLM's runtime KV capacity, then reports it in heartbeats. The `.29`
   result `2` is not a hardcoded model limit or a value to copy elsewhere.
-- **Status:** the signed catalog and `.29` technical evidence do not prove a
-  paid or live route. Do not report Qwen 3.8 as live until provider health and
-  route visibility are green, the chosen rails have verified payout bindings,
-  and a paid request, usage, final receipt/ACK, and website billing check are
-  retained. The `.29` onboarding target is `fiat,tap,tnk`, but verify each
-  binding instead of claiming all three are active.
+- **Status:** Qwen 3.8 is live. The `.29` provider health and route are green,
+  its accepted rails are `fiat,tap,tnk`, overlapping FIAT requests produced
+  independent final signed receipts, and website billing completed. Treat
+  this as proof of that provider, not a substitute for checking bindings and
+  paid behavior when another provider joins.
 
 **Qwen 3.6 35B-A3B uncensored**
 - **Install/start:** `mayhem doctor --provider-backend vllm`, then

@@ -782,7 +782,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
-| `Qwen/Qwen3.8-27B` | Multimodal LLM, NVFP4, tools/reasoning, 262K native context | C | cataloged; `.29` technical overlap proof passed; paid/live proof pending |
+| `Qwen/Qwen3.8-27B` | Multimodal LLM, NVFP4, tools/reasoning, 262K native context | C | **live** |
 | `video.lipsync` | Comfy workflow, LongCat Avatar talking-video lipsync | D | paid technical proof passed; quality-fit gap for action anime |
 | `upscale.diffusion` | Comfy workflow, SeedVR2 diffusion upscale/restore | A/B | **live** |
 | `upscale.conv.le24mp` | Comfy workflow, standalone 4x image upscale | A/B | **live** |
@@ -821,7 +821,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 
 Class = smallest machine class that serves it well: **A** CPU/laptop, **B** consumer GPU 8–12GB, **C** enthusiast GPU 16–24GB, **D** pro 48–80GB or big-memory Apple Silicon. Many models ship multiple artifacts (GGUF for llama.cpp, MLX for Apple Silicon, NVFP4 for Blackwell), so the same model can serve from very different hardware. Most launch models are Apache, MIT, or CC-BY licensed; models under a vendor license (Gemma, Llama, LTX-2) carry that license in their signed catalog entry. Larger flagships join after launch as capable hardware comes online.
 
-Qwen 3.8 requires Mayhem `0.2.159` or newer and uses only the pinned
+Qwen 3.8 requires Mayhem `0.2.161` or newer and uses only the pinned
 `HivenetQuant/Qwen3.8-27B-NVFP4@cd5a8f0739c1df89d8cd9d39ede58c619d8298c2`
 artifact derived from
 `Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`.
@@ -833,8 +833,10 @@ opts into `independent_dispatch` for the request modality. Each provider then
 derives context-dependent capacity from its own hwprobe result, configured
 limits, usable memory and KV requirement, and vLLM runtime KV capacity, and
 advertises that value through heartbeats. Image/video requests are not in the
-current independent-dispatch profile. No retained paid request, receipt, live
-route, or website billing proof exists yet, so the model is not marked live.
+current independent-dispatch profile. The retained live proof includes two
+overlapping full-context FIAT requests with independent final signed receipts,
+cancellation of one request without disrupting its paid peer, and a metered
+request through `openmayhem.ai`.
 
 **Routes:**
 
