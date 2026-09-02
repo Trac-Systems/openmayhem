@@ -40,9 +40,11 @@ A non-Comfy model is calibrated only after:
   architecture, and platform limitations are recorded in
   [`MODEL-CHEATSHEET.md`](MODEL-CHEATSHEET.md).
 
-### Qwen 3.8 27B NVFP4 current evidence
+### Qwen 3.8 27B NVFP4 launch record
 
-Qwen 3.8 is cataloged in release `0.2.159` as the exact model
+#### Signed universal requirements
+
+Qwen 3.8 was added to the catalog in release `0.2.159` as the exact model
 `Qwen/Qwen3.8-27B`. Canonical provenance is
 `Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`; the only
 cataloged serving artifact is
@@ -52,6 +54,8 @@ mirrored byte-for-byte as
 It uses vLLM `0.24.0`, BF16 compute, artifact-scoped FP8 KV, safetensors, and
 the native 262,144-token ceiling. No YaRN extension, MLX, GGUF, CPU fallback,
 or alternative quantization is calibrated or cataloged.
+
+#### Retained `.29` measurements
 
 The retained `.29` technical calibration records:
 
@@ -87,16 +91,25 @@ and a metered `openmayhem.ai` request completed. The provider accepts FIAT,
 TAP, and TNK, and the live ledger carries `le8k`, `le32k`, `le128k`, and
 `le256k` price brackets through the 262,144-token ceiling.
 
-Warm paid streaming measurement on `.29`, using the exact artifact and release
-`0.2.162`, processed 12,017 prompt tokens and 32 completion tokens. The first
-content token arrived at 7,785.77 ms and the last at 21,997.83 ms. This is an
-end-to-end prefill rate of 1,543.46 tok/s (1,626.19 tok/s after the streaming
-response headers) and a generation rate of 2.18 tok/s. The final FIAT receipt
-was signed for the same usage. During the request the vLLM EngineCore held
-46,303 MiB of accelerator memory and the host retained about 64.67 GiB of
-available system memory; the provider stayed active with zero restarts. These
-are `.29` request-path measurements, not universal performance requirements or
-pure kernel benchmarks.
+The completed fleet checkpoint is source release `0.2.164` at commit
+`743997714fbd3064829d0f6b8a87becf52cdd3e6`. The designated persistent `.29`
+provider, writer, helper, production Core gateway, and all included fleet
+workers were aligned to that release without replacing the canonical indexer
+store.
+At `2026-09-03 00:58 CEST`, `.29` was observed running the exact release with
+one live Qwen route, a 262,144-token served context, and FIAT, TAP, and TNK
+accepted. Future liveness claims require a fresh gateway observation.
+
+The historical warm paid streaming measurement on `.29`, using the exact
+artifact and release `0.2.162`, processed 12,017 prompt tokens and 32 completion
+tokens. The first content token arrived at 7,785.77 ms and the last at
+21,997.83 ms. This is an end-to-end prefill rate of 1,543.46 tok/s (1,626.19
+tok/s after the streaming response headers) and a generation rate of 2.18
+tok/s. The final FIAT receipt was signed for the same usage. During the request
+the vLLM EngineCore held 46,303 MiB of accelerator memory and the host retained
+about 64.67 GiB of available system memory; the provider stayed active with
+zero restarts. These are `.29` request-path measurements, not universal
+performance requirements or pure kernel benchmarks.
 
 ## Comfy Workflow Calibration
 

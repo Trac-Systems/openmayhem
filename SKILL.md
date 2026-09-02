@@ -98,14 +98,14 @@ aggregate admission refusal or compensate with an undocumented memory override.
 ## 3. Install
 
 ### 3.1 Get the code — exact source release (MANDATORY rule)
-- `v0.2.162` is source-only. Never invent or offer a native archive URL: the release has no unsigned
+- `v0.2.164` is source-only. Never invent or offer a native archive URL: the release has no unsigned
   OpenMayhem executable assets. Clone the exact release tag and build it locally.
 
   **macOS/Linux:**
   ```bash
   git clone https://github.com/Trac-Systems/openmayhem.git
   cd openmayhem
-  git checkout --detach v0.2.162
+  git checkout --detach v0.2.164
   ./install.sh --from-source
   ```
 
@@ -113,7 +113,7 @@ aggregate admission refusal or compensate with an undocumented memory override.
   ```powershell
   git clone https://github.com/Trac-Systems/openmayhem.git
   Set-Location openmayhem
-  git checkout --detach v0.2.162
+  git checkout --detach v0.2.164
   .\install.ps1 -FromSource
   ```
 On updated source checkouts, `mayhem up` verifies and, when needed, deterministically repairs only
@@ -394,9 +394,9 @@ upstream repository name. `mayhem doctor --provider-backend <backend>` preflight
 its managed runtime only. The exact model/artifact/enclave fit is decided by the subsequent
 `mayhem up` command against the admin-published catalog and ledger.
 
-| Exact selector | Doctor backend | Canonical artifact | Supported execution | Catalog minimum | Gateway endpoints |
+| Exact selector | Doctor backend | Canonical artifact | Supported execution | Admission / operational minimum | Gateway endpoints |
 |---|---|---|---|---|---|
-| `Qwen/Qwen3.8-27B` | `vllm` | `nvfp4` / vLLM safetensors | Linux NVIDIA Blackwell; compute capability >= 12.0; signed independent dispatch is text-only | 48 GiB RAM, 24 GiB NVIDIA dedicated or unified memory, AVX2 or NEON; Mayhem >= 0.2.161 | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/hf-inference/models/<model-id>` |
+| `Qwen/Qwen3.8-27B` | `vllm` | `nvfp4` / vLLM safetensors | Linux NVIDIA Blackwell; compute capability >= 12.0; signed independent dispatch is text-only | 48 GiB RAM, 24 GiB NVIDIA dedicated or unified memory, AVX2 or NEON; operational Mayhem minimum 0.2.161 | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/hf-inference/models/<model-id>` |
 | `hauhaucs/qwen3.6-35b-a3b-uncensored` | `vllm` | `nvfp4` / vLLM safetensors | Current documented path is Linux NVIDIA; CLI rejects Windows; artifact requires compute capability >= 12.0 | 48 GiB RAM, 24 GiB NVIDIA dedicated or unified memory, AVX2 or NEON | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/hf-inference/models/<model-id>` |
 | `google/gemma-4-E4B-it` | `llama.cpp` | `gguf-q4_k_m` + mandatory BF16 projector | Linux/Windows/macOS CPU; CUDA, Metal, or Vulkan when the installed Mayhem build has that feature | 12 GiB RAM, 8 GiB VRAM for full offload, AVX2 or NEON | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/hf-inference/models/<model-id>` |
 | `tongyi/z-image-turbo` | `stable-diffusion.cpp` | `gguf-q4_k` + text encoder + VAE | Linux/Windows/macOS CPU fallback; CUDA, Metal, ROCm, or Vulkan selected from hwprobe when the matching `sd-cli`/`sd-server` build is installed | 16 GiB RAM, 8 GiB VRAM for full offload; no catalog CPU-flag floor | `/v1/images/generations`, `/hf-inference/models/<model-id>` |
@@ -476,11 +476,13 @@ serve, `heartbeat.live=true`, `gateway.ok=true`, `gateway.route_count>0`, and th
   reserves and claims, per-session KV memory, any signed scheduler ceiling,
   and vLLM's runtime KV capacity, then reports it in heartbeats. The `.29`
   result `2` is not a hardcoded model limit or a value to copy elsewhere.
-- **Status:** Qwen 3.8 is live. The `.29` provider health and route are green,
-  its accepted rails are `fiat,tap,tnk`, overlapping FIAT requests produced
-  independent final signed receipts, and website billing completed. Treat
-  this as proof of that provider, not a substitute for checking bindings and
-  paid behavior when another provider joins.
+- **Status:** `v0.2.164` is the completed fleet checkpoint, not the minimum
+  client/provider version. At `2026-09-03 00:58 CEST`, the designated `.29`
+  provider was observed on that exact release with one live route, 262,144
+  served context, and `fiat,tap,tnk`. Overlapping FIAT requests produced
+  independent final signed receipts and website billing completed. Run a
+  fresh `/v1/models` check before making any future liveness claim; this proof
+  does not replace bindings and paid checks when another provider joins.
 
 **Qwen 3.6 35B-A3B uncensored**
 - **Install/start:** `mayhem doctor --provider-backend vllm`, then
@@ -782,8 +784,8 @@ forwarded as-is.
 
 | Goal | Command |
 |---|---|
-| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.162 && ./install.sh --from-source` |
-| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.162; .\install.ps1 -FromSource` |
+| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.164 && ./install.sh --from-source` |
+| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.164; .\install.ps1 -FromSource` |
 | Start user gateway | `mayhem up --rail <fiat\|tap\|tnk> --yes` |
 | Start provider | `mayhem up --provider --yes` |
 | Stop and leave provider registrations | `mayhem down` |

@@ -352,7 +352,7 @@ executable version is not release-pinned, so this document does not invent one.
 
 | Exact model ID | Class | Canonical backend/artifact | Tier floor/fallback | Catalog RAM | Full-offload guidance | Download |
 |---|---|---|---|---:|---:|---:|
-| `Qwen/Qwen3.8-27B` | Text generation | vLLM / NVFP4 | Tier 1; live paid FIAT and website proof | 48 GiB | 24 GiB NVIDIA | 23,114,056,343 B (21.52 GiB) |
+| `Qwen/Qwen3.8-27B` | Text generation | vLLM / NVFP4 | Tier 1 floor; Tier-1/Tier-2 markets published | 48 GiB | 24 GiB NVIDIA | 23,114,056,343 B (21.52 GiB) |
 | `hauhaucs/qwen3.6-35b-a3b-uncensored` | Text generation | vLLM / NVFP4 | Tier 1; use highest proved tier | 48 GiB | 24 GiB NVIDIA | 23,374,279,873 B (21.77 GiB) |
 | `google/gemma-4-E4B-it` | Text generation | llama.cpp / Q4_K_M GGUF | Tier 1; use highest proved tier; cataloged, not owned-fleet served | 12 GiB | 8 GiB | 6,326,841,504 B (5.89 GiB) |
 | `tongyi/z-image-turbo` | Image generation | stable-diffusion.cpp / Q4_K GGUF | Tier 1; use highest proved tier | 16 GiB | 8 GiB | 6,696,835,812 B (6.24 GiB) |
@@ -377,11 +377,14 @@ additional disk and memory headroom.
 ## Qwen 3.8 27B NVFP4
 
 Current status: signed catalog entry, `.29` technical calibration, paid FIAT
-receipts, confirmed live route, and website billing proof are retained.
+receipts, retained paid launch proof, designated persistent `.29` provider,
+website billing proof, and the full `0.2.164` fleet rollout are complete.
 
 **Selector and source**
 
-- Model: `Qwen/Qwen3.8-27B`; minimum Mayhem version `0.2.161`.
+- Model: `Qwen/Qwen3.8-27B`; operational Mayhem minimum `0.2.161`. Catalog
+  version 51 publishes that minimum; `v0.2.164` is the completed fleet
+  checkpoint, not the minimum client/provider version.
 - Canonical provenance:
   `Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`.
 - Backend/artifact: `vllm` / `nvfp4`. The approved upstream artifact is
@@ -416,7 +419,7 @@ receipts, confirmed live route, and website billing proof are retained.
   streaming, `thinking_mode`, `thinking_history`, and low/medium/xhigh
   `reasoning_effort` are calibrated.
 
-**Measured `.29` guidance**
+**Retained `.29` measurements (non-normative)**
 
 - Two text-only requests genuinely overlapped at full 262,144-token context
   with vLLM scheduler capacity `2`, BF16 compute, FP8 KV, and

@@ -83,7 +83,7 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.162` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.164` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -92,7 +92,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.162
+git checkout --detach v0.2.164
 ./install.sh --from-source
 ```
 
@@ -101,7 +101,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.162
+git checkout --detach v0.2.164
 .\install.ps1 -FromSource
 ```
 
@@ -778,11 +778,13 @@ Attestation tiers describe what trust evidence a provider has. They don't all me
 
 The model catalog is signed and canonical: `mayhem models` reads the ledger anchor and verifies the signed catalog release, so you always discover current models without requiring a repo update. Providers opt into canonical enclaves the network operator creates — they do not set prices, create canonical rooms, or submit arbitrary models — which is what keeps every listed model a verified, hash-pinned artifact instead of a claim.
 
-The launch roster is being onboarded model by model right now; `mayhem models --gateway` is always the live truth. The table below lists the launch set in onboarding order, newest live model on top. Status moves to **live** as each model finishes calibration and its signed catalog entry is published.
+Qwen 3.8 onboarding is complete and further model onboarding is paused;
+`mayhem models --gateway` is always the live truth. The table below records the
+launch set and latest observed status rather than promising continuous liveness.
 
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
-| `Qwen/Qwen3.8-27B` | Multimodal LLM, NVFP4, tools/reasoning, 262K native context | C | **live** |
+| `Qwen/Qwen3.8-27B` | Multimodal LLM, NVFP4, tools/reasoning, 262K native context | C | **launched; observed live on `.29` at 2026-09-03 00:58 CEST** |
 | `video.lipsync` | Comfy workflow, LongCat Avatar talking-video lipsync | D | paid technical proof passed; quality-fit gap for action anime |
 | `upscale.diffusion` | Comfy workflow, SeedVR2 diffusion upscale/restore | A/B | **live** |
 | `upscale.conv.le24mp` | Comfy workflow, standalone 4x image upscale | A/B | **live** |
@@ -799,25 +801,25 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 | `google/gemma-4-E4B-it` | LLM, small + vision, laptop/CPU-friendly | A/B | cataloged — not served by the owned fleet |
 | `HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive` (`@nvfp4`) | LLM, uncensored, 262K ctx | C | **live** |
 | `Cactus-Compute/needle` | Deterministic tools-only specialist, 30.4M, CPU/CUDA | A | **live** |
-| `microsoft/Mage-Flow-Edit-Turbo` | Image editing from a reference image + instruction, 512–2048 native | B | onboarding — **next (⑩)** |
-| `microsoft/Mage-Flow-Turbo` | Image, 4-step, 512–2048 native resolution, any aspect ratio | B | onboarding — **next (⑩)** |
-| `deepreinforce-ai/Ornith-1.0-35B` | LLM, agentic MoE, 262K ctx — GGUF Q4 / MLX 4-bit / NVFP4 | B/C | onboarding — **⑪** |
-| `NousResearch/Hermes-3-Llama-3.1-70B` (`@mlx-4bit`) | LLM, 70B, 128K ctx | D | onboarding — ⑬ |
-| `openai/gpt-oss-20b` | LLM, agentic | B | onboarding |
-| `Qwen/Qwen3.6-35B-A3B` | LLM, MoE, 262K ctx | C | onboarding |
-| `mistralai/Devstral-Small-2-24B-Instruct-2512` | LLM, coding | C | onboarding |
-| `openai/gpt-oss-120b` | LLM, flagship | D | onboarding |
-| `HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive` | LLM, uncensored | B | onboarding |
-| `wepiqx/Qwythos-9B-Claude-Mythos-5-1M-MTP-SHQ8-GGUF` | LLM, 1M ctx, MTP | B | onboarding |
-| `baidu/Unlimited-OCR` | OCR, vision-language | A/B | onboarding |
-| `black-forest-labs/FLUX.2-klein-4B` | Image | B/C | onboarding |
-| `lodestones/Chroma1-HD` | Image, uncensored | C | onboarding |
-| `Qwen/Qwen-Image-2512` | Image, text rendering | C | onboarding |
-| `hexgrad/Kokoro-82M` | TTS (CPU-friendly) | A | onboarding |
-| `openai/whisper-large-v3-turbo` | ASR | A/B | onboarding |
-| `BAAI/bge-m3` | Embeddings (CPU-friendly) | A | onboarding |
-| `Qwen/Qwen3-Embedding-0.6B` | Embeddings (CPU-friendly) | A | onboarding |
-| `BAAI/bge-reranker-v2-m3` | Reranker (CPU-friendly) | A | onboarding |
+| `microsoft/Mage-Flow-Edit-Turbo` | Image editing from a reference image + instruction, 512–2048 native | B | planned — paused |
+| `microsoft/Mage-Flow-Turbo` | Image, 4-step, 512–2048 native resolution, any aspect ratio | B | planned — paused |
+| `deepreinforce-ai/Ornith-1.0-35B` | LLM, agentic MoE, 262K ctx — GGUF Q4 / MLX 4-bit / NVFP4 | B/C | retired — do not onboard |
+| `NousResearch/Hermes-3-Llama-3.1-70B` (`@mlx-4bit`) | LLM, 70B, 128K ctx | D | planned — paused |
+| `openai/gpt-oss-20b` | LLM, agentic | B | planned — paused |
+| `Qwen/Qwen3.6-35B-A3B` | LLM, MoE, 262K ctx | C | planned — paused |
+| `mistralai/Devstral-Small-2-24B-Instruct-2512` | LLM, coding | C | planned — paused |
+| `openai/gpt-oss-120b` | LLM, flagship | D | planned — paused |
+| `HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive` | LLM, uncensored | B | planned — paused |
+| `wepiqx/Qwythos-9B-Claude-Mythos-5-1M-MTP-SHQ8-GGUF` | LLM, 1M ctx, MTP | B | planned — paused |
+| `baidu/Unlimited-OCR` | OCR, vision-language | A/B | planned — paused |
+| `black-forest-labs/FLUX.2-klein-4B` | Image | B/C | planned — paused |
+| `lodestones/Chroma1-HD` | Image, uncensored | C | planned — paused |
+| `Qwen/Qwen-Image-2512` | Image, text rendering | C | planned — paused |
+| `hexgrad/Kokoro-82M` | TTS (CPU-friendly) | A | planned — paused |
+| `openai/whisper-large-v3-turbo` | ASR | A/B | planned — paused |
+| `BAAI/bge-m3` | Embeddings (CPU-friendly) | A | planned — paused |
+| `Qwen/Qwen3-Embedding-0.6B` | Embeddings (CPU-friendly) | A | planned — paused |
+| `BAAI/bge-reranker-v2-m3` | Reranker (CPU-friendly) | A | planned — paused |
 
 Class = smallest machine class that serves it well: **A** CPU/laptop, **B** consumer GPU 8–12GB, **C** enthusiast GPU 16–24GB, **D** pro 48–80GB or big-memory Apple Silicon. Many models ship multiple artifacts (GGUF for llama.cpp, MLX for Apple Silicon, NVFP4 for Blackwell), so the same model can serve from very different hardware. Most launch models are Apache, MIT, or CC-BY licensed; models under a vendor license (Gemma, Llama, LTX-2) carry that license in their signed catalog entry. Larger flagships join after launch as capable hardware comes online.
 
@@ -828,6 +830,7 @@ artifact derived from
 Its native ceiling is 262,144 tokens with no YaRN, MLX, GGUF, or alternate
 quant path. The `.29` proof ran two overlapping full-context text requests,
 but that is measured host evidence, not a network-wide capacity of `2`.
+The completed fleet rollout checkpoint is `v0.2.164`.
 Concurrent dispatch is enabled only when the exact artifact's signed profile
 opts into `independent_dispatch` for the request modality. Each provider then
 derives context-dependent capacity from its own hwprobe result, configured
@@ -1069,7 +1072,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.162` is source-only. The GitHub release contains the tagged source, not
+`v0.2.164` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -1077,7 +1080,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.162
+git checkout --detach v0.2.164
 ./install.sh --from-source
 ```
 
@@ -1086,7 +1089,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.162
+git checkout --detach v0.2.164
 .\install.ps1 -FromSource
 ```
 

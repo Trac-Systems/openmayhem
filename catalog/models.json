@@ -37630,7 +37630,7 @@
         }
       },
       "tier": "launch",
-      "min_app_version": "0.2.159"
+      "min_app_version": "0.2.161"
     }
   ],
   "schema_version": 1,
