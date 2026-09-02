@@ -72042,6 +72042,18 @@ fn provider_vllm_generation_execution_capacity(
     let scheduler_capacity = enclave_max_batch_size(caps)?
         .unwrap_or(provider_capacity)
         .max(1);
+    let utilization = provider_vllm_memory_utilization_for_feasibility(
+        caps,
+        feasibility,
+        args.vllm_memory_utilization,
+    )?;
+    let allocation_bytes = u64::try_from(
+        u128::from(feasibility.memory_budget.total_bytes)
+            .saturating_mul(u128::from(utilization.target_pct))
+            / 100,
+    )
+    .unwrap_or(u64::MAX)
+    .min(feasibility.memory_budget.budget_bytes);
     let static_bytes = feasibility
         .estimated_required_bytes
         .saturating_sub(feasibility.estimated_kv_bytes);
@@ -72049,11 +72061,7 @@ fn provider_vllm_generation_execution_capacity(
         u32::MAX
     } else {
         u32::try_from(
-            feasibility
-                .memory_budget
-                .budget_bytes
-                .saturating_sub(static_bytes)
-                / feasibility.estimated_kv_bytes,
+            allocation_bytes.saturating_sub(static_bytes) / feasibility.estimated_kv_bytes,
         )
         .unwrap_or(u32::MAX)
         .max(1)
@@ -72145,13 +72153,25 @@ fn provider_vllm_memory_utilization(
     selected: &ProviderCandidate,
     local_target_pct: Option<u32>,
 ) -> Result<VllmMemoryUtilizationPlan> {
-    let total_bytes = selected.feasibility.memory_budget.total_bytes;
+    provider_vllm_memory_utilization_for_feasibility(
+        &selected.enclave.caps,
+        &selected.feasibility,
+        local_target_pct,
+    )
+}
+
+fn provider_vllm_memory_utilization_for_feasibility(
+    caps: &Value,
+    feasibility: &ProviderCtxFeasibility,
+    local_target_pct: Option<u32>,
+) -> Result<VllmMemoryUtilizationPlan> {
+    let total_bytes = feasibility.memory_budget.total_bytes;
     ensure!(
         total_bytes > 0,
         "cannot derive vLLM memory utilization without a non-zero accelerator memory total"
     );
-    let required_bytes = selected.feasibility.estimated_required_bytes;
-    let budget_bytes = selected.feasibility.memory_budget.budget_bytes;
+    let required_bytes = feasibility.estimated_required_bytes;
+    let budget_bytes = feasibility.memory_budget.budget_bytes;
     ensure!(
         required_bytes <= budget_bytes,
         "vLLM model and context require {}, exceeding the usable memory budget {}",
@@ -72172,7 +72192,7 @@ fn provider_vllm_memory_utilization(
     if next_budget_pct <= 100 && next_budget_bytes <= budget_bytes {
         budget_pct = next_budget_pct;
     }
-    let admin_max_pct = enclave_vllm_gpu_memory_utilization_pct(&selected.enclave.caps)?;
+    let admin_max_pct = enclave_vllm_gpu_memory_utilization_pct(caps)?;
     let max_pct = budget_pct
         .min(admin_max_pct)
         .min(VLLM_ADMIN_MEMORY_UTILIZATION_MAX_PCT);
@@ -104618,6 +104638,57 @@ status: linked
         assert!(provider_vllm_memory_utilization(&selected, None).is_err());
         selected.enclave.caps = json!({ "vllm_gpu_memory_utilization_pct": 91 });
         assert!(provider_vllm_memory_utilization(&selected, None).is_err());
+    }
+
+    #[test]
+    fn vllm_generation_capacity_uses_the_admitted_allocation() {
+        let mut selected =
+            test_auto_fit_candidate('f', "test/vllm-concurrent", "text", 34, 102, 1, 30.0);
+        selected.enclave.backend = "vllm".to_owned();
+        selected.artifact.engine = "vllm".to_owned();
+        selected.enclave.caps = json!({});
+        selected.verdict.backend = "vllm".to_owned();
+        selected.verdict.max_sessions = 9;
+        selected.feasibility.memory_budget.total_bytes = 120 * GIB_BYTES;
+        selected.feasibility.memory_budget.budget_bytes = 102 * GIB_BYTES;
+        selected.feasibility.estimated_required_bytes = 34 * GIB_BYTES;
+        selected.feasibility.estimated_kv_bytes = 8 * GIB_BYTES;
+
+        let profile = catalog::CatalogGenerationExecutionProfile {
+            schema_version: 1,
+            engine: "vllm".to_owned(),
+            independent_dispatch: true,
+            request_modalities: vec![vec!["text".to_owned()]],
+            proof_sha256: "ab".repeat(32),
+        };
+        let mut args = test_provider_start_args();
+        args.vllm_memory_utilization = Some(40);
+
+        let capacity = provider_vllm_generation_execution_capacity(
+            &selected.artifact,
+            Some(&profile),
+            &selected.enclave.caps,
+            &selected.verdict,
+            &args,
+            &selected.feasibility,
+        )
+        .unwrap();
+        assert_eq!(capacity, 2);
+
+        reserve_provider_generation_execution_memory(&mut selected.feasibility, capacity).unwrap();
+        assert_eq!(
+            selected.feasibility.estimated_required_bytes,
+            42 * GIB_BYTES
+        );
+        assert_eq!(selected.feasibility.estimated_kv_bytes, 16 * GIB_BYTES);
+        assert_eq!(
+            provider_vllm_memory_utilization(&selected, Some(40)).unwrap(),
+            VllmMemoryUtilizationPlan {
+                target_pct: 40,
+                floor_pct: 35,
+                max_pct: 85,
+            }
+        );
     }
 
     #[test]

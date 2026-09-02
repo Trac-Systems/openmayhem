@@ -83,7 +83,7 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.108` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.160` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -92,7 +92,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.108
+git checkout --detach v0.2.160
 ./install.sh --from-source
 ```
 
@@ -101,7 +101,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.108
+git checkout --detach v0.2.160
 .\install.ps1 -FromSource
 ```
 
@@ -782,6 +782,7 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 
 | Model | Category | Class | Status |
 |-------|----------|-------|--------|
+| `Qwen/Qwen3.8-27B` | Multimodal LLM, NVFP4, tools/reasoning, 262K native context | C | cataloged; `.29` technical overlap proof passed; paid/live proof pending |
 | `video.lipsync` | Comfy workflow, LongCat Avatar talking-video lipsync | D | paid technical proof passed; quality-fit gap for action anime |
 | `upscale.diffusion` | Comfy workflow, SeedVR2 diffusion upscale/restore | A/B | **live** |
 | `upscale.conv.le24mp` | Comfy workflow, standalone 4x image upscale | A/B | **live** |
@@ -819,6 +820,21 @@ The launch roster is being onboarded model by model right now; `mayhem models --
 | `BAAI/bge-reranker-v2-m3` | Reranker (CPU-friendly) | A | onboarding |
 
 Class = smallest machine class that serves it well: **A** CPU/laptop, **B** consumer GPU 8–12GB, **C** enthusiast GPU 16–24GB, **D** pro 48–80GB or big-memory Apple Silicon. Many models ship multiple artifacts (GGUF for llama.cpp, MLX for Apple Silicon, NVFP4 for Blackwell), so the same model can serve from very different hardware. Most launch models are Apache, MIT, or CC-BY licensed; models under a vendor license (Gemma, Llama, LTX-2) carry that license in their signed catalog entry. Larger flagships join after launch as capable hardware comes online.
+
+Qwen 3.8 requires Mayhem `0.2.159` or newer and uses only the pinned
+`HivenetQuant/Qwen3.8-27B-NVFP4@cd5a8f0739c1df89d8cd9d39ede58c619d8298c2`
+artifact derived from
+`Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`.
+Its native ceiling is 262,144 tokens with no YaRN, MLX, GGUF, or alternate
+quant path. The `.29` proof ran two overlapping full-context text requests,
+but that is measured host evidence, not a network-wide capacity of `2`.
+Concurrent dispatch is enabled only when the exact artifact's signed profile
+opts into `independent_dispatch` for the request modality. Each provider then
+derives context-dependent capacity from its own hwprobe result, configured
+limits, usable memory and KV requirement, and vLLM runtime KV capacity, and
+advertises that value through heartbeats. Image/video requests are not in the
+current independent-dispatch profile. No retained paid request, receipt, live
+route, or website billing proof exists yet, so the model is not marked live.
 
 **Routes:**
 
@@ -1047,7 +1063,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.108` is source-only. The GitHub release contains the tagged source, not
+`v0.2.160` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -1055,7 +1071,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.108
+git checkout --detach v0.2.160
 ./install.sh --from-source
 ```
 
@@ -1064,7 +1080,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.108
+git checkout --detach v0.2.160
 .\install.ps1 -FromSource
 ```
 

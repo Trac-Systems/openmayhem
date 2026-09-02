@@ -352,6 +352,7 @@ executable version is not release-pinned, so this document does not invent one.
 
 | Exact model ID | Class | Canonical backend/artifact | Tier floor/fallback | Catalog RAM | Full-offload guidance | Download |
 |---|---|---|---|---:|---:|---:|
+| `Qwen/Qwen3.8-27B` | Text generation | vLLM / NVFP4 | Tier 1; cataloged, paid/live proof pending | 48 GiB | 24 GiB NVIDIA | 23,114,056,343 B (21.52 GiB) |
 | `hauhaucs/qwen3.6-35b-a3b-uncensored` | Text generation | vLLM / NVFP4 | Tier 1; use highest proved tier | 48 GiB | 24 GiB NVIDIA | 23,374,279,873 B (21.77 GiB) |
 | `google/gemma-4-E4B-it` | Text generation | llama.cpp / Q4_K_M GGUF | Tier 1; use highest proved tier; cataloged, not owned-fleet served | 12 GiB | 8 GiB | 6,326,841,504 B (5.89 GiB) |
 | `tongyi/z-image-turbo` | Image generation | stable-diffusion.cpp / Q4_K GGUF | Tier 1; use highest proved tier | 16 GiB | 8 GiB | 6,696,835,812 B (6.24 GiB) |
@@ -372,6 +373,87 @@ executable version is not release-pinned, so this document does not invent one.
 The RAM and full-offload columns are catalog admission/guidance fields. Model
 weights, runtime environments, caches, outputs, and build artifacts require
 additional disk and memory headroom.
+
+## Qwen 3.8 27B NVFP4
+
+Current status: signed catalog entry and `.29` technical calibration are
+present; paid OpenMayhem, confirmed live-route, and website billing proof are
+not retained. Do not report this model as paid-proven or live yet.
+
+**Selector and source**
+
+- Model: `Qwen/Qwen3.8-27B`; minimum Mayhem version `0.2.159`.
+- Canonical provenance:
+  `Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`.
+- Backend/artifact: `vllm` / `nvfp4`. The approved upstream artifact is
+  `HivenetQuant/Qwen3.8-27B-NVFP4@cd5a8f0739c1df89d8cd9d39ede58c619d8298c2`;
+  the canonical byte mirror is
+  `TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4@4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94`.
+- Artifact root:
+  `36abadf4a7aa1ac3b60abc57bda718c3329cf3ad69fb9dfca13a5384c32c6f11`.
+  The primary shard plus 17 signed weight/runtime sidecars total exactly
+  23,114,056,343 bytes. Only complete hash- and Merkle-verified safetensors
+  from the canonical mirror are eligible.
+- Canary:
+  [`canary-qwen3.8-27b-nvfp4-v1.json`](catalog/canaries/canary-qwen3.8-27b-nvfp4-v1.json),
+  `token_fingerprint`, `match_min=0.9`, with 14 cases.
+
+**Hard requirements and surface**
+
+- Linux NVIDIA Blackwell is the documented serving path; compute capability
+  must be at least 12.0. Catalog floors are 48 GiB RAM, 24 GiB NVIDIA dedicated
+  or unified memory, and AVX2 or NEON. CPU, Apple Metal, AMD, pre-Blackwell
+  NVIDIA, Windows, MLX, GGUF, and alternate quants are not eligible.
+- The managed runtime is vLLM `0.24.0` with BF16 compute and artifact-scoped
+  FP8 KV. The native context ceiling is exactly 262,144 tokens; there is no
+  YaRN extension. Providers may advertise a smaller fitting native context,
+  but only the `le8k`, `le32k`, `le128k`, and `le256k` brackets apply through
+  this ceiling.
+- The catalog reference rate is `$0.05` per million input tokens and `$0.35`
+  per million output tokens. Current bracket prices and routes come only from
+  the live ledger; the reference rate does not prove their publication.
+- Endpoints are OpenAI chat completions, completions, responses, and HF
+  multimodal chat. Input is text, image, or video; output is text. JSON, tools,
+  streaming, `thinking_mode`, `thinking_history`, and low/medium/xhigh
+  `reasoning_effort` are calibrated.
+
+**Measured `.29` guidance**
+
+- Two text-only requests genuinely overlapped at full 262,144-token context
+  with vLLM scheduler capacity `2`, BF16 compute, FP8 KV, and
+  `max_num_batched_tokens=2048`. Proof SHA-256:
+  `3fbab1e8f6fed5d8b5e393e958edebef20544346d07ae66a0d68a7c8e59114fd`.
+- The 1-megapixel image and 16-frame video calibration used NVIDIA unified
+  memory with a 15% (`17.35 GiB`) reserve and a `98.32 GiB` F13 budget.
+  Process-tree RSS was about `5.435 GiB`; measured working sets were `12 MiB`
+  for image and `9.19 MiB` for video. RSS excludes accelerator allocations and
+  does not replace the catalog admission floors.
+- No retained prefill/decode throughput values or paid session/receipt are in
+  the repository. Do not infer or advertise them from the overlap pass.
+
+**Independent dispatch and capacity**
+
+`independent_dispatch` is opt-in through the signed generation execution
+profile for this exact artifact root, and currently covers only the exact
+text-only modality set. Image/video requests remain exclusive. Without a
+matching profile, vLLM serving remains serial. For an opted-in provider,
+Mayhem derives context-dependent capacity from hwprobe, the provider/operator
+session limit, usable memory after reserves and claims, per-session KV memory,
+any signed scheduler ceiling, and vLLM's runtime KV capacity; it advertises the
+derived maximum and active load in heartbeats. The `.29` value `2` is evidence
+for `.29`, not a hardcoded canonical ceiling or a default for other machines.
+
+**Start**
+
+```bash
+mayhem doctor --provider-backend vllm
+mayhem up --provider --provider-enclave Qwen/Qwen3.8-27B --yes
+```
+
+Do not substitute another Qwen checkpoint, quantization, runtime, or local
+weights. A green local start is still not paid/live proof; verify the selected
+rails and payout bindings, route visibility, paid request, usage, and final
+receipt before changing that status.
 
 ## Qwen 3.6 35B-A3B uncensored
 

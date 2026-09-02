@@ -40,6 +40,55 @@ A non-Comfy model is calibrated only after:
   architecture, and platform limitations are recorded in
   [`MODEL-CHEATSHEET.md`](MODEL-CHEATSHEET.md).
 
+### Qwen 3.8 27B NVFP4 current evidence
+
+Qwen 3.8 is cataloged in release `0.2.159` as the exact model
+`Qwen/Qwen3.8-27B`. Canonical provenance is
+`Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`; the only
+cataloged serving artifact is
+`HivenetQuant/Qwen3.8-27B-NVFP4@cd5a8f0739c1df89d8cd9d39ede58c619d8298c2`,
+mirrored byte-for-byte as
+`TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4@4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94`.
+It uses vLLM `0.24.0`, BF16 compute, artifact-scoped FP8 KV, safetensors, and
+the native 262,144-token ceiling. No YaRN extension, MLX, GGUF, CPU fallback,
+or alternative quantization is calibrated or cataloged.
+
+The retained `.29` technical calibration records:
+
+- functional token-fingerprint evidence for deterministic text, tools,
+  structured JSON, low/medium/xhigh reasoning, thinking controls, image and
+  video understanding, and sampling boundaries;
+- a 1-megapixel image and 16-frame video run on NVIDIA unified memory with a
+  15% (`17.35 GiB`) reserve and a `98.32 GiB` F13 memory budget; process-tree
+  RSS was about `5.435 GiB`, with `12 MiB` image and `9.19 MiB` video working
+  sets. These RSS observations exclude accelerator allocations and are not
+  portable RAM/VRAM minima or a total-headroom claim;
+- two genuinely overlapping text-only requests at the full 262,144-token
+  context with vLLM scheduler capacity `2`, BF16 compute, FP8 KV, and
+  `max_num_batched_tokens=2048`. The retained concurrency proof SHA-256 is
+  `3fbab1e8f6fed5d8b5e393e958edebef20544346d07ae66a0d68a7c8e59114fd`.
+
+Concurrency is an explicit signed opt-in, not a model-wide assumption. The
+generation execution profile is bound to artifact root
+`36abadf4a7aa1ac3b60abc57bda718c3329cf3ad69fb9dfca13a5384c32c6f11`,
+sets `independent_dispatch: true`, and authorizes only the exact `text`
+request-modality set. Requests outside that profile remain exclusive. Each
+provider derives its own context-dependent capacity from hwprobe, its local
+and operator session limits, its usable memory after reserves and claims, the
+per-session KV requirement, any signed scheduler ceiling, and vLLM's reported
+KV capacity. Heartbeats advertise that provider-derived capacity and current
+load. The `.29` result proves that machine sustained two sessions; `2` is not
+a canonical limit, default, promise, or value to copy to another provider.
+
+This evidence is not a completed paid/live launch proof. The repository does
+not retain Qwen 3.8 prefill/decode throughput values, a paid OpenMayhem session
+and receipt, a confirmed live route, or website billing proof. Do not invent
+those values or describe Qwen 3.8 as paid-proven, permanently serving, or live
+until the native-provider, paid gateway, rail/binding, receipt, and production
+checks are retained. Its 262,144-token ceiling requires `le8k`, `le32k`,
+`le128k`, and `le256k` ledger price brackets; the live ledger, not this file or
+the catalog reference rate, proves their publication.
+
 ## Comfy Workflow Calibration
 
 A Comfy workflow is calibrated only after all gates below pass:

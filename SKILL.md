@@ -98,14 +98,14 @@ aggregate admission refusal or compensate with an undocumented memory override.
 ## 3. Install
 
 ### 3.1 Get the code — exact source release (MANDATORY rule)
-- `v0.2.108` is source-only. Never invent or offer a native archive URL: the release has no unsigned
+- `v0.2.160` is source-only. Never invent or offer a native archive URL: the release has no unsigned
   OpenMayhem executable assets. Clone the exact release tag and build it locally.
 
   **macOS/Linux:**
   ```bash
   git clone https://github.com/Trac-Systems/openmayhem.git
   cd openmayhem
-  git checkout --detach v0.2.108
+  git checkout --detach v0.2.160
   ./install.sh --from-source
   ```
 
@@ -113,7 +113,7 @@ aggregate admission refusal or compensate with an undocumented memory override.
   ```powershell
   git clone https://github.com/Trac-Systems/openmayhem.git
   Set-Location openmayhem
-  git checkout --detach v0.2.108
+  git checkout --detach v0.2.160
   .\install.ps1 -FromSource
   ```
 On updated source checkouts, `mayhem up` verifies and, when needed, deterministically repairs only
@@ -396,6 +396,7 @@ its managed runtime only. The exact model/artifact/enclave fit is decided by the
 
 | Exact selector | Doctor backend | Canonical artifact | Supported execution | Catalog minimum | Gateway endpoints |
 |---|---|---|---|---|---|
+| `Qwen/Qwen3.8-27B` | `vllm` | `nvfp4` / vLLM safetensors | Linux NVIDIA Blackwell; compute capability >= 12.0; signed independent dispatch is text-only | 48 GiB RAM, 24 GiB NVIDIA dedicated or unified memory, AVX2 or NEON; Mayhem >= 0.2.159 | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/hf-inference/models/<model-id>` |
 | `hauhaucs/qwen3.6-35b-a3b-uncensored` | `vllm` | `nvfp4` / vLLM safetensors | Current documented path is Linux NVIDIA; CLI rejects Windows; artifact requires compute capability >= 12.0 | 48 GiB RAM, 24 GiB NVIDIA dedicated or unified memory, AVX2 or NEON | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/hf-inference/models/<model-id>` |
 | `google/gemma-4-E4B-it` | `llama.cpp` | `gguf-q4_k_m` + mandatory BF16 projector | Linux/Windows/macOS CPU; CUDA, Metal, or Vulkan when the installed Mayhem build has that feature | 12 GiB RAM, 8 GiB VRAM for full offload, AVX2 or NEON | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/hf-inference/models/<model-id>` |
 | `tongyi/z-image-turbo` | `stable-diffusion.cpp` | `gguf-q4_k` + text encoder + VAE | Linux/Windows/macOS CPU fallback; CUDA, Metal, ROCm, or Vulkan selected from hwprobe when the matching `sd-cli`/`sd-server` build is installed | 16 GiB RAM, 8 GiB VRAM for full offload; no catalog CPU-flag floor | `/v1/images/generations`, `/hf-inference/models/<model-id>` |
@@ -431,6 +432,49 @@ price exists. `mayhem up` is the authoritative model check. On success its provi
 `Provider start complete: heartbeats flowing.` Final health requires `ok=true`, at least one active
 serve, `heartbeat.live=true`, `gateway.ok=true`, `gateway.route_count>0`, and this model/provider in
 `/v1/models`.
+
+**Qwen 3.8 27B NVFP4**
+- **Install/start:** require Mayhem `0.2.159` or newer, run
+  `mayhem doctor --provider-backend vllm`, then
+  `mayhem up --provider --provider-enclave Qwen/Qwen3.8-27B --yes`.
+- **Exact pins:** canonical model
+  `Qwen/Qwen3.8-27B@1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`; approved NVFP4
+  source
+  `HivenetQuant/Qwen3.8-27B-NVFP4@cd5a8f0739c1df89d8cd9d39ede58c619d8298c2`;
+  canonical byte mirror
+  `TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4@4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94`;
+  artifact root
+  `36abadf4a7aa1ac3b60abc57bda718c3329cf3ad69fb9dfca13a5384c32c6f11`.
+  Use only its complete hash-verified safetensors payload. Do not use YaRN,
+  MLX, GGUF, another quant, or a local checkpoint.
+- **Surface:** vLLM `0.24.0`, BF16 compute, artifact-scoped FP8 KV, native
+  262,144-token ceiling, text output, text/image/video input, JSON, tools,
+  streaming, thinking controls, and low/medium/xhigh reasoning. Required
+  context brackets through the ceiling are `le8k`, `le32k`, `le128k`, and
+  `le256k`; use live ledger prices, never the catalog reference rate as proof
+  that a bracket is active.
+- **Measured `.29` evidence:** two text-only requests overlapped at full
+  262,144-token context with scheduler capacity `2` and
+  `max_num_batched_tokens=2048`. Proof SHA-256 is
+  `3fbab1e8f6fed5d8b5e393e958edebef20544346d07ae66a0d68a7c8e59114fd`.
+  A 1-megapixel image and 16-frame video calibration used a 15% (`17.35 GiB`)
+  unified-memory reserve and `98.32 GiB` F13 budget; process-tree RSS was about
+  `5.435 GiB`, excluding accelerator allocations. No retained prefill/decode
+  rates or paid session/receipt exist; never invent or imply them.
+- **Concurrency:** `independent_dispatch` is a signed, artifact-root-bound
+  opt-in and currently authorizes only the exact text-only modality set.
+  Image/video requests remain exclusive, and artifacts without a matching
+  profile remain serial. Mayhem derives the provider's context-dependent
+  capacity from hwprobe, local/operator session limits, usable memory after
+  reserves and claims, per-session KV memory, any signed scheduler ceiling,
+  and vLLM's runtime KV capacity, then reports it in heartbeats. The `.29`
+  result `2` is not a hardcoded model limit or a value to copy elsewhere.
+- **Status:** the signed catalog and `.29` technical evidence do not prove a
+  paid or live route. Do not report Qwen 3.8 as live until provider health and
+  route visibility are green, the chosen rails have verified payout bindings,
+  and a paid request, usage, final receipt/ACK, and website billing check are
+  retained. The `.29` onboarding target is `fiat,tap,tnk`, but verify each
+  binding instead of claiming all three are active.
 
 **Qwen 3.6 35B-A3B uncensored**
 - **Install/start:** `mayhem doctor --provider-backend vllm`, then
@@ -732,8 +776,8 @@ forwarded as-is.
 
 | Goal | Command |
 |---|---|
-| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.108 && ./install.sh --from-source` |
-| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.108; .\install.ps1 -FromSource` |
+| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.160 && ./install.sh --from-source` |
+| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.160; .\install.ps1 -FromSource` |
 | Start user gateway | `mayhem up --rail <fiat\|tap\|tnk> --yes` |
 | Start provider | `mayhem up --provider --yes` |
 | Stop and leave provider registrations | `mayhem down` |
