@@ -16,6 +16,8 @@ const DEFAULT_OPEN_RETRY_MAX = 5;
 const DEFAULT_OPEN_RETRY_BASE_MS = 100;
 const DEFAULT_OPEN_RETRY_RESET_MS = 2_000;
 const DEFAULT_FLUSH_TIMEOUT_MS = 10_000;
+const DEFAULT_ANNOUNCE_RETRY_DELAY_MS = 1_000;
+const MAX_ANNOUNCE_RETRY_DELAY_MS = 30_000;
 const DEFAULT_DIRECT_CONNECT_MAX_WAIT_MS = 120_000;
 const DEFAULT_DIRECT_CONNECT_POLL_MS = 100;
 const DEFAULT_MAX_CHANNELS = 1024;
@@ -101,6 +103,8 @@ class Sidechannel extends Feature {
     this._startGeneration = 0;
     this._connectionListenerAttached = false;
     this._dhtBootPromise = null;
+    this._announceRetryTimer = null;
+    this._announceRetryFailures = 0;
     this.onMessage = typeof config.onMessage === 'function' ? config.onMessage : null;
     this.debug = config.debug === true;
     this.muxRetryMax = safeIntegerOr(config.muxRetryMax, DEFAULT_MUX_RETRY_MAX);
@@ -123,6 +127,11 @@ class Sidechannel extends Feature {
     this.flushTimeoutMs = safeIntegerOr(
       config.flushTimeoutMs,
       DEFAULT_FLUSH_TIMEOUT_MS,
+      { min: 1 }
+    );
+    this.announceRetryDelayMs = safeIntegerOr(
+      config.announceRetryDelayMs,
+      DEFAULT_ANNOUNCE_RETRY_DELAY_MS,
       { min: 1 }
     );
     this.directConnectMaxWaitMs = safeIntegerOr(
@@ -1123,7 +1132,7 @@ class Sidechannel extends Feature {
     return new Promise((resolve) => entry._announceWaiters.push(resolve));
   }
 
-  async _announceChannels(entries) {
+  async _announceChannels(entries, generation = null) {
     if (!this.peer?.swarm) return entries.map(() => false);
     const fresh = entries.filter((entry) => (
       entry &&
@@ -1150,10 +1159,14 @@ class Sidechannel extends Feature {
           this._reportEventError(`announce ${fresh.length} sidechannel(s)`, error);
         }
         for (const entry of fresh) {
-          this._markAnnounced(
-            entry,
-            ok && entry.swarmJoined && this.channels.get(entry.name) === entry
-          );
+          if (
+            ok &&
+            entry.swarmJoined &&
+            this.channels.get(entry.name) === entry &&
+            (generation === null || generation === this._startGeneration)
+          ) {
+            this._markAnnounced(entry, true);
+          }
         }
       })();
       for (const entry of fresh) entry._announcing = batch;
@@ -1178,6 +1191,44 @@ class Sidechannel extends Feature {
 
   _announceChannel(entry) {
     return this._announceChannels([entry]).then(([announced]) => announced);
+  }
+
+  _scheduleAnnouncementRetry(generation) {
+    if (
+      this._announceRetryTimer !== null ||
+      generation !== this._startGeneration ||
+      !this.started
+    ) return;
+
+    const delay = Math.min(
+      this.announceRetryDelayMs * (2 ** Math.min(this._announceRetryFailures, 5)),
+      MAX_ANNOUNCE_RETRY_DELAY_MS
+    );
+    this._announceRetryTimer = setTimeout(async () => {
+      this._announceRetryTimer = null;
+      if (generation !== this._startGeneration || !this.started) return;
+
+      const pending = Array.from(this.channels.values()).filter(
+        (entry) => !entry.announced && !entry._announcing
+      );
+      if (pending.length === 0) {
+        this._announceRetryFailures = 0;
+        return;
+      }
+
+      try {
+        const announced = await this._announceChannels(pending, generation);
+        if (generation !== this._startGeneration || !this.started) return;
+        if (announced.every(Boolean)) {
+          this._announceRetryFailures = 0;
+          return;
+        }
+      } catch (error) {
+        this._reportEventError('retry sidechannel announcements', error);
+      }
+      this._announceRetryFailures += 1;
+      this._scheduleAnnouncementRetry(generation);
+    }, delay);
   }
 
   _sendWelcome(record, entry, connection) {
@@ -1906,24 +1957,26 @@ class Sidechannel extends Feature {
     const initialFlushed = await this._flushSwarm('startup swarm flush');
     if (generation !== this._startGeneration) return false;
     for (const entry of initial) {
-      if (this.channels.get(entry.name) === entry) {
-        this._markAnnounced(entry, initialFlushed && entry.swarmJoined);
+      if (initialFlushed && this.channels.get(entry.name) === entry && entry.swarmJoined) {
+        this._markAnnounced(entry, true);
       }
     }
-    if (!initialFlushed) throw new Error('Sidechannel startup could not confirm channel discovery.');
-    this.started = true;
 
-    const stragglers = [];
-    for (const entry of this.channels.values()) {
-      if (!entry.announced && !entry._announcing) stragglers.push(entry);
-    }
-    if (stragglers.length > 0) {
-      const announced = await this._announceChannels(stragglers);
-      if (generation !== this._startGeneration) return false;
-      if (announced.some((ok) => !ok)) {
-        this.started = false;
-        throw new Error('Sidechannel startup could not confirm every joined channel.');
+    let retryNeeded = !initialFlushed;
+    if (initialFlushed) {
+      const stragglers = Array.from(this.channels.values()).filter(
+        (entry) => !entry.announced && !entry._announcing
+      );
+      if (stragglers.length > 0) {
+        const announced = await this._announceChannels(stragglers, generation);
+        if (generation !== this._startGeneration) return false;
+        retryNeeded = announced.some((ok) => !ok);
       }
+    }
+
+    this.started = true;
+    if (retryNeeded) {
+      this._scheduleAnnouncementRetry(generation);
     }
 
     if (this.peer.swarm.connections) {
@@ -1961,6 +2014,9 @@ class Sidechannel extends Feature {
     this._startPromise = null;
     this.started = false;
     this._dhtBootPromise = null;
+    if (this._announceRetryTimer !== null) clearTimeout(this._announceRetryTimer);
+    this._announceRetryTimer = null;
+    this._announceRetryFailures = 0;
     for (const entry of this.channels.values()) {
       const wasJoined = entry.swarmJoined === true;
       entry.swarmJoined = false;

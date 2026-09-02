@@ -278,16 +278,59 @@ test('removal during an announce flush leaves the already joined swarm topic', a
   assert.equal(sc.channels.has('doomed'), false);
 });
 
-test('a rejected announce flush never produces announced readiness', async () => {
-  const { swarm } = makeSwarm();
-  swarm.flush = async () => {
-    throw new Error('injected flush rejection');
-  };
-  const sc = makeSidechannel(swarm);
+test('an initial flush timeout is non-fatal and keeps the topic joined', async () => {
+  const { swarm, joined, left } = makeSwarm();
+  const sc = makeSidechannel(swarm, {
+    flushTimeoutMs: 5,
+    announceRetryDelayMs: 1_000,
+  });
 
-  await assert.rejects(sc.start(), /could not confirm channel discovery/i);
-  assert.equal(sc.started, false);
+  await sc.start();
+
+  assert.equal(sc.started, true, 'a transient flush timeout must not kill startup');
+  assert.equal(sc.channels.get('boot').swarmJoined, true);
+  assert.equal(sc.channels.get('boot').announced, false, 'timeout is not false confirmation');
+  assert.equal(joined.length, 1, 'the topic remains joined for discovery and connections');
+  assert.equal(left.length, 0, 'startup timeout must not leave the joined topic');
+
+  await sc.stop();
+});
+
+test('startup retries announcement and confirms it after a later flush succeeds', async () => {
+  const { swarm, joined } = makeSwarm();
+  let bootstrapCalls = 0;
+  swarm.dht = {
+    async fullyBootstrapped() {
+      bootstrapCalls += 1;
+    },
+  };
+  let flushCalls = 0;
+  swarm.flush = () => {
+    flushCalls += 1;
+    if (flushCalls === 1) return new Promise(() => {});
+    return Promise.resolve();
+  };
+  const sc = makeSidechannel(swarm, {
+    flushTimeoutMs: 5,
+    announceRetryDelayMs: 5,
+  });
+
+  await sc.start();
+  assert.equal(bootstrapCalls, 1, 'the timeout occurs after the DHT readiness barrier');
+  assert.equal(sc.started, true);
   assert.equal(sc.channels.get('boot').announced, false);
+
+  const deadline = Date.now() + 500;
+  while (!sc.channels.get('boot').announced && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+
+  assert.equal(flushCalls, 2, 'one bounded retry confirms the pending announcement');
+  assert.equal(joined.length, 1, 'reannounce flush does not duplicate swarm.join');
+  assert.equal(sc.channels.get('boot').announced, true);
+  assert.equal(sc.started, true);
+
+  await sc.stop();
 });
 
 test('a failed DHT bootstrap releases joins waiting for startup', async () => {
