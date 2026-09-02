@@ -873,6 +873,7 @@ class ScBridge extends Feature {
               type: 'joined',
               ...(channels.length === 1 ? { channel } : {}),
               channels,
+              announced: true,
             });
           })
           .catch((err) => {

@@ -39,6 +39,7 @@ const PEER_ACK_OPERATION_TYPE = '_trac_peer_ack_v1';
 const DEFAULT_TIMEOUT_MS = 0;
 const DEFAULT_RETRY_MS = 1_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
+const DEFAULT_RESULT_CONNECT_GRACE_MS = 25;
 const DEFAULT_RESULT_TIMEOUT_MS = 15_000;
 const DEFAULT_RESULT_WAIT_MAX_MS = 60_000;
 const DEFAULT_RESULT_POLL_MS = 50;
@@ -409,6 +410,10 @@ class MayhemFeature extends Feature {
       : this.timeoutMs > 0
         ? Math.min(this.timeoutMs, DEFAULT_CONNECT_TIMEOUT_MS)
         : DEFAULT_CONNECT_TIMEOUT_MS;
+    this.resultConnectGraceMs = Number.isSafeInteger(config.resultConnectGraceMs) &&
+      config.resultConnectGraceMs >= 0
+      ? config.resultConnectGraceMs
+      : DEFAULT_RESULT_CONNECT_GRACE_MS;
     this.resultTimeoutMs = Number.isSafeInteger(config.resultTimeoutMs) &&
       config.resultTimeoutMs > 0
       ? config.resultTimeoutMs
@@ -1410,6 +1415,37 @@ class MayhemFeature extends Feature {
     return result;
   }
 
+  async _deliverResult(sidechannel, transport, message, active) {
+    if (typeof sidechannel.connectDirectPeer !== 'function') {
+      if (active()) sidechannel.broadcast(this.channel, message);
+      return;
+    }
+
+    const connect = Promise.resolve()
+      .then(() => sidechannel.connectDirectPeer(
+        transport,
+        this.channel,
+        this.connectTimeoutMs
+      ))
+      .then((connected) => connected === true)
+      .catch(() => false);
+    let timer = null;
+    const grace = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(null), this.resultConnectGraceMs);
+    });
+    const connected = await Promise.race([connect, grace]);
+    if (timer !== null) clearTimeout(timer);
+    if (!active()) return;
+
+    // Give an already joined relay channel a prompt opportunity, but never wait
+    // the full direct-connect budget before using it. If direct setup completes
+    // later, send the same idempotent result once more over the now-ready path.
+    sidechannel.broadcast(this.channel, message);
+    if (connected === null && await connect && active()) {
+      sidechannel.broadcast(this.channel, message);
+    }
+  }
+
   _startFeatureResultDelivery(requestId, cached) {
     if (cached.deliveryStarted || !cached.result?.message) return;
     cached.deliveryStarted = true;
@@ -1444,19 +1480,12 @@ class MayhemFeature extends Feature {
         const sidechannel = this.peer?.sidechannel;
         if (!sidechannel || typeof sidechannel.broadcast !== 'function') return;
         if (!sidechannel.started) return;
-        if (typeof sidechannel.connectDirectPeer === 'function') {
-          try {
-            void Promise.resolve(sidechannel.connectDirectPeer(
-              cached.transport,
-              this.channel,
-              this.connectTimeoutMs
-            )).catch(() => {});
-          } catch (_error) {
-            // Direct reconnect is best-effort; the joined relay channel still carries the result.
-          }
-        }
-        if (!active()) return;
-        sidechannel.broadcast(this.channel, cached.result.message);
+        await this._deliverResult(
+          sidechannel,
+          cached.transport,
+          cached.result.message,
+          active
+        );
       } catch (_error) {
         // A bounded later attempt reconnects the current result transport.
       } finally {
@@ -1563,19 +1592,12 @@ class MayhemFeature extends Feature {
         const sidechannel = this.peer?.sidechannel;
         if (!sidechannel || typeof sidechannel.broadcast !== 'function') return;
         if (!sidechannel.started) return;
-        if (typeof sidechannel.connectDirectPeer === 'function') {
-          try {
-            void Promise.resolve(sidechannel.connectDirectPeer(
-              cached.transport,
-              this.channel,
-              this.connectTimeoutMs
-            )).catch(() => {});
-          } catch (_error) {
-            // Direct reconnect is best-effort; the joined relay channel still carries the result.
-          }
-        }
-        if (!active()) return;
-        sidechannel.broadcast(this.channel, cached.result.message);
+        await this._deliverResult(
+          sidechannel,
+          cached.transport,
+          cached.result.message,
+          active
+        );
       } catch (_error) {
         // A bounded later attempt re-reads and reconnects the current sidechannel.
       } finally {

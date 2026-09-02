@@ -59835,7 +59835,7 @@ impl ReceiptSettlementOutbox {
         .context("submitting receipt settlement through participant relay")?;
         ensure!(
             response.get("ok").and_then(Value::as_bool) == Some(true),
-            "receipt settlement relay rejected canonical evidence: {response}"
+            "receipt settlement relay did not confirm canonical evidence: {response}"
         );
         self.remove(&entry)
     }

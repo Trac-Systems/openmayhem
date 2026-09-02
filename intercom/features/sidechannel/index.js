@@ -97,6 +97,9 @@ class Sidechannel extends Feature {
     this.preparedConnections = new WeakSet();
     this.closedConnections = new WeakSet();
     this.started = false;
+    this._startPromise = null;
+    this._startGeneration = 0;
+    this._connectionListenerAttached = false;
     this._dhtBootPromise = null;
     this.onMessage = typeof config.onMessage === 'function' ? config.onMessage : null;
     this.debug = config.debug === true;
@@ -1068,10 +1071,113 @@ class Sidechannel extends Feature {
     const entry = {
       name: channel,
       topic: toTopic(channel),
-      protocol: toProtocol(channel)
+      protocol: toProtocol(channel),
+      swarmJoined: false,
+      announced: false,
+      _announceWaiters: null,
+      _announcing: null,
     };
     this.channels.set(channel, entry);
     return entry;
+  }
+
+  async _flushSwarm(context) {
+    if (typeof this.peer?.swarm?.flush !== 'function') return true;
+    let timer = null;
+    const flush = Promise.resolve()
+      .then(() => this.peer.swarm.flush())
+      .then(() => true)
+      .catch((error) => {
+        this._reportEventError(context, error);
+        return false;
+      });
+    const bounded = new Promise((resolve) => {
+      timer = setTimeout(() => {
+        this._reportEventError(
+          context,
+          new Error(`swarm flush did not complete within ${this.flushTimeoutMs}ms`)
+        );
+        resolve(false);
+      }, this.flushTimeoutMs);
+    });
+    try {
+      return await Promise.race([flush, bounded]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
+  }
+
+  _markAnnounced(entry, announced = true) {
+    if (!entry) return;
+    entry.announced = announced === true;
+    const waiters = entry._announceWaiters;
+    entry._announceWaiters = null;
+    if (!waiters) return;
+    for (const resolve of waiters) resolve(entry.announced);
+  }
+
+  _whenAnnounced(entry) {
+    if (!entry) return Promise.resolve(false);
+    if (entry.announced) return Promise.resolve(true);
+    if (!entry._announceWaiters) entry._announceWaiters = [];
+    return new Promise((resolve) => entry._announceWaiters.push(resolve));
+  }
+
+  async _announceChannels(entries) {
+    if (!this.peer?.swarm) return entries.map(() => false);
+    const fresh = entries.filter((entry) => (
+      entry &&
+      this.channels.get(entry.name) === entry &&
+      !entry.announced &&
+      !entry._announcing
+    ));
+    let batch = null;
+    if (fresh.length > 0) {
+      batch = (async () => {
+        let ok = true;
+        try {
+          for (const entry of fresh) {
+            if (!entry.swarmJoined) {
+              this.peer.swarm.join(entry.topic, { server: true, client: true });
+              entry.swarmJoined = true;
+            }
+          }
+          ok = await this._flushSwarm(
+            `flush after joining ${fresh.length} sidechannel(s)`
+          );
+        } catch (error) {
+          ok = false;
+          this._reportEventError(`announce ${fresh.length} sidechannel(s)`, error);
+        }
+        for (const entry of fresh) {
+          this._markAnnounced(
+            entry,
+            ok && entry.swarmJoined && this.channels.get(entry.name) === entry
+          );
+        }
+      })();
+      for (const entry of fresh) entry._announcing = batch;
+    }
+
+    const waiting = entries
+      .map((entry) => entry?._announcing)
+      .filter(Boolean);
+    try {
+      await Promise.all(waiting);
+    } finally {
+      if (batch) {
+        for (const entry of fresh) {
+          if (entry._announcing === batch) entry._announcing = null;
+        }
+      }
+    }
+    return entries.map((entry) => (
+      !!entry && this.channels.get(entry.name) === entry && entry.announced === true
+    ));
+  }
+
+  _announceChannel(entry) {
+    return this._announceChannels([entry]).then(([announced]) => announced);
   }
 
   _sendWelcome(record, entry, connection) {
@@ -1471,30 +1577,15 @@ class Sidechannel extends Feature {
       Array.from(names || [], (name) => normalizeChannel(name)).filter(Boolean)
     )].map((name) => this._registerChannel(name));
     if (entries.length === 0 || entries.some((entry) => !entry)) return null;
-    if (this.started && this.peer?.swarm) {
-      for (const entry of entries) {
-        this.peer.swarm.join(entry.topic, { server: true, client: true });
-      }
-      {
-        const flushP = Promise.resolve()
-          .then(() => this.peer.swarm.flush())
-          .catch((error) => {
-            this._reportEventError(
-              `flush after joining ${entries.length} sidechannel(s)`,
-              error
-            );
-          });
-        await Promise.race([
-          flushP,
-          new Promise((resolve) => setTimeout(resolve, this.flushTimeoutMs)),
-        ]);
-      }
+    const announced = this.started
+      ? await this._announceChannels(entries)
+      : await Promise.all(entries.map((entry) => this._whenAnnounced(entry)));
+    if (announced.some((ok) => !ok)) return null;
 
-      for (const entry of entries) {
-        if (this.channels.get(entry.name) !== entry) return null;
-        for (const connection of this.connections.keys()) {
-          this._openChannelForConnection(connection, entry);
-        }
+    for (const entry of entries) {
+      if (this.channels.get(entry.name) !== entry) return null;
+      for (const connection of this.connections.keys()) {
+        this._openChannelForConnection(connection, entry);
       }
     }
     return entries.map((entry) => entry.name);
@@ -1570,6 +1661,9 @@ class Sidechannel extends Feature {
     }
 
     const normalized = normalizeChannel(entry.name);
+    const wasJoined = entry.swarmJoined === true;
+    entry.swarmJoined = false;
+    this._markAnnounced(entry, false);
 
     // Drop in-memory per-channel state to avoid unbounded growth from ephemeral channels.
     this.channels.delete(entry.name);
@@ -1580,24 +1674,14 @@ class Sidechannel extends Feature {
     this.welcomedChannels.delete(normalized);
 
     // Best-effort: stop swarm discovery for the topic if supported.
-    if (this.started && this.peer?.swarm) {
+    if (wasJoined && this.peer?.swarm) {
       try {
         if (typeof this.peer.swarm.leave === 'function') {
           this.peer.swarm.leave(entry.topic);
         }
       } catch (_e) {}
       try {
-        if (typeof this.peer.swarm.flush === 'function') {
-          const flushP = Promise.resolve()
-            .then(() => this.peer.swarm.flush())
-            .catch((error) => {
-              this._reportEventError(`flush after leaving ${entry.name}`, error);
-            });
-          await Promise.race([
-            flushP,
-            new Promise((resolve) => setTimeout(resolve, this.flushTimeoutMs)),
-          ]);
-        }
+        await this._flushSwarm(`flush after leaving ${entry.name}`);
       } catch (_e) {}
     }
 
@@ -1767,6 +1851,26 @@ class Sidechannel extends Feature {
 
   async start() {
     if (this.started) return;
+    if (!this._startPromise) {
+      const generation = ++this._startGeneration;
+      let startPromise = null;
+      startPromise = this._start(generation)
+        .catch((error) => {
+          if (generation === this._startGeneration) {
+            this.started = false;
+            for (const entry of this.channels.values()) this._markAnnounced(entry, false);
+          }
+          throw error;
+        })
+        .finally(() => {
+          if (this._startPromise === startPromise) this._startPromise = null;
+        });
+      this._startPromise = startPromise;
+    }
+    return this._startPromise;
+  }
+
+  async _start(generation) {
     if (!this.peer?.swarm) {
       throw new Error('Sidechannel requires peer.swarm to be initialized.');
     }
@@ -1783,26 +1887,44 @@ class Sidechannel extends Feature {
         .then(() => dht.fullyBootstrapped());
       await bootPromise;
     }
+    if (generation !== this._startGeneration) return false;
     this._dhtBootPromise = bootPromise;
 
-    this.peer.swarm.on('connection', (connection) => this._prepareConnection(connection));
+    if (!this._connectionListenerAttached) {
+      this.peer.swarm.on('connection', (connection) => this._prepareConnection(connection));
+      this._connectionListenerAttached = true;
+    }
 
+    const initial = [];
     for (const entry of this.channels.values()) {
-      this.peer.swarm.join(entry.topic, { server: true, client: true });
+      if (!entry.swarmJoined) {
+        this.peer.swarm.join(entry.topic, { server: true, client: true });
+        entry.swarmJoined = true;
+      }
+      initial.push(entry);
     }
-    // Flush can hang in degraded networks. Bound the wait so the app can keep running.
-    {
-      const flushP = Promise.resolve()
-        .then(() => this.peer.swarm.flush())
-        .catch((error) => {
-          this._reportEventError('startup swarm flush', error);
-        });
-      await Promise.race([
-        flushP,
-        new Promise((resolve) => setTimeout(resolve, this.flushTimeoutMs)),
-      ]);
+    const initialFlushed = await this._flushSwarm('startup swarm flush');
+    if (generation !== this._startGeneration) return false;
+    for (const entry of initial) {
+      if (this.channels.get(entry.name) === entry) {
+        this._markAnnounced(entry, initialFlushed && entry.swarmJoined);
+      }
     }
+    if (!initialFlushed) throw new Error('Sidechannel startup could not confirm channel discovery.');
     this.started = true;
+
+    const stragglers = [];
+    for (const entry of this.channels.values()) {
+      if (!entry.announced && !entry._announcing) stragglers.push(entry);
+    }
+    if (stragglers.length > 0) {
+      const announced = await this._announceChannels(stragglers);
+      if (generation !== this._startGeneration) return false;
+      if (announced.some((ok) => !ok)) {
+        this.started = false;
+        throw new Error('Sidechannel startup could not confirm every joined channel.');
+      }
+    }
 
     if (this.peer.swarm.connections) {
       for (const connection of this.peer.swarm.connections) {
@@ -1835,8 +1957,20 @@ class Sidechannel extends Feature {
   }
 
   async stop() {
+    this._startGeneration += 1;
+    this._startPromise = null;
     this.started = false;
     this._dhtBootPromise = null;
+    for (const entry of this.channels.values()) {
+      const wasJoined = entry.swarmJoined === true;
+      entry.swarmJoined = false;
+      this._markAnnounced(entry, false);
+      if (wasJoined && typeof this.peer?.swarm?.leave === 'function') {
+        try {
+          this.peer.swarm.leave(entry.topic);
+        } catch (_error) {}
+      }
+    }
     for (const connection of this.connections.keys()) this._dropConnection(connection);
     this.connections.clear();
     this.rateLimits.clear();

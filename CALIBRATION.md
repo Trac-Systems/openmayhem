@@ -80,14 +80,17 @@ KV capacity. Heartbeats advertise that provider-derived capacity and current
 load. The `.29` result proves that machine sustained two sessions; `2` is not
 a canonical limit, default, promise, or value to copy to another provider.
 
-This evidence is not a completed paid/live launch proof. The repository does
-not retain Qwen 3.8 prefill/decode throughput values, a paid OpenMayhem session
-and receipt, a confirmed live route, or website billing proof. Do not invent
-those values or describe Qwen 3.8 as paid-proven, permanently serving, or live
-until the native-provider, paid gateway, rail/binding, receipt, and production
-checks are retained. Its 262,144-token ceiling requires `le8k`, `le32k`,
-`le128k`, and `le256k` ledger price brackets; the live ledger, not this file or
-the catalog reference rate, proves their publication.
+The paid/live launch gate is complete. Two overlapping full-context FIAT
+requests returned independent final signed receipts, cancellation of one
+shorter overlap did not disrupt its paid peer, the `.29` route remained live,
+and a metered `openmayhem.ai` request completed. The provider accepts FIAT,
+TAP, and TNK, and the live ledger carries `le8k`, `le32k`, `le128k`, and
+`le256k` price brackets through the 262,144-token ceiling.
+
+The repository still does not retain raw Qwen 3.8 prefill/decode throughput
+measurements. Do not infer or advertise throughput from overlap duration or
+from another Qwen release; recover the original measurements if available or
+run only that missing measurement on the exact `.29` artifact.
 
 ## Comfy Workflow Calibration
 

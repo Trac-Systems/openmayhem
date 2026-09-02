@@ -1224,6 +1224,84 @@ test('feature result uses joined channel even when direct reconnect is unavailab
   await writerFeature.stop();
 });
 
+test('feature result waits briefly for direct reconnect before its first delivery', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 500,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    resultRetryMs: 100,
+    resultRetryMax: 1,
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+
+  writer.peer.base.append = async (operation) => {
+    if (isPeerAck(operation)) return;
+    writer.appended.push(operation);
+    writer.state.set(`fr/${operation.value.dispatch.hash}`, {
+      type: 'feature_result',
+      status: 'applied',
+      ok: true,
+      result: { ok: true, op: operation.value.dispatch.value.op },
+    });
+  };
+
+  let connected = false;
+  let prematureBroadcasts = 0;
+  participant.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      if (message.control === 'mayhem_feature_request') {
+        queueMicrotask(() => writerFeature.handleSidechannelMessage(
+          channel,
+          relayPayload(providerKey, message)
+        ));
+      } else if (message.control === 'mayhem_feature_result_ack') {
+        queueMicrotask(() => writerFeature.handleSidechannelMessage(
+          channel,
+          relayPayload(providerKey, message)
+        ));
+      }
+      return true;
+    },
+  };
+  writer.peer.sidechannel = {
+    started: true,
+    async connectDirectPeer() {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      connected = true;
+      return true;
+    },
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      if (message.control !== 'mayhem_feature_result') return true;
+      if (!connected) {
+        prematureBroadcasts += 1;
+        return true;
+      }
+      queueMicrotask(() => participantFeature.handleSidechannelMessage(
+        channel,
+        relayPayload(adminKey, message)
+      ));
+      return true;
+    },
+  };
+
+  const key = `consent/${providerKey}/1/rules-hash`;
+  const result = await participantFeature.relay(key, consentValue());
+
+  assert.equal(result.ok, true);
+  assert.equal(writer.appended.length, 1);
+  assert.equal(prematureBroadcasts, 0);
+  await participantFeature.stop();
+  await writerFeature.stop();
+});
+
 test('feature relay never freezes a nonterminal pending result', async () => {
   const participant = peerFor(providerKey);
   const writer = peerFor(adminKey, { writable: true });
@@ -2309,7 +2387,7 @@ test('Stripe service result retries the exact cache after drop and reconnect unt
   await writerFeature.stop();
 });
 
-test('Stripe service result uses joined channel even when direct reconnect is unavailable', async () => {
+test('Stripe service result uses joined channel before a slow direct reconnect times out', async () => {
   const participant = peerFor(otherKey);
   const signer = peerFor(providerKey);
   const writer = peerFor(adminKey, { writable: true });
@@ -2317,6 +2395,8 @@ test('Stripe service result uses joined channel even when direct reconnect is un
   let resultBroadcasts = 0;
   let acknowledgements = 0;
   let reconnects = 0;
+  let reconnectFinished = false;
+  let broadcastBeforeReconnect = false;
   const participantFeature = new MayhemFeature(participant.peer, {
     timeoutMs: 500,
     retryMs: 100,
@@ -2324,6 +2404,7 @@ test('Stripe service result uses joined channel even when direct reconnect is un
   const writerFeature = new MayhemFeature(writer.peer, {
     resultRetryMs: 100,
     resultRetryMax: 2,
+    resultConnectGraceMs: 5,
     async serviceHandler() {
       serviceCalls += 1;
       return {
@@ -2359,12 +2440,15 @@ test('Stripe service result uses joined channel even when direct reconnect is un
     started: true,
     async connectDirectPeer() {
       reconnects += 1;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      reconnectFinished = true;
       return false;
     },
     verifyPayload: verifyRelayPayload,
     broadcast(channel, message) {
       if (message.control !== 'mayhem_service_result') return true;
       resultBroadcasts += 1;
+      if (!reconnectFinished) broadcastBeforeReconnect = true;
       queueMicrotask(() => participantFeature.handleSidechannelMessage(
         channel,
         relayPayload(adminKey, message)
@@ -2384,9 +2468,88 @@ test('Stripe service result uses joined channel even when direct reconnect is un
   assert.equal(result.checkout_session.url, 'https://checkout.stripe.com/c/pay/joined-channel');
   assert.equal(serviceCalls, 1);
   assert.equal(resultBroadcasts, 1);
+  assert.equal(broadcastBeforeReconnect, true);
   assert.equal(acknowledgements, 1);
   assert.ok(reconnects >= 1);
   assert.equal(writerFeature.serviceProcessed.values().next().value.acked, true);
+  await participantFeature.stop();
+  await writerFeature.stop();
+});
+
+test('Stripe service result waits briefly for direct reconnect before its first delivery', async () => {
+  const participant = peerFor(otherKey);
+  const signer = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 500,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    resultRetryMs: 100,
+    resultRetryMax: 1,
+    async serviceHandler() {
+      return {
+        ok: true,
+        checkout_session: { url: 'https://checkout.stripe.com/c/pay/reconnect-first' },
+      };
+    },
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = participantFeature;
+  writer.peer.protocol.instance.features.mayhem = writerFeature;
+
+  let connected = false;
+  let prematureBroadcasts = 0;
+  participant.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      if (message.control === 'mayhem_service_result_ack') {
+        queueMicrotask(() => writerFeature.handleSidechannelMessage(
+          channel,
+          relayPayload(otherKey, message)
+        ));
+      } else {
+        queueMicrotask(() => writerFeature.handleSidechannelMessage(
+          channel,
+          relayPayload(otherKey, message)
+        ));
+      }
+      return true;
+    },
+  };
+  writer.peer.sidechannel = {
+    started: true,
+    async connectDirectPeer() {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      connected = true;
+      return true;
+    },
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      if (message.control !== 'mayhem_service_result') return true;
+      if (!connected) {
+        prematureBroadcasts += 1;
+        return true;
+      }
+      queueMicrotask(() => participantFeature.handleSidechannelMessage(
+        channel,
+        relayPayload(adminKey, message)
+      ));
+      return true;
+    },
+  };
+
+  const result = await requestStripeCheckout(
+    participant.peer,
+    signedServiceValue(signer.peer, 'stripe_checkout', stripeCheckoutValue(), otherKey)
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.checkout_session.url, 'https://checkout.stripe.com/c/pay/reconnect-first');
+  assert.equal(prematureBroadcasts, 0);
   await participantFeature.stop();
   await writerFeature.stop();
 });
