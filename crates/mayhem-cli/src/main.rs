@@ -77350,14 +77350,8 @@ fn provider_session_allows_independent_dispatch(
 }
 
 fn provider_session_open_required_modalities(frame: &Value) -> Option<Vec<String>> {
-    frame
-        .get("voucher")?
-        .get("body")?
-        .get("required_modalities")?
-        .as_array()?
-        .iter()
-        .map(|value| value.as_str().map(str::to_owned))
-        .collect()
+    let voucher: SpendVoucher = serde_json::from_value(frame.get("voucher")?.clone()).ok()?;
+    (!voucher.body.required_modalities.is_empty()).then_some(voucher.body.required_modalities)
 }
 
 fn provider_local_session_acceptance_decision(
@@ -116055,6 +116049,31 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let idle = load.snapshot(config.max_sessions);
         assert_eq!(idle.free_slots, 1);
         assert!(idle.accepting_new);
+    }
+
+    #[test]
+    fn provider_concurrent_admission_reads_flattened_spend_voucher_wire_shape() {
+        let terms = test_provider_session_terms();
+        let mut frame = test_session_open_frame(&terms);
+        let voucher: SpendVoucher =
+            serde_json::from_value(frame["voucher"].clone()).expect("signed test voucher");
+        frame["voucher"] = serde_json::to_value(voucher).expect("serialize spend voucher");
+
+        assert!(frame["voucher"].get("body").is_none());
+        assert_eq!(
+            provider_session_open_required_modalities(&frame),
+            Some(vec!["text".to_owned()])
+        );
+
+        let mut missing = frame.clone();
+        missing["voucher"]
+            .as_object_mut()
+            .expect("voucher object")
+            .remove("required_modalities");
+        assert_eq!(provider_session_open_required_modalities(&missing), None);
+
+        frame["voucher"]["required_modalities"] = json!([]);
+        assert_eq!(provider_session_open_required_modalities(&frame), None);
     }
 
     #[test]
