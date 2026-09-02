@@ -427,11 +427,16 @@ receipts, confirmed live route, and website billing proof are retained.
   Process-tree RSS was about `5.435 GiB`; measured working sets were `12 MiB`
   for image and `9.19 MiB` for video. RSS excludes accelerator allocations and
   does not replace the catalog admission floors.
-- No retained prefill/decode throughput values are in the repository. Do not
-  infer or advertise them from the overlap pass. Paid proof retained during
-  launch used two overlapping full-context FIAT requests with independent
-  final signed receipts; cancellation of one shorter overlap did not disrupt
-  its paid peer. A metered `openmayhem.ai` request also completed successfully.
+- A warm paid streaming request on `.29` under release `0.2.162` processed
+  12,017 prompt and 32 completion tokens. First content arrived at 7,785.77 ms
+  and last content at 21,997.83 ms: 1,543.46 prompt tok/s end to end
+  (1,626.19 tok/s after response headers) and 2.18 generation tok/s. The
+  EngineCore held 46,303 MiB of accelerator memory, about 64.67 GiB of system
+  memory remained available, and the provider had zero restarts. The request
+  returned a final signed FIAT receipt. These are `.29` request-path results,
+  not portable minima or pure kernel benchmarks. Separate paid launch proof
+  used two overlapping full-context FIAT requests with independent final
+  receipts; cancelling one shorter overlap did not disrupt its paid peer.
 
 **Independent dispatch and capacity**
 

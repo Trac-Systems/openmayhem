@@ -442,7 +442,7 @@ test('read-only participant relays a signed feature to the sole admin writer', a
   assert.equal(result.ok, true);
   assert.equal(result.relayed, true);
   assert.equal(writer.appended.length, 1);
-  assert.equal(writer.flushes.length, 1);
+  assert.equal(writer.flushes.length, 0);
   assert.equal(participant.appended.length, 0);
   assert.equal(writer.appended[0].value.dispatch.address, adminKey);
   assert.equal(writer.appended[0].value.dispatch.contract_version, CONTRACT_VERSION);
@@ -479,6 +479,41 @@ test('admin writer deduplicates a retried relay request by deterministic request
   await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
   await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
 
+  assert.equal(writer.appended.length, 1);
+});
+
+test('canonical feature result does not require a synthetic Autobase ACK append', async () => {
+  const writer = peerFor(adminKey, { writable: true });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    resultTimeoutMs: 100,
+    resultPollMs: 1,
+  });
+  writerFeature.key = 'mayhem';
+  writer.peer.base.append = async (operation) => {
+    if (isPeerAck(operation)) throw new Error('synthetic ACK append must not run');
+    writer.appended.push(operation);
+    const hash = operation.value.dispatch.hash;
+    writer.state.set(`fr/${hash}`, {
+      type: 'feature_result',
+      status: 'applied',
+      ok: true,
+      result: { ok: true, op: operation.value.dispatch.value.op },
+    });
+  };
+
+  const result = await Promise.race([
+    writerFeature.submit(
+      `consent/${providerKey}/1/rules-hash`,
+      consentValue()
+    ),
+    new Promise((_, reject) => setTimeout(
+      () => reject(new Error('canonical result remained blocked after feature append')),
+      250
+    )),
+  ]);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.status, 'applied');
   assert.equal(writer.appended.length, 1);
 });
 
@@ -639,7 +674,7 @@ test('Mayhem feature limit admits a canonical payload above the Intercom core de
 
   assert.equal(result.ok, true);
   assert.equal(writer.appended.length, 1);
-  assert.equal(writer.flushes.length, 1);
+  assert.equal(writer.flushes.length, 0);
 });
 
 test('admin writer bounds concurrent remote relay work and returns retryable busy', async () => {
@@ -755,7 +790,7 @@ test('admin writer can retry a transient rejection under a fresh feature hash', 
   await writerFeature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, payload);
 
   assert.equal(writer.appended.length, 2);
-  assert.equal(writer.flushes.length, 2);
+  assert.equal(writer.flushes.length, 0);
   assert.notEqual(
     writer.appended[0].value.dispatch.hash,
     writer.appended[1].value.dispatch.hash
@@ -826,7 +861,7 @@ test('lost rejection result is replayed until ACK, then evicted', async () => {
   assert.equal(result.ok, false);
   assert.match(result.message, /focused retry proof/);
   assert.equal(writer.appended.length, 1);
-  assert.equal(writer.flushes.length, 1);
+  assert.equal(writer.flushes.length, 0);
   assert.ok(resultBroadcasts >= 2);
   if (cached) assert.equal(cached.pending, false);
   assert.equal(writerFeature.processed.has(requestId), false);
@@ -876,7 +911,7 @@ test('admin writer returns a bounded relay error when an accepted feature never 
   assert.equal(result.relayed, true);
   assert.match(result.message, /no canonical result appeared before the relay result budget/);
   assert.equal(writer.appended.length, 1);
-  assert.equal(writer.flushes.length, 1);
+  assert.equal(writer.flushes.length, 0);
   await participantFeature.stop();
   await writerFeature.stop();
 });

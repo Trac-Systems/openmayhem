@@ -459,10 +459,15 @@ serve, `heartbeat.live=true`, `gateway.ok=true`, `gateway.route_count>0`, and th
   `3fbab1e8f6fed5d8b5e393e958edebef20544346d07ae66a0d68a7c8e59114fd`.
   A 1-megapixel image and 16-frame video calibration used a 15% (`17.35 GiB`)
   unified-memory reserve and `98.32 GiB` F13 budget; process-tree RSS was about
-  `5.435 GiB`, excluding accelerator allocations. No retained prefill/decode
-  rates exist; never invent or imply them. Paid launch proof used two
-  overlapping full-context FIAT requests with independent final signed
-  receipts, plus cancellation isolation and a metered website request.
+  `5.435 GiB`, excluding accelerator allocations. A warm release `0.2.162`
+  paid stream measured 12,017 prompt tokens at 1,543.46 tok/s end to end
+  (1,626.19 tok/s after response headers) and 32 completion tokens at
+  2.18 tok/s. EngineCore used 46,303 MiB of accelerator memory while about
+  64.67 GiB system memory remained available; the provider stayed at zero
+  restarts and returned a final FIAT receipt. Treat these as `.29` request-path
+  evidence, not universal requirements or pure kernel throughput. Separate
+  paid launch proof used two overlapping full-context FIAT requests with
+  independent final signed receipts, plus cancellation isolation.
 - **Concurrency:** `independent_dispatch` is a signed, artifact-root-bound
   opt-in and currently authorizes only the exact text-only modality set.
   Image/video requests remain exclusive, and artifacts without a matching

@@ -87,10 +87,16 @@ and a metered `openmayhem.ai` request completed. The provider accepts FIAT,
 TAP, and TNK, and the live ledger carries `le8k`, `le32k`, `le128k`, and
 `le256k` price brackets through the 262,144-token ceiling.
 
-The repository still does not retain raw Qwen 3.8 prefill/decode throughput
-measurements. Do not infer or advertise throughput from overlap duration or
-from another Qwen release; recover the original measurements if available or
-run only that missing measurement on the exact `.29` artifact.
+Warm paid streaming measurement on `.29`, using the exact artifact and release
+`0.2.162`, processed 12,017 prompt tokens and 32 completion tokens. The first
+content token arrived at 7,785.77 ms and the last at 21,997.83 ms. This is an
+end-to-end prefill rate of 1,543.46 tok/s (1,626.19 tok/s after the streaming
+response headers) and a generation rate of 2.18 tok/s. The final FIAT receipt
+was signed for the same usage. During the request the vLLM EngineCore held
+46,303 MiB of accelerator memory and the host retained about 64.67 GiB of
+available system memory; the provider stayed active with zero restarts. These
+are `.29` request-path measurements, not universal performance requirements or
+pure kernel benchmarks.
 
 ## Comfy Workflow Calibration
 

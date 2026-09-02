@@ -35,7 +35,6 @@ const SERVICE_RESULT_DIGEST_DOMAIN = 'mayhem-service-result-v1';
 const MAYHEM_RELAY_CHANNEL = '0000mayhem-relay';
 const MAYHEM_RELAY_MAX_MESSAGE_BYTES = 256 * 1024;
 const MAYHEM_RELAY_MAX_PAYLOAD_BYTES = MAYHEM_RELAY_MAX_MESSAGE_BYTES + 8 * 1024;
-const PEER_ACK_OPERATION_TYPE = '_trac_peer_ack_v1';
 const DEFAULT_TIMEOUT_MS = 0;
 const DEFAULT_RETRY_MS = 1_000;
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
@@ -53,13 +52,6 @@ const STRIPE_CONNECT_RELINK_CONSENT_VERSION = 1;
 const STRIPE_CONNECT_RELINK_CONSENT_MAX_SECONDS = 600;
 const STRIPE_CONNECT_ADOPT_CONSENT_MAX_SECONDS = 600;
 const normalizeKey = (value) => String(value ?? '').trim().toLowerCase();
-// MAYHEM PATCH: represent Autobase ACKs as signed no-op operations; append(null)
-// crashes on the Pear/Bare hypercore-storage path.
-const appendPeerAck = (base) => base.append({
-  type: PEER_ACK_OPERATION_TYPE,
-  value: { version: 1 },
-});
-
 const verifyEd25519Hex = (wallet, signature, message, publicKey) => {
   if (!/^[0-9a-f]{128}$/.test(signature) ||
       !/^[0-9a-f]{64}$/.test(publicKey) ||
@@ -546,7 +538,6 @@ class MayhemFeature extends Feature {
     }
     try {
       await this.peer.base.append(operation);
-      await appendPeerAck(this.peer.base);
     } catch (error) {
       if (appendBlockSizeError(error)) {
         return {
@@ -566,6 +557,9 @@ class MayhemFeature extends Feature {
       }
       throw error;
     }
+    // The canonical fr/<hash> record is the authoritative completion signal.
+    // The peer updater owns Autobase ACK writes; coupling this request to a
+    // second synthetic append can strand an already-applied feature forever.
     const featureResult = await this._waitForResult(
       resultKey,
       this.resultTimeoutMs,

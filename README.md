@@ -836,7 +836,11 @@ advertises that value through heartbeats. Image/video requests are not in the
 current independent-dispatch profile. The retained live proof includes two
 overlapping full-context FIAT requests with independent final signed receipts,
 cancellation of one request without disrupting its paid peer, and a metered
-request through `openmayhem.ai`.
+request through `openmayhem.ai`. A warm `.29` paid stream on release `0.2.162`
+measured 1,543.46 prompt tok/s end to end (1,626.19 tok/s after response
+headers) and 2.18 generation tok/s for a 12,017-input/32-output-token request.
+Those figures are host-specific request-path evidence, not canonical provider
+limits or pure kernel benchmarks.
 
 **Routes:**
 
