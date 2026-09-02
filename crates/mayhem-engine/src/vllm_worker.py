@@ -15,6 +15,7 @@ import wave
 protocol_stdout = os.fdopen(os.dup(sys.stdout.fileno()), "w", buffering=1)
 os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
 sys.stdout = sys.stderr
+protocol_stdout_lock = threading.Lock()
 
 
 engine = None
@@ -27,18 +28,25 @@ event_loop = asyncio.new_event_loop()
 asyncio.set_event_loop(event_loop)
 request_queue = queue.Queue()
 cancelled_requests = set()
+active_request_ids = set()
 cancelled_requests_lock = threading.Lock()
 completed_request_id = 0
+generation_multiplexer = None
 
 
 class RequestCancelled(Exception):
     pass
 
 
+def register_request(request_id):
+    with cancelled_requests_lock:
+        active_request_ids.add(int(request_id))
+
+
 def mark_cancelled(request_id):
     with cancelled_requests_lock:
         request_id = int(request_id)
-        if request_id <= completed_request_id:
+        if request_id <= completed_request_id and request_id not in active_request_ids:
             return False
         cancelled_requests.add(request_id)
         return True
@@ -47,11 +55,14 @@ def mark_cancelled(request_id):
 def finish_request(request_id):
     global completed_request_id
     with cancelled_requests_lock:
-        completed_request_id = max(completed_request_id, int(request_id))
+        request_id = int(request_id)
+        active_request_ids.discard(request_id)
+        completed_request_id = max(completed_request_id, request_id)
         completed_cancellations = {
             cancelled_id
             for cancelled_id in cancelled_requests
             if cancelled_id <= completed_request_id
+            and cancelled_id not in active_request_ids
         }
         cancelled_requests.difference_update(completed_cancellations)
 
@@ -77,14 +88,126 @@ async def abort_engine_request(request_id):
         await result
 
 
+class GenerationMultiplexer:
+    def __init__(self, capacity, generate, abort, emit, complete, abort_timeout=2.0):
+        capacity = int(capacity)
+        if capacity < 1:
+            raise ValueError("vLLM generation capacity must be positive")
+        self.capacity = capacity
+        self._generate = generate
+        self._abort = abort
+        self._emit = emit
+        self._complete = complete
+        self._abort_timeout = float(abort_timeout)
+        self._semaphore = asyncio.Semaphore(capacity)
+        self._tasks = {}
+        self._running = set()
+        self._engine_running = set()
+        self._abort_failures = set()
+
+    def submit(self, request_id, payload):
+        request_id = int(request_id)
+        existing = self._tasks.get(request_id)
+        if existing is not None and not existing.done():
+            raise ValueError(f"duplicate active vLLM request id {request_id}")
+        register_request(request_id)
+        task = asyncio.create_task(
+            self._run(request_id, payload), name=f"mayhem-vllm-{request_id}"
+        )
+        self._tasks[request_id] = task
+        return task
+
+    async def cancel(self, request_id):
+        request_id = int(request_id)
+        task = self._tasks.get(request_id)
+        if task is None or task.done():
+            return False
+        try:
+            if request_id in self._engine_running:
+                await asyncio.wait_for(
+                    self._abort(request_id), timeout=self._abort_timeout
+                )
+        except Exception:
+            self._abort_failures.add(request_id)
+        return True
+
+    def engine_started(self, request_id):
+        self._engine_running.add(int(request_id))
+
+    def engine_stopped(self, request_id):
+        self._engine_running.discard(int(request_id))
+
+    async def drain(self):
+        tasks = list(self._tasks.values())
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _run(self, request_id, payload):
+        try:
+            async with self._semaphore:
+                check_cancelled(request_id)
+                self._running.add(request_id)
+                try:
+                    # Cancellation is cooperative: the request marker and the
+                    # engine abort stop work without abandoning to_thread
+                    # preprocessing or releasing this capacity slot early.
+                    result = await self._generate(request_id, payload)
+                finally:
+                    self._running.discard(request_id)
+                check_cancelled(request_id)
+            self._emit(
+                {"id": request_id, "type": "response", "ok": True, "result": result}
+            )
+        except (RequestCancelled, asyncio.CancelledError) as exc:
+            error = str(exc) or "engine request cancelled"
+            abort_failed = request_id in self._abort_failures
+            message = {
+                "id": request_id,
+                "type": "response",
+                "ok": False,
+                "cancelled": True,
+                "error": error,
+            }
+            if abort_failed:
+                message["abort_failed"] = True
+            self._emit(message)
+        except Exception as exc:
+            error = str(exc) or repr(exc) or type(exc).__name__
+            message = {
+                "id": request_id,
+                "type": "response",
+                "ok": False,
+                "error": error,
+            }
+            if request_id in self._abort_failures:
+                message["cancelled"] = True
+                message["abort_failed"] = True
+            self._emit(message)
+        finally:
+            self._complete(request_id)
+            self._engine_running.discard(request_id)
+            self._abort_failures.discard(request_id)
+            current = asyncio.current_task()
+            if self._tasks.get(request_id) is current:
+                self._tasks.pop(request_id, None)
+
+
+async def cancel_generation_request(request_id):
+    multiplexer = generation_multiplexer
+    if multiplexer is not None:
+        await multiplexer.cancel(request_id)
+
+
 def schedule_abort(request_id):
     if mark_cancelled(request_id) and event_loop.is_running():
-        asyncio.run_coroutine_threadsafe(abort_engine_request(request_id), event_loop)
+        asyncio.run_coroutine_threadsafe(cancel_generation_request(request_id), event_loop)
 
 
 def send(message):
-    protocol_stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
-    protocol_stdout.flush()
+    encoded = json.dumps(message, separators=(",", ":")) + "\n"
+    with protocol_stdout_lock:
+        protocol_stdout.write(encoded)
+        protocol_stdout.flush()
 
 
 def accepted_kwargs(callable_obj, kwargs):
@@ -446,7 +569,7 @@ def create_engine(payload):
         "tokenizer": path,
         "trust_remote_code": False,
         "max_model_len": positive_int(payload.get("ctx_size"), 2048),
-        "max_num_seqs": positive_int(payload.get("max_batch_size"), 1),
+        "max_num_seqs": load_generation_capacity(payload),
         "max_num_batched_tokens": positive_int(
             payload.get("max_num_tokens"), max(256, positive_int(payload.get("ctx_size"), 2048))
         ),
@@ -473,6 +596,10 @@ def create_engine(payload):
     dtype = payload.get("dtype")
     if dtype:
         kwargs["dtype"] = str(dtype)
+    kv_cache_dtype = payload.get("kv_cache_dtype")
+    if kv_cache_dtype:
+        kwargs["kv_cache_dtype"] = str(kv_cache_dtype)
+        required_options.add("kv_cache_dtype")
     gpu_memory_utilization = utilization_float(payload.get("gpu_memory_utilization"))
     if gpu_memory_utilization is not None:
         kwargs["gpu_memory_utilization"] = gpu_memory_utilization
@@ -486,6 +613,32 @@ def create_engine(payload):
     if hasattr(AsyncLLM, "from_engine_args"):
         return AsyncLLM.from_engine_args(args)
     return AsyncLLM(args)
+
+
+def load_generation_capacity(payload):
+    return positive_int(payload.get("max_batch_size"), 1)
+
+
+def runtime_kv_cache_info():
+    config = getattr(getattr(engine, "vllm_config", None), "cache_config", None)
+    size_tokens = getattr(config, "kv_cache_size_tokens", None)
+    max_concurrency = getattr(config, "kv_cache_max_concurrency", None)
+    try:
+        size_tokens = int(size_tokens)
+    except (TypeError, ValueError, OverflowError):
+        size_tokens = 0
+    try:
+        max_concurrency = float(max_concurrency)
+    except (TypeError, ValueError, OverflowError):
+        max_concurrency = 0.0
+    return {
+        "size_tokens": size_tokens if size_tokens > 0 else None,
+        "max_concurrency": (
+            max_concurrency
+            if math.isfinite(max_concurrency) and max_concurrency > 0.0
+            else None
+        ),
+    }
 
 
 def get_tokenizer():
@@ -736,7 +889,7 @@ def multimodal_engine_prompt(payload, mm_data, template_kwargs, prompt_suffixes)
     return prompt, prompt
 
 
-async def async_handle_generate(request_id, payload):
+def prepare_generation_request(request_id, payload):
     check_cancelled(request_id)
     if engine is None:
         raise RuntimeError("model has not been loaded")
@@ -754,66 +907,96 @@ async def async_handle_generate(request_id, payload):
     prompt, engine_prompt = multimodal_engine_prompt(
         payload, mm_data, template_kwargs, prompt_suffixes
     )
+    check_cancelled(request_id)
     prompt_tokens = encode_text(prompt)
+    check_cancelled(request_id)
     if prompt_tokens and len(prompt_tokens) >= ctx_size:
         raise ValueError(
             f"prompt has {len(prompt_tokens)} tokens, leaving no room in ctx_size={ctx_size}"
         )
     if max_tokens <= 0:
+        return {"empty": True}
+
+    return {
+        "empty": False,
+        "engine_prompt": engine_prompt,
+        "prompt_tokens": prompt_tokens,
+        "sampling_params": make_sampling_params(payload, sampling_kwargs),
+        "mm_data": mm_data,
+        "reasoning_active": reasoning_enabled(payload),
+    }
+
+
+async def async_handle_generate(request_id, payload):
+    prepared = await asyncio.to_thread(prepare_generation_request, request_id, payload)
+    check_cancelled(request_id)
+    if prepared["empty"]:
         return {
             "text": "",
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             "finish_reason": "length",
         }
 
-    sampling_params = make_sampling_params(payload, sampling_kwargs)
+    engine_prompt = prepared["engine_prompt"]
+    prompt_tokens = prepared["prompt_tokens"]
+    sampling_params = prepared["sampling_params"]
+    mm_data = prepared["mm_data"]
     text = ""
     completion_tokens = 0
     token_ids = []
     finish_reason = "length"
     reasoning_tokens = 0
-    reasoning_active = reasoning_enabled(payload)
+    reasoning_active = prepared["reasoning_active"]
     actual_prompt_tokens = len(prompt_tokens)
-    async for output in engine.generate(
-        request_id=f"mayhem-{request_id}", prompt=engine_prompt, sampling_params=sampling_params
-    ):
-        if request_cancelled(request_id):
-            await abort_engine_request(request_id)
-            raise RequestCancelled("engine request cancelled")
-        output_prompt_ids = getattr(output, "prompt_token_ids", None)
-        if output_prompt_ids is not None:
-            actual_prompt_tokens = max(actual_prompt_tokens, len(output_prompt_ids))
-        for completion in getattr(output, "outputs", []) or []:
-            chunk_text = str(getattr(completion, "text", "") or "")
-            ids = getattr(completion, "token_ids", None) or []
-            ids = [int(token) for token in ids]
-            if chunk_text or ids:
-                if not ids:
-                    ids = [-1]
-                for token in ids:
-                    send(
-                        {
-                            "id": request_id,
-                            "type": "token",
-                            "chunk": {
-                                "index": completion_tokens,
-                                "token_id": int(token),
-                                "text": chunk_text if token == ids[0] else "",
-                            },
-                        }
-                    )
-                    completion_tokens += 1
-                    token_ids.append(int(token))
-                    if reasoning_active:
-                        reasoning_tokens += 1
-                text += chunk_text
-                if reasoning_active and "</think>" in text:
-                    reasoning_active = False
-            reason = getattr(completion, "finish_reason", None)
-            if reason is not None:
-                finish_reason = "stop" if str(reason) == "stop" else "length"
-        if getattr(output, "finished", False):
-            break
+    multiplexer = generation_multiplexer
+    if multiplexer is not None:
+        multiplexer.engine_started(request_id)
+    try:
+        async for output in engine.generate(
+            request_id=f"mayhem-{request_id}",
+            prompt=engine_prompt,
+            sampling_params=sampling_params,
+        ):
+            if request_cancelled(request_id):
+                await abort_engine_request(request_id)
+                raise RequestCancelled("engine request cancelled")
+            output_prompt_ids = getattr(output, "prompt_token_ids", None)
+            if output_prompt_ids is not None:
+                actual_prompt_tokens = max(actual_prompt_tokens, len(output_prompt_ids))
+            for completion in getattr(output, "outputs", []) or []:
+                chunk_text = str(getattr(completion, "text", "") or "")
+                ids = getattr(completion, "token_ids", None) or []
+                ids = [int(token) for token in ids]
+                if chunk_text or ids:
+                    if not ids:
+                        ids = [-1]
+                    for token in ids:
+                        send(
+                            {
+                                "id": request_id,
+                                "type": "token",
+                                "chunk": {
+                                    "index": completion_tokens,
+                                    "token_id": int(token),
+                                    "text": chunk_text if token == ids[0] else "",
+                                },
+                            }
+                        )
+                        completion_tokens += 1
+                        token_ids.append(int(token))
+                        if reasoning_active:
+                            reasoning_tokens += 1
+                    text += chunk_text
+                    if reasoning_active and "</think>" in text:
+                        reasoning_active = False
+                reason = getattr(completion, "finish_reason", None)
+                if reason is not None:
+                    finish_reason = "stop" if str(reason) == "stop" else "length"
+            if getattr(output, "finished", False):
+                break
+    finally:
+        if multiplexer is not None:
+            multiplexer.engine_stopped(request_id)
 
     check_cancelled(request_id)
 
@@ -839,7 +1022,7 @@ async def async_handle_generate(request_id, payload):
 
 
 def handle_load(payload):
-    global engine, tokenizer, processor, ctx_size, model_path
+    global engine, tokenizer, processor, ctx_size, model_path, generation_multiplexer
     model_path = str(payload["path"])
     ctx_size = positive_int(payload.get("ctx_size"), 2048)
     engine = create_engine(payload)
@@ -855,9 +1038,19 @@ def handle_load(payload):
         tokenizer = None
         processor = None
     get_tokenizer()
+    kv_cache = runtime_kv_cache_info()
+    generation_multiplexer = GenerationMultiplexer(
+        load_generation_capacity(payload),
+        async_handle_generate,
+        abort_engine_request,
+        send,
+        finish_request,
+    )
     return {
         "n_ctx_train": model_ctx(ctx_size),
         "n_vocab": int(vocab_size()),
+        "kv_cache_size_tokens": kv_cache["size_tokens"],
+        "kv_cache_max_concurrency": kv_cache["max_concurrency"],
         "determinism": {
             "async_scheduling": False,
             "batch_invariant": batch_invariant,
@@ -881,37 +1074,12 @@ def handle(request_id, op, payload):
         return handle_load(payload or {})
     if op == "tokenize":
         return handle_tokenize(payload or {})
-    if op == "generate":
-        return event_loop.run_until_complete(async_handle_generate(request_id, payload or {}))
     if op == "shutdown":
         raise SystemExit(0)
     raise ValueError(f"unknown vLLM worker op {op!r}")
 
 
-def read_requests():
-    for line in sys.stdin:
-        if not line.strip():
-            continue
-        try:
-            request = json.loads(line)
-        except Exception as exc:
-            request_queue.put({"id": 0, "op": "invalid", "parse_error": str(exc)})
-            continue
-        request_id = int(request.get("id", 0))
-        if str(request.get("op", "")) == "cancel":
-            payload = request.get("payload") or {}
-            schedule_abort(int(payload.get("request_id", request_id)))
-            continue
-        request_queue.put(request)
-    request_queue.put(None)
-
-
-threading.Thread(target=read_requests, name="mayhem-vllm-control", daemon=True).start()
-
-while True:
-    request = request_queue.get()
-    if request is None:
-        break
+def emit_control_response(request):
     request_id = int(request.get("id", 0))
     try:
         if "parse_error" in request:
@@ -936,3 +1104,55 @@ while True:
         send({"id": request_id, "type": "response", "ok": False, "error": error})
     finally:
         finish_request(request_id)
+
+
+def read_requests():
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            request = json.loads(line)
+        except Exception as exc:
+            request_queue.put({"id": 0, "op": "invalid", "parse_error": str(exc)})
+            continue
+        request_id = int(request.get("id", 0))
+        if str(request.get("op", "")) == "cancel":
+            payload = request.get("payload") or {}
+            schedule_abort(int(payload.get("request_id", request_id)))
+            continue
+        register_request(request_id)
+        request_queue.put(request)
+    request_queue.put(None)
+
+
+async def run_worker():
+    global generation_multiplexer
+
+    while True:
+        request = await asyncio.to_thread(request_queue.get)
+        if request is None:
+            break
+        request_id = int(request.get("id", 0))
+        op = str(request.get("op", ""))
+        if op == "generate":
+            if generation_multiplexer is None:
+                emit_control_response(request)
+                continue
+            try:
+                generation_multiplexer.submit(request_id, request.get("payload") or {})
+            except Exception as exc:
+                error = str(exc) or repr(exc) or type(exc).__name__
+                send({"id": request_id, "type": "response", "ok": False, "error": error})
+                finish_request(request_id)
+            continue
+
+        if generation_multiplexer is not None:
+            await generation_multiplexer.drain()
+        emit_control_response(request)
+
+    if generation_multiplexer is not None:
+        await generation_multiplexer.drain()
+
+
+threading.Thread(target=read_requests, name="mayhem-vllm-control", daemon=True).start()
+event_loop.run_until_complete(run_worker())

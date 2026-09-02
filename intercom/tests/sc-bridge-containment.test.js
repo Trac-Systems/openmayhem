@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { registerHooks } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
@@ -24,8 +25,28 @@ import {
   ownSession,
   sessionFrameRecipients,
   sessionSubscriptionMatches,
+  transferSessionOwnership,
 } from '../features/sc-bridge/session-ownership.js';
 import { resolveScBridgeToken } from '../features/sc-bridge/token.js';
+
+const loadScBridgeForNodeTest = async () => {
+  const hooks = registerHooks({
+    resolve(specifier, context, nextResolve) {
+      if (specifier === 'bare-ws') {
+        return {
+          url: 'data:text/javascript,export default { Server: class {} };',
+          shortCircuit: true,
+        };
+      }
+      return nextResolve(specifier, context);
+    },
+  });
+  try {
+    return (await import('../features/sc-bridge/index.js?node-containment-test')).default;
+  } finally {
+    hooks.deregister();
+  }
+};
 
 test('SC-Bridge reads a private token file when Pear does not expose child environment', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mayhem-sc-bridge-token-'));
@@ -256,6 +277,181 @@ test('SC-Bridge bounds and reclaims every direct session owned by a disconnected
   });
   assert.equal(closed.length, maxSessions - 1);
   assert.equal(sessions.size, 0);
+});
+
+test('SC-Bridge transfers one live session without closing or duplicating ownership', () => {
+  const remote = 'ab'.repeat(32);
+  const sessionId = 'cd'.repeat(32);
+  const original = { directSessions: new Map() };
+  const replacement = { directSessions: new Map() };
+  ownSession(original.directSessions, remote, sessionId);
+
+  transferSessionOwnership([original, replacement], replacement, remote, sessionId);
+
+  assert.equal(original.directSessions.size, 0);
+  assert.equal(replacement.directSessions.size, 1);
+  assert.equal(
+    replacement.directSessions.has(`${remote}:${sessionId}`),
+    true,
+  );
+});
+
+test('SC-Bridge isolates concurrent paid sessions when one cancels and disconnects', async () => {
+  const ScBridge = await loadScBridgeForNodeTest();
+  const remote = 'ab'.repeat(32);
+  const sessionA = '01'.repeat(32);
+  const sessionB = '02'.repeat(32);
+  const opened = [];
+  const sent = [];
+  const closed = [];
+  const sessions = new Map();
+  const directSession = {
+    sessions,
+    async open(openRemote, sessionId) {
+      const session = { remote: openRemote, session_id: sessionId, opened: true };
+      sessions.set(`${openRemote}:${sessionId}`, session);
+      opened.push(sessionId);
+      return session;
+    },
+    async send(sendRemote, sessionId, frame) {
+      sent.push({ remote: sendRemote, sessionId, frame });
+      return { remote: sendRemote, session_id: sessionId, sent: true };
+    },
+    close(closeRemote, sessionId) {
+      sessions.delete(`${closeRemote}:${sessionId}`);
+      closed.push(sessionId);
+      return { remote: closeRemote, session_id: sessionId, closed: true };
+    },
+  };
+  const makeClient = (id) => {
+    const messages = [];
+    const client = {
+      id,
+      ready: true,
+      authed: true,
+      closed: false,
+      socket: {
+        write(data) {
+          messages.push(JSON.parse(data));
+        },
+        destroy() {},
+      },
+      filter: [],
+      channels: null,
+      sessionIds: new Set(),
+      sessionAll: false,
+      directSessions: new Map(),
+      heartbeatRelayRooms: new Set(),
+      outboundQueue: [],
+      outboundBytes: 0,
+      writing: false,
+      authTimer: null,
+    };
+    return { client, messages };
+  };
+  const bridge = new ScBridge({ wallet: {} }, { requireAuth: false });
+  bridge.attachDirectSession(directSession);
+  const left = makeClient(1);
+  const right = makeClient(2);
+  bridge.clients.add(left.client);
+  bridge.clients.add(right.client);
+  const send = (client, message) => bridge._handleSocketData(client, JSON.stringify(message));
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+  send(left.client, { id: 1, type: 'session_subscribe', session_id: sessionA });
+  send(right.client, { id: 2, type: 'session_subscribe', session_id: sessionB });
+  send(left.client, { id: 3, type: 'session_open', remote, session_id: sessionA });
+  send(right.client, { id: 4, type: 'session_open', remote, session_id: sessionB });
+  await settle();
+  send(left.client, {
+    id: 5,
+    type: 'session_send',
+    remote,
+    session_id: sessionA,
+    frame: { t: 's.open', session_id: sessionA, spend_voucher: { rail: 'tnk' } },
+  });
+  send(right.client, {
+    id: 6,
+    type: 'session_send',
+    remote,
+    session_id: sessionB,
+    frame: { t: 's.open', session_id: sessionB, spend_voucher: { rail: 'tnk' } },
+  });
+  await settle();
+
+  assert.deepEqual(opened, [sessionA, sessionB]);
+  assert.equal(left.client.directSessions.has(`${remote}:${sessionA}`), true);
+  assert.equal(right.client.directSessions.has(`${remote}:${sessionB}`), true);
+  assert.equal(left.client.directSessions.has(`${remote}:${sessionB}`), false);
+  assert.equal(right.client.directSessions.has(`${remote}:${sessionA}`), false);
+
+  for (const sessionId of [sessionA, sessionB]) {
+    bridge.handleSessionFrame({
+      session_id: sessionId,
+      remote,
+      direct: true,
+      frame: { t: 's.accept', session_id: sessionId },
+    });
+  }
+  send(left.client, {
+    id: 7,
+    type: 'session_send',
+    remote,
+    session_id: sessionA,
+    frame: { t: 's.close', session_id: sessionA, reason: 'cancelled' },
+  });
+  await settle();
+  bridge._dropClient(left.client, 'client disconnected');
+
+  assert.deepEqual(closed, [sessionA]);
+  assert.equal(right.client.directSessions.has(`${remote}:${sessionB}`), true);
+  assert.equal(sessions.has(`${remote}:${sessionB}`), true);
+
+  bridge.handleSessionFrame({
+    session_id: sessionA,
+    remote,
+    direct: true,
+    frame: { t: 's.receipt', session_id: sessionA, amount: '1' },
+  });
+  bridge.handleSessionFrame({
+    session_id: sessionB,
+    remote,
+    direct: true,
+    frame: { t: 's.receipt', session_id: sessionB, amount: '2' },
+  });
+
+  const rightFrames = right.messages
+    .filter((message) => message.type === 'session_frame')
+    .map((message) => [message.session_id, message.frame.t]);
+  assert.deepEqual(
+    left.messages
+      .filter((message) => message.type === 'session_frame')
+      .map((message) => [message.session_id, message.frame.t]),
+    [[sessionA, 's.accept']],
+  );
+  assert.deepEqual(rightFrames, [
+    [sessionB, 's.accept'],
+    [sessionB, 's.receipt'],
+  ]);
+  assert.equal(
+    [...left.messages, ...right.messages].some(
+      (message) => message.type === 'session_taken_over'
+    ),
+    false,
+  );
+
+  send(right.client, { id: 8, type: 'session_close', remote, session_id: sessionB });
+  assert.deepEqual(closed, [sessionA, sessionB]);
+  assert.equal(right.client.directSessions.size, 0);
+  assert.equal(sessions.size, 0);
+  assert.deepEqual(
+    sent.map(({ sessionId, frame }) => [sessionId, frame.t]),
+    [
+      [sessionA, 's.open'],
+      [sessionB, 's.open'],
+      [sessionA, 's.close'],
+    ],
+  );
 });
 
 test('SC-Bridge does not leak session frames to an unsubscribed local client', () => {

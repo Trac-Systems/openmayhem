@@ -23,6 +23,7 @@ import {
   sessionFrameRecipients,
   sessionOwnershipKey,
   sessionSubscriptionMatches,
+  transferSessionOwnership,
 } from './session-ownership.js';
 import { writeBareHeapSnapshot } from './heap-snapshot.js';
 import { closeBridgeSocket } from './socket.js';
@@ -646,6 +647,38 @@ class ScBridge extends Feature {
             }
             sendError(err?.message ? `Session open failed: ${err.message}` : 'Session open failed.');
           });
+        return;
+      }
+      case 'session_takeover': {
+        if (!this.directSession) {
+          sendError('Direct session feature not ready.');
+          return;
+        }
+        const remote = String(message.remote || '').trim();
+        const sessionId = String(message.session_id || '').trim();
+        if (this._isLocalPeer(remote)) {
+          reply({
+            type: 'session_taken_over',
+            ...this._loopbackSessionInfo(remote, sessionId, { taken_over: true }),
+          });
+          return;
+        }
+        if (!this._canTrackClientSession(client, remote, sessionId)) {
+          sendError('Direct session ownership limit reached.');
+          return;
+        }
+        const ownershipKey = sessionOwnershipKey(remote, sessionId);
+        if (!this.directSession.sessions?.has(ownershipKey)) {
+          sendError('Direct session is not open.');
+          return;
+        }
+        transferSessionOwnership(this.clients, client, remote, sessionId);
+        reply({
+          type: 'session_taken_over',
+          remote,
+          session_id: sessionId,
+          taken_over: true,
+        });
         return;
       }
       case 'session_send': {

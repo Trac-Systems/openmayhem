@@ -1,6 +1,6 @@
 {
   "catalog_id": "openmayhem-mainnet",
-  "generated_at": "2026-08-12T03:45:20.000Z",
+  "generated_at": "2026-09-02T12:29:47Z",
   "models": [
     {
       "model_id": "Cactus-Compute/needle",
@@ -31879,6 +31879,5758 @@
         "per_req_au": "0",
         "min_session_au": "0"
       }
+    },
+    {
+      "adapter": {
+        "chat_template_id": "qwen3.5-instruct",
+        "endpoint_families": [
+          {
+            "family": "openai_chat_completions",
+            "interaction_groups": [
+              [
+                "tools",
+                "tool_choice"
+              ],
+              [
+                "response_format",
+                "stream"
+              ],
+              [
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p",
+                "frequency_penalty",
+                "presence_penalty",
+                "seed"
+              ]
+            ],
+            "request_attribute_specs": {
+              "frequency_penalty": {
+                "calibration_values": [
+                  0
+                ],
+                "maximum": 2,
+                "minimum": -2,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "max_completion_tokens": {
+                "calibration_values": [
+                  8
+                ],
+                "maximum": 262144,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "max_tokens": {
+                "calibration_values": [
+                  8
+                ],
+                "maximum": 262144,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "messages": {
+                "calibration_values": [
+                  [
+                    {
+                      "content": "Mayhem calibration context",
+                      "role": "user"
+                    },
+                    {
+                      "content": "Mayhem calibration",
+                      "role": "user"
+                    }
+                  ],
+                  [
+                    {
+                      "content": [
+                        {
+                          "text": "Mayhem calibration",
+                          "type": "text"
+                        }
+                      ],
+                      "role": "user"
+                    }
+                  ],
+                  [
+                    {
+                      "content": [
+                        {
+                          "text": "Describe the calibration image.",
+                          "type": "text"
+                        },
+                        {
+                          "image_url": {
+                            "url": "$IMAGE_DATA_URL"
+                          },
+                          "type": "image_url"
+                        }
+                      ],
+                      "role": "user"
+                    }
+                  ]
+                ],
+                "max_items": 4096,
+                "min_items": 1,
+                "value_types": [
+                  "array"
+                ]
+              },
+              "messages.content.image_url.url": {
+                "calibration_values": [
+                  "$IMAGE_DATA_URL"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.content.text": {
+                "calibration_values": [
+                  "Mayhem calibration"
+                ],
+                "max_length": 32000,
+                "min_length": 1,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.content.type": {
+                "calibration_values": [
+                  "text",
+                  "image_url"
+                ],
+                "enum_values": [
+                  "text",
+                  "image_url"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.name": {
+                "calibration_values": [
+                  "calibration"
+                ],
+                "max_length": 256,
+                "min_length": 1,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.role": {
+                "calibration_values": [
+                  "user",
+                  "system",
+                  "assistant",
+                  "tool"
+                ],
+                "enum_values": [
+                  "system",
+                  "user",
+                  "assistant",
+                  "tool"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.tool_call_id": {
+                "calibration_values": [
+                  "calibration"
+                ],
+                "max_length": 256,
+                "min_length": 1,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.tool_calls": {
+                "calibration_values": [
+                  [
+                    {
+                      "function": {
+                        "arguments": "{}",
+                        "name": "calibration_tool"
+                      },
+                      "id": "call-calibration",
+                      "type": "function"
+                    }
+                  ]
+                ],
+                "max_items": 128,
+                "min_items": 1,
+                "value_types": [
+                  "array"
+                ]
+              },
+              "metadata": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              },
+              "min_p": {
+                "calibration_values": [
+                  0.05
+                ],
+                "maximum": 1,
+                "minimum": 0,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "model": {
+                "calibration_values": [
+                  "Qwen/Qwen3.8-27B"
+                ],
+                "enum_values": [
+                  "Qwen/Qwen3.8-27B"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "presence_penalty": {
+                "calibration_values": [
+                  0,
+                  1.5,
+                  2
+                ],
+                "maximum": 2,
+                "minimum": -2,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "response_format": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              },
+              "seed": {
+                "calibration_values": [
+                  7
+                ],
+                "maximum": 4294967295,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "stop": {
+                "calibration_values": [
+                  "CALIBRATION_STOP",
+                  [
+                    "CALIBRATION_STOP",
+                    "CALIBRATION_END"
+                  ],
+                  null
+                ],
+                "value_types": [
+                  "string",
+                  "array",
+                  "null"
+                ]
+              },
+              "stream": {
+                "calibration_values": [
+                  false,
+                  true
+                ],
+                "default": false,
+                "value_types": [
+                  "boolean"
+                ]
+              },
+              "stream_options.include_usage": {
+                "calibration_values": [
+                  false,
+                  true
+                ],
+                "value_types": [
+                  "boolean"
+                ]
+              },
+              "temperature": {
+                "calibration_values": [
+                  0.6
+                ],
+                "maximum": 2,
+                "minimum": 0,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "thinking_history": {
+                "calibration_values": [
+                  "latest_only",
+                  "preserve"
+                ],
+                "default": "preserve",
+                "enum_values": [
+                  "latest_only",
+                  "preserve"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "thinking_mode": {
+                "calibration_values": [
+                  "disabled",
+                  "enabled"
+                ],
+                "default": "enabled",
+                "enum_values": [
+                  "disabled",
+                  "enabled"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "tool_choice": {
+                "calibration_values": [
+                  "auto",
+                  "none",
+                  {
+                    "function": {
+                      "name": "calibration_tool"
+                    },
+                    "type": "function"
+                  }
+                ],
+                "value_types": [
+                  "string",
+                  "object"
+                ]
+              },
+              "tools": {
+                "calibration_values": [
+                  [
+                    {
+                      "function": {
+                        "name": "calibration_tool",
+                        "parameters": {
+                          "type": "object"
+                        }
+                      },
+                      "type": "function"
+                    }
+                  ]
+                ],
+                "max_items": 128,
+                "min_items": 1,
+                "value_types": [
+                  "array"
+                ]
+              },
+              "top_k": {
+                "calibration_values": [
+                  20
+                ],
+                "maximum": 1000000,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "top_p": {
+                "calibration_values": [
+                  0.95
+                ],
+                "maximum": 1,
+                "minimum": 0.000001,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "user": {
+                "calibration_values": [
+                  "mayhem-calibration-user"
+                ],
+                "max_length": 512,
+                "min_length": 1,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "reasoning_effort": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "low",
+                  "medium",
+                  "xhigh"
+                ],
+                "calibration_values": [
+                  "low",
+                  "medium",
+                  "xhigh"
+                ],
+                "default": "xhigh"
+              }
+            },
+            "request_attributes": [
+              "frequency_penalty",
+              "max_completion_tokens",
+              "max_tokens",
+              "messages",
+              "messages.content.image_url.url",
+              "messages.content.text",
+              "messages.content.type",
+              "messages.name",
+              "messages.role",
+              "messages.tool_call_id",
+              "messages.tool_calls",
+              "metadata",
+              "min_p",
+              "model",
+              "presence_penalty",
+              "reasoning_effort",
+              "response_format",
+              "seed",
+              "stop",
+              "stream",
+              "stream_options.include_usage",
+              "temperature",
+              "thinking_history",
+              "thinking_mode",
+              "tool_choice",
+              "tools",
+              "top_k",
+              "top_p",
+              "user"
+            ],
+            "required_request_attributes": [
+              "messages",
+              "messages.role",
+              "model"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "created",
+              "model",
+              "choices",
+              "usage",
+              "mayhem"
+            ],
+            "response_attribute_specs": {
+              "choices": {
+                "calibration_values": [
+                  []
+                ],
+                "max_items": 1000000,
+                "min_items": 0,
+                "value_types": [
+                  "array"
+                ]
+              },
+              "created": {
+                "calibration_values": [
+                  1
+                ],
+                "maximum": 1.8446744073709552E+19,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "id": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "mayhem": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              },
+              "model": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "object": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "usage": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              }
+            },
+            "response_attributes": [
+              "id",
+              "object",
+              "created",
+              "model",
+              "choices",
+              "usage",
+              "mayhem"
+            ],
+            "speciality_mappings": {
+              "thinking_history": {
+                "native_path": "preserve_thinking",
+                "request_path": "thinking_history",
+                "target": "chat_template_kwarg"
+              },
+              "thinking_mode": {
+                "native_path": "enable_thinking",
+                "request_path": "thinking_mode",
+                "target": "chat_template_kwarg"
+              },
+              "reasoning_effort": {
+                "request_path": "reasoning_effort",
+                "target": "chat_template_kwarg",
+                "native_path": "reasoning_effort"
+              }
+            }
+          },
+          {
+            "family": "openai_completions",
+            "interaction_groups": [
+              [
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p",
+                "frequency_penalty",
+                "presence_penalty",
+                "seed"
+              ]
+            ],
+            "request_attribute_specs": {
+              "frequency_penalty": {
+                "calibration_values": [
+                  0
+                ],
+                "maximum": 2,
+                "minimum": -2,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "max_tokens": {
+                "calibration_values": [
+                  8
+                ],
+                "maximum": 262144,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "min_p": {
+                "calibration_values": [
+                  0.05
+                ],
+                "maximum": 1,
+                "minimum": 0,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "model": {
+                "calibration_values": [
+                  "Qwen/Qwen3.8-27B"
+                ],
+                "enum_values": [
+                  "Qwen/Qwen3.8-27B"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "presence_penalty": {
+                "calibration_values": [
+                  0,
+                  1.5,
+                  2
+                ],
+                "maximum": 2,
+                "minimum": -2,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "prompt": {
+                "calibration_values": [
+                  "Mayhem calibration"
+                ],
+                "max_length": 32000,
+                "min_length": 1,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "seed": {
+                "calibration_values": [
+                  7
+                ],
+                "maximum": 4294967295,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "stop": {
+                "calibration_values": [
+                  "CALIBRATION_STOP",
+                  [
+                    "CALIBRATION_STOP",
+                    "CALIBRATION_END"
+                  ],
+                  null
+                ],
+                "value_types": [
+                  "string",
+                  "array",
+                  "null"
+                ]
+              },
+              "stream": {
+                "calibration_values": [
+                  false,
+                  true
+                ],
+                "default": false,
+                "value_types": [
+                  "boolean"
+                ]
+              },
+              "temperature": {
+                "calibration_values": [
+                  0.6
+                ],
+                "maximum": 2,
+                "minimum": 0,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "thinking_history": {
+                "calibration_values": [
+                  "latest_only",
+                  "preserve"
+                ],
+                "default": "preserve",
+                "enum_values": [
+                  "latest_only",
+                  "preserve"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "thinking_mode": {
+                "calibration_values": [
+                  "disabled",
+                  "enabled"
+                ],
+                "default": "enabled",
+                "enum_values": [
+                  "disabled",
+                  "enabled"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "top_k": {
+                "calibration_values": [
+                  20
+                ],
+                "maximum": 1000000,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "top_p": {
+                "calibration_values": [
+                  0.95
+                ],
+                "maximum": 1,
+                "minimum": 0.000001,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "user": {
+                "calibration_values": [
+                  "mayhem-calibration-user"
+                ],
+                "max_length": 512,
+                "min_length": 1,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "reasoning_effort": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "low",
+                  "medium",
+                  "xhigh"
+                ],
+                "calibration_values": [
+                  "low",
+                  "medium",
+                  "xhigh"
+                ],
+                "default": "xhigh"
+              }
+            },
+            "request_attributes": [
+              "frequency_penalty",
+              "max_tokens",
+              "min_p",
+              "model",
+              "presence_penalty",
+              "prompt",
+              "reasoning_effort",
+              "seed",
+              "stop",
+              "stream",
+              "temperature",
+              "thinking_history",
+              "thinking_mode",
+              "top_k",
+              "top_p",
+              "user"
+            ],
+            "required_request_attributes": [
+              "model",
+              "prompt"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "created",
+              "model",
+              "choices",
+              "usage",
+              "mayhem"
+            ],
+            "response_attribute_specs": {
+              "choices": {
+                "calibration_values": [
+                  []
+                ],
+                "max_items": 1000000,
+                "min_items": 0,
+                "value_types": [
+                  "array"
+                ]
+              },
+              "created": {
+                "calibration_values": [
+                  1
+                ],
+                "maximum": 1.8446744073709552E+19,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "id": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "mayhem": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              },
+              "model": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "object": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "usage": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              }
+            },
+            "response_attributes": [
+              "id",
+              "object",
+              "created",
+              "model",
+              "choices",
+              "usage",
+              "mayhem"
+            ],
+            "speciality_mappings": {
+              "thinking_history": {
+                "native_path": "preserve_thinking",
+                "request_path": "thinking_history",
+                "target": "chat_template_kwarg"
+              },
+              "thinking_mode": {
+                "native_path": "enable_thinking",
+                "request_path": "thinking_mode",
+                "target": "chat_template_kwarg"
+              },
+              "reasoning_effort": {
+                "request_path": "reasoning_effort",
+                "target": "chat_template_kwarg",
+                "native_path": "reasoning_effort"
+              }
+            }
+          },
+          {
+            "family": "openai_responses",
+            "interaction_groups": [
+              [
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p"
+              ],
+              [
+                "tools",
+                "tool_choice"
+              ]
+            ],
+            "request_attribute_specs": {
+              "input": {
+                "calibration_values": [
+                  "Mayhem calibration",
+                  [
+                    {
+                      "content": "Mayhem calibration",
+                      "role": "user"
+                    }
+                  ]
+                ],
+                "value_types": [
+                  "string",
+                  "array"
+                ]
+              },
+              "max_output_tokens": {
+                "calibration_values": [
+                  8
+                ],
+                "maximum": 262144,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "metadata": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              },
+              "min_p": {
+                "calibration_values": [
+                  0.05
+                ],
+                "maximum": 1,
+                "minimum": 0,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "model": {
+                "calibration_values": [
+                  "Qwen/Qwen3.8-27B"
+                ],
+                "enum_values": [
+                  "Qwen/Qwen3.8-27B"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "stream": {
+                "calibration_values": [
+                  false,
+                  true
+                ],
+                "default": false,
+                "value_types": [
+                  "boolean"
+                ]
+              },
+              "temperature": {
+                "calibration_values": [
+                  0.6
+                ],
+                "maximum": 2,
+                "minimum": 0,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "text": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              },
+              "thinking_history": {
+                "calibration_values": [
+                  "latest_only",
+                  "preserve"
+                ],
+                "default": "preserve",
+                "enum_values": [
+                  "latest_only",
+                  "preserve"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "thinking_mode": {
+                "calibration_values": [
+                  "disabled",
+                  "enabled"
+                ],
+                "default": "enabled",
+                "enum_values": [
+                  "disabled",
+                  "enabled"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "tool_choice": {
+                "calibration_values": [
+                  "auto",
+                  "none",
+                  {
+                    "function": {
+                      "name": "calibration_tool"
+                    },
+                    "type": "function"
+                  }
+                ],
+                "value_types": [
+                  "string",
+                  "object"
+                ]
+              },
+              "tools": {
+                "calibration_values": [
+                  [
+                    {
+                      "function": {
+                        "name": "calibration_tool",
+                        "parameters": {
+                          "type": "object"
+                        }
+                      },
+                      "type": "function"
+                    }
+                  ]
+                ],
+                "max_items": 128,
+                "min_items": 1,
+                "value_types": [
+                  "array"
+                ]
+              },
+              "top_k": {
+                "calibration_values": [
+                  20
+                ],
+                "maximum": 1000000,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "top_p": {
+                "calibration_values": [
+                  0.95
+                ],
+                "maximum": 1,
+                "minimum": 0.000001,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "user": {
+                "calibration_values": [
+                  "mayhem-calibration-user"
+                ],
+                "max_length": 512,
+                "min_length": 1,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "reasoning_effort": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "low",
+                  "medium",
+                  "xhigh"
+                ],
+                "calibration_values": [
+                  "low",
+                  "medium",
+                  "xhigh"
+                ],
+                "default": "xhigh"
+              }
+            },
+            "request_attributes": [
+              "input",
+              "max_output_tokens",
+              "metadata",
+              "min_p",
+              "model",
+              "reasoning_effort",
+              "stream",
+              "temperature",
+              "text",
+              "thinking_history",
+              "thinking_mode",
+              "tool_choice",
+              "tools",
+              "top_k",
+              "top_p",
+              "user"
+            ],
+            "required_request_attributes": [
+              "model",
+              "input"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "created_at",
+              "status",
+              "model",
+              "output",
+              "usage",
+              "mayhem"
+            ],
+            "response_attribute_specs": {
+              "created_at": {
+                "calibration_values": [
+                  1
+                ],
+                "maximum": 1.8446744073709552E+19,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "id": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "mayhem": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              },
+              "model": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "object": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "output": {
+                "calibration_values": [
+                  []
+                ],
+                "max_items": 1000000,
+                "min_items": 0,
+                "value_types": [
+                  "array"
+                ]
+              },
+              "status": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "usage": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              }
+            },
+            "response_attributes": [
+              "id",
+              "object",
+              "created_at",
+              "status",
+              "model",
+              "output",
+              "usage",
+              "mayhem"
+            ],
+            "speciality_mappings": {
+              "thinking_history": {
+                "native_path": "preserve_thinking",
+                "request_path": "thinking_history",
+                "target": "chat_template_kwarg"
+              },
+              "thinking_mode": {
+                "native_path": "enable_thinking",
+                "request_path": "thinking_mode",
+                "target": "chat_template_kwarg"
+              },
+              "reasoning_effort": {
+                "request_path": "reasoning_effort",
+                "target": "chat_template_kwarg",
+                "native_path": "reasoning_effort"
+              }
+            }
+          },
+          {
+            "family": "hf_multimodal_chat",
+            "interaction_groups": [
+              [
+                "tools",
+                "tool_choice"
+              ],
+              [
+                "response_format",
+                "stream"
+              ],
+              [
+                "temperature",
+                "top_p",
+                "top_k",
+                "min_p",
+                "seed"
+              ]
+            ],
+            "request_attribute_specs": {
+              "max_tokens": {
+                "calibration_values": [
+                  8
+                ],
+                "maximum": 262144,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "messages": {
+                "calibration_values": [
+                  [
+                    {
+                      "content": "Mayhem calibration context",
+                      "role": "user"
+                    },
+                    {
+                      "content": "Mayhem calibration",
+                      "role": "user"
+                    }
+                  ],
+                  [
+                    {
+                      "content": [
+                        {
+                          "text": "Describe the calibration image.",
+                          "type": "text"
+                        },
+                        {
+                          "image_url": {
+                            "url": "$IMAGE_DATA_URL"
+                          },
+                          "type": "image_url"
+                        }
+                      ],
+                      "role": "user"
+                    }
+                  ],
+                  [
+                    {
+                      "content": [
+                        {
+                          "text": "Describe the calibration video.",
+                          "type": "text"
+                        },
+                        {
+                          "type": "video",
+                          "video": {
+                            "content_type": "video/mp4",
+                            "data": "$VIDEO_BASE64",
+                            "fps": 8,
+                            "num_frames": 16
+                          }
+                        }
+                      ],
+                      "role": "user"
+                    }
+                  ],
+                  [
+                    {
+                      "content": [
+                        {
+                          "text": "Compare the calibration image and video.",
+                          "type": "text"
+                        },
+                        {
+                          "image_url": {
+                            "url": "$IMAGE_DATA_URL"
+                          },
+                          "type": "image_url"
+                        },
+                        {
+                          "type": "video",
+                          "video": {
+                            "content_type": "video/mp4",
+                            "data": "$VIDEO_BASE64",
+                            "fps": 8,
+                            "num_frames": 16
+                          }
+                        }
+                      ],
+                      "role": "user"
+                    }
+                  ]
+                ],
+                "max_items": 4096,
+                "min_items": 1,
+                "value_types": [
+                  "array"
+                ]
+              },
+              "messages.content.image_url.url": {
+                "calibration_values": [
+                  "$IMAGE_DATA_URL"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.content.text": {
+                "calibration_values": [
+                  "Mayhem calibration"
+                ],
+                "max_length": 32000,
+                "min_length": 1,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.content.type": {
+                "calibration_values": [
+                  "text",
+                  "image_url",
+                  "video"
+                ],
+                "enum_values": [
+                  "text",
+                  "image_url",
+                  "video"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.content.video.content_type": {
+                "calibration_values": [
+                  "video/mp4"
+                ],
+                "enum_values": [
+                  "video/mp4",
+                  "video/webm"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.content.video.data": {
+                "calibration_values": [
+                  "$VIDEO_BASE64"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.content.video.fps": {
+                "calibration_values": [
+                  8
+                ],
+                "maximum": 240,
+                "minimum": 0.01,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "messages.content.video.num_frames": {
+                "calibration_values": [
+                  16
+                ],
+                "maximum": 1024,
+                "minimum": 1,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "messages.name": {
+                "calibration_values": [
+                  "calibration"
+                ],
+                "max_length": 256,
+                "min_length": 1,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.role": {
+                "calibration_values": [
+                  "user",
+                  "system",
+                  "assistant",
+                  "tool"
+                ],
+                "enum_values": [
+                  "system",
+                  "user",
+                  "assistant",
+                  "tool"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.tool_call_id": {
+                "calibration_values": [
+                  "calibration"
+                ],
+                "max_length": 256,
+                "min_length": 1,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.tool_calls": {
+                "calibration_values": [
+                  [
+                    {
+                      "function": {
+                        "arguments": "{}",
+                        "name": "calibration_tool"
+                      },
+                      "id": "call-calibration",
+                      "type": "function"
+                    }
+                  ]
+                ],
+                "max_items": 128,
+                "min_items": 1,
+                "value_types": [
+                  "array"
+                ]
+              },
+              "min_p": {
+                "calibration_values": [
+                  0.05
+                ],
+                "maximum": 1,
+                "minimum": 0,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "model": {
+                "calibration_values": [
+                  "Qwen/Qwen3.8-27B"
+                ],
+                "enum_values": [
+                  "Qwen/Qwen3.8-27B"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "response_format": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              },
+              "seed": {
+                "calibration_values": [
+                  7
+                ],
+                "maximum": 4294967295,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "stream": {
+                "calibration_values": [
+                  false,
+                  true
+                ],
+                "default": false,
+                "value_types": [
+                  "boolean"
+                ]
+              },
+              "temperature": {
+                "calibration_values": [
+                  0.6
+                ],
+                "maximum": 2,
+                "minimum": 0,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "thinking_history": {
+                "calibration_values": [
+                  "latest_only",
+                  "preserve"
+                ],
+                "default": "preserve",
+                "enum_values": [
+                  "latest_only",
+                  "preserve"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "thinking_mode": {
+                "calibration_values": [
+                  "disabled",
+                  "enabled"
+                ],
+                "default": "enabled",
+                "enum_values": [
+                  "disabled",
+                  "enabled"
+                ],
+                "value_types": [
+                  "string"
+                ]
+              },
+              "tool_choice": {
+                "calibration_values": [
+                  "auto",
+                  "none",
+                  {
+                    "function": {
+                      "name": "calibration_tool"
+                    },
+                    "type": "function"
+                  }
+                ],
+                "value_types": [
+                  "string",
+                  "object"
+                ]
+              },
+              "tools": {
+                "calibration_values": [
+                  [
+                    {
+                      "function": {
+                        "name": "calibration_tool",
+                        "parameters": {
+                          "type": "object"
+                        }
+                      },
+                      "type": "function"
+                    }
+                  ]
+                ],
+                "max_items": 128,
+                "min_items": 1,
+                "value_types": [
+                  "array"
+                ]
+              },
+              "top_k": {
+                "calibration_values": [
+                  20
+                ],
+                "maximum": 1000000,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "top_p": {
+                "calibration_values": [
+                  0.95
+                ],
+                "maximum": 1,
+                "minimum": 0.000001,
+                "value_types": [
+                  "number"
+                ]
+              },
+              "reasoning_effort": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "low",
+                  "medium",
+                  "xhigh"
+                ],
+                "calibration_values": [
+                  "low",
+                  "medium",
+                  "xhigh"
+                ],
+                "default": "xhigh"
+              }
+            },
+            "request_attributes": [
+              "max_tokens",
+              "messages",
+              "messages.content.image_url.url",
+              "messages.content.text",
+              "messages.content.type",
+              "messages.content.video.content_type",
+              "messages.content.video.data",
+              "messages.content.video.fps",
+              "messages.content.video.num_frames",
+              "messages.name",
+              "messages.role",
+              "messages.tool_call_id",
+              "messages.tool_calls",
+              "min_p",
+              "model",
+              "reasoning_effort",
+              "response_format",
+              "seed",
+              "stream",
+              "temperature",
+              "thinking_history",
+              "thinking_mode",
+              "tool_choice",
+              "tools",
+              "top_k",
+              "top_p"
+            ],
+            "required_request_attributes": [
+              "messages",
+              "messages.role",
+              "model"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "created",
+              "model",
+              "choices",
+              "usage",
+              "mayhem"
+            ],
+            "response_attribute_specs": {
+              "choices": {
+                "calibration_values": [
+                  []
+                ],
+                "max_items": 1000000,
+                "min_items": 0,
+                "value_types": [
+                  "array"
+                ]
+              },
+              "created": {
+                "calibration_values": [
+                  1
+                ],
+                "maximum": 1.8446744073709552E+19,
+                "minimum": 0,
+                "value_types": [
+                  "integer"
+                ]
+              },
+              "id": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "mayhem": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              },
+              "model": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "object": {
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ],
+                "max_length": 536870912,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "usage": {
+                "calibration_values": [
+                  {}
+                ],
+                "value_types": [
+                  "object"
+                ]
+              }
+            },
+            "response_attributes": [
+              "id",
+              "object",
+              "created",
+              "model",
+              "choices",
+              "usage",
+              "mayhem"
+            ],
+            "speciality_mappings": {
+              "thinking_history": {
+                "native_path": "preserve_thinking",
+                "request_path": "thinking_history",
+                "target": "chat_template_kwarg"
+              },
+              "thinking_mode": {
+                "native_path": "enable_thinking",
+                "request_path": "thinking_mode",
+                "target": "chat_template_kwarg"
+              },
+              "reasoning_effort": {
+                "request_path": "reasoning_effort",
+                "target": "chat_template_kwarg",
+                "native_path": "reasoning_effort"
+              }
+            }
+          }
+        ],
+        "modality_set": [
+          "text",
+          "image",
+          "video"
+        ],
+        "reasoning_passthrough": "strip",
+        "specialities": [
+          {
+            "name": "thinking_mode",
+            "mechanism": "boolean",
+            "default_level": "enabled",
+            "levels": [
+              {
+                "name": "disabled",
+                "rank": 0,
+                "native_value": false
+              },
+              {
+                "name": "enabled",
+                "rank": 1,
+                "native_value": true
+              }
+            ],
+            "calibration_modalities": [],
+            "research_evidence": [
+              "Pinned Qwen/Qwen3.8-27B chat_template.jinja exposes enable_thinking; thinking is enabled by default."
+            ]
+          },
+          {
+            "name": "thinking_history",
+            "mechanism": "boolean",
+            "default_level": "preserve",
+            "levels": [
+              {
+                "name": "latest_only",
+                "rank": 0,
+                "native_value": false
+              },
+              {
+                "name": "preserve",
+                "rank": 1,
+                "native_value": true
+              }
+            ],
+            "calibration_modalities": [],
+            "research_evidence": [
+              "Pinned Qwen/Qwen3.8-27B chat_template.jinja exposes preserve_thinking; preservation is enabled by default."
+            ]
+          },
+          {
+            "name": "reasoning_effort",
+            "mechanism": "enum",
+            "default_level": "xhigh",
+            "levels": [
+              {
+                "name": "low",
+                "rank": 0,
+                "native_value": "low",
+                "default_max_output_tokens": 32768,
+                "max_reasoning_tokens": 32768
+              },
+              {
+                "name": "medium",
+                "rank": 1,
+                "native_value": "medium",
+                "default_max_output_tokens": 32768,
+                "max_reasoning_tokens": 32768
+              },
+              {
+                "name": "xhigh",
+                "rank": 2,
+                "native_value": "xhigh",
+                "default_max_output_tokens": 32768,
+                "max_reasoning_tokens": 32768
+              }
+            ],
+            "calibration_modalities": [],
+            "research_evidence": [
+              "Pinned Qwen/Qwen3.8-27B model card and chat_template.jinja define low, medium, and xhigh reasoning_effort with xhigh as default; equal output caps avoid inventing undocumented per-level token budgets."
+            ]
+          }
+        ],
+        "tool_call_strategy": "qwen_function_xml"
+      },
+      "artifacts": {
+        "nvfp4": {
+          "engine": "vllm",
+          "kv_cache": {
+            "dtype": "fp8",
+            "bits": 8,
+            "group_size": 1,
+            "quantized_start_tokens": 0,
+            "full_attention_layers": 16,
+            "total_layers": 64,
+            "bytes_per_token": 32768,
+            "measurement_source": "Pinned Qwen3.8 config structure plus exact vLLM 0.24 FP8-KV runtime proof on GB10; publication remains gated on the retained calibration report."
+          },
+          "source": {
+            "kind": "huggingface",
+            "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+            "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+            "publisher_key": "huggingface-repo"
+          },
+          "path": "model-00001-of-00006.safetensors",
+          "artifact_root": "36abadf4a7aa1ac3b60abc57bda718c3329cf3ad69fb9dfca13a5384c32c6f11",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 3392259568,
+          "source_sha256": "5b4c7df31dd4117193e80029052ef334475f70a07c9fe27e9408622d159f50ea",
+          "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+          "chat_template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+          "min_compute_cap": "12.0",
+          "download_check": true,
+          "notes": "Model-scoped HivenetQuant NVFP4 W4A4 checkpoint for NVIDIA Blackwell, mirrored byte-for-byte at an immutable TracNetwork revision; BF16 compute and FP8 KV are calibrated only for this artifact.",
+          "sidecars": {
+            "vllm_weight_shard_00002": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "model-00002-of-00006.safetensors",
+              "artifact_root": "d3698301e1a4ec1bb8609ac2c3736321a95dc76fbc9c576de4855767dbb52717",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 4806767856,
+              "source_sha256": "e9e46210d090e2914a05150be94af87e1fffe168a22113d2b6802aa259e63c2d",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            },
+            "vllm_weight_shard_00003": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "model-00003-of-00006.safetensors",
+              "artifact_root": "b57ca7a783c0f86b6c95e69f161a0e9edefb927d9d57bf98e1840e2b7ba33f13",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 4827420552,
+              "source_sha256": "7bfa46154be683981bb8a40d87ff439f0acd848c3acdc28e01f4a969393bf189",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            },
+            "vllm_weight_shard_00004": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "model-00004-of-00006.safetensors",
+              "artifact_root": "6ec3d2e2c7ed0a3c52a40e49d04001efbaf9b180ba1e2d2a9cf5f61221292e1b",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 4811018872,
+              "source_sha256": "59ba3301262f0db28479084277675e68a0fa45cfcedf6022f8f50ab5fb6b333b",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            },
+            "vllm_weight_shard_00005": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "model-00005-of-00006.safetensors",
+              "artifact_root": "25850fddd6682436a626a5e4c7fe6acf01d9f5fcc39600440ffb5fed45cf6c76",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 4799874120,
+              "source_sha256": "05e4f44eecb7886c8587f3cbe2543aadfdbb325276dcb20f036ff878831285eb",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            },
+            "vllm_weight_shard_00006": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "model-00006-of-00006.safetensors",
+              "artifact_root": "76ccd09457e2b4d05c71162b3e4f8be77cb7a29f6026d76e68df76c7aa449119",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 453510880,
+              "source_sha256": "17a15c71dc05b3651ca9e261f11cab26e0169a99933db95df62c2c378d198945",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            },
+            "vllm_model_index": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "model.safetensors.index.json",
+              "artifact_root": "13d9b0e5e67a7bc28e421757c34ea130ef7acf575c52b8d49941c933ea20fba5",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 209337,
+              "source_sha256": "e172494953f9159f0593051553935e30ca2353f1584e738d0af84a9edc02b0c1",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            },
+            "vllm_config": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "config.json",
+              "artifact_root": "e1d4f7a687f008df717810172978840aebbd108ef518c89737ab008e7f13fd12",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 46727,
+              "source_sha256": "b62bc703738bd384cf2ae1627b96187b0d116716cb2f08a3530e34db0bda2484",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            },
+            "vllm_generation_config": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "generation_config.json",
+              "artifact_root": "26a1fa96f1930683c7c843eab3c40a677e9bcbedcd12c10a5a03aec72f1be27e",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 219,
+              "source_sha256": "67e83b6e03315ea963323b705a9de6e1654ea9f2331938eb6e53429e461102c7",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            },
+            "vllm_chat_template": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "chat_template.jinja",
+              "artifact_root": "35aaaf0b4ea909024b9fea1f571c86646297669a3a6575a4d96801792fd0c7b4",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 8952,
+              "source_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            },
+            "vllm_tokenizer_json": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "tokenizer.json",
+              "artifact_root": "d9c0c2fff88da258388ad0741e1d0ba1fa590854cb27a8a8da90830bdc6341e6",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 12809320,
+              "source_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            },
+            "vllm_tokenizer_config": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "tokenizer_config.json",
+              "artifact_root": "196c84b5061e35d96476933a06a79dabcccd8569d9405852936afc02107c8e0c",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 17928,
+              "source_sha256": "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            },
+            "vllm_merges": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "merges.txt",
+              "artifact_root": "01bd379db1872b2dda6fff0c5a7e61d6a0e698a9f3ae13d08878238df8c391c9",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 3353259,
+              "source_sha256": "a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            },
+            "vllm_vocab": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "vocab.json",
+              "artifact_root": "4967da4487f6232edb3cf804e21bfcac18bf38229842670149615c8d73dcc2bd",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 6722759,
+              "source_sha256": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            },
+            "vllm_preprocessor_config": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "preprocessor_config.json",
+              "artifact_root": "f9fafb8697273df9509d76d11473ff515156364565523f269193b4fecbbbd8d6",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 390,
+              "source_sha256": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            },
+            "vllm_processor_config": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "processor_config.json",
+              "artifact_root": "b325a1decf72968f6ffce669664045045adea3d512c20d13ece2ce9bcc2530b8",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 1191,
+              "source_sha256": "d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            },
+            "vllm_video_preprocessor_config": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "video_preprocessor_config.json",
+              "artifact_root": "d23ac039844c1a551b8a4df90b39f4acc63d473f051fa4ba31da99d72b25be00",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 385,
+              "source_sha256": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            },
+            "vllm_recipe_summary": {
+              "source": {
+                "kind": "huggingface",
+                "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-27B-NVFP4",
+                "revision": "4ee2ca6a5987ba7f07cbe0e779f73f98d66b4a94",
+                "publisher_key": "huggingface-repo"
+              },
+              "path": "recipe_summary.json",
+              "artifact_root": "f5266ab0b7254e5d532f3763717f617bf465a9879aeb975465e266425cde4fb3",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 34028,
+              "source_sha256": "6c4dcb1d90bf95b5f1bad4c16fe4a45870f705b8e776c3a0dba035d71983590f",
+              "upstream_source": {
+                "kind": "huggingface",
+                "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+                "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+                "publisher_key": "huggingface-repo"
+              }
+            }
+          },
+          "upstream_source": {
+            "kind": "huggingface",
+            "repo": "HivenetQuant/Qwen3.8-27B-NVFP4",
+            "revision": "cd5a8f0739c1df89d8cd9d39ede58c619d8298c2",
+            "publisher_key": "huggingface-repo"
+          }
+        }
+      },
+      "canary": {
+        "set_id": "canary-qwen3.8-27b-nvfp4-v1",
+        "match_min": 0.9,
+        "verification_method": "token_fingerprint",
+        "fingerprints": {
+          "nvfp4": "b9c2534438c3cd5b5cde5ef08fe4b88e31bee97f2d5729a823453ed385451d15"
+        },
+        "token_prefixes": {
+          "nvfp4": {
+            "qwen38-image-understanding": [
+              760,
+              46120,
+              36367,
+              2099,
+              4275,
+              264,
+              8358,
+              36004,
+              1500,
+              314,
+              30787,
+              46026,
+              78841,
+              716,
+              2272,
+              264,
+              3870,
+              314,
+              11795,
+              1829,
+              15436,
+              11,
+              440,
+              2438,
+              1602,
+              279,
+              1379,
+              23681,
+              1829,
+              383,
+              279,
+              2047,
+              3008,
+              13,
+              248046
+            ],
+            "qwen38-json-object": [
+              90,
+              198,
+              220,
+              328,
+              19370,
+              763,
+              328,
+              2428,
+              17812,
+              28085,
+              487,
+              198,
+              220,
+              328,
+              2448,
+              763,
+              328,
+              80,
+              16451,
+              18,
+              13,
+              23,
+              487,
+              198,
+              220,
+              328,
+              13646,
+              763,
+              220,
+              17,
+              198,
+              92,
+              248046
+            ],
+            "qwen38-preserve-thinking-false": [
+              23282,
+              622,
+              25,
+              33829,
+              198,
+              19981,
+              25,
+              33829,
+              198,
+              26889,
+              25,
+              33829,
+              248046
+            ],
+            "qwen38-preserve-thinking-true": [
+              23282,
+              622,
+              25,
+              32709,
+              3045,
+              1284,
+              24900,
+              12,
+              23,
+              17,
+              22,
+              198,
+              19981,
+              25,
+              32471,
+              198,
+              26889,
+              25,
+              13263,
+              31626,
+              369,
+              2420,
+              248046
+            ],
+            "qwen38-reasoning-low": [
+              9764,
+              728,
+              944,
+              1472,
+              411,
+              2923,
+              539,
+              2923,
+              13,
+              271,
+              1596,
+              599,
+              220,
+              18,
+              2438,
+              11,
+              220,
+              19,
+              6105,
+              11,
+              321,
+              220,
+              20,
+              5983,
+              10885,
+              13,
+              10342,
+              283,
+              220,
+              16,
+              17,
+              10885,
+              13,
+              271,
+              1596,
+              3902,
+              1330,
+              1973,
+              13329,
+              13,
+              1165,
+              1318,
+              279,
+              18356,
+              421,
+              2107,
+              599,
+              279,
+              1788,
+              1829,
+              13,
+              271,
+              47,
+              1104,
+              368,
+              1829,
+              8,
+              283,
+              387,
+              7,
+              20385,
+              2438,
+              8,
+              478,
+              387,
+              7,
+              20385,
+              6105,
+              8,
+              478,
+              387,
+              7,
+              20385,
+              5983,
+              8,
+              271,
+              47,
+              7,
+              20385,
+              2438,
+              8,
+              283,
+              318,
+              18,
+              14,
+              16,
+              17,
+              8,
+              23985,
+              318,
+              17,
+              14,
+              16,
+              16,
+              8,
+              283,
+              220,
+              21,
+              14,
+              16,
+              18,
+              17,
+              198,
+              47,
+              7,
+              20385,
+              6105,
+              8,
+              283,
+              318,
+              19,
+              14,
+              16,
+              17,
+              8,
+              23985,
+              318,
+              18,
+              14,
+              16,
+              16,
+              8,
+              283,
+              220,
+              16,
+              17,
+              14,
+              16,
+              18,
+              17,
+              198,
+              47,
+              7,
+              20385,
+              5983,
+              8,
+              283,
+              318,
+              20,
+              14,
+              16,
+              17,
+              8,
+              23985,
+              318,
+              19,
+              14,
+              16,
+              16,
+              8,
+              283,
+              220,
+              17,
+              15,
+              14,
+              16,
+              18,
+              17,
+              271,
+              7354,
+              283,
+              318,
+              21,
+              478,
+              220,
+              16,
+              17,
+              478,
+              220,
+              17,
+              15,
+              8,
+              593,
+              220,
+              16,
+              18,
+              17,
+              283,
+              220,
+              18,
+              23,
+              14,
+              16,
+              18,
+              17,
+              283,
+              220,
+              16,
+              24,
+              14,
+              21,
+              21
+            ],
+            "qwen38-reasoning-medium": [
+              760,
+              1156,
+              6587,
+              279,
+              18356,
+              421,
+              1330,
+              10885,
+              14336,
+              1973,
+              13329,
+              494,
+              264,
+              3618,
+              314,
+              220,
+              18,
+              2438,
+              11,
+              220,
+              19,
+              6105,
+              11,
+              321,
+              220,
+              20,
+              5983,
+              10885,
+              318,
+              4873,
+              220,
+              16,
+              17,
+              8,
+              513,
+              279,
+              1788,
+              1829,
+              13,
+              271,
+              9764,
+              728,
+              10724,
+              25,
+              271,
+              7354,
+              5337,
+              310,
+              3902,
+              220,
+              17,
+              494,
+              220,
+              16,
+              17,
+              25,
+              351,
+              7,
+              16,
+              17,
+              11,
+              17,
+              8,
+              283,
+              220,
+              21,
+              21,
+              271,
+              54,
+              912,
+              310,
+              3902,
+              220,
+              17,
+              2438,
+              25,
+              351,
+              7,
+              18,
+              11,
+              17,
+              8,
+              283,
+              220,
+              18,
+              198,
+              54,
+              912,
+              310,
+              3902,
+              220,
+              17,
+              6105,
+              25,
+              351,
+              7,
+              19,
+              11,
+              17,
+              8,
+              283,
+              220,
+              21,
+              198,
+              54,
+              912,
+              310,
+              3902,
+              220,
+              17,
+              5983,
+              25,
+              351,
+              7,
+              20,
+              11,
+              17,
+              8,
+              283,
+              220,
+              16,
+              15,
+              271,
+              7354,
+              35531,
+              25,
+              220,
+              18,
+              478,
+              220,
+              21,
+              478,
+              220,
+              16,
+              15,
+              283,
+              220,
+              16,
+              24,
+              271,
+              85419,
+              283,
+              220,
+              16,
+              24,
+              14,
+              21,
+              21,
+              271,
+              9764,
+              728,
+              9845,
+              25,
+              220,
+              16,
+              24,
+              14,
+              21,
+              21,
+              13,
+              2885,
+              411,
+              381,
+              42349,
+              30,
+              220,
+              16,
+              24,
+              369,
+              9944,
+              11,
+              220,
+              21,
+              21,
+              283,
+              220,
+              17,
+              17044,
+              18,
+              17044,
+              16,
+              16,
+              13,
+              2233,
+              4047,
+              9085,
+              13,
+              1987,
+              220,
+              16,
+              24,
+              14
+            ],
+            "qwen38-reasoning-xhigh": [
+              1596,
+              1144,
+              4087,
+              1156,
+              25,
+              328,
+              32,
+              3618,
+              5435,
+              220,
+              18,
+              2438,
+              11,
+              220,
+              19,
+              6105,
+              11,
+              321,
+              220,
+              20,
+              5983,
+              10885,
+              13,
+              8771,
+              513,
+              14336,
+              1973,
+              13329,
+              13,
+              20052,
+              279,
+              18356,
+              421,
+              2107,
+              599,
+              279,
+              1788,
+              1829,
+              11,
+              1179,
+              799,
+              11316,
+              24228,
+              279,
+              21261,
+              1149,
+              271,
+              22916,
+              12204,
+              18356,
+              13,
+              10342,
+              10885,
+              220,
+              16,
+              17,
+              13,
+              11651,
+              1330,
+              1973,
+              13329,
+              13,
+              83648,
+              1788,
+              1829,
+              283,
+              2542,
+              888,
+              7736,
+              351,
+              1393,
+              5150,
+              11,
+              17,
+              5443,
+              34,
+              7,
+              16,
+              17,
+              11,
+              17,
+              553,
+              351,
+              7,
+              18,
+              11,
+              17,
+              11393,
+              18,
+              11,
+              351,
+              7,
+              19,
+              11,
+              17,
+              11393,
+              21,
+              11,
+              351,
+              7,
+              20,
+              11,
+              17,
+              11393,
+              16,
+              15,
+              2702,
+              220,
+              16,
+              24,
+              13,
+              351,
+              7,
+              16,
+              17,
+              11,
+              17,
+              11393,
+              21,
+              21,
+              13,
+              83648,
+              220,
+              16,
+              24,
+              14,
+              21,
+              21,
+              13,
+              39752,
+              49282,
+              25,
+              318,
+              18,
+              14,
+              16,
+              17,
+              2299,
+              17,
+              14,
+              16,
+              16,
+              40415,
+              19,
+              14,
+              16,
+              17,
+              2299,
+              18,
+              14,
+              16,
+              16,
+              40415,
+              20,
+              14,
+              16,
+              17,
+              2299,
+              19,
+              14,
+              16,
+              16,
+              11393,
+              318,
+              21,
+              10,
+              16,
+              17,
+              10,
+              17,
+              15,
+              23493,
+              16,
+              18,
+              17,
+              11393,
+              18,
+              23,
+              14,
+              16,
+              18,
+              17,
+              28,
+              16,
+              24,
+              14,
+              21,
+              21,
+              13,
+              14235,
+              799,
+              11316
+            ],
+            "qwen38-sampling-non-thinking": [
+              16,
+              13,
+              2972,
+              13788,
+              623,
+              776,
+              332,
+              198,
+              17,
+              13,
+              2972,
+              35,
+              15104,
+              58384,
+              332,
+              248046
+            ],
+            "qwen38-sampling-thinking": [
+              760,
+              1156,
+              6587,
+              6681,
+              1330,
+              61446,
+              10242,
+              4874,
+              364,
+              264,
+              4098,
+              42903,
+              27867,
+              13,
+              6558,
+              728,
+              1683,
+              314,
+              4874,
+              421,
+              513,
+              3514,
+              499,
+              1340,
+              11,
+              10597,
+              11,
+              321,
+              61446,
+              13,
+              271,
+              3670,
+              310,
+              2814,
+              25,
+              198,
+              12,
+              328,
+              10956,
+              1,
+              471,
+              4145,
+              11,
+              2708,
+              198,
+              12,
+              328,
+              56316,
+              403,
+              1,
+              471,
+              12846,
+              29051,
+              944,
+              3808,
+              7552,
+              198,
+              12,
+              328,
+              3217,
+              1592,
+              1,
+              471,
+              48039,
+              8806,
+              198,
+              12,
+              328,
+              44,
+              21674,
+              1,
+              471,
+              264,
+              68063,
+              369,
+              264,
+              9766,
+              2308,
+              17049,
+              23198,
+              11,
+              524,
+              2098,
+              9468,
+              198,
+              12,
+              328,
+              43,
+              30748,
+              1,
+              471,
+              5646,
+              12317,
+              7731,
+              198,
+              12
+            ],
+            "qwen38-temperature-upper-boundary": [
+              62980,
+              248046
+            ],
+            "qwen38-text-deterministic-a": [
+              48,
+              54,
+              923,
+              18,
+              23,
+              12,
+              1113,
+              4059,
+              15932,
+              79710,
+              12,
+              17,
+              22,
+              16,
+              248046
+            ],
+            "qwen38-text-deterministic-b": [
+              48,
+              54,
+              923,
+              18,
+              23,
+              12,
+              1113,
+              4059,
+              15932,
+              79710,
+              12,
+              17,
+              22,
+              16,
+              248046
+            ],
+            "qwen38-tool-routing": [
+              248058,
+              198,
+              27,
+              1628,
+              27362,
+              67017,
+              29,
+              198,
+              27,
+              15704,
+              28,
+              8656,
+              29,
+              198,
+              91149,
+              198,
+              510,
+              15704,
+              29,
+              198,
+              27,
+              15704,
+              28,
+              3715,
+              29,
+              198,
+              66,
+              38915,
+              198,
+              510,
+              15704,
+              29,
+              198,
+              510,
+              1628,
+              29,
+              198,
+              248059,
+              248046
+            ],
+            "qwen38-video-understanding": [
+              32,
+              2658,
+              25617,
+              2922,
+              11,
+              12583,
+              639,
+              1500,
+              93133,
+              81122,
+              722,
+              3808,
+              264,
+              4034,
+              27034,
+              11795,
+              1829,
+              15436,
+              321,
+              37417,
+              13513,
+              13,
+              248046
+            ]
+          }
+        }
+      },
+      "caps": {
+        "ctx_max": 262144,
+        "json": true,
+        "output_modalities": [
+          "text"
+        ],
+        "output_modality": "text",
+        "tools": true,
+        "vision": true
+      },
+      "family": "qwen3.8",
+      "modality_assessment": {
+        "calibrated_fingerprints": {
+          "nvfp4": {
+            "image": "3752d816b31a869b902a2de6aa083d9a7f85f8d88a177126561ac50e18875a80",
+            "text": "b9c2534438c3cd5b5cde5ef08fe4b88e31bee97f2d5729a823453ed385451d15",
+            "video": "c9274b7adcff3841819601f4afc837e950f6ca471439b7180f985bb082903404"
+          }
+        },
+        "detected": [
+          "text",
+          "image",
+          "video"
+        ],
+        "evidence": [
+          "Pinned Qwen/Qwen3.8-27B and NVFP4 configs declare the native Qwen3.8 vision-language architecture; pinned processor files and chat template carry image and video inputs."
+        ],
+        "resource_profiles": {
+          "nvfp4": {
+            "image": {
+              "unit": "pixel",
+              "measurement_source": "process_tree_rss; pool=nvidia_unified_memory; NVIDIA unified memory from hwprobe; --memory-reserve override 15% = 17.35GiB",
+              "max_item_bytes": 112442,
+              "max_item_units": 1048576,
+              "measured_item_bytes": 112442,
+              "measured_item_units": 1048576,
+              "measured_working_set_bytes": 12582912,
+              "calibration_baseline_memory_bytes": 5835579392,
+              "calibration_peak_memory_bytes": 5836599296,
+              "calibration_f13_budget_bytes": 105569061273,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            },
+            "video": {
+              "unit": "frame",
+              "measurement_source": "process_tree_rss; pool=nvidia_unified_memory; NVIDIA unified memory from hwprobe; --memory-reserve override 15% = 17.35GiB",
+              "max_item_bytes": 17042,
+              "max_item_units": 16,
+              "measured_item_bytes": 17042,
+              "measured_item_units": 16,
+              "measured_working_set_bytes": 9633792,
+              "calibration_baseline_memory_bytes": 5836599296,
+              "calibration_peak_memory_bytes": 5836619776,
+              "calibration_f13_budget_bytes": 105569061273,
+              "default_max_inflight_items": 1,
+              "default_max_items_per_request": 1
+            }
+          }
+        }
+      },
+      "model_class": "text-generation",
+      "model_id": "Qwen/Qwen3.8-27B",
+      "params_b": 27,
+      "price_ref_au": {
+        "denom": "au_usd",
+        "in_per_1k": "50000000000000",
+        "out_per_1k": "350000000000000"
+      },
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "Qwen/Qwen3.8-27B",
+          "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+          "publisher_key": "huggingface-repo"
+        },
+        "conversion": [
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:pinned-nvfp4-shards-and-runtime-sidecars",
+            "input_sha256": "5b4c7df31dd4117193e80029052ef334475f70a07c9fe27e9408622d159f50ea",
+            "output_sha256": "5b4c7df31dd4117193e80029052ef334475f70a07c9fe27e9408622d159f50ea"
+          }
+        ],
+        "license": "apache-2.0",
+        "license_sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+      },
+      "requirements": {
+        "min_ram_gb": 48,
+        "min_vram_gb_full_offload": 24,
+        "cpu_flags": [
+          "avx2|neon"
+        ],
+        "backends": [
+          "vllm"
+        ]
+      },
+      "sampling": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "repeat_penalty": 1.0,
+        "presence_penalty": 0.0
+      },
+      "speciality_assessment": {
+        "detected": [
+          "reasoning_effort",
+          "thinking_mode",
+          "thinking_history"
+        ],
+        "evidence": [
+          "Pinned Qwen3.8 model card and chat template expose all three controls."
+        ],
+        "unsupported": {},
+        "calibrated": {
+          "nvfp4": {
+            "reasoning_effort": {
+              "low": {
+                "fingerprint": "04b2590c9c77caa49a681fb8e0b1f4255843a4c3877a513c6a13988f821a8b2e",
+                "token_prefixes": {
+                  "qwen38-preserve-thinking-false": [
+                    760,
+                    1156,
+                    369,
+                    9859,
+                    728,
+                    310,
+                    460,
+                    2250,
+                    28853,
+                    4965,
+                    440,
+                    3050,
+                    2144,
+                    13,
+                    6558,
+                    728,
+                    1683,
+                    883,
+                    1092,
+                    579,
+                    1602,
+                    4439,
+                    25,
+                    271,
+                    16,
+                    13,
+                    17479,
+                    622,
+                    25,
+                    279,
+                    843,
+                    10811,
+                    494,
+                    4711,
+                    31626,
+                    11,
+                    466,
+                    33829,
+                    198,
+                    17,
+                    13,
+                    23265,
+                    25,
+                    32471,
+                    466,
+                    33829,
+                    198,
+                    18,
+                    13,
+                    16252,
+                    25,
+                    13263,
+                    31626,
+                    369,
+                    2420,
+                    466,
+                    33829,
+                    271,
+                    623,
+                    821,
+                    4711,
+                    31626,
+                    11,
+                    353,
+                    1467,
+                    524,
+                    3404,
+                    4992,
+                    264,
+                    843,
+                    10811,
+                    13,
+                    353,
+                    557,
+                    4439,
+                    310,
+                    328,
+                    11548,
+                    2565,
+                    4992,
+                    279,
+                    10811,
+                    10897,
+                    303,
+                    678,
+                    31626,
+                    1,
+                    694,
+                    353,
+                    3105,
+                    914,
+                    3404,
+                    635,
+                    421,
+                    303,
+                    264
+                  ],
+                  "qwen38-preserve-thinking-true": [
+                    760,
+                    1156,
+                    369,
+                    9859,
+                    728,
+                    310,
+                    460,
+                    2250,
+                    28853,
+                    4965,
+                    440,
+                    3050,
+                    2144,
+                    13,
+                    6558,
+                    728,
+                    1683,
+                    883,
+                    1092,
+                    579,
+                    1602,
+                    4439,
+                    25,
+                    271,
+                    16,
+                    13,
+                    17479,
+                    622,
+                    25,
+                    279,
+                    843,
+                    10811,
+                    494,
+                    4711,
+                    31626,
+                    11,
+                    466,
+                    33829,
+                    198,
+                    17,
+                    13,
+                    23265,
+                    25,
+                    32471,
+                    466,
+                    33829,
+                    198,
+                    18,
+                    13,
+                    16252,
+                    25,
+                    13263,
+                    31626,
+                    369,
+                    2420,
+                    466,
+                    33829,
+                    271,
+                    623,
+                    821,
+                    4711,
+                    31626,
+                    11,
+                    353,
+                    1467,
+                    524,
+                    3404,
+                    4992,
+                    264,
+                    843,
+                    10811,
+                    13,
+                    353,
+                    557,
+                    4439,
+                    310,
+                    328,
+                    11548,
+                    2565,
+                    4992,
+                    279,
+                    10811,
+                    10897,
+                    303,
+                    678,
+                    31626,
+                    1,
+                    694,
+                    353,
+                    3105,
+                    914,
+                    3404,
+                    635,
+                    421,
+                    303,
+                    264
+                  ],
+                  "qwen38-sampling-non-thinking": [
+                    760,
+                    1156,
+                    6587,
+                    6681,
+                    1330,
+                    61446,
+                    10242,
+                    4874,
+                    364,
+                    264,
+                    4098,
+                    42903,
+                    27867,
+                    13,
+                    6558,
+                    728,
+                    1683,
+                    883,
+                    1092,
+                    3520,
+                    1603,
+                    4874,
+                    364,
+                    411,
+                    2993,
+                    314,
+                    1785,
+                    25,
+                    271,
+                    12,
+                    1049,
+                    1220,
+                    90912,
+                    7731,
+                    11,
+                    36602,
+                    11,
+                    321,
+                    42903,
+                    198,
+                    12,
+                    11910,
+                    381,
+                    61446,
+                    318,
+                    588,
+                    466,
+                    1330,
+                    4105,
+                    47897,
+                    8,
+                    198,
+                    12,
+                    11910,
+                    4950,
+                    6376,
+                    321,
+                    31423,
+                    271,
+                    9764,
+                    728,
+                    83783,
+                    25,
+                    198,
+                    12,
+                    328,
+                    1948,
+                    552,
+                    1,
+                    1892,
+                    3514,
+                    7690,
+                    42898,
+                    944,
+                    3808,
+                    7552,
+                    198,
+                    12,
+                    328,
+                    56316,
+                    403,
+                    1,
+                    1892,
+                    16067,
+                    48039,
+                    7154,
+                    198,
+                    12,
+                    328,
+                    2126,
+                    329,
+                    14670,
+                    1,
+                    1892,
+                    2716,
+                    364
+                  ],
+                  "qwen38-sampling-thinking": [
+                    760,
+                    1156,
+                    6587,
+                    6681,
+                    1330,
+                    61446,
+                    10242,
+                    4874,
+                    364,
+                    264,
+                    4098,
+                    42903,
+                    27867,
+                    13,
+                    6558,
+                    728,
+                    1683,
+                    883,
+                    1092,
+                    3520,
+                    264,
+                    1603,
+                    803,
+                    1532,
+                    25,
+                    271,
+                    12,
+                    1049,
+                    1220,
+                    90912,
+                    328,
+                    60273,
+                    1,
+                    318,
+                    56240,
+                    11,
+                    10967,
+                    11,
+                    58791,
+                    11,
+                    5646,
+                    11,
+                    10337,
+                    8,
+                    198,
+                    12,
+                    1049,
+                    1220,
+                    90912,
+                    328,
+                    258,
+                    2133,
+                    1,
+                    318,
+                    86479,
+                    11,
+                    6805,
+                    11,
+                    12204,
+                    11,
+                    8418,
+                    8,
+                    198,
+                    12,
+                    1049,
+                    1220,
+                    90912,
+                    328,
+                    60991,
+                    1,
+                    318,
+                    20923,
+                    14670,
+                    824,
+                    11,
+                    37516,
+                    11,
+                    8997,
+                    11,
+                    58709,
+                    11,
+                    48038,
+                    8,
+                    271,
+                    9764,
+                    728,
+                    83783,
+                    321,
+                    1179,
+                    3608,
+                    279,
+                    1330,
+                    1786,
+                    25,
+                    271,
+                    12
+                  ],
+                  "qwen38-temperature-upper-boundary": [
+                    760,
+                    1156,
+                    369,
+                    9859,
+                    728,
+                    310,
+                    9559,
+                    440
+                  ]
+                },
+                "output_tokens_min": 392,
+                "output_tokens_max": 392,
+                "reasoning_tokens_min": 392,
+                "reasoning_tokens_max": 392
+              },
+              "medium": {
+                "fingerprint": "9df7d694a4c0d24ba5789562eeeb14ce3923707b21e1f628ef1f9a5c9a551895",
+                "token_prefixes": {
+                  "qwen38-preserve-thinking-false": [
+                    760,
+                    1156,
+                    369,
+                    9859,
+                    728,
+                    310,
+                    460,
+                    2250,
+                    28853,
+                    4965,
+                    440,
+                    3050,
+                    1928,
+                    13,
+                    6558,
+                    728,
+                    1683,
+                    883,
+                    1092,
+                    579,
+                    1602,
+                    4439,
+                    25,
+                    271,
+                    16,
+                    13,
+                    17479,
+                    622,
+                    25,
+                    279,
+                    843,
+                    10811,
+                    494,
+                    4711,
+                    31626,
+                    471,
+                    733,
+                    821,
+                    4711,
+                    31626,
+                    11,
+                    353,
+                    10036,
+                    328,
+                    760,
+                    843,
+                    10811,
+                    369,
+                    32709,
+                    3045,
+                    1284,
+                    24900,
+                    12,
+                    23,
+                    17,
+                    22,
+                    1149,
+                    1987,
+                    279,
+                    10811,
+                    369,
+                    328,
+                    82601,
+                    3045,
+                    1284,
+                    24900,
+                    12,
+                    23,
+                    17,
+                    22,
+                    1149,
+                    271,
+                    17,
+                    13,
+                    23265,
+                    25,
+                    32471,
+                    466,
+                    33829,
+                    471,
+                    561,
+                    10811,
+                    557,
+                    32471,
+                    303,
+                    821,
+                    31626,
+                    11,
+                    748,
+                    328,
+                    22885,
+                    2683,
+                    1149,
+                    271,
+                    18,
+                    13
+                  ],
+                  "qwen38-preserve-thinking-true": [
+                    760,
+                    1156,
+                    369,
+                    9859,
+                    728,
+                    310,
+                    460,
+                    2250,
+                    28853,
+                    4965,
+                    440,
+                    3050,
+                    1928,
+                    13,
+                    6558,
+                    728,
+                    1683,
+                    883,
+                    1092,
+                    579,
+                    1602,
+                    4439,
+                    25,
+                    271,
+                    16,
+                    13,
+                    17479,
+                    622,
+                    25,
+                    279,
+                    843,
+                    10811,
+                    494,
+                    4711,
+                    31626,
+                    471,
+                    733,
+                    821,
+                    4711,
+                    31626,
+                    11,
+                    353,
+                    10036,
+                    328,
+                    760,
+                    843,
+                    10811,
+                    369,
+                    32709,
+                    3045,
+                    1284,
+                    24900,
+                    12,
+                    23,
+                    17,
+                    22,
+                    1149,
+                    1987,
+                    279,
+                    10811,
+                    369,
+                    328,
+                    82601,
+                    3045,
+                    1284,
+                    24900,
+                    12,
+                    23,
+                    17,
+                    22,
+                    1149,
+                    271,
+                    17,
+                    13,
+                    23265,
+                    25,
+                    32471,
+                    466,
+                    33829,
+                    471,
+                    561,
+                    10811,
+                    557,
+                    32471,
+                    303,
+                    821,
+                    31626,
+                    11,
+                    748,
+                    328,
+                    22885,
+                    2683,
+                    1149,
+                    271,
+                    18,
+                    13
+                  ],
+                  "qwen38-sampling-non-thinking": [
+                    760,
+                    1156,
+                    6587,
+                    6681,
+                    1330,
+                    61446,
+                    10242,
+                    4874,
+                    364,
+                    264,
+                    4098,
+                    42903,
+                    27867,
+                    13,
+                    6558,
+                    728,
+                    1683,
+                    314,
+                    1603,
+                    11,
+                    61446,
+                    4874,
+                    421,
+                    11969,
+                    279,
+                    26599,
+                    314,
+                    48039,
+                    42903,
+                    944,
+                    31600,
+                    3808,
+                    5081,
+                    7552,
+                    3082,
+                    67767,
+                    13,
+                    271,
+                    1536,
+                    18369,
+                    25,
+                    4098,
+                    11,
+                    42903,
+                    11,
+                    36602,
+                    11,
+                    67518,
+                    2096,
+                    11,
+                    6631,
+                    286,
+                    11,
+                    28109,
+                    13,
+                    271,
+                    8114,
+                    6498,
+                    25,
+                    198,
+                    12,
+                    328,
+                    623,
+                    776,
+                    13788,
+                    1,
+                    471,
+                    38823,
+                    4098,
+                    318,
+                    22772,
+                    8,
+                    478,
+                    42903,
+                    198,
+                    12,
+                    328,
+                    10956,
+                    1,
+                    471,
+                    2166,
+                    13553,
+                    198,
+                    12,
+                    328,
+                    623,
+                    776,
+                    3426,
+                    1,
+                    471,
+                    5646,
+                    23197,
+                    7731,
+                    198,
+                    12,
+                    328
+                  ],
+                  "qwen38-sampling-thinking": [
+                    760,
+                    1156,
+                    6587,
+                    6681,
+                    1330,
+                    61446,
+                    10242,
+                    4874,
+                    364,
+                    264,
+                    4098,
+                    42903,
+                    27867,
+                    13,
+                    6558,
+                    728,
+                    1683,
+                    314,
+                    4874,
+                    421,
+                    513,
+                    3514,
+                    499,
+                    1340,
+                    11,
+                    10597,
+                    11,
+                    321,
+                    61446,
+                    13,
+                    271,
+                    3670,
+                    310,
+                    2814,
+                    25,
+                    198,
+                    12,
+                    328,
+                    10956,
+                    1,
+                    471,
+                    4145,
+                    11,
+                    2708,
+                    198,
+                    12,
+                    328,
+                    56316,
+                    403,
+                    1,
+                    471,
+                    12846,
+                    29051,
+                    944,
+                    3808,
+                    7552,
+                    198,
+                    12,
+                    328,
+                    3217,
+                    1592,
+                    1,
+                    471,
+                    48039,
+                    8806,
+                    198,
+                    12,
+                    328,
+                    44,
+                    21674,
+                    1,
+                    471,
+                    264,
+                    68063,
+                    369,
+                    264,
+                    9766,
+                    2308,
+                    17049,
+                    23198,
+                    11,
+                    524,
+                    2098,
+                    9468,
+                    198,
+                    12,
+                    328,
+                    43,
+                    30748,
+                    1,
+                    471,
+                    5646,
+                    12317,
+                    7731,
+                    198,
+                    12
+                  ],
+                  "qwen38-temperature-upper-boundary": [
+                    760,
+                    1156,
+                    369,
+                    9859,
+                    728,
+                    310,
+                    9559,
+                    440
+                  ]
+                },
+                "output_tokens_min": 392,
+                "output_tokens_max": 392,
+                "reasoning_tokens_min": 392,
+                "reasoning_tokens_max": 392
+              },
+              "xhigh": {
+                "fingerprint": "223883744b009ab9bf69beb2e4e167d207c607451f1c978d1595637add3c5c07",
+                "token_prefixes": {
+                  "qwen38-preserve-thinking-false": [
+                    760,
+                    1156,
+                    369,
+                    9859,
+                    728,
+                    310,
+                    460,
+                    2250,
+                    28853,
+                    4965,
+                    440,
+                    3050,
+                    1928,
+                    13,
+                    6558,
+                    728,
+                    1683,
+                    883,
+                    1092,
+                    579,
+                    1602,
+                    4439,
+                    25,
+                    271,
+                    16,
+                    13,
+                    17479,
+                    622,
+                    25,
+                    279,
+                    843,
+                    10811,
+                    494,
+                    4711,
+                    31626,
+                    11,
+                    466,
+                    33829,
+                    198,
+                    17,
+                    13,
+                    23265,
+                    25,
+                    32471,
+                    466,
+                    33829,
+                    198,
+                    18,
+                    13,
+                    16252,
+                    25,
+                    13263,
+                    31626,
+                    369,
+                    2420,
+                    466,
+                    33829,
+                    271,
+                    623,
+                    821,
+                    4711,
+                    31626,
+                    318,
+                    1719,
+                    7047,
+                    2424,
+                    681,
+                    353,
+                    995,
+                    3955,
+                    328,
+                    82601,
+                    3045,
+                    1284,
+                    24900,
+                    12,
+                    23,
+                    17,
+                    22,
+                    1,
+                    430,
+                    279,
+                    843,
+                    10811,
+                    13,
+                    4213,
+                    11,
+                    279,
+                    1156,
+                    369,
+                    1381,
+                    9859,
+                    728,
+                    310,
+                    2468,
+                    411
+                  ],
+                  "qwen38-preserve-thinking-true": [
+                    760,
+                    1156,
+                    369,
+                    9859,
+                    728,
+                    310,
+                    460,
+                    2250,
+                    28853,
+                    4965,
+                    440,
+                    3050,
+                    1928,
+                    13,
+                    6558,
+                    728,
+                    1683,
+                    883,
+                    1092,
+                    579,
+                    1602,
+                    4439,
+                    25,
+                    271,
+                    16,
+                    13,
+                    17479,
+                    622,
+                    25,
+                    279,
+                    843,
+                    10811,
+                    494,
+                    4711,
+                    31626,
+                    11,
+                    466,
+                    33829,
+                    198,
+                    17,
+                    13,
+                    23265,
+                    25,
+                    32471,
+                    466,
+                    33829,
+                    198,
+                    18,
+                    13,
+                    16252,
+                    25,
+                    13263,
+                    31626,
+                    369,
+                    2420,
+                    466,
+                    33829,
+                    271,
+                    623,
+                    821,
+                    4711,
+                    31626,
+                    318,
+                    1719,
+                    7047,
+                    2424,
+                    681,
+                    353,
+                    995,
+                    3955,
+                    328,
+                    82601,
+                    3045,
+                    1284,
+                    24900,
+                    12,
+                    23,
+                    17,
+                    22,
+                    1,
+                    430,
+                    279,
+                    843,
+                    10811,
+                    13,
+                    4213,
+                    11,
+                    279,
+                    1156,
+                    369,
+                    1381,
+                    9859,
+                    728,
+                    310,
+                    2468,
+                    411
+                  ],
+                  "qwen38-sampling-non-thinking": [
+                    1596,
+                    1144,
+                    310,
+                    5707,
+                    310,
+                    1156,
+                    25,
+                    328,
+                    7734,
+                    6681,
+                    1330,
+                    61446,
+                    25605,
+                    364,
+                    33791,
+                    264,
+                    4098,
+                    42903,
+                    27867,
+                    1149,
+                    14235,
+                    7936,
+                    6681,
+                    1330,
+                    61446,
+                    25605,
+                    13,
+                    90410,
+                    1066,
+                    1330,
+                    4874,
+                    13,
+                    28320,
+                    6681,
+                    1330,
+                    30,
+                    16018,
+                    381,
+                    16916,
+                    1103,
+                    440,
+                    1330,
+                    3470,
+                    13,
+                    60585,
+                    1029,
+                    13,
+                    10380,
+                    328,
+                    623,
+                    776,
+                    13788,
+                    1,
+                    321,
+                    328,
+                    58384,
+                    3426,
+                    3158,
+                    14235,
+                    1534,
+                    1132,
+                    1330,
+                    25605,
+                    13,
+                    2233,
+                    4799,
+                    13,
+                    198,
+                    248069,
+                    271,
+                    16,
+                    13,
+                    60545,
+                    13788,
+                    2228,
+                    17,
+                    13,
+                    51154,
+                    3426,
+                    248046
+                  ],
+                  "qwen38-sampling-thinking": [
+                    1596,
+                    1144,
+                    310,
+                    4087,
+                    1156,
+                    25,
+                    328,
+                    7734,
+                    6681,
+                    1330,
+                    61446,
+                    25605,
+                    364,
+                    33791,
+                    264,
+                    4098,
+                    42903,
+                    27867,
+                    1149,
+                    14235,
+                    4222,
+                    3300,
+                    1330,
+                    4874,
+                    11,
+                    61446,
+                    13,
+                    28320,
+                    6681,
+                    1330,
+                    25605,
+                    30,
+                    35923,
+                    1330,
+                    16916,
+                    3387,
+                    466,
+                    47193,
+                    13,
+                    14235,
+                    381,
+                    61446,
+                    13,
+                    12650,
+                    1132,
+                    1330,
+                    25605,
+                    13,
+                    14235,
+                    6970,
+                    4874,
+                    25,
+                    328,
+                    623,
+                    776,
+                    13788,
+                    1,
+                    321,
+                    328,
+                    3214,
+                    4740,
+                    3158,
+                    6558,
+                    579,
+                    10453,
+                    6681,
+                    1330,
+                    61446,
+                    25605,
+                    13,
+                    16018,
+                    381,
+                    25,
+                    198,
+                    12,
+                    60545,
+                    13788,
+                    198,
+                    12,
+                    9372,
+                    4740,
+                    198,
+                    2665,
+                    4799,
+                    13,
+                    28320,
+                    6681,
+                    1330,
+                    13,
+                    198,
+                    248069,
+                    271,
+                    12,
+                    60545,
+                    13788,
+                    2228
+                  ],
+                  "qwen38-temperature-upper-boundary": [
+                    760,
+                    1156,
+                    16561,
+                    310,
+                    9559,
+                    440,
+                    6681,
+                    279
+                  ]
+                },
+                "output_tokens_min": 376,
+                "output_tokens_max": 376,
+                "reasoning_tokens_min": 360,
+                "reasoning_tokens_max": 360
+              }
+            },
+            "thinking_history": {
+              "latest_only": {
+                "fingerprint": "54ef47e64de621ff93f1c4cc6f596c09f77910cdb16642cab930ee8e7aaf370f",
+                "token_prefixes": {
+                  "qwen38-preserve-thinking-false": [
+                    1596,
+                    1144,
+                    4087,
+                    1156,
+                    579,
+                    1622,
+                    13,
+                    14235,
+                    460,
+                    6681,
+                    2250,
+                    28853,
+                    4965,
+                    13,
+                    2570,
+                    16561,
+                    25,
+                    198,
+                    1,
+                    5423,
+                    6681,
+                    2250,
+                    28853,
+                    4965,
+                    13,
+                    17479,
+                    622,
+                    25,
+                    279,
+                    843,
+                    10811,
+                    494,
+                    4711,
+                    31626,
+                    11,
+                    466,
+                    33829,
+                    13,
+                    23265,
+                    25,
+                    32471,
+                    466,
+                    33829,
+                    13,
+                    16252,
+                    25,
+                    13263,
+                    31626,
+                    369,
+                    2420,
+                    466,
+                    33829,
+                    1149,
+                    271,
+                    1596,
+                    599,
+                    4711,
+                    10125,
+                    25,
+                    2570,
+                    25,
+                    328,
+                    31065,
+                    2565,
+                    4992,
+                    279,
+                    10811,
+                    10897,
+                    303,
+                    678,
+                    31626,
+                    1149,
+                    20732,
+                    25,
+                    328,
+                    2536,
+                    290,
+                    1149,
+                    2532,
+                    369,
+                    874,
+                    4880,
+                    843,
+                    31626,
+                    2144,
+                    303,
+                    9155,
+                    10125,
+                    30,
+                    1921,
+                    1785,
+                    2640,
+                    328,
+                    22791,
+                    279,
+                    16713
+                  ],
+                  "qwen38-preserve-thinking-true": [
+                    1596,
+                    1144,
+                    4087,
+                    1156,
+                    579,
+                    1622,
+                    13,
+                    14235,
+                    460,
+                    6681,
+                    2250,
+                    28853,
+                    4965,
+                    13,
+                    2570,
+                    16561,
+                    25,
+                    198,
+                    1,
+                    5423,
+                    6681,
+                    2250,
+                    28853,
+                    4965,
+                    13,
+                    17479,
+                    622,
+                    25,
+                    279,
+                    843,
+                    10811,
+                    494,
+                    4711,
+                    31626,
+                    11,
+                    466,
+                    33829,
+                    13,
+                    23265,
+                    25,
+                    32471,
+                    466,
+                    33829,
+                    13,
+                    16252,
+                    25,
+                    13263,
+                    31626,
+                    369,
+                    2420,
+                    466,
+                    33829,
+                    1149,
+                    271,
+                    1596,
+                    599,
+                    4711,
+                    10125,
+                    25,
+                    2570,
+                    25,
+                    328,
+                    31065,
+                    2565,
+                    4992,
+                    279,
+                    10811,
+                    10897,
+                    303,
+                    678,
+                    31626,
+                    1149,
+                    20732,
+                    25,
+                    328,
+                    2536,
+                    290,
+                    1149,
+                    2532,
+                    369,
+                    874,
+                    4880,
+                    843,
+                    31626,
+                    2144,
+                    303,
+                    9155,
+                    10125,
+                    30,
+                    1921,
+                    1785,
+                    2640,
+                    328,
+                    22791,
+                    279,
+                    16713
+                  ],
+                  "qwen38-sampling-non-thinking": [
+                    1596,
+                    1144,
+                    310,
+                    5707,
+                    310,
+                    1156,
+                    25,
+                    328,
+                    7734,
+                    6681,
+                    1330,
+                    61446,
+                    25605,
+                    364,
+                    33791,
+                    264,
+                    4098,
+                    42903,
+                    27867,
+                    1149,
+                    14235,
+                    7936,
+                    6681,
+                    1330,
+                    61446,
+                    25605,
+                    13,
+                    90410,
+                    1066,
+                    1330,
+                    4874,
+                    13,
+                    28320,
+                    6681,
+                    1330,
+                    30,
+                    16018,
+                    381,
+                    16916,
+                    1103,
+                    440,
+                    1330,
+                    3470,
+                    13,
+                    60585,
+                    1029,
+                    13,
+                    10380,
+                    328,
+                    623,
+                    776,
+                    13788,
+                    1,
+                    321,
+                    328,
+                    58384,
+                    3426,
+                    3158,
+                    14235,
+                    1534,
+                    1132,
+                    1330,
+                    25605,
+                    13,
+                    2233,
+                    4799,
+                    13,
+                    198,
+                    248069,
+                    271,
+                    16,
+                    13,
+                    60545,
+                    13788,
+                    2228,
+                    17,
+                    13,
+                    51154,
+                    3426,
+                    248046
+                  ],
+                  "qwen38-sampling-thinking": [
+                    1596,
+                    1144,
+                    310,
+                    4087,
+                    1156,
+                    25,
+                    328,
+                    7734,
+                    6681,
+                    1330,
+                    61446,
+                    25605,
+                    364,
+                    33791,
+                    264,
+                    4098,
+                    42903,
+                    27867,
+                    1149,
+                    14235,
+                    4222,
+                    3300,
+                    1330,
+                    4874,
+                    11,
+                    61446,
+                    13,
+                    28320,
+                    6681,
+                    1330,
+                    25605,
+                    30,
+                    35923,
+                    1330,
+                    16916,
+                    3387,
+                    466,
+                    47193,
+                    13,
+                    14235,
+                    381,
+                    61446,
+                    13,
+                    12650,
+                    1132,
+                    1330,
+                    25605,
+                    13,
+                    14235,
+                    6970,
+                    4874,
+                    25,
+                    328,
+                    623,
+                    776,
+                    13788,
+                    1,
+                    321,
+                    328,
+                    3214,
+                    4740,
+                    3158,
+                    6558,
+                    579,
+                    10453,
+                    6681,
+                    1330,
+                    61446,
+                    25605,
+                    13,
+                    16018,
+                    381,
+                    25,
+                    198,
+                    12,
+                    60545,
+                    13788,
+                    198,
+                    12,
+                    9372,
+                    4740,
+                    198,
+                    2665,
+                    4799,
+                    13,
+                    28320,
+                    6681,
+                    1330,
+                    13,
+                    198,
+                    248069,
+                    271,
+                    12,
+                    60545,
+                    13788,
+                    2228
+                  ],
+                  "qwen38-temperature-upper-boundary": [
+                    760,
+                    1156,
+                    16561,
+                    310,
+                    9559,
+                    440,
+                    6681,
+                    279
+                  ]
+                },
+                "output_tokens_min": 376,
+                "output_tokens_max": 376,
+                "reasoning_tokens_min": 360,
+                "reasoning_tokens_max": 360
+              },
+              "preserve": {
+                "fingerprint": "223883744b009ab9bf69beb2e4e167d207c607451f1c978d1595637add3c5c07",
+                "token_prefixes": {
+                  "qwen38-preserve-thinking-false": [
+                    760,
+                    1156,
+                    369,
+                    9859,
+                    728,
+                    310,
+                    460,
+                    2250,
+                    28853,
+                    4965,
+                    440,
+                    3050,
+                    1928,
+                    13,
+                    6558,
+                    728,
+                    1683,
+                    883,
+                    1092,
+                    579,
+                    1602,
+                    4439,
+                    25,
+                    271,
+                    16,
+                    13,
+                    17479,
+                    622,
+                    25,
+                    279,
+                    843,
+                    10811,
+                    494,
+                    4711,
+                    31626,
+                    11,
+                    466,
+                    33829,
+                    198,
+                    17,
+                    13,
+                    23265,
+                    25,
+                    32471,
+                    466,
+                    33829,
+                    198,
+                    18,
+                    13,
+                    16252,
+                    25,
+                    13263,
+                    31626,
+                    369,
+                    2420,
+                    466,
+                    33829,
+                    271,
+                    623,
+                    821,
+                    4711,
+                    31626,
+                    318,
+                    1719,
+                    7047,
+                    2424,
+                    681,
+                    353,
+                    995,
+                    3955,
+                    328,
+                    82601,
+                    3045,
+                    1284,
+                    24900,
+                    12,
+                    23,
+                    17,
+                    22,
+                    1,
+                    430,
+                    279,
+                    843,
+                    10811,
+                    13,
+                    4213,
+                    11,
+                    279,
+                    1156,
+                    369,
+                    1381,
+                    9859,
+                    728,
+                    310,
+                    2468,
+                    411
+                  ],
+                  "qwen38-preserve-thinking-true": [
+                    760,
+                    1156,
+                    369,
+                    9859,
+                    728,
+                    310,
+                    460,
+                    2250,
+                    28853,
+                    4965,
+                    440,
+                    3050,
+                    1928,
+                    13,
+                    6558,
+                    728,
+                    1683,
+                    883,
+                    1092,
+                    579,
+                    1602,
+                    4439,
+                    25,
+                    271,
+                    16,
+                    13,
+                    17479,
+                    622,
+                    25,
+                    279,
+                    843,
+                    10811,
+                    494,
+                    4711,
+                    31626,
+                    11,
+                    466,
+                    33829,
+                    198,
+                    17,
+                    13,
+                    23265,
+                    25,
+                    32471,
+                    466,
+                    33829,
+                    198,
+                    18,
+                    13,
+                    16252,
+                    25,
+                    13263,
+                    31626,
+                    369,
+                    2420,
+                    466,
+                    33829,
+                    271,
+                    623,
+                    821,
+                    4711,
+                    31626,
+                    318,
+                    1719,
+                    7047,
+                    2424,
+                    681,
+                    353,
+                    995,
+                    3955,
+                    328,
+                    82601,
+                    3045,
+                    1284,
+                    24900,
+                    12,
+                    23,
+                    17,
+                    22,
+                    1,
+                    430,
+                    279,
+                    843,
+                    10811,
+                    13,
+                    4213,
+                    11,
+                    279,
+                    1156,
+                    369,
+                    1381,
+                    9859,
+                    728,
+                    310,
+                    2468,
+                    411
+                  ],
+                  "qwen38-sampling-non-thinking": [
+                    1596,
+                    1144,
+                    310,
+                    5707,
+                    310,
+                    1156,
+                    25,
+                    328,
+                    7734,
+                    6681,
+                    1330,
+                    61446,
+                    25605,
+                    364,
+                    33791,
+                    264,
+                    4098,
+                    42903,
+                    27867,
+                    1149,
+                    14235,
+                    7936,
+                    6681,
+                    1330,
+                    61446,
+                    25605,
+                    13,
+                    90410,
+                    1066,
+                    1330,
+                    4874,
+                    13,
+                    28320,
+                    6681,
+                    1330,
+                    30,
+                    16018,
+                    381,
+                    16916,
+                    1103,
+                    440,
+                    1330,
+                    3470,
+                    13,
+                    60585,
+                    1029,
+                    13,
+                    10380,
+                    328,
+                    623,
+                    776,
+                    13788,
+                    1,
+                    321,
+                    328,
+                    58384,
+                    3426,
+                    3158,
+                    14235,
+                    1534,
+                    1132,
+                    1330,
+                    25605,
+                    13,
+                    2233,
+                    4799,
+                    13,
+                    198,
+                    248069,
+                    271,
+                    16,
+                    13,
+                    60545,
+                    13788,
+                    2228,
+                    17,
+                    13,
+                    51154,
+                    3426,
+                    248046
+                  ],
+                  "qwen38-sampling-thinking": [
+                    1596,
+                    1144,
+                    310,
+                    4087,
+                    1156,
+                    25,
+                    328,
+                    7734,
+                    6681,
+                    1330,
+                    61446,
+                    25605,
+                    364,
+                    33791,
+                    264,
+                    4098,
+                    42903,
+                    27867,
+                    1149,
+                    14235,
+                    4222,
+                    3300,
+                    1330,
+                    4874,
+                    11,
+                    61446,
+                    13,
+                    28320,
+                    6681,
+                    1330,
+                    25605,
+                    30,
+                    35923,
+                    1330,
+                    16916,
+                    3387,
+                    466,
+                    47193,
+                    13,
+                    14235,
+                    381,
+                    61446,
+                    13,
+                    12650,
+                    1132,
+                    1330,
+                    25605,
+                    13,
+                    14235,
+                    6970,
+                    4874,
+                    25,
+                    328,
+                    623,
+                    776,
+                    13788,
+                    1,
+                    321,
+                    328,
+                    3214,
+                    4740,
+                    3158,
+                    6558,
+                    579,
+                    10453,
+                    6681,
+                    1330,
+                    61446,
+                    25605,
+                    13,
+                    16018,
+                    381,
+                    25,
+                    198,
+                    12,
+                    60545,
+                    13788,
+                    198,
+                    12,
+                    9372,
+                    4740,
+                    198,
+                    2665,
+                    4799,
+                    13,
+                    28320,
+                    6681,
+                    1330,
+                    13,
+                    198,
+                    248069,
+                    271,
+                    12,
+                    60545,
+                    13788,
+                    2228
+                  ],
+                  "qwen38-temperature-upper-boundary": [
+                    760,
+                    1156,
+                    16561,
+                    310,
+                    9559,
+                    440,
+                    6681,
+                    279
+                  ]
+                },
+                "output_tokens_min": 376,
+                "output_tokens_max": 376,
+                "reasoning_tokens_min": 360,
+                "reasoning_tokens_max": 360
+              }
+            },
+            "thinking_mode": {
+              "disabled": {
+                "fingerprint": "badeffa48e189d827a4df1a85ed660b99daa0fa9a64bc78810f31178cc283426",
+                "token_prefixes": {
+                  "qwen38-preserve-thinking-false": [
+                    23282,
+                    622,
+                    25,
+                    32709,
+                    3045,
+                    1284,
+                    24900,
+                    12,
+                    23,
+                    17,
+                    22,
+                    198,
+                    19981,
+                    25,
+                    32471,
+                    198,
+                    26889,
+                    25,
+                    13263,
+                    31626,
+                    369,
+                    2420,
+                    248046
+                  ],
+                  "qwen38-preserve-thinking-true": [
+                    23282,
+                    622,
+                    25,
+                    32709,
+                    3045,
+                    1284,
+                    24900,
+                    12,
+                    23,
+                    17,
+                    22,
+                    198,
+                    19981,
+                    25,
+                    32471,
+                    198,
+                    26889,
+                    25,
+                    13263,
+                    31626,
+                    369,
+                    2420,
+                    248046
+                  ],
+                  "qwen38-sampling-non-thinking": [
+                    16,
+                    13,
+                    2972,
+                    13788,
+                    623,
+                    776,
+                    332,
+                    198,
+                    17,
+                    13,
+                    2972,
+                    35,
+                    15104,
+                    58384,
+                    332,
+                    248046
+                  ],
+                  "qwen38-sampling-thinking": [
+                    16,
+                    13,
+                    2972,
+                    22631,
+                    18843,
+                    332,
+                    198,
+                    17,
+                    13,
+                    2972,
+                    1888,
+                    2126,
+                    329,
+                    332,
+                    248046
+                  ],
+                  "qwen38-temperature-upper-boundary": [
+                    62980,
+                    248046
+                  ]
+                },
+                "output_tokens_min": 79,
+                "output_tokens_max": 79,
+                "reasoning_tokens_min": 0,
+                "reasoning_tokens_max": 0
+              },
+              "enabled": {
+                "fingerprint": "223883744b009ab9bf69beb2e4e167d207c607451f1c978d1595637add3c5c07",
+                "token_prefixes": {
+                  "qwen38-preserve-thinking-false": [
+                    760,
+                    1156,
+                    369,
+                    9859,
+                    728,
+                    310,
+                    460,
+                    2250,
+                    28853,
+                    4965,
+                    440,
+                    3050,
+                    1928,
+                    13,
+                    6558,
+                    728,
+                    1683,
+                    883,
+                    1092,
+                    579,
+                    1602,
+                    4439,
+                    25,
+                    271,
+                    16,
+                    13,
+                    17479,
+                    622,
+                    25,
+                    279,
+                    843,
+                    10811,
+                    494,
+                    4711,
+                    31626,
+                    11,
+                    466,
+                    33829,
+                    198,
+                    17,
+                    13,
+                    23265,
+                    25,
+                    32471,
+                    466,
+                    33829,
+                    198,
+                    18,
+                    13,
+                    16252,
+                    25,
+                    13263,
+                    31626,
+                    369,
+                    2420,
+                    466,
+                    33829,
+                    271,
+                    623,
+                    821,
+                    4711,
+                    31626,
+                    318,
+                    1719,
+                    7047,
+                    2424,
+                    681,
+                    353,
+                    995,
+                    3955,
+                    328,
+                    82601,
+                    3045,
+                    1284,
+                    24900,
+                    12,
+                    23,
+                    17,
+                    22,
+                    1,
+                    430,
+                    279,
+                    843,
+                    10811,
+                    13,
+                    4213,
+                    11,
+                    279,
+                    1156,
+                    369,
+                    1381,
+                    9859,
+                    728,
+                    310,
+                    2468,
+                    411
+                  ],
+                  "qwen38-preserve-thinking-true": [
+                    760,
+                    1156,
+                    369,
+                    9859,
+                    728,
+                    310,
+                    460,
+                    2250,
+                    28853,
+                    4965,
+                    440,
+                    3050,
+                    1928,
+                    13,
+                    6558,
+                    728,
+                    1683,
+                    883,
+                    1092,
+                    579,
+                    1602,
+                    4439,
+                    25,
+                    271,
+                    16,
+                    13,
+                    17479,
+                    622,
+                    25,
+                    279,
+                    843,
+                    10811,
+                    494,
+                    4711,
+                    31626,
+                    11,
+                    466,
+                    33829,
+                    198,
+                    17,
+                    13,
+                    23265,
+                    25,
+                    32471,
+                    466,
+                    33829,
+                    198,
+                    18,
+                    13,
+                    16252,
+                    25,
+                    13263,
+                    31626,
+                    369,
+                    2420,
+                    466,
+                    33829,
+                    271,
+                    623,
+                    821,
+                    4711,
+                    31626,
+                    318,
+                    1719,
+                    7047,
+                    2424,
+                    681,
+                    353,
+                    995,
+                    3955,
+                    328,
+                    82601,
+                    3045,
+                    1284,
+                    24900,
+                    12,
+                    23,
+                    17,
+                    22,
+                    1,
+                    430,
+                    279,
+                    843,
+                    10811,
+                    13,
+                    4213,
+                    11,
+                    279,
+                    1156,
+                    369,
+                    1381,
+                    9859,
+                    728,
+                    310,
+                    2468,
+                    411
+                  ],
+                  "qwen38-sampling-non-thinking": [
+                    1596,
+                    1144,
+                    310,
+                    5707,
+                    310,
+                    1156,
+                    25,
+                    328,
+                    7734,
+                    6681,
+                    1330,
+                    61446,
+                    25605,
+                    364,
+                    33791,
+                    264,
+                    4098,
+                    42903,
+                    27867,
+                    1149,
+                    14235,
+                    7936,
+                    6681,
+                    1330,
+                    61446,
+                    25605,
+                    13,
+                    90410,
+                    1066,
+                    1330,
+                    4874,
+                    13,
+                    28320,
+                    6681,
+                    1330,
+                    30,
+                    16018,
+                    381,
+                    16916,
+                    1103,
+                    440,
+                    1330,
+                    3470,
+                    13,
+                    60585,
+                    1029,
+                    13,
+                    10380,
+                    328,
+                    623,
+                    776,
+                    13788,
+                    1,
+                    321,
+                    328,
+                    58384,
+                    3426,
+                    3158,
+                    14235,
+                    1534,
+                    1132,
+                    1330,
+                    25605,
+                    13,
+                    2233,
+                    4799,
+                    13,
+                    198,
+                    248069,
+                    271,
+                    16,
+                    13,
+                    60545,
+                    13788,
+                    2228,
+                    17,
+                    13,
+                    51154,
+                    3426,
+                    248046
+                  ],
+                  "qwen38-sampling-thinking": [
+                    1596,
+                    1144,
+                    310,
+                    4087,
+                    1156,
+                    25,
+                    328,
+                    7734,
+                    6681,
+                    1330,
+                    61446,
+                    25605,
+                    364,
+                    33791,
+                    264,
+                    4098,
+                    42903,
+                    27867,
+                    1149,
+                    14235,
+                    4222,
+                    3300,
+                    1330,
+                    4874,
+                    11,
+                    61446,
+                    13,
+                    28320,
+                    6681,
+                    1330,
+                    25605,
+                    30,
+                    35923,
+                    1330,
+                    16916,
+                    3387,
+                    466,
+                    47193,
+                    13,
+                    14235,
+                    381,
+                    61446,
+                    13,
+                    12650,
+                    1132,
+                    1330,
+                    25605,
+                    13,
+                    14235,
+                    6970,
+                    4874,
+                    25,
+                    328,
+                    623,
+                    776,
+                    13788,
+                    1,
+                    321,
+                    328,
+                    3214,
+                    4740,
+                    3158,
+                    6558,
+                    579,
+                    10453,
+                    6681,
+                    1330,
+                    61446,
+                    25605,
+                    13,
+                    16018,
+                    381,
+                    25,
+                    198,
+                    12,
+                    60545,
+                    13788,
+                    198,
+                    12,
+                    9372,
+                    4740,
+                    198,
+                    2665,
+                    4799,
+                    13,
+                    28320,
+                    6681,
+                    1330,
+                    13,
+                    198,
+                    248069,
+                    271,
+                    12,
+                    60545,
+                    13788,
+                    2228
+                  ],
+                  "qwen38-temperature-upper-boundary": [
+                    760,
+                    1156,
+                    16561,
+                    310,
+                    9559,
+                    440,
+                    6681,
+                    279
+                  ]
+                },
+                "output_tokens_min": 376,
+                "output_tokens_max": 376,
+                "reasoning_tokens_min": 360,
+                "reasoning_tokens_max": 360
+              }
+            }
+          }
+        }
+      },
+      "tier": "launch",
+      "min_app_version": "0.2.159"
     }
   ],
   "schema_version": 1,
@@ -31999,5 +37751,18 @@
       "enclave_id": "d07f0f341169256f4798cc5f4b3b49602bd948f792ff75106bdcd4ee867181a4",
       "kind": "tpm2_quote_ek"
     }
-  ]
+  ],
+  "generation_execution_profiles": {
+    "36abadf4a7aa1ac3b60abc57bda718c3329cf3ad69fb9dfca13a5384c32c6f11": {
+      "schema_version": 1,
+      "engine": "vllm",
+      "independent_dispatch": true,
+      "request_modalities": [
+        [
+          "text"
+        ]
+      ],
+      "proof_sha256": "3fbab1e8f6fed5d8b5e393e958edebef20544346d07ae66a0d68a7c8e59114fd"
+    }
+  }
 }

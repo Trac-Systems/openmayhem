@@ -472,6 +472,10 @@ pub struct LoadConfig {
     #[serde(default = "default_ubatch_size")]
     pub ubatch_size: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_max_num_seqs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_concurrent_generation_capacity: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_layers: Option<u32>,
@@ -495,6 +499,8 @@ pub struct LoadConfig {
     pub vllm_tensor_parallel: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vllm_dtype: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_kv_cache_dtype: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vllm_gpu_memory_utilization_pct: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -622,6 +628,8 @@ impl Default for LoadConfig {
             ctx_size: DEFAULT_CONTEXT_SIZE,
             batch_size: DEFAULT_BATCH_SIZE,
             ubatch_size: DEFAULT_UBATCH_SIZE,
+            vllm_max_num_seqs: None,
+            vllm_concurrent_generation_capacity: None,
             threads: None,
             gpu_layers: None,
             trt_engine_dir: None,
@@ -634,6 +642,7 @@ impl Default for LoadConfig {
             kv_cache_quantized_start_tokens: None,
             vllm_tensor_parallel: None,
             vllm_dtype: None,
+            vllm_kv_cache_dtype: None,
             vllm_gpu_memory_utilization_pct: None,
             vllm_gpu_memory_utilization_floor_pct: None,
             backend_cache_dir: None,
@@ -1461,6 +1470,16 @@ impl ArtifactSink for NoopArtifactSink {
     }
 }
 
+pub trait ConcurrentGenerationBackend: Send + Sync {
+    fn capacity(&self) -> usize;
+    fn generate(
+        &self,
+        request: GenerateRequest,
+        sink: &mut dyn TokenSink,
+        cancellation: &CancellationToken,
+    ) -> Result<GenerateOutput>;
+}
+
 pub trait EngineBackend {
     fn backend_id(&self) -> &'static str;
     fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo>;
@@ -1472,6 +1491,9 @@ pub trait EngineBackend {
     }
     fn process_ids(&self) -> Vec<u32> {
         Vec::new()
+    }
+    fn concurrent_generation_backend(&self) -> Option<Arc<dyn ConcurrentGenerationBackend>> {
+        None
     }
     fn tokenize(&self, text: &str) -> Result<Tokenization>;
     fn generate(
@@ -1950,6 +1972,24 @@ fn validate_load_config(config: &LoadConfig) -> Result<()> {
     if config.ubatch_size == 0 {
         return Err(EngineError::InvalidConfig(
             "ubatch_size must be greater than zero".to_owned(),
+        ));
+    }
+    if config.vllm_max_num_seqs == Some(0) {
+        return Err(EngineError::InvalidConfig(
+            "vllm_max_num_seqs must be greater than zero".to_owned(),
+        ));
+    }
+    if config.vllm_concurrent_generation_capacity == Some(0) {
+        return Err(EngineError::InvalidConfig(
+            "vllm_concurrent_generation_capacity must be greater than zero".to_owned(),
+        ));
+    }
+    if config
+        .vllm_concurrent_generation_capacity
+        .is_some_and(|capacity| capacity > effective_vllm_max_num_seqs(config))
+    {
+        return Err(EngineError::InvalidConfig(
+            "vllm_concurrent_generation_capacity cannot exceed vllm_max_num_seqs".to_owned(),
         ));
     }
 
@@ -2442,6 +2482,10 @@ fn default_batch_size() -> u32 {
 
 fn default_ubatch_size() -> u32 {
     DEFAULT_UBATCH_SIZE
+}
+
+fn effective_vllm_max_num_seqs(config: &LoadConfig) -> u32 {
+    config.vllm_max_num_seqs.unwrap_or(config.batch_size).max(1)
 }
 
 fn default_max_new_tokens() -> u32 {
@@ -7713,42 +7757,55 @@ print("ok")
 #[cfg(feature = "vllm")]
 mod vllm_backend {
     use super::{
-        attach_worker_containment, engine_worker_command, select_runtime_compatible_cuda_home,
-        validate_load_config, verify_artifact, vllm_safetensors_payload_path, ArtifactFormat,
-        CancellationToken, EngineBackend, EngineError, FinishReason, GenerateOutput,
+        attach_worker_containment, effective_vllm_max_num_seqs, engine_worker_command,
+        select_runtime_compatible_cuda_home, validate_load_config, verify_artifact,
+        vllm_safetensors_payload_path, ArtifactFormat, CancellationToken,
+        ConcurrentGenerationBackend, EngineBackend, EngineError, FinishReason, GenerateOutput,
         GenerateRequest, LoadConfig, LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization,
         UsageCounters, WorkerContainment,
     };
     use serde::de::DeserializeOwned;
     use serde::Deserialize;
     use serde_json::{json, Value};
-    use std::cell::{Cell, RefCell};
+    use std::collections::{HashMap, HashSet};
     use std::env;
     use std::fs;
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, ChildStdout, Stdio};
-    use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+    use std::sync::{Arc, Condvar, Mutex, RwLock};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
     const WORKER: &str = include_str!("vllm_worker.py");
     const PYTHON_ENV: &str = "MAYHEM_VLLM_PYTHON";
     const REQUEST_TIMEOUT_ENV: &str = "MAYHEM_VLLM_REQUEST_TIMEOUT_SECS";
+    const CANCEL_TIMEOUT_ENV: &str = "MAYHEM_VLLM_CANCEL_TIMEOUT_SECS";
     const CACHE_DIR_ENV: &str = "MAYHEM_VLLM_CACHE_DIR";
     const CUDA_HOME_ENV: &str = "MAYHEM_VLLM_CUDA_HOME";
     const BUILD_JOBS_ENV: &str = "MAYHEM_VLLM_BUILD_JOBS";
     const DEFAULT_BUILD_JOBS: usize = 2;
     const MEMORY_UTILIZATION_BACKOFF_STEP_PCT: u32 = 5;
     const DEFAULT_REQUEST_TIMEOUT: Option<Duration> = None;
+    const DEFAULT_CANCEL_TIMEOUT: Duration = Duration::from_secs(5);
 
     pub struct VllmBackend {
         python: PathBuf,
-        worker: RefCell<Option<VllmWorker>>,
+        worker: Option<Arc<VllmWorker>>,
         loaded: Option<LoadedModelInfo>,
-        next_id: Cell<u64>,
-        memory_limit_bytes: Cell<Option<u64>>,
-        cache_root: RefCell<Option<PathBuf>>,
+        next_id: Arc<AtomicU64>,
+        memory_limit_bytes: Option<u64>,
+        cache_root: Option<PathBuf>,
+        generation_gate: Arc<RwLock<()>>,
+        generation_epoch: Arc<AtomicU64>,
+        concurrent_generation: Option<Arc<VllmConcurrentGeneration>>,
+        concurrent_generation_enabled: bool,
+        loaded_batch_invariant: Option<bool>,
+        loaded_generation_capacity: Option<usize>,
+        loaded_kv_cache_size_tokens: Option<u64>,
+        loaded_kv_full_context_capacity: Option<usize>,
     }
 
     impl VllmBackend {
@@ -7762,122 +7819,185 @@ mod vllm_backend {
         pub fn with_python(python: impl Into<PathBuf>) -> Result<Self> {
             Ok(Self {
                 python: python.into(),
-                worker: RefCell::new(None),
+                worker: None,
                 loaded: None,
-                next_id: Cell::new(1),
-                memory_limit_bytes: Cell::new(None),
-                cache_root: RefCell::new(None),
+                next_id: Arc::new(AtomicU64::new(1)),
+                memory_limit_bytes: None,
+                cache_root: None,
+                generation_gate: Arc::new(RwLock::new(())),
+                generation_epoch: Arc::new(AtomicU64::new(0)),
+                concurrent_generation: None,
+                concurrent_generation_enabled: false,
+                loaded_batch_invariant: None,
+                loaded_generation_capacity: None,
+                loaded_kv_cache_size_tokens: None,
+                loaded_kv_full_context_capacity: None,
             })
         }
 
-        fn call<T>(&self, op: &str, payload: Value) -> Result<T>
-        where
-            T: DeserializeOwned,
-        {
-            self.call_streaming(op, payload, &mut |_| Ok(()), None)
-        }
-
-        fn call_streaming<T>(
-            &self,
-            op: &str,
-            payload: Value,
-            sink: &mut dyn FnMut(TokenChunk) -> Result<()>,
-            cancellation: Option<&CancellationToken>,
-        ) -> Result<T>
-        where
-            T: DeserializeOwned,
-        {
-            let id = self.next_id.get();
-            self.next_id.set(id.saturating_add(1));
-            let mut worker = self.worker.borrow_mut();
-            if worker.is_none() {
-                *worker = Some(VllmWorker::spawn(
-                    &self.python,
-                    self.memory_limit_bytes.get(),
-                    self.cache_root.borrow().as_deref(),
-                )?);
-            }
-            let worker = worker.as_mut().ok_or_else(|| {
-                EngineError::Vllm("failed to start vLLM backend worker".to_owned())
-            })?;
-            worker.send(id, op, payload)?;
-            let mut sink_error = None;
-            let mut cancel_sent = false;
-            let mut last_progress = Instant::now();
-
+        fn next_request_id(&self) -> u64 {
             loop {
-                let message = if op == "load" {
-                    worker.read_load_message().map(Some)
-                } else {
-                    if cancellation.is_some_and(CancellationToken::is_cancelled) && !cancel_sent {
-                        worker.send(id, "cancel", json!({ "request_id": id }))?;
-                        cancel_sent = true;
-                    }
-                    if let Some(timeout) = worker.request_timeout {
-                        if last_progress.elapsed() >= timeout {
-                            worker.terminate();
-                            return Err(sink_error.unwrap_or_else(|| {
-                                EngineError::Vllm(format!(
-                                    "vLLM backend worker stalled for {}s without a response",
-                                    timeout.as_secs()
-                                ))
-                            }));
-                        }
-                    }
-                    worker.read_message_poll(Duration::from_millis(25))
-                };
-                let message = match message {
-                    Ok(Some(message)) => message,
-                    Ok(None) => continue,
-                    Err(err) => return Err(sink_error.unwrap_or(err)),
-                };
-                last_progress = Instant::now();
-                if message.id < id {
-                    continue;
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                if id != 0 {
+                    return id;
                 }
-                if message.id > id {
-                    return Err(EngineError::Vllm(format!(
-                        "worker response id {} did not match request id {id}",
-                        message.id
-                    )));
-                }
-
-                if message.kind == "token" {
-                    let chunk = message.chunk.ok_or_else(|| {
-                        EngineError::Vllm("worker token message missing chunk".to_owned())
-                    })?;
-                    if sink_error.is_none() {
-                        if let Err(err) = sink(chunk) {
-                            worker.send(id, "cancel", json!({ "request_id": id }))?;
-                            cancel_sent = true;
-                            sink_error = Some(err);
-                        }
-                    }
-                    continue;
-                }
-
-                if let Some(err) = sink_error {
-                    return Err(err);
-                }
-                if cancel_sent || message.cancelled {
-                    return Err(EngineError::Cancelled);
-                }
-
-                if message.ok.unwrap_or(false) {
-                    let result = message.result.unwrap_or(Value::Null);
-                    return Ok(serde_json::from_value(result)?);
-                }
-
-                return Err(EngineError::Vllm(
-                    message
-                        .error
-                        .unwrap_or_else(|| "worker returned an unknown error".to_owned()),
-                ));
             }
         }
 
-        fn reset_worker(&self) {
-            self.worker.borrow_mut().take();
+        fn spawn_worker(&mut self) -> Result<Arc<VllmWorker>> {
+            if let Some(worker) = &self.worker {
+                return Ok(Arc::clone(worker));
+            }
+            let worker = Arc::new(VllmWorker::spawn(
+                &self.python,
+                self.memory_limit_bytes,
+                self.cache_root.as_deref(),
+            )?);
+            self.worker = Some(Arc::clone(&worker));
+            Ok(worker)
+        }
+
+        fn call_control<T>(&self, op: &str, payload: Value, load: bool) -> Result<T>
+        where
+            T: DeserializeOwned,
+        {
+            let worker = self.worker.as_ref().ok_or(EngineError::NotLoaded)?;
+            worker.call_streaming(
+                self.next_request_id(),
+                op,
+                payload,
+                &mut |_| Ok(()),
+                None,
+                load,
+                2,
+            )
+        }
+
+        fn reset_worker(&mut self) {
+            if let Some(worker) = self.worker.take() {
+                worker.terminate();
+            }
+        }
+    }
+
+    struct VllmConcurrentGeneration {
+        worker: Arc<VllmWorker>,
+        next_id: Arc<AtomicU64>,
+        generation_gate: Arc<RwLock<()>>,
+        generation_epoch: Arc<AtomicU64>,
+        expected_epoch: u64,
+        limiter: Arc<GenerationLimiter>,
+    }
+
+    impl VllmConcurrentGeneration {
+        fn next_request_id(&self) -> u64 {
+            loop {
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                if id != 0 {
+                    return id;
+                }
+            }
+        }
+    }
+
+    impl ConcurrentGenerationBackend for VllmConcurrentGeneration {
+        fn capacity(&self) -> usize {
+            self.limiter.capacity()
+        }
+
+        fn generate(
+            &self,
+            request: GenerateRequest,
+            sink: &mut dyn TokenSink,
+            cancellation: &CancellationToken,
+        ) -> Result<GenerateOutput> {
+            cancellation.check()?;
+            request.validate_sampling()?;
+            if request.max_new_tokens == 0 {
+                return Ok(GenerateOutput {
+                    text: String::new(),
+                    usage: UsageCounters::default(),
+                    finish_reason: FinishReason::Length,
+                });
+            }
+
+            let _generation = self
+                .generation_gate
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.generation_epoch.load(Ordering::Acquire) != self.expected_epoch {
+                return Err(EngineError::NotLoaded);
+            }
+            let _permit = self.limiter.acquire(cancellation)?;
+            let route_capacity = usize::try_from(request.max_new_tokens)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1);
+            self.worker.call_streaming(
+                self.next_request_id(),
+                "generate",
+                serde_json::to_value(request)?,
+                &mut |chunk| sink.on_token(chunk),
+                Some(cancellation),
+                false,
+                route_capacity,
+            )
+        }
+    }
+
+    struct GenerationLimiter {
+        capacity: usize,
+        active: Mutex<usize>,
+        available: Condvar,
+    }
+
+    impl GenerationLimiter {
+        fn new(capacity: usize) -> Self {
+            Self {
+                capacity: capacity.max(1),
+                active: Mutex::new(0),
+                available: Condvar::new(),
+            }
+        }
+
+        fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        fn acquire(self: &Arc<Self>, cancellation: &CancellationToken) -> Result<GenerationPermit> {
+            let mut active = self
+                .active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            loop {
+                cancellation.check()?;
+                if *active < self.capacity {
+                    *active += 1;
+                    return Ok(GenerationPermit {
+                        limiter: Arc::clone(self),
+                    });
+                }
+                let (next, _) = self
+                    .available
+                    .wait_timeout(active, Duration::from_millis(25))
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                active = next;
+            }
+        }
+    }
+
+    struct GenerationPermit {
+        limiter: Arc<GenerationLimiter>,
+    }
+
+    impl Drop for GenerationPermit {
+        fn drop(&mut self) {
+            let mut active = self
+                .limiter
+                .active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *active = active.saturating_sub(1);
+            self.limiter.available.notify_one();
         }
     }
 
@@ -7895,8 +8015,23 @@ mod vllm_backend {
                 )));
             }
             verify_artifact(&config.artifact)?;
-            self.memory_limit_bytes.set(config.memory_limit_bytes);
-            self.cache_root.replace(config.backend_cache_dir.clone());
+            let generation_gate = Arc::clone(&self.generation_gate);
+            let _exclusive = generation_gate
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.loaded = None;
+            self.concurrent_generation = None;
+            self.concurrent_generation_enabled = false;
+            self.loaded_batch_invariant = None;
+            self.loaded_generation_capacity = None;
+            self.loaded_kv_cache_size_tokens = None;
+            self.loaded_kv_full_context_capacity = None;
+            let generation_epoch = self
+                .generation_epoch
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1);
+            self.memory_limit_bytes = config.memory_limit_bytes;
+            self.cache_root = config.backend_cache_dir.clone();
 
             let model_path = vllm_model_path(&config.artifact.path)?;
             let attempts = vllm_memory_utilization_attempts(
@@ -7907,9 +8042,12 @@ mod vllm_backend {
             for (index, utilization_pct) in attempts.iter().enumerate() {
                 let mut attempt_config = config.clone();
                 attempt_config.vllm_gpu_memory_utilization_pct = *utilization_pct;
-                match self
-                    .call::<WorkerLoadInfo>("load", vllm_load_payload(&attempt_config, &model_path))
-                {
+                self.spawn_worker()?;
+                match self.call_control::<WorkerLoadInfo>(
+                    "load",
+                    vllm_load_payload(&attempt_config, &model_path),
+                    true,
+                ) {
                     Ok(loaded) => {
                         info = Some(loaded);
                         break;
@@ -7923,6 +8061,36 @@ mod vllm_backend {
             let info = info.ok_or_else(|| {
                 EngineError::Vllm("vLLM load exhausted memory-utilization attempts".to_owned())
             })?;
+            let scheduler_capacity = usize::try_from(effective_vllm_max_num_seqs(&config))
+                .unwrap_or(usize::MAX)
+                .max(1);
+            let requested_execution_capacity =
+                usize::try_from(config.vllm_concurrent_generation_capacity.unwrap_or(1))
+                    .unwrap_or(usize::MAX)
+                    .max(1);
+            let runtime_full_context_capacity = info
+                .kv_cache_size_tokens
+                .map(|tokens| tokens / u64::from(config.ctx_size))
+                .map(|capacity| usize::try_from(capacity).unwrap_or(usize::MAX));
+            if requested_execution_capacity > 1 && runtime_full_context_capacity.is_none() {
+                self.reset_worker();
+                return Err(EngineError::InvalidConfig(
+                    "vLLM did not report runtime KV token capacity; independent generation remains unavailable"
+                        .to_owned(),
+                ));
+            }
+            if runtime_full_context_capacity == Some(0) {
+                self.reset_worker();
+                return Err(EngineError::InvalidConfig(format!(
+                    "vLLM runtime KV capacity of {} tokens cannot serve ctx_size={}",
+                    info.kv_cache_size_tokens.unwrap_or(0),
+                    config.ctx_size
+                )));
+            }
+            let execution_capacity = requested_execution_capacity
+                .min(scheduler_capacity)
+                .min(runtime_full_context_capacity.unwrap_or(1))
+                .max(1);
             let loaded = LoadedModelInfo {
                 backend: self.backend_id().to_owned(),
                 artifact: config.artifact,
@@ -7934,6 +8102,24 @@ mod vllm_backend {
                 },
                 n_vocab: info.n_vocab,
             };
+            let worker = self
+                .worker
+                .as_ref()
+                .ok_or_else(|| EngineError::Vllm("loaded vLLM worker is missing".to_owned()))?;
+            self.concurrent_generation = Some(Arc::new(VllmConcurrentGeneration {
+                worker: Arc::clone(worker),
+                next_id: Arc::clone(&self.next_id),
+                generation_gate: Arc::clone(&self.generation_gate),
+                generation_epoch: Arc::clone(&self.generation_epoch),
+                expected_epoch: generation_epoch,
+                limiter: Arc::new(GenerationLimiter::new(execution_capacity)),
+            }));
+            self.concurrent_generation_enabled = execution_capacity > 1;
+            self.loaded_batch_invariant = info.determinism.batch_invariant;
+            self.loaded_generation_capacity = Some(execution_capacity);
+            self.loaded_kv_cache_size_tokens = info.kv_cache_size_tokens;
+            self.loaded_kv_full_context_capacity = runtime_full_context_capacity;
+            debug_assert!(scheduler_capacity >= execution_capacity);
             self.loaded = Some(loaded.clone());
             Ok(loaded)
         }
@@ -7942,22 +8128,52 @@ mod vllm_backend {
             self.loaded.is_none()
                 || self
                     .worker
-                    .get_mut()
-                    .as_mut()
-                    .is_some_and(|worker| matches!(worker.child.try_wait(), Ok(None)))
+                    .as_ref()
+                    .is_some_and(|worker| worker.component_healthy())
         }
 
         fn process_ids(&self) -> Vec<u32> {
             self.worker
-                .borrow()
                 .as_ref()
-                .map(|worker| vec![worker.child.id()])
+                .map(|worker| vec![worker.process_id()])
                 .unwrap_or_default()
+        }
+
+        fn loaded_backend_evidence(&self) -> Option<Value> {
+            self.loaded.as_ref()?;
+            let mut evidence = json!({
+                "determinism": {
+                    "batch_invariant": self.loaded_batch_invariant,
+                },
+                "generation": {
+                    "capacity": self.loaded_generation_capacity.unwrap_or(1),
+                    "concurrent": self.concurrent_generation_enabled,
+                },
+            });
+            if let Some(tokens) = self.loaded_kv_cache_size_tokens {
+                evidence["generation"]["runtime_kv_token_capacity"] = json!(tokens);
+            }
+            if let Some(capacity) = self.loaded_kv_full_context_capacity {
+                evidence["generation"]["runtime_full_context_capacity"] = json!(capacity);
+            }
+            Some(evidence)
+        }
+
+        fn concurrent_generation_backend(&self) -> Option<Arc<dyn ConcurrentGenerationBackend>> {
+            self.concurrent_generation_enabled.then(|| {
+                self.concurrent_generation
+                    .as_ref()
+                    .map(|backend| Arc::clone(backend) as Arc<dyn ConcurrentGenerationBackend>)
+            })?
         }
 
         fn tokenize(&self, text: &str) -> Result<Tokenization> {
             self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
-            self.call("tokenize", json!({ "text": text }))
+            let _exclusive = self
+                .generation_gate
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.call_control("tokenize", json!({ "text": text }), false)
         }
 
         fn generate(
@@ -7966,23 +8182,11 @@ mod vllm_backend {
             sink: &mut dyn TokenSink,
             cancellation: &CancellationToken,
         ) -> Result<GenerateOutput> {
-            cancellation.check()?;
-            request.validate_sampling()?;
-            if request.max_new_tokens == 0 {
-                return Ok(GenerateOutput {
-                    text: String::new(),
-                    usage: UsageCounters::default(),
-                    finish_reason: FinishReason::Length,
-                });
-            }
-            self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
-
-            self.call_streaming(
-                "generate",
-                serde_json::to_value(request)?,
-                &mut |chunk| sink.on_token(chunk),
-                Some(cancellation),
-            )
+            let backend = self
+                .concurrent_generation
+                .as_ref()
+                .ok_or(EngineError::NotLoaded)?;
+            ConcurrentGenerationBackend::generate(backend.as_ref(), request, sink, cancellation)
         }
     }
 
@@ -7992,6 +8196,16 @@ mod vllm_backend {
         n_ctx_train: u32,
         #[serde(default)]
         n_vocab: i32,
+        #[serde(default)]
+        kv_cache_size_tokens: Option<u64>,
+        #[serde(default)]
+        determinism: WorkerDeterminismInfo,
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    struct WorkerDeterminismInfo {
+        #[serde(default)]
+        batch_invariant: Option<bool>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -8009,15 +8223,22 @@ mod vllm_backend {
         chunk: Option<TokenChunk>,
         #[serde(default)]
         cancelled: bool,
+        #[serde(default)]
+        abort_failed: bool,
     }
 
     struct VllmWorker {
+        process: Mutex<VllmProcess>,
+        stdin: Mutex<ChildStdin>,
+        router: Arc<WorkerRouter>,
+        reader: Mutex<Option<JoinHandle<()>>>,
+        request_timeout: Option<Duration>,
+        cancel_timeout: Duration,
+    }
+
+    struct VllmProcess {
         child: Child,
         _containment: WorkerContainment,
-        stdin: ChildStdin,
-        stdout_rx: Option<Receiver<WorkerRead>>,
-        reader: Option<JoinHandle<()>>,
-        request_timeout: Option<Duration>,
         terminated: bool,
     }
 
@@ -8027,12 +8248,35 @@ mod vllm_backend {
             memory_limit_bytes: Option<u64>,
             cache_root: Option<&Path>,
         ) -> Result<Self> {
-            Self::spawn_with_timeout(python, request_timeout()?, memory_limit_bytes, cache_root)
+            Self::spawn_with_timeouts(
+                python,
+                request_timeout()?,
+                cancel_timeout()?,
+                memory_limit_bytes,
+                cache_root,
+            )
         }
 
+        #[cfg(test)]
         fn spawn_with_timeout(
             python: &Path,
             request_timeout: Option<Duration>,
+            memory_limit_bytes: Option<u64>,
+            cache_root: Option<&Path>,
+        ) -> Result<Self> {
+            Self::spawn_with_timeouts(
+                python,
+                request_timeout,
+                DEFAULT_CANCEL_TIMEOUT,
+                memory_limit_bytes,
+                cache_root,
+            )
+        }
+
+        fn spawn_with_timeouts(
+            python: &Path,
+            request_timeout: Option<Duration>,
+            cancel_timeout: Duration,
             memory_limit_bytes: Option<u64>,
             cache_root: Option<&Path>,
         ) -> Result<Self> {
@@ -8063,147 +8307,427 @@ mod vllm_backend {
                 attach_worker_containment(&child, memory_limit_bytes).map_err(|err| {
                     EngineError::Vllm(format!("applying worker containment failed: {err}"))
                 })?;
-            let (stdout_tx, stdout_rx) = mpsc::sync_channel(super::WORKER_STDOUT_QUEUE_CAPACITY);
-            let reader = thread::spawn(move || read_worker_stdout(stdout, stdout_tx));
+            let router = Arc::new(WorkerRouter::default());
+            let reader_router = Arc::clone(&router);
+            let reader = thread::spawn(move || read_worker_stdout(stdout, &reader_router));
             Ok(Self {
-                child,
-                _containment: containment,
-                stdin,
-                stdout_rx: Some(stdout_rx),
-                reader: Some(reader),
+                process: Mutex::new(VllmProcess {
+                    child,
+                    _containment: containment,
+                    terminated: false,
+                }),
+                stdin: Mutex::new(stdin),
+                router,
+                reader: Mutex::new(Some(reader)),
                 request_timeout,
-                terminated: false,
+                cancel_timeout,
             })
         }
 
-        fn send(&mut self, id: u64, op: &str, payload: Value) -> Result<()> {
+        fn send(&self, id: u64, op: &str, payload: Value) -> Result<()> {
+            if let Some(error) = self.router.failure() {
+                return Err(EngineError::Vllm(error));
+            }
             let message = json!({
                 "id": id,
                 "op": op,
                 "payload": payload,
             });
-            serde_json::to_writer(&mut self.stdin, &message)?;
-            self.stdin.write_all(b"\n")?;
-            self.stdin.flush()?;
+            let mut stdin = self
+                .stdin
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            serde_json::to_writer(&mut *stdin, &message)?;
+            stdin.write_all(b"\n")?;
+            stdin.flush()?;
             Ok(())
         }
 
-        #[cfg(test)]
-        fn read_message(&mut self) -> Result<WorkerMessage> {
-            let read = match self.request_timeout {
-                Some(request_timeout) => match self
-                    .stdout_rx
-                    .as_ref()
-                    .ok_or_else(|| {
-                        EngineError::Vllm("vLLM backend worker stdout reader is closed".to_owned())
-                    })?
-                    .recv_timeout(request_timeout)
-                {
-                    Ok(read) => read,
-                    Err(RecvTimeoutError::Timeout) => {
-                        self.terminate();
-                        return Err(EngineError::Vllm(format!(
-                            "vLLM backend worker stalled for {}s without a response",
-                            request_timeout.as_secs()
-                        )));
-                    }
-                    Err(RecvTimeoutError::Disconnected) => {
-                        return Err(EngineError::Vllm(
-                            "vLLM backend worker stdout reader stopped".to_owned(),
-                        ));
-                    }
-                },
-                None => self
-                    .stdout_rx
-                    .as_ref()
-                    .ok_or_else(|| {
-                        EngineError::Vllm("vLLM backend worker stdout reader is closed".to_owned())
-                    })?
-                    .recv()
-                    .map_err(|_| {
-                        EngineError::Vllm("vLLM backend worker stdout reader stopped".to_owned())
-                    })?,
-            };
-            Self::decode_read(read)
-        }
-
-        fn read_message_poll(&mut self, wait: Duration) -> Result<Option<WorkerMessage>> {
-            match self
-                .stdout_rx
-                .as_ref()
-                .ok_or_else(|| {
-                    EngineError::Vllm("vLLM backend worker stdout reader is closed".to_owned())
-                })?
-                .recv_timeout(wait)
-            {
-                Ok(read) => Self::decode_read(read).map(Some),
-                Err(RecvTimeoutError::Timeout) => Ok(None),
-                Err(RecvTimeoutError::Disconnected) => Err(EngineError::Vllm(
-                    "vLLM backend worker stdout reader stopped".to_owned(),
-                )),
+        fn call_streaming<T>(
+            &self,
+            id: u64,
+            op: &str,
+            payload: Value,
+            sink: &mut dyn FnMut(TokenChunk) -> Result<()>,
+            cancellation: Option<&CancellationToken>,
+            load: bool,
+            route_capacity: usize,
+        ) -> Result<T>
+        where
+            T: DeserializeOwned,
+        {
+            let mut route = WorkerRoute::new(id, Arc::clone(&self.router), route_capacity)?;
+            if let Err(error) = self.send(id, op, payload) {
+                route.cancel_registration();
+                return Err(error);
             }
-        }
+            route.mark_sent();
+            let mut sink_error = None;
+            let mut cancel_sent = false;
+            let mut cancel_sent_at = None;
+            let mut last_progress = Instant::now();
 
-        fn read_load_message(&mut self) -> Result<WorkerMessage> {
-            let read = self
-                .stdout_rx
-                .as_ref()
-                .ok_or_else(|| {
-                    EngineError::Vllm("vLLM backend worker stdout reader is closed".to_owned())
-                })?
-                .recv()
-                .map_err(|_| {
-                    EngineError::Vllm("vLLM backend worker stdout reader stopped".to_owned())
-                })?;
-            Self::decode_read(read)
-        }
+            loop {
+                if !load {
+                    if cancellation.is_some_and(CancellationToken::is_cancelled) && !cancel_sent {
+                        self.send(id, "cancel", json!({ "request_id": id }))?;
+                        cancel_sent = true;
+                        cancel_sent_at = Some(Instant::now());
+                    }
+                    if cancel_sent_at
+                        .is_some_and(|sent_at| sent_at.elapsed() >= self.cancel_timeout)
+                    {
+                        self.terminate();
+                        return Err(sink_error.unwrap_or(EngineError::Cancelled));
+                    }
+                    if let Some(timeout) = self.request_timeout {
+                        if last_progress.elapsed() >= timeout {
+                            if !cancel_sent {
+                                self.send(id, "cancel", json!({ "request_id": id }))?;
+                                cancel_sent = true;
+                                cancel_sent_at = Some(Instant::now());
+                                sink_error = Some(EngineError::Vllm(format!(
+                                    "vLLM backend worker stalled for {}s without a response",
+                                    timeout.as_secs()
+                                )));
+                            }
+                        }
+                    }
+                }
 
-        fn decode_read(read: WorkerRead) -> Result<WorkerMessage> {
-            let line = match read {
-                WorkerRead::Line(line) => line,
-                WorkerRead::Eof => {
+                let event = if load {
+                    route.recv()?
+                } else {
+                    match route.recv_timeout(Duration::from_millis(25))? {
+                        Some(event) => event,
+                        None => continue,
+                    }
+                };
+                let message = match event {
+                    WorkerEvent::Message(message) => message,
+                    WorkerEvent::Failure(error) => {
+                        route.mark_terminal();
+                        return Err(EngineError::Vllm(error));
+                    }
+                };
+                last_progress = Instant::now();
+
+                if message.kind == "token" {
+                    let chunk = message.chunk.ok_or_else(|| {
+                        EngineError::Vllm("worker token message missing chunk".to_owned())
+                    })?;
+                    if sink_error.is_none() {
+                        if let Err(error) = sink(chunk) {
+                            self.send(id, "cancel", json!({ "request_id": id }))?;
+                            cancel_sent = true;
+                            cancel_sent_at = Some(Instant::now());
+                            sink_error = Some(error);
+                        }
+                    }
+                    continue;
+                }
+
+                route.mark_terminal();
+                if message.abort_failed {
+                    self.terminate();
                     return Err(EngineError::Vllm(
-                        "vLLM backend worker exited before replying".to_owned(),
+                        "vLLM cancellation was not acknowledged; worker quarantined".to_owned(),
                     ));
                 }
-                WorkerRead::Error(error) => return Err(EngineError::Vllm(error)),
-            };
-            Ok(serde_json::from_str(line.trim_end())?)
+                if let Some(error) = sink_error {
+                    return Err(error);
+                }
+                if cancel_sent || message.cancelled {
+                    return Err(EngineError::Cancelled);
+                }
+                if message.ok.unwrap_or(false) {
+                    return Ok(serde_json::from_value(
+                        message.result.unwrap_or(Value::Null),
+                    )?);
+                }
+                return Err(EngineError::Vllm(
+                    message
+                        .error
+                        .unwrap_or_else(|| "worker returned an unknown error".to_owned()),
+                ));
+            }
         }
 
-        fn terminate(&mut self) {
-            if self.terminated {
+        fn component_healthy(&self) -> bool {
+            if self.router.failure().is_some() {
+                return false;
+            }
+            let mut process = self
+                .process
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            !process.terminated && matches!(process.child.try_wait(), Ok(None))
+        }
+
+        fn process_id(&self) -> u32 {
+            self.process
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .child
+                .id()
+        }
+
+        fn terminate(&self) {
+            let mut process = self
+                .process
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if process.terminated {
                 return;
             }
-            terminate_worker_process(&mut self.child);
-            self.terminated = true;
+            self.router
+                .fail("vLLM backend worker was terminated".to_owned());
+            terminate_worker_process(&mut process.child);
+            process.terminated = true;
         }
     }
 
-    enum WorkerRead {
-        Line(String),
-        Eof,
-        Error(String),
+    enum WorkerEvent {
+        Message(WorkerMessage),
+        Failure(String),
     }
 
-    fn read_worker_stdout(stdout: ChildStdout, sender: mpsc::SyncSender<WorkerRead>) {
+    #[derive(Default)]
+    struct WorkerRouter {
+        state: Mutex<WorkerRouterState>,
+    }
+
+    #[derive(Default)]
+    struct WorkerRouterState {
+        routes: HashMap<u64, WorkerRouteSender>,
+        abandoned: HashSet<u64>,
+        route_failures: HashMap<u64, String>,
+        failure: Option<String>,
+    }
+
+    struct WorkerRouteSender {
+        sender: SyncSender<WorkerEvent>,
+    }
+
+    impl WorkerRouter {
+        fn register(&self, id: u64, capacity: usize) -> Result<Receiver<WorkerEvent>> {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(error) = &state.failure {
+                return Err(EngineError::Vllm(error.clone()));
+            }
+            if state.routes.contains_key(&id)
+                || state.abandoned.contains(&id)
+                || state.route_failures.contains_key(&id)
+            {
+                return Err(EngineError::Vllm(format!(
+                    "duplicate active vLLM worker request id {id}"
+                )));
+            }
+            let (sender, receiver) = mpsc::sync_channel(capacity.max(1));
+            state.routes.insert(id, WorkerRouteSender { sender });
+            Ok(receiver)
+        }
+
+        fn unregister(&self, id: u64) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.routes.remove(&id);
+            state.abandoned.remove(&id);
+            state.route_failures.remove(&id);
+        }
+
+        fn abandon(&self, id: u64) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.routes.remove(&id).is_some() && state.failure.is_none() {
+                state.abandoned.insert(id);
+            }
+            state.route_failures.remove(&id);
+        }
+
+        fn route(&self, message: WorkerMessage) {
+            let id = message.id;
+            let terminal = message.kind != "token";
+            let sender = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if state.abandoned.contains(&id) {
+                    if terminal {
+                        state.abandoned.remove(&id);
+                    }
+                    return;
+                }
+                if terminal {
+                    state.routes.remove(&id).map(|route| route.sender)
+                } else {
+                    state.routes.get(&id).map(|route| route.sender.clone())
+                }
+            };
+
+            let Some(sender) = sender else {
+                self.fail(format!(
+                    "vLLM backend worker returned an unknown request id {id}"
+                ));
+                return;
+            };
+            match sender.try_send(WorkerEvent::Message(message)) {
+                Ok(()) => {}
+                Err(TrySendError::Disconnected(_)) if !terminal => self.abandon(id),
+                Err(TrySendError::Disconnected(_)) => {}
+                Err(TrySendError::Full(_)) => {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.routes.remove(&id);
+                    state.abandoned.insert(id);
+                    state.route_failures.insert(
+                        id,
+                        format!("vLLM request {id} exceeded its bounded response route capacity"),
+                    );
+                }
+            }
+        }
+
+        fn fail(&self, error: String) {
+            let (failure, routes) = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let failure = state.failure.get_or_insert(error).clone();
+                state.abandoned.clear();
+                state.route_failures.clear();
+                let routes = state
+                    .routes
+                    .drain()
+                    .map(|(_, route)| route.sender)
+                    .collect::<Vec<_>>();
+                (failure, routes)
+            };
+            for sender in routes {
+                let _ = sender.try_send(WorkerEvent::Failure(failure.clone()));
+            }
+        }
+
+        fn failure(&self) -> Option<String> {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .failure
+                .clone()
+        }
+
+        fn take_route_failure(&self, id: u64) -> Option<String> {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.abandoned.remove(&id);
+            state.route_failures.remove(&id)
+        }
+    }
+
+    struct WorkerRoute {
+        id: u64,
+        router: Arc<WorkerRouter>,
+        receiver: Receiver<WorkerEvent>,
+        sent: bool,
+        terminal: bool,
+    }
+
+    impl WorkerRoute {
+        fn new(id: u64, router: Arc<WorkerRouter>, capacity: usize) -> Result<Self> {
+            let receiver = router.register(id, capacity)?;
+            Ok(Self {
+                id,
+                router,
+                receiver,
+                sent: false,
+                terminal: false,
+            })
+        }
+
+        fn mark_sent(&mut self) {
+            self.sent = true;
+        }
+
+        fn mark_terminal(&mut self) {
+            self.terminal = true;
+        }
+
+        fn cancel_registration(&mut self) {
+            self.router.unregister(self.id);
+            self.terminal = true;
+        }
+
+        fn disconnected_event(&self) -> Result<WorkerEvent> {
+            if let Some(error) = self.router.take_route_failure(self.id) {
+                return Ok(WorkerEvent::Failure(error));
+            }
+            if let Some(error) = self.router.failure() {
+                return Ok(WorkerEvent::Failure(error));
+            }
+            Err(EngineError::Vllm(
+                "vLLM backend worker response route closed".to_owned(),
+            ))
+        }
+
+        fn recv(&self) -> Result<WorkerEvent> {
+            match self.receiver.recv() {
+                Ok(event) => Ok(event),
+                Err(_) => self.disconnected_event(),
+            }
+        }
+
+        fn recv_timeout(&self, wait: Duration) -> Result<Option<WorkerEvent>> {
+            match self.receiver.recv_timeout(wait) {
+                Ok(event) => Ok(Some(event)),
+                Err(RecvTimeoutError::Timeout) => Ok(None),
+                Err(RecvTimeoutError::Disconnected) => self.disconnected_event().map(Some),
+            }
+        }
+    }
+
+    impl Drop for WorkerRoute {
+        fn drop(&mut self) {
+            if self.sent && !self.terminal {
+                self.router.abandon(self.id);
+            } else if !self.sent {
+                self.router.unregister(self.id);
+            }
+        }
+    }
+
+    fn read_worker_stdout(stdout: ChildStdout, router: &WorkerRouter) {
         let mut stdout = BufReader::new(stdout);
         loop {
             let mut line = String::new();
             match stdout.read_line(&mut line) {
                 Ok(0) => {
-                    let _ = sender.send(WorkerRead::Eof);
+                    router.fail("vLLM backend worker exited before replying".to_owned());
                     return;
                 }
-                Ok(_) => {
-                    if sender.send(WorkerRead::Line(line)).is_err() {
+                Ok(_) => match serde_json::from_str::<WorkerMessage>(line.trim_end()) {
+                    Ok(message) => router.route(message),
+                    Err(error) => {
+                        router.fail(format!(
+                            "decoding vLLM backend worker response failed: {error}"
+                        ));
                         return;
                     }
-                }
+                },
                 Err(err) => {
-                    let _ = sender.send(WorkerRead::Error(format!(
-                        "reading vLLM backend worker stdout failed: {err}"
-                    )));
+                    router.fail(format!("reading vLLM backend worker stdout failed: {err}"));
                     return;
                 }
             }
@@ -8230,6 +8754,33 @@ mod vllm_backend {
             ))
         })?;
         Ok((seconds > 0).then(|| Duration::from_secs(seconds)))
+    }
+
+    fn cancel_timeout() -> Result<Duration> {
+        match env::var(CANCEL_TIMEOUT_ENV) {
+            Ok(value) => cancel_timeout_from(Some(&value)),
+            Err(env::VarError::NotPresent) => Ok(DEFAULT_CANCEL_TIMEOUT),
+            Err(err) => Err(EngineError::InvalidConfig(format!(
+                "reading {CANCEL_TIMEOUT_ENV} failed: {err}"
+            ))),
+        }
+    }
+
+    fn cancel_timeout_from(value: Option<&str>) -> Result<Duration> {
+        let Some(value) = value else {
+            return Ok(DEFAULT_CANCEL_TIMEOUT);
+        };
+        let seconds = value.trim().parse::<u64>().map_err(|_| {
+            EngineError::InvalidConfig(format!(
+                "{CANCEL_TIMEOUT_ENV} must be a positive integer in seconds"
+            ))
+        })?;
+        if seconds == 0 {
+            return Err(EngineError::InvalidConfig(format!(
+                "{CANCEL_TIMEOUT_ENV} must be positive"
+            )));
+        }
+        Ok(Duration::from_secs(seconds))
     }
 
     fn configure_vllm_worker_environment(
@@ -8433,13 +8984,24 @@ mod vllm_backend {
     impl Drop for VllmWorker {
         fn drop(&mut self) {
             let _ = self.send(0, "shutdown", Value::Null);
-            self.stdout_rx.take();
-            if wait_for_child_exit(&mut self.child, Duration::from_secs(3)) {
-                self.terminated = true;
-            } else {
-                self.terminate();
+            {
+                let mut process = self
+                    .process
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if wait_for_child_exit(&mut process.child, Duration::from_secs(3)) {
+                    process.terminated = true;
+                } else {
+                    terminate_worker_process(&mut process.child);
+                    process.terminated = true;
+                }
             }
-            if let Some(reader) = self.reader.take() {
+            if let Some(reader) = self
+                .reader
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
                 let _ = reader.join();
             }
         }
@@ -8460,10 +9022,11 @@ mod vllm_backend {
         let mut payload = json!({
             "path": model_path,
             "ctx_size": config.ctx_size,
-            "max_batch_size": config.batch_size.max(1),
+            "max_batch_size": effective_vllm_max_num_seqs(config),
             "max_num_tokens": config.ubatch_size.max(1),
             "tensor_parallel": config.vllm_tensor_parallel.unwrap_or(1),
             "dtype": config.vllm_dtype,
+            "kv_cache_dtype": config.vllm_kv_cache_dtype,
         });
         if let Some(pct) = config.vllm_gpu_memory_utilization_pct {
             payload["gpu_memory_utilization"] = json!((pct as f64) / 100.0);
@@ -8534,8 +9097,137 @@ mod vllm_backend {
         use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
 
+        fn worker_token_message(id: u64, index: u32) -> WorkerMessage {
+            WorkerMessage {
+                id,
+                kind: "token".to_owned(),
+                ok: None,
+                result: None,
+                error: None,
+                chunk: Some(TokenChunk {
+                    index,
+                    token_id: i32::try_from(index).unwrap_or(i32::MAX),
+                    text: index.to_string(),
+                }),
+                cancelled: false,
+                abort_failed: false,
+            }
+        }
+
+        fn worker_response_message(id: u64) -> WorkerMessage {
+            WorkerMessage {
+                id,
+                kind: "response".to_owned(),
+                ok: Some(true),
+                result: Some(json!({})),
+                error: None,
+                chunk: None,
+                cancelled: false,
+                abort_failed: false,
+            }
+        }
+
         #[test]
-        fn vllm_worker_read_timeout_kills_silent_child() {
+        fn vllm_slow_route_buffers_without_blocking_or_cancelling_siblings() {
+            let router = Arc::new(WorkerRouter::default());
+            let buffered = super::super::WORKER_STDOUT_QUEUE_CAPACITY * 3;
+            let mut slow_route = WorkerRoute::new(1, Arc::clone(&router), buffered + 1).unwrap();
+            let mut sibling_route = WorkerRoute::new(2, Arc::clone(&router), 1).unwrap();
+            slow_route.mark_sent();
+            sibling_route.mark_sent();
+
+            for index in 0..buffered {
+                router.route(worker_token_message(1, index as u32));
+            }
+            router.route(worker_response_message(2));
+            router.route(worker_response_message(1));
+
+            assert!(matches!(
+                sibling_route.recv().unwrap(),
+                WorkerEvent::Message(WorkerMessage { id: 2, .. })
+            ));
+            sibling_route.mark_terminal();
+            assert!(router.failure().is_none());
+
+            for _ in 0..buffered {
+                assert!(matches!(
+                    slow_route.recv().unwrap(),
+                    WorkerEvent::Message(WorkerMessage { id: 1, .. })
+                ));
+            }
+            assert!(matches!(
+                slow_route.recv().unwrap(),
+                WorkerEvent::Message(WorkerMessage {
+                    id: 1,
+                    kind,
+                    ..
+                }) if kind == "response"
+            ));
+            slow_route.mark_terminal();
+            assert!(router.failure().is_none());
+        }
+
+        #[test]
+        fn vllm_route_overflow_is_bounded_and_does_not_fail_siblings() {
+            let router = Arc::new(WorkerRouter::default());
+            let mut full_route = WorkerRoute::new(1, Arc::clone(&router), 1).unwrap();
+            let mut sibling_route = WorkerRoute::new(2, Arc::clone(&router), 1).unwrap();
+            full_route.mark_sent();
+            sibling_route.mark_sent();
+
+            router.route(worker_token_message(1, 0));
+            router.route(worker_token_message(1, 1));
+            router.route(worker_response_message(2));
+
+            assert!(matches!(
+                sibling_route.recv().unwrap(),
+                WorkerEvent::Message(WorkerMessage { id: 2, .. })
+            ));
+            sibling_route.mark_terminal();
+            assert!(matches!(
+                full_route.recv().unwrap(),
+                WorkerEvent::Message(WorkerMessage { id: 1, .. })
+            ));
+            assert!(matches!(
+                full_route.recv().unwrap(),
+                WorkerEvent::Failure(error)
+                    if error.contains("bounded response route capacity")
+            ));
+            full_route.mark_terminal();
+            assert!(router.failure().is_none());
+        }
+
+        #[test]
+        fn vllm_worker_termination_reports_explicit_failure_to_every_sibling_route() {
+            let root = unique_test_root("vllm-shared-worker-termination");
+            let python = root.join("bin/python");
+            fs::create_dir_all(python.parent().expect("python parent")).unwrap();
+            fs::write(&python, "#!/bin/sh\nexec sleep 30\n").unwrap();
+            let mut permissions = fs::metadata(&python).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&python, permissions).unwrap();
+
+            let worker = VllmWorker::spawn_with_timeout(&python, None, None, None).unwrap();
+            let mut first = WorkerRoute::new(1, Arc::clone(&worker.router), 1).unwrap();
+            let mut second = WorkerRoute::new(2, Arc::clone(&worker.router), 1).unwrap();
+            first.mark_sent();
+            second.mark_sent();
+
+            worker.terminate();
+            for route in [&mut first, &mut second] {
+                let WorkerEvent::Failure(error) = route.recv().unwrap() else {
+                    panic!("active sibling route did not receive a terminal failure");
+                };
+                assert_eq!(error, "vLLM backend worker was terminated");
+                route.mark_terminal();
+            }
+            assert!(!worker.component_healthy());
+            drop(worker);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn vllm_worker_read_timeout_abandons_only_the_stalled_request() {
             let path =
                 env::temp_dir().join(format!("mayhem-silent-vllm-worker-{}", std::process::id()));
             fs::write(&path, "#!/bin/sh\nexec sleep 20\n").expect("write fake worker");
@@ -8543,14 +9235,26 @@ mod vllm_backend {
             perms.set_mode(0o700);
             fs::set_permissions(&path, perms).expect("chmod fake worker");
 
-            let mut worker =
-                VllmWorker::spawn_with_timeout(&path, Some(Duration::from_secs(1)), None, None)
-                    .expect("spawn");
-            worker
-                .send(1, "load", Value::Null)
-                .expect("send request to fake worker");
+            let worker = VllmWorker::spawn_with_timeouts(
+                &path,
+                Some(Duration::from_secs(1)),
+                Duration::from_millis(100),
+                None,
+                None,
+            )
+            .expect("spawn");
             let start = Instant::now();
-            let err = worker.read_message().expect_err("silent worker times out");
+            let err = worker
+                .call_streaming::<Value>(
+                    1,
+                    "generate",
+                    Value::Null,
+                    &mut |_| Ok(()),
+                    None,
+                    false,
+                    2,
+                )
+                .expect_err("silent worker times out");
             assert!(start.elapsed() < Duration::from_secs(5));
             assert!(
                 format!("{err}").contains("stalled for 1s without a response"),
@@ -8575,19 +9279,15 @@ mod vllm_backend {
             perms.set_mode(0o700);
             fs::set_permissions(&path, perms).expect("chmod fake worker");
 
-            let mut worker =
+            let worker =
                 VllmWorker::spawn_with_timeout(&path, Some(Duration::from_millis(50)), None, None)
                     .expect("spawn");
-            worker
-                .send(1, "load", Value::Null)
-                .expect("send load request to fake worker");
             let start = Instant::now();
-            let message = worker
-                .read_load_message()
+            let result = worker
+                .call_streaming::<Value>(1, "load", Value::Null, &mut |_| Ok(()), None, true, 2)
                 .expect("load waits beyond inference timeout");
             assert!(start.elapsed() >= Duration::from_millis(500));
-            assert_eq!(message.id, 1);
-            assert_eq!(message.ok, Some(true));
+            assert_eq!(result, json!({}));
 
             let _ = fs::remove_file(path);
         }
@@ -8605,16 +9305,19 @@ mod vllm_backend {
             perms.set_mode(0o700);
             fs::set_permissions(&path, perms).expect("chmod fake worker");
 
-            let mut worker =
-                VllmWorker::spawn_with_timeout(&path, None, None, None).expect("spawn");
-            worker
-                .send(1, "generate", Value::Null)
-                .expect("send generation request");
-            let message = worker
-                .read_message()
+            let worker = VllmWorker::spawn_with_timeout(&path, None, None, None).expect("spawn");
+            let result = worker
+                .call_streaming::<Value>(
+                    1,
+                    "generate",
+                    Value::Null,
+                    &mut |_| Ok(()),
+                    None,
+                    false,
+                    2,
+                )
                 .expect("default response wait has no time ceiling");
-            assert_eq!(message.id, 1);
-            assert_eq!(message.ok, Some(true));
+            assert_eq!(result, json!({}));
 
             let _ = fs::remove_file(path);
         }
@@ -8631,7 +9334,89 @@ mod vllm_backend {
         }
 
         #[test]
+        fn vllm_worker_cancel_timeout_override_is_validated() {
+            assert_eq!(cancel_timeout_from(None).unwrap(), Duration::from_secs(5));
+            assert_eq!(
+                cancel_timeout_from(Some("9")).unwrap(),
+                Duration::from_secs(9)
+            );
+            assert!(cancel_timeout_from(Some("0")).is_err());
+            assert!(cancel_timeout_from(Some("later")).is_err());
+        }
+
+        #[test]
+        fn vllm_unacknowledged_cancellation_quarantines_worker() {
+            let root = unique_test_root("vllm-cancel-timeout");
+            let python = root.join("bin/python");
+            fs::create_dir_all(python.parent().expect("python parent")).unwrap();
+            fs::write(
+                &python,
+                concat!(
+                    "#!/bin/sh\n",
+                    "read generate_request\n",
+                    "read cancel_request\n",
+                    "sleep 1\n",
+                    "read sibling_request\n",
+                    "printf '%s\\n' '{\"id\":2,\"type\":\"response\",\"ok\":true,\"result\":{\"survived\":true}}'\n",
+                    "read shutdown\n",
+                ),
+            )
+            .unwrap();
+            let mut permissions = fs::metadata(&python).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&python, permissions).unwrap();
+
+            let worker = VllmWorker::spawn_with_timeouts(
+                &python,
+                None,
+                Duration::from_millis(100),
+                None,
+                Some(&root.join("cache")),
+            )
+            .expect("spawn fake worker");
+            let cancellation = CancellationToken::new();
+            let peer_cancellation = cancellation.clone();
+            let cancel_thread = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                peer_cancellation.cancel();
+            });
+
+            let started = Instant::now();
+            let error = worker
+                .call_streaming::<Value>(
+                    1,
+                    "generate",
+                    Value::Null,
+                    &mut |_| Ok(()),
+                    Some(&cancellation),
+                    false,
+                    2,
+                )
+                .expect_err("unacknowledged cancellation must remain bounded");
+            cancel_thread.join().expect("cancel thread");
+
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert_eq!(error.to_string(), EngineError::Cancelled.to_string());
+            assert!(!worker.component_healthy());
+            let sibling_error = worker
+                .call_streaming::<Value>(
+                    2,
+                    "generate",
+                    Value::Null,
+                    &mut |_| Ok(()),
+                    None,
+                    false,
+                    2,
+                )
+                .expect_err("quarantined worker must refuse sibling requests");
+            assert!(sibling_error.to_string().contains("terminated"));
+            drop(worker);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
         fn vllm_worker_multimodal_path_is_local_only_and_processor_backed() {
+            assert!(WORKER.contains("await asyncio.to_thread(prepare_generation_request"));
             assert!(WORKER.contains("AutoProcessor.from_pretrained"));
             assert!(WORKER.contains("renderer.apply_chat_template"));
             assert!(WORKER.contains("multi_modal_data"));
@@ -8657,6 +9442,7 @@ mod vllm_backend {
             assert!(WORKER.contains("kwargs[\"linear_backend\"] = \"cutlass\""));
             assert!(WORKER.contains("kwargs[\"moe_backend\"] = \"cutlass\""));
             assert!(WORKER.contains("\"kernel_policy\": kernel_policy"));
+            assert!(WORKER.contains("required_options.add(\"kv_cache_dtype\")"));
         }
 
         #[test]
@@ -8821,13 +9607,360 @@ printf '%s\n' '{"id":3,"type":"response","ok":true,"result":{"text":"second","us
         }
 
         #[test]
+        fn vllm_concurrent_requests_route_out_of_order_frames_to_the_matching_caller() {
+            let root = unique_test_root("vllm-out-of-order");
+            let python = root.join("bin/python");
+            let model = root.join("checkpoint/model.safetensors");
+            let first_seen = root.join("first-seen");
+            fs::create_dir_all(python.parent().expect("python parent")).unwrap();
+            fs::create_dir_all(model.parent().expect("model parent")).unwrap();
+            let script = r#"#!/bin/sh
+read load_request
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000,"kv_cache_size_tokens":12288,"determinism":{"batch_invariant":false}}}'
+read first_generate
+: > "__FIRST_SEEN__"
+read second_generate
+printf '%s\n' '{"id":3,"type":"token","chunk":{"index":0,"token_id":33,"text":"second"}}'
+printf '%s\n' '{"id":3,"type":"response","ok":true,"result":{"text":"second","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"finish_reason":"stop"}}'
+printf '%s\n' '{"id":2,"type":"token","chunk":{"index":0,"token_id":22,"text":"first"}}'
+printf '%s\n' '{"id":2,"type":"response","ok":true,"result":{"text":"first","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"finish_reason":"stop"}}'
+read shutdown
+"#
+            .replace("__FIRST_SEEN__", &first_seen.display().to_string());
+            write_fake_vllm_worker(&python, &model, &script);
+
+            let mut backend = VllmBackend::with_python(&python).unwrap();
+            let mut config = LoadConfig::vllm_safetensors(&model);
+            config.ctx_size = 4096;
+            config.vllm_max_num_seqs = Some(2);
+            config.vllm_concurrent_generation_capacity = Some(2);
+            config.backend_cache_dir = Some(root.join("cache"));
+            backend.load(config).unwrap();
+            assert_eq!(
+                backend.loaded_backend_evidence().unwrap(),
+                json!({
+                    "determinism": { "batch_invariant": false },
+                    "generation": {
+                        "capacity": 2,
+                        "concurrent": true,
+                        "runtime_kv_token_capacity": 12288,
+                        "runtime_full_context_capacity": 3,
+                    },
+                })
+            );
+            let concurrent = backend
+                .concurrent_generation_backend()
+                .expect("vLLM exposes concurrent generation");
+            assert_eq!(concurrent.capacity(), 2);
+
+            let first_backend = Arc::clone(&concurrent);
+            let first = thread::spawn(move || {
+                let mut chunks = Vec::new();
+                let output = first_backend
+                    .generate(
+                        GenerateRequest::new("first"),
+                        &mut |chunk| {
+                            chunks.push(chunk);
+                            Ok(())
+                        },
+                        &CancellationToken::new(),
+                    )
+                    .expect("first generation");
+                (output, chunks)
+            });
+            wait_for_test_path(&first_seen);
+
+            let second_backend = Arc::clone(&concurrent);
+            let second = thread::spawn(move || {
+                let mut chunks = Vec::new();
+                let output = second_backend
+                    .generate(
+                        GenerateRequest::new("second"),
+                        &mut |chunk| {
+                            chunks.push(chunk);
+                            Ok(())
+                        },
+                        &CancellationToken::new(),
+                    )
+                    .expect("second generation");
+                (output, chunks)
+            });
+
+            let (second_output, second_chunks) = second.join().expect("second thread");
+            let (first_output, first_chunks) = first.join().expect("first thread");
+            assert_eq!(first_output.text, "first");
+            assert_eq!(first_chunks.len(), 1);
+            assert_eq!(first_chunks[0].text, "first");
+            assert_eq!(second_output.text, "second");
+            assert_eq!(second_chunks.len(), 1);
+            assert_eq!(second_chunks[0].text, "second");
+
+            drop(concurrent);
+            drop(backend);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn vllm_concurrent_cancellation_targets_only_the_selected_request() {
+            let root = unique_test_root("vllm-cancel-isolated");
+            let python = root.join("bin/python");
+            let model = root.join("checkpoint/model.safetensors");
+            let first_seen = root.join("first-seen");
+            let second_seen = root.join("second-seen");
+            let cancel_request = root.join("cancel.json");
+            fs::create_dir_all(python.parent().expect("python parent")).unwrap();
+            fs::create_dir_all(model.parent().expect("model parent")).unwrap();
+            let script = r#"#!/bin/sh
+read load_request
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000,"kv_cache_size_tokens":8192}}'
+read first_generate
+: > "__FIRST_SEEN__"
+read second_generate
+: > "__SECOND_SEEN__"
+read cancel_request
+printf '%s\n' "$cancel_request" > "__CANCEL_REQUEST__"
+printf '%s\n' '{"id":3,"type":"token","chunk":{"index":0,"token_id":33,"text":"survivor"}}'
+printf '%s\n' '{"id":3,"type":"response","ok":true,"result":{"text":"survivor","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"finish_reason":"stop"}}'
+printf '%s\n' '{"id":2,"type":"response","ok":false,"cancelled":true,"error":"engine request cancelled"}'
+read shutdown
+"#
+            .replace("__FIRST_SEEN__", &first_seen.display().to_string())
+            .replace("__SECOND_SEEN__", &second_seen.display().to_string())
+            .replace("__CANCEL_REQUEST__", &cancel_request.display().to_string());
+            write_fake_vllm_worker(&python, &model, &script);
+
+            let mut backend = VllmBackend::with_python(&python).unwrap();
+            let mut config = LoadConfig::vllm_safetensors(&model);
+            config.ctx_size = 4096;
+            config.vllm_max_num_seqs = Some(2);
+            config.vllm_concurrent_generation_capacity = Some(2);
+            config.backend_cache_dir = Some(root.join("cache"));
+            backend.load(config).unwrap();
+            let concurrent = backend.concurrent_generation_backend().unwrap();
+
+            let first_cancellation = CancellationToken::new();
+            let first_thread_cancellation = first_cancellation.clone();
+            let first_backend = Arc::clone(&concurrent);
+            let first = thread::spawn(move || {
+                first_backend.generate(
+                    GenerateRequest::new("cancel me"),
+                    &mut |_| Ok(()),
+                    &first_thread_cancellation,
+                )
+            });
+            wait_for_test_path(&first_seen);
+
+            let second_backend = Arc::clone(&concurrent);
+            let second = thread::spawn(move || {
+                let mut chunks = Vec::new();
+                let output = second_backend
+                    .generate(
+                        GenerateRequest::new("keep me"),
+                        &mut |chunk| {
+                            chunks.push(chunk);
+                            Ok(())
+                        },
+                        &CancellationToken::new(),
+                    )
+                    .expect("uncancelled request completes");
+                (output, chunks)
+            });
+            wait_for_test_path(&second_seen);
+            first_cancellation.cancel();
+
+            let first_error = first
+                .join()
+                .expect("cancelled thread")
+                .expect_err("first request is cancelled");
+            let (second_output, second_chunks) = second.join().expect("surviving thread");
+            assert_eq!(first_error.to_string(), EngineError::Cancelled.to_string());
+            assert_eq!(second_output.text, "survivor");
+            assert_eq!(second_chunks.len(), 1);
+            assert_eq!(second_chunks[0].text, "survivor");
+            let cancel: Value =
+                serde_json::from_slice(&fs::read(&cancel_request).unwrap()).unwrap();
+            assert_eq!(cancel["op"], json!("cancel"));
+            assert_eq!(cancel["payload"]["request_id"], json!(2));
+
+            drop(concurrent);
+            drop(backend);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn vllm_default_capacity_keeps_public_generation_serial() {
+            let root = unique_test_root("vllm-capacity");
+            let python = root.join("bin/python");
+            let model = root.join("checkpoint/model.safetensors");
+            let first_seen = root.join("first-seen");
+            let second_seen = root.join("second-seen");
+            fs::create_dir_all(python.parent().expect("python parent")).unwrap();
+            fs::create_dir_all(model.parent().expect("model parent")).unwrap();
+            let script = r#"#!/bin/sh
+read load_request
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000,"determinism":{"batch_invariant":true}}}'
+read first_generate
+: > "__FIRST_SEEN__"
+sleep 1
+printf '%s\n' '{"id":2,"type":"response","ok":true,"result":{"text":"first","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"finish_reason":"stop"}}'
+read second_generate
+: > "__SECOND_SEEN__"
+printf '%s\n' '{"id":3,"type":"response","ok":true,"result":{"text":"second","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"finish_reason":"stop"}}'
+read shutdown
+"#
+            .replace("__FIRST_SEEN__", &first_seen.display().to_string())
+            .replace("__SECOND_SEEN__", &second_seen.display().to_string());
+            write_fake_vllm_worker(&python, &model, &script);
+
+            let mut backend = VllmBackend::with_python(&python).unwrap();
+            let mut config = LoadConfig::vllm_safetensors(&model);
+            config.ctx_size = 4096;
+            config.batch_size = 1;
+            config.backend_cache_dir = Some(root.join("cache"));
+            backend.load(config).unwrap();
+            assert!(backend.concurrent_generation_backend().is_none());
+            assert_eq!(
+                backend.loaded_backend_evidence().unwrap(),
+                json!({
+                    "determinism": { "batch_invariant": true },
+                    "generation": { "capacity": 1, "concurrent": false },
+                })
+            );
+            let concurrent = Arc::clone(
+                backend
+                    .concurrent_generation
+                    .as_ref()
+                    .expect("serial generation backend is loaded"),
+            );
+            assert_eq!(concurrent.capacity(), 1);
+
+            let first_backend = Arc::clone(&concurrent);
+            let first = thread::spawn(move || {
+                first_backend
+                    .generate(
+                        GenerateRequest::new("first"),
+                        &mut |_| Ok(()),
+                        &CancellationToken::new(),
+                    )
+                    .unwrap()
+            });
+            wait_for_test_path(&first_seen);
+            let second_backend = Arc::clone(&concurrent);
+            let second = thread::spawn(move || {
+                second_backend
+                    .generate(
+                        GenerateRequest::new("second"),
+                        &mut |_| Ok(()),
+                        &CancellationToken::new(),
+                    )
+                    .unwrap()
+            });
+            thread::sleep(Duration::from_millis(200));
+            assert!(
+                !second_seen.exists(),
+                "second request reached the worker before the sole permit was released"
+            );
+            assert_eq!(first.join().expect("first thread").text, "first");
+            assert_eq!(second.join().expect("second thread").text, "second");
+            assert!(second_seen.exists());
+
+            drop(concurrent);
+            drop(backend);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn vllm_runtime_kv_capacity_clamps_independent_generation() {
+            let root = unique_test_root("vllm-runtime-kv-clamp");
+            let python = root.join("bin/python");
+            let model = root.join("checkpoint/model.safetensors");
+            fs::create_dir_all(python.parent().expect("python parent")).unwrap();
+            fs::create_dir_all(model.parent().expect("model parent")).unwrap();
+            let script = r#"#!/bin/sh
+read load_request
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000,"kv_cache_size_tokens":6144}}'
+read shutdown
+"#;
+            write_fake_vllm_worker(&python, &model, script);
+
+            let mut backend = VllmBackend::with_python(&python).unwrap();
+            let mut config = LoadConfig::vllm_safetensors(&model);
+            config.ctx_size = 4096;
+            config.vllm_max_num_seqs = Some(2);
+            config.vllm_concurrent_generation_capacity = Some(2);
+            config.backend_cache_dir = Some(root.join("cache"));
+            backend.load(config).unwrap();
+
+            assert!(backend.concurrent_generation_backend().is_none());
+            assert_eq!(
+                backend.loaded_backend_evidence().unwrap(),
+                json!({
+                    "determinism": { "batch_invariant": null },
+                    "generation": {
+                        "capacity": 1,
+                        "concurrent": false,
+                        "runtime_kv_token_capacity": 6144,
+                        "runtime_full_context_capacity": 1,
+                    },
+                })
+            );
+
+            drop(backend);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn vllm_independent_generation_requires_runtime_kv_capacity() {
+            let root = unique_test_root("vllm-runtime-kv-required");
+            let python = root.join("bin/python");
+            let model = root.join("checkpoint/model.safetensors");
+            fs::create_dir_all(python.parent().expect("python parent")).unwrap();
+            fs::create_dir_all(model.parent().expect("model parent")).unwrap();
+            let script = r#"#!/bin/sh
+read load_request
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000}}'
+"#;
+            write_fake_vllm_worker(&python, &model, script);
+
+            let mut backend = VllmBackend::with_python(&python).unwrap();
+            let mut config = LoadConfig::vllm_safetensors(&model);
+            config.ctx_size = 4096;
+            config.vllm_max_num_seqs = Some(2);
+            config.vllm_concurrent_generation_capacity = Some(2);
+            config.backend_cache_dir = Some(root.join("cache"));
+            let error = backend
+                .load(config)
+                .expect_err("missing authoritative KV capacity must reject concurrency");
+            assert!(
+                error
+                    .to_string()
+                    .contains("did not report runtime KV token capacity"),
+                "{error}"
+            );
+
+            drop(backend);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
         fn vllm_load_payload_carries_capacity_knobs() {
+            let mut legacy = LoadConfig::vllm_safetensors("/tmp/checkpoint");
+            let legacy_payload = vllm_load_payload(&legacy, Path::new("/tmp/checkpoint"));
+            assert_eq!(
+                legacy_payload["max_batch_size"],
+                json!(super::super::DEFAULT_BATCH_SIZE)
+            );
+            legacy.batch_size = 7;
+            let legacy_payload = vllm_load_payload(&legacy, Path::new("/tmp/checkpoint"));
+            assert_eq!(legacy_payload["max_batch_size"], json!(7));
+
             let mut config = LoadConfig::vllm_safetensors("/tmp/checkpoint");
             config.ctx_size = 1024;
-            config.batch_size = 4;
+            config.vllm_max_num_seqs = Some(4);
             config.ubatch_size = 512;
             config.vllm_tensor_parallel = Some(2);
             config.vllm_dtype = Some("float16".to_owned());
+            config.vllm_kv_cache_dtype = Some("fp8".to_owned());
             config.vllm_gpu_memory_utilization_pct = Some(45);
 
             let payload = vllm_load_payload(&config, Path::new("/tmp/checkpoint"));
@@ -8836,6 +9969,7 @@ printf '%s\n' '{"id":3,"type":"response","ok":true,"result":{"text":"second","us
             assert_eq!(payload["max_num_tokens"], json!(512));
             assert_eq!(payload["tensor_parallel"], json!(2));
             assert_eq!(payload["dtype"], json!("float16"));
+            assert_eq!(payload["kv_cache_dtype"], json!("fp8"));
             assert_eq!(payload["gpu_memory_utilization"], json!(0.45));
 
             config.ctx_size = 131_072;
@@ -8949,6 +10083,37 @@ fi
             assert_eq!(parse_build_jobs("3"), Some(3));
             assert_eq!(parse_build_jobs("0"), None);
             assert_eq!(parse_build_jobs("many"), None);
+        }
+
+        fn unique_test_root(label: &str) -> PathBuf {
+            env::temp_dir().join(format!(
+                "mayhem-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock")
+                    .as_nanos()
+            ))
+        }
+
+        fn write_fake_vllm_worker(python: &Path, model: &Path, script: &str) {
+            fs::write(python, script).expect("fake vLLM worker");
+            fs::write(model, safetensors_fixture()).expect("model fixture");
+            let mut permissions = fs::metadata(python).expect("metadata").permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(python, permissions).expect("chmod fake worker");
+        }
+
+        fn wait_for_test_path(path: &Path) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !path.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {}",
+                    path.display()
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
         }
 
         fn safetensors_fixture() -> Vec<u8> {
@@ -10424,6 +11589,11 @@ mod tests {
     #[test]
     fn exposes_crate_name() {
         assert_eq!(CRATE_NAME, "mayhem-engine");
+    }
+
+    #[test]
+    fn engine_backends_remain_serial_unless_they_opt_into_concurrent_generation() {
+        assert!(EchoBackend.concurrent_generation_backend().is_none());
     }
 
     #[test]

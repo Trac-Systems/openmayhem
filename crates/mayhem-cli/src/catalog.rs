@@ -107,7 +107,28 @@ pub(crate) struct CatalogDocument {
     pub(crate) schema_version: u32,
     pub(crate) catalog_id: String,
     pub(crate) generated_at: String,
+    #[serde(default)]
+    pub(crate) generation_execution_profiles: BTreeMap<String, CatalogGenerationExecutionProfile>,
     pub(crate) models: Vec<CatalogModel>,
+}
+
+impl CatalogDocument {
+    pub(crate) fn generation_execution_profile(
+        &self,
+        artifact_root: &str,
+    ) -> Option<&CatalogGenerationExecutionProfile> {
+        self.generation_execution_profiles.get(artifact_root)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CatalogGenerationExecutionProfile {
+    pub(crate) schema_version: u32,
+    pub(crate) engine: String,
+    pub(crate) independent_dispatch: bool,
+    pub(crate) request_modalities: Vec<Vec<String>>,
+    pub(crate) proof_sha256: String,
 }
 
 /// The optional attestation authority carried inside the signed catalog bytes.
@@ -805,6 +826,118 @@ fn validate_catalog(catalog: &CatalogDocument, errors: &mut Vec<String>) {
     }
     if catalog.generated_at.trim().is_empty() {
         errors.push("generated_at is required".to_owned());
+    }
+    validate_generation_execution_profiles(catalog, errors);
+}
+
+fn validate_generation_execution_profiles(catalog: &CatalogDocument, errors: &mut Vec<String>) {
+    let mut primary_artifacts = BTreeMap::<&str, Vec<(&CatalogModel, &CatalogArtifact)>>::new();
+    for model in &catalog.models {
+        for artifact in model.artifacts.values() {
+            primary_artifacts
+                .entry(artifact.artifact_root.as_str())
+                .or_default()
+                .push((model, artifact));
+        }
+    }
+
+    for (artifact_root, profile) in &catalog.generation_execution_profiles {
+        let label = format!("generation_execution_profiles[{artifact_root}]");
+        if !is_lower_hex_len(artifact_root, 64) {
+            errors.push(format!("{label} key must be exact lowercase 32-byte hex"));
+        }
+        let bound_model = match primary_artifacts.get(artifact_root.as_str()) {
+            Some(bindings) if bindings.len() == 1 => {
+                let (model, artifact) = bindings[0];
+                if model.model_class != DEFAULT_MODEL_CLASS {
+                    errors.push(format!(
+                        "{label} is only valid for generation-capable text models"
+                    ));
+                }
+                if artifact.engine != profile.engine {
+                    errors.push(format!(
+                        "{label}.engine {} does not match bound artifact engine {}",
+                        profile.engine, artifact.engine
+                    ));
+                }
+                Some(model)
+            }
+            Some(bindings) => {
+                errors.push(format!(
+                    "{label} must resolve to exactly one primary catalog artifact root, found {}",
+                    bindings.len()
+                ));
+                None
+            }
+            None => {
+                errors.push(format!(
+                    "{label} references an unknown primary catalog artifact root"
+                ));
+                None
+            }
+        };
+        if profile.schema_version != 1 {
+            errors.push(format!("{label}.schema_version must be 1"));
+        }
+        if profile.engine != "vllm" {
+            errors.push(format!("{label}.engine must be vllm"));
+        }
+        if !profile.independent_dispatch {
+            errors.push(format!("{label}.independent_dispatch must be true"));
+        }
+        if !is_lower_hex_len(&profile.proof_sha256, 64) {
+            errors.push(format!(
+                "{label}.proof_sha256 must be exact lowercase 32-byte hex"
+            ));
+        }
+        if profile.request_modalities.is_empty() {
+            errors.push(format!(
+                "{label}.request_modalities must contain at least one modality set"
+            ));
+            continue;
+        }
+
+        let mut seen_sets = BTreeSet::new();
+        for (set_index, modality_set) in profile.request_modalities.iter().enumerate() {
+            let set_label = format!("{label}.request_modalities[{set_index}]");
+            if modality_set.is_empty() {
+                errors.push(format!("{set_label} must not be empty"));
+                continue;
+            }
+
+            let mut normalized = BTreeSet::new();
+            for modality in modality_set {
+                if !valid_adapter_modality(modality) || modality == "embedding" {
+                    errors.push(format!(
+                        "{set_label} contains unsupported generation modality {modality:?}"
+                    ));
+                }
+                if bound_model.is_some_and(|model| !model.adapter.modality_set.contains(modality)) {
+                    errors.push(format!(
+                        "{set_label} contains modality {modality} not served by the bound artifact's model"
+                    ));
+                }
+                if !normalized.insert(modality.clone()) {
+                    errors.push(format!("{set_label} duplicates modality {modality}"));
+                }
+            }
+            let normalized = normalized.into_iter().collect::<Vec<_>>();
+            if !normalized.iter().any(|modality| modality == "text") {
+                errors.push(format!(
+                    "{set_label} must include text for vLLM generation dispatch"
+                ));
+            }
+            if &normalized != modality_set {
+                errors.push(format!(
+                    "{set_label} must be a sorted, unique normalized modality set"
+                ));
+            }
+            if !seen_sets.insert(normalized) {
+                errors.push(format!(
+                    "{label}.request_modalities contains a duplicate modality set"
+                ));
+            }
+        }
     }
 }
 
@@ -4135,6 +4268,30 @@ fn validate_artifact_with_engine_policy(
                     ));
                 }
             }
+            "vllm" => {
+                let expected_bits = vllm_kv_cache_expected_bits(&profile.dtype);
+                match expected_bits {
+                    Some(bits) if bits == profile.bits => {}
+                    Some(bits) => errors.push(format!(
+                        "{model_id}/{name} vLLM KV-cache dtype {} requires bits={bits}, got {}",
+                        profile.dtype, profile.bits
+                    )),
+                    None => errors.push(format!(
+                        "{model_id}/{name} has unsupported vLLM KV-cache dtype {}",
+                        profile.dtype
+                    )),
+                }
+                if profile.group_size != 1 {
+                    errors.push(format!(
+                        "{model_id}/{name} vLLM KV-cache group_size must be 1"
+                    ));
+                }
+                if profile.quantized_start_tokens != 0 {
+                    errors.push(format!(
+                        "{model_id}/{name} vLLM KV-cache quantized_start_tokens must be 0"
+                    ));
+                }
+            }
             _ => errors.push(format!(
                 "{model_id}/{name} declares a KV-cache profile for unsupported engine {}",
                 artifact.engine
@@ -4483,6 +4640,25 @@ fn validate_needle_artifact(
                 "{model_id}/{name} Needle artifact has unapproved sidecar {sidecar_name}"
             ));
         }
+    }
+}
+
+fn vllm_kv_cache_expected_bits(dtype: &str) -> Option<u8> {
+    match dtype {
+        "float16" | "bfloat16" => Some(16),
+        "fp8"
+        | "fp8_e4m3"
+        | "fp8_e5m2"
+        | "fp8_inc"
+        | "fp8_ds_mla"
+        | "int8_per_token_head"
+        | "fp8_per_token_head" => Some(8),
+        "nvfp4" | "turboquant_4bit_nc" => Some(4),
+        "turboquant_3bit_nc" => Some(3),
+        // A signed profile must name one exact storage width. Runtime-selected
+        // `auto` and mixed-width TurboQuant layouts cannot be represented by
+        // CatalogKvCacheProfile::bits without making its memory claim ambiguous.
+        _ => None,
     }
 }
 
@@ -5173,6 +5349,13 @@ fn is_hex_len(value: &str, len: usize) -> bool {
     value.len() == len && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
 }
 
+fn is_lower_hex_len(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn hex_to_array<const N: usize>(value: &str) -> Result<[u8; N]> {
     let bytes = hex_to_vec(value)?;
     bytes
@@ -5206,6 +5389,37 @@ fn hex_nibble(byte: u8) -> Result<u8> {
 mod tests {
     use super::*;
     use ed25519_dalek::Signer;
+
+    fn repository_catalog() -> CatalogDocument {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../catalog/models.json");
+        let bytes = fs::read(&path)
+            .unwrap_or_else(|err| panic!("reading repository catalog {}: {err}", path.display()));
+        serde_json::from_slice(&bytes).expect("repository catalog must parse")
+    }
+
+    fn catalog_with_valid_generation_execution_profile() -> (CatalogDocument, String) {
+        let mut catalog = repository_catalog();
+        catalog.generation_execution_profiles.clear();
+        let artifact_root = catalog
+            .models
+            .iter()
+            .flat_map(|model| model.artifacts.values())
+            .find(|artifact| artifact.engine == "vllm")
+            .expect("repository catalog must contain a vLLM artifact")
+            .artifact_root
+            .clone();
+        catalog.generation_execution_profiles.insert(
+            artifact_root.clone(),
+            CatalogGenerationExecutionProfile {
+                schema_version: 1,
+                engine: "vllm".to_owned(),
+                independent_dispatch: true,
+                request_modalities: vec![vec!["text".to_owned()]],
+                proof_sha256: "a".repeat(64),
+            },
+        );
+        (catalog, artifact_root)
+    }
 
     fn test_video_av_fingerprint() -> String {
         let encoded = serde_json::to_vec(&serde_json::json!({
@@ -5268,6 +5482,193 @@ mod tests {
         assert_eq!(hex_to_vec("00ff").unwrap(), vec![0, 255]);
         assert!(hex_to_vec("0").is_err());
         assert!(hex_to_vec("zz").is_err());
+    }
+
+    #[test]
+    fn catalog_without_generation_execution_profiles_remains_compatible() {
+        let catalog: CatalogDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "catalog_id": "legacy",
+            "generated_at": "2026-09-02T00:00:00Z",
+            "models": [],
+            "future_top_level_field": {"ignored": true}
+        }))
+        .expect("legacy catalog must parse while retaining top-level extensibility");
+
+        assert!(catalog.generation_execution_profiles.is_empty());
+        let mut errors = Vec::new();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn generation_execution_profile_accepts_one_exact_bound_vllm_artifact() {
+        let (catalog, artifact_root) = catalog_with_valid_generation_execution_profile();
+
+        let mut errors = Vec::new();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+        assert_eq!(
+            catalog
+                .generation_execution_profile(&artifact_root)
+                .expect("profile must resolve")
+                .request_modalities,
+            vec![vec!["text".to_owned()]]
+        );
+    }
+
+    #[test]
+    fn generation_execution_profile_rejects_invalid_fixed_fields() {
+        let (mut catalog, artifact_root) = catalog_with_valid_generation_execution_profile();
+        let profile = catalog
+            .generation_execution_profiles
+            .get_mut(&artifact_root)
+            .expect("profile");
+        profile.schema_version = 2;
+        profile.engine = "llama.cpp".to_owned();
+        profile.independent_dispatch = false;
+        profile.proof_sha256 = "A".repeat(64);
+
+        let mut errors = Vec::new();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("schema_version must be 1")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("engine must be vllm")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("does not match bound artifact engine")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("independent_dispatch must be true")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("proof_sha256 must be exact lowercase")));
+    }
+
+    #[test]
+    fn generation_execution_profile_rejects_invalid_modality_sets() {
+        let (mut catalog, artifact_root) = catalog_with_valid_generation_execution_profile();
+        catalog
+            .generation_execution_profiles
+            .get_mut(&artifact_root)
+            .expect("profile")
+            .request_modalities = vec![
+            Vec::new(),
+            vec!["text".to_owned(), "image".to_owned()],
+            vec!["image".to_owned(), "text".to_owned()],
+            vec!["text".to_owned(), "text".to_owned()],
+            vec!["Text".to_owned()],
+            vec!["embedding".to_owned()],
+        ];
+
+        let mut errors = Vec::new();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("must not be empty")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("must be a sorted, unique normalized modality set")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("duplicate modality set")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("duplicates modality text")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unsupported generation modality \"Text\"")));
+        assert!(errors.iter().any(|error| {
+            error.contains("modality embedding not served by the bound artifact's model")
+        }));
+
+        catalog
+            .generation_execution_profiles
+            .get_mut(&artifact_root)
+            .expect("profile")
+            .request_modalities
+            .clear();
+        errors.clear();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("must contain at least one modality set")));
+    }
+
+    #[test]
+    fn generation_execution_profile_rejects_invalid_or_ambiguous_root_binding() {
+        let (mut catalog, artifact_root) = catalog_with_valid_generation_execution_profile();
+        let duplicate_model = catalog
+            .models
+            .iter()
+            .find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == artifact_root)
+            })
+            .expect("bound model")
+            .clone();
+        catalog.models.push(duplicate_model);
+
+        let mut errors = Vec::new();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors.iter().any(|error| error
+            .contains("must resolve to exactly one primary catalog artifact root, found 2")));
+
+        let profile = catalog
+            .generation_execution_profiles
+            .remove(&artifact_root)
+            .expect("profile");
+        let unknown_root = "0".repeat(64);
+        assert!(!catalog.models.iter().any(|model| model
+            .artifacts
+            .values()
+            .any(|artifact| artifact.artifact_root == unknown_root)));
+        catalog
+            .generation_execution_profiles
+            .insert(unknown_root, profile.clone());
+        errors.clear();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unknown primary catalog artifact root")));
+
+        catalog.generation_execution_profiles.clear();
+        catalog
+            .generation_execution_profiles
+            .insert("A".repeat(64), profile);
+        errors.clear();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("key must be exact lowercase")));
+    }
+
+    #[test]
+    fn generation_execution_profile_denies_unknown_value_fields() {
+        let error = serde_json::from_value::<CatalogDocument>(serde_json::json!({
+            "schema_version": 1,
+            "catalog_id": "strict-profile",
+            "generated_at": "2026-09-02T00:00:00Z",
+            "generation_execution_profiles": {
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+                    "schema_version": 1,
+                    "engine": "vllm",
+                    "independent_dispatch": true,
+                    "request_modalities": [["text"]],
+                    "proof_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "unexpected": true
+                }
+            },
+            "models": []
+        }))
+        .expect_err("profile value must deny unknown fields");
+
+        assert!(error.to_string().contains("unknown field `unexpected`"));
     }
 
     #[test]
@@ -6870,6 +7271,126 @@ mod tests {
         assert!(mlx_errors
             .iter()
             .any(|error| error.contains("requires bits=4")));
+
+        artifact.engine = "vllm".to_owned();
+        let profile = artifact.kv_cache.as_mut().expect("KV-cache profile");
+        profile.dtype = "fp8".to_owned();
+        profile.bits = 8;
+        profile.group_size = 1;
+        profile.quantized_start_tokens = 0;
+        artifact.min_compute_cap = Some("12.0".to_owned());
+        for (name, path) in [
+            ("vllm_config", "config.json"),
+            ("vllm_tokenizer_json", "tokenizer.json"),
+            ("vllm_tokenizer_config", "tokenizer_config.json"),
+        ] {
+            let mut sidecar = artifact.clone();
+            sidecar.path = path.to_owned();
+            artifact.sidecars.insert(
+                name.to_owned(),
+                CatalogArtifactSidecar {
+                    source: sidecar.source,
+                    upstream_source: None,
+                    path: sidecar.path,
+                    artifact_root: "d".repeat(64),
+                    artifact_root_kind: "blake3_merkle_v1".to_owned(),
+                    weights_bytes: 1,
+                    source_sha256: "e".repeat(64),
+                },
+            );
+        }
+        for (dtype, bits) in [
+            ("float16", 16),
+            ("bfloat16", 16),
+            ("fp8", 8),
+            ("fp8_e4m3", 8),
+            ("fp8_e5m2", 8),
+            ("fp8_inc", 8),
+            ("fp8_ds_mla", 8),
+            ("int8_per_token_head", 8),
+            ("fp8_per_token_head", 8),
+            ("nvfp4", 4),
+            ("turboquant_4bit_nc", 4),
+            ("turboquant_3bit_nc", 3),
+        ] {
+            let profile = artifact.kv_cache.as_mut().expect("KV-cache profile");
+            profile.dtype = dtype.to_owned();
+            profile.bits = bits;
+            let mut vllm_errors = Vec::new();
+            validate_artifact(
+                "admin/model",
+                "launch",
+                "nvfp4",
+                &artifact,
+                &mut vllm_errors,
+            );
+            assert!(vllm_errors.is_empty(), "{dtype}: {vllm_errors:#?}");
+        }
+
+        let profile = artifact.kv_cache.as_mut().expect("KV-cache profile");
+        profile.dtype = "float16".to_owned();
+        profile.bits = 8;
+        let mut wrong_bits_errors = Vec::new();
+        validate_artifact(
+            "admin/model",
+            "launch",
+            "nvfp4",
+            &artifact,
+            &mut wrong_bits_errors,
+        );
+        assert!(wrong_bits_errors
+            .iter()
+            .any(|error| error.contains("vLLM KV-cache dtype float16 requires bits=16")));
+
+        let profile = artifact.kv_cache.as_mut().expect("KV-cache profile");
+        profile.dtype = "auto".to_owned();
+        profile.bits = 16;
+        let mut ambiguous_dtype_errors = Vec::new();
+        validate_artifact(
+            "admin/model",
+            "launch",
+            "nvfp4",
+            &artifact,
+            &mut ambiguous_dtype_errors,
+        );
+        assert!(ambiguous_dtype_errors
+            .iter()
+            .any(|error| error.contains("unsupported vLLM KV-cache dtype auto")));
+
+        for dtype in ["turboquant_k8v4", "turboquant_k3v4_nc", "q4_0"] {
+            let profile = artifact.kv_cache.as_mut().expect("KV-cache profile");
+            profile.dtype = dtype.to_owned();
+            profile.bits = 4;
+            let mut unsupported_dtype_errors = Vec::new();
+            validate_artifact(
+                "admin/model",
+                "launch",
+                "nvfp4",
+                &artifact,
+                &mut unsupported_dtype_errors,
+            );
+            assert!(unsupported_dtype_errors
+                .iter()
+                .any(|error| error.contains(&format!("unsupported vLLM KV-cache dtype {dtype}"))));
+        }
+
+        let profile = artifact.kv_cache.as_mut().expect("KV-cache profile");
+        profile.dtype = "fp8".to_owned();
+        profile.bits = 8;
+        profile.group_size = 64;
+        let mut vllm_errors = Vec::new();
+        validate_artifact(
+            "admin/model",
+            "launch",
+            "nvfp4",
+            &artifact,
+            &mut vllm_errors,
+        );
+        assert!(vllm_errors
+            .iter()
+            .any(|error| error.contains("vLLM KV-cache group_size must be 1")));
+
+        artifact.sidecars.clear();
         artifact.kv_cache.as_mut().expect("KV-cache profile").bits = 4;
         artifact.engine = "llama.cpp".to_owned();
         artifact.kv_cache.as_mut().expect("KV-cache profile").dtype = "q4_0".to_owned();

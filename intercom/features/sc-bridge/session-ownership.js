@@ -18,6 +18,14 @@ export const disownSession = (sessions, remote, sessionId) => {
   sessions.delete(sessionOwnershipKey(remote, sessionId));
 };
 
+export const transferSessionOwnership = (clients, target, remote, sessionId) => {
+  const key = sessionOwnershipKey(remote, sessionId);
+  for (const client of clients) {
+    if (client !== target) client.directSessions?.delete(key);
+  }
+  ownSession(target.directSessions, remote, sessionId);
+};
+
 export const closeOwnedSessions = (sessions, close) => {
   for (const session of sessions.values()) {
     try {

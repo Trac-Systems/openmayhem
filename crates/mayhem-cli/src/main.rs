@@ -28,7 +28,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Once,
+    Arc, Mutex, Once,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -68,9 +68,9 @@ use mayhem_enclave::{
 use mayhem_engine::ComfyUiBackend;
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, CancellationToken,
-    ComfyUiCustomNodePackage, ComfyUiModelFile, EngineBackend, EngineError, GenerateRequest,
-    GenerateSpecialityParameter, GenerateSpecialityTarget, GrammarSpec,
-    ImageGenerationRequest as EngineImageGenerationRequest, LoadConfig,
+    ComfyUiCustomNodePackage, ComfyUiModelFile, ConcurrentGenerationBackend, EngineBackend,
+    EngineError, GenerateRequest, GenerateSpecialityParameter, GenerateSpecialityTarget,
+    GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest, LoadConfig,
     MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
     SpeechReferenceAudio, SpeechRequest, TokenChunk, ToolSpec, WorkflowGenerationRequest,
     WorkflowInputFile, MTMD_MEDIA_MARKER,
@@ -3380,6 +3380,22 @@ struct CatalogCalibrateCanaryArgs {
     #[arg(long, value_name = "PCT")]
     vllm_memory_utilization_floor: Option<u32>,
 
+    /// vLLM model dtype used by calibration, e.g. bfloat16.
+    #[arg(long)]
+    vllm_dtype: Option<String>,
+
+    /// vLLM KV-cache dtype used by calibration, e.g. fp8.
+    #[arg(long)]
+    vllm_kv_cache_dtype: Option<String>,
+
+    /// vLLM concurrent sequence capacity used by calibration.
+    #[arg(long)]
+    vllm_max_num_seqs: Option<u32>,
+
+    /// vLLM prefill-token batch ceiling used by calibration.
+    #[arg(long)]
+    vllm_max_num_batched_tokens: Option<u32>,
+
     /// Print a machine-readable calibration report.
     #[arg(long)]
     json: bool,
@@ -3505,6 +3521,22 @@ struct CatalogCanaryPlanArgs {
     /// Lowest vLLM memory percentage attempted by printed calibration commands.
     #[arg(long, value_name = "PCT")]
     vllm_memory_utilization_floor: Option<u32>,
+
+    /// vLLM model dtype for printed calibration commands.
+    #[arg(long)]
+    vllm_dtype: Option<String>,
+
+    /// vLLM KV-cache dtype for printed calibration commands.
+    #[arg(long)]
+    vllm_kv_cache_dtype: Option<String>,
+
+    /// vLLM concurrent sequence capacity for printed calibration commands.
+    #[arg(long)]
+    vllm_max_num_seqs: Option<u32>,
+
+    /// vLLM prefill-token batch ceiling for printed calibration commands.
+    #[arg(long)]
+    vllm_max_num_batched_tokens: Option<u32>,
 
     /// Include dev-tier models in addition to launch-tier models.
     #[arg(long)]
@@ -10784,6 +10816,47 @@ fn catalog_models_by_id(path: &Path) -> Result<BTreeMap<String, Value>> {
     Ok(by_id)
 }
 
+fn catalog_artifact_root_owners(document: &Value) -> BTreeMap<String, BTreeSet<String>> {
+    let mut owners = BTreeMap::<String, BTreeSet<String>>::new();
+    for model in document
+        .get("models")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(model_id) = model.get("model_id").and_then(Value::as_str) else {
+            continue;
+        };
+        for artifact in model
+            .get("artifacts")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|artifacts| artifacts.values())
+        {
+            if let Some(root) = artifact.get("artifact_root").and_then(Value::as_str) {
+                owners
+                    .entry(root.to_owned())
+                    .or_default()
+                    .insert(model_id.to_owned());
+            }
+        }
+    }
+    owners
+}
+
+fn catalog_generation_execution_profiles(document: &Value) -> BTreeMap<String, Value> {
+    document
+        .get("generation_execution_profiles")
+        .and_then(Value::as_object)
+        .map(|profiles| {
+            profiles
+                .iter()
+                .map(|(root, profile)| (root.clone(), profile.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn validate_additive_catalog_update(
     base_path: &Path,
     candidate_path: &Path,
@@ -10827,6 +10900,34 @@ fn validate_additive_catalog_update(
         changed.is_empty(),
         "catalog signing refuses unapproved changes to existing model(s): {}; review and repeat --allow-model-change for each intentional update",
         changed.join(", ")
+    );
+
+    let base_profiles = catalog_generation_execution_profiles(&base_document);
+    let candidate_profiles = catalog_generation_execution_profiles(&candidate_document);
+    let base_root_owners = catalog_artifact_root_owners(&base_document);
+    let candidate_root_owners = catalog_artifact_root_owners(&candidate_document);
+    let mut unapproved_execution_profile_changes = BTreeSet::new();
+    for root in base_profiles.keys().chain(candidate_profiles.keys()) {
+        if base_profiles.get(root) == candidate_profiles.get(root) {
+            continue;
+        }
+        let owners = base_root_owners
+            .get(root)
+            .or_else(|| candidate_root_owners.get(root));
+        let authorized = owners.is_some_and(|owners| {
+            owners.len() == 1
+                && owners.iter().all(|model_id| {
+                    !base.contains_key(model_id) || allowed_model_changes.contains(model_id)
+                })
+        });
+        if !authorized {
+            unapproved_execution_profile_changes.insert(root.clone());
+        }
+    }
+    ensure!(
+        unapproved_execution_profile_changes.is_empty(),
+        "catalog signing refuses unapproved generation execution profile changes for artifact root(s): {}; add profiles only with new models or explicitly review the owning existing model with --allow-model-change",
+        unapproved_execution_profile_changes.into_iter().collect::<Vec<_>>().join(", ")
     );
 
     let changed_authority_fields = ["attestation_policy_chain", "enclave_attestation_bindings"]
@@ -10965,6 +11066,39 @@ fn validate_catalog_signing_document(catalog_bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn validate_catalog_signing_semantics(
+    catalog_path: &Path,
+    detached: &CatalogDetachedSignature,
+    key_id: &str,
+    public_key: &str,
+) -> Result<()> {
+    let work_dir = temp_work_dir("mayhem-catalog-signing-preflight")?;
+    let signature_path = work_dir.join("catalog.json.sig");
+    let keys_dir = work_dir.join("keys");
+    let validation_result = (|| {
+        fs::create_dir_all(&keys_dir)
+            .with_context(|| format!("creating {}", keys_dir.display()))?;
+        write_json_file(&signature_path, detached)?;
+        write_json_file(
+            &keys_dir.join(format!("{key_id}.json")),
+            &CatalogPublicKeyRecord {
+                key_id: key_id.to_owned(),
+                alg: "ed25519".to_owned(),
+                public_key: public_key.to_owned(),
+                status: "active".to_owned(),
+                created_at: "catalog-signing-semantic-preflight".to_owned(),
+            },
+        )?;
+        catalog::verify_signed_catalog_base(catalog_path, &signature_path, &keys_dir)
+            .map(|_| ())
+            .context("catalog semantic validation failed")
+    })();
+    let cleanup_result = fs::remove_dir_all(&work_dir)
+        .with_context(|| format!("removing catalog signing preflight {}", work_dir.display()));
+    validation_result?;
+    cleanup_result
+}
+
 fn catalog_sign_report(request: CatalogSignRequest) -> Result<CatalogSignReport> {
     validate_catalog_key_id(&request.key_id)?;
     let catalog_bytes = fs::read(&request.catalog_path)
@@ -10993,6 +11127,14 @@ fn catalog_sign_report(request: CatalogSignRequest) -> Result<CatalogSignReport>
         blake3: blake3.clone(),
         sig: hex_encode(&signature.to_bytes()),
     };
+
+    validate_catalog_signing_semantics(
+        &request.catalog_path,
+        &detached,
+        &request.key_id,
+        &public_key,
+    )
+    .context("refusing to sign a semantically invalid catalog")?;
 
     let mut key_path = None;
     let mut key_written = false;
@@ -18982,6 +19124,26 @@ fn verify_calibration_sidecars_match_catalog(
             );
         }
     }
+    if artifact.engine == "vllm" {
+        for (required, filename) in VLLM_REQUIRED_SIDECARS {
+            let sidecar = artifact.sidecars.get(*required).with_context(|| {
+                format!("vLLM calibration requires admin catalog sidecar {required}")
+            })?;
+            ensure!(
+                sidecar.path == *filename,
+                "vLLM sidecar {required} must use path {filename}, got {}",
+                sidecar.path
+            );
+        }
+        ensure!(
+            paths.len() == artifact.sidecars.len()
+                && artifact
+                    .sidecars
+                    .keys()
+                    .all(|name| paths.contains_key(name)),
+            "vLLM calibration requires every admin-signed checkpoint shard and sidecar and no extras"
+        );
+    }
     if needle_device_for_engine(&artifact.engine).is_some() {
         ensure!(
             needle_source_binds_canonical_upstream(
@@ -19137,6 +19299,27 @@ fn validate_calibration_args_for_artifact(
         .vllm_memory_utilization_floor
         .map(validate_provider_vllm_memory_utilization_pct)
         .transpose()?;
+    let has_vllm_runtime_options = args.vllm_dtype.is_some()
+        || args.vllm_kv_cache_dtype.is_some()
+        || args.vllm_max_num_seqs.is_some()
+        || args.vllm_max_num_batched_tokens.is_some();
+    for (name, value) in [
+        ("--vllm-dtype", args.vllm_dtype.as_deref()),
+        ("--vllm-kv-cache-dtype", args.vllm_kv_cache_dtype.as_deref()),
+    ] {
+        if let Some(value) = value {
+            ensure!(!value.trim().is_empty(), "{name} must not be empty");
+        }
+    }
+    if let Some(value) = args.vllm_max_num_seqs {
+        ensure!(value > 0, "--vllm-max-num-seqs must be greater than zero");
+    }
+    if let Some(value) = args.vllm_max_num_batched_tokens {
+        ensure!(
+            value > 0,
+            "--vllm-max-num-batched-tokens must be greater than zero"
+        );
+    }
     let has_trt_options = args.trt_engine_dir.is_some()
         || args.trt_require_engine_dir
         || args.trt_tensor_parallel.is_some()
@@ -19153,8 +19336,8 @@ fn validate_calibration_args_for_artifact(
     }
     if artifact.engine == "trt-llm" {
         ensure!(
-            vllm_target.is_none() && vllm_floor.is_none(),
-            "vLLM memory calibration options require a vllm artifact"
+            vllm_target.is_none() && vllm_floor.is_none() && !has_vllm_runtime_options,
+            "vLLM calibration options require a vllm artifact"
         );
         return Ok(());
     }
@@ -19167,6 +19350,14 @@ fn validate_calibration_args_for_artifact(
                 "TensorRT engine/KV-cache calibration options require a trt-llm artifact, got vllm"
             );
         }
+        ensure!(
+            args.vllm_max_num_seqs.is_none() || args.trt_max_batch_size.is_none(),
+            "--vllm-max-num-seqs conflicts with legacy --trt-max-batch-size on a vllm artifact"
+        );
+        ensure!(
+            args.vllm_max_num_batched_tokens.is_none() || args.trt_max_num_tokens.is_none(),
+            "--vllm-max-num-batched-tokens conflicts with legacy --trt-max-num-tokens on a vllm artifact"
+        );
         return Ok(());
     }
     if has_trt_options {
@@ -19175,9 +19366,9 @@ fn validate_calibration_args_for_artifact(
             artifact.engine
         );
     }
-    if vllm_target.is_some() || vllm_floor.is_some() {
+    if vllm_target.is_some() || vllm_floor.is_some() || has_vllm_runtime_options {
         bail!(
-            "vLLM memory calibration options require a vllm artifact, got {}",
+            "vLLM calibration options require a vllm artifact, got {}",
             artifact.engine
         );
     }
@@ -19734,6 +19925,18 @@ fn catalog_canary_runtime_config(
             .flatten(),
         vllm_memory_utilization_floor_pct: (artifact.engine == "vllm")
             .then_some(args.vllm_memory_utilization_floor)
+            .flatten(),
+        vllm_dtype: (artifact.engine == "vllm")
+            .then_some(args.vllm_dtype.clone())
+            .flatten(),
+        vllm_kv_cache_dtype: (artifact.engine == "vllm")
+            .then_some(args.vllm_kv_cache_dtype.clone())
+            .flatten(),
+        vllm_max_num_seqs: (artifact.engine == "vllm")
+            .then(|| args.vllm_max_num_seqs.or(args.trt_max_batch_size))
+            .flatten(),
+        vllm_max_num_batched_tokens: (artifact.engine == "vllm")
+            .then_some(args.vllm_max_num_batched_tokens)
             .flatten(),
     })
 }
@@ -22659,6 +22862,22 @@ fn catalog_canary_calibration_plan_command(
         }
     }
     if artifact.engine == "vllm" {
+        if let Some(dtype) = &args.vllm_dtype {
+            push_plan_value_arg(&mut argv, "--vllm-dtype", dtype);
+        }
+        if let Some(kv_cache_dtype) = &args.vllm_kv_cache_dtype {
+            push_plan_value_arg(&mut argv, "--vllm-kv-cache-dtype", kv_cache_dtype);
+        }
+        if let Some(max_num_seqs) = args.vllm_max_num_seqs {
+            push_plan_value_arg(&mut argv, "--vllm-max-num-seqs", max_num_seqs.to_string());
+        }
+        if let Some(max_num_batched_tokens) = args.vllm_max_num_batched_tokens {
+            push_plan_value_arg(
+                &mut argv,
+                "--vllm-max-num-batched-tokens",
+                max_num_batched_tokens.to_string(),
+            );
+        }
         if let Some(target) = args.vllm_memory_utilization {
             push_plan_value_arg(&mut argv, "--vllm-memory-utilization", target.to_string());
         }
@@ -23657,6 +23876,18 @@ fn catalog_calibration_backend(
             cache_dir,
         )?;
         materialized_artifact_path.as_path()
+    } else if artifact.engine == "vllm" {
+        let paths = ProviderArtifactPaths {
+            primary: artifact_path.to_path_buf(),
+            sidecars: sidecar_paths.clone(),
+        };
+        materialized_artifact_path = materialize_vllm_layout(
+            &format!("{}/{}", artifact.source.repo, artifact.path),
+            &args.artifact,
+            artifact,
+            &paths,
+        )?;
+        materialized_artifact_path.as_path()
     } else {
         artifact_path
     };
@@ -23699,6 +23930,24 @@ fn catalog_calibration_backend(
     if artifact.engine == "vllm" {
         config.vllm_gpu_memory_utilization_pct = args.vllm_memory_utilization;
         config.vllm_gpu_memory_utilization_floor_pct = args.vllm_memory_utilization_floor;
+        config.vllm_dtype = args.vllm_dtype.clone();
+        let signed_kv_cache_dtype = artifact
+            .kv_cache
+            .as_ref()
+            .map(|profile| profile.dtype.clone());
+        if let Some(requested) = args.vllm_kv_cache_dtype.as_deref() {
+            ensure!(
+                signed_kv_cache_dtype.as_deref() == Some(requested),
+                "--vllm-kv-cache-dtype must match the admin-signed artifact KV-cache profile"
+            );
+        }
+        config.vllm_kv_cache_dtype = signed_kv_cache_dtype;
+        if let Some(max_num_seqs) = args.vllm_max_num_seqs.or(args.trt_max_batch_size) {
+            config.vllm_max_num_seqs = Some(max_num_seqs);
+        }
+        if let Some(max_num_batched_tokens) = args.vllm_max_num_batched_tokens {
+            config.ubatch_size = max_num_batched_tokens;
+        }
     }
     if artifact.engine == "sulphur" {
         bind_sulphur_primary_hash_path(&mut config.artifact, artifact)?;
@@ -45765,6 +46014,14 @@ struct CatalogCanaryRuntimeConfig {
     trt_max_num_tokens: Option<u32>,
     vllm_memory_utilization_pct: Option<u32>,
     vllm_memory_utilization_floor_pct: Option<u32>,
+    #[serde(default)]
+    vllm_dtype: Option<String>,
+    #[serde(default)]
+    vllm_kv_cache_dtype: Option<String>,
+    #[serde(default)]
+    vllm_max_num_seqs: Option<u32>,
+    #[serde(default)]
+    vllm_max_num_batched_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -57700,6 +57957,8 @@ struct ProviderCandidate {
     model: catalog::CatalogModel,
     artifact_name: String,
     artifact: catalog::CatalogArtifact,
+    generation_execution_profile: Option<catalog::CatalogGenerationExecutionProfile>,
+    generation_execution_capacity: u32,
     verdict: BackendVerdict,
     price: Option<LedgerPriceSchedule>,
     served_ctx: u64,
@@ -58053,6 +58312,7 @@ impl ProviderLoadSnapshot {
 #[derive(Clone, Debug)]
 struct ProviderHeartbeatLoad {
     active_slots: Arc<AtomicU64>,
+    exclusive_session_active: Arc<AtomicBool>,
     active_requests: Arc<AtomicU64>,
     rolling_turn_ms: Arc<AtomicU64>,
     rolling_ttft_ms: Arc<AtomicU64>,
@@ -58069,6 +58329,7 @@ impl Default for ProviderHeartbeatLoad {
         let (changes, _) = tokio::sync::watch::channel(0);
         Self {
             active_slots: Arc::new(AtomicU64::new(0)),
+            exclusive_session_active: Arc::new(AtomicBool::new(false)),
             active_requests: Arc::new(AtomicU64::new(0)),
             rolling_turn_ms: Arc::new(AtomicU64::new(0)),
             rolling_ttft_ms: Arc::new(AtomicU64::new(0)),
@@ -58105,6 +58366,7 @@ impl ProviderHeartbeatLoad {
 
     fn snapshot(&self, max_sessions: u32) -> ProviderLoadSnapshot {
         let active_slots = self.active_slots.load(Ordering::Relaxed);
+        let exclusive_session_active = self.exclusive_session_active.load(Ordering::Acquire);
         let active_requests = self.active_requests.load(Ordering::Relaxed);
         let session_capacity = u64::from(max_sessions);
         let modality_active_items = self
@@ -58123,7 +58385,7 @@ impl ProviderHeartbeatLoad {
                 .is_some_and(|limit| *limit > 0 && u64::from(*active) >= *limit)
         });
         let session_at_capacity = max_sessions > 0 && active_slots >= session_capacity;
-        let free_slots = if modality_at_capacity {
+        let free_slots = if modality_at_capacity || exclusive_session_active {
             0
         } else {
             session_capacity.saturating_sub(active_slots)
@@ -58149,17 +58411,51 @@ impl ProviderHeartbeatLoad {
             measured_tok_s_milli,
             accepting_new: self.accepting_new.load(Ordering::Relaxed)
                 && !session_at_capacity
-                && !modality_at_capacity,
+                && !modality_at_capacity
+                && !exclusive_session_active,
             modality_at_capacity,
             modality_active_items,
         }
     }
 
-    fn set_active_sessions(&self, sessions: usize) {
-        let active = u64::try_from(sessions).unwrap_or(u64::MAX);
-        if self.active_slots.swap(active, Ordering::AcqRel) != active {
+    fn set_active_sessions(
+        &self,
+        sessions: &HashMap<String, ActiveProviderSession>,
+        terms: &ProviderSessionTerms,
+    ) {
+        let active = u64::try_from(sessions.len()).unwrap_or(u64::MAX);
+        let exclusive = sessions
+            .values()
+            .any(|session| !provider_session_allows_independent_dispatch(terms, session));
+        let (active_changed, exclusive_changed) = if exclusive {
+            let exclusive_changed = !self.exclusive_session_active.swap(true, Ordering::AcqRel);
+            let active_changed = self.active_slots.swap(active, Ordering::AcqRel) != active;
+            (active_changed, exclusive_changed)
+        } else {
+            let active_changed = self.active_slots.swap(active, Ordering::AcqRel) != active;
+            let exclusive_changed = self.exclusive_session_active.swap(false, Ordering::AcqRel);
+            (active_changed, exclusive_changed)
+        };
+        if active_changed || exclusive_changed {
             self.notify_change();
         }
+    }
+
+    #[cfg(test)]
+    fn set_independent_session_count(&self, sessions: usize) {
+        let active = u64::try_from(sessions).unwrap_or(u64::MAX);
+        let active_changed = self.active_slots.swap(active, Ordering::AcqRel) != active;
+        let exclusive_changed = self.exclusive_session_active.swap(false, Ordering::AcqRel);
+        if active_changed || exclusive_changed {
+            self.notify_change();
+        }
+    }
+
+    fn with_isolated_session_counter(&self) -> Self {
+        let mut isolated = self.clone();
+        isolated.active_slots = Arc::new(AtomicU64::new(1));
+        isolated.exclusive_session_active = Arc::new(AtomicBool::new(false));
+        isolated
     }
 
     fn begin_request(
@@ -58234,6 +58530,7 @@ impl ProviderHeartbeatLoad {
 
     fn is_accepting_new(&self) -> bool {
         self.accepting_new.load(Ordering::Relaxed)
+            && !self.exclusive_session_active.load(Ordering::Acquire)
     }
 
     fn finish_request(&self, modality_items: &BTreeMap<String, u32>) {
@@ -58450,6 +58747,14 @@ impl ProviderProtectionState {
             self.accepted_at.pop_front();
         }
     }
+}
+
+fn lock_provider_protection(
+    protection: &Arc<Mutex<ProviderProtectionState>>,
+) -> std::sync::MutexGuard<'_, ProviderProtectionState> {
+    protection
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Debug)]
@@ -59927,6 +60232,7 @@ struct ProviderSessionTerms {
     enclave_id: String,
     model_id: String,
     adapter: catalog::CatalogAdapter,
+    generation_execution_profile: Option<catalog::CatalogGenerationExecutionProfile>,
     sampling: catalog::CatalogSamplingProfile,
     workflow_policy: Option<mayhem_proto::ComfyWorkflowCatalogPolicy>,
     output_modalities: Vec<String>,
@@ -59973,6 +60279,9 @@ trait ProviderSessionResponder {
     }
     fn process_ids(&self) -> Vec<u32> {
         Vec::new()
+    }
+    fn concurrent_generation_backend(&self) -> Option<Arc<dyn ConcurrentGenerationBackend>> {
+        None
     }
     fn respond(
         &mut self,
@@ -60045,6 +60354,18 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
         true
     }
 
+    fn concurrent_session_capacity(&self) -> u32 {
+        self.backend
+            .concurrent_generation_backend()
+            .map(|backend| u32::try_from(backend.capacity()).unwrap_or(u32::MAX))
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    fn concurrent_generation_backend(&self) -> Option<Arc<dyn ConcurrentGenerationBackend>> {
+        self.backend.concurrent_generation_backend()
+    }
+
     fn component_healthy(&mut self) -> bool {
         self.backend.component_healthy()
     }
@@ -60080,6 +60401,105 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
     ) -> Result<ProviderSessionOutput> {
         provider_engine_session_response_with_sampling(
             self.backend.as_mut(),
+            Some(&terms.model_id),
+            &terms.adapter,
+            &terms.sampling,
+            terms.workflow_policy.as_ref(),
+            body,
+            stream,
+            cancellation,
+        )
+    }
+}
+
+struct ConcurrentGenerationEngineBackend {
+    backend: Arc<dyn ConcurrentGenerationBackend>,
+}
+
+impl EngineBackend for ConcurrentGenerationEngineBackend {
+    fn backend_id(&self) -> &'static str {
+        "vllm"
+    }
+
+    fn load(
+        &mut self,
+        _config: LoadConfig,
+    ) -> mayhem_engine::Result<mayhem_engine::LoadedModelInfo> {
+        Err(EngineError::InvalidConfig(
+            "concurrent vLLM request handles cannot load models".to_owned(),
+        ))
+    }
+
+    fn tokenize(&self, _text: &str) -> mayhem_engine::Result<mayhem_engine::Tokenization> {
+        Err(EngineError::InvalidConfig(
+            "concurrent vLLM request handles cannot tokenize outside generation".to_owned(),
+        ))
+    }
+
+    fn generate(
+        &mut self,
+        request: GenerateRequest,
+        sink: &mut dyn mayhem_engine::TokenSink,
+        cancellation: &CancellationToken,
+    ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
+        self.backend.generate(request, sink, cancellation)
+    }
+}
+
+struct ConcurrentEngineProviderSessionResponder {
+    backend: ConcurrentGenerationEngineBackend,
+}
+
+impl ConcurrentEngineProviderSessionResponder {
+    fn new(backend: Arc<dyn ConcurrentGenerationBackend>) -> Self {
+        Self {
+            backend: ConcurrentGenerationEngineBackend { backend },
+        }
+    }
+}
+
+impl ProviderSessionResponder for ConcurrentEngineProviderSessionResponder {
+    fn mode(&self) -> &'static str {
+        "mayhem-engine-vllm-concurrent"
+    }
+
+    fn concurrent_session_capacity(&self) -> u32 {
+        u32::try_from(self.backend.backend.capacity())
+            .unwrap_or(u32::MAX)
+            .max(1)
+    }
+
+    fn supports_live_text_streaming(&self) -> bool {
+        true
+    }
+
+    fn respond(
+        &mut self,
+        terms: &ProviderSessionTerms,
+        body: &Value,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderSessionOutput> {
+        provider_engine_session_response_with_sampling(
+            &mut self.backend,
+            Some(&terms.model_id),
+            &terms.adapter,
+            &terms.sampling,
+            terms.workflow_policy.as_ref(),
+            body,
+            None,
+            cancellation,
+        )
+    }
+
+    fn respond_streaming(
+        &mut self,
+        terms: &ProviderSessionTerms,
+        body: &Value,
+        stream: Option<&mut ProviderSessionLiveStream<'_>>,
+        cancellation: &CancellationToken,
+    ) -> Result<ProviderSessionOutput> {
+        provider_engine_session_response_with_sampling(
+            &mut self.backend,
             Some(&terms.model_id),
             &terms.adapter,
             &terms.sampling,
@@ -60155,19 +60575,22 @@ impl ProviderEngineRecovery {
     }
 }
 
-fn provider_engine_component_failure(
-    responder: &mut dyn ProviderSessionResponder,
-    error: &anyhow::Error,
-) -> Option<String> {
+fn provider_engine_component_failure<R>(responder: &mut R, error: &anyhow::Error) -> Option<String>
+where
+    R: ProviderSessionResponder + ?Sized,
+{
     let reason = format!("{error:#}");
     (reason.contains("provider engine panicked") || !responder.component_healthy())
         .then_some(reason)
 }
 
-fn provider_engine_component_failure_after_cancel(
-    responder: &mut dyn ProviderSessionResponder,
+fn provider_engine_component_failure_after_cancel<R>(
+    responder: &mut R,
     error: &anyhow::Error,
-) -> Option<String> {
+) -> Option<String>
+where
+    R: ProviderSessionResponder + ?Sized,
+{
     let reason = format!("{error:#}");
     if reason.contains(PROVIDER_ENGINE_REQUEST_CANCELLED)
         && !reason.contains("provider engine panicked")
@@ -71588,6 +72011,94 @@ fn enclave_max_batch_size(caps: &Value) -> Result<Option<u32>> {
     }
 }
 
+fn provider_vllm_generation_execution_capacity(
+    artifact: &catalog::CatalogArtifact,
+    profile: Option<&catalog::CatalogGenerationExecutionProfile>,
+    caps: &Value,
+    verdict: &BackendVerdict,
+    args: &ProviderStartArgs,
+    feasibility: &ProviderCtxFeasibility,
+) -> Result<u32> {
+    let Some(profile) = profile else {
+        return Ok(1);
+    };
+    ensure!(
+        artifact.engine == "vllm" && profile.engine == artifact.engine,
+        "generation execution profiles only authorize their exact vLLM artifact"
+    );
+    ensure!(
+        profile.independent_dispatch,
+        "generation execution profile does not authorize independent dispatch"
+    );
+
+    let provider_capacity = args
+        .max_sessions
+        .unwrap_or(verdict.max_sessions)
+        .min(verdict.max_sessions)
+        .max(1);
+    // A signed max_batch_size is an optional artifact ceiling, not a default
+    // hardware limit. Profiled vLLM artifacts without one scale to the local
+    // provider's proven memory and hwprobe capacity.
+    let scheduler_capacity = enclave_max_batch_size(caps)?
+        .unwrap_or(provider_capacity)
+        .max(1);
+    let static_bytes = feasibility
+        .estimated_required_bytes
+        .saturating_sub(feasibility.estimated_kv_bytes);
+    let memory_capacity = if feasibility.estimated_kv_bytes == 0 {
+        u32::MAX
+    } else {
+        u32::try_from(
+            feasibility
+                .memory_budget
+                .budget_bytes
+                .saturating_sub(static_bytes)
+                / feasibility.estimated_kv_bytes,
+        )
+        .unwrap_or(u32::MAX)
+        .max(1)
+    };
+    Ok(scheduler_capacity
+        .min(provider_capacity)
+        .min(memory_capacity)
+        .max(1))
+}
+
+fn reserve_provider_generation_execution_memory(
+    feasibility: &mut ProviderCtxFeasibility,
+    capacity: u32,
+) -> Result<()> {
+    let capacity = u64::from(capacity.max(1));
+    let total_kv_bytes = feasibility.estimated_kv_bytes.saturating_mul(capacity);
+    let additional_kv_bytes = total_kv_bytes.saturating_sub(feasibility.estimated_kv_bytes);
+    let required_bytes = feasibility
+        .estimated_required_bytes
+        .saturating_add(additional_kv_bytes);
+    ensure!(
+        required_bytes <= feasibility.memory_budget.budget_bytes,
+        "independent generation capacity {capacity} requires {}, exceeding the usable memory budget {}",
+        human_bytes(required_bytes),
+        human_bytes(feasibility.memory_budget.budget_bytes)
+    );
+    feasibility.estimated_kv_bytes = total_kv_bytes;
+    feasibility.estimated_required_bytes = required_bytes;
+    Ok(())
+}
+
+fn generation_execution_profile_allows_modalities(
+    profile: Option<&catalog::CatalogGenerationExecutionProfile>,
+    requested: &[String],
+) -> bool {
+    let Some(profile) = profile else {
+        return false;
+    };
+    let requested = requested.iter().cloned().collect::<BTreeSet<_>>();
+    profile
+        .request_modalities
+        .iter()
+        .any(|allowed| allowed.iter().cloned().collect::<BTreeSet<_>>() == requested)
+}
+
 fn enclave_max_num_tokens(caps: &Value) -> Result<Option<u32>> {
     match caps.get("max_num_tokens") {
         None => Ok(None),
@@ -72915,6 +73426,9 @@ fn build_provider_candidates(
             ));
             continue;
         }
+        let generation_execution_profile = catalog_doc
+            .generation_execution_profile(&artifact.artifact_root)
+            .cloned();
         let served_modalities = match provider_served_modalities(model, &args.disable_modalities) {
             Ok(modalities) => modalities,
             Err(err) => {
@@ -72958,7 +73472,7 @@ fn build_provider_candidates(
                     continue;
                 }
             };
-        let feasibility = match provider_context_feasibility(
+        let mut feasibility = match provider_context_feasibility(
             enclave,
             model,
             &artifact_name,
@@ -72980,6 +73494,35 @@ fn build_provider_candidates(
                 continue;
             }
         };
+        let generation_execution_capacity = match provider_vllm_generation_execution_capacity(
+            &artifact,
+            generation_execution_profile.as_ref(),
+            &enclave.caps,
+            verdict,
+            args,
+            &feasibility,
+        ) {
+            Ok(capacity) => capacity,
+            Err(err) => {
+                rejections.push(provider_rejection(
+                    enclave,
+                    format!("resolving independent generation capacity: {err:#}"),
+                    None,
+                ));
+                continue;
+            }
+        };
+        if let Err(err) = reserve_provider_generation_execution_memory(
+            &mut feasibility,
+            generation_execution_capacity,
+        ) {
+            rejections.push(provider_rejection(
+                enclave,
+                format!("reserving independent generation memory: {err:#}"),
+                None,
+            ));
+            continue;
+        }
         let served_ctx = feasibility.served_ctx;
         if let Err(err) = validate_provider_speciality_fit(model, &served_specialities, served_ctx)
         {
@@ -73036,6 +73579,8 @@ fn build_provider_candidates(
             model: model.clone(),
             artifact_name,
             artifact,
+            generation_execution_profile,
+            generation_execution_capacity,
             verdict: verdict.clone(),
             price: Some(price),
             served_ctx,
@@ -76556,6 +77101,276 @@ fn provider_heartbeat_min_ask_au(
         .unwrap_or(0)
 }
 
+#[derive(Clone)]
+struct OwnedProviderSessionRuntime {
+    rpc: PeerRpcClient,
+    rooms: Vec<LedgerRoom>,
+    keypair_path: PathBuf,
+    password: String,
+    provider_signing_seed: Option<[u8; 32]>,
+    hardware_quote_config: Option<ProviderHardwareQuoteConfig>,
+    attestation_identity: CatalogEnclaveIdentity,
+    runtime_config: AttestationRuntimeConfig,
+    runtime_keypair: RuntimeKeypair,
+    binary_path: PathBuf,
+    boot_epoch: u64,
+    tpm_activation_hello: Option<mayhem_proto::TpmActivateCredentialHello>,
+    receipt_settlement: Arc<ProviderReceiptSettlement>,
+}
+
+impl OwnedProviderSessionRuntime {
+    fn from_borrowed(runtime: &ProviderSessionRuntime<'_>) -> Self {
+        Self {
+            rpc: runtime.rpc.clone(),
+            rooms: runtime.rooms.to_vec(),
+            keypair_path: runtime.keypair_path.to_path_buf(),
+            password: runtime.password.to_owned(),
+            provider_signing_seed: runtime.provider_signing_seed,
+            hardware_quote_config: runtime.hardware_quote_config.clone(),
+            attestation_identity: runtime.attestation_identity.clone(),
+            runtime_config: runtime.runtime_config.clone(),
+            runtime_keypair: runtime.runtime_keypair.clone(),
+            binary_path: runtime.binary_path.to_path_buf(),
+            boot_epoch: runtime.boot_epoch,
+            tpm_activation_hello: runtime.tpm_activation_hello.cloned(),
+            receipt_settlement: Arc::clone(&runtime.receipt_settlement),
+        }
+    }
+
+    fn borrowed(&self) -> ProviderSessionRuntime<'_> {
+        ProviderSessionRuntime {
+            rpc: &self.rpc,
+            rooms: &self.rooms,
+            keypair_path: &self.keypair_path,
+            password: &self.password,
+            provider_signing_seed: self.provider_signing_seed,
+            hardware_quote_config: self.hardware_quote_config.clone(),
+            attestation_identity: self.attestation_identity.clone(),
+            runtime_config: self.runtime_config.clone(),
+            runtime_keypair: &self.runtime_keypair,
+            binary_path: &self.binary_path,
+            boot_epoch: self.boot_epoch,
+            tpm_activation_hello: self.tpm_activation_hello.as_ref(),
+            receipt_settlement: Arc::clone(&self.receipt_settlement),
+        }
+    }
+}
+
+struct ProviderConcurrentSessionTask {
+    bridge: ScBridgeClient,
+    event: Value,
+    active: ActiveProviderSession,
+    pending_request_deadline: Instant,
+    pending_payloads: HashMap<String, PendingProviderPayload>,
+    terms: ProviderSessionTerms,
+    runtime: Arc<OwnedProviderSessionRuntime>,
+    sc_bridge_url: String,
+    sc_bridge_token: String,
+    bridge_operation_deadline: Option<Duration>,
+    admission_timeout: Duration,
+    request_stall_timeout: Duration,
+    max_request_bytes: usize,
+    max_payload_chunks: usize,
+    heartbeat_load: ProviderHeartbeatLoad,
+    protection: Arc<Mutex<ProviderProtectionState>>,
+    engine_recovery_initial: Duration,
+    engine_recovery_max: Duration,
+    backend: Arc<dyn ConcurrentGenerationBackend>,
+    cancellation: CancellationToken,
+}
+
+struct ProviderConcurrentSessionCompletion {
+    session_id: String,
+    engine_failure: Option<String>,
+    result: Result<()>,
+}
+
+async fn connect_provider_concurrent_session_bridge(
+    sc_bridge_url: &str,
+    sc_bridge_token: &str,
+    remote: &str,
+    session_id: &str,
+    operation_deadline: Option<Duration>,
+) -> Result<ScBridgeClient> {
+    let mut bridge = ScBridgeClient::connect(
+        ScBridgeConfig::new(sc_bridge_url, sc_bridge_token.to_owned())?
+            .with_operation_deadline(operation_deadline),
+    )
+    .await
+    .context("connecting the concurrent provider request to SC-Bridge")?;
+    let subscription = bridge
+        .session_subscribe([session_id])
+        .await
+        .context("subscribing the concurrent provider request")?;
+    ensure!(
+        subscription
+            .get("session_ids")
+            .and_then(Value::as_array)
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(session_id))),
+        "SC-Bridge did not confirm the concurrent provider session subscription"
+    );
+    let takeover = bridge
+        .session_takeover(remote, session_id)
+        .await
+        .context("transferring the concurrent provider session to its request bridge")?;
+    ensure!(
+        takeover.get("taken_over").and_then(Value::as_bool) == Some(true),
+        "SC-Bridge did not confirm concurrent provider session ownership"
+    );
+    Ok(bridge)
+}
+
+async fn run_provider_concurrent_session_task(
+    task: ProviderConcurrentSessionTask,
+) -> ProviderConcurrentSessionCompletion {
+    let session_id = task.active.session_id.clone();
+    let remote = task.active.remote.clone();
+    let request_id = task
+        .event
+        .get("frame")
+        .and_then(|frame| frame.get("rid"))
+        .and_then(Value::as_str)
+        .filter(|rid| !rid.is_empty())
+        .unwrap_or("missing-rid")
+        .to_owned();
+    let mut bridge = task.bridge;
+    let (result, engine_failure) = async {
+        let mut sessions = HashMap::from([(session_id.clone(), task.active)]);
+        let mut rejected_sessions = HashMap::new();
+        let mut pending_requests =
+            HashMap::from([(session_id.clone(), task.pending_request_deadline)]);
+        let mut pending_payloads = task.pending_payloads;
+        let mut responder = ConcurrentEngineProviderSessionResponder::new(task.backend);
+        let mut engine_recovery =
+            ProviderEngineRecovery::new(task.engine_recovery_initial, task.engine_recovery_max);
+        let runtime = task.runtime.borrowed();
+        let result = match ProviderTpmActivationLimiter::from_environment() {
+            Ok(mut tpm_activation_limiter) => {
+                handle_provider_session_frame(
+                    &mut bridge,
+                    &mut sessions,
+                    &mut rejected_sessions,
+                    &mut pending_requests,
+                    &mut pending_payloads,
+                    &task.heartbeat_load,
+                    &task.protection,
+                    &mut tpm_activation_limiter,
+                    &task.terms,
+                    &runtime,
+                    &task.sc_bridge_url,
+                    &task.sc_bridge_token,
+                    task.bridge_operation_deadline,
+                    task.admission_timeout,
+                    &mut responder,
+                    &mut engine_recovery,
+                    None,
+                    task.request_stall_timeout,
+                    task.max_request_bytes,
+                    task.max_payload_chunks,
+                    Some(task.cancellation),
+                    task.event,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        (result, engine_recovery.reason().map(str::to_owned))
+    }
+    .await;
+    if let Err(error) = &result {
+        let error_code = provider_response_error_code(error);
+        let error_message = provider_response_error_message(error);
+        let _ = send_provider_session_error(
+            &mut bridge,
+            &remote,
+            &session_id,
+            &request_id,
+            error_code,
+            &error_message,
+        )
+        .await;
+        let _ = send_provider_session_close(
+            &mut bridge,
+            &remote,
+            &session_id,
+            &format!("err:{error_code}"),
+        )
+        .await;
+    }
+    ProviderConcurrentSessionCompletion {
+        session_id,
+        engine_failure,
+        result,
+    }
+}
+
+fn take_provider_session_pending_payloads(
+    pending_payloads: &mut HashMap<String, PendingProviderPayload>,
+    session_id: &str,
+) -> HashMap<String, PendingProviderPayload> {
+    let prefix = format!("{session_id}:");
+    let keys = pending_payloads
+        .keys()
+        .filter(|key| key.starts_with(&prefix))
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.into_iter()
+        .filter_map(|key| pending_payloads.remove(&key).map(|value| (key, value)))
+        .collect()
+}
+
+fn provider_session_allows_independent_dispatch(
+    terms: &ProviderSessionTerms,
+    active: &ActiveProviderSession,
+) -> bool {
+    generation_execution_profile_allows_modalities(
+        terms.generation_execution_profile.as_ref(),
+        &active.required_modalities,
+    )
+}
+
+fn provider_session_open_required_modalities(frame: &Value) -> Option<Vec<String>> {
+    frame
+        .get("voucher")?
+        .get("body")?
+        .get("required_modalities")?
+        .as_array()?
+        .iter()
+        .map(|value| value.as_str().map(str::to_owned))
+        .collect()
+}
+
+fn provider_local_session_acceptance_decision(
+    protection: &Arc<Mutex<ProviderProtectionState>>,
+    sessions: &HashMap<String, ActiveProviderSession>,
+    terms: &ProviderSessionTerms,
+    open_frame: &Value,
+) -> ProviderSessionDecision {
+    let Some(requested_modalities) = provider_session_open_required_modalities(open_frame) else {
+        return ProviderSessionDecision::Reject {
+            code: "SCHEMA",
+            reason: "signed spend voucher is missing normalized required_modalities".to_owned(),
+        };
+    };
+    let requested_is_independent = generation_execution_profile_allows_modalities(
+        terms.generation_execution_profile.as_ref(),
+        &requested_modalities,
+    );
+    let active_are_independent = sessions
+        .values()
+        .all(|active| provider_session_allows_independent_dispatch(terms, active));
+    if (!requested_is_independent && !sessions.is_empty())
+        || (requested_is_independent && !active_are_independent)
+    {
+        return ProviderSessionDecision::Reject {
+            code: "CAPACITY",
+            reason: "request requires exclusive execution while another provider session is active"
+                .to_owned(),
+        };
+    }
+    lock_provider_protection(protection).acceptance_decision(sessions.len())
+}
+
 fn provider_heartbeat_workflow_classes(
     selected: &ProviderCandidate,
     min_ask_au: MoneyAu,
@@ -76595,8 +77410,12 @@ async fn serve_provider_sessions(
     let terms = provider_session_terms(&ctx)?;
     let configured_protection =
         ProviderProtectionConfig::from_provider_args(ctx.args, ctx.selected)?;
-    let protection_config =
-        provider_effective_protection_config(configured_protection, Some(responder.as_ref()));
+    let execution_capacity = if terms.generation_execution_profile.is_some() {
+        responder.concurrent_session_capacity()
+    } else {
+        1
+    };
+    let protection_config = configured_protection.limit_to_execution_capacity(execution_capacity);
     let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
         ctx.args.home.as_ref(),
         ctx.args.sc_bridge_url.as_deref(),
@@ -76738,7 +77557,12 @@ async fn serve_provider_sessions(
     let mut rejected_sessions = HashMap::new();
     let mut pending_requests = HashMap::new();
     let mut pending_payloads = HashMap::new();
-    let mut protection = ProviderProtectionState::new(protection_config);
+    let mut concurrent_session_ids = BTreeSet::new();
+    let mut concurrent_tasks = tokio::task::JoinSet::<ProviderConcurrentSessionCompletion>::new();
+    let mut concurrent_task_sessions = HashMap::<tokio::task::Id, String>::new();
+    let mut concurrent_task_cancellations = HashMap::<String, CancellationToken>::new();
+    let owned_runtime = Arc::new(OwnedProviderSessionRuntime::from_borrowed(&runtime));
+    let protection = Arc::new(Mutex::new(ProviderProtectionState::new(protection_config)));
     let mut tpm_activation_limiter = ProviderTpmActivationLimiter::from_environment()?;
     let mut draining = false;
     let mut local_drain_request = None::<ProviderDrainRequest>;
@@ -76755,6 +77579,70 @@ async fn serve_provider_sessions(
     );
     let serve_result: Result<()> = async {
         loop {
+            while let Some(joined) = concurrent_tasks.try_join_next_with_id() {
+                match joined {
+                    Ok((task_id, completion)) => {
+                        concurrent_task_sessions.remove(&task_id);
+                        concurrent_session_ids.remove(&completion.session_id);
+                        concurrent_task_cancellations.remove(&completion.session_id);
+                        if let Some(reason) = completion.engine_failure {
+                            heartbeat_load.set_accepting_new(false);
+                            engine_recovery.mark_failed(reason);
+                        }
+                        if let Err(err) = completion.result {
+                            provider_session_debug(format!(
+                                "concurrent provider session {} failed: {err:#}",
+                                completion.session_id
+                            ));
+                        }
+                        discard_provider_session_state(
+                            &mut sessions,
+                            &mut pending_requests,
+                            &mut pending_payloads,
+                            &completion.session_id,
+                        );
+                        heartbeat_load.set_active_sessions(&sessions, &terms);
+                    }
+                    Err(err) => {
+                        let session_id = concurrent_task_sessions.remove(&err.id());
+                        if let Some(session_id) = session_id {
+                            concurrent_session_ids.remove(&session_id);
+                            concurrent_task_cancellations.remove(&session_id);
+                            if let Some(active) = sessions.get(&session_id).cloned() {
+                                send_provider_session_error(
+                                    &mut bridge,
+                                    &active.remote,
+                                    &active.session_id,
+                                    "unknown",
+                                    "provider_response_failed",
+                                    "provider request task stopped unexpectedly",
+                                )
+                                .await
+                                .ok();
+                                send_provider_session_close(
+                                    &mut bridge,
+                                    &active.remote,
+                                    &active.session_id,
+                                    "err:provider_response_failed",
+                                )
+                                .await
+                                .ok();
+                            }
+                            discard_provider_session_state(
+                                &mut sessions,
+                                &mut pending_requests,
+                                &mut pending_payloads,
+                                &session_id,
+                            );
+                            heartbeat_load.set_active_sessions(&sessions, &terms);
+                        }
+                        heartbeat_load.set_accepting_new(false);
+                        engine_recovery.mark_failed(format!(
+                            "concurrent provider request task failed unexpectedly: {err}"
+                        ));
+                    }
+                }
+            }
             if heartbeat_task
                 .as_ref()
                 .is_some_and(tokio::task::JoinHandle::is_finished)
@@ -76790,7 +77678,7 @@ async fn serve_provider_sessions(
                     "provider engine child exited while idle; no user session caused the failure",
                 );
             }
-            if engine_recovery.retry_due(Instant::now()) {
+            if engine_recovery.retry_due(Instant::now()) && sessions.is_empty() {
                 heartbeat_load.set_accepting_new(false);
                 let reason = engine_recovery
                     .reason()
@@ -76831,6 +77719,7 @@ async fn serve_provider_sessions(
                 &mut pending_requests,
                 &mut pending_payloads,
                 &heartbeat_load,
+                &terms,
             )
             .await;
             let next_runtime_floor_reject = if draining {
@@ -76968,6 +77857,34 @@ async fn serve_provider_sessions(
             }
             match bridge.next_session_event(wait).await {
                 Ok(event) => {
+                    let event_session_id = event
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            event
+                                .get("frame")
+                                .and_then(|frame| frame.get("session_id"))
+                                .and_then(Value::as_str)
+                        })
+                        .unwrap_or("")
+                        .to_owned();
+                    if concurrent_session_ids.contains(&event_session_id) {
+                        let transport_closed = event.get("type").and_then(Value::as_str)
+                            == Some("session_closed");
+                        let peer_closed = event
+                            .get("frame")
+                            .and_then(|frame| frame.get("t"))
+                            .and_then(Value::as_str)
+                            == Some("s.close");
+                        if transport_closed || peer_closed {
+                            if let Some(cancellation) =
+                                concurrent_task_cancellations.get(&event_session_id)
+                            {
+                                cancellation.cancel();
+                            }
+                        }
+                        continue;
+                    }
                     if event.get("type").and_then(Value::as_str) == Some("session_closed") {
                         let session_id = event
                             .get("session_id")
@@ -76982,6 +77899,7 @@ async fn serve_provider_sessions(
                             &mut pending_requests,
                             &mut pending_payloads,
                             &heartbeat_load,
+                            &terms,
                             &event,
                         ) {
                             provider_session_debug(format!(
@@ -77006,22 +77924,85 @@ async fn serve_provider_sessions(
                             .and_then(Value::as_str)
                             .unwrap_or("")
                     ));
-                    let event_session_id = event
-                        .get("session_id")
-                        .and_then(Value::as_str)
-                        .or_else(|| {
-                            event
-                                .get("frame")
-                                .and_then(|frame| frame.get("session_id"))
-                                .and_then(Value::as_str)
-                        })
-                        .unwrap_or("")
-                        .to_owned();
                     let event_remote = event
                         .get("remote")
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_owned();
+                    if frame_type == "s.req"
+                        && sessions.get(&event_session_id).is_some_and(|active| {
+                            provider_session_allows_independent_dispatch(&terms, active)
+                        })
+                    {
+                        if let (Some(backend), Some(active), Some(pending_request_deadline)) = (
+                            responder.concurrent_generation_backend(),
+                            sessions.get(&event_session_id).cloned(),
+                            pending_requests.get(&event_session_id).copied(),
+                        ) {
+                            if active.remote == event_remote {
+                                match connect_provider_concurrent_session_bridge(
+                                    &sc_bridge_url,
+                                    &sc_bridge_token,
+                                    &event_remote,
+                                    &event_session_id,
+                                    session_bridge_operation_deadline,
+                                )
+                                .await
+                                {
+                                    Ok(request_bridge) => {
+                                        pending_requests.remove(&event_session_id);
+                                        let task_pending_payloads =
+                                            take_provider_session_pending_payloads(
+                                                &mut pending_payloads,
+                                                &event_session_id,
+                                            );
+                                        concurrent_session_ids.insert(event_session_id.clone());
+                                        let cancellation = CancellationToken::new();
+                                        concurrent_task_cancellations.insert(
+                                            event_session_id.clone(),
+                                            cancellation.clone(),
+                                        );
+                                        let abort_handle = concurrent_tasks.spawn(
+                                            run_provider_concurrent_session_task(
+                                                ProviderConcurrentSessionTask {
+                                                    bridge: request_bridge,
+                                                    event,
+                                                    active,
+                                                    pending_request_deadline,
+                                                    pending_payloads: task_pending_payloads,
+                                                    terms: terms.clone(),
+                                                    runtime: Arc::clone(&owned_runtime),
+                                                    sc_bridge_url: sc_bridge_url.clone(),
+                                                    sc_bridge_token: sc_bridge_token.clone(),
+                                                    bridge_operation_deadline:
+                                                        session_bridge_operation_deadline,
+                                                    admission_timeout,
+                                                    request_stall_timeout,
+                                                    max_request_bytes,
+                                                    max_payload_chunks,
+                                                    heartbeat_load: heartbeat_load
+                                                        .with_isolated_session_counter(),
+                                                    protection: Arc::clone(&protection),
+                                                    engine_recovery_initial:
+                                                        provider_heartbeat_reconnect_initial,
+                                                    engine_recovery_max:
+                                                        provider_heartbeat_reconnect_max,
+                                                    backend,
+                                                    cancellation,
+                                                },
+                                            ),
+                                        );
+                                        concurrent_task_sessions
+                                            .insert(abort_handle.id(), event_session_id.clone());
+                                        continue;
+                                    }
+                                    Err(err) => provider_session_debug(format!(
+                                        "concurrent request bridge setup failed for session {event_session_id}; using serial handling: {err:#}"
+                                    )),
+                                }
+                            }
+                        }
+                    }
                     let session_reject = runtime_floor_reject
                         .clone()
                         .or_else(|| engine_watchdog_reject.clone())
@@ -77038,7 +78019,7 @@ async fn serve_provider_sessions(
                         &mut pending_requests,
                         &mut pending_payloads,
                         &heartbeat_load,
-                        &mut protection,
+                        &protection,
                         &mut tpm_activation_limiter,
                         &terms,
                         &runtime,
@@ -77052,6 +78033,7 @@ async fn serve_provider_sessions(
                         request_stall_timeout,
                         max_request_bytes,
                         max_payload_chunks,
+                        None,
                         event,
                     )
                     .await
@@ -77078,7 +78060,7 @@ async fn serve_provider_sessions(
                                 &event_session_id,
                             );
                         }
-                        heartbeat_load.set_active_sessions(sessions.len());
+                        heartbeat_load.set_active_sessions(&sessions, &terms);
                     }
                 }
                 Err(BridgeError::Timeout) => {
@@ -77088,6 +78070,7 @@ async fn serve_provider_sessions(
                         &mut pending_requests,
                         &mut pending_payloads,
                         &heartbeat_load,
+                        &terms,
                     )
                     .await;
                     if draining && sessions.is_empty() {
@@ -77095,11 +78078,13 @@ async fn serve_provider_sessions(
                     }
                 }
                 Err(BridgeError::Closed) | Err(BridgeError::WebSocket(_)) => {
-                    let dropped = clear_provider_sessions_after_bridge_drop(
+                    let dropped = clear_provider_sessions_after_bridge_drop_except(
                         &mut sessions,
                         &mut pending_requests,
                         &mut pending_payloads,
                         &heartbeat_load,
+                        &terms,
+                        &concurrent_session_ids,
                     );
                     provider_session_debug(format!(
                         "SC-Bridge closed provider session stream; dropped {dropped} active session(s), reconnecting"
@@ -77117,11 +78102,13 @@ async fn serve_provider_sessions(
                         .await?;
                 }
                 Err(err) => {
-                    let dropped = clear_provider_sessions_after_bridge_drop(
+                    let dropped = clear_provider_sessions_after_bridge_drop_except(
                         &mut sessions,
                         &mut pending_requests,
                         &mut pending_payloads,
                         &heartbeat_load,
+                        &terms,
+                        &concurrent_session_ids,
                     );
                     provider_session_debug(format!(
                         "SC-Bridge provider session reader failed ({err}); dropped {dropped} active session(s), reconnecting without stopping the provider"
@@ -77142,6 +78129,20 @@ async fn serve_provider_sessions(
         Ok(())
     }
     .await;
+    for cancellation in concurrent_task_cancellations.values() {
+        cancellation.cancel();
+    }
+    let drained = tokio::time::timeout(Duration::from_secs(10), async {
+        while concurrent_tasks.join_next().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    if !drained {
+        provider_session_debug(
+            "concurrent provider requests did not stop within 10 seconds after cancellation",
+        );
+        concurrent_tasks.abort_all();
+    }
     heartbeat_load.stop();
     if let Some(task) = heartbeat_task {
         match tokio::time::timeout(Duration::from_secs(5), task).await {
@@ -77265,6 +78266,7 @@ impl ProviderSessionLivenessMonitor {
         session_id: &str,
         remote: &str,
         operation_deadline: Option<Duration>,
+        cancellation: Option<CancellationToken>,
     ) -> Result<Self> {
         let mut bridge = ScBridgeClient::connect(
             ScBridgeConfig::new(sc_bridge_url, sc_bridge_token.to_owned())?
@@ -77284,7 +78286,7 @@ impl ProviderSessionLivenessMonitor {
             "SC-Bridge did not confirm the provider session liveness subscription"
         );
 
-        let cancellation = CancellationToken::new();
+        let cancellation = cancellation.unwrap_or_default();
         let task_cancellation = cancellation.clone();
         let session_id = session_id.to_owned();
         let remote = remote.to_owned();
@@ -77355,12 +78357,36 @@ fn clear_provider_sessions_after_bridge_drop(
     pending_requests: &mut HashMap<String, Instant>,
     pending_payloads: &mut HashMap<String, PendingProviderPayload>,
     heartbeat_load: &ProviderHeartbeatLoad,
+    terms: &ProviderSessionTerms,
 ) -> usize {
-    let dropped = sessions.len();
-    sessions.clear();
-    pending_requests.clear();
-    pending_payloads.clear();
-    heartbeat_load.set_active_sessions(0);
+    clear_provider_sessions_after_bridge_drop_except(
+        sessions,
+        pending_requests,
+        pending_payloads,
+        heartbeat_load,
+        terms,
+        &BTreeSet::new(),
+    )
+}
+
+fn clear_provider_sessions_after_bridge_drop_except(
+    sessions: &mut HashMap<String, ActiveProviderSession>,
+    pending_requests: &mut HashMap<String, Instant>,
+    pending_payloads: &mut HashMap<String, PendingProviderPayload>,
+    heartbeat_load: &ProviderHeartbeatLoad,
+    terms: &ProviderSessionTerms,
+    preserved_session_ids: &BTreeSet<String>,
+) -> usize {
+    let before = sessions.len();
+    sessions.retain(|session_id, _| preserved_session_ids.contains(session_id));
+    pending_requests.retain(|session_id, _| preserved_session_ids.contains(session_id));
+    pending_payloads.retain(|key, _| {
+        preserved_session_ids
+            .iter()
+            .any(|session_id| key.starts_with(&format!("{session_id}:")))
+    });
+    let dropped = before.saturating_sub(sessions.len());
+    heartbeat_load.set_active_sessions(sessions, terms);
     dropped
 }
 
@@ -77380,6 +78406,7 @@ fn discard_pre_request_provider_session_on_close(
     pending_requests: &mut HashMap<String, Instant>,
     pending_payloads: &mut HashMap<String, PendingProviderPayload>,
     heartbeat_load: &ProviderHeartbeatLoad,
+    terms: &ProviderSessionTerms,
     event: &Value,
 ) -> bool {
     let Some(session_id) = event.get("session_id").and_then(Value::as_str) else {
@@ -77395,7 +78422,7 @@ fn discard_pre_request_provider_session_on_close(
         return false;
     }
     discard_provider_session_state(sessions, pending_requests, pending_payloads, session_id);
-    heartbeat_load.set_active_sessions(sessions.len());
+    heartbeat_load.set_active_sessions(sessions, terms);
     true
 }
 
@@ -77405,6 +78432,7 @@ async fn expire_provider_pending_sessions(
     pending_requests: &mut HashMap<String, Instant>,
     pending_payloads: &mut HashMap<String, PendingProviderPayload>,
     heartbeat_load: &ProviderHeartbeatLoad,
+    terms: &ProviderSessionTerms,
 ) {
     let expired = provider_session_expired_pending_ids(pending_requests, Instant::now());
     if expired.is_empty() {
@@ -77434,7 +78462,7 @@ async fn expire_provider_pending_sessions(
             ));
         }
     }
-    heartbeat_load.set_active_sessions(sessions.len());
+    heartbeat_load.set_active_sessions(sessions, terms);
 }
 
 fn provider_session_expired_pending_ids(
@@ -78824,14 +79852,14 @@ fn record_provider_session_request_progress(
     pending_requests.insert(session_id.to_owned(), progressed_at + request_timeout);
 }
 
-async fn handle_provider_session_frame(
+async fn handle_provider_session_frame<R>(
     bridge: &mut ScBridgeClient,
     sessions: &mut HashMap<String, ActiveProviderSession>,
     rejected_sessions: &mut HashMap<String, ProviderSessionRejectReplay>,
     pending_requests: &mut HashMap<String, Instant>,
     pending_payloads: &mut HashMap<String, PendingProviderPayload>,
     heartbeat_load: &ProviderHeartbeatLoad,
-    protection: &mut ProviderProtectionState,
+    protection: &Arc<Mutex<ProviderProtectionState>>,
     tpm_activation_limiter: &mut ProviderTpmActivationLimiter,
     terms: &ProviderSessionTerms,
     runtime: &ProviderSessionRuntime<'_>,
@@ -78839,14 +79867,18 @@ async fn handle_provider_session_frame(
     sc_bridge_token: &str,
     bridge_operation_deadline: Option<Duration>,
     admission_timeout: Duration,
-    responder: &mut dyn ProviderSessionResponder,
+    responder: &mut R,
     engine_recovery: &mut ProviderEngineRecovery,
     runtime_floor_reject: Option<ProviderRuntimeFloorRejection>,
     request_stall_timeout: Duration,
     max_request_bytes: usize,
     max_payload_chunks: usize,
+    request_cancellation: Option<CancellationToken>,
     event: Value,
-) -> Result<()> {
+) -> Result<()>
+where
+    R: ProviderSessionResponder + ?Sized,
+{
     let frame = event
         .get("frame")
         .cloned()
@@ -79053,7 +80085,9 @@ async fn handle_provider_session_frame(
                             reason: "provider receipt settlement outbox is near capacity; refusing new work until durable evidence is relayed".to_owned(),
                         }
                     } else if heartbeat_load.is_accepting_new() {
-                        protection.acceptance_decision(sessions.len())
+                        provider_local_session_acceptance_decision(
+                            protection, sessions, terms, &frame,
+                        )
                     } else {
                         ProviderSessionDecision::Reject {
                             code: "DRAINING",
@@ -79076,28 +80110,37 @@ async fn handle_provider_session_frame(
                         );
                         match live_decision {
                             ProviderSessionDecision::Accept => {
-                                match tokio::time::timeout(
-                                    admission_timeout,
-                                    provider_session_spend_reservation_decision(
-                                        runtime.rpc,
-                                        runtime.keypair_path,
-                                        runtime.password,
-                                        &runtime.runtime_keypair.public_key_hex(),
-                                        terms,
-                                        &frame,
-                                        &session_rail,
-                                    ),
-                                )
-                                .await
-                                {
-                                    Ok(decision) => decision?,
-                                    Err(_) => ProviderSessionDecision::Reject {
+                                let local_decision = provider_local_session_acceptance_decision(
+                                    protection, sessions, terms, &frame,
+                                );
+                                if !matches!(local_decision, ProviderSessionDecision::Accept) {
+                                    local_decision
+                                } else {
+                                    let reservation = tokio::time::timeout(
+                                        admission_timeout,
+                                        provider_session_spend_reservation_decision(
+                                            runtime.rpc,
+                                            runtime.keypair_path,
+                                            runtime.password,
+                                            &runtime.runtime_keypair.public_key_hex(),
+                                            terms,
+                                            &frame,
+                                            &session_rail,
+                                        ),
+                                    )
+                                    .await;
+                                    let reservation_decision = match reservation {
+                                        Ok(Ok(decision)) => decision,
+                                        Ok(Err(error)) => return Err(error),
+                                        Err(_) => ProviderSessionDecision::Reject {
                                         code: "BALANCE",
                                         reason: format!(
                                             "spend reservation did not complete within the {} ms provider admission budget; no work was served",
                                             admission_timeout.as_millis()
                                         ),
                                     },
+                                    };
+                                    reservation_decision
                                 }
                             }
                             reject => reject,
@@ -79211,9 +80254,9 @@ async fn handle_provider_session_frame(
                         open_head,
                         accept_frame: accept_frame.clone(),
                     });
+                    lock_provider_protection(protection).record_accept();
                     sessions.insert(session_id.clone(), active);
-                    protection.record_accept();
-                    heartbeat_load.set_active_sessions(sessions.len());
+                    heartbeat_load.set_active_sessions(sessions, terms);
                     record_provider_session_request_progress(
                         pending_requests,
                         &session_id,
@@ -79319,7 +80362,7 @@ async fn handle_provider_session_frame(
                 sessions.remove(&session_id);
                 pending_requests.remove(&session_id);
                 remove_provider_session_pending_payloads(pending_payloads, &session_id);
-                heartbeat_load.set_active_sessions(sessions.len());
+                heartbeat_load.set_active_sessions(sessions, terms);
             } else {
                 record_provider_session_request_progress(
                     pending_requests,
@@ -79387,7 +80430,7 @@ async fn handle_provider_session_frame(
                     sessions.remove(&session_id);
                     pending_requests.remove(&session_id);
                     remove_provider_session_pending_payloads(pending_payloads, &session_id);
-                    heartbeat_load.set_active_sessions(sessions.len());
+                    heartbeat_load.set_active_sessions(sessions, terms);
                     return Ok(());
                 }
             };
@@ -79420,7 +80463,7 @@ async fn handle_provider_session_frame(
                     sessions.remove(&session_id);
                     pending_requests.remove(&session_id);
                     remove_provider_session_pending_payloads(pending_payloads, &session_id);
-                    heartbeat_load.set_active_sessions(sessions.len());
+                    heartbeat_load.set_active_sessions(sessions, terms);
                     return Ok(());
                 }
             };
@@ -79449,7 +80492,7 @@ async fn handle_provider_session_frame(
                     sessions.remove(&session_id);
                     pending_requests.remove(&session_id);
                     remove_provider_session_pending_payloads(pending_payloads, &session_id);
-                    heartbeat_load.set_active_sessions(sessions.len());
+                    heartbeat_load.set_active_sessions(sessions, terms);
                     return Ok(());
                 }
             };
@@ -79460,6 +80503,7 @@ async fn handle_provider_session_frame(
                 &active.session_id,
                 &active.remote,
                 bridge_operation_deadline,
+                request_cancellation,
             )
             .await
             .context("starting in-session provider peer liveness")?;
@@ -79480,19 +80524,21 @@ async fn handle_provider_session_frame(
                     &cancellation,
                 )
             });
-            let response = contain_provider_request(|| {
-                let mut output = responder.respond_streaming(
-                    terms,
-                    &body,
-                    live_stream.as_mut(),
-                    &cancellation,
-                )?;
-                normalize_provider_visible_output_usage(&body, &mut output)?;
-                cancellation
-                    .check()
-                    .context("provider request cancelled before response publication")?;
-                validate_provider_session_output(terms, &body, &output)?;
-                Ok(output)
+            let response = tokio::task::block_in_place(|| {
+                contain_provider_request(|| {
+                    let mut output = responder.respond_streaming(
+                        terms,
+                        &body,
+                        live_stream.as_mut(),
+                        &cancellation,
+                    )?;
+                    normalize_provider_visible_output_usage(&body, &mut output)?;
+                    cancellation
+                        .check()
+                        .context("provider request cancelled before response publication")?;
+                    validate_provider_session_output(terms, &body, &output)?;
+                    Ok(output)
+                })
             });
             let (output, measured_throughput) = match response {
                 Ok(output) => {
@@ -79525,7 +80571,7 @@ async fn handle_provider_session_frame(
                                     pending_payloads,
                                     &session_id,
                                 );
-                                heartbeat_load.set_active_sessions(sessions.len());
+                                heartbeat_load.set_active_sessions(sessions, terms);
                                 return Ok(());
                             }
                             provider_session_debug(format!(
@@ -79550,7 +80596,7 @@ async fn handle_provider_session_frame(
                             sessions.remove(&session_id);
                             pending_requests.remove(&session_id);
                             remove_provider_session_pending_payloads(pending_payloads, &session_id);
-                            heartbeat_load.set_active_sessions(sessions.len());
+                            heartbeat_load.set_active_sessions(sessions, terms);
                             return Ok(());
                         }
                     }
@@ -79589,7 +80635,7 @@ async fn handle_provider_session_frame(
                         .await
                         {
                             Ok(receipt) => {
-                                protection.record_usage(
+                                lock_provider_protection(protection).record_usage(
                                     &receipt.body.usage,
                                     receipt.body.au_owed_cum,
                                 );
@@ -79601,7 +80647,7 @@ async fn handle_provider_session_frame(
                         sessions.remove(&session_id);
                         pending_requests.remove(&session_id);
                         remove_provider_session_pending_payloads(pending_payloads, &session_id);
-                        heartbeat_load.set_active_sessions(sessions.len());
+                        heartbeat_load.set_active_sessions(sessions, terms);
                         return Ok(());
                     }
                     if let Some(reason) = provider_engine_component_failure(responder, &err) {
@@ -79618,7 +80664,7 @@ async fn handle_provider_session_frame(
                         sessions.remove(&session_id);
                         pending_requests.remove(&session_id);
                         remove_provider_session_pending_payloads(pending_payloads, &session_id);
-                        heartbeat_load.set_active_sessions(sessions.len());
+                        heartbeat_load.set_active_sessions(sessions, terms);
                         return Ok(());
                     }
                     provider_session_debug(format!(
@@ -79645,7 +80691,7 @@ async fn handle_provider_session_frame(
                     sessions.remove(&session_id);
                     pending_requests.remove(&session_id);
                     remove_provider_session_pending_payloads(pending_payloads, &session_id);
-                    heartbeat_load.set_active_sessions(sessions.len());
+                    heartbeat_load.set_active_sessions(sessions, terms);
                     return Ok(());
                 }
             };
@@ -79701,11 +80747,12 @@ async fn handle_provider_session_frame(
                     sessions.remove(&session_id);
                     pending_requests.remove(&session_id);
                     remove_provider_session_pending_payloads(pending_payloads, &session_id);
-                    heartbeat_load.set_active_sessions(sessions.len());
+                    heartbeat_load.set_active_sessions(sessions, terms);
                     return Ok(());
                 }
             };
-            protection.record_usage(&receipt.body.usage, receipt.body.au_owed_cum);
+            lock_provider_protection(protection)
+                .record_usage(&receipt.body.usage, receipt.body.au_owed_cum);
             provider_session_debug(format!(
                 "waiting for receipt ack on session {session_id} request {request_id}"
             ));
@@ -79732,7 +80779,7 @@ async fn handle_provider_session_frame(
                 sessions.remove(&session_id);
                 pending_requests.remove(&session_id);
                 remove_provider_session_pending_payloads(pending_payloads, &session_id);
-                heartbeat_load.set_active_sessions(sessions.len());
+                heartbeat_load.set_active_sessions(sessions, terms);
                 return Ok(());
             }
             if let Err(error) = liveness.stop().await {
@@ -79748,7 +80795,7 @@ async fn handle_provider_session_frame(
             sessions.remove(&session_id);
             pending_requests.remove(&session_id);
             remove_provider_session_pending_payloads(pending_payloads, &session_id);
-            heartbeat_load.set_active_sessions(sessions.len());
+            heartbeat_load.set_active_sessions(sessions, terms);
         }
         "s.close" => {
             let owns_session = sessions
@@ -79763,7 +80810,7 @@ async fn handle_provider_session_frame(
                 );
             }
             let _ = bridge.session_close(&remote, &session_id).await;
-            heartbeat_load.set_active_sessions(sessions.len());
+            heartbeat_load.set_active_sessions(sessions, terms);
         }
         _ => {
             provider_session_debug(format!(
@@ -79779,7 +80826,7 @@ async fn handle_provider_session_frame(
                     pending_payloads,
                     &session_id,
                 );
-                heartbeat_load.set_active_sessions(sessions.len());
+                heartbeat_load.set_active_sessions(sessions, terms);
             }
             let _ = bridge.session_close(&remote, &session_id).await;
         }
@@ -83701,9 +84748,13 @@ fn provider_engine_load_config(
     }
     if selected.artifact.engine == "vllm" {
         config.vllm_tensor_parallel = Some(enclave_tp_degree(&selected.enclave.caps)?);
-        if let Some(max_batch_size) = enclave_max_batch_size(&selected.enclave.caps)? {
-            config.batch_size = max_batch_size;
+        if selected.generation_execution_profile.is_some() {
+            config.vllm_max_num_seqs = Some(selected.generation_execution_capacity.max(1));
+        } else if let Some(scheduler_capacity) = enclave_max_batch_size(&selected.enclave.caps)? {
+            config.vllm_max_num_seqs = Some(scheduler_capacity);
         }
+        config.vllm_concurrent_generation_capacity = (selected.generation_execution_capacity > 1)
+            .then_some(selected.generation_execution_capacity);
         if let Some(max_num_tokens) = enclave_max_num_tokens(&selected.enclave.caps)? {
             config.ubatch_size = max_num_tokens.max(1);
         }
@@ -83713,6 +84764,11 @@ fn provider_engine_load_config(
             .get("vllm_dtype")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        config.vllm_kv_cache_dtype = selected
+            .artifact
+            .kv_cache
+            .as_ref()
+            .map(|profile| profile.dtype.clone());
         let utilization = provider_vllm_memory_utilization(selected, args.vllm_memory_utilization)?;
         config.vllm_gpu_memory_utilization_pct = Some(utilization.target_pct);
         config.vllm_gpu_memory_utilization_floor_pct = Some(utilization.floor_pct);
@@ -83959,44 +85015,48 @@ fn materialize_vllm_artifacts(
     selected: &ProviderCandidate,
     artifact_paths: &ProviderArtifactPaths,
 ) -> Result<PathBuf> {
-    let checkpoint_dir =
-        vllm_checkpoint_cache_dir(&artifact_paths.primary, &selected.artifact_name);
+    materialize_vllm_layout(
+        &format!("{}/{}", selected.model.model_id, selected.artifact_name),
+        &selected.artifact_name,
+        &selected.artifact,
+        artifact_paths,
+    )
+}
+
+fn materialize_vllm_layout(
+    label: &str,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    artifact_paths: &ProviderArtifactPaths,
+) -> Result<PathBuf> {
+    let checkpoint_dir = vllm_checkpoint_cache_dir(&artifact_paths.primary, artifact_name);
     fs::create_dir_all(&checkpoint_dir).with_context(|| {
         format!(
             "creating vLLM checkpoint layout {}",
             checkpoint_dir.display()
         )
     })?;
-    let payload_name = catalog_path_file_name(&selected.artifact.path, "vLLM primary artifact")?;
-    link_or_copy_file(&artifact_paths.primary, &checkpoint_dir.join(payload_name))?;
+    let payload_relative = validate_catalog_artifact_relative_path(&artifact.path)?;
+    link_or_copy_file(
+        &artifact_paths.primary,
+        &checkpoint_dir.join(payload_relative),
+    )?;
     for (sidecar_name, filename) in VLLM_REQUIRED_SIDECARS {
-        let sidecar = selected
-            .artifact
-            .sidecars
-            .get(*sidecar_name)
-            .with_context(|| {
-                format!(
-                    "vLLM artifact {}/{} requires admin catalog sidecar {}",
-                    selected.model.model_id, selected.artifact_name, sidecar_name
-                )
-            })?;
+        let sidecar = artifact.sidecars.get(*sidecar_name).with_context(|| {
+            format!("vLLM artifact {label} requires admin catalog sidecar {sidecar_name}")
+        })?;
         if sidecar.path != *filename {
             bail!(
-                "vLLM artifact {}/{} sidecar {} must use path {}, got {}",
-                selected.model.model_id,
-                selected.artifact_name,
+                "vLLM artifact {label} sidecar {} must use path {}, got {}",
                 sidecar_name,
                 filename,
                 sidecar.path
             );
         }
     }
-    for (sidecar_name, sidecar) in &selected.artifact.sidecars {
+    for (sidecar_name, sidecar) in &artifact.sidecars {
         let source = artifact_paths.sidecars.get(sidecar_name).with_context(|| {
-            format!(
-                "downloaded vLLM artifact {}/{} is missing admin sidecar {}",
-                selected.model.model_id, selected.artifact_name, sidecar_name
-            )
+            format!("downloaded vLLM artifact {label} is missing admin sidecar {sidecar_name}")
         })?;
         let relative = validate_catalog_artifact_relative_path(&sidecar.path)?;
         let destination = checkpoint_dir.join(relative);
@@ -85062,6 +86122,7 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         enclave_id: ctx.selected.enclave.enclave_id.clone(),
         model_id: ctx.selected.enclave.model_id.clone(),
         adapter: ctx.selected.model.adapter.clone(),
+        generation_execution_profile: ctx.selected.generation_execution_profile.clone(),
         sampling: ctx.selected.model.sampling.clone(),
         workflow_policy: ctx.selected.model.workflow.clone(),
         output_modalities: if ctx.selected.model.caps.output_modalities.is_empty() {
@@ -93202,6 +94263,8 @@ mod tests {
             model: catalog.models[0].clone(),
             artifact_name: "gguf-q4_k_m".to_owned(),
             artifact: catalog.models[0].artifacts["gguf-q4_k_m"].clone(),
+            generation_execution_profile: None,
+            generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "llama.cpp".to_owned(),
                 status: VerdictStatus::CpuOnly,
@@ -97628,6 +98691,8 @@ status: linked
             model: catalog.models[0].clone(),
             artifact_name: "gguf-q4_k_m".to_owned(),
             artifact,
+            generation_execution_profile: None,
+            generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "comfyui".to_owned(),
                 status: VerdictStatus::FullOffload,
@@ -97714,7 +98779,16 @@ status: linked
 
     #[test]
     fn provider_comfy_artifact_path_is_local_runtime_checkout() {
-        let root = "aa".repeat(32);
+        let definition = json!({
+            "schema_version": 1,
+            "class_id": "upscale.conv.le24mp",
+            "label": "Convolutional upscale <= 24MP",
+            "output_modality": "image",
+            "max_width": 2048,
+            "max_height": 2048,
+            "pricing_unit": "image"
+        });
+        let root = mayhem_proto::comfy_outcome_class_definition_hash(&definition).unwrap();
         let contract = test_workflow_contract(&root);
         let catalog = test_catalog(&root);
         let hardware = test_hardware(FixtureProfile::LinuxNvidia);
@@ -97738,11 +98812,16 @@ status: linked
         let runtime = temp.join("ComfyUI");
         fs::create_dir_all(&runtime).unwrap();
         fs::write(runtime.join("main.py"), "print('comfy')\n").unwrap();
+        let definition_path = temp.join("workflow-class.json");
+        write_json_file(&definition_path, &definition).unwrap();
         args.artifact = Some(runtime.clone());
+        args.workflow_class_definition = Some(definition_path);
         let paths =
             download_provider_artifact_blocking(&args, &temp.join("downloads"), &selected).unwrap();
         assert_eq!(paths.primary, runtime);
-        assert!(paths.sidecars.is_empty());
+        assert!(paths
+            .sidecars
+            .contains_key(PROVIDER_COMFY_WORKFLOW_DEFINITION_ARTIFACT));
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -97850,6 +98929,8 @@ status: linked
             model: catalog.models[0].clone(),
             artifact_name: "gguf-q4_k_m".to_owned(),
             artifact,
+            generation_execution_profile: None,
+            generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "comfyui".to_owned(),
                 status: VerdictStatus::FullOffload,
@@ -100586,7 +101667,7 @@ status: linked
         let tx = admin_contract_tx_digest(&prepared_command, &admin, &nonce, false, &context);
         assert_eq!(
             tx,
-            "59921aa499ce06befca12bcda721ec905deb3a4ed6f4cb73764fb25ebf8c6459"
+            "2e60ee6c323d431422f9c77f862a9893e57e11c11bde71fe69c7b170ecd2d600"
         );
         assert_eq!(
             admin_contract_tx_feature(
@@ -102814,6 +103895,8 @@ status: linked
             model,
             artifact_name,
             artifact,
+            generation_execution_profile: None,
+            generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "llama.cpp".to_owned(),
                 status: VerdictStatus::FullOffload,
@@ -104310,6 +105393,7 @@ status: linked
         catalog.models[0].caps.ctx_max = 262_144;
         let mut vllm_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
         vllm_artifact.engine = "vllm".to_owned();
+        vllm_artifact.artifact_root = "ef".repeat(32);
         vllm_artifact.path = "model.safetensors".to_owned();
         vllm_artifact.artifact_root = vllm_root.clone();
         vllm_artifact.min_compute_cap = Some("7.0".to_owned());
@@ -107042,7 +108126,7 @@ esac
         let expected_message = concat!(
             "mayhem-targeted-spend-reservation-v1",
             "{\"payout_revision\":\"9999999999999999999999999999999999999999999999999999999999999999\",",
-            "\"reservation\":{\"at\":25200,\"contract_version\":18,\"ctx_bracket\":\"le8k\",",
+            "\"reservation\":{\"at\":25200,\"contract_version\":21,\"ctx_bracket\":\"le8k\",",
             "\"ctx_bracket_table_ver\":1,",
             "\"enclave_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
             "\"enclave_pubkey\":\"5555555555555555555555555555555555555555555555555555555555555555\",",
@@ -107071,7 +108155,7 @@ esac
             "\"reservation_expires_after_epoch\":31,",
             "\"reservation_id\":\"7777777777777777777777777777777777777777777777777777777777777777\",",
             "\"reservation_receipt_grace_epochs\":6,",
-            "\"rules_ver\":6,\"schema_version\":10,\"served_ctx\":8192,",
+            "\"rules_ver\":6,\"schema_version\":11,\"served_ctx\":8192,",
             "\"session_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",",
             "\"user\":\"2222222222222222222222222222222222222222222222222222222222222222\",",
             "\"user_sig\":\"6666666666666666666666666666666666666666666666666666666666666666",
@@ -107084,7 +108168,7 @@ esac
                 "hold/targeted/tnk/",
                 "2222222222222222222222222222222222222222222222222222222222222222/7/",
                 "1111111111111111111111111111111111111111111111111111111111111111/",
-                "9e47d78c1ea692060052576455edbf093412be34e537cccadf78804759290675"
+                "cacdf4212d8c6f252d2efaf8a7874397f170ff562a2e13b3d82c31d5108dba1f"
             )
         );
     }
@@ -108038,8 +109122,9 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .expect_err("low-order receipt ack forgery must fail strict verification");
 
         let mut open_frame = test_session_open_frame(&terms);
-        open_frame["user"] = json!(weak_key);
-        open_frame["voucher"]["user_sig"] = json!(weak_signature);
+        open_frame["user"] = json!(weak_key.clone());
+        open_frame["voucher"]["user"] = json!(weak_key);
+        open_frame["voucher"]["user_sig"] = json!(weak_signature.clone());
         open_frame["sig"] = json!(weak_signature);
         assert!(matches!(
             provider_session_open_decision(&open_frame, &terms),
@@ -112276,15 +113361,26 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let mut catalog = test_catalog(&root);
         let mut vllm_artifact = catalog.models[0].artifacts["gguf-q4_k_m"].clone();
         vllm_artifact.engine = "vllm".to_owned();
-        vllm_artifact.path = "model.safetensors".to_owned();
+        vllm_artifact.path = "model-00001-of-00002.safetensors".to_owned();
         vllm_artifact.min_compute_cap = Some("8.0".to_owned());
         vllm_artifact.notes = Some("admin-pinned vLLM safetensors checkpoint".to_owned());
+        vllm_artifact.kv_cache = Some(catalog::CatalogKvCacheProfile {
+            dtype: "fp8".to_owned(),
+            bits: 8,
+            group_size: 1,
+            quantized_start_tokens: 0,
+            full_attention_layers: 16,
+            total_layers: 64,
+            bytes_per_token: 4096,
+            measurement_source: "test fixture".to_owned(),
+        });
         catalog.models[0].requirements.backends = vec!["vllm".to_owned()];
         catalog.models[0].caps.ctx_max = 131_072;
 
         let mut contract = test_contract(&root);
         contract.enclaves[0].backend = "vllm".to_owned();
-        contract.enclaves[0].artifact_source.path = "model.safetensors".to_owned();
+        contract.enclaves[0].artifact_root = vllm_artifact.artifact_root.clone();
+        contract.enclaves[0].artifact_source.path = "model-00001-of-00002.safetensors".to_owned();
         contract.enclaves[0].quant = "bf16".to_owned();
         let ctx_bracket = ctx_bracket_for_tokens(131_072).to_owned();
         contract.prices[0].ctx_bracket = Some(ctx_bracket.clone());
@@ -112305,6 +113401,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ("vllm_tokenizer_config", "tokenizer_config.json"),
             ("vllm_generation_config", "generation_config.json"),
             ("vllm_chat_template", "chat_template.jinja"),
+            (
+                "vllm_weight_shard_00002",
+                "model-00002-of-00002.safetensors",
+            ),
         ] {
             vllm_artifact.sidecars.insert(
                 name.to_owned(),
@@ -112342,17 +113442,54 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         }
         let vllm_enclave_id = canonicalize_test_enclave_id(&mut contract.enclaves[0]);
         contract.prices[0].enclave_id = vllm_enclave_id;
+        catalog.generation_execution_profiles.insert(
+            vllm_artifact.artifact_root.clone(),
+            catalog::CatalogGenerationExecutionProfile {
+                schema_version: 1,
+                engine: "vllm".to_owned(),
+                independent_dispatch: true,
+                request_modalities: vec![vec!["text".to_owned()]],
+                proof_sha256: "ab".repeat(32),
+            },
+        );
         catalog.models[0]
             .artifacts
             .insert("vllm-fp16".to_owned(), vllm_artifact);
         let hardware = test_hardware(FixtureProfile::LinuxNvidia);
         let mut args = test_provider_start_args();
         args.ctx = Some(131_072);
+        args.max_sessions = Some(2);
         let selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
             .unwrap()
             .remove(0);
+        assert_eq!(selected.generation_execution_capacity, 2);
+        assert!(selected.generation_execution_profile.is_some());
+
+        let mut uncapped_contract = contract.clone();
+        uncapped_contract.enclaves[0]
+            .caps
+            .as_object_mut()
+            .unwrap()
+            .remove("max_batch_size");
+        let uncapped = build_provider_candidates(&uncapped_contract, &catalog, &hardware, &args)
+            .unwrap()
+            .remove(0);
+        assert_eq!(uncapped.generation_execution_capacity, 2);
+        assert!(uncapped.generation_execution_profile.is_some());
+
+        let mut serial_catalog = catalog.clone();
+        serial_catalog.generation_execution_profiles.clear();
+        let serial = build_provider_candidates(&contract, &serial_catalog, &hardware, &args)
+            .unwrap()
+            .remove(0);
+        assert_eq!(serial.generation_execution_capacity, 1);
+        assert!(serial.generation_execution_profile.is_none());
+        assert_eq!(
+            selected.feasibility.estimated_kv_bytes,
+            serial.feasibility.estimated_kv_bytes.saturating_mul(2)
+        );
         let temp = test_temp_dir("mayhem-vllm-layout");
-        let primary = temp.join("model.safetensors");
+        let primary = temp.join("model-00001-of-00002.safetensors");
         fs::write(&primary, b"checkpoint").unwrap();
         let sidecar_paths = BTreeMap::from([
             ("vllm_config".to_owned(), temp.join("config.json")),
@@ -112371,6 +113508,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             (
                 "vllm_chat_template".to_owned(),
                 temp.join("chat_template.jinja"),
+            ),
+            (
+                "vllm_weight_shard_00002".to_owned(),
+                temp.join("model-00002-of-00002.safetensors"),
             ),
         ]);
         for path in sidecar_paths.values() {
@@ -112395,7 +113536,16 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             mayhem_engine::ArtifactFormat::VllmSafetensors
         );
         assert_eq!(config.artifact.path, checkpoint_dir);
-        assert!(config.artifact.path.join("model.safetensors").is_file());
+        assert!(config
+            .artifact
+            .path
+            .join("model-00001-of-00002.safetensors")
+            .is_file());
+        assert!(config
+            .artifact
+            .path
+            .join("model-00002-of-00002.safetensors")
+            .is_file());
         assert!(config.artifact.path.join("config.json").is_file());
         assert!(config.artifact.path.join("tokenizer.json").is_file());
         assert!(config.artifact.path.join("tokenizer_config.json").is_file());
@@ -112407,11 +113557,13 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(config.artifact.path.join("chat_template.jinja").is_file());
         assert_eq!(config.ctx_size, 131_072);
         assert_eq!(config.vllm_tensor_parallel, Some(2));
-        assert_eq!(config.batch_size, 3);
+        assert_eq!(config.vllm_max_num_seqs, Some(2));
+        assert_eq!(config.vllm_concurrent_generation_capacity, Some(2));
         assert_eq!(config.ubatch_size, 4096);
         assert_eq!(config.vllm_dtype.as_deref(), Some("float16"));
-        assert_eq!(config.vllm_gpu_memory_utilization_pct, Some(7));
-        assert_eq!(config.vllm_gpu_memory_utilization_floor_pct, Some(2));
+        assert_eq!(config.vllm_kv_cache_dtype.as_deref(), Some("fp8"));
+        assert_eq!(config.vllm_gpu_memory_utilization_pct, Some(6));
+        assert_eq!(config.vllm_gpu_memory_utilization_floor_pct, Some(1));
         assert_eq!(
             config.memory_limit_bytes,
             Some(selected.feasibility.memory_budget.worker_limit_bytes)
@@ -113050,6 +114202,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             model,
             artifact_name: "onnx-lessac-low".to_owned(),
             artifact,
+            generation_execution_profile: None,
+            generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "piper".to_owned(),
                 status: VerdictStatus::CpuOnly,
@@ -113124,6 +114278,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             model,
             artifact_name: "comfy-runtime".to_owned(),
             artifact,
+            generation_execution_profile: None,
+            generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "comfyui".to_owned(),
                 status: VerdictStatus::CpuOnly,
@@ -113151,13 +114307,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ..ProviderBackendRuntime::default()
         };
 
-        let config = provider_engine_load_config(
-            &test_provider_start_args(),
-            &selected,
-            &artifact_paths,
-            &runtime,
-        )
-        .unwrap();
+        let mut args = test_provider_start_args();
+        args.home = Some(PathBuf::from("/tmp/mayhem-home"));
+        let config =
+            provider_engine_load_config(&args, &selected, &artifact_paths, &runtime).unwrap();
 
         assert_eq!(
             config.artifact.format,
@@ -113167,7 +114320,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             config.artifact.path,
             PathBuf::from("/tmp/admin-approved-comfy-runtime")
         );
-        assert_eq!(config.artifact.sha256.as_deref(), Some(source_sha.as_str()));
+        assert!(config.artifact.sha256.is_none());
         assert_eq!(config.backend_cache_dir, Some(cache_dir));
     }
 
@@ -113222,6 +114375,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             model: catalog.models[0].clone(),
             artifact_name: "gguf-q4_k_m".to_owned(),
             artifact,
+            generation_execution_profile: None,
+            generation_execution_capacity: 1,
             verdict,
             price: None,
             served_ctx: 4096,
@@ -113396,6 +114551,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             model: catalog.models[0].clone(),
             artifact_name: "gguf-q4_k_m".to_owned(),
             artifact,
+            generation_execution_profile: None,
+            generation_execution_capacity: 1,
             verdict,
             price: contract.prices.first().cloned(),
             served_ctx: 4096,
@@ -113488,6 +114645,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             model: catalog.models[0].clone(),
             artifact_name: "gguf-q4_k_m".to_owned(),
             artifact,
+            generation_execution_profile: None,
+            generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "comfyui".to_owned(),
                 status: VerdictStatus::FullOffload,
@@ -113573,6 +114732,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             model: catalog.models[0].clone(),
             artifact_name: "workflow-class".to_owned(),
             artifact,
+            generation_execution_profile: None,
+            generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "comfyui".to_owned(),
                 status: VerdictStatus::FullOffload,
@@ -113629,6 +114790,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             model: catalog.models[0].clone(),
             artifact_name: "gguf-q4_k_m".to_owned(),
             artifact,
+            generation_execution_profile: None,
+            generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "comfyui".to_owned(),
                 status: VerdictStatus::FullOffload,
@@ -113776,6 +114939,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
     #[test]
     fn provider_bridge_drop_clears_active_session_slots_without_exiting() {
+        let terms = test_provider_session_terms();
         let mut sessions = HashMap::new();
         let mut pending_requests = HashMap::new();
         let mut pending_payloads = HashMap::new();
@@ -113819,13 +114983,14 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             PendingProviderPayload::default(),
         );
         let load = ProviderHeartbeatLoad::default();
-        load.set_active_sessions(sessions.len());
+        load.set_active_sessions(&sessions, &terms);
 
         let dropped = clear_provider_sessions_after_bridge_drop(
             &mut sessions,
             &mut pending_requests,
             &mut pending_payloads,
             &load,
+            &terms,
         );
 
         assert_eq!(dropped, 2);
@@ -113915,13 +115080,14 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             PendingProviderPayload::default(),
         );
         let load = ProviderHeartbeatLoad::default();
-        load.set_active_sessions(sessions.len());
+        load.set_active_sessions(&sessions, &terms);
 
         let released = discard_pre_request_provider_session_on_close(
             &mut sessions,
             &mut pending_requests,
             &mut pending_payloads,
             &load,
+            &terms,
             &json!({
                 "type": "session_closed",
                 "session_id": session_id,
@@ -113949,13 +115115,14 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let remote = active.remote.clone();
         sessions.insert(session_id.clone(), active);
         let load = ProviderHeartbeatLoad::default();
-        load.set_active_sessions(sessions.len());
+        load.set_active_sessions(&sessions, &terms);
 
         let released = discard_pre_request_provider_session_on_close(
             &mut sessions,
             &mut pending_requests,
             &mut pending_payloads,
             &load,
+            &terms,
             &json!({
                 "type": "session_closed",
                 "session_id": session_id,
@@ -114607,7 +115774,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(load.snapshot(0), ProviderLoadSnapshot::default());
         assert_eq!(load.snapshot(8), ProviderLoadSnapshot::idle(8));
         assert!(!changes.has_changed().unwrap());
-        load.set_active_sessions(2);
+        load.set_independent_session_count(2);
         assert!(changes.has_changed().unwrap());
         changes.borrow_and_update();
         assert_eq!(
@@ -114636,7 +115803,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     #[test]
     fn provider_heartbeat_load_tracks_queue_and_measured_perf() {
         let load = ProviderHeartbeatLoad::default();
-        load.set_active_sessions(3);
+        load.set_independent_session_count(3);
         let mut request = load.begin_request(BTreeMap::new()).unwrap();
 
         let busy = load.snapshot(4);
@@ -114809,14 +115976,92 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
         let load = ProviderHeartbeatLoad::default();
         assert_eq!(load.snapshot(config.max_sessions).free_slots, 1);
-        load.set_active_sessions(1);
+        load.set_independent_session_count(1);
         let busy = load.snapshot(config.max_sessions);
         assert_eq!(busy.free_slots, 0);
         assert!(!busy.accepting_new);
-        load.set_active_sessions(0);
+        load.set_independent_session_count(0);
         let idle = load.snapshot(config.max_sessions);
         assert_eq!(idle.free_slots, 1);
         assert!(idle.accepting_new);
+    }
+
+    #[test]
+    fn provider_concurrent_capacity_and_artifact_profile_gate_are_explicit() {
+        struct TwoSessionResponder;
+
+        impl ProviderSessionResponder for TwoSessionResponder {
+            fn mode(&self) -> &'static str {
+                "test-concurrent"
+            }
+
+            fn concurrent_session_capacity(&self) -> u32 {
+                2
+            }
+
+            fn respond(
+                &mut self,
+                _terms: &ProviderSessionTerms,
+                _body: &Value,
+                _cancellation: &CancellationToken,
+            ) -> Result<ProviderSessionOutput> {
+                unreachable!("capacity test does not execute inference")
+            }
+        }
+
+        let responder = TwoSessionResponder;
+        let config = provider_effective_protection_config(
+            ProviderProtectionConfig::unlimited_for_tests(8),
+            Some(&responder),
+        );
+        assert_eq!(config.max_sessions, 2);
+
+        let load = ProviderHeartbeatLoad::default();
+        let mut terms = test_provider_session_terms();
+        let text = test_active_provider_session(&terms, vec!["text".to_owned()]);
+        assert!(!provider_session_allows_independent_dispatch(&terms, &text));
+        let mut sessions = HashMap::from([(text.session_id.clone(), text.clone())]);
+        load.set_active_sessions(&sessions, &terms);
+        let exclusive = load.snapshot(config.max_sessions);
+        assert_eq!(exclusive.active_slots, 1);
+        assert_eq!(exclusive.free_slots, 0);
+        assert!(!exclusive.accepting_new);
+        assert!(!load.is_accepting_new());
+
+        terms.generation_execution_profile = Some(catalog::CatalogGenerationExecutionProfile {
+            schema_version: 1,
+            engine: "vllm".to_owned(),
+            independent_dispatch: true,
+            request_modalities: vec![vec!["text".to_owned()]],
+            proof_sha256: "aa".repeat(32),
+        });
+        assert!(provider_session_allows_independent_dispatch(&terms, &text));
+        load.set_active_sessions(&sessions, &terms);
+        let independent = load.snapshot(config.max_sessions);
+        assert_eq!(independent.active_slots, 1);
+        assert_eq!(independent.free_slots, 1);
+        assert!(independent.accepting_new);
+        assert!(load.is_accepting_new());
+
+        let mut image =
+            test_active_provider_session(&terms, vec!["image".to_owned(), "text".to_owned()]);
+        image.session_id = "bb".repeat(32);
+        assert!(!provider_session_allows_independent_dispatch(
+            &terms, &image
+        ));
+        sessions.insert(image.session_id.clone(), image);
+        load.set_active_sessions(&sessions, &terms);
+        let mixed = load.snapshot(config.max_sessions);
+        assert_eq!(mixed.active_slots, 2);
+        assert_eq!(mixed.free_slots, 0);
+        assert!(!mixed.accepting_new);
+
+        sessions.retain(|_, session| session.required_modalities == ["text"]);
+        load.set_active_sessions(&sessions, &terms);
+        let recovered = load.snapshot(config.max_sessions);
+        assert_eq!(recovered.active_slots, 1);
+        assert_eq!(recovered.free_slots, 1);
+        assert!(recovered.accepting_new);
     }
 
     #[test]
@@ -114853,6 +116098,19 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             rate.acceptance_decision(0),
             ProviderSessionDecision::Reject { code: "RATE", .. }
         ));
+
+        let mut uncommitted = ProviderProtectionState::new(ProviderProtectionConfig {
+            max_sessions: 4,
+            accept_rate_per_minute: 1,
+            budget_au: 0,
+            budget_units: 0,
+            budget_period: Duration::from_secs(86_400),
+        });
+        assert_eq!(
+            uncommitted.acceptance_decision(0),
+            ProviderSessionDecision::Accept
+        );
+        assert!(uncommitted.accepted_at.is_empty());
 
         let mut quota_au = ProviderProtectionState::new(ProviderProtectionConfig {
             max_sessions: 4,
@@ -118044,6 +119302,10 @@ State initialization...
         let mut args = test_calibrate_canary_args();
         args.vllm_memory_utilization = Some(40);
         args.vllm_memory_utilization_floor = Some(40);
+        args.vllm_dtype = Some("bfloat16".to_owned());
+        args.vllm_kv_cache_dtype = Some("fp8".to_owned());
+        args.vllm_max_num_seqs = Some(2);
+        args.vllm_max_num_batched_tokens = Some(2048);
 
         validate_calibration_args_for_artifact(&artifact, &args).unwrap();
         let runtime =
@@ -118051,11 +119313,39 @@ State initialization...
                 .unwrap();
         assert_eq!(runtime.vllm_memory_utilization_pct, Some(40));
         assert_eq!(runtime.vllm_memory_utilization_floor_pct, Some(40));
+        assert_eq!(runtime.vllm_dtype.as_deref(), Some("bfloat16"));
+        assert_eq!(runtime.vllm_kv_cache_dtype.as_deref(), Some("fp8"));
+        assert_eq!(runtime.vllm_max_num_seqs, Some(2));
+        assert_eq!(runtime.vllm_max_num_batched_tokens, Some(2048));
+
+        let mut legacy_args = test_calibrate_canary_args();
+        legacy_args.trt_max_batch_size = Some(3);
+        validate_calibration_args_for_artifact(&artifact, &legacy_args).unwrap();
+        let legacy_runtime = catalog_canary_runtime_config(
+            &artifact,
+            Path::new("/tmp/model.safetensors"),
+            &legacy_args,
+        )
+        .unwrap();
+        assert_eq!(legacy_runtime.vllm_max_num_seqs, Some(3));
+
+        legacy_args.vllm_max_num_seqs = Some(2);
+        let error = validate_calibration_args_for_artifact(&artifact, &legacy_args).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--vllm-max-num-seqs conflicts with legacy --trt-max-batch-size"),
+            "{error}"
+        );
 
         let mut plan_args = test_canary_plan_args();
         plan_args.home = Some(PathBuf::from("/tmp/provider-home"));
         plan_args.vllm_memory_utilization = Some(40);
         plan_args.vllm_memory_utilization_floor = Some(40);
+        plan_args.vllm_dtype = Some("bfloat16".to_owned());
+        plan_args.vllm_kv_cache_dtype = Some("fp8".to_owned());
+        plan_args.vllm_max_num_seqs = Some(2);
+        plan_args.vllm_max_num_batched_tokens = Some(2048);
         let command = catalog_canary_calibration_plan_command(CatalogCanaryCalibrationPlanInput {
             catalog_path: Path::new("/tmp/catalog.json"),
             canaries_dir: Path::new("/tmp/canaries"),
@@ -118080,6 +119370,17 @@ State initialization...
             .argv
             .windows(2)
             .any(|pair| { pair[0] == "--vllm-memory-utilization-floor" && pair[1] == "40" }));
+        for (flag, value) in [
+            ("--vllm-dtype", "bfloat16"),
+            ("--vllm-kv-cache-dtype", "fp8"),
+            ("--vllm-max-num-seqs", "2"),
+            ("--vllm-max-num-batched-tokens", "2048"),
+        ] {
+            assert!(command
+                .argv
+                .windows(2)
+                .any(|pair| pair[0] == flag && pair[1] == value));
+        }
 
         args.vllm_memory_utilization_floor = Some(41);
         let err = validate_calibration_args_for_artifact(&artifact, &args).unwrap_err();
@@ -121792,6 +123093,44 @@ State initialization...
     }
 
     #[test]
+    fn catalog_sign_report_rejects_semantically_invalid_execution_profile_before_writing() {
+        let temp = test_temp_dir("mayhem-catalog-sign-invalid-execution-profile");
+        let catalog_path = temp.join("models.json");
+        write_semantically_valid_test_catalog(&catalog_path);
+        let mut catalog = read_json_file(&catalog_path).unwrap();
+        catalog["generation_execution_profiles"] = json!({
+            "00".repeat(32): {
+                "schema_version": 1,
+                "engine": "vllm",
+                "independent_dispatch": true,
+                "request_modalities": [["text"]],
+                "proof_sha256": "11".repeat(32),
+            }
+        });
+        write_json_file(&catalog_path, &catalog).unwrap();
+        let seed_file = temp.join("catalog-seed.hex");
+        fs::write(&seed_file, "08".repeat(32)).unwrap();
+        let signature_output = temp.join("models.json.sig");
+        let keys_dir = temp.join("keys");
+
+        let error = catalog_sign_report(CatalogSignRequest {
+            catalog_path,
+            signature_output: signature_output.clone(),
+            keys_dir: keys_dir.clone(),
+            key_id: "test-catalog-key".to_owned(),
+            seed_file,
+            write_key: true,
+            created_at: Some("2026-09-02T00:00:00Z".to_owned()),
+        })
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("unknown primary catalog artifact root"));
+        assert!(!signature_output.exists());
+        assert!(!keys_dir.exists());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn catalog_apply_attestation_authority_command_parses_typed_inputs() {
         let cli = Cli::try_parse_from([
             "mayhem",
@@ -122942,6 +124281,62 @@ State initialization...
     }
 
     #[test]
+    fn catalog_signing_guard_binds_execution_profiles_to_model_review() {
+        let temp = test_temp_dir("mayhem-catalog-execution-profile-signing");
+        let base_path = temp.join("base.json");
+        let candidate_path = temp.join("candidate.json");
+        let existing_root = "11".repeat(32);
+        let new_root = "22".repeat(32);
+        let profile = |proof: &str| {
+            json!({
+                "schema_version": 1,
+                "engine": "vllm",
+                "independent_dispatch": true,
+                "request_modalities": [["text"]],
+                "proof_sha256": proof
+            })
+        };
+        let base = json!({
+            "models": [{
+                "model_id": "test/keep",
+                "artifacts": {"nvfp4": {"artifact_root": existing_root}}
+            }],
+            "generation_execution_profiles": {
+                existing_root.clone(): profile(&"33".repeat(32))
+            }
+        });
+        write_json_file(&base_path, &base).unwrap();
+
+        let mut additive = base.clone();
+        additive["models"].as_array_mut().unwrap().push(json!({
+            "model_id": "test/new",
+            "artifacts": {"nvfp4": {"artifact_root": new_root}}
+        }));
+        additive["generation_execution_profiles"][&new_root] = profile(&"44".repeat(32));
+        write_json_file(&candidate_path, &additive).unwrap();
+        validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), false)
+            .unwrap();
+
+        additive["generation_execution_profiles"][&existing_root] = profile(&"55".repeat(32));
+        write_json_file(&candidate_path, &additive).unwrap();
+        let error =
+            validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), false)
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unapproved generation execution profile changes"));
+        validate_additive_catalog_update(
+            &base_path,
+            &candidate_path,
+            &BTreeSet::from(["test/keep".to_owned()]),
+            false,
+        )
+        .unwrap();
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn catalog_signing_guard_ignores_lossless_json_number_reserialization() {
         let temp = test_temp_dir("mayhem-catalog-number-reserialization");
         let base_path = temp.join("base.json");
@@ -123976,6 +125371,7 @@ State initialization...
                 .clone(),
             model_id: "test/model@4bit".to_owned(),
             adapter: catalog::CatalogAdapter::default(),
+            generation_execution_profile: None,
             sampling: catalog::CatalogSamplingProfile::default(),
             workflow_policy: None,
             output_modalities: vec!["text".to_owned()],
@@ -124429,6 +125825,10 @@ State initialization...
                 trt_max_num_tokens: None,
                 vllm_memory_utilization_pct: None,
                 vllm_memory_utilization_floor_pct: None,
+                vllm_dtype: None,
+                vllm_kv_cache_dtype: None,
+                vllm_max_num_seqs: None,
+                vllm_max_num_batched_tokens: None,
             },
             canary_set: "test-canary".to_owned(),
             canary_set_sha256: String::new(),
@@ -124609,6 +126009,10 @@ State initialization...
             trt_max_num_tokens: None,
             vllm_memory_utilization: None,
             vllm_memory_utilization_floor: None,
+            vllm_dtype: None,
+            vllm_kv_cache_dtype: None,
+            vllm_max_num_seqs: None,
+            vllm_max_num_batched_tokens: None,
             json: false,
         }
     }
@@ -124640,6 +126044,10 @@ State initialization...
             trt_max_num_tokens: None,
             vllm_memory_utilization: None,
             vllm_memory_utilization_floor: None,
+            vllm_dtype: None,
+            vllm_kv_cache_dtype: None,
+            vllm_max_num_seqs: None,
+            vllm_max_num_batched_tokens: None,
             include_dev: false,
             json: false,
         }
@@ -126304,6 +127712,7 @@ State initialization...
             .cloned()
             .expect("repo catalog must retain at least one signed launch model");
         *models = vec![launch];
+        catalog["generation_execution_profiles"] = json!({});
         catalog["catalog_id"] = json!("mayhem-test-signed-catalog");
         write_json_file(path, &catalog).unwrap();
     }
@@ -126342,6 +127751,7 @@ State initialization...
             schema_version: 1,
             catalog_id: "test".to_owned(),
             generated_at: "2026-07-02T00:00:00Z".to_owned(),
+            generation_execution_profiles: BTreeMap::new(),
             models: vec![catalog::CatalogModel {
                 model_id: "test/model@4bit".to_owned(),
                 model_class: DEFAULT_MODEL_CLASS.to_owned(),

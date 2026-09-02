@@ -351,6 +351,22 @@ impl ScBridgeClient {
         .await
     }
 
+    pub async fn session_takeover(
+        &mut self,
+        remote: impl AsRef<str>,
+        session_id: impl AsRef<str>,
+    ) -> Result<Value> {
+        self.request(
+            json!({
+                "type": "session_takeover",
+                "remote": remote.as_ref(),
+                "session_id": session_id.as_ref(),
+            }),
+            "session_taken_over",
+        )
+        .await
+    }
+
     pub async fn peer_connect(&mut self, remote: impl AsRef<str>, wait: Duration) -> Result<Value> {
         let wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
         self.request(
