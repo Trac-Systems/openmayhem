@@ -70,6 +70,122 @@ const MUSIC_REQUEST_ALIAS_GROUPS: &[(&str, &[&str])] = &[
     ("constrained_decoding", &["use_constrained_decoding"]),
 ];
 
+pub fn openai_responses_input_to_chat_messages(input: &Value) -> Result<Vec<Value>, String> {
+    match input {
+        Value::String(text) if !text.trim().is_empty() => {
+            Ok(vec![json!({"role": "user", "content": text})])
+        }
+        Value::Array(items) if !items.is_empty() => {
+            let mut messages = Vec::with_capacity(items.len());
+            for item in items {
+                let object = item
+                    .as_object()
+                    .ok_or_else(|| "Responses input array items must be objects".to_owned())?;
+                match object.get("type").and_then(Value::as_str) {
+                    Some("function_call") => {
+                        let call_id = responses_required_string(
+                            object,
+                            "call_id",
+                            "Responses function call is missing call_id",
+                        )?;
+                        let name = responses_required_string(
+                            object,
+                            "name",
+                            "Responses function call is missing name",
+                        )?;
+                        let arguments = responses_required_string(
+                            object,
+                            "arguments",
+                            "Responses function call is missing arguments",
+                        )?;
+                        let tool_call = json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": arguments,
+                            },
+                        });
+                        if let Some(previous) = messages.last_mut().and_then(Value::as_object_mut) {
+                            let is_tool_call_message = previous.get("role").and_then(Value::as_str)
+                                == Some("assistant")
+                                && previous.get("content").is_some_and(Value::is_null)
+                                && previous.get("tool_calls").is_some_and(Value::is_array);
+                            if is_tool_call_message {
+                                previous
+                                    .get_mut("tool_calls")
+                                    .and_then(Value::as_array_mut)
+                                    .expect("tool_calls checked as an array")
+                                    .push(tool_call);
+                                continue;
+                            }
+                        }
+                        messages.push(json!({
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [tool_call],
+                        }));
+                    }
+                    Some("function_call_output") => {
+                        let call_id = responses_required_string(
+                            object,
+                            "call_id",
+                            "Responses function call output is missing call_id",
+                        )?;
+                        let output = object.get("output").cloned().ok_or_else(|| {
+                            "Responses function call output is missing output".to_owned()
+                        })?;
+                        if !output.is_string() && !output.is_array() {
+                            return Err(
+                                "Responses function call output must be a string or content array"
+                                    .to_owned(),
+                            );
+                        }
+                        messages.push(json!({
+                            "role": "tool",
+                            "content": output,
+                            "tool_call_id": call_id,
+                        }));
+                    }
+                    Some("message") | None => {
+                        let role = responses_required_string(
+                            object,
+                            "role",
+                            "Responses input message is missing role",
+                        )?;
+                        if !object.contains_key("content") {
+                            return Err("Responses input message is missing content".to_owned());
+                        }
+                        let mut message = object.clone();
+                        message.remove("type");
+                        message.insert("role".to_owned(), json!(role));
+                        messages.push(Value::Object(message));
+                    }
+                    Some(item_type) => {
+                        return Err(format!(
+                            "unsupported Responses input item type: {item_type}"
+                        ));
+                    }
+                }
+            }
+            Ok(messages)
+        }
+        _ => Err("input must be a non-empty string or array of Responses input objects".to_owned()),
+    }
+}
+
+fn responses_required_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+    message: &'static str,
+) -> Result<&'a str, String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| message.to_owned())
+}
+
 const MUSIC_INLINE_AUDIO_ROOTS: &[&str] = &[
     "source_audio",
     "src_audio",
@@ -5235,6 +5351,55 @@ fn validate_nested_endpoint_attributes(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn responses_continuation_normalizes_to_chat_tool_history() {
+        let messages = openai_responses_input_to_chat_messages(&json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "What is the weather?"}]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_weather",
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Berlin\"}"
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_time",
+                "name": "get_time",
+                "arguments": "{\"city\":\"Berlin\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_weather",
+                "output": "{\"temperature_c\":21}"
+            }
+        ]))
+        .expect("valid Responses continuation");
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert!(messages[0].get("type").is_none());
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"].as_array().map(Vec::len), Some(2));
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_weather");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_weather");
+    }
+
+    #[test]
+    fn responses_continuation_rejects_unsupported_items() {
+        let error = openai_responses_input_to_chat_messages(&json!([{
+            "type": "web_search_call",
+            "id": "search_1"
+        }]))
+        .expect_err("hosted tool calls are not provider messages");
+
+        assert!(error.contains("web_search_call"));
+    }
 
     #[test]
     fn endpoint_request_fingerprint_survives_javascript_number_serialization() {

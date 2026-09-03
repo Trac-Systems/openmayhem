@@ -89842,13 +89842,7 @@ fn provider_endpoint_messages(endpoint_family: &str, body: &Value) -> Result<Vec
             let input = body
                 .get("input")
                 .context("Responses request missing input")?;
-            match input {
-                Value::String(text) if !text.trim().is_empty() => {
-                    Ok(vec![json!({"role":"user", "content":text})])
-                }
-                Value::Array(items) if !items.is_empty() => Ok(items.clone()),
-                _ => bail!("Responses input must be a non-empty string or message array"),
-            }
+            mayhem_proto::openai_responses_input_to_chat_messages(input).map_err(anyhow::Error::msg)
         }
         other => bail!("endpoint family {other} is not a conversational text surface"),
     }
@@ -110019,6 +110013,39 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         malformed["messages"][0]["tool_calls"][0]["function"]["arguments"] = json!("not-json");
         let error = provider_engine_request_from_body(&malformed, &adapter).unwrap_err();
         assert!(error.to_string().contains("are not valid JSON"));
+    }
+
+    #[test]
+    fn provider_responses_continuation_maps_function_calls_to_tool_history() {
+        let body = json!({
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "What is the weather?"}]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_weather",
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"Berlin\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_weather",
+                    "output": "{\"temperature_c\":21}"
+                }
+            ]
+        });
+
+        let messages = provider_endpoint_messages(mayhem_proto::ENDPOINT_OPENAI_RESPONSES, &body)
+            .expect("valid provider Responses continuation");
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_weather");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_weather");
     }
 
     #[test]

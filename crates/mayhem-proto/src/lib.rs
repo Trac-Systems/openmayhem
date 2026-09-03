@@ -25,10 +25,10 @@ pub use endpoint_contract::{
     canonicalize_endpoint_request_aliases, endpoint_attribute_value_matches,
     endpoint_contract_fingerprint, endpoint_family_contract_template, endpoint_request_fingerprint,
     generate_endpoint_calibration_cases, materialize_endpoint_calibration_request,
-    materialize_endpoint_request_defaults, validate_endpoint_attribute_value,
-    validate_endpoint_request, validate_endpoint_response, ArtifactGenerationInlineAudioLoad,
-    EndpointCalibrationCase, EndpointCalibrationMutation, EndpointCalibrationValue,
-    EndpointContractViolation,
+    materialize_endpoint_request_defaults, openai_responses_input_to_chat_messages,
+    validate_endpoint_attribute_value, validate_endpoint_request, validate_endpoint_response,
+    ArtifactGenerationInlineAudioLoad, EndpointCalibrationCase, EndpointCalibrationMutation,
+    EndpointCalibrationValue, EndpointContractViolation,
 };
 pub use parts_catalog::{
     build_comfy_parts_index, comfy_part_record_hash, comfy_parts_anchor_hash, derive_comfy_part_id,
