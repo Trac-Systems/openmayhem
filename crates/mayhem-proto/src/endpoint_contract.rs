@@ -144,6 +144,8 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
                 "user",
                 "messages.role",
                 "messages.name",
+                "messages.reasoning",
+                "messages.reasoning_content",
                 "messages.tool_calls",
                 "messages.tool_call_id",
                 "messages.content.type",
@@ -214,6 +216,8 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
                 "messages",
                 "messages.role",
                 "messages.name",
+                "messages.reasoning",
+                "messages.reasoning_content",
                 "messages.tool_calls",
                 "messages.tool_call_id",
                 "messages.content.type",
@@ -1224,6 +1228,9 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
             ],
         ),
         "messages.name" | "messages.tool_call_id" => string_spec(1, 256, json!("calibration")),
+        "messages.reasoning" | "messages.reasoning_content" => {
+            string_spec(0, 1_048_576, json!("Mayhem calibration reasoning"))
+        }
         "messages.tool_calls" => array_spec(
             1,
             128,
@@ -6906,6 +6913,49 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(unknown[0].path, "provider_native");
+    }
+
+    #[test]
+    fn chat_contract_accepts_opencode_reasoning_history_messages() {
+        let contract = endpoint_family_contract_template(ENDPOINT_OPENAI_CHAT_COMPLETIONS)
+            .expect("chat contract");
+        let request = json!({
+            "model": "test",
+            "messages": [
+                {"role": "user", "content": "Remember cobalt-signal-827."},
+                {
+                    "role": "assistant",
+                    "content": "Noted.",
+                    "reasoning_content": "I should retain the marker for the next turn."
+                },
+                {"role": "user", "content": "What was the marker?"}
+            ],
+            "stream": true
+        });
+        assert!(validate_endpoint_request(&contract, &request).is_ok());
+
+        let alias = json!({
+            "model": "test",
+            "messages": [{
+                "role": "assistant",
+                "content": "Noted.",
+                "reasoning": "Equivalent reasoning-history alias."
+            }]
+        });
+        assert!(validate_endpoint_request(&contract, &alias).is_ok());
+
+        let wrong_type = json!({
+            "model": "test",
+            "messages": [{
+                "role": "assistant",
+                "content": "Noted.",
+                "reasoning_content": {"text": "must remain a string"}
+            }]
+        });
+        let violations = validate_endpoint_request(&contract, &wrong_type).unwrap_err();
+        assert!(violations
+            .iter()
+            .any(|violation| violation.path == "messages.reasoning_content"));
     }
 
     #[test]

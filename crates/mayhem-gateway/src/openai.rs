@@ -37272,6 +37272,34 @@ mod tests {
         assert_eq!(normalized.normalized_request["stream"], false);
     }
 
+    #[test]
+    fn chat_normalization_preserves_nested_reasoning_history() {
+        let contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+        )
+        .expect("OpenAI chat contract");
+        let raw = json!({
+            "model": "test/model",
+            "messages": [
+                {"role": "user", "content": "Remember cobalt-signal-827."},
+                {
+                    "role": "assistant",
+                    "content": "Noted.",
+                    "reasoning_content": "The private marker is cobalt-signal-827."
+                },
+                {"role": "user", "content": "Repeat the marker."}
+            ],
+            "stream": true
+        });
+        let normalized = normalize_endpoint_request_for_provider(&contract, &raw)
+            .expect("OpenCode-style request normalization");
+
+        assert_eq!(
+            normalized.normalized_request["messages"][1]["reasoning_content"],
+            raw["messages"][1]["reasoning_content"]
+        );
+    }
+
     fn z_image_test_contract() -> EndpointFamilyContract {
         let mut contract = mayhem_proto::endpoint_family_contract_template(
             mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,

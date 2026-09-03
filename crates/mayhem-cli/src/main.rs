@@ -110075,7 +110075,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             json!({"role": "user", "content": "Choose a private marker"}),
             json!({
                 "role": "assistant",
-                "content": "<think>copper-signal-731</think>Noted."
+                "content": "<think>bronze-signal-419</think>Noted.",
+                "reasoning_content": "copper-signal-731"
             }),
             json!({"role": "user", "content": "Continue"}),
         ];
@@ -110095,6 +110096,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         )
         .unwrap();
         assert!(!prompt.contains("copper-signal-731"));
+        assert!(!prompt.contains("bronze-signal-419"));
         assert!(prompt.contains("Noted."));
 
         let preserve = GenerateSpecialityParameter {
@@ -110105,6 +110107,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let prompt =
             provider_engine_qwen3_prompt(&history, &[], &[disabled, preserve], &adapter).unwrap();
         assert!(prompt.contains("copper-signal-731"));
+        assert!(prompt.contains("bronze-signal-419"));
     }
 
     #[test]

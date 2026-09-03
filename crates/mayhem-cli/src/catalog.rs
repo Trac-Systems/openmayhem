@@ -3248,6 +3248,7 @@ fn validate_endpoint_families(model: &CatalogModel, errors: &mut Vec<String>) {
             errors,
         );
         validate_endpoint_attribute_specs(model, contract, errors);
+        validate_reasoning_history_contract(model, contract, errors);
         validate_image_endpoint_defaults(model, contract, errors);
         for required in &contract.required_request_attributes {
             if !contract.request_attributes.contains(required) {
@@ -3271,6 +3272,43 @@ fn validate_endpoint_families(model: &CatalogModel, errors: &mut Vec<String>) {
             errors.push(format!(
                 "{} adapter.endpoint_families missing required compatible family {}",
                 model.model_id, required
+            ));
+        }
+    }
+}
+
+fn validate_reasoning_history_contract(
+    model: &CatalogModel,
+    contract: &EndpointFamilyContract,
+    errors: &mut Vec<String>,
+) {
+    let requires_message_fields = model
+        .min_app_version
+        .as_deref()
+        .and_then(|value| semver::Version::parse(value.trim()).ok())
+        .is_some_and(|version| version >= semver::Version::new(0, 2, 166));
+    if !requires_message_fields
+        || !matches!(
+            contract.family.as_str(),
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+        )
+        || !contract
+            .speciality_mappings
+            .contains_key("thinking_history")
+    {
+        return;
+    }
+
+    for path in ["messages.reasoning", "messages.reasoning_content"] {
+        if !contract
+            .request_attributes
+            .iter()
+            .any(|attribute| attribute == path)
+        {
+            errors.push(format!(
+                "{} endpoint family {} exposes thinking_history but omits {}",
+                model.model_id, contract.family, path
             ));
         }
     }
@@ -5395,6 +5433,44 @@ mod tests {
         let bytes = fs::read(&path)
             .unwrap_or_else(|err| panic!("reading repository catalog {}: {err}", path.display()));
         serde_json::from_slice(&bytes).expect("repository catalog must parse")
+    }
+
+    #[test]
+    fn reasoning_history_contracts_declare_supported_message_fields() {
+        let catalog = repository_catalog();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "Qwen/Qwen3.8-27B")
+            .expect("Qwen 3.8 catalog model");
+        let mut contract = model
+            .adapter
+            .endpoint_families
+            .iter()
+            .find(|contract| contract.family == mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS)
+            .expect("Qwen 3.8 chat contract")
+            .clone();
+
+        let mut errors = Vec::new();
+        validate_reasoning_history_contract(model, &contract, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+
+        contract
+            .request_attributes
+            .retain(|path| path != "messages.reasoning_content");
+        errors.clear();
+        validate_reasoning_history_contract(model, &contract, &mut errors);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("omits messages.reasoning_content"));
+
+        let mut legacy_model = model.clone();
+        legacy_model.min_app_version = Some("0.2.165".to_owned());
+        errors.clear();
+        validate_reasoning_history_contract(&legacy_model, &contract, &mut errors);
+        assert!(
+            errors.is_empty(),
+            "the new guard must not invalidate an older signed catalog: {errors:?}"
+        );
     }
 
     fn catalog_with_valid_generation_execution_profile() -> (CatalogDocument, String) {

@@ -11434,6 +11434,26 @@
                 "value_types": [
                   "string"
                 ]
+              },
+              "messages.reasoning": {
+                "calibration_values": [
+                  "Mayhem calibration reasoning"
+                ],
+                "max_length": 1048576,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.reasoning_content": {
+                "calibration_values": [
+                  "Mayhem calibration reasoning"
+                ],
+                "max_length": 1048576,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
               }
             },
             "request_attributes": [
@@ -11445,6 +11465,8 @@
               "messages.content.text",
               "messages.content.type",
               "messages.name",
+              "messages.reasoning",
+              "messages.reasoning_content",
               "messages.role",
               "messages.tool_call_id",
               "messages.tool_calls",
@@ -12578,6 +12600,26 @@
                 "value_types": [
                   "number"
                 ]
+              },
+              "messages.reasoning": {
+                "calibration_values": [
+                  "Mayhem calibration reasoning"
+                ],
+                "max_length": 1048576,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.reasoning_content": {
+                "calibration_values": [
+                  "Mayhem calibration reasoning"
+                ],
+                "max_length": 1048576,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
               }
             },
             "request_attributes": [
@@ -12591,6 +12633,8 @@
               "messages.content.video.fps",
               "messages.content.video.num_frames",
               "messages.name",
+              "messages.reasoning",
+              "messages.reasoning_content",
               "messages.role",
               "messages.tool_call_id",
               "messages.tool_calls",
@@ -14825,7 +14869,8 @@
         ],
         "unsupported": {}
       },
-      "tier": "launch"
+      "tier": "launch",
+      "min_app_version": "0.2.166"
     },
     {
       "model_id": "huihui-ai/Huihui-Agents-A1-abliterated",
@@ -19274,6 +19319,26 @@
                 "value_types": [
                   "string"
                 ]
+              },
+              "messages.reasoning": {
+                "calibration_values": [
+                  "Mayhem calibration reasoning"
+                ],
+                "max_length": 1048576,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.reasoning_content": {
+                "calibration_values": [
+                  "Mayhem calibration reasoning"
+                ],
+                "max_length": 1048576,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
               }
             },
             "request_attributes": [
@@ -19285,6 +19350,8 @@
               "messages.content.text",
               "messages.content.type",
               "messages.name",
+              "messages.reasoning",
+              "messages.reasoning_content",
               "messages.role",
               "messages.tool_call_id",
               "messages.tool_calls",
@@ -20431,6 +20498,26 @@
                 "value_types": [
                   "string"
                 ]
+              },
+              "messages.reasoning": {
+                "calibration_values": [
+                  "Mayhem calibration reasoning"
+                ],
+                "max_length": 1048576,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.reasoning_content": {
+                "calibration_values": [
+                  "Mayhem calibration reasoning"
+                ],
+                "max_length": 1048576,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
               }
             },
             "request_attributes": [
@@ -20444,6 +20531,8 @@
               "messages.content.video.fps",
               "messages.content.video.num_frames",
               "messages.name",
+              "messages.reasoning",
+              "messages.reasoning_content",
               "messages.role",
               "messages.tool_call_id",
               "messages.tool_calls",
@@ -24559,7 +24648,8 @@
         ],
         "unsupported": {}
       },
-      "tier": "launch"
+      "tier": "launch",
+      "min_app_version": "0.2.166"
     },
     {
       "model_id": "tongyi/z-image-turbo",
@@ -32282,6 +32372,26 @@
                   "xhigh"
                 ],
                 "default": "xhigh"
+              },
+              "messages.reasoning": {
+                "calibration_values": [
+                  "Mayhem calibration reasoning"
+                ],
+                "max_length": 1048576,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.reasoning_content": {
+                "calibration_values": [
+                  "Mayhem calibration reasoning"
+                ],
+                "max_length": 1048576,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
               }
             },
             "request_attributes": [
@@ -32293,6 +32403,8 @@
               "messages.content.text",
               "messages.content.type",
               "messages.name",
+              "messages.reasoning",
+              "messages.reasoning_content",
               "messages.role",
               "messages.tool_call_id",
               "messages.tool_calls",
@@ -33492,6 +33604,26 @@
                   "xhigh"
                 ],
                 "default": "xhigh"
+              },
+              "messages.reasoning": {
+                "calibration_values": [
+                  "Mayhem calibration reasoning"
+                ],
+                "max_length": 1048576,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
+              },
+              "messages.reasoning_content": {
+                "calibration_values": [
+                  "Mayhem calibration reasoning"
+                ],
+                "max_length": 1048576,
+                "min_length": 0,
+                "value_types": [
+                  "string"
+                ]
               }
             },
             "request_attributes": [
@@ -33505,6 +33637,8 @@
               "messages.content.video.fps",
               "messages.content.video.num_frames",
               "messages.name",
+              "messages.reasoning",
+              "messages.reasoning_content",
               "messages.role",
               "messages.tool_call_id",
               "messages.tool_calls",
@@ -37630,7 +37764,7 @@
         }
       },
       "tier": "launch",
-      "min_app_version": "0.2.161"
+      "min_app_version": "0.2.166"
     }
   ],
   "schema_version": 1,
