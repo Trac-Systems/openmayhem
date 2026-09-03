@@ -27869,44 +27869,148 @@ fn responses_input_messages(input: &Value) -> Result<Vec<ChatMessage>, ApiError>
             name: None,
             extra: BTreeMap::new(),
         }]),
-        Value::Array(items) if !items.is_empty() => items
-            .iter()
-            .map(|item| {
-                let role = item
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .filter(|role| !role.is_empty())
-                    .ok_or_else(|| {
-                        ApiError::bad_request(
-                            "Responses input message is missing role",
-                            Some("input"),
-                        )
-                    })?;
-                let content = item.get("content").cloned().ok_or_else(|| {
+        Value::Array(items) if !items.is_empty() => {
+            let mut messages: Vec<ChatMessage> = Vec::with_capacity(items.len());
+            for item in items {
+                let object = item.as_object().ok_or_else(|| {
                     ApiError::bad_request(
-                        "Responses input message is missing content",
+                        "Responses input array items must be objects",
                         Some("input"),
                     )
                 })?;
-                Ok(ChatMessage {
-                    role: role.to_owned(),
-                    content,
-                    name: item.get("name").and_then(Value::as_str).map(str::to_owned),
-                    extra: item
-                        .as_object()
-                        .into_iter()
-                        .flatten()
-                        .filter(|(key, _)| !matches!(key.as_str(), "role" | "content" | "name"))
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect(),
-                })
-            })
-            .collect(),
+                match object.get("type").and_then(Value::as_str) {
+                    Some("function_call") => {
+                        let call_id = responses_required_string(
+                            object,
+                            "call_id",
+                            "Responses function call is missing call_id",
+                        )?;
+                        let name = responses_required_string(
+                            object,
+                            "name",
+                            "Responses function call is missing name",
+                        )?;
+                        let arguments = responses_required_string(
+                            object,
+                            "arguments",
+                            "Responses function call is missing arguments",
+                        )?;
+                        let tool_call = json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": arguments,
+                            },
+                        });
+                        if let Some(previous) = messages.last_mut().filter(|message| {
+                            message.role == "assistant"
+                                && message.content.is_null()
+                                && message.extra.contains_key("tool_calls")
+                        }) {
+                            previous
+                                .extra
+                                .get_mut("tool_calls")
+                                .and_then(Value::as_array_mut)
+                                .expect("tool_calls created as an array")
+                                .push(tool_call);
+                        } else {
+                            messages.push(ChatMessage {
+                                role: "assistant".to_owned(),
+                                content: Value::Null,
+                                name: None,
+                                extra: BTreeMap::from([(
+                                    "tool_calls".to_owned(),
+                                    Value::Array(vec![tool_call]),
+                                )]),
+                            });
+                        }
+                    }
+                    Some("function_call_output") => {
+                        let call_id = responses_required_string(
+                            object,
+                            "call_id",
+                            "Responses function call output is missing call_id",
+                        )?;
+                        let output = object.get("output").cloned().ok_or_else(|| {
+                            ApiError::bad_request(
+                                "Responses function call output is missing output",
+                                Some("input"),
+                            )
+                        })?;
+                        if !output.is_string() && !output.is_array() {
+                            return Err(ApiError::bad_request(
+                                "Responses function call output must be a string or content array",
+                                Some("input"),
+                            ));
+                        }
+                        messages.push(ChatMessage {
+                            role: "tool".to_owned(),
+                            content: output,
+                            name: None,
+                            extra: BTreeMap::from([("tool_call_id".to_owned(), json!(call_id))]),
+                        });
+                    }
+                    Some("message") | None => {
+                        let role = object
+                            .get("role")
+                            .and_then(Value::as_str)
+                            .filter(|role| !role.is_empty())
+                            .ok_or_else(|| {
+                                ApiError::bad_request(
+                                    "Responses input message is missing role",
+                                    Some("input"),
+                                )
+                            })?;
+                        let content = object.get("content").cloned().ok_or_else(|| {
+                            ApiError::bad_request(
+                                "Responses input message is missing content",
+                                Some("input"),
+                            )
+                        })?;
+                        messages.push(ChatMessage {
+                            role: role.to_owned(),
+                            content,
+                            name: object
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            extra: object
+                                .iter()
+                                .filter(|(key, _)| {
+                                    !matches!(key.as_str(), "type" | "role" | "content" | "name")
+                                })
+                                .map(|(key, value)| (key.clone(), value.clone()))
+                                .collect(),
+                        });
+                    }
+                    Some(item_type) => {
+                        return Err(ApiError::bad_request(
+                            format!("unsupported Responses input item type: {item_type}"),
+                            Some("input"),
+                        ));
+                    }
+                }
+            }
+            Ok(messages)
+        }
         _ => Err(ApiError::bad_request(
-            "input must be a non-empty string or array of message objects",
+            "input must be a non-empty string or array of Responses input objects",
             Some("input"),
         )),
     }
+}
+
+fn responses_required_string<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+    message: &'static str,
+) -> Result<&'a str, ApiError> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ApiError::bad_request(message, Some("input")))
 }
 
 fn responses_value_from_chat(response: Value) -> Result<Value, ApiError> {
@@ -27925,21 +28029,76 @@ fn responses_value_from_chat(response: Value) -> Result<Value, ApiError> {
         .and_then(|choices| choices.first())
         .ok_or_else(|| ApiError::bad_gateway("chat provider returned no choices", Some("model")))?;
     let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
-    let text = message.get("content").cloned().unwrap_or(Value::Null);
-    let mut output_content = vec![json!({
-        "type": "output_text",
-        "text": text,
-        "annotations": [],
-    })];
+    let mut output = Vec::new();
+    if let Some(text) = message.get("content").and_then(Value::as_str) {
+        if !text.is_empty() {
+            output.push(json!({
+                "id": make_id("msg"),
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": [],
+                }],
+            }));
+        }
+    } else if message
+        .get("content")
+        .is_some_and(|content| !content.is_null())
+    {
+        return Err(ApiError::bad_gateway(
+            "chat provider returned non-text response content",
+            Some("model"),
+        ));
+    }
     if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
-        output_content.extend(tool_calls.iter().map(|call| {
-            json!({
+        for call in tool_calls {
+            let call_id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::bad_gateway(
+                        "chat provider returned a function call without an id",
+                        Some("model"),
+                    )
+                })?;
+            let function = call.get("function").ok_or_else(|| {
+                ApiError::bad_gateway(
+                    "chat provider returned a function call without a function",
+                    Some("model"),
+                )
+            })?;
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    ApiError::bad_gateway(
+                        "chat provider returned a function call without a name",
+                        Some("model"),
+                    )
+                })?;
+            let arguments = function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ApiError::bad_gateway(
+                        "chat provider returned a function call without string arguments",
+                        Some("model"),
+                    )
+                })?;
+            output.push(json!({
+                "id": make_id("fc"),
                 "type": "function_call",
-                "call_id": call.get("id").cloned().unwrap_or(Value::Null),
-                "name": call.get("function").and_then(|function| function.get("name")).cloned().unwrap_or(Value::Null),
-                "arguments": call.get("function").and_then(|function| function.get("arguments")).cloned().unwrap_or(Value::Null),
-            })
-        }));
+                "status": "completed",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+            }));
+        }
     }
     let usage = response.get("usage").cloned().unwrap_or_else(|| json!({}));
     Ok(json!({
@@ -27948,13 +28107,7 @@ fn responses_value_from_chat(response: Value) -> Result<Value, ApiError> {
         "created_at": created_at,
         "status": "completed",
         "model": model,
-        "output": [{
-            "id": make_id("msg"),
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": output_content,
-        }],
+        "output": output,
         "usage": {
             "input_tokens": usage.get("prompt_tokens").cloned().unwrap_or_else(|| json!(0)),
             "output_tokens": usage.get("completion_tokens").cloned().unwrap_or_else(|| json!(0)),
@@ -36444,6 +36597,97 @@ mod tests {
         assert_eq!(public_error_code(error), "provider_verification_failed");
         assert_eq!(public_error_category(error), "provider_response");
         assert!(!public_error_retryable(error));
+    }
+
+    #[test]
+    fn responses_input_round_trips_function_call_continuations() {
+        let messages = responses_input_messages(&json!([
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "What is the weather?"}]
+            },
+            {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Berlin\"}"
+            },
+            {
+                "type": "function_call",
+                "id": "fc_2",
+                "call_id": "call_2",
+                "name": "get_time",
+                "arguments": "{\"city\":\"Berlin\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "{\"temperature_c\":21}"
+            }
+        ]))
+        .expect("valid Responses continuation");
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "user");
+        assert!(!messages[0].extra.contains_key("type"));
+        assert_eq!(messages[1].role, "assistant");
+        assert!(messages[1].content.is_null());
+        assert_eq!(
+            messages[1].extra["tool_calls"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(messages[1].extra["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[2].role, "tool");
+        assert_eq!(messages[2].extra["tool_call_id"], "call_1");
+        assert_eq!(messages[2].content, "{\"temperature_c\":21}");
+    }
+
+    #[test]
+    fn responses_output_emits_function_calls_as_top_level_items() {
+        let response = responses_value_from_chat(json!({
+            "id": "chatcmpl_1",
+            "created": 42,
+            "model": "test/model",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"Berlin\"}"
+                        }
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        }))
+        .expect("valid chat tool response");
+
+        assert_eq!(response["output"].as_array().map(Vec::len), Some(1));
+        assert_eq!(response["output"][0]["type"], "function_call");
+        assert_eq!(response["output"][0]["call_id"], "call_1");
+        assert_eq!(response["output"][0]["name"], "get_weather");
+        assert_eq!(response["output"][0]["status"], "completed");
+        assert!(response["output"][0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("fc-mayhem-")));
+    }
+
+    #[test]
+    fn responses_input_rejects_unsupported_item_types() {
+        let error = responses_input_messages(&json!([{
+            "type": "web_search_call",
+            "id": "search_1"
+        }]))
+        .expect_err("hosted tool items are not supported by local providers");
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("web_search_call"));
     }
 
     #[test]
