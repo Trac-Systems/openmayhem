@@ -114,8 +114,9 @@ use mayhem_proto::{
     MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
     SESSION_RECEIPT_SCHEMA_VERSION, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
     TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION, TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE,
-    USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
-    USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
+    TRANSPORT_MAX_OUTPUT_DURATION_SECONDS, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN,
+    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
+    USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 #[cfg(test)]
 use mayhem_proto::{chunk_json_payload, visible_output_units};
@@ -11167,6 +11168,77 @@ fn artifact_generation_contract_max_duration_seconds(
     })
 }
 
+fn artifact_generation_uses_automatic_audio_duration(request: &ArtifactGenerationRequest) -> bool {
+    request.output_modality == "audio"
+        && request.workflow.is_none()
+        && request.requested_duration_seconds.is_none()
+}
+
+fn artifact_generation_route_selection_request(
+    request: &ArtifactGenerationRequest,
+) -> ArtifactGenerationRequest {
+    let mut selection = request.clone();
+    if artifact_generation_uses_automatic_audio_duration(request) {
+        selection.max_duration_seconds = request
+            .duration_seconds
+            .max(request.input_audio_max_seconds)
+            .max(1);
+    }
+    selection
+}
+
+fn artifact_generation_request_for_route_capacity(
+    state: &GatewayState,
+    request: &ArtifactGenerationRequest,
+    route: Option<&GatewayRouteCandidate>,
+) -> Result<ArtifactGenerationRequest, ModalityAdmissionError> {
+    let mut bounded = request.clone();
+    if !artifact_generation_uses_automatic_audio_duration(request) {
+        return Ok(bounded);
+    }
+    let Some(route) = route else {
+        return Ok(bounded);
+    };
+    let provider = route_key(route);
+    let entry = state
+        .provider_table
+        .lock_recover("provider table")
+        .entries(now_millis_u64())
+        .into_iter()
+        .find(|entry| entry.key == provider)
+        .ok_or_else(|| {
+            ModalityAdmissionError::unavailable(
+                "provider disappeared before automatic-duration binding",
+            )
+        })?;
+    let heartbeat = entry.heartbeat.ok_or_else(|| {
+        ModalityAdmissionError::unavailable(
+            "provider heartbeat disappeared before automatic-duration binding",
+        )
+    })?;
+    let capacity = heartbeat
+        .caps
+        .modality_capacity
+        .get("audio")
+        .ok_or_else(|| {
+            ModalityAdmissionError::unavailable(
+                "provider no longer advertises audio duration capacity",
+            )
+        })?;
+    let minimum = request
+        .duration_seconds
+        .max(request.input_audio_max_seconds)
+        .max(1);
+    let maximum = request.max_duration_seconds.min(capacity.max_item_units);
+    if maximum < minimum {
+        return Err(ModalityAdmissionError::unavailable(
+            "provider audio duration capacity is below the request minimum",
+        ));
+    }
+    bounded.max_duration_seconds = maximum;
+    Ok(bounded)
+}
+
 fn gateway_comfy_workflow_derivation_policy(
     workflow_policy: Option<&mayhem_proto::ComfyWorkflowCatalogPolicy>,
 ) -> Result<mayhem_proto::ComfyWorkflowDerivationPolicy, mayhem_proto::ComfyWorkflowDerivationError>
@@ -15914,7 +15986,7 @@ impl ScBridgeGatewaySessionBackend {
         let request_body = seal_direct_session_request_body_with_workflow_output(
             model,
             &request.endpoint_family,
-            json!({"kind": request.transport_kind}),
+            direct_artifact_generation_transport_body(request),
             request.contract_request.clone(),
             request.workflow_output.as_ref(),
         )?;
@@ -16646,8 +16718,17 @@ fn direct_session_contract_request(transport_body: &Value) -> Value {
         object.remove("mayhem_contract");
         object.remove("contract_request");
         object.remove("specialities");
+        object.remove(TRANSPORT_MAX_OUTPUT_DURATION_SECONDS);
     }
     request
+}
+
+fn direct_artifact_generation_transport_body(request: &ArtifactGenerationRequest) -> Value {
+    let mut body = json!({"kind": request.transport_kind});
+    if artifact_generation_uses_automatic_audio_duration(request) {
+        body[TRANSPORT_MAX_OUTPUT_DURATION_SECONDS] = json!(request.max_duration_seconds);
+    }
+    body
 }
 
 fn seal_direct_session_request_body(
@@ -16696,7 +16777,12 @@ fn seal_direct_session_request_body_with_workflow_output(
         )));
     }
     let mut sealed = json!({});
-    for key in ["kind", "audio", "audio_seconds"] {
+    for key in [
+        "kind",
+        "audio",
+        "audio_seconds",
+        TRANSPORT_MAX_OUTPUT_DURATION_SECONDS,
+    ] {
         if let Some(value) = transport_body.get(key) {
             sealed[key] = value.clone();
         }
@@ -21608,10 +21694,11 @@ async fn run_artifact_generation_with_route_retry(
     options: GatewayRequestOptions,
 ) -> Result<GatewayArtifactGenerationRun, ApiError> {
     let deadline = RouteWaitDeadline::new(options.max_wait_ms);
+    let selection_request = artifact_generation_route_selection_request(request);
     let requirements = request_requirements_for_artifact_generation(
         state,
         model,
-        request,
+        &selection_request,
         now_millis_u64(),
         options.max_price_au,
         state.throughput_floor_for_model(
@@ -21711,31 +21798,63 @@ async fn run_artifact_generation_with_route_retry(
         {
             break;
         }
-        let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
-            Ok(admission) => admission,
-            Err(err) => {
-                last_retryable_error =
-                    Some(recovery.record_modality_admission_error(state, route, err));
-                pending_routes = ordered_route_candidates_for_artifact_generation_with_options(
-                    state,
-                    model,
-                    request,
-                    &attempt_options,
-                );
-                continue;
-            }
-        };
+        let attempt_request =
+            match artifact_generation_request_for_route_capacity(state, request, route) {
+                Ok(request) => request,
+                Err(err) => {
+                    last_retryable_error =
+                        Some(recovery.record_modality_admission_error(state, route, err));
+                    pending_routes = ordered_route_candidates_for_artifact_generation_with_options(
+                        state,
+                        model,
+                        request,
+                        &attempt_options,
+                    );
+                    continue;
+                }
+            };
+        let attempt_requirements = request_requirements_for_artifact_generation(
+            state,
+            model,
+            &attempt_request,
+            now_millis_u64(),
+            attempt_options.max_price_au,
+            state.throughput_floor_for_model(
+                model,
+                &attempt_options,
+                if attempt_request.output_modality == "video" {
+                    DEFAULT_IMAGE_FLOOR_IMAGES_PER_S
+                } else {
+                    DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR
+                },
+            ),
+        );
+        let _modality_admission =
+            match state.try_acquire_modality_admission(route, &attempt_requirements) {
+                Ok(admission) => admission,
+                Err(err) => {
+                    last_retryable_error =
+                        Some(recovery.record_modality_admission_error(state, route, err));
+                    pending_routes = ordered_route_candidates_for_artifact_generation_with_options(
+                        state,
+                        model,
+                        request,
+                        &attempt_options,
+                    );
+                    continue;
+                }
+            };
         recovery.begin_attempt(route);
         let invocation = state.prepare_artifact_generation_invocation_for_route(
             model,
-            request,
+            &attempt_request,
             route,
             &attempt_options,
         )?;
         let attempt_started = Instant::now();
         match state
             .session_backend
-            .run_artifact_generation(model, request, &invocation)
+            .run_artifact_generation(model, &attempt_request, &invocation)
             .await
         {
             Ok(result) => {
@@ -21743,13 +21862,13 @@ async fn run_artifact_generation_with_route_retry(
                     state,
                     route,
                     observation_sample_from_artifact_generation_success(
-                        request,
+                        &attempt_request,
                         &result,
                         attempt_started.elapsed(),
                     ),
                 );
                 return Ok(GatewayArtifactGenerationRun {
-                    metering_request: request.clone(),
+                    metering_request: attempt_request,
                     metering_output: result.output.clone(),
                     result,
                     invocation,
@@ -25214,6 +25333,7 @@ fn ordered_route_candidates_for_artifact_generation_with_options<'a>(
 ) -> Vec<&'a GatewayRouteCandidate> {
     let seed = artifact_generation_route_selection_seed(model, request, now_millis_u64());
     let now_millis = now_millis_u64();
+    let selection_request = artifact_generation_route_selection_request(request);
     let routes = ordered_route_candidates_for_requirements_with_seed(
         state,
         model,
@@ -25223,7 +25343,7 @@ fn ordered_route_candidates_for_artifact_generation_with_options<'a>(
         request_requirements_for_artifact_generation(
             state,
             model,
-            request,
+            &selection_request,
             now_millis,
             options.max_price_au,
             state.throughput_floor_for_model(
@@ -45689,6 +45809,60 @@ mod tests {
         assert_eq!(
             artifact_generation_job_result(&request, &output)["seconds"],
             11
+        );
+    }
+
+    #[test]
+    fn automatic_music_duration_binds_to_live_route_capacity() {
+        let request = artifact_generation_request(
+            "mayhem/music-test",
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            json!({
+                "model": "mayhem/music-test",
+                "prompt": "automatic piano",
+                "duration_seconds": null,
+                "n": 1,
+                "response_format": "wav"
+            }),
+            VideoRequestPreparation::default(),
+        )
+        .unwrap();
+        assert_eq!(request.max_duration_seconds, 600);
+
+        let mut model = test_routed_model(1);
+        model.mayhem.route_candidates[0].served_modalities = vec!["audio".to_owned()];
+        let route = model.mayhem.route_candidates[0].clone();
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let now = now_millis_u64();
+        let mut heartbeat = heartbeat_for_route(&model, &route, now);
+        heartbeat.caps.modality_capacity.insert(
+            "audio".to_owned(),
+            HeartbeatModalityCapacity {
+                unit: "second".to_owned(),
+                max_inflight_items: 2,
+                active_items: 0,
+                max_items_per_request: 1,
+                max_item_bytes: 1024,
+                max_item_units: 300,
+                working_set_bytes_per_item: 1024,
+            },
+        );
+        heartbeat.sig = "aa".repeat(64);
+        state.ingest_provider_heartbeat(heartbeat, now);
+
+        let selection = artifact_generation_route_selection_request(&request);
+        assert_eq!(selection.max_duration_seconds, 1);
+        let bounded =
+            artifact_generation_request_for_route_capacity(&state, &request, Some(&route)).unwrap();
+        assert_eq!(bounded.max_duration_seconds, 300);
+        let requirements =
+            request_requirements_for_artifact_generation(&state, &model, &bounded, now, None, None);
+        assert_eq!(requirements.modality_load["audio"].max_item_units, 300);
+        assert_eq!(requirements.usage.get(USAGE_AUDIO_SECOND), 300);
+        assert_eq!(
+            direct_artifact_generation_transport_body(&bounded)
+                [TRANSPORT_MAX_OUTPUT_DURATION_SECONDS],
+            json!(300)
         );
     }
 

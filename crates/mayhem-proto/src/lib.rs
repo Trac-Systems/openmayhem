@@ -70,6 +70,7 @@ pub const VISIBLE_OUTPUT_BYTES_PER_UNIT: u64 = 4;
 pub const MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN: u64 = 256;
 pub const MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN: u64 =
     MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN / VISIBLE_OUTPUT_BYTES_PER_UNIT;
+pub const TRANSPORT_MAX_OUTPUT_DURATION_SECONDS: &str = "max_output_duration_seconds";
 
 pub mod decimal_u128 {
     use serde::{de::Error as _, Deserialize, Deserializer, Serializer};

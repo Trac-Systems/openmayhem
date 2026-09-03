@@ -126,9 +126,9 @@ use mayhem_proto::{
     DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
     SESSION_RECEIPT_SCHEMA_VERSION, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
     TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION, TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE,
-    USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
-    USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
-    VISIBLE_OUTPUT_BYTES_PER_UNIT,
+    TRANSPORT_MAX_OUTPUT_DURATION_SECONDS, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN,
+    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
+    USAGE_STEP, USAGE_VIDEO_SECOND, VISIBLE_OUTPUT_BYTES_PER_UNIT,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -79447,6 +79447,66 @@ fn provider_merge_modality_load(
     entry.max_item_units = entry.max_item_units.max(max_item_units);
 }
 
+fn provider_automatic_audio_duration_cap(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    requested_duration_seconds: Option<u64>,
+    transport_body: &Value,
+) -> Result<Option<u64>> {
+    let Some(value) = transport_body.get(TRANSPORT_MAX_OUTPUT_DURATION_SECONDS) else {
+        return Ok(None);
+    };
+    let cap = value
+        .as_u64()
+        .filter(|value| *value > 0)
+        .context("automatic audio duration cap must be a positive integer")?;
+    ensure!(
+        requested_duration_seconds.is_none(),
+        "automatic audio duration cap cannot accompany an explicit duration"
+    );
+    let aliases = [
+        "duration_seconds",
+        "duration",
+        "audio_duration",
+        "target_duration",
+        "audioDuration",
+        "targetDuration",
+    ];
+    let hf = contract.family == mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO;
+    let paths = if hf {
+        aliases
+            .iter()
+            .map(|alias| format!("parameters.{alias}"))
+            .chain(aliases.iter().map(|alias| (*alias).to_owned()))
+            .collect::<Vec<_>>()
+    } else {
+        aliases
+            .iter()
+            .map(|alias| (*alias).to_owned())
+            .chain(aliases.iter().map(|alias| format!("parameters.{alias}")))
+            .collect::<Vec<_>>()
+    };
+    let signed_maximum = paths
+        .iter()
+        .find_map(|path| contract.request_attribute_specs.get(path))
+        .and_then(|spec| {
+            spec.maximum
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .map(|value| value.floor() as u64)
+                .or_else(|| {
+                    spec.enum_values
+                        .iter()
+                        .filter_map(provider_duration_seconds_ceil)
+                        .max()
+                })
+        })
+        .context("automatic audio duration cap requires a finite signed endpoint maximum")?;
+    ensure!(
+        cap <= signed_maximum,
+        "automatic audio duration cap {cap} exceeds signed endpoint maximum {signed_maximum}"
+    );
+    Ok(Some(cap))
+}
+
 fn provider_session_modality_load(
     contract: &mayhem_proto::EndpointFamilyContract,
     family: &str,
@@ -79615,6 +79675,12 @@ fn provider_session_modality_load(
             let request = provider_session_request_result(
                 provider_media_generation_request_from_body(family, body),
             )?;
+            let automatic_duration_cap =
+                provider_session_request_result(provider_automatic_audio_duration_cap(
+                    contract,
+                    request.duration_seconds,
+                    transport_body,
+                ))?;
             let output_item_count = provider_session_request_result(
                 request
                     .request
@@ -79632,6 +79698,7 @@ fn provider_session_modality_load(
             let item_count = output_item_count.max(inline_audio.item_count);
             let max_item_units = request
                 .duration_seconds
+                .or(automatic_duration_cap)
                 .unwrap_or(inline_audio.max_item_seconds.max(1))
                 .max(inline_audio.max_item_seconds)
                 .max(1);
@@ -87644,6 +87711,7 @@ fn provider_seal_local_contract_request(
         object.remove("endpoint_family");
         object.remove("mayhem_contract");
         object.remove("contract_request");
+        object.remove(TRANSPORT_MAX_OUTPUT_DURATION_SECONDS);
         if contract
             .request_attributes
             .iter()
@@ -87701,7 +87769,11 @@ fn provider_seal_local_contract_request(
         )
     })?;
     let mut transport = json!({"kind": provider_endpoint_transport_kind(family)?});
-    for key in ["audio", "audio_seconds"] {
+    for key in [
+        "audio",
+        "audio_seconds",
+        TRANSPORT_MAX_OUTPUT_DURATION_SECONDS,
+    ] {
         if let Some(value) = body.get(key) {
             transport[key] = value.clone();
         }
@@ -88329,6 +88401,9 @@ fn provider_engine_session_response_with_sampling_bounded(
             provider_media_generation_request_from_body(endpoint_family, request_body),
         )?;
         let requested_duration = request.duration_seconds;
+        let automatic_duration_cap = provider_session_request_result(
+            provider_automatic_audio_duration_cap(verified.contract, requested_duration, body),
+        )?;
         let input_characters =
             provider_media_generation_input_characters(endpoint_family, &request.request)?;
         let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
@@ -88357,6 +88432,12 @@ fn provider_engine_session_response_with_sampling_bounded(
             ensure!(
                 output.duration_seconds.abs_diff(expected) <= 1,
                 "provider audio engine returned {} seconds, expected approximately {expected}",
+                output.duration_seconds
+            );
+        } else if let Some(cap) = automatic_duration_cap {
+            ensure!(
+                output.duration_seconds <= cap,
+                "provider audio engine returned {} seconds, exceeding the negotiated automatic-duration cap of {cap} seconds",
                 output.duration_seconds
             );
         }
@@ -88394,6 +88475,12 @@ fn provider_engine_session_response_with_sampling_bounded(
                 ensure!(
                     expected.abs_diff(metadata.duration_seconds_ceil) <= 1,
                     "provider audio artifact measures {} seconds, expected {expected}",
+                    metadata.duration_seconds_ceil
+                );
+            } else if let Some(cap) = automatic_duration_cap {
+                ensure!(
+                    metadata.duration_seconds_ceil <= cap,
+                    "provider audio artifact measures {} seconds, exceeding the negotiated automatic-duration cap of {cap} seconds",
                     metadata.duration_seconds_ceil
                 );
             }
@@ -92742,6 +92829,7 @@ mod tests {
         last_speech_request: Option<SpeechRequest>,
         last_video_request: Option<EngineMediaGenerationRequest>,
         video_output: Option<mayhem_engine::MediaGenerationOutput>,
+        audio_output_duration_seconds: Option<u64>,
         last_audio_request: Option<EngineMediaGenerationRequest>,
         last_music_request: Option<EngineMediaGenerationRequest>,
         last_workflow_request: Option<WorkflowGenerationRequest>,
@@ -92878,6 +92966,7 @@ mod tests {
                 last_speech_request: None,
                 last_video_request: None,
                 video_output: None,
+                audio_output_duration_seconds: None,
                 last_audio_request: None,
                 last_music_request: None,
                 last_workflow_request: None,
@@ -92891,6 +92980,11 @@ mod tests {
 
         fn with_artifact_chunks(mut self, artifact_chunks: Vec<ArtifactChunk>) -> Self {
             self.artifact_chunks = artifact_chunks;
+            self
+        }
+
+        fn with_audio_output_duration_seconds(mut self, duration_seconds: u64) -> Self {
+            self.audio_output_duration_seconds = Some(duration_seconds);
             self
         }
 
@@ -93101,7 +93195,9 @@ mod tests {
             _cancellation: &CancellationToken,
         ) -> mayhem_engine::Result<mayhem_engine::MediaGenerationOutput> {
             let output = mayhem_engine::MediaGenerationOutput {
-                duration_seconds: request.duration_seconds.unwrap_or(1),
+                duration_seconds: self
+                    .audio_output_duration_seconds
+                    .unwrap_or_else(|| request.duration_seconds.unwrap_or(1)),
                 frame_count: 0,
                 step_count: request.step_count.unwrap_or(1),
             };
@@ -93120,7 +93216,9 @@ mod tests {
         ) -> mayhem_engine::Result<mayhem_engine::MediaGenerationOutput> {
             self.music_generation_calls = self.music_generation_calls.saturating_add(1);
             let output = mayhem_engine::MediaGenerationOutput {
-                duration_seconds: request.duration_seconds.unwrap_or(1),
+                duration_seconds: self
+                    .audio_output_duration_seconds
+                    .unwrap_or_else(|| request.duration_seconds.unwrap_or(1)),
                 frame_count: 0,
                 step_count: request.step_count.unwrap_or(1),
             };
@@ -112814,6 +112912,99 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(load["audio"].item_count, 2);
         assert_eq!(load["audio"].max_item_bytes, source_len);
         assert_eq!(load["audio"].max_item_units, 2);
+    }
+
+    #[test]
+    fn provider_music_admission_uses_negotiated_automatic_duration_cap() {
+        let contract =
+            catalog::endpoint_contract_template(mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+                .unwrap();
+        let body = json!({
+            "model": "test/music",
+            "prompt": "automatic arrangement",
+            "duration_seconds": null,
+            "n": 1,
+            "response_format": "wav"
+        });
+        let transport = json!({
+            "kind": "music_generation",
+            (TRANSPORT_MAX_OUTPUT_DURATION_SECONDS): 300
+        });
+
+        let load = provider_session_modality_load(
+            &contract,
+            mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+            &body,
+            &transport,
+            None,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(load["audio"].max_item_units, 300);
+    }
+
+    #[test]
+    fn provider_music_rejects_invalid_automatic_duration_caps() {
+        let contract =
+            catalog::endpoint_contract_template(mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS)
+                .unwrap();
+        let too_large = provider_automatic_audio_duration_cap(
+            &contract,
+            None,
+            &json!({(TRANSPORT_MAX_OUTPUT_DURATION_SECONDS): 601}),
+        )
+        .unwrap_err();
+        assert!(too_large
+            .to_string()
+            .contains("signed endpoint maximum 600"));
+
+        let explicit = provider_automatic_audio_duration_cap(
+            &contract,
+            Some(10),
+            &json!({(TRANSPORT_MAX_OUTPUT_DURATION_SECONDS): 10}),
+        )
+        .unwrap_err();
+        assert!(explicit
+            .to_string()
+            .contains("cannot accompany an explicit duration"));
+    }
+
+    #[test]
+    fn provider_music_rejects_output_beyond_negotiated_automatic_duration_cap() {
+        let mut backend = FakeEngineBackend::new("")
+            .with_audio_output_duration_seconds(10)
+            .with_artifact_chunks(vec![ArtifactChunk {
+                artifact_id: "music-1".to_owned(),
+                index: 0,
+                content_type: "audio/wav".to_owned(),
+                bytes: tiny_wav_bytes(160_000),
+                final_chunk: true,
+            }]);
+        let body = json!({
+            "kind": "music_generation",
+            "model": "test/music",
+            "prompt": "automatic arrangement",
+            "duration_seconds": null,
+            "response_format": "wav",
+            "n": 1,
+            (TRANSPORT_MAX_OUTPUT_DURATION_SECONDS): 5
+        });
+
+        let error = provider_engine_session_response(
+            &mut backend,
+            &catalog::CatalogAdapter::default(),
+            &body,
+            None,
+        )
+        .expect_err("automatic output beyond the negotiated cap must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("negotiated automatic-duration cap of 5 seconds"),
+            "{error:#}"
+        );
     }
 
     #[test]
