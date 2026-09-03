@@ -3780,6 +3780,8 @@ async fn music_generation_uses_signed_defaults_and_ranges() {
     let requests = requests.lock().expect("artifact generation records");
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].duration_seconds, 1);
+    assert_eq!(requests[0].requested_duration_seconds, None);
+    assert_eq!(requests[0].max_duration_seconds, 600);
     assert_eq!(requests[0].step_count, 50);
     assert_eq!(requests[0].artifact_count, 1);
     assert_eq!(requests[0].response_format, "flac");

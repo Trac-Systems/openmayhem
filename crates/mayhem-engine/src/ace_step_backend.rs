@@ -1883,6 +1883,11 @@ struct NormalizedRequest {
 
 impl NormalizedRequest {
     fn from_media_request(request: MediaGenerationRequest) -> Result<Self> {
+        let default_batch_size = if request.endpoint_family == ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
+            2
+        } else {
+            1
+        };
         let handled_request_attributes = ace_source_request_attributes(&request.request);
         let request = canonicalize_ace_media_request(request)?;
         validate_ace_media_request(&request)?;
@@ -2473,7 +2478,7 @@ impl NormalizedRequest {
                     ("n", raw.n),
                 ],
             )?,
-            2,
+            default_batch_size,
             1,
             MAX_BATCH_SIZE,
         )?;
@@ -3895,6 +3900,7 @@ mod tests {
         assert_eq!(payload["params"]["guidance_scale"], 6.5);
         assert_eq!(payload["params"]["seed"], 19);
         assert_eq!(payload["config"]["audio_format"], "opus");
+        assert_eq!(payload["config"]["batch_size"], 1);
 
         let hf_audio = MediaGenerationRequest {
             endpoint_family: ENDPOINT_HF_TEXT_TO_AUDIO.to_owned(),
@@ -3923,6 +3929,7 @@ mod tests {
         assert_eq!(payload["params"]["guidance_scale"], 5.0);
         assert_eq!(payload["params"]["seed"], 23);
         assert_eq!(payload["config"]["audio_format"], "flac");
+        assert_eq!(payload["config"]["batch_size"], 1);
     }
 
     #[test]
@@ -4925,13 +4932,15 @@ print("ok")
         assert!(!backend.component_healthy());
 
         let mut artifacts = Vec::new();
+        let mut audio_request = media_request(json!({
+            "prompt": "reload prompt",
+            "duration_seconds": 10,
+            "response_format": "flac",
+        }));
+        audio_request.endpoint_family = ENDPOINT_MAYHEM_AUDIO_GENERATIONS.to_owned();
         backend
             .generate_audio(
-                media_request(json!({
-                    "prompt": "reload prompt",
-                    "duration": 10,
-                    "response_format": "flac",
-                })),
+                audio_request,
                 &mut |chunk: ArtifactChunk| {
                     artifacts.push(chunk);
                     Ok(())
@@ -4941,7 +4950,7 @@ print("ok")
             .expect("generate generic audio after lazy reload");
         let second_pid = backend.process_ids()[0];
         assert_ne!(first_pid, second_pid);
-        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts.len(), 1);
         let loads = read_log(model_root)
             .into_iter()
             .filter(|entry| entry["event"] == "load")
