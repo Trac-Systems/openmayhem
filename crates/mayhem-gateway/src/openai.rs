@@ -22089,19 +22089,32 @@ fn no_eligible_route_error(
         .with_public_error("required_modality_unavailable", "route_selection", true)
         .with_safe_detail(json!({ "modalities": non_text_modalities }));
     }
-    let now_millis = now_millis_u64();
-    if modality_candidates
+    let price_candidates = modality_candidates
         .iter()
-        .all(|candidate| state.route_provider_in_cooloff(candidate, now_millis))
+        .copied()
+        .filter(|candidate| {
+            options.max_price_au.is_none_or(|max_price_au| {
+                price_rate_gate_basis_au(route_price_ref_au(model, Some(candidate))) <= max_price_au
+            })
+        })
+        .collect::<Vec<_>>();
+    if options.max_price_au.is_some()
+        && !modality_candidates.is_empty()
+        && price_candidates.is_empty()
+    {
+        return no_price_band_route_error();
+    }
+    let now_millis = now_millis_u64();
+    if !price_candidates.is_empty()
+        && price_candidates
+            .iter()
+            .all(|candidate| state.route_provider_in_cooloff(candidate, now_millis))
     {
         return ApiError::service_unavailable(
             "all otherwise eligible provider routes are cooling off after a retryable failure",
             Some("model"),
         )
         .with_public_error("provider_routes_cooling_off", "provider_admission", true);
-    }
-    if options.max_price_au.is_some() {
-        return no_price_band_route_error();
     }
     if !non_text_modalities.is_empty() {
         return ApiError::service_unavailable(
@@ -22741,6 +22754,11 @@ fn route_static_filters_have_candidates(
             required_modalities
                 .iter()
                 .all(|modality| candidate.served_modalities.contains(modality))
+        })
+        .filter(|candidate| {
+            options.max_price_au.is_none_or(|max_price_au| {
+                price_rate_gate_basis_au(route_price_ref_au(model, Some(candidate))) <= max_price_au
+            })
         })
         .any(|candidate| {
             options
@@ -39029,6 +39047,47 @@ mod tests {
         );
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.message.contains("image"));
+
+        let route_price = price_rate_gate_basis_au(route_price_ref_au(
+            &model,
+            Some(&model.mayhem.route_candidates[0]),
+        ));
+        let price_limited = GatewayRequestOptions {
+            max_wait_ms: 40,
+            max_price_au: Some(route_price.saturating_sub(1)),
+            ..GatewayRequestOptions::default()
+        };
+        let price_requirements = RequestRequirements {
+            required_modalities: vec!["text".to_owned()],
+            max_price_au: price_limited.max_price_au,
+            ..RequestRequirements::default()
+        };
+        let price_refreshes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refresh_count = price_refreshes.clone();
+        let outcome = wait_for_eligible_routes_with_poll(
+            &state,
+            &model,
+            &price_limited,
+            &price_requirements,
+            RouteWaitDeadline::new(price_limited.max_wait_ms),
+            Vec::new(),
+            || {
+                refresh_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Vec::new()
+            },
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(!outcome.waited);
+        assert_eq!(price_refreshes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let error = no_eligible_route_error(
+            &state,
+            &model,
+            &price_limited,
+            &price_requirements.required_modalities,
+        );
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.public_code, "no_provider_within_price_band");
 
         let error = route_wait_expired_error(&options);
         assert!(error.message.contains("no eligible provider"));
