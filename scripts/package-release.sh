@@ -1653,6 +1653,22 @@ const countRegularFiles = (directory) => {
   }
   return count;
 };
+const packageDeclaresTargetUnsupported = (prebuilds) => {
+  const packageRoot = path.dirname(prebuilds);
+  const packageJsonPath = path.join(packageRoot, 'package.json');
+  if (!fs.existsSync(packageJsonPath)) return false;
+  const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+  const platform = keep.slice(0, keep.lastIndexOf('-'));
+  const unsupportedExport = packageJson?.exports?.['.']?.bare?.[platform];
+  if (typeof unsupportedExport !== 'string' || path.basename(unsupportedExport) !== 'unsupported.js') {
+    return false;
+  }
+  const resolved = path.resolve(packageRoot, unsupportedExport);
+  if (!resolved.startsWith(`${packageRoot}${path.sep}`)) {
+    throw new Error(`native dependency has an escaping unsupported export: ${packageJsonPath}`);
+  }
+  return fs.existsSync(resolved) && fs.lstatSync(resolved).isFile();
+};
 
 visit(root);
 if ((prebuildDirectories.length > 0 || nodeArtifacts.length > 0) && target !== nativeHost) {
@@ -1665,6 +1681,10 @@ for (const prebuilds of prebuildDirectories) {
   const entries = fs.readdirSync(prebuilds, { withFileTypes: true });
   const selected = entries.find((entry) => entry.name === keep);
   if (!selected || !selected.isDirectory() || selected.isSymbolicLink()) {
+    if (packageDeclaresTargetUnsupported(prebuilds)) {
+      fs.rmSync(prebuilds, { recursive: true, force: false });
+      continue;
+    }
     throw new Error(`native dependency ${prebuilds} has no ${keep} prebuild`);
   }
   const selectedPath = path.join(prebuilds, keep);

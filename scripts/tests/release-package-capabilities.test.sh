@@ -83,6 +83,11 @@ grep -F '"$root/bin/nvcc" --version' "$ROOT_DIR/scripts/package-release.sh" >/de
   fail "release packaging accepts an nvcc path without executing it"
 grep -F 'pkg-config --exists vulkan' "$ROOT_DIR/scripts/package-release.sh" >/dev/null ||
   fail "release packaging does not validate Vulkan development metadata"
+grep -F 'packageDeclaresTargetUnsupported' "$ROOT_DIR/scripts/package-release.sh" >/dev/null ||
+  fail "platform-explicit unsupported native dependencies are not handled during packaging"
+grep -F "path.basename(unsupportedExport) !== 'unsupported.js'" \
+  "$ROOT_DIR/scripts/package-release.sh" >/dev/null ||
+  fail "native dependency pruning is not limited to explicit unsupported platform exports"
 release_build_block="$(
   sed -n '/^if \[\[ "\$SKIP_BUILD" -eq 0 \]\]; then/,/^fi$/p' \
     "$ROOT_DIR/scripts/package-release.sh"
