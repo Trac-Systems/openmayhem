@@ -88628,6 +88628,9 @@ fn provider_engine_session_response_with_sampling_bounded(
             )
         })
         .unwrap_or_default();
+    if let Some(mode) = tool_mode.as_ref() {
+        validate_provider_engine_tool_call_outputs(&tools, &mode.tools)?;
+    }
     if tool_mode
         .as_ref()
         .is_some_and(|mode| !mode.parallel && tools.len() > 1)
@@ -90438,6 +90441,9 @@ fn provider_engine_tool_specs(body: &Value) -> Result<Vec<ToolSpec>> {
             .map(str::to_owned);
         specs.push(spec);
     }
+    if !specs.is_empty() {
+        mayhem_engine::tool_call_json_schema(&specs)?;
+    }
     Ok(specs)
 }
 
@@ -90459,9 +90465,28 @@ fn provider_engine_named_tool_choice(choice: &serde_json::Map<String, Value>) ->
 }
 
 fn provider_openai_tool_calls_json_schema(tools: &[ToolSpec], parallel: bool) -> Value {
-    let names = tools
+    let call_variants = tools
         .iter()
-        .map(|tool| Value::String(tool.name.clone()))
+        .map(|tool| {
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "type", "function"],
+                "properties": {
+                    "id": { "type": "string" },
+                    "type": { "const": "function" },
+                    "function": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["name", "arguments"],
+                        "properties": {
+                            "name": { "const": tool.name },
+                            "arguments": tool.parameters,
+                        },
+                    },
+                },
+            })
+        })
         .collect::<Vec<_>>();
     let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -90474,22 +90499,7 @@ fn provider_openai_tool_calls_json_schema(tools: &[ToolSpec], parallel: bool) ->
                 "type": "array",
                 "minItems": 1,
                 "items": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "required": ["id", "type", "function"],
-                    "properties": {
-                        "id": { "type": "string" },
-                        "type": { "const": "function" },
-                        "function": {
-                            "type": "object",
-                            "additionalProperties": false,
-                            "required": ["name", "arguments"],
-                            "properties": {
-                                "name": { "type": "string", "enum": names },
-                                "arguments": { "type": "string" },
-                            },
-                        },
-                    },
+                    "oneOf": call_variants,
                 },
             },
         },
@@ -90550,6 +90560,41 @@ fn provider_engine_tool_call_outputs(
     Some(calls)
 }
 
+fn validate_provider_engine_tool_call_outputs(calls: &[Value], tools: &[ToolSpec]) -> Result<()> {
+    for call in calls {
+        let name = call.get("name").and_then(Value::as_str).ok_or_else(|| {
+            provider_session_output_error("provider engine returned a tool call without a name")
+        })?;
+        let tool = tools
+            .iter()
+            .find(|candidate| candidate.name == name)
+            .ok_or_else(|| {
+                provider_session_output_error(format!(
+                    "provider engine returned an unadvertised tool call: {name}"
+                ))
+            })?;
+        let encoded = call
+            .get("arguments")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                provider_session_output_error(format!(
+                    "provider engine returned malformed arguments for tool {name}"
+                ))
+            })?;
+        let arguments = serde_json::from_str::<Value>(encoded).map_err(|_| {
+            provider_session_output_error(format!(
+                "provider engine returned malformed arguments for tool {name}"
+            ))
+        })?;
+        mayhem_engine::validate_tool_call_arguments(tool, &arguments).map_err(|_| {
+            provider_session_output_error(format!(
+                "provider engine returned arguments that do not satisfy the schema for tool {name}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 fn provider_mayhem_json_tool_call_outputs(text: &str) -> Option<Vec<Value>> {
     let value: Value = serde_json::from_str(text.trim()).ok()?;
     let calls = value
@@ -90577,12 +90622,8 @@ fn provider_mayhem_json_tool_call_value(value: &Value) -> Option<Value> {
         .or_else(|| function.get("name"))
         .and_then(Value::as_str)?
         .to_owned();
-    let arguments = provider_tool_arguments_string(
-        function
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({})),
-    );
+    let arguments =
+        provider_tool_arguments_string(function.get("arguments").cloned().unwrap_or(Value::Null));
     let id = value.get("id").and_then(Value::as_str).map(str::to_owned);
     Some(provider_normalized_tool_call(id, name, arguments))
 }
@@ -90601,12 +90642,8 @@ fn provider_openai_tool_call_outputs(text: &str) -> Option<Vec<Value>> {
 fn provider_openai_tool_call_value(call: &Value) -> Option<Value> {
     let function = call.get("function")?;
     let name = function.get("name").and_then(Value::as_str)?.to_owned();
-    let arguments = provider_tool_arguments_string(
-        function
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({})),
-    );
+    let arguments =
+        provider_tool_arguments_string(function.get("arguments").cloned().unwrap_or(Value::Null));
     let id = call.get("id").and_then(Value::as_str).map(str::to_owned);
     Some(provider_normalized_tool_call(id, name, arguments))
 }
@@ -109744,7 +109781,12 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "type": "function",
                 "function": {
                     "name": "write",
-                    "parameters": { "type": "object" }
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["filePath"],
+                        "properties": { "filePath": { "type": "string" } }
+                    }
                 }
             }],
             "tool_choice": "required"
@@ -109756,9 +109798,19 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         };
         assert_eq!(schema["title"], "OpenAIToolCalls");
         assert_eq!(
-            schema["properties"]["tool_calls"]["items"]["properties"]["function"]["properties"]
-                ["name"]["enum"][0],
+            schema["properties"]["tool_calls"]["items"]["oneOf"][0]["properties"]["function"]
+                ["properties"]["name"]["const"],
             "write"
+        );
+        assert_eq!(
+            schema["properties"]["tool_calls"]["items"]["oneOf"][0]["properties"]["function"]
+                ["properties"]["arguments"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            schema["properties"]["tool_calls"]["items"]["oneOf"][0]["properties"]["function"]
+                ["properties"]["arguments"]["required"][0],
+            "filePath"
         );
         assert!(schema["properties"]["tool_calls"].get("maxItems").is_none());
     }
@@ -109860,6 +109912,29 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 .expect("tool mode")
                 .parallel
         );
+    }
+
+    #[test]
+    fn provider_engine_request_rejects_invalid_tool_parameter_schema() {
+        let adapter = catalog::CatalogAdapter {
+            tool_call_strategy: "openai_tool_calls".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [{ "role": "user", "content": "write one file" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": { "type": "not-a-json-schema-type" }
+                }
+            }],
+            "tool_choice": "auto"
+        });
+
+        let error = provider_engine_request_from_body(&body, &adapter)
+            .expect_err("invalid tool schemas must fail at request admission");
+        assert!(format!("{error:#}").contains("invalid parameters JSON Schema"));
     }
 
     #[test]
@@ -113402,6 +113477,39 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .expect("engine request")
             .grammar
             .is_none());
+    }
+
+    #[test]
+    fn provider_engine_session_response_rejects_schema_invalid_auto_tool_arguments() {
+        let adapter = catalog::CatalogAdapter {
+            tool_call_strategy: "openai_tool_calls".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let mut backend = FakeEngineBackend::new(
+            r#"{ "tool_calls": [{ "id": "call-openai", "type": "function", "function": { "name": "read_file", "arguments": {"path":"index.html","content":"not allowed"} } }] }"#,
+        );
+        let body = json!({
+            "messages": [{ "role": "user", "content": "read a file" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "parameters": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["path"],
+                        "properties": { "path": { "type": "string" } }
+                    }
+                }
+            }],
+            "tool_choice": "auto"
+        });
+
+        let error = provider_engine_session_response(&mut backend, &adapter, &body, None)
+            .expect_err("schema-invalid automatic tool arguments must fail closed");
+
+        assert!(format!("{error:#}")
+            .contains("arguments that do not satisfy the schema for tool read_file"));
     }
 
     #[test]

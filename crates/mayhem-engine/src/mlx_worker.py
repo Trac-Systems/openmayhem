@@ -78,19 +78,35 @@ def required_sampling_kwargs(callable_obj, kwargs, requested):
 
 
 def tool_call_schema(tools):
-    names = [str(tool.get("name", "")) for tool in tools if str(tool.get("name", ""))]
-    if not names:
+    branches = []
+    names = set()
+    for tool in tools:
+        name = str(tool.get("name", ""))
+        if not name:
+            continue
+        if name in names:
+            raise ValueError(f"duplicate tool name {name!r}")
+        names.add(name)
+        branches.append(
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["tool", "arguments"],
+                "properties": {
+                    "tool": {"const": name},
+                    "arguments": tool.get(
+                        "parameters",
+                        {"type": "object", "additionalProperties": True},
+                    ),
+                },
+            }
+        )
+    if not branches:
         raise ValueError("tool-call grammar requires at least one tool")
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "MayhemToolCall",
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["tool", "arguments"],
-        "properties": {
-            "tool": {"type": "string", "enum": names},
-            "arguments": {"type": "object"},
-        },
+        "oneOf": branches,
     }
 
 

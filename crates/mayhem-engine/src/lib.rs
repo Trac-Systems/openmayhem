@@ -1766,23 +1766,69 @@ pub fn tool_call_json_schema(tools: &[ToolSpec]) -> Result<Value> {
         ));
     }
 
-    let mut names = Vec::with_capacity(tools.len());
+    let mut names = BTreeSet::new();
+    let mut branches = Vec::with_capacity(tools.len());
     for tool in tools {
         validate_tool_name(&tool.name)?;
-        names.push(Value::String(tool.name.clone()));
+        if !names.insert(&tool.name) {
+            return Err(EngineError::InvalidConfig(format!(
+                "duplicate tool name {:?}",
+                tool.name
+            )));
+        }
+        validate_tool_parameters_schema(tool)?;
+        branches.push(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["tool", "arguments"],
+            "properties": {
+                "tool": { "const": &tool.name },
+                "arguments": tool.parameters.clone(),
+            },
+        }));
     }
 
     Ok(json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "MayhemToolCall",
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["tool", "arguments"],
-        "properties": {
-            "tool": { "type": "string", "enum": names },
-            "arguments": { "type": "object" },
-        },
+        "oneOf": branches,
     }))
+}
+
+fn validate_tool_parameters_schema(tool: &ToolSpec) -> Result<()> {
+    jsonschema::draft202012::options()
+        .build(&tool.parameters)
+        .map(|_| ())
+        .map_err(|error| {
+            EngineError::InvalidConfig(format!(
+                "tool {:?} has invalid parameters JSON Schema: {error}",
+                tool.name
+            ))
+        })
+}
+
+pub fn validate_tool_call_arguments(tool: &ToolSpec, arguments: &Value) -> Result<()> {
+    validate_tool_name(&tool.name)?;
+    let validator = jsonschema::draft202012::options()
+        .build(&tool.parameters)
+        .map_err(|error| {
+            EngineError::InvalidConfig(format!(
+                "tool {:?} has invalid parameters JSON Schema: {error}",
+                tool.name
+            ))
+        })?;
+    if !arguments.is_object() {
+        return Err(EngineError::InvalidOutput(format!(
+            "tool {:?} arguments must be a JSON object",
+            tool.name
+        )));
+    }
+    validator.validate(arguments).map_err(|error| {
+        EngineError::InvalidOutput(format!(
+            "tool {:?} arguments violate its parameters JSON Schema: {error}",
+            tool.name
+        ))
+    })
 }
 
 pub fn tool_call_gbnf(tools: &[ToolSpec]) -> Result<String> {
@@ -7664,11 +7710,21 @@ sys.modules["mlx_vlm.structured"] = structured
 
 thinking = [{"name": "thinking_mode", "native_path": "enable_thinking", "value": True}]
 tool_processor = namespace["structured_logits_processor"]({
-    "grammar": {"kind": "tool_call", "tools": [{"name": "lookup"}]},
+    "grammar": {"kind": "tool_call", "tools": [{
+        "name": "lookup",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    }]},
     "speciality_parameters": thinking,
 })
 assert tool_processor[0] == "schema"
-assert tool_processor[1]["properties"]["tool"]["enum"] == ["lookup"]
+assert tool_processor[1]["oneOf"][0]["properties"]["tool"] == {"const": "lookup"}
+assert tool_processor[1]["oneOf"][0]["properties"]["arguments"]["required"] == ["query"]
+assert tool_processor[1]["oneOf"][0]["properties"]["arguments"]["additionalProperties"] is False
 json_processor = namespace["structured_logits_processor"]({
     "grammar": {"kind": "json_schema", "schema": {"type": "object"}},
     "speciality_parameters": thinking,
@@ -11699,17 +11755,101 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_schema_restricts_names() {
+    fn tool_call_schema_correlates_names_with_exact_parameter_schemas() {
+        let lookup_parameters = json!({
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+            "additionalProperties": false,
+        });
+        let quote_parameters = json!({
+            "type": "object",
+            "properties": {"symbol": {"type": "string"}},
+            "required": ["symbol"],
+            "additionalProperties": false,
+        });
         let schema = tool_call_json_schema(&[
-            ToolSpec::new("lookup", json!({"type": "object"})),
-            ToolSpec::new("quote", json!({"type": "object"})),
+            ToolSpec::new("lookup", lookup_parameters.clone()),
+            ToolSpec::new("quote", quote_parameters.clone()),
         ])
         .expect("schema");
 
-        let names = &schema["properties"]["tool"]["enum"];
-        assert!(names.as_array().expect("enum").contains(&json!("lookup")));
-        assert!(names.as_array().expect("enum").contains(&json!("quote")));
-        assert_eq!(schema["required"], json!(["tool", "arguments"]));
+        let branches = schema["oneOf"].as_array().expect("oneOf branches");
+        assert_eq!(branches.len(), 2);
+        assert_eq!(
+            branches[0]["properties"]["tool"],
+            json!({"const": "lookup"})
+        );
+        assert_eq!(branches[0]["properties"]["arguments"], lookup_parameters);
+        assert_eq!(branches[1]["properties"]["tool"], json!({"const": "quote"}));
+        assert_eq!(branches[1]["properties"]["arguments"], quote_parameters);
+
+        let validator = jsonschema::draft202012::options()
+            .build(&schema)
+            .expect("generated schema compiles");
+        assert!(validator.is_valid(&json!({
+            "tool": "lookup",
+            "arguments": {"query": "weather"},
+        })));
+        assert!(!validator.is_valid(&json!({
+            "tool": "lookup",
+            "arguments": {"symbol": "MAYHEM"},
+        })));
+    }
+
+    #[test]
+    fn tool_call_argument_validation_is_fail_closed() {
+        let tool = ToolSpec::new(
+            "write",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "options": {
+                        "type": "object",
+                        "properties": {"overwrite": {"type": "boolean"}},
+                        "required": ["overwrite"],
+                        "additionalProperties": false,
+                    },
+                },
+                "required": ["path", "options"],
+                "additionalProperties": false,
+            }),
+        );
+
+        validate_tool_call_arguments(
+            &tool,
+            &json!({"path": "README.md", "options": {"overwrite": true}}),
+        )
+        .expect("valid arguments");
+
+        for invalid in [
+            json!([]),
+            json!({"options": {"overwrite": true}}),
+            json!({"path": 7, "options": {"overwrite": true}}),
+            json!({"path": "README.md", "options": {"overwrite": true}, "extra": 1}),
+            json!({"path": "README.md", "options": {"overwrite": true, "extra": 1}}),
+        ] {
+            assert!(matches!(
+                validate_tool_call_arguments(&tool, &invalid),
+                Err(EngineError::InvalidOutput(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn tool_call_argument_validation_rejects_invalid_or_external_schemas() {
+        for parameters in [
+            json!({"type": "not-a-json-schema-type"}),
+            json!({"$ref": "https://example.invalid/tool-schema.json"}),
+            json!({"$ref": "file:///tmp/tool-schema.json"}),
+        ] {
+            let tool = ToolSpec::new("lookup", parameters);
+            assert!(matches!(
+                validate_tool_call_arguments(&tool, &json!({})),
+                Err(EngineError::InvalidConfig(_))
+            ));
+        }
     }
 
     #[test]

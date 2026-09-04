@@ -463,28 +463,52 @@ def make_structured_outputs_params(grammar):
 def make_guided_params(cls, grammar):
     kind = grammar.get("kind")
     if kind == "json_schema":
-        return cls(**accepted_kwargs(cls, {"json": grammar.get("schema") or {}}))
+        field = "json"
+        value = grammar.get("schema") or {}
     if kind == "gbnf":
-        return cls(**accepted_kwargs(cls, {"grammar": grammar.get("grammar") or ""}))
+        field = "grammar"
+        value = grammar.get("grammar") or ""
     if kind == "tool_call":
-        return cls(**accepted_kwargs(cls, {"json": tool_call_schema(grammar.get("tools") or [])}))
-    raise ValueError(f"unsupported vLLM grammar kind {kind!r}")
+        field = "json"
+        value = tool_call_schema(grammar.get("tools") or [])
+    if kind not in ("json_schema", "gbnf", "tool_call"):
+        raise ValueError(f"unsupported vLLM grammar kind {kind!r}")
+    kwargs = accepted_kwargs(cls, {field: value})
+    if field not in kwargs:
+        raise ValueError(f"vLLM structured-output API does not accept {field!r}")
+    return cls(**kwargs)
 
 
 def tool_call_schema(tools):
-    names = [str(tool.get("name", "")) for tool in tools if str(tool.get("name", ""))]
-    if not names:
+    branches = []
+    names = set()
+    for tool in tools:
+        name = str(tool.get("name", ""))
+        if not name:
+            continue
+        if name in names:
+            raise ValueError(f"duplicate tool name {name!r}")
+        names.add(name)
+        branches.append(
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["tool", "arguments"],
+                "properties": {
+                    "tool": {"const": name},
+                    "arguments": tool.get(
+                        "parameters",
+                        {"type": "object", "additionalProperties": True},
+                    ),
+                },
+            }
+        )
+    if not branches:
         raise ValueError("tool-call grammar requires at least one tool")
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "MayhemToolCall",
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["tool", "arguments"],
-        "properties": {
-            "tool": {"type": "string", "enum": names},
-            "arguments": {"type": "object"},
-        },
+        "oneOf": branches,
     }
 
 
@@ -536,8 +560,16 @@ def make_sampling_params(payload, speciality_sampling_kwargs=None):
         requested.add(name)
     structured = make_structured_outputs_params(payload.get("grammar"))
     if structured is not None:
-        kwargs["structured_outputs"] = structured
-        kwargs["guided_decoding"] = structured
+        structured_kwargs = accepted_kwargs(
+            SamplingParams,
+            {
+                "structured_outputs": structured,
+                "guided_decoding": structured,
+            },
+        )
+        if not structured_kwargs:
+            raise ValueError("vLLM sampling API does not accept structured decoding")
+        kwargs.update(structured_kwargs)
     try:
         RequestOutputKind = import_attr((("vllm.sampling_params", "RequestOutputKind"),))
         kwargs["output_kind"] = getattr(RequestOutputKind, "DELTA")

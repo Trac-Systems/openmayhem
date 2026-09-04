@@ -5463,6 +5463,7 @@ pub fn openai_router(state: GatewayState) -> Router {
             "/v1/jobs/{job_id}",
             get(retrieve_gateway_job).delete(delete_gateway_job),
         )
+        .route("/v1/jobs/{job_id}/cancel", post(cancel_gateway_job))
         .route("/v1/jobs/{job_id}/result", get(retrieve_gateway_job_result))
         .route(
             "/v1/jobs/{job_id}/artifacts/{artifact_id}",
@@ -9050,6 +9051,39 @@ async fn delete_gateway_job(
         "deleted": true,
     }))
     .into_response()
+}
+
+/// Request cancellation without ever deleting terminal evidence. This is the
+/// race-safe operation for clients that must reconcile billing after Stop.
+async fn cancel_gateway_job(
+    State(state): State<SharedState>,
+    Path(job_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let job = match lookup_gateway_job(&state, &job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            return ApiError::not_found("gateway job was not found", Some("job_id")).into_response()
+        }
+        Err(err) => return err.into_response(),
+    };
+    if let Err(err) = authorize_gateway_job(&state, &headers, &job) {
+        return err.into_response();
+    }
+    if matches!(job, GatewayJobLookup::InProgress { .. }) {
+        if request_gateway_job_cancellation(&state, &job_id) {
+            return gateway_job_cancelling_response(&job_id);
+        }
+        return ApiError::conflict(
+            "the in-progress job no longer has a live execution to cancel",
+            Some("job_id"),
+        )
+        .into_response();
+    }
+    match job {
+        GatewayJobLookup::Terminal(job) => gateway_existing_job_response(job),
+        GatewayJobLookup::InProgress { .. } => unreachable!("handled above"),
+    }
 }
 
 async fn create_chat_completion(
@@ -44941,6 +44975,51 @@ mod tests {
             .active_job_cancellations
             .lock_recover("active gateway job cancellations")
             .contains_key(&job.id));
+    }
+
+    #[tokio::test]
+    async fn cancel_only_endpoint_preserves_a_terminal_job_result() {
+        use tower::ServiceExt;
+
+        let state = GatewayState::fixture();
+        let job = match prepare_gateway_job(
+            &state,
+            &HeaderMap::new(),
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+            "mayhem/chat-test",
+            &json!({"model": "mayhem/chat-test", "messages": []}),
+            &None,
+        )
+        .await
+        .unwrap()
+        {
+            PreparedGatewayJob::Started(job) => job,
+            _ => panic!("fresh request must start a job"),
+        };
+        job.persist_completed_if_active(json!({"choices": []}), Vec::new(), None)
+            .await
+            .unwrap();
+
+        let response = openai_router(state.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/jobs/{}/cancel", job.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let stored = state
+            .jobs
+            .lock_recover("gateway job vault")
+            .get(&job.id, now_secs())
+            .unwrap()
+            .expect("cancel-only must retain terminal evidence");
+        assert_eq!(stored.status, GatewayJobStatus::Completed);
+        assert_eq!(stored.result, Some(json!({"choices": []})));
     }
 
     #[tokio::test]
