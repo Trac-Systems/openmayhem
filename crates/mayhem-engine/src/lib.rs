@@ -1768,7 +1768,8 @@ pub fn tool_call_json_schema(tools: &[ToolSpec]) -> Result<Value> {
 
     let mut names = BTreeSet::new();
     let mut branches = Vec::with_capacity(tools.len());
-    for tool in tools {
+    let mut definitions = serde_json::Map::new();
+    for (index, tool) in tools.iter().enumerate() {
         validate_tool_name(&tool.name)?;
         if !names.insert(&tool.name) {
             return Err(EngineError::InvalidConfig(format!(
@@ -1777,22 +1778,64 @@ pub fn tool_call_json_schema(tools: &[ToolSpec]) -> Result<Value> {
             )));
         }
         validate_tool_parameters_schema(tool)?;
+        let definition = format!("tool_{index}_parameters");
+        let reference = format!("#/$defs/{definition}");
+        let mut parameters = tool.parameters.clone();
+        rebase_local_json_schema_refs(&mut parameters, &reference);
+        definitions.insert(definition, parameters);
         branches.push(json!({
             "type": "object",
             "additionalProperties": false,
             "required": ["tool", "arguments"],
             "properties": {
                 "tool": { "const": &tool.name },
-                "arguments": tool.parameters.clone(),
+                "arguments": { "$ref": reference },
             },
         }));
     }
 
-    Ok(json!({
+    let schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "MayhemToolCall",
+        "$defs": definitions,
         "oneOf": branches,
-    }))
+    });
+    jsonschema::draft202012::options()
+        .build(&schema)
+        .map_err(|error| {
+            EngineError::InvalidConfig(format!(
+                "generated tool-call JSON Schema is invalid: {error}"
+            ))
+        })?;
+    Ok(schema)
+}
+
+fn rebase_local_json_schema_refs(value: &mut Value, new_root: &str) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                rebase_local_json_schema_refs(value, new_root);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                let rebased = if reference == "#" {
+                    Some(new_root.to_owned())
+                } else {
+                    reference
+                        .strip_prefix("#/")
+                        .map(|suffix| format!("{new_root}/{suffix}"))
+                };
+                if let Some(rebased) = rebased {
+                    object.insert("$ref".to_owned(), Value::String(rebased));
+                }
+            }
+            for value in object.values_mut() {
+                rebase_local_json_schema_refs(value, new_root);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn validate_tool_parameters_schema(tool: &ToolSpec) -> Result<()> {
@@ -11780,9 +11823,17 @@ mod tests {
             branches[0]["properties"]["tool"],
             json!({"const": "lookup"})
         );
-        assert_eq!(branches[0]["properties"]["arguments"], lookup_parameters);
+        assert_eq!(
+            branches[0]["properties"]["arguments"],
+            json!({"$ref": "#/$defs/tool_0_parameters"})
+        );
         assert_eq!(branches[1]["properties"]["tool"], json!({"const": "quote"}));
-        assert_eq!(branches[1]["properties"]["arguments"], quote_parameters);
+        assert_eq!(
+            branches[1]["properties"]["arguments"],
+            json!({"$ref": "#/$defs/tool_1_parameters"})
+        );
+        assert_eq!(schema["$defs"]["tool_0_parameters"], lookup_parameters);
+        assert_eq!(schema["$defs"]["tool_1_parameters"], quote_parameters);
 
         let validator = jsonschema::draft202012::options()
             .build(&schema)
@@ -11794,6 +11845,39 @@ mod tests {
         assert!(!validator.is_valid(&json!({
             "tool": "lookup",
             "arguments": {"symbol": "MAYHEM"},
+        })));
+    }
+
+    #[test]
+    fn tool_call_schema_preserves_local_parameter_references_when_wrapped() {
+        let schema = tool_call_json_schema(&[ToolSpec::new(
+            "write",
+            json!({
+                "$defs": {
+                    "path": {"type": "string", "minLength": 1}
+                },
+                "type": "object",
+                "properties": {"path": {"$ref": "#/$defs/path"}},
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        )])
+        .expect("schema");
+
+        assert_eq!(
+            schema["$defs"]["tool_0_parameters"]["properties"]["path"]["$ref"],
+            "#/$defs/tool_0_parameters/$defs/path"
+        );
+        let validator = jsonschema::draft202012::options()
+            .build(&schema)
+            .expect("generated schema compiles");
+        assert!(validator.is_valid(&json!({
+            "tool": "write",
+            "arguments": {"path": "index.html"}
+        })));
+        assert!(!validator.is_valid(&json!({
+            "tool": "write",
+            "arguments": {"path": ""}
         })));
     }
 

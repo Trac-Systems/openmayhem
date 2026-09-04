@@ -1,4 +1,5 @@
 import ast
+import copy
 import inspect
 import pathlib
 import sys
@@ -10,6 +11,7 @@ ENGINE_SRC = pathlib.Path(__file__).resolve().parents[1] / "src"
 
 
 def load_functions(worker_name, function_names):
+    function_names = set(function_names) | {"rebase_local_json_schema_refs"}
     worker_path = ENGINE_SRC / worker_name
     tree = ast.parse(worker_path.read_text(), worker_path.name)
     retained = [
@@ -17,7 +19,7 @@ def load_functions(worker_name, function_names):
         for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in function_names
     ]
-    namespace = {"inspect": inspect}
+    namespace = {"copy": copy, "inspect": inspect}
     exec(
         compile(ast.Module(body=retained, type_ignores=[]), worker_path.name, "exec"),
         namespace,
@@ -56,13 +58,40 @@ class ToolCallWorkerSchemaTests(unittest.TestCase):
                 schema = worker["tool_call_schema"](tools())
 
                 self.assertEqual(len(schema["oneOf"]), 2)
-                for branch, tool in zip(schema["oneOf"], tools()):
+                for index, (branch, tool) in enumerate(zip(schema["oneOf"], tools())):
                     self.assertEqual(
                         branch["properties"]["tool"], {"const": tool["name"]}
                     )
                     self.assertEqual(
-                        branch["properties"]["arguments"], tool["parameters"]
+                        branch["properties"]["arguments"],
+                        {"$ref": f"#/$defs/tool_{index}_parameters"},
                     )
+                    self.assertEqual(
+                        schema["$defs"][f"tool_{index}_parameters"],
+                        tool["parameters"],
+                    )
+
+    def test_workers_rebase_local_parameter_references(self):
+        referenced_tools = [
+            {
+                "name": "write",
+                "parameters": {
+                    "$defs": {"path": {"type": "string", "minLength": 1}},
+                    "type": "object",
+                    "properties": {"path": {"$ref": "#/$defs/path"}},
+                },
+            }
+        ]
+        for worker_name in ("vllm_worker.py", "mlx_worker.py"):
+            with self.subTest(worker=worker_name):
+                worker = load_functions(worker_name, {"tool_call_schema"})
+                schema = worker["tool_call_schema"](referenced_tools)
+                self.assertEqual(
+                    schema["$defs"]["tool_0_parameters"]["properties"]["path"][
+                        "$ref"
+                    ],
+                    "#/$defs/tool_0_parameters/$defs/path",
+                )
 
     def test_vllm_guided_payload_retains_parameter_schemas(self):
         worker = load_functions(
@@ -80,8 +109,9 @@ class ToolCallWorkerSchemaTests(unittest.TestCase):
         )
         self.assertEqual(
             params.json["oneOf"][1]["properties"]["arguments"],
-            tools()[1]["parameters"],
+            {"$ref": "#/$defs/tool_1_parameters"},
         )
+        self.assertEqual(params.json["$defs"]["tool_1_parameters"], tools()[1]["parameters"])
 
     def test_vllm_guided_payload_rejects_a_dropped_schema(self):
         worker = load_functions(
@@ -137,6 +167,10 @@ class ToolCallWorkerSchemaTests(unittest.TestCase):
         self.assertEqual(processor, "processor")
         self.assertEqual(
             captured["schema"]["oneOf"][0]["properties"]["arguments"],
+            {"$ref": "#/$defs/tool_0_parameters"},
+        )
+        self.assertEqual(
+            captured["schema"]["$defs"]["tool_0_parameters"],
             tools()[0]["parameters"],
         )
 

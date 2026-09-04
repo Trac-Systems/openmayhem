@@ -40166,6 +40166,7 @@ struct UpPlan {
     supervisor_url: String,
     mayhemd_control_token: String,
     wallet_password: Option<String>,
+    wallet_password_file: Option<PathBuf>,
     gateway_bind: SocketAddr,
     rail: GatewayLedgerRail,
     gateway_require_auth: bool,
@@ -40961,6 +40962,10 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
         .wallet_password
         .clone()
         .or_else(|| env::var("MAYHEM_WALLET_PASSWORD").ok());
+    let wallet_password_file = wallet_password
+        .as_deref()
+        .map(|password| persist_up_wallet_password(&home, password))
+        .transpose()?;
     let config_path = config_path_for_home(&home);
     let mut config = read_config_toml_value(&config_path)?;
     let gateway_bind =
@@ -41141,6 +41146,7 @@ async fn prepare_up_plan(args: &UpArgs) -> Result<UpPlan> {
         supervisor_url,
         mayhemd_control_token,
         wallet_password,
+        wallet_password_file,
         gateway_bind,
         rail,
         gateway_require_auth,
@@ -41512,6 +41518,32 @@ fn write_up_supervisor_config(plan: &UpPlan) -> Result<()> {
     .with_context(|| format!("writing {}", plan.supervisor_config_path.display()))
 }
 
+fn persist_up_wallet_password(home: &Path, password: &str) -> Result<PathBuf> {
+    let path = home.join("secrets").join("wallet-password");
+    let parent = path
+        .parent()
+        .context("supervised wallet password path has no parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("securing {}", parent.display()))?;
+    }
+    write_private_file(&path, password.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(path)
+}
+
+fn append_supervised_wallet_password_arg(args: &mut Vec<String>, plan: &UpPlan) {
+    if let Some(path) = plan.wallet_password_file.as_ref() {
+        args.extend([
+            "--wallet-password-file".to_owned(),
+            path.display().to_string(),
+        ]);
+    }
+}
+
 fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
     let mut out = String::new();
     writeln!(&mut out, "[supervisor]")?;
@@ -41660,6 +41692,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
         "--rail".to_owned(),
         plan.rail.as_str().to_owned(),
     ];
+    append_supervised_wallet_password_arg(&mut gateway_args, plan);
     if plan.gateway_require_auth {
         gateway_args.push("--require-auth".to_owned());
     }
@@ -41677,7 +41710,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
     )?;
 
     if plan.fraud_challenger {
-        let challenger_args = vec![
+        let mut challenger_args = vec![
             "fraud-proof".to_owned(),
             "challenge".to_owned(),
             "--home".to_owned(),
@@ -41692,6 +41725,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
             plan.fraud_challenger_poll_interval_seconds.to_string(),
             "--json".to_owned(),
         ];
+        append_supervised_wallet_password_arg(&mut challenger_args, plan);
         write_supervisor_child(
             &mut out,
             "fraud-challenger",
@@ -41716,6 +41750,7 @@ fn up_supervisor_config(plan: &UpPlan) -> Result<String> {
                 plan.sc_bridge_url.clone(),
                 "--serve-sessions".to_owned(),
             ];
+            append_supervised_wallet_password_arg(&mut provider_args, plan);
             if let Some(enclave) = &worker.enclave {
                 provider_args.extend(["--enclave".to_owned(), enclave.clone()]);
             }
@@ -82931,7 +82966,7 @@ fn provider_session_receipt_for_usage_attribution(
         usage: usage.clone(),
         usage_attribution,
         au_owed_cum,
-        prompt_hash: provider_session_prompt_hash(body),
+        prompt_hash: provider_session_prompt_hash(body, &terms.adapter),
         ts: unix_epoch_millis()?,
     };
     let payload = receipt_signing_bytes(&receipt_body).context("building receipt signing bytes")?;
@@ -83000,7 +83035,7 @@ fn provider_session_workflow_output(
     Ok(derivation.workflow_output)
 }
 
-fn provider_session_prompt_hash(body: &Value) -> String {
+fn provider_session_prompt_hash(body: &Value, adapter: &catalog::CatalogAdapter) -> String {
     let endpoint_family = body
         .get("mayhem_contract")
         .and_then(|value| value.get("endpoint_family"))
@@ -83010,7 +83045,7 @@ fn provider_session_prompt_hash(body: &Value) -> String {
             body.get("contract_request").unwrap_or(body),
         );
     }
-    blake3::hash(provider_session_prompt_text(body).as_bytes())
+    blake3::hash(provider_session_prompt_text(body, adapter).as_bytes())
         .to_hex()
         .to_string()
 }
@@ -83033,7 +83068,7 @@ fn provider_receipt_binds_contract_request(endpoint_family: &str) -> bool {
     )
 }
 
-fn provider_session_prompt_text(body: &Value) -> String {
+fn provider_session_prompt_text(body: &Value, adapter: &catalog::CatalogAdapter) -> String {
     let endpoint_family = body
         .get("mayhem_contract")
         .and_then(|value| value.get("endpoint_family"))
@@ -83071,17 +83106,57 @@ fn provider_session_prompt_text(body: &Value) -> String {
     ) {
         return stable_json_value(body).to_string();
     }
+    let preserve_reasoning_content = endpoint_family.is_some_and(|family| {
+        provider_engine_preserves_reasoning_history(family, body, adapter).unwrap_or(false)
+    });
     endpoint_family
         .and_then(|family| provider_endpoint_messages(family, body).ok())
         .or_else(|| body.get("messages").and_then(Value::as_array).cloned())
         .map(|messages| {
             messages
                 .iter()
-                .map(provider_message_to_text)
+                .map(|message| {
+                    provider_accounting_message_text(message, preserve_reasoning_content)
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         })
         .unwrap_or_default()
+}
+
+fn provider_engine_preserves_reasoning_history(
+    endpoint_family: &str,
+    body: &Value,
+    adapter: &catalog::CatalogAdapter,
+) -> Result<bool> {
+    if adapter.chat_template_id != "qwen3.5-instruct" {
+        return Ok(false);
+    }
+    let (specialities, _) = provider_engine_speciality_parameters(endpoint_family, body, adapter)?;
+    provider_engine_speciality_bool(&specialities, "preserve_thinking", false)
+}
+
+fn provider_accounting_message_text(message: &Value, preserve_reasoning_content: bool) -> String {
+    let content = provider_message_to_text(message);
+    if !preserve_reasoning_content
+        || message.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return content;
+    }
+    let Some(reasoning) = message
+        .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return content;
+    };
+    if content.trim().is_empty() {
+        reasoning.to_owned()
+    } else {
+        format!("{reasoning}\n{content}")
+    }
 }
 
 fn provider_embedding_prompt_text(body: &Value) -> String {
@@ -88580,7 +88655,7 @@ fn provider_engine_session_response_with_sampling_bounded(
     // Existing text models keep the established request-text estimate. A signed
     // tools-only endpoint is metered from the model-visible query and selected
     // tools so buyer and provider agree without charging transport metadata.
-    let estimated_prompt_tokens = rough_text_tokens(&provider_session_prompt_text(body));
+    let estimated_prompt_tokens = rough_text_tokens(&provider_session_prompt_text(body, adapter));
     let output = backend
         .generate_with_artifacts(
             request,
@@ -89575,6 +89650,13 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
     let (speciality_parameters, speciality_output_cap) =
         provider_engine_speciality_parameters(endpoint_family, body, adapter)?;
     let tool_request = provider_engine_tool_request(body, adapter)?;
+    ensure!(
+        !(tool_request
+            .as_ref()
+            .is_some_and(|request| !request.required)
+            && provider_wants_json(body)),
+        "response_format cannot be combined with automatic tool selection on this provider backend"
+    );
     let template_tools = tool_request
         .as_ref()
         .map(|request| provider_engine_template_tools(&request.tools))
@@ -90377,6 +90459,10 @@ fn provider_engine_tool_request(
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     if advertised_tools.is_empty() {
+        ensure!(
+            !required,
+            "tool_choice requires a function that is present in tools"
+        );
         return Ok(None);
     }
     let tools = provider_session_request_result(provider_engine_tool_specs(body))?;
@@ -90465,9 +90551,16 @@ fn provider_engine_named_tool_choice(choice: &serde_json::Map<String, Value>) ->
 }
 
 fn provider_openai_tool_calls_json_schema(tools: &[ToolSpec], parallel: bool) -> Value {
+    let mut definitions = serde_json::Map::new();
     let call_variants = tools
         .iter()
-        .map(|tool| {
+        .enumerate()
+        .map(|(index, tool)| {
+            let definition = format!("tool_{index}_parameters");
+            let reference = format!("#/$defs/{definition}");
+            let mut parameters = tool.parameters.clone();
+            provider_rebase_local_json_schema_refs(&mut parameters, &reference);
+            definitions.insert(definition, parameters);
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -90481,7 +90574,7 @@ fn provider_openai_tool_calls_json_schema(tools: &[ToolSpec], parallel: bool) ->
                         "required": ["name", "arguments"],
                         "properties": {
                             "name": { "const": tool.name },
-                            "arguments": tool.parameters,
+                            "arguments": { "$ref": reference },
                         },
                     },
                 },
@@ -90491,6 +90584,7 @@ fn provider_openai_tool_calls_json_schema(tools: &[ToolSpec], parallel: bool) ->
     let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "OpenAIToolCalls",
+        "$defs": definitions,
         "type": "object",
         "additionalProperties": false,
         "required": ["tool_calls"],
@@ -90510,6 +90604,34 @@ fn provider_openai_tool_calls_json_schema(tools: &[ToolSpec], parallel: bool) ->
     schema
 }
 
+fn provider_rebase_local_json_schema_refs(value: &mut Value, new_root: &str) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                provider_rebase_local_json_schema_refs(value, new_root);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                let rebased = if reference == "#" {
+                    Some(new_root.to_owned())
+                } else {
+                    reference
+                        .strip_prefix("#/")
+                        .map(|suffix| format!("{new_root}/{suffix}"))
+                };
+                if let Some(rebased) = rebased {
+                    object.insert("$ref".to_owned(), Value::String(rebased));
+                }
+            }
+            for value in object.values_mut() {
+                provider_rebase_local_json_schema_refs(value, new_root);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn provider_response_json_schema(body: &Value) -> Value {
     body.get("response_format")
         .and_then(|format| format.get("json_schema"))
@@ -90526,7 +90648,7 @@ fn provider_response_json_schema(body: &Value) -> Value {
 fn provider_engine_tool_call_outputs(
     text: &str,
     strategy: ProviderEngineToolStrategy,
-    tools: &[ToolSpec],
+    _tools: &[ToolSpec],
 ) -> Option<Vec<Value>> {
     let mut calls = match strategy {
         ProviderEngineToolStrategy::MayhemJson => provider_mayhem_json_tool_call_outputs(text),
@@ -90546,14 +90668,7 @@ fn provider_engine_tool_call_outputs(
             })
             .or_else(|| provider_mayhem_json_tool_call_outputs(text)),
     }?;
-    if calls.is_empty()
-        || calls.iter().any(|call| {
-            let Some(name) = call.get("name").and_then(Value::as_str) else {
-                return true;
-            };
-            !tools.iter().any(|candidate| candidate.name == name)
-        })
-    {
+    if calls.is_empty() {
         return None;
     }
     make_provider_tool_call_ids_unique(&mut calls)?;
@@ -108832,7 +108947,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(receipt.body.au_owed_cum, 1);
         assert_eq!(
             receipt.body.prompt_hash,
-            provider_session_prompt_hash(&body)
+            provider_session_prompt_hash(&body, &terms.adapter)
         );
 
         let key_bytes: [u8; 32] = test_hex_decode(&runtime_keypair.public_key_hex())
@@ -109703,7 +109818,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
-    fn provider_engine_request_does_not_replace_auto_tools_with_response_grammar() {
+    fn provider_engine_request_rejects_auto_tools_with_response_grammar() {
         let adapter = catalog::CatalogAdapter {
             tool_call_strategy: "qwen_function_xml".to_owned(),
             ..catalog::CatalogAdapter::default()
@@ -109720,10 +109835,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             "tool_choice": "auto",
             "response_format": { "type": "json_object" }
         });
-        let request = provider_engine_request_from_body(&body, &adapter).unwrap();
-
-        assert_eq!(request.tools.len(), 1);
-        assert!(request.grammar.is_none());
+        let error = provider_engine_request_from_body(&body, &adapter).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("response_format cannot be combined with automatic tool selection"));
     }
 
     #[test]
@@ -109751,7 +109866,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
-    fn provider_engine_request_accepts_tool_choice_without_advertised_tools() {
+    fn provider_engine_request_rejects_tool_choice_without_advertised_tools() {
         let adapter = catalog::CatalogAdapter {
             tool_call_strategy: "qwen_function_xml".to_owned(),
             ..catalog::CatalogAdapter::default()
@@ -109763,10 +109878,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "function": { "name": "calibration_tool" }
             }
         });
-        let request = provider_engine_request_from_body(&body, &adapter).unwrap();
-
-        assert!(request.tools.is_empty());
-        assert!(request.grammar.is_none());
+        let error = provider_engine_request_from_body(&body, &adapter).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires a function that is present in tools"));
     }
 
     #[test]
@@ -109804,15 +109919,43 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         );
         assert_eq!(
             schema["properties"]["tool_calls"]["items"]["oneOf"][0]["properties"]["function"]
-                ["properties"]["arguments"]["additionalProperties"],
+                ["properties"]["arguments"]["$ref"],
+            "#/$defs/tool_0_parameters"
+        );
+        assert_eq!(
+            schema["$defs"]["tool_0_parameters"]["additionalProperties"],
             false
         );
         assert_eq!(
-            schema["properties"]["tool_calls"]["items"]["oneOf"][0]["properties"]["function"]
-                ["properties"]["arguments"]["required"][0],
+            schema["$defs"]["tool_0_parameters"]["required"][0],
             "filePath"
         );
         assert!(schema["properties"]["tool_calls"].get("maxItems").is_none());
+    }
+
+    #[test]
+    fn provider_openai_tool_schema_preserves_local_parameter_references() {
+        let schema = provider_openai_tool_calls_json_schema(
+            &[ToolSpec::new(
+                "write",
+                json!({
+                    "$defs": {"path": {"type": "string", "minLength": 1}},
+                    "type": "object",
+                    "properties": {"path": {"$ref": "#/$defs/path"}}
+                }),
+            )],
+            false,
+        );
+
+        assert_eq!(
+            schema["$defs"]["tool_0_parameters"]["properties"]["path"]["$ref"],
+            "#/$defs/tool_0_parameters/$defs/path"
+        );
+        assert_eq!(
+            schema["properties"]["tool_calls"]["items"]["oneOf"][0]["properties"]["function"]
+                ["properties"]["arguments"]["$ref"],
+            "#/$defs/tool_0_parameters"
+        );
     }
 
     #[test]
@@ -110210,6 +110353,98 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             provider_engine_qwen3_prompt(&history, &[], &[disabled, preserve], &adapter).unwrap();
         assert!(prompt.contains("copper-signal-731"));
         assert!(prompt.contains("bronze-signal-419"));
+    }
+
+    #[test]
+    fn qwen_preserved_reasoning_history_is_billed_and_bound_in_receipts() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "Qwen/Qwen3.8-27B")
+            .expect("Qwen 3.8 catalog model");
+        let mut body = json!({
+            "model": model.model_id,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Choose a marker.",
+                    "reasoning_content": "user reasoning is not rendered by the provider"
+                },
+                {
+                    "role": "assistant",
+                    "content": "Marker selected.",
+                    "reasoning_content": "private accounting marker cobalt-signal-827"
+                },
+                {"role": "user", "content": "Continue."}
+            ],
+            "thinking_history": "preserve",
+            "max_tokens": 8
+        });
+        let sealed =
+            provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
+        let preserved_text = provider_session_prompt_text(&sealed, &model.adapter);
+        assert!(preserved_text.contains("private accounting marker cobalt-signal-827"));
+        assert!(!preserved_text.contains("user reasoning is not rendered"));
+        let preserved_tokens = rough_text_tokens(&preserved_text);
+        let preserved_hash = provider_session_prompt_hash(&sealed, &model.adapter);
+        let mut backend = FakeEngineBackend::new("continued");
+        let output = provider_engine_session_response_with_sampling(
+            &mut backend,
+            Some(&model.model_id),
+            &model.adapter,
+            &model.sampling,
+            None,
+            &sealed,
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(backend
+            .last_request
+            .as_ref()
+            .unwrap()
+            .prompt
+            .contains("private accounting marker cobalt-signal-827"));
+        assert_eq!(output.prompt_tokens, preserved_tokens);
+        assert_eq!(output.usage.input_tokens(), preserved_tokens);
+
+        let mut terms = test_provider_session_terms();
+        terms.model_id = model.model_id.clone();
+        terms.adapter = model.adapter.clone();
+        let active = test_active_provider_session(&terms, vec!["text".to_owned()]);
+        let receipt = provider_session_receipt(
+            &terms,
+            &active,
+            &sealed,
+            &output,
+            &RuntimeKeypair::from_seed([9; 32]),
+        )
+        .unwrap();
+        assert_eq!(receipt.body.prompt_hash, preserved_hash);
+        assert_eq!(receipt.body.usage.input_tokens(), preserved_tokens);
+
+        body["thinking_history"] = json!("latest_only");
+        let latest_only =
+            provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
+        let latest_only_text = provider_session_prompt_text(&latest_only, &model.adapter);
+        assert!(!latest_only_text.contains("private accounting marker cobalt-signal-827"));
+        assert!(rough_text_tokens(&latest_only_text) < preserved_tokens);
+        assert_ne!(
+            provider_session_prompt_hash(&latest_only, &model.adapter),
+            preserved_hash
+        );
+        let latest_only_request = provider_engine_request_from_endpoint_body_with_sampling(
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+            latest_only.get("contract_request").unwrap(),
+            &model.adapter,
+            &model.sampling,
+        )
+        .unwrap();
+        assert!(!latest_only_request
+            .prompt
+            .contains("private accounting marker cobalt-signal-827"));
     }
 
     #[test]
@@ -110726,7 +110961,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
         provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter).unwrap();
         assert_eq!(
-            provider_session_prompt_hash(&sealed),
+            provider_session_prompt_hash(&sealed, &model.adapter),
             sealed["mayhem_contract"]["normalized_request_fingerprint"]
                 .as_str()
                 .unwrap()
@@ -111914,7 +112149,9 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(output.tools.is_empty());
         assert_eq!(output.finish_reason, "stop");
         let request = backend.last_request.expect("engine request");
-        let canonical_prompt_tokens = rough_text_tokens(&provider_session_prompt_text(&body));
+        let adapter = catalog::CatalogAdapter::default();
+        let canonical_prompt_tokens =
+            rough_text_tokens(&provider_session_prompt_text(&body, &adapter));
         let rendered_prompt_tokens = rough_text_tokens(&request.prompt);
         assert_eq!(canonical_prompt_tokens, 5);
         assert_eq!(rendered_prompt_tokens, 7);
@@ -112035,7 +112272,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             tool_call_strategy: "mayhem_json".to_owned(),
             ..catalog::CatalogAdapter::default()
         };
-        let estimated = rough_text_tokens(&provider_session_prompt_text(&body));
+        let estimated = rough_text_tokens(&provider_session_prompt_text(&body, &ordinary_adapter));
         let mut ordinary = FakeEngineBackend::new(
             r#"{"tool":"get_weather","arguments":{"city":"Berlin","country":"DE","units":"metric"}}"#,
         );
@@ -116920,7 +117157,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
-    fn provider_tool_parser_rejects_unclosed_reasoning_without_advertised_call() {
+    fn provider_tool_parser_distinguishes_plain_text_from_unadvertised_calls() {
         let tools = vec![ToolSpec::new("write", json!({ "type": "object" }))];
 
         assert!(provider_engine_tool_call_outputs_after_reasoning(
@@ -116932,7 +117169,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             &tools,
         )
         .is_none());
-        assert!(provider_engine_tool_call_outputs_after_reasoning(
+        let calls = provider_engine_tool_call_outputs_after_reasoning(
             r#"{"tool":"unadvertised","arguments":{}}"#,
             ProviderReasoningOutputMode::StripPrefilled,
             Some(true),
@@ -116940,7 +117177,9 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ProviderEngineToolStrategy::QwenFunctionXml,
             &tools,
         )
-        .is_none());
+        .expect("structured tool attempt");
+        let error = validate_provider_engine_tool_call_outputs(&calls, &tools).unwrap_err();
+        assert!(error.to_string().contains("unadvertised tool call"));
     }
 
     #[test]
@@ -116993,14 +117232,17 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
-    fn provider_engine_tool_call_outputs_reject_whole_set_with_unadvertised_tool() {
+    fn provider_engine_tool_call_outputs_preserve_unadvertised_call_for_validation() {
         let tools = vec![ToolSpec::new("read", json!({ "type": "object" }))];
-        assert!(provider_engine_tool_call_outputs(
+        let calls = provider_engine_tool_call_outputs(
             "<tool_call><function=read><parameter=path>README.md</parameter></function></tool_call><tool_call><function=bash><parameter=command>echo no</parameter></function></tool_call>",
             ProviderEngineToolStrategy::QwenFunctionXml,
             &tools,
         )
-        .is_none());
+        .expect("structured tool attempts");
+        assert_eq!(calls.len(), 2);
+        let error = validate_provider_engine_tool_call_outputs(&calls, &tools).unwrap_err();
+        assert!(error.to_string().contains("unadvertised tool call: bash"));
     }
 
     #[tokio::test]
@@ -127332,6 +127574,7 @@ State initialization...
             supervisor_url: "http://127.0.0.1:11437".to_owned(),
             mayhemd_control_token: "11".repeat(32),
             wallet_password: None,
+            wallet_password_file: None,
             gateway_bind: "0.0.0.0:11435".parse().unwrap(),
             rail: GatewayLedgerRail::Tap,
             gateway_require_auth: true,
@@ -127528,6 +127771,48 @@ State initialization...
             .mode()
             & 0o777;
         assert_eq!(config_mode, 0o600);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn up_supervisor_persists_wallet_password_for_signing_children() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = test_temp_dir("mayhem-up-wallet-password");
+        fs::create_dir_all(&home).unwrap();
+        load_or_create_paygate_internal_auth_secret(&home).unwrap();
+        let mut plan = test_up_supervisor_plan(home.clone(), Vec::new());
+        plan.fraud_challenger = true;
+        let password_path = persist_up_wallet_password(&home, "secret-password").unwrap();
+        plan.wallet_password_file = Some(password_path.clone());
+
+        let text = up_supervisor_config(&plan).unwrap();
+        let parsed: toml::Value = toml::from_str(&text).unwrap();
+        let children = parsed["supervisor"]["children"].as_array().unwrap();
+        for name in ["gateway", "fraud-challenger"] {
+            let child = children
+                .iter()
+                .find(|child| child["name"].as_str() == Some(name))
+                .unwrap();
+            let args = child["args"].as_array().unwrap();
+            let index = args
+                .iter()
+                .position(|arg| arg.as_str() == Some("--wallet-password-file"))
+                .unwrap();
+            assert_eq!(
+                args[index + 1].as_str(),
+                Some(password_path.display().to_string().as_str())
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&password_path).unwrap(),
+            "secret-password"
+        );
+        assert_eq!(
+            fs::metadata(password_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         fs::remove_dir_all(home).unwrap();
     }
 

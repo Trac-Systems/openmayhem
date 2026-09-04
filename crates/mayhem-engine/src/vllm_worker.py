@@ -481,14 +481,25 @@ def make_guided_params(cls, grammar):
 
 def tool_call_schema(tools):
     branches = []
+    definitions = {}
     names = set()
-    for tool in tools:
+    for index, tool in enumerate(tools):
         name = str(tool.get("name", ""))
         if not name:
             continue
         if name in names:
             raise ValueError(f"duplicate tool name {name!r}")
         names.add(name)
+        definition = f"tool_{index}_parameters"
+        reference = f"#/$defs/{definition}"
+        parameters = copy.deepcopy(
+            tool.get(
+                "parameters",
+                {"type": "object", "additionalProperties": True},
+            )
+        )
+        rebase_local_json_schema_refs(parameters, reference)
+        definitions[definition] = parameters
         branches.append(
             {
                 "type": "object",
@@ -496,10 +507,7 @@ def tool_call_schema(tools):
                 "required": ["tool", "arguments"],
                 "properties": {
                     "tool": {"const": name},
-                    "arguments": tool.get(
-                        "parameters",
-                        {"type": "object", "additionalProperties": True},
-                    ),
+                    "arguments": {"$ref": reference},
                 },
             }
         )
@@ -508,8 +516,23 @@ def tool_call_schema(tools):
     return {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "MayhemToolCall",
+        "$defs": definitions,
         "oneOf": branches,
     }
+
+
+def rebase_local_json_schema_refs(value, new_root):
+    if isinstance(value, list):
+        for item in value:
+            rebase_local_json_schema_refs(item, new_root)
+    elif isinstance(value, dict):
+        reference = value.get("$ref")
+        if reference == "#":
+            value["$ref"] = new_root
+        elif isinstance(reference, str) and reference.startswith("#/"):
+            value["$ref"] = f"{new_root}/{reference[2:]}"
+        for item in value.values():
+            rebase_local_json_schema_refs(item, new_root)
 
 
 def make_sampling_params(payload, speciality_sampling_kwargs=None):

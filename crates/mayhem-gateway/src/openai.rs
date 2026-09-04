@@ -2228,6 +2228,8 @@ pub struct ChatCompletionRequest {
     #[serde(skip)]
     pub effective_specialities: BTreeMap<String, String>,
     #[serde(skip)]
+    pub preserve_reasoning_content: bool,
+    #[serde(skip)]
     pub endpoint_family: Option<String>,
     #[serde(skip)]
     pub endpoint_request: Option<Value>,
@@ -22925,6 +22927,7 @@ fn apply_model_speciality_defaults(
     request: &mut ChatCompletionRequest,
 ) -> Result<(), ApiError> {
     let mut effective = BTreeMap::new();
+    request.preserve_reasoning_content = false;
     let endpoint_family = request
         .endpoint_family
         .as_deref()
@@ -22990,6 +22993,12 @@ fn apply_model_speciality_defaults(
                 Some("speciality"),
             )
         })?;
+        if model.mayhem.adapter.chat_template_id == "qwen3.5-instruct"
+            && mapping.native_path == "preserve_thinking"
+            && level.native_value == Value::Bool(true)
+        {
+            request.preserve_reasoning_content = true;
+        }
         if descriptor.name == "reasoning_effort" {
             request.reasoning_effort = Some(level.name.clone());
             if request.max_tokens.is_none() && request.max_completion_tokens.is_none() {
@@ -27774,6 +27783,7 @@ fn completion_chat_request(
         reasoning_effort: request.reasoning_effort,
         speciality_values: request.speciality_values,
         effective_specialities: BTreeMap::new(),
+        preserve_reasoning_content: false,
         endpoint_family: Some(mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS.to_owned()),
         endpoint_request: Some(raw_request),
     })
@@ -27890,6 +27900,7 @@ fn responses_chat_request(
         reasoning_effort,
         speciality_values: request.speciality_values,
         effective_specialities: BTreeMap::new(),
+        preserve_reasoning_content: false,
         endpoint_family: Some(mayhem_proto::ENDPOINT_OPENAI_RESPONSES.to_owned()),
         endpoint_request: Some(raw_request),
     })
@@ -33516,6 +33527,7 @@ fn context_needle_chat_request(model_id: &str, spec: &ContextNeedleSpec) -> Chat
         reasoning_effort: None,
         speciality_values: BTreeMap::new(),
         effective_specialities: BTreeMap::new(),
+        preserve_reasoning_content: false,
         endpoint_family: None,
         endpoint_request: None,
     }
@@ -33564,6 +33576,7 @@ fn canary_chat_request(
             .map(|(name, level)| (name.clone(), json!(level)))
             .collect(),
         effective_specialities: BTreeMap::new(),
+        preserve_reasoning_content: false,
         endpoint_family: None,
         endpoint_request: None,
     };
@@ -35436,9 +35449,31 @@ fn chat_prompt_text(request: &ChatCompletionRequest) -> String {
     request
         .messages
         .iter()
-        .map(message_to_text)
+        .map(|message| chat_accounting_message_text(message, request.preserve_reasoning_content))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn chat_accounting_message_text(message: &ChatMessage, preserve_reasoning_content: bool) -> String {
+    let content = message_to_text(message);
+    if !preserve_reasoning_content || message.role != "assistant" {
+        return content;
+    }
+    let Some(reasoning) = message
+        .extra
+        .get("reasoning_content")
+        .or_else(|| message.extra.get("reasoning"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return content;
+    };
+    if content.trim().is_empty() {
+        reasoning.to_owned()
+    } else {
+        format!("{reasoning}\n{content}")
+    }
 }
 
 fn embedding_input_texts(request: &EmbeddingRequest) -> Result<Vec<String>, ApiError> {
@@ -41223,9 +41258,107 @@ mod tests {
             reasoning_effort: None,
             speciality_values: BTreeMap::new(),
             effective_specialities: BTreeMap::new(),
+            preserve_reasoning_content: false,
             endpoint_family: None,
             endpoint_request: None,
         }
+    }
+
+    #[test]
+    fn preserved_reasoning_history_counts_toward_chat_routing_and_reservation() {
+        let mut model = test_model();
+        model.mayhem.adapter.chat_template_id = "qwen3.5-instruct".to_owned();
+        let descriptor = mayhem_proto::ModelSpecialityDescriptor {
+            name: "thinking_history".to_owned(),
+            mechanism: "boolean".to_owned(),
+            default_level: "preserve".to_owned(),
+            levels: vec![
+                mayhem_proto::ModelSpecialityLevel {
+                    name: "latest_only".to_owned(),
+                    rank: 0,
+                    native_value: json!(false),
+                    default_max_output_tokens: None,
+                    max_reasoning_tokens: None,
+                },
+                mayhem_proto::ModelSpecialityLevel {
+                    name: "preserve".to_owned(),
+                    rank: 1,
+                    native_value: json!(true),
+                    default_max_output_tokens: None,
+                    max_reasoning_tokens: None,
+                },
+            ],
+            calibration_modalities: Vec::new(),
+            research_evidence: vec!["signed reasoning-history fixture".to_owned()],
+        };
+        let contract = &mut model.mayhem.adapter.endpoint_families[0];
+        let mut spec = mayhem_proto::EndpointAttributeSpec::new(EndpointValueType::String);
+        spec.default = Some(json!("preserve"));
+        spec.enum_values = vec![json!("latest_only"), json!("preserve")];
+        spec.calibration_values = spec.enum_values.clone();
+        contract
+            .request_attributes
+            .push("thinking_history".to_owned());
+        contract
+            .request_attribute_specs
+            .insert("thinking_history".to_owned(), spec);
+        contract.speciality_mappings.insert(
+            descriptor.name.clone(),
+            mayhem_proto::EndpointSpecialityMapping {
+                request_path: "thinking_history".to_owned(),
+                target: mayhem_proto::EndpointSpecialityTarget::ChatTemplateKwarg,
+                native_path: "preserve_thinking".to_owned(),
+                selector: mayhem_proto::EndpointSpecialitySelector::Exact,
+            },
+        );
+        model.mayhem.adapter.specialities = vec![descriptor];
+
+        let mut request = test_chat_request(&model.id);
+        request.messages = vec![
+            ChatMessage {
+                role: "assistant".to_owned(),
+                content: json!("Visible answer."),
+                name: None,
+                extra: BTreeMap::from([(
+                    "reasoning_content".to_owned(),
+                    json!("private reasoning history occupies routing capacity"),
+                )]),
+            },
+            ChatMessage {
+                role: "user".to_owned(),
+                content: json!("Continue."),
+                name: None,
+                extra: BTreeMap::from([(
+                    "reasoning_content".to_owned(),
+                    json!("user reasoning is not rendered by the provider"),
+                )]),
+            },
+        ];
+        request
+            .speciality_values
+            .insert("thinking_history".to_owned(), json!("preserve"));
+        apply_model_speciality_defaults(&model, &mut request).unwrap();
+        assert!(request.preserve_reasoning_content);
+        let preserved_text = chat_prompt_text(&request);
+        assert!(preserved_text.contains("private reasoning history"));
+        assert!(!preserved_text.contains("user reasoning is not rendered"));
+        let preserved_hash = blake3_hex(preserved_text.as_bytes());
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let preserved =
+            request_requirements_for_chat(&state, &model, &request, 1, None, None, None);
+
+        request
+            .speciality_values
+            .insert("thinking_history".to_owned(), json!("latest_only"));
+        apply_model_speciality_defaults(&model, &mut request).unwrap();
+        assert!(!request.preserve_reasoning_content);
+        let latest_only_text = chat_prompt_text(&request);
+        assert!(!latest_only_text.contains("private reasoning history"));
+        assert_ne!(preserved_hash, blake3_hex(latest_only_text.as_bytes()));
+        let latest_only =
+            request_requirements_for_chat(&state, &model, &request, 1, None, None, None);
+        assert!(preserved.input_tokens > latest_only.input_tokens);
+        assert!(preserved.usage.input_tokens() > latest_only.usage.input_tokens());
     }
 
     fn test_png_data_url() -> String {
